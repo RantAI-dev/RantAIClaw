@@ -335,7 +335,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
 
     print_step(3, 10, "Channels (How You Talk to RantaiClaw)");
-    let channels_config = setup_channels()?;
+    let channels_config = setup_channels(ChannelsConfig::default())?;
 
     print_step(4, 10, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
@@ -482,7 +482,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     let mut config = Config::load_or_init().await?;
 
     print_step(1, 1, "Channels (How You Talk to RantaiClaw)");
-    config.channels_config = setup_channels()?;
+    config.channels_config = setup_channels(config.channels_config.clone())?;
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 
@@ -3432,12 +3432,18 @@ fn setup_memory() -> Result<MemoryConfig> {
 // ── Step 3: Channels ────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
+/// Run the channels interview, SEEDED from the caller's existing config. Starting
+/// from the existing state (rather than `ChannelsConfig::default()`) preserves
+/// `approval_owners`, the guest capability ceiling, and any already-configured
+/// channel the operator does not touch — re-running `setup channels` to add one
+/// channel used to wipe all of them. Already-connected channels also render with
+/// their "✅ connected" marker as a result.
+pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to RantaiClaw from anywhere.");
     print_bullet("CLI is always available. Connect more channels now.");
     println!();
 
-    let mut config = ChannelsConfig::default();
+    let mut config = existing;
     #[derive(Clone, Copy)]
     enum ChannelMenuChoice {
         Telegram,

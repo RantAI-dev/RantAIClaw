@@ -64,26 +64,26 @@ impl TuiProvisioner for GatewayProvisioner {
         )
         .await?;
 
-        // Enable/disable
+        // Configure-or-skip. `GatewayConfig` has no `enabled` field, so answering
+        // "No" cannot disable anything — it just skips configuration. Report that
+        // honestly rather than the old "Gateway disabled" (which was a lie).
         send(
             &events,
             ProvisionEvent::Choose {
-                id: "enabled".into(),
-                label: "Enable webhook gateway?".into(),
-                options: vec!["No".to_string(), "Yes".to_string()],
+                id: "configure".into(),
+                label: "Configure the webhook gateway?".into(),
+                options: vec!["No — leave it as is".to_string(), "Yes".to_string()],
                 multi: false,
             },
         )
         .await?;
 
         let sel = recv_selection(&mut responses).await?;
-        let enabled = sel.first().copied() == Some(1);
-
-        if !enabled {
+        if sel.first().copied() != Some(1) {
             send(
                 &events,
                 ProvisionEvent::Done {
-                    summary: "Gateway disabled.".into(),
+                    summary: "Gateway settings left unchanged.".into(),
                 },
             )
             .await?;
@@ -113,7 +113,7 @@ impl TuiProvisioner for GatewayProvisioner {
         .await?;
 
         let host = recv_text(&mut responses).await?;
-        let host = if host.trim().is_empty() {
+        let mut host = if host.trim().is_empty() {
             "127.0.0.1".to_string()
         } else {
             host.trim().to_string()
@@ -130,6 +130,28 @@ impl TuiProvisioner for GatewayProvisioner {
                 },
             )
             .await?;
+            // A 0.0.0.0 bind refuses to start unless `allow_public_bind` is set, so
+            // require an explicit opt-in rather than persisting a config the gateway
+            // then rejects. Declining keeps the bind local.
+            send(
+                &events,
+                ProvisionEvent::Choose {
+                    id: "allow_public_bind".into(),
+                    label: "Bind publicly anyway? Required for a 0.0.0.0 bind to start.".into(),
+                    options: vec![
+                        "No — keep it local (127.0.0.1)".to_string(),
+                        "Yes, bind publicly".to_string(),
+                    ],
+                    multi: false,
+                },
+            )
+            .await?;
+            let confirm = recv_selection(&mut responses).await?;
+            if confirm.first().copied() == Some(1) {
+                config.gateway.allow_public_bind = true;
+            } else {
+                host = "127.0.0.1".to_string();
+            }
         }
 
         // Require pairing
@@ -192,7 +214,8 @@ mod tests {
     use super::*;
     use crate::onboard::provision::traits::ProvisionResponse;
 
-    /// Drive the provisioner through its four prompts with scripted answers.
+    /// Drive the provisioner through its prompts with scripted answers. A
+    /// `0.0.0.0` host triggers the extra public-bind confirm (answered Yes here).
     async fn run_with(config: &mut Config, host: &str) -> Result<ProvisionOutcome> {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
         let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(32);
@@ -201,7 +224,7 @@ mod tests {
         resp_tx
             .send(ProvisionResponse::Selection(vec![1]))
             .await
-            .unwrap(); // enable = Yes
+            .unwrap(); // configure = Yes
         resp_tx
             .send(ProvisionResponse::Text("9999".into()))
             .await
@@ -210,6 +233,12 @@ mod tests {
             .send(ProvisionResponse::Text(host.into()))
             .await
             .unwrap(); // host
+        if host == "0.0.0.0" {
+            resp_tx
+                .send(ProvisionResponse::Selection(vec![1]))
+                .await
+                .unwrap(); // bind publicly = Yes
+        }
         resp_tx
             .send(ProvisionResponse::Selection(vec![0]))
             .await
@@ -267,5 +296,61 @@ mod tests {
         assert_eq!(config.gateway.host, "0.0.0.0");
         assert_eq!(config.gateway.port, 9999);
         assert!(config.gateway.require_pairing);
+        // A confirmed 0.0.0.0 bind must set allow_public_bind, or the gateway
+        // refuses to start from the config the provisioner just wrote.
+        assert!(
+            config.gateway.allow_public_bind,
+            "public-bind opt-in must be persisted for a 0.0.0.0 bind to be startable"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_gateway_declined_public_bind_stays_local() {
+        // Declining the public-bind confirm keeps the bind local instead of
+        // persisting a 0.0.0.0 config the gateway would refuse to start from.
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![1]))
+            .await
+            .unwrap(); // configure = Yes
+        resp_tx
+            .send(ProvisionResponse::Text("9999".into()))
+            .await
+            .unwrap(); // port
+        resp_tx
+            .send(ProvisionResponse::Text("0.0.0.0".into()))
+            .await
+            .unwrap(); // host
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![0]))
+            .await
+            .unwrap(); // bind publicly = No
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![0]))
+            .await
+            .unwrap(); // pairing = Yes
+        let mut config = Config::default();
+        let profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp"),
+        };
+        GatewayProvisioner::new()
+            .run(
+                &mut config,
+                &profile,
+                ProvisionIo {
+                    events: events_tx,
+                    responses: resp_rx,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            config.gateway.host, "127.0.0.1",
+            "declined bind stays local"
+        );
+        assert!(!config.gateway.allow_public_bind);
     }
 }
