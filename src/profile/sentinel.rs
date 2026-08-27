@@ -103,13 +103,47 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
+/// Best-effort guard against PID reuse. After an unclean kill (SIGKILL, crash)
+/// the kernel can hand the dead daemon's PID to an unrelated process, and
+/// `pid_is_alive` (a bare `kill(pid, 0)`) would then wrongly report the stale
+/// sentinel as live — the symptom being a TUI that permanently refuses to start
+/// channels because "another process owns them". On Linux we additionally
+/// require the PID to be running the SAME executable as the current process
+/// (compare `/proc/<pid>/comm` to `/proc/self/comm`); both the daemon and the
+/// CLI/TUI checking it are the same binary, so a genuine daemon matches while a
+/// reused PID running some other program (`bash`, `sleep`, …) does not. Non-Linux
+/// hosts fall back to liveness only — the guard is a documented best-effort.
+#[cfg(target_os = "linux")]
+fn pid_is_our_process(pid: u32) -> bool {
+    let theirs = std::fs::read_to_string(format!("/proc/{pid}/comm"));
+    let ours = std::fs::read_to_string("/proc/self/comm");
+    match (theirs, ours) {
+        (Ok(a), Ok(b)) => a.trim() == b.trim(),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_is_our_process(_pid: u32) -> bool {
+    true
+}
+
+/// `pid` is alive AND (best-effort) actually a RantaiClaw process — see
+/// [`pid_is_our_process`]. Use this, not raw `pid_is_alive`, wherever a stale
+/// reused PID must not be mistaken for the live daemon (channel-ownership
+/// checks, profile-switch handoff).
+pub fn pid_is_live_daemon(pid: u32) -> bool {
+    pid_is_alive(pid) && pid_is_our_process(pid)
+}
+
 /// PID of the *live* daemon for `profile`, or `None` when there is no sentinel
-/// or it is stale (the recorded PID is dead). Use this — not `is_daemon_active`
-/// — when deciding whether another process already owns the channels, so a
-/// crashed daemon's leftover sentinel does not wrongly suppress startup.
+/// or it is stale (the recorded PID is dead, or reused by another process). Use
+/// this — not `is_daemon_active` — when deciding whether another process already
+/// owns the channels, so a crashed daemon's leftover sentinel does not wrongly
+/// suppress startup.
 pub fn active_daemon_pid(profile: &str) -> Option<u32> {
     match read_sentinel(profile) {
-        Ok(Some(s)) if pid_is_alive(s.pid) => Some(s.pid),
+        Ok(Some(s)) if pid_is_live_daemon(s.pid) => Some(s.pid),
         _ => None,
     }
 }
@@ -229,6 +263,39 @@ mod tests {
         with_home(|| {
             super::super::ProfileManager::ensure("alpha").unwrap();
             assert_eq!(active_daemon_pid("alpha"), None);
+        });
+    }
+
+    // PID-reuse guard: a sentinel PID that is alive but belongs to some *other*
+    // program (here `sleep`, whose `/proc/<pid>/comm` differs from the test
+    // binary's) must be treated as stale, not as the live daemon. Linux-only —
+    // the guard degrades to liveness on other hosts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pid_of_other_program_is_not_treated_as_daemon() {
+        with_home(|| {
+            super::super::ProfileManager::ensure("alpha").unwrap();
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep");
+            let pid = child.id();
+            write_sentinel(
+                "alpha",
+                &DaemonSentinel {
+                    pid,
+                    unit: None,
+                    started_at: None,
+                },
+            )
+            .unwrap();
+            let got = active_daemon_pid("alpha");
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_eq!(
+                got, None,
+                "a live pid running `sleep` must not count as the daemon"
+            );
         });
     }
 }

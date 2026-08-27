@@ -59,7 +59,9 @@ impl DaemonControl for Recorder {
         Ok(())
     }
     fn is_active(&self, _unit: &str) -> Result<bool> {
-        Ok(false)
+        // The restart is now gated on the unit being active, so the recorder
+        // reports active — these tests exercise the restart path itself.
+        Ok(true)
     }
 }
 
@@ -81,10 +83,13 @@ fn handoff_no_op_when_no_sentinel() {
 fn handoff_restarts_when_sentinel_present() {
     with_home(|| {
         ProfileManager::ensure("work").unwrap();
+        // A LIVE daemon pid — the handoff now skips (and clears) a stale
+        // sentinel, so use the current process, which the liveness guard treats
+        // as a live RantaiClaw process.
         write_sentinel(
             "work",
             &DaemonSentinel {
-                pid: 1234,
+                pid: std::process::id(),
                 unit: Some("rantaiclaw@work.service".into()),
                 started_at: None,
             },
@@ -104,11 +109,12 @@ fn handoff_restarts_when_sentinel_present() {
 fn handoff_falls_back_to_default_unit_name() {
     with_home(|| {
         ProfileManager::ensure("staging").unwrap();
-        // Sentinel without a unit — handoff must synthesize the default.
+        // Sentinel without a unit — handoff must synthesize the default. Use a
+        // live pid so the sentinel is not treated as stale.
         write_sentinel(
             "staging",
             &DaemonSentinel {
-                pid: 99,
+                pid: std::process::id(),
                 unit: None,
                 started_at: None,
             },
@@ -125,6 +131,29 @@ fn handoff_falls_back_to_default_unit_name() {
 }
 
 #[test]
+fn handoff_skips_and_clears_a_stale_sentinel() {
+    use rantaiclaw::profile::sentinel::is_daemon_active;
+    with_home(|| {
+        ProfileManager::ensure("gone").unwrap();
+        // A pid that is effectively never alive — the daemon crashed / was
+        // stopped. Handoff must NOT restart, and must clear the stale sentinel.
+        write_sentinel(
+            "gone",
+            &DaemonSentinel {
+                pid: 2_147_483_646,
+                unit: Some("rantaiclaw.service".into()),
+                started_at: None,
+            },
+        )
+        .unwrap();
+        let rec = Recorder::new("stub");
+        restart_daemon_for_profile_with("gone", rec.as_ref()).unwrap();
+        assert_eq!(rec.restarts.load(Ordering::SeqCst), 0, "stale ⇒ no restart");
+        assert!(!is_daemon_active("gone"), "stale sentinel must be cleared");
+    });
+}
+
+#[test]
 fn handoff_no_init_skips_with_friendly_message() {
     // The `NoInit` impl returns Ok(()) without touching anything, even if
     // the sentinel is present — profile switching must not block on
@@ -132,10 +161,11 @@ fn handoff_no_init_skips_with_friendly_message() {
     use rantaiclaw::daemon::handoff::NoInit;
     with_home(|| {
         ProfileManager::ensure("ci").unwrap();
+        // Live pid so we exercise the NoInit branch rather than the stale-skip.
         write_sentinel(
             "ci",
             &DaemonSentinel {
-                pid: 1,
+                pid: std::process::id(),
                 unit: None,
                 started_at: None,
             },

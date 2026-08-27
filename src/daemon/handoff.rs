@@ -179,6 +179,19 @@ pub fn restart_daemon_for_profile_with(profile: &str, control: &dyn DaemonContro
         return Ok(());
     };
 
+    // The recorded daemon is gone (crashed, or the operator stopped it) — the
+    // sentinel is stale. Do NOT restart: resurrecting a daemon the operator
+    // isn't running would be a surprise on `profile use`. Clear the stale
+    // sentinel and skip. `pid_is_live_daemon` also guards against PID reuse.
+    if !sentinel::pid_is_live_daemon(sentinel.pid) {
+        tracing::debug!(
+            "Daemon sentinel for {profile:?} is stale (pid {} not a live daemon); clearing",
+            sentinel.pid
+        );
+        let _ = sentinel::clear_sentinel(profile);
+        return Ok(());
+    }
+
     if control.name() == "none" {
         eprintln!(
             "Note: profile {profile:?} has a registered daemon (pid {pid}) but no \
@@ -194,6 +207,17 @@ pub fn restart_daemon_for_profile_with(profile: &str, control: &dyn DaemonContro
         .unit
         .clone()
         .unwrap_or_else(|| default_unit_name(profile));
+
+    // Only cycle a unit the init system reports as active. Some controllers
+    // treat `restart` as start-if-stopped, so an unconditional restart could
+    // launch a daemon the operator had deliberately stopped.
+    if !control
+        .is_active(&unit)
+        .with_context(|| format!("query active state of {unit} via {}", control.name()))?
+    {
+        tracing::debug!("Unit {unit} is not active; skipping restart for {profile:?}");
+        return Ok(());
+    }
 
     control
         .restart(&unit)
@@ -228,7 +252,7 @@ fn users_uid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -238,6 +262,9 @@ mod tests {
         pub restarts: AtomicUsize,
         pub units: Mutex<Vec<String>>,
         pub fail_with: Mutex<Option<String>>,
+        /// What `is_active` reports. Defaults to `true` so restart-path tests
+        /// exercise the restart unless they explicitly mark the unit inactive.
+        pub active: AtomicBool,
     }
 
     impl RecordingControl {
@@ -247,7 +274,12 @@ mod tests {
                 restarts: AtomicUsize::new(0),
                 units: Mutex::new(vec![]),
                 fail_with: Mutex::new(None),
+                active: AtomicBool::new(true),
             })
+        }
+
+        pub fn set_active(&self, active: bool) {
+            self.active.store(active, Ordering::SeqCst);
         }
     }
 
@@ -264,8 +296,82 @@ mod tests {
             Ok(())
         }
         fn is_active(&self, _unit: &str) -> Result<bool> {
-            Ok(false)
+            Ok(self.active.load(Ordering::SeqCst))
         }
+    }
+
+    // Handoff tests touch the process-global HOME (profile paths resolve from
+    // it); serialize against the crate-shared ENV_LOCK like the sentinel tests.
+    fn with_home<F: FnOnce()>(f: F) {
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        if let Some(h) = prev {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    fn write_sentinel_for(profile: &str, pid: u32, unit: Option<&str>) {
+        crate::profile::ProfileManager::ensure(profile).unwrap();
+        crate::profile::sentinel::write_sentinel(
+            profile,
+            &crate::profile::sentinel::DaemonSentinel {
+                pid,
+                unit: unit.map(str::to_string),
+                started_at: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dead_pid_does_not_restart_and_clears_sentinel() {
+        with_home(|| {
+            // 2^31-2 is effectively never a live PID.
+            write_sentinel_for("alpha", 2_147_483_646, Some("rantaiclaw.service"));
+            let stub = RecordingControl::new("systemd");
+            restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(stub.restarts.load(Ordering::SeqCst), 0);
+            assert!(
+                !crate::profile::sentinel::is_daemon_active("alpha"),
+                "stale sentinel should be cleared"
+            );
+        });
+    }
+
+    #[test]
+    fn inactive_unit_does_not_restart() {
+        with_home(|| {
+            write_sentinel_for("alpha", std::process::id(), Some("rantaiclaw.service"));
+            let stub = RecordingControl::new("systemd");
+            stub.set_active(false);
+            restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(stub.restarts.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn live_active_daemon_restarts_recorded_unit() {
+        with_home(|| {
+            // The current test process is a RantaiClaw binary from the guard's
+            // point of view (comm matches self), so it counts as a live daemon.
+            write_sentinel_for("alpha", std::process::id(), Some("rantaiclaw.service"));
+            let stub = RecordingControl::new("systemd");
+            stub.set_active(true);
+            restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(stub.restarts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                stub.units.lock().unwrap().clone(),
+                vec!["rantaiclaw.service".to_string()]
+            );
+        });
     }
 
     #[test]
