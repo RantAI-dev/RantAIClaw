@@ -355,15 +355,53 @@ async fn lock_and_load(
 /// Persist the mutated config, then swap it into the running state. Must be
 /// called while holding the [`lock_and_load`] guard so a concurrent writer can't
 /// interleave between the disk read and this save.
-async fn persist_and_swap(state: &AppState, cfg: crate::config::Config) -> Result<(), ApiError> {
+async fn persist_and_swap(
+    state: &AppState,
+    cfg: crate::config::Config,
+    change_summary: &str,
+) -> Result<(), ApiError> {
     // Reject a config the loader would refuse, at the write boundary — otherwise a
     // console write can persist a state that then bricks the next startup (e.g.
     // autonomy.max_actions_per_hour = 0) or an out-of-range temperature that 400s
     // every provider call, both far from the request that caused it.
     cfg.validate().map_err(|e| err_400(e.to_string()))?;
     cfg.save().await.map_err(err_500)?;
+    audit_config_change(&cfg, change_summary);
     *state.config.lock() = cfg;
     Ok(())
+}
+
+/// Record a config-API mutation to the audit log so a policy-weakening change over
+/// HTTP leaves a trail (who, when, which section). Field/section NAMES only — never
+/// values — so no secret can leak. Best-effort; the blocking append runs off the
+/// async worker.
+///
+/// `SecurityConfig` (which owns the operator-facing `[security.audit]` block) is not
+/// wired into `Config` today, so there is no reachable per-deployment audit config to
+/// read; config-change auditing therefore uses `AuditConfig::default()` (enabled). If
+/// a future change threads `SecurityConfig` into `Config`, source the config here.
+fn audit_config_change(cfg: &crate::config::Config, change_summary: &str) {
+    let Some(dir) = cfg.config_path.parent().map(std::path::Path::to_path_buf) else {
+        return;
+    };
+    let audit_cfg = crate::config::AuditConfig::default();
+    let event = config_change_event(change_summary);
+    tokio::task::spawn_blocking(move || {
+        if let Ok(logger) = crate::security::AuditLogger::new(audit_cfg, dir) {
+            if let Err(e) = logger.log(&event) {
+                tracing::warn!(target: "gateway", error = %e, "failed to write config-change audit record");
+            }
+        }
+    });
+}
+
+/// Build the `ConfigChange` audit record for a config-API mutation. The actor is
+/// the anonymous console principal (pairing tokens are hashed, not individually
+/// labelled) and the "command" is the changed section NAME — never a value.
+fn config_change_event(change_summary: &str) -> crate::security::AuditEvent {
+    crate::security::AuditEvent::new(crate::security::AuditEventType::ConfigChange)
+        .with_actor("web-console".to_string(), None, None)
+        .with_action(change_summary.to_string(), "config".to_string(), true, true)
 }
 
 /// If a provider switch left the active provider without a usable credential,
@@ -419,7 +457,7 @@ async fn set_model(
     if let Some(w) = warning {
         resp["warning"] = json!(w);
     }
-    persist_and_swap(&state, cfg).await?;
+    persist_and_swap(&state, cfg, "model").await?;
     Ok(Json(resp))
 }
 
@@ -522,7 +560,7 @@ async fn set_autonomy(
         }
     }
     let resp = serde_json::to_value(&cfg.autonomy).map_err(err_500)?;
-    persist_and_swap(&state, cfg).await?;
+    persist_and_swap(&state, cfg, "autonomy").await?;
     // A tightening must revoke prior "Always" grants — otherwise a blanket grant
     // made under a looser preset is re-seeded into the next turn's manager and
     // keeps skipping the prompt.
@@ -646,7 +684,7 @@ async fn add_mcp_server(
     let merged = merge_mcp_server(existing.as_ref(), command, body.args, body.env);
     cfg.mcp_servers.insert(name.clone(), merged);
     let count = cfg.mcp_servers.len();
-    persist_and_swap(&state, cfg).await?;
+    persist_and_swap(&state, cfg, "mcp_servers").await?;
     Ok(Json(json!({ "name": name, "added": true, "count": count })))
 }
 
@@ -659,7 +697,7 @@ async fn remove_mcp_server(
     let (_guard, mut cfg) = lock_and_load().await?;
     let removed = cfg.mcp_servers.remove(&name).is_some();
     let count = cfg.mcp_servers.len();
-    persist_and_swap(&state, cfg).await?;
+    persist_and_swap(&state, cfg, "mcp_servers").await?;
     Ok(Json(
         json!({ "name": name, "removed": removed, "count": count }),
     ))
@@ -861,7 +899,7 @@ async fn connect_telegram(
         body.allowed_users.clone(),
     )?;
     cfg.channels_config.telegram = Some(tg);
-    persist_and_swap(&state, cfg).await?;
+    persist_and_swap(&state, cfg, "channels.telegram").await?;
 
     // A new token creates or replaces the channel itself, which the running
     // runtime cannot swap in place — that still needs a restart.
@@ -924,7 +962,7 @@ async fn disconnect_telegram(
     let (_guard, mut cfg) = lock_and_load().await?;
     let was_configured = cfg.channels_config.telegram.is_some();
     cfg.channels_config.telegram = None;
-    persist_and_swap(&state, cfg).await?;
+    persist_and_swap(&state, cfg, "channels.telegram").await?;
 
     // Only bounce the runtime if we actually removed a running channel.
     if was_configured {
@@ -1063,7 +1101,7 @@ async fn set_secrets(
     let (_guard, mut cfg) = lock_and_load().await?;
     apply_secrets(&mut cfg, &body).map_err(err_400)?;
     let present = api_key_present(&cfg);
-    persist_and_swap(&state, cfg).await?;
+    persist_and_swap(&state, cfg, "secrets").await?;
     Ok(Json(json!({ "ok": true, "api_key_present": present })))
 }
 
@@ -1225,7 +1263,7 @@ async fn set_knowledge(
             ));
         }
     }
-    persist_and_swap(&state, cfg).await?;
+    persist_and_swap(&state, cfg, "knowledge").await?;
     // New credentials invalidate any cached KB embedding/extraction context.
     // `clear_kb_ctx` is sufficient: the next KB request rebuilds the context
     // in-process with the new key. Do NOT call `schedule_daemon_reload()` here
@@ -1339,6 +1377,22 @@ mod tests {
         for k in ["PATH", "API_KEY", "NODE_ENV"] {
             assert!(!is_loader_env_key(k), "{k} should be allowed");
         }
+    }
+
+    #[test]
+    fn config_change_event_records_section_not_values() {
+        let event = config_change_event("autonomy");
+        let json = serde_json::to_string(&event).expect("event should serialize");
+        // Records WHAT section changed and WHO (anonymous console principal)…
+        assert!(json.contains("config_change"), "event type: {json}");
+        assert!(json.contains("web-console"), "actor: {json}");
+        assert!(json.contains("autonomy"), "section: {json}");
+        // …but only the section NAME is carried, never a value, so a secret set
+        // through the same handler can never reach the audit record.
+        assert!(
+            !json.contains("MARKER_SECRET"),
+            "no value should leak: {json}"
+        );
     }
 
     #[test]
