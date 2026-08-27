@@ -194,6 +194,10 @@ fn is_service_running(config: &Config, init_system: InitSystem) -> bool {
 ///
 /// Auto-apply targets the common systemd user daemon. On other init systems /
 /// platforms it returns a manual hint rather than guessing.
+///
+/// **Blocking**: shells out `systemctl daemon-reload` + `restart` synchronously
+/// (up to `TimeoutStopSec=30`). Async callers (the TUI provisioning overlay)
+/// must wrap this in `tokio::task::spawn_blocking` or they freeze the runtime.
 pub fn apply_channel_config(config: &Config, init_system: InitSystem) -> Result<String> {
     let resolved = init_system.resolve().unwrap_or(InitSystem::Auto);
     if !cfg!(target_os = "linux") || resolved != InitSystem::Systemd {
@@ -217,6 +221,10 @@ pub fn apply_channel_config(config: &Config, init_system: InitSystem) -> Result<
     }
 }
 
+/// **Blocking**: shells out to `systemctl`/`launchctl`/`rc-service`
+/// synchronously — `restart`/`stop` can block up to the unit's
+/// `TimeoutStopSec` (30s). Async callers must invoke this via
+/// `tokio::task::spawn_blocking`, not inline, or they stall the runtime worker.
 pub fn handle_command(
     command: &crate::ServiceCommands,
     config: &Config,

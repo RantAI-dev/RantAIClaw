@@ -248,15 +248,29 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                 // answers immediately — no manual restart needed. Quiet (no
                 // stdout) so it is safe inside the TUI overlay; the result is
                 // surfaced via the provision event stream.
-                let (severity, text) = match crate::service::apply_channel_config(
-                    config,
-                    crate::service::InitSystem::Auto,
-                ) {
-                    Ok(msg) => (Severity::Success, format!("↳ {msg}")),
-                    Err(e) => (
+                //
+                // `apply_channel_config` shells out `systemctl daemon-reload` +
+                // `restart` synchronously (blocks up to TimeoutStopSec=30). This
+                // runs on the TUI's async worker, so wrap it in `spawn_blocking`
+                // — otherwise the whole runtime (every other in-flight task)
+                // freezes for the duration of the restart.
+                let cfg = config.clone();
+                let (severity, text) = match tokio::task::spawn_blocking(move || {
+                    crate::service::apply_channel_config(&cfg, crate::service::InitSystem::Auto)
+                })
+                .await
+                {
+                    Ok(Ok(msg)) => (Severity::Success, format!("↳ {msg}")),
+                    Ok(Err(e)) => (
                         Severity::Warn,
                         format!(
                             "config saved, but auto-apply failed: {e}. Run `rantaiclaw service restart`."
+                        ),
+                    ),
+                    Err(e) => (
+                        Severity::Warn,
+                        format!(
+                            "config saved, but auto-apply thread panicked: {e}. Run `rantaiclaw service restart`."
                         ),
                     ),
                 };
