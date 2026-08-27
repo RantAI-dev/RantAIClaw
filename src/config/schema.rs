@@ -4133,6 +4133,15 @@ impl Config {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
         }
 
+        // Sampling: an out-of-range temperature is accepted by serde but rejected
+        // by every provider, so catch it at load/write instead of at request time.
+        if !(0.0..=2.0).contains(&self.default_temperature) {
+            anyhow::bail!(
+                "default_temperature must be between 0.0 and 2.0 (got {})",
+                self.default_temperature
+            );
+        }
+
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
             anyhow::bail!("scheduler.max_concurrent must be greater than 0");
@@ -6550,6 +6559,26 @@ default_temperature = 0.7
             error.to_string().contains("password_hash is empty"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_out_of_range_temperature() {
+        let mut config = Config::default();
+        config.default_temperature = 99.0;
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(
+            error.to_string().contains("default_temperature"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_default_config() {
+        // The default config must pass validate(), or persist_and_swap would
+        // reject every normal console write.
+        Config::default()
+            .validate()
+            .expect("default config should be valid");
     }
 
     #[test]
