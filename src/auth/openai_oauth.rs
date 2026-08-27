@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 pub const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
@@ -244,44 +244,111 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
         .await
         .context("Failed to bind callback listener at 127.0.0.1:1455")?;
 
-    let accepted = tokio::time::timeout(timeout, listener.accept())
-        .await
-        .context("Timed out waiting for browser callback")?
-        .context("Failed to accept callback connection")?;
+    // Accept in a loop until the real OAuth callback arrives. A single `accept()`
+    // was fragile: any stray request (browser preconnect, favicon fetch, a port
+    // scanner) that landed first consumed the one connection, and — combined with
+    // the raw-path escape hatch — the flow "succeeded" into a token exchange
+    // using e.g. `/favicon.ico` as the code, with the CSRF `state` never checked.
+    // Now non-callback requests get 204 and we keep waiting within the deadline.
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("Timed out waiting for browser callback");
+        }
+        let (mut stream, _) = match tokio::time::timeout(remaining, listener.accept()).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Err(e).context("Failed to accept callback connection"),
+            Err(_) => anyhow::bail!("Timed out waiting for browser callback"),
+        };
 
-    let (mut stream, _) = accepted;
-    let mut buffer = vec![0_u8; 8192];
-    let bytes_read = stream
-        .read(&mut buffer)
-        .await
-        .context("Failed to read callback request")?;
+        let Some(path) = read_request_path(&mut stream, remaining).await else {
+            // Couldn't read a request line (EOF/timeout/garbage) — ignore this
+            // connection and keep waiting for the real callback.
+            continue;
+        };
 
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let first_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Malformed callback request"))?;
+        // Only a request that actually carries the OAuth result drives
+        // verification; everything else is served 204 and ignored.
+        if !looks_like_oauth_callback(&path) {
+            let _ = respond(&mut stream, "204 No Content", "").await;
+            continue;
+        }
 
-    let path = first_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("Callback request missing path"))?;
-
-    let code = parse_code_from_redirect(path, Some(expected_state))?;
-
-    let body =
-        "<html><body><h2>RantaiClaw login complete</h2><p>You can close this tab.</p></body></html>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
-
-    Ok(code)
+        // The loopback path must carry a `code` and a matching `state` — the raw
+        // path is NEVER accepted as a code here (that escape hatch is only for the
+        // interactive `auth paste-redirect` entry point).
+        match parse_code_from_redirect(&path, Some(expected_state), false) {
+            Ok(code) => {
+                let body = "<html><body><h2>RantaiClaw login complete</h2><p>You can close this tab.</p></body></html>";
+                let _ = respond(&mut stream, "200 OK", body).await;
+                return Ok(code);
+            }
+            Err(e) => {
+                let _ = respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "Login failed — check the terminal.",
+                )
+                .await;
+                return Err(e);
+            }
+        }
+    }
 }
 
-pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {
+/// True when the request path looks like the OAuth callback (carries a `code` or
+/// an `error`), as opposed to a stray browser/scanner request we should ignore.
+fn looks_like_oauth_callback(path: &str) -> bool {
+    path.contains("code=") || path.contains("error=")
+}
+
+/// Read the HTTP request line from `stream` (looping until a full first line is
+/// buffered, in case it arrives split across reads) and return its path token.
+/// Returns `None` on EOF/timeout/garbage so the caller can move on.
+async fn read_request_path(stream: &mut TcpStream, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let mut buffer: Vec<u8> = Vec::with_capacity(8192);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&buffer[..pos]);
+            return line.split_whitespace().nth(1).map(str::to_string);
+        }
+        if buffer.len() > 16 * 1024 {
+            return None; // implausibly long request line
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => return None, // EOF before a full line
+            Ok(Ok(n)) => buffer.extend_from_slice(&chunk[..n]),
+            _ => return None,
+        }
+    }
+}
+
+/// Write a minimal HTTP response and close.
+async fn respond(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await
+}
+
+/// Parse the OAuth `code` from a redirect URL, path, or (when `allow_raw_code`)
+/// a bare pasted code. `allow_raw_code` gates the raw-input fallback: the
+/// interactive `auth paste-redirect` command passes `true` (a user may paste
+/// just the code); the loopback listener passes `false` so a non-callback path
+/// can never be mistaken for a code and the CSRF `state` is always verified.
+pub fn parse_code_from_redirect(
+    input: &str,
+    expected_state: Option<&str>,
+    allow_raw_code: bool,
+) -> Result<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         anyhow::bail!("No OAuth code provided");
@@ -321,7 +388,7 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
         return Ok(code);
     }
 
-    if !is_callback_payload {
+    if allow_raw_code && !is_callback_payload {
         return Ok(trimmed.to_string());
     }
 
@@ -458,9 +525,30 @@ mod tests {
     #[test]
     fn pkce_generation_is_valid() {
         let pkce = generate_pkce_state();
-        assert!(pkce.code_verifier.len() >= 43);
-        assert!(!pkce.code_challenge.is_empty());
-        assert!(!pkce.state.is_empty());
+        // The whole security property: challenge == BASE64URL(SHA256(verifier)).
+        let digest = Sha256::digest(pkce.code_verifier.as_bytes());
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        assert_eq!(
+            pkce.code_challenge, expected,
+            "code_challenge must be the S256 hash of the verifier"
+        );
+        assert!(
+            pkce.code_verifier.len() >= 43,
+            "verifier too short for PKCE"
+        );
+
+        // Distinct per call — a reused verifier/state would defeat PKCE + CSRF.
+        let other = generate_pkce_state();
+        assert_ne!(pkce.code_verifier, other.code_verifier);
+        assert_ne!(pkce.state, other.state);
+
+        // The authorize URL advertises S256, not `plain`.
+        let url = build_authorize_url(&pkce);
+        assert!(
+            url.contains("code_challenge_method=S256"),
+            "authorize url must use S256: {url}"
+        );
+        assert!(url.contains(&format!("code_challenge={}", pkce.code_challenge)));
     }
 
     #[test]
@@ -468,20 +556,58 @@ mod tests {
         let code = parse_code_from_redirect(
             "http://127.0.0.1:1455/auth/callback?code=abc123&state=xyz",
             Some("xyz"),
+            false,
         )
         .unwrap();
         assert_eq!(code, "abc123");
     }
 
     #[test]
-    fn parse_redirect_accepts_raw_code() {
-        let code = parse_code_from_redirect("raw-code", None).unwrap();
+    fn parse_redirect_accepts_raw_code_when_allowed() {
+        // The interactive paste path allows a bare code.
+        let code = parse_code_from_redirect("raw-code", None, true).unwrap();
         assert_eq!(code, "raw-code");
     }
 
     #[test]
+    fn loopback_rejects_raw_path_as_code() {
+        // The loopback listener passes allow_raw_code=false: a stray path with no
+        // `code` must NOT be returned as the code (the old escape-hatch bug).
+        let err = parse_code_from_redirect("/favicon.ico", Some("xyz"), false).unwrap_err();
+        assert!(
+            err.to_string().contains("Missing OAuth code"),
+            "raw path must not be accepted as a code: {err}"
+        );
+    }
+
+    #[test]
+    fn loopback_requires_code_and_matching_state() {
+        // A callback with a matching state but no code → error.
+        let err =
+            parse_code_from_redirect("/auth/callback?state=xyz", Some("xyz"), false).unwrap_err();
+        assert!(err.to_string().contains("Missing OAuth code"), "{err}");
+        // A code with a mismatched state → error (CSRF).
+        let err = parse_code_from_redirect("/auth/callback?code=x&state=a", Some("b"), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("state mismatch"), "{err}");
+    }
+
+    #[test]
+    fn callback_filter_ignores_stray_requests() {
+        assert!(looks_like_oauth_callback(
+            "/auth/callback?code=abc&state=xyz"
+        ));
+        assert!(looks_like_oauth_callback(
+            "/auth/callback?error=access_denied"
+        ));
+        assert!(!looks_like_oauth_callback("/favicon.ico"));
+        assert!(!looks_like_oauth_callback("/"));
+    }
+
+    #[test]
     fn parse_redirect_rejects_state_mismatch() {
-        let err = parse_code_from_redirect("/auth/callback?code=x&state=a", Some("b")).unwrap_err();
+        let err = parse_code_from_redirect("/auth/callback?code=x&state=a", Some("b"), false)
+            .unwrap_err();
         assert!(err.to_string().contains("state mismatch"));
     }
 
@@ -490,6 +616,7 @@ mod tests {
         let err = parse_code_from_redirect(
             "/auth/callback?error=access_denied&error_description=user+cancelled",
             Some("xyz"),
+            false,
         )
         .unwrap_err();
         assert!(err
