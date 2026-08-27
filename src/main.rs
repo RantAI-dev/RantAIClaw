@@ -2711,6 +2711,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             let code = auth::openai_oauth::parse_code_from_redirect(
                 &redirect_input,
                 Some(&pending.state),
+                // Interactive paste: the operator may paste a bare code, not a
+                // full redirect URL, so the raw-code fallback is intended here.
+                true,
             )?;
 
             let pkce = auth::openai_oauth::PkceState {

@@ -15,6 +15,11 @@ const PROFILES_FILENAME: &str = "auth-profiles.json";
 const LOCK_FILENAME: &str = "auth-profiles.lock";
 const LOCK_WAIT_MS: u64 = 50;
 const LOCK_TIMEOUT_MS: u64 = 10_000;
+/// A lock older than this (in seconds) whose recorded pid is dead is treated as
+/// orphaned and reclaimed. Generous — no legitimate auth write holds the lock
+/// for a minute — so a concurrent holder that just created the lock is never
+/// stolen.
+const STALE_LOCK_AGE_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -488,6 +493,7 @@ impl AuthProfilesStore {
         }
 
         let mut waited = 0_u64;
+        let mut reclaimed = false;
         loop {
             match OpenOptions::new()
                 .create_new(true)
@@ -517,10 +523,24 @@ impl AuthProfilesStore {
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Reclaim an orphaned lock ONCE. A hard kill (SIGKILL, OOM,
+                    // `panic=abort`) skips the `Drop` guard, leaving the lock
+                    // forever — every subsequent `load`/`auth login`/provider
+                    // using an auth profile would then block 10s and fail. Only
+                    // reclaim when BOTH signals agree the holder is gone: the
+                    // file is older than STALE_LOCK_AGE AND its recorded pid is
+                    // not alive (so a live concurrent holder is never stolen).
+                    if !reclaimed && self.lock_is_stale().await {
+                        reclaimed = true;
+                        let _ = fs::remove_file(&self.lock_path).await;
+                        continue;
+                    }
                     if waited >= LOCK_TIMEOUT_MS {
                         anyhow::bail!(
-                            "Timed out waiting for auth profile lock at {}",
-                            self.lock_path.display()
+                            "Timed out waiting for auth profile lock at {path}. If no other \
+                             rantaiclaw process is running, this lock is stale — delete it: \
+                             rm {path}",
+                            path = self.lock_path.display()
                         );
                     }
                     sleep(Duration::from_millis(LOCK_WAIT_MS)).await;
@@ -537,6 +557,55 @@ impl AuthProfilesStore {
             }
         }
     }
+
+    /// Whether the existing lock file looks orphaned: older than
+    /// [`STALE_LOCK_AGE`] AND its recorded pid is not alive. A missing pid line
+    /// on an old file also counts as stale. Both signals are required so a
+    /// genuine concurrent holder — which may not have written its pid yet, or
+    /// was created moments ago — is never reclaimed.
+    async fn lock_is_stale(&self) -> bool {
+        let old_enough = match fs::metadata(&self.lock_path).await {
+            Ok(meta) => meta
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .is_some_and(|age| age.as_secs() > STALE_LOCK_AGE_SECS),
+            Err(_) => false,
+        };
+        if !old_enough {
+            return false;
+        }
+        match fs::read_to_string(&self.lock_path).await {
+            Ok(body) => match parse_lock_pid(&body) {
+                Some(pid) => !pid_is_alive(pid),
+                None => true,
+            },
+            Err(_) => false,
+        }
+    }
+}
+
+/// Parse the `pid=<n>` line the lock writer records.
+fn parse_lock_pid(body: &str) -> Option<u32> {
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix("pid="))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
+/// Advisory liveness check (mirrors `profile::sentinel`): `kill(pid, 0)`
+/// succeeds, or fails with `EPERM` (alive but owned by another user). Non-unix:
+/// conservatively `true` so a lock is never reclaimed from a possibly-live
+/// holder we cannot probe (the operator can delete it manually — the timeout
+/// error says how).
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
 }
 
 struct AuthProfileLockGuard {
@@ -670,6 +739,69 @@ mod tests {
 
         assert!(token_set.is_expiring_within(Duration::from_secs(15)));
         assert!(!token_set.is_expiring_within(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn parse_lock_pid_reads_pid_line() {
+        assert_eq!(parse_lock_pid("pid=1234\n"), Some(1234));
+        assert_eq!(parse_lock_pid("pid=1234\nextra=x\n"), Some(1234));
+        assert_eq!(parse_lock_pid("garbage"), None);
+        assert_eq!(parse_lock_pid(""), None);
+    }
+
+    /// Backdate a file's mtime by `secs_ago` seconds (unix only, no extra deps).
+    #[cfg(unix)]
+    fn backdate_mtime(path: &Path, secs_ago: i64) {
+        use std::os::unix::ffi::OsStrExt;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let tv = libc::timeval {
+            tv_sec: now - secs_ago as libc::time_t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        let rc = unsafe { libc::utimes(cpath.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes failed to backdate {}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_lock_is_reclaimed() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let lock_path = tmp.path().join(LOCK_FILENAME);
+        // Orphaned lock: a dead pid + an mtime older than STALE_LOCK_AGE. The
+        // Drop guard never ran (simulating a hard kill).
+        std::fs::write(&lock_path, "pid=2147483646\n").unwrap();
+        backdate_mtime(&lock_path, 120);
+
+        // Must reclaim and acquire promptly, not block for LOCK_TIMEOUT_MS.
+        let guard = store
+            .acquire_lock()
+            .await
+            .expect("a stale orphaned lock should be reclaimed");
+        drop(guard);
+        assert!(!lock_path.exists(), "guard should remove the lock on drop");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_lock_is_not_reclaimed() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let lock_path = tmp.path().join(LOCK_FILENAME);
+        // A live holder (this very process) with an old mtime must NOT be
+        // reclaimed — both signals (dead pid AND old mtime) are required.
+        std::fs::write(&lock_path, format!("pid={}\n", std::process::id())).unwrap();
+        backdate_mtime(&lock_path, 120);
+
+        assert!(
+            !store.lock_is_stale().await,
+            "a lock held by a live process must never be reclaimed"
+        );
     }
 
     #[tokio::test]
