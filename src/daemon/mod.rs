@@ -16,6 +16,17 @@ const STATUS_FLUSH_SECONDS: u64 = 5;
 /// so the whole stop (drain + `stop_all`) stays inside the unit's window.
 const GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// How long to let channels drain in-flight replies and commit long-poll offsets
+/// after a shutdown signal before they are force-aborted. Kept with the gateway
+/// drain inside systemd's `TimeoutStopSec=30` window.
+const CHANNELS_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Consecutive `EADDRINUSE` binds the gateway tolerates before the port conflict
+/// is treated as fatal. A few retries cover a fast restart where the old process
+/// is still releasing the port; beyond that it is a real conflict that must
+/// propagate rather than loop forever.
+const GATEWAY_ADDR_IN_USE_MAX_RETRIES: u32 = 5;
+
 /// The background scheduler runs only when BOTH the cron feature master switch
 /// (`[cron].enabled`) and the scheduler-loop switch (`[scheduler].enabled`) are
 /// on. Previously only `[cron].enabled` was honored, leaving `[scheduler].enabled`
@@ -70,42 +81,47 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     // The gateway is held separately so we can await its drain before aborting
-    // the rest; it is the only component with in-flight request state to save.
-    let mut gateway_handle = {
-        let gateway_cfg = config.clone();
-        let gateway_host = host.clone();
-        let gateway_shutdown = shutdown.clone();
-        spawn_component_supervisor(
-            "gateway",
+    // the rest, and so a fatal startup failure (a refused public bind, an
+    // unparseable address, a persistent port conflict) exits the process instead
+    // of looping behind a false "started" banner. `gateway_ready` fires on the
+    // first successful bind; `fatal_rx` carries a non-retryable error.
+    let gateway_ready = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (fatal_tx, mut fatal_rx) = tokio::sync::oneshot::channel::<anyhow::Error>();
+    let gateway_handle = spawn_gateway_supervisor(
+        host.clone(),
+        port,
+        config.clone(),
+        shutdown.clone(),
+        gateway_ready.clone(),
+        fatal_tx,
+        initial_backoff,
+        max_backoff,
+    );
+
+    // Channels are held separately too, so shutdown can DRAIN them instead of a
+    // bare `abort()`. They run under `start_channels_with_cancellation` (the same
+    // cancellable path the TUI uses): cancelling the token stops each listener,
+    // closes the dispatch loop, and returns cleanly — where the old
+    // non-cancellable `start_channels` + `abort()` dropped in-flight replies and
+    // uncommitted long-poll offsets (duplicate reprocessing on the next start).
+    let mut channels_handle: Option<JoinHandle<()>> = None;
+    if has_supervised_channels(&config) {
+        let channels_cfg = config.clone();
+        let channels_shutdown = shutdown.clone();
+        channels_handle = Some(spawn_component_supervisor(
+            "channels",
             initial_backoff,
             max_backoff,
             shutdown.clone(),
             move || {
-                let cfg = gateway_cfg.clone();
-                let host = gateway_host.clone();
-                let sd = gateway_shutdown.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg, sd).await }
+                let cfg = channels_cfg.clone();
+                let sd = channels_shutdown.clone();
+                async move { crate::channels::start_channels_with_cancellation(cfg, sd).await }
             },
-        )
-    };
-
-    {
-        if has_supervised_channels(&config) {
-            let channels_cfg = config.clone();
-            handles.push(spawn_component_supervisor(
-                "channels",
-                initial_backoff,
-                max_backoff,
-                shutdown.clone(),
-                move || {
-                    let cfg = channels_cfg.clone();
-                    async move { crate::channels::start_channels(cfg).await }
-                },
-            ));
-        } else {
-            crate::health::mark_component_ok("channels");
-            tracing::info!("No real-time channels configured; channel supervisor disabled");
-        }
+        ));
+    } else {
+        crate::health::mark_component_ok("channels");
+        tracing::info!("No real-time channels configured; channel supervisor disabled");
     }
 
     if config.heartbeat.enabled {
@@ -141,21 +157,103 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         );
     }
 
+    // Gate the "started" banner on the gateway's first successful bind. If the
+    // gateway fails fatally first (refused/unparseable bind, persistent port
+    // conflict), exit non-zero so `systemctl status` shows a FAILED unit — not
+    // "active (running)" for a daemon that never served a request. A stop signal
+    // before the first bind is a clean early shutdown.
+    enum Startup {
+        Ready,
+        Fatal(anyhow::Error),
+        ShutdownEarly,
+    }
+    let startup = tokio::select! {
+        () = gateway_ready.notified() => Startup::Ready,
+        result = &mut fatal_rx => Startup::Fatal(
+            result.unwrap_or_else(|_| anyhow::anyhow!("gateway supervisor ended before binding")),
+        ),
+        () = shutdown_signal() => Startup::ShutdownEarly,
+    };
+    match startup {
+        Startup::Fatal(e) => {
+            tracing::error!("Gateway failed to start (fatal): {e:#}");
+            shutdown.cancel();
+            drain_and_cleanup(
+                gateway_handle,
+                channels_handle,
+                handles,
+                &services,
+                &active_profile,
+            )
+            .await;
+            return Err(e);
+        }
+        Startup::ShutdownEarly => {
+            shutdown.cancel();
+            drain_and_cleanup(
+                gateway_handle,
+                channels_handle,
+                handles,
+                &services,
+                &active_profile,
+            )
+            .await;
+            return Ok(());
+        }
+        Startup::Ready => {}
+    }
+
     println!("🧠 RantaiClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
     println!("   Ctrl+C to stop");
 
-    shutdown_signal().await;
+    // Main wait: a normal stop signal, or a fatal gateway error that surfaces
+    // AFTER the first bind (e.g. `EADDRINUSE`-after-N on a later restart).
+    let fatal_after: Option<anyhow::Error> = tokio::select! {
+        () = shutdown_signal() => None,
+        result = &mut fatal_rx => Some(
+            result.unwrap_or_else(|_| anyhow::anyhow!("gateway supervisor ended")),
+        ),
+    };
+
     println!("⏻ shutting down — draining in-flight requests, then cleaning up…");
     crate::health::mark_component_error("daemon", "shutdown requested");
-
     // Signal graceful shutdown: the gateway stops accepting new connections and
-    // finishes in-flight requests; supervisors won't restart on the resulting
-    // clean exit.
+    // finishes in-flight requests; channels drain their listeners; supervisors
+    // won't restart a component that exited because of the shutdown.
     shutdown.cancel();
+    drain_and_cleanup(
+        gateway_handle,
+        channels_handle,
+        handles,
+        &services,
+        &active_profile,
+    )
+    .await;
 
-    // Give the gateway a bounded window to drain. On timeout, force it.
+    match fatal_after {
+        Some(e) => {
+            tracing::error!("Gateway failed (fatal) after start: {e:#}");
+            Err(e)
+        }
+        None => Ok(()),
+    }
+}
+
+/// Drain and tear down all daemon components after `shutdown` has been cancelled.
+/// The gateway and channels get bounded drain windows (they have in-flight state
+/// — HTTP requests, long-poll offsets); the rest are aborted directly. Shared by
+/// the fatal-exit, early-shutdown, and normal-stop paths so teardown stays
+/// identical.
+async fn drain_and_cleanup(
+    mut gateway_handle: JoinHandle<()>,
+    channels_handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
+    services: &[Box<dyn crate::services::Service>],
+    active_profile: &str,
+) {
+    // Gateway: bounded drain, then force.
     if tokio::time::timeout(GATEWAY_DRAIN_TIMEOUT, &mut gateway_handle)
         .await
         .is_err()
@@ -164,8 +262,20 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         let _ = gateway_handle.await;
     }
 
-    // The remaining components (channels/heartbeat/scheduler) have no in-flight
-    // request state to save, so abort them directly.
+    // Channels: bounded drain window (cancellation makes them return cleanly)
+    // before falling back to abort.
+    if let Some(mut channels_handle) = channels_handle {
+        if tokio::time::timeout(CHANNELS_DRAIN_TIMEOUT, &mut channels_handle)
+            .await
+            .is_err()
+        {
+            channels_handle.abort();
+            let _ = channels_handle.await;
+        }
+    }
+
+    // The rest (heartbeat/scheduler/state-writer) have no in-flight state to
+    // save, so abort them directly.
     for handle in &handles {
         handle.abort();
     }
@@ -173,19 +283,125 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         let _ = handle.await;
     }
 
-    // Stop auto-managed services after the supervised components have been aborted,
-    // so in-flight tool calls don't get a torn-down container mid-request.
+    // Stop auto-managed services after the supervised components are down, so
+    // in-flight tool calls don't get a torn-down container mid-request.
     if !services.is_empty() {
-        crate::services::stop_all(&services).await;
+        crate::services::stop_all(services).await;
     }
 
-    // Clear sentinel — best-effort; a stale sentinel from a crash will be
-    // ignored by handoff anyway since the unit will not be active.
-    if let Err(e) = crate::profile::sentinel::clear_sentinel(&active_profile) {
+    // Clear sentinel — best-effort; a stale sentinel from a crash is ignored by
+    // handoff anyway since the unit will not be active.
+    if let Err(e) = crate::profile::sentinel::clear_sentinel(active_profile) {
         tracing::warn!("Failed to clear daemon sentinel: {e}");
     }
+}
 
-    Ok(())
+/// How a failed gateway run should be treated by its supervisor.
+#[derive(Debug, PartialEq, Eq)]
+enum GatewayFailure {
+    /// Never retry — propagate so the process exits non-zero.
+    Fatal,
+    /// The port is occupied; retry a bounded number of times (a restart may just
+    /// be racing the old process releasing the port) before treating it as fatal.
+    AddrInUse,
+    /// A recoverable error — retry with backoff, as before.
+    Transient,
+}
+
+/// Classify a gateway run error. A [`crate::gateway::GatewayStartupFatal`] in the
+/// chain is unrecoverable; an `EADDRINUSE` io-error is fatal-after-N; anything
+/// else is transient.
+fn classify_gateway_failure(e: &anyhow::Error) -> GatewayFailure {
+    if e.chain().any(|c| {
+        c.downcast_ref::<crate::gateway::GatewayStartupFatal>()
+            .is_some()
+    }) {
+        return GatewayFailure::Fatal;
+    }
+    if e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    }) {
+        return GatewayFailure::AddrInUse;
+    }
+    GatewayFailure::Transient
+}
+
+/// Supervise the gateway: retry transient failures with backoff (racing
+/// shutdown), signal `ready` on the first successful bind, and on a fatal error
+/// (or a persistent port conflict) send it on `fatal_tx`, cancel `shutdown`, and
+/// stop — so `run` can exit non-zero instead of looping.
+#[allow(clippy::too_many_arguments)]
+fn spawn_gateway_supervisor(
+    host: String,
+    port: u16,
+    config: Config,
+    shutdown: CancellationToken,
+    ready: std::sync::Arc<tokio::sync::Notify>,
+    fatal_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
+    initial_backoff_secs: u64,
+    max_backoff_secs: u64,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff = initial_backoff_secs.max(1);
+        let max_backoff = max_backoff_secs.max(backoff);
+        let mut fatal_tx = Some(fatal_tx);
+        let mut addr_in_use_retries: u32 = 0;
+
+        loop {
+            crate::health::mark_component_ok("gateway");
+            let outcome = crate::gateway::run_gateway(
+                &host,
+                port,
+                config.clone(),
+                shutdown.clone(),
+                Some(ready.clone()),
+            )
+            .await;
+            if shutdown.is_cancelled() {
+                break;
+            }
+            match outcome {
+                Ok(()) => {
+                    crate::health::mark_component_error("gateway", "component exited unexpectedly");
+                    tracing::warn!("Daemon component 'gateway' exited unexpectedly");
+                    backoff = initial_backoff_secs.max(1);
+                    addr_in_use_retries = 0;
+                }
+                Err(e) => {
+                    let fatal = match classify_gateway_failure(&e) {
+                        GatewayFailure::Fatal => true,
+                        GatewayFailure::AddrInUse => {
+                            addr_in_use_retries += 1;
+                            addr_in_use_retries >= GATEWAY_ADDR_IN_USE_MAX_RETRIES
+                        }
+                        GatewayFailure::Transient => false,
+                    };
+                    if fatal {
+                        crate::health::mark_component_error("gateway", format!("fatal: {e}"));
+                        tracing::error!("Daemon component 'gateway' failed fatally: {e:#}");
+                        if let Some(tx) = fatal_tx.take() {
+                            let _ = tx.send(e);
+                        }
+                        // Stop the other components too; `run` drives the exit.
+                        shutdown.cancel();
+                        break;
+                    }
+                    crate::health::mark_component_error("gateway", e.to_string());
+                    tracing::error!("Daemon component 'gateway' failed: {e}");
+                }
+            }
+
+            crate::health::bump_component_restart("gateway");
+            // Race the backoff against shutdown so a SIGTERM mid-backoff stops
+            // promptly instead of waiting out the sleep.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                () = shutdown.cancelled() => break,
+            }
+            backoff = backoff.saturating_mul(2).min(max_backoff);
+        }
+    })
 }
 
 /// Block until the daemon receives a shutdown signal — Ctrl+C (SIGINT) or, on
@@ -608,5 +824,39 @@ mod tests {
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn typed_startup_error_is_classified_fatal() {
+        // A GatewayStartupFatal anywhere in the chain → the supervisor propagates
+        // (exits non-zero) instead of retrying the bind forever.
+        let e = anyhow::Error::new(crate::gateway::GatewayStartupFatal(
+            "refusing public bind".into(),
+        ));
+        assert_eq!(classify_gateway_failure(&e), GatewayFailure::Fatal);
+        // Still fatal when wrapped with added context.
+        let wrapped = e.context("while starting the gateway");
+        assert_eq!(classify_gateway_failure(&wrapped), GatewayFailure::Fatal);
+    }
+
+    #[test]
+    fn addr_in_use_is_classified_addr_in_use() {
+        let e = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "address already in use",
+        ));
+        assert_eq!(classify_gateway_failure(&e), GatewayFailure::AddrInUse);
+    }
+
+    #[test]
+    fn other_errors_are_transient() {
+        let e = anyhow::anyhow!("some transient provider hiccup");
+        assert_eq!(classify_gateway_failure(&e), GatewayFailure::Transient);
+        // A non-AddrInUse io-error is transient too.
+        let io = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert_eq!(classify_gateway_failure(&io), GatewayFailure::Transient);
     }
 }
