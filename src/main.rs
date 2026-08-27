@@ -1904,7 +1904,9 @@ async fn main() -> Result<()> {
                 daemon::shutdown_signal().await;
                 shutdown_trigger.cancel();
             });
-            gateway::run_gateway(&host, port, config, shutdown).await
+            // Standalone `gateway` command: no daemon supervisor to signal, so
+            // no readiness Notify.
+            gateway::run_gateway(&host, port, config, shutdown, None).await
         }
 
         Some(Commands::Daemon { port, host }) => {

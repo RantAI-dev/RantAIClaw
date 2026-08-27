@@ -905,26 +905,60 @@ fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
+/// A gateway startup failure the daemon supervisor must NOT retry: an
+/// unrecoverable bind refusal (public-bind guard) or an unparseable bind
+/// address. It is wrapped in the returned `anyhow::Error` so the supervisor can
+/// `downcast_ref` and propagate a non-zero exit instead of looping forever
+/// behind a false "daemon started" banner. `EADDRINUSE` is intentionally NOT
+/// wrapped — the supervisor treats it as fatal-after-N-retries, since during a
+/// restart the old process may still be releasing the port.
+#[derive(Debug)]
+pub struct GatewayStartupFatal(pub String);
+
+impl std::fmt::Display for GatewayStartupFatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for GatewayStartupFatal {}
+
 pub async fn run_gateway(
     host: &str,
     port: u16,
     config: Config,
     shutdown: tokio_util::sync::CancellationToken,
+    ready: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) -> Result<()> {
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
-        anyhow::bail!(
+        // Fatal: no amount of retrying makes an exposed bind acceptable.
+        return Err(anyhow::Error::new(GatewayStartupFatal(format!(
             "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
              Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
-        );
+        ))));
     }
 
-    let addr = resolve_bind_addr(host, port)?;
+    // Fatal: an unparseable host/port can never succeed on retry.
+    let addr = resolve_bind_addr(host, port).map_err(|e| {
+        anyhow::Error::new(GatewayStartupFatal(format!(
+            "invalid bind address {host}:{port}: {e}"
+        )))
+    })?;
+    // NOT wrapped: a bind failure here (e.g. EADDRINUSE) stays a raw io::Error so
+    // the supervisor can classify it as fatal-after-N rather than fatal-now.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
+
+    // Signal first successful bind so the daemon prints its "started" banner
+    // only once the gateway is actually listening (not before). Harmless if
+    // fired again on a later restart — the daemon awaits it once.
+    if let Some(ready) = &ready {
+        ready.notify_one();
+    }
 
     let (state, app) = build_gateway_router(config.clone())?;
 
