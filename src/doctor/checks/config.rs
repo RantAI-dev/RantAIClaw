@@ -247,7 +247,12 @@ fn writable_probe(dir: &Path) -> std::io::Result<()> {
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
-    match crate::providers::create_provider(name, None) {
+    // Validate the provider spec's SHAPE (name / custom URL), not credential
+    // presence: pass a placeholder key so providers that now require one at
+    // construction (e.g. the rig `anthropic-custom:` path) don't report a
+    // missing key as an invalid-shape error. Credential presence is checked
+    // separately (`ProviderKeyCheck` / `resolve_key_for_provider`).
+    match crate::providers::create_provider(name, Some("doctor-shape-check")) {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
@@ -427,6 +432,24 @@ mod tests {
         let result = ConfigSchemaCheck.run(&ctx).await;
         assert_eq!(result.severity, Severity::Fail);
         assert!(result.hint.is_some());
+    }
+
+    #[tokio::test]
+    async fn provider_requiring_key_is_not_misdiagnosed() {
+        // A provider that requires a credential at construction (the rig
+        // `anthropic-custom:` path) must validate on SHAPE, not on credential
+        // presence — otherwise `config.schema` reports a missing key as
+        // "default_provider is invalid". The placeholder key makes it construct.
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("anthropic-custom:https://api.example.com".into());
+        cfg.api_key = None;
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        let result = ConfigSchemaCheck.run(&ctx).await;
+        assert!(
+            !result.message.contains("default_provider") || !result.message.contains("is invalid"),
+            "a keyless key-requiring provider must not be misdiagnosed as invalid: {}",
+            result.message
+        );
     }
 
     #[tokio::test]
