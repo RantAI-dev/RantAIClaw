@@ -2065,7 +2065,15 @@ async fn main() -> Result<()> {
             service_init,
         }) => {
             let init_system = service_init.parse()?;
-            service::handle_command(&service_command, &config, init_system)
+            // `service::handle_command` shells out synchronously — `systemctl
+            // restart` blocks up to the unit's TimeoutStopSec (30s). Run it off
+            // the async worker so it doesn't stall the runtime, mirroring `ui`.
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || {
+                service::handle_command(&service_command, &config, init_system)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("service command panicked: {e}"))?
         }
 
         Some(Commands::Ui { ui_command }) => {
@@ -2567,7 +2575,11 @@ async fn handle_permissions_command(
     updated.save().await?;
     println!("✅ {}", outcome.message);
     println!("   Saved to {}", updated.config_path.display());
-    channels::announce_daemon_reload();
+    // `announce_daemon_reload` shells out (`systemctl`/`launchctl`/`rc-service`)
+    // synchronously; keep it off the async worker.
+    tokio::task::spawn_blocking(channels::announce_daemon_reload)
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon reload panicked: {e}"))?;
     Ok(())
 }
 

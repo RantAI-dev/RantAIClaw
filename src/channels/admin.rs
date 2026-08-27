@@ -56,7 +56,10 @@ pub(crate) async fn bind_telegram_identity(config: &Config, identity: &str) -> R
     updated.save().await?;
     println!("✅ Bound Telegram identity: {normalized}");
     println!("   Saved to {}", updated.config_path.display());
-    announce_daemon_reload();
+    // `announce_daemon_reload` shells out synchronously; keep it off the worker.
+    tokio::task::spawn_blocking(announce_daemon_reload)
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon reload panicked: {e}"))?;
     Ok(())
 }
 
@@ -95,7 +98,10 @@ pub(crate) async fn unbind_telegram_identity(config: &Config, identity: &str) ->
              Add yourself with `rantaiclaw channel bind-telegram <your-username-or-id>`."
         );
     }
-    announce_daemon_reload();
+    // `announce_daemon_reload` shells out synchronously; keep it off the worker.
+    tokio::task::spawn_blocking(announce_daemon_reload)
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon reload panicked: {e}"))?;
     Ok(())
 }
 
@@ -150,6 +156,11 @@ pub(crate) fn pair_channel(
 /// print a clear note about what happened either way. Shared by the channel
 /// allowlist binder and the `permissions` CLI so config edits made on disk are
 /// picked up without the user having to remember to bounce the service.
+///
+/// **Blocking**: `maybe_restart_managed_daemon_service` shells out to
+/// `launchctl`/`rc-service`/`systemctl` synchronously (a restart blocks up to
+/// the unit's stop timeout). Async callers must run this via
+/// `tokio::task::spawn_blocking`.
 pub(crate) fn announce_daemon_reload() {
     match maybe_restart_managed_daemon_service() {
         Ok(true) => {
