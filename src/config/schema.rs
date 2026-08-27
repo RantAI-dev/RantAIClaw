@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -44,6 +44,11 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] =
     &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
+/// Proxy env vars THIS process authored via `apply_to_process_env`. On a config
+/// reload, `apply_env_overrides` must not mistake a var it wrote itself for a
+/// user-supplied proxy signal — re-reading the `HTTP_PROXY` it had just written
+/// flipped a `[proxy] enabled = false` config back to `true` every reload.
+static PROXY_AUTHORED_VARS: OnceLock<RwLock<HashSet<&'static str>>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
 
@@ -1616,6 +1621,27 @@ impl ProxyConfig {
     pub fn apply_to_process_env(&self) {
         for (key, value) in self.process_env_assignments() {
             set_proxy_env_pair(key, value.as_deref());
+            // Track which vars we wrote so a reload does not read them back as a
+            // user proxy signal, and so `clear_authored_process_env` can undo
+            // exactly our own writes without touching a user's HTTP_PROXY.
+            mark_proxy_var_authored(key, value.is_some());
+        }
+    }
+
+    /// Clear ONLY the proxy env vars this process previously authored (via
+    /// [`apply_to_process_env`]). Used when the proxy is disabled or its scope
+    /// moves away from `Environment`, so a disabled proxy stops proxying without
+    /// wiping a proxy var the operator set in their own shell.
+    pub fn clear_authored_process_env() {
+        let authored: Vec<&'static str> = {
+            let lock = proxy_authored_vars();
+            let mut guard = lock
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.drain().collect()
+        };
+        for key in authored {
+            clear_proxy_env_pair(key);
         }
     }
 
@@ -1642,10 +1668,10 @@ impl ProxyConfig {
     }
 
     pub fn clear_process_env() {
-        clear_proxy_env_pair("HTTP_PROXY");
-        clear_proxy_env_pair("HTTPS_PROXY");
-        clear_proxy_env_pair("ALL_PROXY");
-        clear_proxy_env_pair("NO_PROXY");
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+            clear_proxy_env_pair(key);
+            mark_proxy_var_authored(key, false);
+        }
     }
 
     fn no_proxy_value(&self) -> Option<reqwest::NoProxy> {
@@ -1758,6 +1784,45 @@ fn set_proxy_env_pair(key: &str, value: Option<&str>) {
 fn clear_proxy_env_pair(key: &str) {
     std::env::remove_var(key);
     std::env::remove_var(key.to_ascii_lowercase());
+}
+
+fn proxy_authored_vars() -> &'static RwLock<HashSet<&'static str>> {
+    PROXY_AUTHORED_VARS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// Record (or clear) that this process authored the proxy env var `key`.
+fn mark_proxy_var_authored(key: &'static str, authored: bool) {
+    let lock = proxy_authored_vars();
+    let mut guard = lock
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if authored {
+        guard.insert(key);
+    } else {
+        guard.remove(key);
+    }
+}
+
+/// Whether the generic proxy env var `key` currently holds a value THIS process
+/// wrote (so it must not be read back as a user-supplied proxy signal).
+fn proxy_var_was_authored(key: &str) -> bool {
+    proxy_authored_vars()
+        .read()
+        .map(|set| set.contains(key))
+        .unwrap_or(false)
+}
+
+/// Read a proxy URL from the explicit `RANTAICLAW_*` var, else the generic var —
+/// but skip the generic var when we authored it ourselves, so a self-written
+/// value cannot be mistaken for a user signal that resurrects a disabled proxy.
+fn read_user_proxy_var(explicit: &str, generic: &'static str) -> Option<String> {
+    if let Ok(value) = std::env::var(explicit) {
+        return Some(value);
+    }
+    if proxy_var_was_authored(generic) {
+        return None;
+    }
+    std::env::var(generic).ok()
 }
 
 fn runtime_proxy_state() -> &'static RwLock<ProxyConfig> {
@@ -1935,7 +2000,11 @@ fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
     }
 }
 
-fn parse_proxy_enabled(raw: &str) -> Option<bool> {
+/// Parse an env-var boolean, tolerant of the common spellings. Returns `None`
+/// for anything unrecognized so callers can WARN and keep the config value —
+/// the old inline `val == "1" || val == "true"` silently turned `yes`/`on` into
+/// `false`, so `WEB_SEARCH_ENABLED=yes` DISABLED web search.
+fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
@@ -4306,12 +4375,21 @@ impl Config {
             }
         }
 
-        // Workspace directory: RANTAICLAW_WORKSPACE
-        if let Ok(workspace) = std::env::var("RANTAICLAW_WORKSPACE") {
-            if !workspace.is_empty() {
-                let (_, workspace_dir) =
-                    resolve_config_dir_for_workspace(&PathBuf::from(workspace));
-                self.workspace_dir = workspace_dir;
+        // Workspace directory: RANTAICLAW_WORKSPACE.
+        //
+        // Honor CONFIG_DIR precedence: when RANTAICLAW_CONFIG_DIR is set,
+        // `resolve_runtime_config_dirs` already derived `workspace_dir` as
+        // `<config_dir>/workspace` and ignored RANTAICLAW_WORKSPACE. Re-applying
+        // it here produced a split brain — `config_path` under CONFIG_DIR but
+        // `workspace_dir` under WORKSPACE — so skills/memory/policy resolved
+        // against a different tree than the config.
+        if std::env::var_os("RANTAICLAW_CONFIG_DIR").is_none() {
+            if let Ok(workspace) = std::env::var("RANTAICLAW_WORKSPACE") {
+                if !workspace.is_empty() {
+                    let (_, workspace_dir) =
+                        resolve_config_dir_for_workspace(&PathBuf::from(workspace));
+                    self.workspace_dir = workspace_dir;
+                }
             }
         }
 
@@ -4353,8 +4431,13 @@ impl Config {
         if let Ok(port_str) =
             std::env::var("RANTAICLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
         {
-            if let Ok(port) = port_str.parse::<u16>() {
-                self.gateway.port = port;
+            match port_str.trim().parse::<u16>() {
+                Ok(port) => self.gateway.port = port,
+                Err(_) if port_str.trim().is_empty() => {}
+                Err(_) => tracing::warn!(
+                    "Ignoring invalid gateway port {port_str:?} (expected 0–65535); keeping {}",
+                    self.gateway.port
+                ),
             }
         }
 
@@ -4369,15 +4452,26 @@ impl Config {
 
         // Allow public bind: RANTAICLAW_ALLOW_PUBLIC_BIND
         if let Ok(val) = std::env::var("RANTAICLAW_ALLOW_PUBLIC_BIND") {
-            self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
+            match parse_env_bool(&val) {
+                Some(flag) => self.gateway.allow_public_bind = flag,
+                None => tracing::warn!(
+                    "Ignoring invalid RANTAICLAW_ALLOW_PUBLIC_BIND {val:?} (valid: true/false); \
+                     keeping {}",
+                    self.gateway.allow_public_bind
+                ),
+            }
         }
 
         // Temperature: RANTAICLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("RANTAICLAW_TEMPERATURE") {
-            if let Ok(temp) = temp_str.parse::<f64>() {
-                if (0.0..=2.0).contains(&temp) {
-                    self.default_temperature = temp;
-                }
+            match temp_str.trim().parse::<f64>() {
+                Ok(temp) if (0.0..=2.0).contains(&temp) => self.default_temperature = temp,
+                Err(_) if temp_str.trim().is_empty() => {}
+                _ => tracing::warn!(
+                    "Ignoring invalid RANTAICLAW_TEMPERATURE {temp_str:?} (expected 0.0–2.0); \
+                     keeping {}",
+                    self.default_temperature
+                ),
             }
         }
 
@@ -4397,7 +4491,14 @@ impl Config {
         if let Ok(enabled) = std::env::var("RANTAICLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
         {
-            self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
+            match parse_env_bool(&enabled) {
+                Some(flag) => self.web_search.enabled = flag,
+                None => tracing::warn!(
+                    "Ignoring invalid WEB_SEARCH_ENABLED {enabled:?} (valid: true/false); \
+                     keeping {}",
+                    self.web_search.enabled
+                ),
+            }
         }
 
         // Web search provider: RANTAICLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
@@ -4424,10 +4525,14 @@ impl Config {
         if let Ok(max_results) = std::env::var("RANTAICLAW_WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
         {
-            if let Ok(max_results) = max_results.parse::<usize>() {
-                if (1..=10).contains(&max_results) {
-                    self.web_search.max_results = max_results;
-                }
+            match max_results.trim().parse::<usize>() {
+                Ok(n) if (1..=10).contains(&n) => self.web_search.max_results = n,
+                Err(_) if max_results.trim().is_empty() => {}
+                _ => tracing::warn!(
+                    "Ignoring invalid WEB_SEARCH_MAX_RESULTS {max_results:?} (expected 1–10); \
+                     keeping {}",
+                    self.web_search.max_results
+                ),
             }
         }
 
@@ -4435,10 +4540,14 @@ impl Config {
         if let Ok(timeout_secs) = std::env::var("RANTAICLAW_WEB_SEARCH_TIMEOUT_SECS")
             .or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
         {
-            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
-                if timeout_secs > 0 {
-                    self.web_search.timeout_secs = timeout_secs;
-                }
+            match timeout_secs.trim().parse::<u64>() {
+                Ok(n) if n > 0 => self.web_search.timeout_secs = n,
+                Err(_) if timeout_secs.trim().is_empty() => {}
+                _ => tracing::warn!(
+                    "Ignoring invalid WEB_SEARCH_TIMEOUT_SECS {timeout_secs:?} (expected > 0); \
+                     keeping {}",
+                    self.web_search.timeout_secs
+                ),
             }
         }
 
@@ -4470,28 +4579,25 @@ impl Config {
         let explicit_proxy_enabled = std::env::var("RANTAICLAW_PROXY_ENABLED")
             .ok()
             .as_deref()
-            .and_then(parse_proxy_enabled);
+            .and_then(parse_env_bool);
         if let Some(enabled) = explicit_proxy_enabled {
             self.proxy.enabled = enabled;
         }
 
-        // Proxy URLs: RANTAICLAW_* wins, then generic *PROXY vars.
+        // Proxy URLs: RANTAICLAW_* wins, then generic *PROXY vars — but never a
+        // generic var we authored ourselves (see `read_user_proxy_var`), so the
+        // proxy env we wrote last apply cannot be read back as a user signal and
+        // resurrect a disabled proxy.
         let mut proxy_url_overridden = false;
-        if let Ok(proxy_url) =
-            std::env::var("RANTAICLAW_HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
-        {
+        if let Some(proxy_url) = read_user_proxy_var("RANTAICLAW_HTTP_PROXY", "HTTP_PROXY") {
             self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
-        if let Ok(proxy_url) =
-            std::env::var("RANTAICLAW_HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
-        {
+        if let Some(proxy_url) = read_user_proxy_var("RANTAICLAW_HTTPS_PROXY", "HTTPS_PROXY") {
             self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
-        if let Ok(proxy_url) =
-            std::env::var("RANTAICLAW_ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
-        {
+        if let Some(proxy_url) = read_user_proxy_var("RANTAICLAW_ALL_PROXY", "ALL_PROXY") {
             self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
@@ -4531,6 +4637,12 @@ impl Config {
 
         if self.proxy.enabled && self.proxy.scope == ProxyScope::Environment {
             self.proxy.apply_to_process_env();
+        } else {
+            // Not applying to the process env (disabled, or a non-Environment
+            // scope): clear only the proxy vars WE authored on a previous apply,
+            // so `[proxy] enabled = false` actually stops proxying without wiping
+            // a user's own shell HTTP_PROXY.
+            ProxyConfig::clear_authored_process_env();
         }
 
         set_runtime_proxy_config(self.proxy.clone());
@@ -6428,6 +6540,90 @@ default_temperature = 0.7
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
 
         std::env::remove_var("RANTAICLAW_PROVIDER");
+    }
+
+    #[test]
+    async fn web_search_enabled_yes_is_true() {
+        let _env_guard = env_override_lock().await;
+        std::env::remove_var("RANTAICLAW_WEB_SEARCH_ENABLED");
+        std::env::set_var("WEB_SEARCH_ENABLED", "yes");
+        let mut config = Config::default();
+        config.web_search.enabled = false;
+        config.apply_env_overrides();
+        assert!(
+            config.web_search.enabled,
+            "`WEB_SEARCH_ENABLED=yes` must enable, not disable"
+        );
+        std::env::remove_var("WEB_SEARCH_ENABLED");
+    }
+
+    #[test]
+    async fn invalid_port_keeps_config_value() {
+        let _env_guard = env_override_lock().await;
+        std::env::remove_var("RANTAICLAW_GATEWAY_PORT");
+        std::env::set_var("PORT", "not-a-number");
+        let mut config = Config::default();
+        config.gateway.port = 8787;
+        config.apply_env_overrides();
+        assert_eq!(
+            config.gateway.port, 8787,
+            "an invalid PORT must be ignored, not silently discarded to 0"
+        );
+        std::env::remove_var("PORT");
+    }
+
+    #[test]
+    async fn disabled_proxy_stays_disabled_across_reload() {
+        let _env_guard = env_override_lock().await;
+        clear_proxy_env_test_vars();
+        ProxyConfig::clear_authored_process_env();
+
+        // 1. An enabled proxy applies its URL to the process env (authoring
+        //    HTTP_PROXY) so requests are proxied.
+        let mut config = Config::default();
+        config.proxy.enabled = true;
+        config.proxy.scope = ProxyScope::Environment;
+        config.proxy.http_proxy = Some("http://proxy.local:8080".into());
+        config.apply_env_overrides();
+        assert!(config.proxy.enabled);
+        assert!(
+            std::env::var("HTTP_PROXY").is_ok(),
+            "an enabled proxy writes HTTP_PROXY"
+        );
+
+        // 2. The operator disables it. A reload must NOT read back the HTTP_PROXY
+        //    we wrote and flip `enabled` to true, and must clear our own var.
+        config.proxy.enabled = false;
+        config.apply_env_overrides();
+        assert!(
+            !config.proxy.enabled,
+            "a disabled proxy must not resurrect itself on reload"
+        );
+        assert!(
+            std::env::var("HTTP_PROXY").is_err(),
+            "the proxy env we authored is cleared on disable"
+        );
+
+        clear_proxy_env_test_vars();
+        ProxyConfig::clear_authored_process_env();
+    }
+
+    #[test]
+    async fn config_dir_wins_over_workspace_split() {
+        let _env_guard = env_override_lock().await;
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", "/custom/cfg");
+        std::env::set_var("RANTAICLAW_WORKSPACE", "/other/workspace");
+        let mut config = Config::default();
+        // Simulates what `resolve_runtime_config_dirs` derives under CONFIG_DIR.
+        config.workspace_dir = PathBuf::from("/custom/cfg/workspace");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.workspace_dir,
+            PathBuf::from("/custom/cfg/workspace"),
+            "RANTAICLAW_WORKSPACE must not override workspace_dir when CONFIG_DIR is set"
+        );
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
     }
 
     #[test]
