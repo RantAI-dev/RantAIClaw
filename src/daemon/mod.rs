@@ -198,7 +198,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 ///
 /// Infallible on purpose: if the SIGTERM handler can't be installed we log and
 /// fall back to Ctrl+C only, rather than refusing to start the daemon.
-async fn shutdown_signal() {
+/// Wait for SIGTERM/SIGINT (Ctrl-C). Shared so the standalone `gateway` command
+/// can drive a graceful-drain token the same way the daemon does.
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

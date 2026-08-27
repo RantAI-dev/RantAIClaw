@@ -890,6 +890,29 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
     Ok((state, app))
 }
 
+/// Resolve a gateway host + port into a bind address. `SocketAddr::parse` accepts
+/// only a numeric IPv4 or a bracketed IPv6, but `is_public_bind` blesses the
+/// spellings `localhost`, `::1`, and `0:0:0:0:0:0:0:1` — so `--host localhost`
+/// (the natural "loopback only") used to crash the gateway at startup. Normalize
+/// the known loopback aliases (no DNS), then fall back to a resolver for a
+/// hostname or an unbracketed IPv6.
+fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let normalized = match host {
+        "localhost" => "127.0.0.1".to_string(),
+        "::1" | "[::1]" | "0:0:0:0:0:0:0:1" => "[::1]".to_string(),
+        other => other.to_string(),
+    };
+    if let Ok(addr) = format!("{normalized}:{port}").parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("could not resolve gateway host {host:?}"))?
+        .next()
+        .with_context(|| format!("gateway host {host:?} resolved to no address"))
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
@@ -908,7 +931,7 @@ pub async fn run_gateway(
         );
     }
 
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let addr = resolve_bind_addr(host, port)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
@@ -2672,6 +2695,27 @@ async fn handle_trigger_webhook(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_loopback_spelling_resolves() {
+        // Each spelling is_public_bind blesses as loopback must produce a valid
+        // bind address — `--host localhost` used to crash the gateway at startup.
+        for host in ["127.0.0.1", "localhost", "::1", "[::1]", "0:0:0:0:0:0:0:1"] {
+            let addr = super::resolve_bind_addr(host, 8080)
+                .unwrap_or_else(|e| panic!("{host} should resolve, got {e}"));
+            assert!(
+                addr.ip().is_loopback(),
+                "{host} -> {addr} should be loopback"
+            );
+            assert_eq!(addr.port(), 8080);
+        }
+    }
+
+    #[test]
+    fn resolve_bind_addr_handles_numeric_public_host() {
+        let addr = super::resolve_bind_addr("0.0.0.0", 9393).unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:9393");
+    }
+
     /// The three channel webhooks had no idempotency at all, while `/webhook`
     /// in the same file has had it since it was written. A redelivery — which
     /// Meta and Nextcloud both perform when an ACK is slow, no attacker

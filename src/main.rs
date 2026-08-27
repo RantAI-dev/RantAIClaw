@@ -1870,16 +1870,16 @@ async fn main() -> Result<()> {
             } else {
                 info!("🚀 Starting RantaiClaw Gateway on {host}:{port}");
             }
-            // The standalone `gateway` command keeps today's behavior (runs
-            // until the process is signalled); pass a token that is never
-            // cancelled. Graceful drain here is a separate follow-up.
-            gateway::run_gateway(
-                &host,
-                port,
-                config,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await
+            // Drive a real shutdown token from SIGINT/SIGTERM so in-flight
+            // requests drain (matching the daemon) instead of being severed — a
+            // container SIGTERM used to drop live requests on every rolling restart.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let shutdown_trigger = shutdown.clone();
+            tokio::spawn(async move {
+                daemon::shutdown_signal().await;
+                shutdown_trigger.cancel();
+            });
+            gateway::run_gateway(&host, port, config, shutdown).await
         }
 
         Some(Commands::Daemon { port, host }) => {
