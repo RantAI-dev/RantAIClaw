@@ -329,38 +329,14 @@ pub(crate) async fn config_file_stamp(path: &Path) -> Result<ConfigFileStamp> {
     })
 }
 
-pub(crate) fn decrypt_optional_secret_for_runtime_reload(
-    store: &crate::security::SecretStore,
-    value: &mut Option<String>,
-    field_name: &str,
-) -> Result<()> {
-    if let Some(raw) = value.clone() {
-        if crate::security::SecretStore::is_encrypted(&raw) {
-            *value = Some(
-                store
-                    .decrypt(&raw)
-                    .with_context(|| format!("Failed to decrypt {field_name}"))?,
-            );
-        }
-    }
-    Ok(())
-}
-
 pub(crate) async fn load_runtime_defaults_from_config_file(
     path: &Path,
 ) -> Result<(ChannelRuntimeDefaults, crate::config::AutonomyConfig)> {
-    let contents = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut parsed: Config =
-        toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
-    parsed.config_path = path.to_path_buf();
-
-    if let Some(rantaiclaw_dir) = path.parent() {
-        let store = crate::security::SecretStore::new(rantaiclaw_dir, parsed.secrets.encrypt);
-        decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
-    }
-
+    // Use the shared, side-effect-free loader so this reload path decrypts EVERY
+    // secret (not just `api_key`) and runs the migration chain — it previously
+    // hand-decrypted only `config.api_key` against a raw `toml::from_str`, leaving
+    // provider/knowledge/telegram secrets `enc2:`-prefixed and skipping migration.
+    let mut parsed = Config::load_from_path(path).await?;
     parsed.apply_env_overrides();
     // Hand back the whole `[autonomy]` section, not just the two fields the
     // couriers used to carry: `apply_config` refreshes all eight at once.

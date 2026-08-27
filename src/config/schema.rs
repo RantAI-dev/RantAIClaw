@@ -3793,6 +3793,9 @@ pub(crate) fn decrypt_config_secrets(
     for agent in config.agents.values_mut() {
         decrypt_optional_secret(store, &mut agent.api_key, "config.agents.*.api_key")?;
     }
+    for agent in config.gateway_agents.values_mut() {
+        decrypt_optional_secret(store, &mut agent.api_key, "config.gateway_agents.*.api_key")?;
+    }
     for key in config.provider_api_keys.values_mut() {
         let mut wrapped = Some(std::mem::take(key));
         decrypt_optional_secret(store, &mut wrapped, "config.provider_api_keys.*")?;
@@ -4091,6 +4094,35 @@ impl Config {
             );
             Ok(config)
         }
+    }
+
+    /// Read a config from a SPECIFIC path with no side effects: read → migrate
+    /// (in memory, no write-back) → parse → decrypt every secret → validate.
+    ///
+    /// Unlike [`Self::load_or_init`] it does NOT re-resolve the path from HOME/env,
+    /// run profile migrations, write anything to disk, or apply env overrides
+    /// (callers that want env precedence apply it themselves). Use it wherever a
+    /// caller must operate on the config it MANAGES — the channel runtime reload
+    /// and the pairing-token writer — rather than a re-resolved default profile.
+    pub async fn load_from_path(path: &Path) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .await
+            .with_context(|| format!("Failed to read config file {}", path.display()))?;
+        let mut raw: toml::Value = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse {} as TOML", path.display()))?;
+        crate::config::migrations::migrate(&mut raw).context("Failed to migrate config schema")?;
+        crate::config::api_url::strip_credential_api_url(&mut raw);
+        let mut config: Config = raw
+            .try_into()
+            .with_context(|| format!("Failed to deserialise config {}", path.display()))?;
+        config.config_path = path.to_path_buf();
+        if let Some(parent) = path.parent() {
+            config.workspace_dir = parent.join("workspace");
+            let store = crate::security::SecretStore::new(parent, config.secrets.encrypt);
+            decrypt_config_secrets(&store, &mut config)?;
+        }
+        config.validate()?;
+        Ok(config)
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -4550,6 +4582,13 @@ impl Config {
 
         for agent in config_to_save.agents.values_mut() {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+        }
+        for agent in config_to_save.gateway_agents.values_mut() {
+            encrypt_optional_secret(
+                &store,
+                &mut agent.api_key,
+                "config.gateway_agents.*.api_key",
+            )?;
         }
 
         for key in config_to_save.provider_api_keys.values_mut() {
@@ -7622,6 +7661,34 @@ default_model = "legacy-model"
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(residue.is_empty(), "temp residue: {residue:?}");
+    }
+
+    #[test]
+    async fn load_from_path_decrypts_all_secrets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut config = Config::default();
+        config.config_path = path.clone();
+        config
+            .provider_api_keys
+            .insert("openai".into(), "sk-secret-xyz".into());
+        config.save().await.unwrap(); // encrypts secrets at rest
+
+        // On disk the provider key (a NON-api_key secret) must be ciphertext.
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            !raw.contains("sk-secret-xyz"),
+            "provider key was not encrypted on disk: {raw}"
+        );
+
+        // load_from_path must decrypt it back — the runtime reload path used to
+        // decrypt only `api_key`, leaving keys like this one `enc2:`-prefixed.
+        let loaded = Config::load_from_path(&path).await.unwrap();
+        assert_eq!(
+            loaded.provider_api_keys.get("openai").map(String::as_str),
+            Some("sk-secret-xyz"),
+            "load_from_path must decrypt every secret, not just api_key"
+        );
     }
 
     #[cfg(unix)]
