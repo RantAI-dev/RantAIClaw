@@ -140,7 +140,9 @@ fn is_service_installed(config: &Config, init_system: InitSystem) -> bool {
             _ => false,
         }
     } else if cfg!(target_os = "windows") {
-        run_capture(Command::new("schtasks").args(["/Query", "/TN", windows_task_name()])).is_ok()
+        // `/Query` exits non-zero when the task does not exist — check the status,
+        // not merely that `schtasks` ran.
+        command_succeeded(Command::new("schtasks").args(["/Query", "/TN", windows_task_name()]))
     } else {
         false
     }
@@ -536,33 +538,11 @@ fn install_macos(config: &Config) -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
-    let plist = format!(
-        r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-    <string>daemon</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{stdout}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr}</string>
-</dict>
-</plist>
-"#,
-        label = SERVICE_LABEL,
-        exe = xml_escape(&exe.display().to_string()),
-        stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string())
+    let plist = macos_plist(
+        SERVICE_LABEL,
+        &xml_escape(&exe.display().to_string()),
+        &xml_escape(&stdout.display().to_string()),
+        &xml_escape(&stderr.display().to_string()),
     );
 
     fs::write(&file, plist)?;
@@ -594,24 +574,71 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
 /// containers, clear the sentinel), and only SIGKILL any cgroup stragglers after
 /// the timeout. TimeoutStopSec=30 leaves room for `docker stop` (default ~10s
 /// grace) on one or two auto-launch services before systemd force-kills.
+/// Build the launchd plist body. The XML declaration/DOCTYPE previously lived in
+/// a raw string with backslash-escaped quotes (`version=\"1.0\"`) — raw strings do
+/// NOT process escapes, so the backslashes landed in the file verbatim, producing
+/// invalid XML that `launchctl load` rejected (the whole macOS service path never
+/// worked). Plain quotes here fix it.
+fn macos_plist(label: &str, exe: &str, stdout: &str, stderr: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{stdout}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr}</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// Escape a value for a systemd unit: double any `%` (systemd reads `%x` as a
+/// specifier like `%h`) and wrap the value in double quotes if it contains
+/// whitespace, so systemd does not split it into multiple tokens.
+fn systemd_escape_value(value: &str) -> String {
+    let escaped = value.replace('%', "%%");
+    if escaped.chars().any(char::is_whitespace) {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    }
+}
+
 fn systemd_user_unit(exe: &Path, working_dir: Option<&Path>, path_env: Option<&str>) -> String {
     use std::fmt::Write as _;
     let mut service = String::from("Type=simple\n");
     if let Some(dir) = working_dir {
-        let _ = writeln!(service, "WorkingDirectory={}", dir.display());
+        let _ = writeln!(
+            service,
+            "WorkingDirectory={}",
+            systemd_escape_value(&dir.display().to_string())
+        );
     }
     if let Some(path) = path_env.filter(|p| !p.is_empty()) {
         // Double-quote so a directory containing a space cannot split the
-        // assignment into multiple malformed tokens (systemd whitespace-splits
-        // an unquoted Environment= value).
-        let _ = writeln!(service, "Environment=\"PATH={path}\"");
+        // assignment; double `%` so systemd does not read it as a specifier.
+        let _ = writeln!(service, "Environment=\"PATH={}\"", path.replace('%', "%%"));
     }
     format!(
         "[Unit]\nDescription=RantaiClaw daemon\nAfter=network.target\n\n\
          [Service]\n{service}ExecStart={} daemon\nRestart=always\nRestartSec=3\n\
          KillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=30\n\n\
          [Install]\nWantedBy=default.target\n",
-        exe.display()
+        systemd_escape_value(&exe.display().to_string())
     )
 }
 
@@ -1246,16 +1273,23 @@ fn macos_service_file() -> Result<PathBuf> {
         .join(format!("{SERVICE_LABEL}.plist")))
 }
 
+/// Directory `systemctl --user` reads units from, honoring `XDG_CONFIG_HOME`.
+/// Hard-coding `~/.config` meant that on an XDG-overridden host the installer wrote
+/// where systemd could not see it — `enable`/`start` then failed on a unit systemd
+/// never loaded, right after "install succeeded".
+pub(crate) fn systemd_user_unit_dir() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(x) if !x.is_empty() => PathBuf::from(x),
+        _ => directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".config"))
+            .context("Could not find home directory")?,
+    };
+    Ok(base.join("systemd").join("user"))
+}
+
 fn linux_service_file(config: &Config) -> Result<PathBuf> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
     let _ = config;
-    Ok(home
-        .join(".config")
-        .join("systemd")
-        .join("user")
-        .join("rantaiclaw.service"))
+    Ok(systemd_user_unit_dir()?.join("rantaiclaw.service"))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -1276,6 +1310,17 @@ fn run_capture(command: &mut Command) -> Result<String> {
     Ok(text)
 }
 
+/// True only if the command spawned AND exited 0. Use this for presence/liveness
+/// probes: `run_capture` returns `Ok` on any successful spawn (it inspects
+/// stdout/stderr, never `status`), so `run_capture(...).is_ok()` reports "present"
+/// whenever the probe binary merely exists.
+fn command_succeeded(command: &mut Command) -> bool {
+    command
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn xml_escape(raw: &str) -> String {
     raw.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1287,6 +1332,53 @@ fn xml_escape(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_plist_is_well_formed() {
+        let p = macos_plist("com.test.daemon", "/usr/bin/rc", "/tmp/o.log", "/tmp/e.log");
+        assert!(
+            p.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+            "declaration must use plain quotes, not backslash-escaped ones: {p}"
+        );
+        assert!(
+            !p.contains("\\\""),
+            "plist must not contain any backslash-escaped quote: {p}"
+        );
+        assert!(p.contains("<string>com.test.daemon</string>"));
+    }
+
+    #[test]
+    fn systemd_unit_quotes_paths_with_spaces_and_escapes_percent() {
+        let unit = systemd_user_unit(
+            std::path::Path::new("/opt/My Apps/rantaiclaw"),
+            Some(std::path::Path::new("/home/op/My Work")),
+            Some("/usr/bin:/opt/100%dir"),
+        );
+        assert!(
+            unit.contains("ExecStart=\"/opt/My Apps/rantaiclaw\" daemon"),
+            "ExecStart must quote a spaced exe path: {unit}"
+        );
+        assert!(
+            unit.contains("WorkingDirectory=\"/home/op/My Work\""),
+            "WorkingDirectory must be quoted: {unit}"
+        );
+        assert!(
+            unit.contains("100%%dir"),
+            "a literal % in PATH must be doubled: {unit}"
+        );
+    }
+
+    #[test]
+    fn unit_dir_honors_xdg_config_home() {
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", "/custom/cfg");
+        let dir = systemd_user_unit_dir().unwrap();
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert_eq!(dir, std::path::PathBuf::from("/custom/cfg/systemd/user"));
+    }
 
     #[test]
     fn xml_escape_escapes_reserved_chars() {
