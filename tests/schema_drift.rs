@@ -43,6 +43,33 @@ fn config_schema_does_not_drift_unannounced() {
     });
 }
 
+/// Snapshot of `Config::default()`'s VALUES — the config a fresh install
+/// actually gets. The schema fingerprint above covers the serde side only, so
+/// every `impl Default` vs `#[serde(default)]` drift (the F2 class) shipped
+/// green. This makes CLAUDE.md's "defaults are fingerprinted" real: any change
+/// to a default value now trips here until the maintainer bumps
+/// `CURRENT_VERSION`, adds a migration, and consciously `cargo insta accept`s.
+///
+/// `config_path` / `workspace_dir` are `#[serde(skip)]`, so this stays
+/// machine-independent.
+#[test]
+fn config_defaults_do_not_drift_unannounced() {
+    // Route through `to_value` first so map-typed fields (e.g. `cost.prices`, a
+    // HashMap) serialise with sorted keys — `to_string_pretty` on the struct
+    // directly emits HashMap entries in a random per-run order, which flakes.
+    let value = serde_json::to_value(Config::default()).expect("defaults serialise");
+    let defaults = serde_json::to_string_pretty(&value).expect("value serialises");
+
+    insta::with_settings!({
+        description => "Config::default() value fingerprint. If this test fails, a DEFAULT VALUE a \
+                        fresh install gets changed. Bump config::migrations::CURRENT_VERSION, add a \
+                        migrate_vN function, write a unit test, then `cargo insta accept` here.",
+        snapshot_suffix => format!("v{}", config_migrations::CURRENT_VERSION),
+    }, {
+        insta::assert_snapshot!("config_defaults", defaults);
+    });
+}
+
 /// Snapshot of the sessions.db DDL after running migrations. Any table,
 /// column, index, or trigger added/removed/renamed without bumping the
 /// sessions `CURRENT_VERSION` will trip this test.

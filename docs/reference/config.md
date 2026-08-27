@@ -272,7 +272,7 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
+| `enabled` | `true` | Enable `browser_open` tool (opens URLs without scraping) |
 | `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
@@ -302,14 +302,14 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable `http_request` tool for API interactions |
-| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact or subdomain match) |
-| `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
-| `timeout_secs` | `30` | Request timeout in seconds |
+| `enabled` | `true` | Enable `http_request` tool for API interactions |
+| `allowed_domains` | `["*"]` | Allowed domains for HTTP requests (exact or subdomain match); `"*"` allows all |
+| `max_response_size` | `5242880` | Maximum response size in bytes (default: 5 MiB) |
+| `timeout_secs` | `20` | Request timeout in seconds |
 
 Notes:
 
-- Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
+- Usable-by-default: the wildcard `["*"]` allows all hosts. If you set `allowed_domains` to a non-wildcard list, only those hosts are permitted; an empty list rejects every request.
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`).
 
 ## `[gateway]`
@@ -396,7 +396,7 @@ Web console (`rantaiclaw ui start`) settings.
 | `max_actions_per_hour` | `200` | per-policy action budget |
 | `max_cost_per_day_cents` | `500` | per-policy daily cost ceiling (cents); tracked for reporting only — not enforced as a hard stop |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
-| `block_high_risk_commands` | `true` | hard block for high-risk commands |
+| `block_high_risk_commands` | `false` | hard block for high-risk commands |
 | `auto_approve` | `["file_read", "memory_recall"]` | tool operations always auto-approved |
 | `always_ask` | `["ssh", "pty"]` | tool operations that always require approval, even after an "Always". Also the Manual-vs-Smart discriminator — `rantaiclaw autonomy <preset>` and the web console both rewrite this field (see [commands](commands.md#autonomy)) |
 

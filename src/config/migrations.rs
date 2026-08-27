@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 23;
+pub const CURRENT_VERSION: u32 = 24;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -318,7 +318,24 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only field)
     }
 
-    // Future migrations (v24, …) inserted here in order.
+    // v23 → v24: aligned the serde `#[serde(default = ...)]` defaults with the
+    // `impl Default` values the v8→v9 migration already declared as the intended
+    // contract — the serde side had never been updated, so a config that OMITTED
+    // a key loaded the STALE value (`http_request.allowed_domains = []`, which
+    // rejects every request; `web_search`/`browser` disabled; `block_high_risk_
+    // commands = true`; `cost.prices = {}`). Also added serde defaults to several
+    // previously-required fields (`[autonomy]`, `default_temperature`,
+    // `[channels_config].cli`, `[memory]`, `[heartbeat]`, `[observability]`) so a
+    // PARTIAL section no longer fails the whole load with "missing field".
+    // Configs that set these explicitly keep their values; omitting configs pick
+    // up the corrected defaults. No data transformation — this arm burns a
+    // version slot so the schema_drift fingerprint (which embeds default values)
+    // is accepted with intent (mirrors v8→v9).
+    if from < 24 {
+        // (no transformation; serde-default alignment only)
+    }
+
+    // Future migrations (v25, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -483,7 +500,7 @@ max_run_history = 42
             Some(42),
             "existing cron keys must be left alone"
         );
-        assert_eq!(version_of(&raw), Some(23));
+        assert_eq!(version_of(&raw), Some(i64::from(CURRENT_VERSION)));
     }
 
     #[test]
