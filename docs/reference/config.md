@@ -102,7 +102,6 @@ Operational note for container users:
 | `compact_context` | `false` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
 | `max_tool_iterations` | `50` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
-| `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
 
 Notes:
@@ -110,7 +109,6 @@ Notes:
 - Setting `max_tool_iterations = 0` falls back to safe default `10`.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
-- `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
 
 ## `[agents.<name>]`
 
@@ -229,13 +227,11 @@ Notes:
 | `daily_limit_usd` | `10.00` | Daily spending limit in USD |
 | `monthly_limit_usd` | `100.00` | Monthly spending limit in USD |
 | `warn_at_percent` | `80` | Warn when spending reaches this percentage of limit |
-| `allow_override` | `false` | Allow requests to exceed budget with `--override` flag |
 
 Notes:
 
 - When `enabled = true`, the runtime tracks per-request cost estimates and enforces daily/monthly limits.
 - At `warn_at_percent` threshold, a warning is emitted but requests continue.
-- When a limit is reached, requests are rejected unless `allow_override = true` and the `--override` flag is passed.
 
 ## `[identity]`
 

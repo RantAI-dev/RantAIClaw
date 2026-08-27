@@ -407,9 +407,6 @@ pub struct AgentConfig {
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
-    /// Enable parallel tool execution within a single iteration. Default: `false`.
-    #[serde(default)]
-    pub parallel_tools: bool,
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
@@ -441,7 +438,6 @@ impl Default for AgentConfig {
             compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
-            parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
         }
     }
@@ -720,27 +716,6 @@ pub struct CostConfig {
     /// Warn when spending reaches this percentage of limit (default: 80)
     #[serde(default = "default_warn_percent")]
     pub warn_at_percent: u8,
-
-    /// Allow requests to exceed budget with --override flag (default: false)
-    #[serde(default)]
-    pub allow_override: bool,
-
-    /// Per-model pricing (USD per 1M tokens). Defaults to the built-in pricing
-    /// table so cost tracking works without a hand-written price list.
-    #[serde(default = "get_default_pricing")]
-    pub prices: std::collections::HashMap<String, ModelPricing>,
-}
-
-/// Per-model pricing entry (USD per 1M tokens).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ModelPricing {
-    /// Input price per 1M tokens
-    #[serde(default)]
-    pub input: f64,
-
-    /// Output price per 1M tokens
-    #[serde(default)]
-    pub output: f64,
 }
 
 fn default_daily_limit() -> f64 {
@@ -762,86 +737,8 @@ impl Default for CostConfig {
             daily_limit_usd: default_daily_limit(),
             monthly_limit_usd: default_monthly_limit(),
             warn_at_percent: default_warn_percent(),
-            allow_override: false,
-            prices: get_default_pricing(),
         }
     }
-}
-
-/// Default pricing for popular models (USD per 1M tokens)
-fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
-    let mut prices = std::collections::HashMap::new();
-
-    // Anthropic models
-    prices.insert(
-        "anthropic/claude-sonnet-4-20250514".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-opus-4-20250514".into(),
-        ModelPricing {
-            input: 15.0,
-            output: 75.0,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-3.5-sonnet".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-3-haiku".into(),
-        ModelPricing {
-            input: 0.25,
-            output: 1.25,
-        },
-    );
-
-    // OpenAI models
-    prices.insert(
-        "openai/gpt-4o".into(),
-        ModelPricing {
-            input: 5.0,
-            output: 15.0,
-        },
-    );
-    prices.insert(
-        "openai/gpt-4o-mini".into(),
-        ModelPricing {
-            input: 0.15,
-            output: 0.60,
-        },
-    );
-    prices.insert(
-        "openai/o1-preview".into(),
-        ModelPricing {
-            input: 15.0,
-            output: 60.0,
-        },
-    );
-
-    // Google models
-    prices.insert(
-        "google/gemini-2.0-flash".into(),
-        ModelPricing {
-            input: 0.10,
-            output: 0.40,
-        },
-    );
-    prices.insert(
-        "google/gemini-1.5-pro".into(),
-        ModelPricing {
-            input: 1.25,
-            output: 5.0,
-        },
-    );
-
-    prices
 }
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
@@ -5321,7 +5218,6 @@ reasoning_enabled = false
         assert!(!cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 50);
         assert_eq!(cfg.max_history_messages, 50);
-        assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
     }
 
@@ -5333,14 +5229,12 @@ default_temperature = 0.7
 compact_context = true
 max_tool_iterations = 20
 max_history_messages = 80
-parallel_tools = true
 tool_dispatcher = "xml"
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
         assert_eq!(parsed.agent.max_tool_iterations, 20);
         assert_eq!(parsed.agent.max_history_messages, 80);
-        assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
     }
 

@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 24;
+pub const CURRENT_VERSION: u32 = 25;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -349,10 +349,36 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; serde-default alignment only)
     }
 
-    // Future migrations (v25, …) inserted here in order.
+    // v24 → v25: drop dead config keys that serialized into every config.toml
+    // and `config schema` output but that nothing read — `cost.allow_override`,
+    // `cost.prices` (+ its bundled pricing table), and `agent.parallel_tools`.
+    // Leaving them advertised a functionality the binary does not implement.
+    // serde already ignores unknown keys at load, so this only tidies the file
+    // in place; the fields keep any explicit value nowhere else, so nothing is
+    // lost.
+    if from < 25 {
+        migrate_v25(raw);
+    }
+
+    // Future migrations (v26, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
+}
+
+/// v24 → v25: remove the dead `cost.allow_override` / `cost.prices` /
+/// `agent.parallel_tools` keys from an existing config.
+fn migrate_v25(raw: &mut Value) {
+    let Some(root) = raw.as_table_mut() else {
+        return;
+    };
+    if let Some(cost) = root.get_mut("cost").and_then(Value::as_table_mut) {
+        cost.remove("allow_override");
+        cost.remove("prices");
+    }
+    if let Some(agent) = root.get_mut("agent").and_then(Value::as_table_mut) {
+        agent.remove("parallel_tools");
+    }
 }
 
 /// v16 → v17: drop the response-cache keys.
@@ -819,6 +845,47 @@ backend = \"markdown\"
         let mut v = parse("schema_version = -1\n");
         let err = migrate(&mut v).expect_err("negative version must be rejected");
         assert!(format!("{err:#}").contains("negative"));
+    }
+
+    #[test]
+    fn dropped_keys_are_removed_on_migration() {
+        let mut v = parse(
+            "schema_version = 24\n\
+             [cost]\nenabled = true\nallow_override = true\n\
+             prices = { \"anthropic/x\" = { input = 1.0, output = 2.0 } }\n\
+             [agent]\nparallel_tools = true\nmax_tool_iterations = 30\n",
+        );
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+
+        let cost = v
+            .get("cost")
+            .and_then(Value::as_table)
+            .expect("cost survives");
+        assert!(
+            cost.get("allow_override").is_none(),
+            "allow_override dropped"
+        );
+        assert!(cost.get("prices").is_none(), "prices dropped");
+        assert_eq!(
+            cost.get("enabled").and_then(Value::as_bool),
+            Some(true),
+            "kept cost keys survive"
+        );
+
+        let agent = v
+            .get("agent")
+            .and_then(Value::as_table)
+            .expect("agent survives");
+        assert!(
+            agent.get("parallel_tools").is_none(),
+            "parallel_tools dropped"
+        );
+        assert_eq!(
+            agent.get("max_tool_iterations").and_then(Value::as_integer),
+            Some(30),
+            "kept agent keys survive"
+        );
     }
 
     /// Serialize the v18 tests against every env-mutating test in the crate and
