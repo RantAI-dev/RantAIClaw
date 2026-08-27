@@ -4354,8 +4354,13 @@ impl Config {
         // KB keys: env folds onto config.knowledge at load (env wins),
         // matching api_key precedence. Downstream reads config.knowledge only.
         if let Ok(k) = std::env::var("KB_EMBEDDING_API_KEY") {
-            if !k.is_empty() {
+            if !k.trim().is_empty() {
                 self.knowledge.embedding_api_key = Some(k);
+                // Supplying the embedding key via env is an explicit opt-in to
+                // the KB — turn it on (env wins, matching the precedence above).
+                // This replaces the env evidence that used to live impurely in
+                // migrate_v18, so the KB no longer stays off with the key present.
+                self.knowledge.enabled = true;
             }
         }
         if let Ok(k) = std::env::var("KB_EXTRACT_VISION_API_KEY") {
@@ -6697,6 +6702,26 @@ level = "full"
         );
         std::env::remove_var("RANTAICLAW_CONFIG_DIR");
         std::env::remove_var("RANTAICLAW_WORKSPACE");
+    }
+
+    #[test]
+    async fn kb_env_key_enables_kb() {
+        let _env_guard = env_override_lock().await;
+        std::env::set_var("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key");
+        let mut config = Config::default();
+        config.knowledge.enabled = false;
+        config.apply_env_overrides();
+        // Supplying the embedding key via env is an opt-in to the KB — this is
+        // where the enable evidence lives now that migrate_v18 is pure.
+        assert!(
+            config.knowledge.enabled,
+            "a non-empty KB_EMBEDDING_API_KEY must enable the KB"
+        );
+        assert_eq!(
+            config.knowledge.embedding_api_key.as_deref(),
+            Some("rantaiclaw_test_key")
+        );
+        std::env::remove_var("KB_EMBEDDING_API_KEY");
     }
 
     #[test]
