@@ -204,6 +204,111 @@ pub(crate) fn redact_config_secrets(cfg: &mut crate::config::Config) {
             api_key.value = None;
         }
     }
+    // `api_url` can carry a credential (a pasted key, or a `user:pass@` / `?key=`
+    // URL). `secrets_view` already withholds such a value; `get_config` must apply
+    // the same policy so the two endpoints don't disagree.
+    cfg.api_url = cfg.api_url.as_deref().and_then(sanitize_api_url);
+    // MCP servers are launched like `npx -y <server> --api-key <token>`; the
+    // key-suffix JSON walk can't see arg values (no keys) or operator-named env
+    // vars (`DATABASE_URL`, `PGPASSWORD`). Blank every env value, arg values that
+    // follow a credential-shaped flag or look like a key, and a key-shaped command.
+    for server in cfg.mcp_servers.values_mut() {
+        for value in server.env.values_mut() {
+            value.clear();
+        }
+        redact_mcp_args(&mut server.args);
+        if looks_like_api_key(&server.command) {
+            server.command.clear();
+        }
+    }
+    // Corporate proxies are conventionally `http://user:password@host:port`; strip
+    // the userinfo so the credential never leaves the gateway while the host/port
+    // stays visible for the operator to see which proxy is configured.
+    for proxy in [
+        &mut cfg.proxy.http_proxy,
+        &mut cfg.proxy.https_proxy,
+        &mut cfg.proxy.all_proxy,
+    ] {
+        if let Some(url) = proxy.as_deref() {
+            *proxy = Some(strip_url_userinfo(url));
+        }
+    }
+}
+
+/// Blank arg values that carry a credential: any arg that looks like a key, and
+/// the token following a credential-shaped flag (`--api-key`, `--token`, …).
+fn redact_mcp_args(args: &mut [String]) {
+    let mut mask_next = false;
+    for arg in args.iter_mut() {
+        if mask_next {
+            arg.clear();
+            mask_next = false;
+            continue;
+        }
+        if looks_like_api_key(arg) {
+            arg.clear();
+            continue;
+        }
+        if arg.starts_with("--") {
+            let flag = arg.to_ascii_lowercase();
+            let secret_flag = ["key", "token", "secret", "password"]
+                .iter()
+                .any(|k| flag.contains(k));
+            // `--api-key=VALUE` carries the secret inline; `--api-key VALUE`
+            // carries it in the next arg.
+            if secret_flag {
+                if let Some((name, _value)) = arg.split_once('=') {
+                    let name = name.to_string();
+                    *arg = format!("{name}=");
+                } else {
+                    mask_next = true;
+                }
+            }
+        }
+    }
+}
+
+/// Strip the `user:pass@` userinfo component from a URL, leaving host/port. Not a
+/// full URL parse — a best-effort scrub that never widens what's returned.
+fn strip_url_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    match rest.split_once('@') {
+        Some((_userinfo, host_and_path)) => format!("{scheme}://{host_and_path}"),
+        None => url.to_string(),
+    }
+}
+
+/// Non-secret form of `api_url`: `None` when it holds a credential, otherwise the
+/// URL with any `user:pass@` userinfo and `key=`/`api_key=`/`access_token=` query
+/// parameter stripped. Shared by `get_config` redaction and `secrets_view`.
+fn sanitize_api_url(value: &str) -> Option<String> {
+    if looks_like_api_key(value) {
+        return None;
+    }
+    let without_userinfo = strip_url_userinfo(value);
+    let cleaned = match without_userinfo.split_once('?') {
+        Some((base, query)) => {
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|param| {
+                    let name = param.split_once('=').map(|(n, _)| n).unwrap_or(param);
+                    !matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "key" | "api_key" | "access_token"
+                    )
+                })
+                .collect();
+            if kept.is_empty() {
+                base.to_string()
+            } else {
+                format!("{base}?{}", kept.join("&"))
+            }
+        }
+        None => without_userinfo,
+    };
+    Some(cleaned)
 }
 
 // ── PUT /config/model ────────────────────────────────────────────────────────
@@ -779,10 +884,7 @@ fn api_key_present(cfg: &crate::config::Config) -> bool {
 /// value is still returned — the operator needs to see it to correct it, and
 /// `doctor` reports that shape.
 fn secrets_view(cfg: &crate::config::Config) -> serde_json::Value {
-    let api_url = cfg
-        .api_url
-        .as_deref()
-        .filter(|value| !looks_like_api_key(value));
+    let api_url = cfg.api_url.as_deref().and_then(sanitize_api_url);
     json!({
         "provider": cfg.default_provider.clone().unwrap_or_default(),
         "api_url": api_url,
@@ -1071,6 +1173,50 @@ mod tests {
         assert!(!json.contains("sk-vision-secret"));
         assert_eq!(cfg.knowledge.embedding_api_key, None);
         assert_eq!(cfg.knowledge.vision_api_key, None);
+    }
+
+    #[test]
+    fn redact_config_secrets_leaves_no_marker_in_real_config() {
+        // Walk the REAL `Config` struct rather than a hand-written JSON literal, so
+        // a newly-added secret field that isn't redacted fails this test instead of
+        // silently leaking. A distinctive marker is written into every secret-bearing
+        // field this function clears; after the full redaction pass (typed clear +
+        // JSON backstop, the same order `get_config` runs) the marker must be gone.
+        const MARKER: &str = "MARKER_SECRET_a1b2c3d4";
+        let mut cfg = Config::default();
+        cfg.api_key = Some(MARKER.into());
+        cfg.api_url = Some(format!("https://user:{MARKER}@host.example/v1"));
+        cfg.provider_api_keys.insert("openai".into(), MARKER.into());
+        cfg.knowledge.embedding_api_key = Some(MARKER.into());
+        cfg.knowledge.vision_api_key = Some(MARKER.into());
+        cfg.proxy.http_proxy = Some(format!("http://user:{MARKER}@proxy.example:8080"));
+        cfg.mcp_servers.insert(
+            "srv".into(),
+            crate::config::schema::McpServerConfig {
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    "server".into(),
+                    "--api-key".into(),
+                    MARKER.into(),
+                ],
+                env: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("DATABASE_URL".to_string(), MARKER.to_string());
+                    m
+                },
+            },
+        );
+
+        // Mirror `get_config`: typed clear, then serialize, then the JSON backstop.
+        redact_config_secrets(&mut cfg);
+        let mut v = serde_json::to_value(&cfg).unwrap();
+        redact_secrets_in_json(&mut v);
+        let json = v.to_string();
+        assert!(
+            !json.contains(MARKER),
+            "a secret marker survived redaction in GET /config: {json}"
+        );
     }
 
     #[test]
