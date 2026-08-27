@@ -88,20 +88,18 @@ impl TuiProvisioner for TunnelProvisioner {
         let sel = recv_selection(&mut responses).await?;
         let provider = sel.first().copied().unwrap_or(0);
 
-        let mut tunnel_cfg = TunnelConfig {
-            provider: match provider {
-                1 => "cloudflare",
-                2 => "tailscale",
-                3 => "ngrok",
-                4 => "custom",
-                _ => "none",
-            }
-            .to_string(),
-            cloudflare: None,
-            tailscale: None,
-            ngrok: None,
-            custom: None,
-        };
+        // Seed from the existing tunnel config so an empty answer keeps the stored
+        // credential instead of wiping it — only the provider selection and any
+        // freshly-entered secret change.
+        let mut tunnel_cfg = config.tunnel.clone();
+        tunnel_cfg.provider = match provider {
+            1 => "cloudflare",
+            2 => "tailscale",
+            3 => "ngrok",
+            4 => "custom",
+            _ => "none",
+        }
+        .to_string();
 
         match provider {
             1 => {
@@ -281,6 +279,30 @@ impl TuiProvisioner for TunnelProvisioner {
             _ => {}
         }
 
+        // Never persist an impossible state — a credential-requiring provider with
+        // no backing config. Fall back to "none" instead. (Tailscale can run on
+        // ambient daemon auth, so it is not required to carry a token.)
+        let has_backing = match tunnel_cfg.provider.as_str() {
+            "cloudflare" => tunnel_cfg.cloudflare.is_some(),
+            "ngrok" => tunnel_cfg.ngrok.is_some(),
+            "custom" => tunnel_cfg.custom.is_some(),
+            _ => true,
+        };
+        if !has_backing {
+            send(
+                &events,
+                ProvisionEvent::Message {
+                    severity: Severity::Warn,
+                    text: format!(
+                        "No credential provided for {}; leaving the tunnel disabled.",
+                        tunnel_cfg.provider
+                    ),
+                },
+            )
+            .await?;
+            tunnel_cfg.provider = "none".to_string();
+        }
+
         config.tunnel = tunnel_cfg;
 
         send(
@@ -292,5 +314,54 @@ impl TuiProvisioner for TunnelProvisioner {
         .await?;
 
         Ok(ProvisionOutcome::Configured)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onboard::provision::traits::ProvisionResponse;
+
+    #[tokio::test]
+    async fn tunnel_preserves_existing_token_on_empty_answer() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![1]))
+            .await
+            .unwrap(); // Cloudflare
+        resp_tx
+            .send(ProvisionResponse::Text(String::new()))
+            .await
+            .unwrap(); // empty token — keep existing
+
+        let mut config = Config::default();
+        config.tunnel.provider = "cloudflare".into();
+        config.tunnel.cloudflare = Some(CloudflareTunnelConfig {
+            token: "existing-token".into(),
+        });
+        let profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp"),
+        };
+        TunnelProvisioner::new()
+            .run(
+                &mut config,
+                &profile,
+                ProvisionIo {
+                    events: events_tx,
+                    responses: resp_rx,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(config.tunnel.provider, "cloudflare");
+        assert_eq!(
+            config.tunnel.cloudflare.as_ref().map(|c| c.token.as_str()),
+            Some("existing-token"),
+            "an empty token answer must keep the stored credential, not wipe it"
+        );
     }
 }

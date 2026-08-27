@@ -207,7 +207,7 @@ impl TuiProvisioner for LarkProvisioner {
                 id: "verification_token".into(),
                 label: "Verification token for webhook (Enter to skip)".into(),
                 default: None,
-                secret: false,
+                secret: true,
             },
         )
         .await?;

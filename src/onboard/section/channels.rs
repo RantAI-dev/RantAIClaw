@@ -36,7 +36,7 @@ impl SetupSection for ChannelsSection {
             eprintln!("{}", self.headless_hint());
             return Ok(());
         }
-        ctx.config.channels_config = wizard::setup_channels()?;
+        ctx.config.channels_config = wizard::setup_channels(ctx.config.channels_config.clone())?;
         // Unified approval model: a configured channel lets people CHAT, but
         // nobody can APPROVE a gated tool call until an owner is set. Owners get
         // the full toolset; everyone else is a "guest" under a capability
