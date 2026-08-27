@@ -1631,8 +1631,11 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Not a provisioner — run the section wizard.
-            let mut config = Config::load_or_init().await.unwrap_or_default();
+            // Not a provisioner — run the section wizard. Propagate a load error
+            // instead of `unwrap_or_default()`: on a bad/undecryptable config that
+            // used to overwrite the real file (provider keys, channel tokens, MCP
+            // servers, paired_tokens) with defaults — setup became a config eraser.
+            let mut config = Config::load_or_init().await?;
             let profile = profile::ProfileManager::active()?;
 
             let mut owned_config = config.clone();
@@ -1652,6 +1655,10 @@ async fn main() -> Result<()> {
 
             let (updated_config, report) = report?;
             config = updated_config;
+            // Validate before persisting so setup can't write a config the loader
+            // would then refuse — a circular lockout, since the recovery command
+            // reloads and dies the same way.
+            config.validate()?;
             config.save().await?;
 
             if !report.visited.is_empty() || !report.skipped.is_empty() {
