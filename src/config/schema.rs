@@ -4018,7 +4018,12 @@ impl Config {
             if migrated || stripped_credential {
                 let serialized =
                     toml::to_string_pretty(&raw).context("Failed to serialise migrated config")?;
-                if let Err(e) = fs::write(&config_path, serialized).await {
+                // Atomic write with a retained `.bak`: this is the one write that
+                // touches every config on every upgrade, and a truncating fs::write
+                // that failed mid-way left no recovery point. keep_backup=true makes
+                // a bad migrate_vN reversible.
+                if let Err(e) = atomic_write_config(&config_path, serialized.as_bytes(), true).await
+                {
                     // Non-fatal: we still have the migrated value in
                     // memory. Warn so the user knows the next load
                     // will redo the work.
@@ -4585,96 +4590,102 @@ impl Config {
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
-        let parent_dir = self
-            .config_path
-            .parent()
-            .context("Config path must have a parent directory")?;
-
-        fs::create_dir_all(parent_dir).await.with_context(|| {
-            format!(
-                "Failed to create config directory: {}",
-                parent_dir.display()
-            )
-        })?;
-
-        let file_name = self
-            .config_path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("config.toml");
-        let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
-        let backup_path = parent_dir.join(format!("{file_name}.bak"));
-
-        let mut open_opts = OpenOptions::new();
-        open_opts.create_new(true).write(true);
-        // 0600 AT OPEN so the config (bot tokens / API keys / paired tokens) is
-        // never briefly world-readable under the process umask between create and
-        // the belt-and-braces chmod below.
-        #[cfg(unix)]
-        open_opts.mode(0o600);
-        let mut temp_file = open_opts.open(&temp_path).await.with_context(|| {
-            format!(
-                "Failed to create temporary config file: {}",
-                temp_path.display()
-            )
-        })?;
-        temp_file
-            .write_all(toml_str.as_bytes())
-            .await
-            .context("Failed to write temporary config contents")?;
-        temp_file
-            .sync_all()
-            .await
-            .context("Failed to fsync temporary config file")?;
-        drop(temp_file);
-
-        // Secure-by-default: the config holds bot tokens / API keys, so restrict
-        // it to the owner (0600) before it becomes the live file. Set on the temp
-        // path so the atomic rename publishes an already-locked file — otherwise
-        // the daemon only *warns* about world-readable configs on the next load.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to restrict config permissions to 0600: {}",
-                        temp_path.display()
-                    )
-                })?;
-        }
-
-        let had_existing_config = self.config_path.exists();
-        if had_existing_config {
-            fs::copy(&self.config_path, &backup_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to create config backup before atomic replace: {}",
-                        backup_path.display()
-                    )
-                })?;
-        }
-
-        if let Err(e) = fs::rename(&temp_path, &self.config_path).await {
-            let _ = fs::remove_file(&temp_path).await;
-            if had_existing_config && backup_path.exists() {
-                fs::copy(&backup_path, &self.config_path)
-                    .await
-                    .context("Failed to restore config backup")?;
-            }
-            anyhow::bail!("Failed to atomically replace config file: {e}");
-        }
-
-        sync_directory(parent_dir).await?;
-
-        if had_existing_config {
-            let _ = fs::remove_file(&backup_path).await;
-        }
+        // Publish atomically (temp → fsync → backup → rename → dir fsync). save()
+        // drops the backup on success; the migration write-back keeps it.
+        atomic_write_config(&self.config_path, toml_str.as_bytes(), false).await?;
 
         Ok(())
     }
+}
+
+/// Atomically write `contents` to `target`: create a 0600 temp file, fsync it,
+/// back up any existing target to `<name>.bak`, rename into place (restoring the
+/// backup on rename failure), and fsync the directory. When `keep_backup` is
+/// false the `.bak` is removed on success; when true it is retained as a recovery
+/// point — the migration write-back keeps it so a bad `migrate_vN` is reversible.
+///
+/// The temp name (`.<name>.tmp-<uuid>`) deliberately does NOT match the config
+/// watcher's filename filter, so the transient temp file never triggers a reload.
+async fn atomic_write_config(target: &Path, contents: &[u8], keep_backup: bool) -> Result<()> {
+    let parent_dir = target
+        .parent()
+        .context("Config path must have a parent directory")?;
+    fs::create_dir_all(parent_dir).await.with_context(|| {
+        format!(
+            "Failed to create config directory: {}",
+            parent_dir.display()
+        )
+    })?;
+    let file_name = target
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("config.toml");
+    let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+    let backup_path = parent_dir.join(format!("{file_name}.bak"));
+
+    let mut open_opts = OpenOptions::new();
+    open_opts.create_new(true).write(true);
+    // 0600 AT OPEN so the config (bot tokens / API keys / paired tokens) is never
+    // briefly world-readable under the process umask between create and chmod.
+    #[cfg(unix)]
+    open_opts.mode(0o600);
+    let mut temp_file = open_opts.open(&temp_path).await.with_context(|| {
+        format!(
+            "Failed to create temporary config file: {}",
+            temp_path.display()
+        )
+    })?;
+    temp_file
+        .write_all(contents)
+        .await
+        .context("Failed to write temporary config contents")?;
+    temp_file
+        .sync_all()
+        .await
+        .context("Failed to fsync temporary config file")?;
+    drop(temp_file);
+
+    // Belt-and-braces: re-assert 0600 on the temp path before it is published.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to restrict config permissions to 0600: {}",
+                    temp_path.display()
+                )
+            })?;
+    }
+
+    let had_existing = target.exists();
+    if had_existing {
+        fs::copy(target, &backup_path).await.with_context(|| {
+            format!(
+                "Failed to create config backup before atomic replace: {}",
+                backup_path.display()
+            )
+        })?;
+    }
+
+    if let Err(e) = fs::rename(&temp_path, target).await {
+        let _ = fs::remove_file(&temp_path).await;
+        if had_existing && backup_path.exists() {
+            fs::copy(&backup_path, target)
+                .await
+                .context("Failed to restore config backup")?;
+        }
+        anyhow::bail!("Failed to atomically replace config file: {e}");
+    }
+
+    sync_directory(parent_dir).await?;
+
+    if had_existing && !keep_backup {
+        let _ = fs::remove_file(&backup_path).await;
+    }
+
+    Ok(())
 }
 
 async fn sync_directory(path: &Path) -> Result<()> {
@@ -7574,6 +7585,43 @@ default_model = "legacy-model"
             mode, 0o600,
             "save() must produce an owner-only (0600) config, got {mode:o}"
         );
+    }
+
+    #[test]
+    async fn atomic_write_config_replaces_and_manages_backup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("config.toml");
+        let bak = tmp.path().join("config.toml.bak");
+
+        // First write (no existing) — no backup.
+        atomic_write_config(&target, b"a = 1\n", false)
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "a = 1\n");
+        assert!(!bak.exists(), "no backup on first write");
+
+        // keep_backup = false drops the backup on success.
+        atomic_write_config(&target, b"a = 2\n", false)
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "a = 2\n");
+        assert!(!bak.exists(), "backup dropped when keep_backup=false");
+
+        // keep_backup = true (the migration write-back) retains the prior content.
+        atomic_write_config(&target, b"a = 3\n", true)
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "a = 3\n");
+        assert!(bak.exists(), "backup kept when keep_backup=true");
+        assert_eq!(fs::read_to_string(&bak).await.unwrap(), "a = 2\n");
+
+        // The atomic temp file must never be left behind.
+        let residue: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(residue.is_empty(), "temp residue: {residue:?}");
     }
 
     #[cfg(unix)]
