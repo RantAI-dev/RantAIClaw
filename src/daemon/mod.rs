@@ -4,7 +4,7 @@ use crate::config::Config;
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -231,6 +231,19 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .join("daemon_state.json")
 }
 
+/// Write the daemon state file atomically: serialize to a per-pid temp file in
+/// the same directory, then `rename` it over the target. `rename` within a
+/// directory is atomic, so a concurrent reader (`doctor`, the TUI) sees either
+/// the old file or the new one in full — never a half-written flush, which used
+/// to surface as an intermittent false "daemon state corrupt". Best-effort: a
+/// failed temp write leaves the previous good file untouched.
+async fn write_state_file_atomic(path: &Path, data: &[u8]) {
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if tokio::fs::write(&tmp, data).await.is_ok() {
+        let _ = tokio::fs::rename(&tmp, path).await;
+    }
+}
+
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
     tokio::spawn(async move {
         let path = state_file_path(&config);
@@ -249,7 +262,7 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
                 );
             }
             let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
-            let _ = tokio::fs::write(&path, data).await;
+            write_state_file_atomic(&path, &data).await;
         }
     })
 }
@@ -423,6 +436,29 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("daemon_state.json"));
+    }
+
+    #[tokio::test]
+    async fn state_file_write_is_atomic_and_leaves_no_temp() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+
+        write_state_file_atomic(&path, br#"{"ok":true}"#).await;
+
+        // Target parses as JSON…
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+
+        // …and no `.tmp` scratch file was left behind in the directory.
+        let mut entries = tokio::fs::read_dir(tmp.path()).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name();
+            assert!(
+                !name.to_string_lossy().contains(".tmp"),
+                "leftover temp file: {name:?}"
+            );
+        }
     }
 
     #[tokio::test]

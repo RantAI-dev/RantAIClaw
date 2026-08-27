@@ -178,6 +178,21 @@ pub(crate) fn reload_managed_daemon() -> Result<bool> {
     maybe_restart_managed_daemon_service()
 }
 
+/// Current uid for the launchd `gui/<uid>/<label>` domain target. `id -u` is
+/// universally available on macOS; the `gui/<uid>` prefix lets `kickstart` reach
+/// a user agent without root. Cross-platform-compilable (the block is guarded by
+/// a runtime `cfg!` check, not a `#[cfg]` attribute), but only called on macOS.
+fn macos_launchctl_uid() -> String {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0".to_string())
+}
+
 pub(crate) fn maybe_restart_managed_daemon_service() -> Result<bool> {
     if cfg!(target_os = "macos") {
         let home = directories::UserDirs::new()
@@ -200,16 +215,29 @@ pub(crate) fn maybe_restart_managed_daemon_service() -> Result<bool> {
             return Ok(false);
         }
 
-        let _ = Command::new("launchctl")
-            .args(["stop", "com.rantaiclaw.daemon"])
-            .output();
-        let start_output = Command::new("launchctl")
-            .args(["start", "com.rantaiclaw.daemon"])
+        // A discarded `launchctl stop` followed by `start` raced: `start`
+        // reported success while the old instance was still tearing down (or the
+        // new one had already died), so the caller was told "reloaded" when the
+        // daemon could be stale or dead. `kickstart -k` atomically kills and
+        // restarts the job in one call (mirrors `handoff::Launchd::restart`);
+        // then confirm the job is actually listed before claiming success.
+        let target = format!("gui/{}/com.rantaiclaw.daemon", macos_launchctl_uid());
+        let kick = Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
             .output()
-            .context("Failed to start launchd daemon service")?;
-        if !start_output.status.success() {
-            let stderr = String::from_utf8_lossy(&start_output.stderr);
-            anyhow::bail!("launchctl start failed: {}", stderr.trim());
+            .context("Failed to kickstart launchd daemon service")?;
+        if !kick.status.success() {
+            let stderr = String::from_utf8_lossy(&kick.stderr);
+            anyhow::bail!("launchctl kickstart -k {target} failed: {}", stderr.trim());
+        }
+        let after = Command::new("launchctl")
+            .arg("list")
+            .output()
+            .context("Failed to query launchctl list after kickstart")?;
+        if !String::from_utf8_lossy(&after.stdout).contains("com.rantaiclaw.daemon") {
+            anyhow::bail!(
+                "launchctl kickstart reported success but com.rantaiclaw.daemon is not listed"
+            );
         }
 
         return Ok(true);

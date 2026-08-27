@@ -543,6 +543,7 @@ fn install_macos(config: &Config) -> Result<()> {
         &xml_escape(&exe.display().to_string()),
         &xml_escape(&stdout.display().to_string()),
         &xml_escape(&stderr.display().to_string()),
+        &xml_escape(&installed_profile()),
     );
 
     fs::write(&file, plist)?;
@@ -579,7 +580,7 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
 /// NOT process escapes, so the backslashes landed in the file verbatim, producing
 /// invalid XML that `launchctl load` rejected (the whole macOS service path never
 /// worked). Plain quotes here fix it.
-fn macos_plist(label: &str, exe: &str, stdout: &str, stderr: &str) -> String {
+fn macos_plist(label: &str, exe: &str, stdout: &str, stderr: &str, profile: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -592,6 +593,13 @@ fn macos_plist(label: &str, exe: &str, stdout: &str, stderr: &str) -> String {
     <string>{exe}</string>
     <string>daemon</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RANTAICLAW_PROFILE</key>
+    <string>{profile}</string>
+    <key>RANTAICLAW_UNIT</key>
+    <string>{label}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -618,7 +626,20 @@ fn systemd_escape_value(value: &str) -> String {
     }
 }
 
-fn systemd_user_unit(exe: &Path, working_dir: Option<&Path>, path_env: Option<&str>) -> String {
+/// The profile the installed service should run as — the same source the daemon
+/// uses to key its sentinel (`RANTAICLAW_PROFILE`, default `"default"`). Read at
+/// install time and stamped into the generated unit so the service reproduces
+/// the profile the operator installed it from.
+fn installed_profile() -> String {
+    std::env::var("RANTAICLAW_PROFILE").unwrap_or_else(|_| "default".to_string())
+}
+
+fn systemd_user_unit(
+    exe: &Path,
+    working_dir: Option<&Path>,
+    path_env: Option<&str>,
+    profile: &str,
+) -> String {
     use std::fmt::Write as _;
     let mut service = String::from("Type=simple\n");
     if let Some(dir) = working_dir {
@@ -633,6 +654,17 @@ fn systemd_user_unit(exe: &Path, working_dir: Option<&Path>, path_env: Option<&s
         // assignment; double `%` so systemd does not read it as a specifier.
         let _ = writeln!(service, "Environment=\"PATH={}\"", path.replace('%', "%%"));
     }
+    // Stamp the profile identity into the unit so a service installed from a
+    // non-default profile actually runs THAT profile — the daemon reads
+    // `RANTAICLAW_PROFILE` to key its sentinel — and so `profile use` restarts
+    // the real installed unit (`rantaiclaw.service`) instead of the
+    // `rantaiclaw@<profile>.service` template the installer never creates.
+    let _ = writeln!(
+        service,
+        "Environment=RANTAICLAW_PROFILE={}",
+        systemd_escape_value(profile)
+    );
+    let _ = writeln!(service, "Environment=RANTAICLAW_UNIT=rantaiclaw.service");
     format!(
         "[Unit]\nDescription=RantaiClaw daemon\nAfter=network.target\n\n\
          [Service]\n{service}ExecStart={} daemon\nRestart=always\nRestartSec=3\n\
@@ -651,7 +683,12 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let working_dir = std::env::current_dir().ok();
     let path_env = std::env::var("PATH").ok();
-    let unit = systemd_user_unit(exe.as_path(), working_dir.as_deref(), path_env.as_deref());
+    let unit = systemd_user_unit(
+        exe.as_path(),
+        working_dir.as_deref(),
+        path_env.as_deref(),
+        &installed_profile(),
+    );
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
@@ -1045,12 +1082,15 @@ fn warn_if_binary_in_home(exe_path: &Path) {
 }
 
 /// Generate OpenRC init script content (pure function for testability)
-fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
+fn generate_openrc_script(exe_path: &Path, config_dir: &Path, profile: &str) -> String {
     format!(
         r#"#!/sbin/openrc-run
 
 name="rantaiclaw"
 description="RantaiClaw daemon"
+
+export RANTAICLAW_PROFILE="{profile}"
+export RANTAICLAW_UNIT="rantaiclaw"
 
 command="{}"
 command_args="--config-dir {} daemon"
@@ -1194,7 +1234,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    let init_script = generate_openrc_script(&exe, config_dir);
+    let init_script = generate_openrc_script(&exe, config_dir, &installed_profile());
     let init_path = Path::new("/etc/init.d/rantaiclaw");
     fs::write(init_path, init_script)
         .with_context(|| format!("Failed to write {}", init_path.display()))?;
@@ -1335,7 +1375,13 @@ mod tests {
 
     #[test]
     fn macos_plist_is_well_formed() {
-        let p = macos_plist("com.test.daemon", "/usr/bin/rc", "/tmp/o.log", "/tmp/e.log");
+        let p = macos_plist(
+            "com.test.daemon",
+            "/usr/bin/rc",
+            "/tmp/o.log",
+            "/tmp/e.log",
+            "work",
+        );
         assert!(
             p.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
             "declaration must use plain quotes, not backslash-escaped ones: {p}"
@@ -1348,11 +1394,23 @@ mod tests {
     }
 
     #[test]
+    fn macos_plist_carries_profile_identity() {
+        let p = macos_plist("com.rantaiclaw.daemon", "/usr/bin/rc", "/o", "/e", "work");
+        assert!(p.contains("<key>EnvironmentVariables</key>"), "plist: {p}");
+        assert!(p.contains("<key>RANTAICLAW_PROFILE</key>\n    <string>work</string>"));
+        // The unit identity is the launchd label so handoff restarts the real job.
+        assert!(
+            p.contains("<key>RANTAICLAW_UNIT</key>\n    <string>com.rantaiclaw.daemon</string>")
+        );
+    }
+
+    #[test]
     fn systemd_unit_quotes_paths_with_spaces_and_escapes_percent() {
         let unit = systemd_user_unit(
             std::path::Path::new("/opt/My Apps/rantaiclaw"),
             Some(std::path::Path::new("/home/op/My Work")),
             Some("/usr/bin:/opt/100%dir"),
+            "default",
         );
         assert!(
             unit.contains("ExecStart=\"/opt/My Apps/rantaiclaw\" daemon"),
@@ -1480,11 +1538,13 @@ mod tests {
         use std::path::PathBuf;
 
         let exe_path = PathBuf::from("/usr/local/bin/rantaiclaw");
-        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"));
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"), "work");
 
         assert!(script.starts_with("#!/sbin/openrc-run"));
         assert!(script.contains("name=\"rantaiclaw\""));
         assert!(script.contains("description=\"RantaiClaw daemon\""));
+        assert!(script.contains("export RANTAICLAW_PROFILE=\"work\""));
+        assert!(script.contains("export RANTAICLAW_UNIT=\"rantaiclaw\""));
         assert!(script.contains("command=\"/usr/local/bin/rantaiclaw\""));
         assert!(script.contains("command_args=\"--config-dir /etc/rantaiclaw daemon\""));
         assert!(!script.contains("env RANTAICLAW_CONFIG_DIR"));
@@ -1588,6 +1648,7 @@ mod tests {
             Path::new("/home/op/.cargo/bin/rantaiclaw"),
             Some(Path::new("/home/op/repo")),
             Some("/home/op/.local/bin:/usr/bin"),
+            "default",
         );
         assert!(
             unit.contains("WorkingDirectory=/home/op/repo\n"),
@@ -1604,27 +1665,52 @@ mod tests {
     }
 
     #[test]
-    fn systemd_user_unit_omits_env_lines_when_absent() {
-        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None);
-        assert!(!unit.contains("WorkingDirectory="), "unit: {unit}");
-        assert!(!unit.contains("Environment="), "unit: {unit}");
-        // Fallback is byte-compatible with the pre-capture unit shape.
+    fn systemd_user_unit_stamps_profile_identity() {
+        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None, "work");
+        // The profile + real unit name are always present so a service installed
+        // from a non-default profile runs that profile and its handoff restarts
+        // the installed `rantaiclaw.service`.
         assert!(
-            unit.contains("[Service]\nType=simple\nExecStart=/usr/bin/rantaiclaw daemon\n"),
+            unit.contains("Environment=RANTAICLAW_PROFILE=work\n"),
+            "unit: {unit}"
+        );
+        assert!(
+            unit.contains("Environment=RANTAICLAW_UNIT=rantaiclaw.service\n"),
+            "unit: {unit}"
+        );
+    }
+
+    #[test]
+    fn systemd_user_unit_omits_optional_lines_when_absent() {
+        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None, "default");
+        assert!(!unit.contains("WorkingDirectory="), "unit: {unit}");
+        // No PATH capture, but the profile-identity Environment lines still stamp.
+        assert!(!unit.contains("Environment=\"PATH="), "unit: {unit}");
+        assert!(
+            unit.contains(
+                "[Service]\nType=simple\nEnvironment=RANTAICLAW_PROFILE=default\n\
+                 Environment=RANTAICLAW_UNIT=rantaiclaw.service\n\
+                 ExecStart=/usr/bin/rantaiclaw daemon\n"
+            ),
             "unit: {unit}"
         );
     }
 
     #[test]
     fn systemd_user_unit_omits_path_when_empty() {
-        let unit = systemd_user_unit(Path::new("/x/rantaiclaw"), Some(Path::new("/w")), Some(""));
+        let unit = systemd_user_unit(
+            Path::new("/x/rantaiclaw"),
+            Some(Path::new("/w")),
+            Some(""),
+            "default",
+        );
         assert!(unit.contains("WorkingDirectory=/w\n"), "unit: {unit}");
-        assert!(!unit.contains("Environment="), "unit: {unit}");
+        assert!(!unit.contains("Environment=\"PATH="), "unit: {unit}");
     }
 
     #[test]
     fn systemd_user_unit_preserves_shutdown_settings() {
-        let unit = systemd_user_unit(Path::new("/x/rantaiclaw"), None, None);
+        let unit = systemd_user_unit(Path::new("/x/rantaiclaw"), None, None, "default");
         for needle in [
             "Restart=always\n",
             "KillSignal=SIGTERM\n",
