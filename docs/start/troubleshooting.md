@@ -45,17 +45,21 @@ Why this happens:
 - Full source build can require **2 GB RAM + swap** and **6+ GB free disk**.
 - Enabling swap on a tiny disk can avoid RAM OOM but still fail due to disk exhaustion.
 
-Preferred path for constrained machines:
+Preferred path for constrained machines — the installer already prefers a
+prebuilt binary and only falls back to source:
 
 ```bash
-./bootstrap.sh --prefer-prebuilt
+./bootstrap.sh
 ```
 
-Binary-only mode (no source fallback):
+Binary-only mode (fail instead of falling back to a source build):
 
 ```bash
 ./bootstrap.sh --prebuilt-only
 ```
+
+(`--prefer-prebuilt` still parses but is a deprecated no-op — the binary is the
+default already.)
 
 If you must compile from source on constrained hosts:
 
@@ -66,11 +70,16 @@ If you must compile from source on constrained hosts:
 CARGO_BUILD_JOBS=1 cargo build --release --locked
 ```
 
-1. Reduce heavy features when Matrix is not required:
+1. Drop optional default features you don't need. The default set is
+   `tui whatsapp-web remote-install kb`; build with `--no-default-features`
+   plus only what you need to cut compile cost:
 
 ```bash
-cargo build --release --locked --features hardware
+cargo build --release --locked --no-default-features --features tui
 ```
+
+   Do **not** add `--features hardware` to shrink a build — it pulls extra
+   USB/serial dependencies (`nusb`, `tokio-serial`) and makes the build heavier.
 
 1. Cross-compile on a stronger machine and copy the binary to the target host.
 
@@ -178,7 +187,7 @@ rantaiclaw status
 rantaiclaw doctor
 ```
 
-Verify `~/.rantaiclaw/config.toml`:
+Verify the active profile's config (`~/.rantaiclaw/profiles/<name>/config.toml`):
 
 - `[gateway].host` (default `127.0.0.1`)
 - `[gateway].port` (default `9393`)

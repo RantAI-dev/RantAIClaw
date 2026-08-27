@@ -9,7 +9,7 @@ Config path resolution at startup:
 1. `RANTAICLAW_CONFIG_DIR` override (if set) — the whole config directory; the workspace becomes `<dir>/workspace`
 2. `RANTAICLAW_WORKSPACE` override (if set)
 3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present)
-4. default `~/.rantaiclaw/config.toml`
+4. default: the **active profile's directory** — `~/.rantaiclaw/profiles/<name>/config.toml` (profile `default` unless `RANTAICLAW_PROFILE` or the `~/.rantaiclaw/active_profile` marker selects another). A flat `~/.rantaiclaw/config.toml` is used only as a fallback if profile resolution fails.
 
 `RANTAICLAW_CONFIG_DIR` moves **config and workspace only**. The profile root —
 `~/.rantaiclaw/profiles/<name>/`, which holds `policy/`, session and KB
@@ -638,7 +638,7 @@ Examples:
 
 Notes:
 
-- Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
+- Default `600s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
 - Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, 4)` and a minimum of `1`.
 - This scaling avoids false timeouts when the first LLM turn is slow/retried but later tool-loop turns still need to complete.
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
