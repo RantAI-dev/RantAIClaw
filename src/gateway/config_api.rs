@@ -366,6 +366,12 @@ async fn persist_and_swap(
     // every provider call, both far from the request that caused it.
     cfg.validate().map_err(|e| err_400(e.to_string()))?;
     cfg.save().await.map_err(err_500)?;
+    // Stamp the fingerprint of what we just wrote BEFORE the file watcher fires,
+    // so the reloader's fingerprint-gate self-suppresses this write's event (no
+    // redundant second load) and `GET /version` reports the new fingerprint
+    // immediately instead of ~500ms stale.
+    *state.config_fingerprint.lock() =
+        crate::config::fingerprint::fingerprint_file(&cfg.config_path);
     audit_config_change(&cfg, change_summary);
     *state.config.lock() = cfg;
     Ok(())

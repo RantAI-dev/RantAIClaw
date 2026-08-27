@@ -39,6 +39,13 @@ pub struct SecretStore {
     key_path: PathBuf,
     /// Whether encryption is enabled
     enabled: bool,
+    /// Memoized key bytes. `decrypt_config_secrets` runs one store over ~15+
+    /// fields, each of which used to re-read `.secret_key` from disk on an async
+    /// worker; caching turns that into a single read. The key is written once at
+    /// creation and never rotated in-process, so the cache never goes stale.
+    /// `Arc` keeps `SecretStore: Clone`; clones share the same key file, so
+    /// sharing the cache is correct.
+    key_cache: std::sync::Arc<std::sync::OnceLock<Vec<u8>>>,
 }
 
 impl SecretStore {
@@ -47,6 +54,7 @@ impl SecretStore {
         Self {
             key_path: rantaiclaw_dir.join(".secret_key"),
             enabled,
+            key_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -167,8 +175,21 @@ impl SecretStore {
         value.starts_with("enc2:")
     }
 
-    /// Load the encryption key from disk, or create one if it doesn't exist.
+    /// Load the encryption key, memoized per store (see `key_cache`). Reads (or
+    /// creates) the key file only on the first call.
     fn load_or_create_key(&self) -> Result<Vec<u8>> {
+        if let Some(cached) = self.key_cache.get() {
+            return Ok(cached.clone());
+        }
+        let key = self.read_or_create_key()?;
+        // A concurrent first caller may have set it already — either value is the
+        // same key file's contents, so ignore the race.
+        let _ = self.key_cache.set(key.clone());
+        Ok(key)
+    }
+
+    /// Load the encryption key from disk, or create one if it doesn't exist.
+    fn read_or_create_key(&self) -> Result<Vec<u8>> {
         if self.key_path.exists() {
             let hex_key =
                 fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
@@ -460,6 +481,23 @@ mod tests {
         // Only a few bytes — shorter than nonce
         let result = store.decrypt("enc2:aabbccdd");
         assert!(result.is_err(), "Too-short ciphertext must be rejected");
+    }
+
+    #[test]
+    fn key_is_read_once_per_store() {
+        // The store memoizes the key on first use. Proof: delete the key file
+        // after encrypting, then decrypt — a cached store succeeds; without the
+        // cache it would read a MISSING file, mint a NEW key, and fail the tag.
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        let ciphertext = store.encrypt("secret-value").unwrap();
+
+        std::fs::remove_file(tmp.path().join(".secret_key")).unwrap();
+
+        let plaintext = store
+            .decrypt(&ciphertext)
+            .expect("a cached store must decrypt without re-reading the key file");
+        assert_eq!(plaintext, "secret-value");
     }
 
     // ── Legacy XOR backward compatibility ───────────────────────

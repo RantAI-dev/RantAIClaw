@@ -286,9 +286,13 @@ impl CommandHandler for DoctorCommand {
             let path = tokio::runtime::Handle::try_current().ok().map(|h| {
                 tokio::task::block_in_place(|| {
                     h.block_on(async {
-                        crate::config::Config::load_or_init()
-                            .await
-                            .map(|c| crate::daemon::state_file_path(&c))
+                        // Resolve the config PATH only — no `load_or_init` on the
+                        // render thread (it migrates, decrypts, applies env
+                        // overrides, and mutates proxy env) just to find the
+                        // daemon state file next to config.toml.
+                        crate::config::Config::resolve_active_paths().await.map(
+                            |(config_path, _)| crate::daemon::state_file_path_for(&config_path),
+                        )
                     })
                 })
             });

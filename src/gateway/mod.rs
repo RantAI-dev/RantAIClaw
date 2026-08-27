@@ -1314,6 +1314,16 @@ fn spawn_config_reloader(
             if event.is_none() {
                 break;
             }
+            // Fingerprint-gate: a watcher event fires on ANY write to the file,
+            // including the gateway's OWN writes (`persist_and_swap` stamps the
+            // fingerprint on save) and touches that don't change content. Skip
+            // the full `load_or_init` — migration, decrypt, env-override, proxy-
+            // env mutation — when the on-disk content already matches what we
+            // hold. This kills the second, redundant load per console write.
+            let fresh_fp = crate::config::fingerprint::fingerprint_file(&config_path);
+            if *config_fingerprint.lock() == fresh_fp {
+                continue;
+            }
             match Config::load_or_init().await {
                 Ok(fresh) => {
                     // Re-sync the pairing guard so `config.toml` is actually the
@@ -1326,8 +1336,7 @@ fn spawn_config_reloader(
                         fresh.gateway.require_pairing,
                     );
                     *config.lock() = fresh;
-                    *config_fingerprint.lock() =
-                        crate::config::fingerprint::fingerprint_file(&config_path);
+                    *config_fingerprint.lock() = fresh_fp;
                     tracing::info!(target: "gateway", "config.toml changed — reloaded running config");
                 }
                 Err(e) => {
