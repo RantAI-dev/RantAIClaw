@@ -1268,10 +1268,14 @@ fn spawn_config_reloader(
             match Config::load_or_init().await {
                 Ok(fresh) => {
                     // Re-sync the pairing guard so `config.toml` is actually the
-                    // authority on which tokens are valid. Without this the
-                    // guard is whatever it was built with at startup, and
-                    // deleting a token hash from the file revoked nothing.
-                    pairing.sync_tokens(&fresh.gateway.paired_tokens);
+                    // authority on both which tokens are valid AND whether pairing
+                    // is enforced. Without this the guard is whatever it was built
+                    // with at startup — deleting a token hash revoked nothing, and
+                    // flipping `require_pairing = true` took effect only on restart.
+                    pairing.sync_from_config(
+                        &fresh.gateway.paired_tokens,
+                        fresh.gateway.require_pairing,
+                    );
                     *config.lock() = fresh;
                     *config_fingerprint.lock() =
                         crate::config::fingerprint::fingerprint_file(&config_path);
