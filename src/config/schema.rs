@@ -88,6 +88,7 @@ pub struct Config {
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
     pub default_model: Option<String>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
+    #[serde(default = "default_temperature_value")]
     pub default_temperature: f64,
 
     /// Observability backend configuration (`[observability]`).
@@ -724,8 +725,9 @@ pub struct CostConfig {
     #[serde(default)]
     pub allow_override: bool,
 
-    /// Per-model pricing (USD per 1M tokens)
-    #[serde(default)]
+    /// Per-model pricing (USD per 1M tokens). Defaults to the built-in pricing
+    /// table so cost tracking works without a hand-written price list.
+    #[serde(default = "get_default_pricing")]
     pub prices: std::collections::HashMap<String, ModelPricing>,
 }
 
@@ -1056,6 +1058,12 @@ fn default_true() -> bool {
     true
 }
 
+/// Serde default for `Config::default_temperature` — a required field otherwise,
+/// so a config omitting it failed to load with "missing field".
+fn default_temperature_value() -> f64 {
+    0.7
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -1205,8 +1213,10 @@ impl Default for BrowserComputerUseConfig {
 /// Controls the `browser_open` tool and browser automation backends.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserConfig {
-    /// Enable `browser_open` tool (opens URLs in Brave without scraping)
-    #[serde(default)]
+    /// Enable `browser_open` tool (opens URLs in Brave without scraping).
+    /// Default `true` (usable-by-default) — must match `impl Default`, which is
+    /// the intended contract declared by the v8→v9 migration.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for `browser_open` (exact or subdomain match)
     #[serde(default)]
@@ -1263,35 +1273,41 @@ impl Default for BrowserConfig {
 /// rejected (the guard protects users who enable without configuring a list).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
-    /// Enable `http_request` tool for API interactions
-    #[serde(default)]
+    /// Enable `http_request` tool for API interactions. Default `true`.
+    #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Allowed domains for HTTP requests (exact or subdomain match)
-    #[serde(default)]
+    /// Allowed domains for HTTP requests (exact or subdomain match). Default
+    /// `["*"]` (allow-all wildcard) — omitting it must NOT yield `[]`, which
+    /// rejects every request.
+    #[serde(default = "default_wildcard_domains")]
     pub allowed_domains: Vec<String>,
-    /// Maximum response size in bytes (default: 1MB)
+    /// Maximum response size in bytes (default: 5 MiB)
     #[serde(default = "default_http_max_response_size")]
     pub max_response_size: usize,
-    /// Request timeout in seconds (default: 30)
+    /// Request timeout in seconds (default: 20)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
 }
 
+fn default_wildcard_domains() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
 fn default_http_max_response_size() -> usize {
-    1_000_000 // 1MB
+    5_242_880 // 5 MiB
 }
 
 fn default_http_timeout_secs() -> u64 {
-    30
+    20
 }
 
 impl Default for HttpRequestConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            allowed_domains: vec!["*".to_string()],
-            max_response_size: 5_242_880, // 5 MiB
-            timeout_secs: 20,
+            enabled: default_true(),
+            allowed_domains: default_wildcard_domains(),
+            max_response_size: default_http_max_response_size(),
+            timeout_secs: default_http_timeout_secs(),
         }
     }
 }
@@ -1301,8 +1317,8 @@ impl Default for HttpRequestConfig {
 /// Web search tool configuration (`[web_search]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchConfig {
-    /// Enable `web_search_tool` for web searches
-    #[serde(default)]
+    /// Enable `web_search_tool` for web searches. Default `true`.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Search provider: "duckduckgo" (free, no API key), "brave" (requires API key),
     /// or "searxng" (auto-launched via `[services.searxng]` or pointed at a custom URL).
@@ -2085,6 +2101,9 @@ impl Default for StorageProviderConfig {
 /// and memory snapshot/hydration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
+// A partial `[memory]` section (e.g. only `backend = "markdown"`) fills the
+// remaining fields from `impl Default` instead of failing with "missing field".
+#[serde(default)]
 pub struct MemoryConfig {
     /// "sqlite" | "lucid" | "postgres" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
@@ -2220,6 +2239,8 @@ impl Default for MemoryConfig {
 
 /// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+// Partial `[observability]` fills missing fields from `impl Default`.
+#[serde(default)]
 pub struct ObservabilityConfig {
     /// "none" | "log" | "prometheus" | "otel"
     pub backend: String,
@@ -2250,6 +2271,10 @@ impl Default for ObservabilityConfig {
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
 /// risk approval gates, and per-policy budgets.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+// Struct-level default so a PARTIAL `[autonomy]` section (e.g. only
+// `level = "full"`, exactly what the docs teach) fills the remaining fields
+// from `impl Default` instead of failing the whole load with "missing field".
+#[serde(default)]
 pub struct AutonomyConfig {
     /// Autonomy level: `readonly`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
@@ -2272,8 +2297,10 @@ pub struct AutonomyConfig {
     #[serde(default = "default_true")]
     pub require_approval_for_medium_risk: bool,
 
-    /// Block high-risk shell commands even if allowlisted.
-    #[serde(default = "default_true")]
+    /// Block high-risk shell commands even if allowlisted. Default `false`
+    /// (usable-by-default local shell; the v8→v9 migration declared this intent)
+    /// — inherits the struct-level `#[serde(default)]`, which resolves to
+    /// `impl Default`'s `false`, instead of the stale `default_true`.
     pub block_high_risk_commands: bool,
 
     /// Tools that never require approval (e.g. read-only tools).
@@ -2659,6 +2686,8 @@ pub struct ClassificationRule {
 
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+// Partial `[heartbeat]` fills missing fields from `impl Default`.
+#[serde(default)]
 pub struct HeartbeatConfig {
     /// Enable periodic heartbeat pings. Default: `false`.
     pub enabled: bool,
@@ -2810,6 +2839,9 @@ pub struct CustomTunnelConfig {
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
 /// setting it to `Some(...)` enables that channel.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+// Partial `[channels_config]` fills missing fields (e.g. `cli`) from
+// `impl Default` instead of failing to load.
+#[serde(default)]
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     pub cli: bool,
@@ -6472,6 +6504,47 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
+    }
+
+    #[test]
+    async fn partial_section_uses_impl_default_not_stale_serde() {
+        // A section PRESENT but omitting a field must fill it from the intended
+        // default (impl Default), not a stale serde default. Before the F2 fix,
+        // `[http_request]` with no `allowed_domains` loaded `[]` (which rejects
+        // every request) and `[browser]`/`[web_search]` loaded disabled. Also
+        // covers F3: a partial `[autonomy]` must load, not fail with "missing
+        // field".
+        let toml_str = r#"
+default_temperature = 0.7
+[http_request]
+timeout_secs = 25
+[browser]
+backend = "auto"
+[web_search]
+provider = "brave"
+[autonomy]
+level = "full"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("partial sections must load");
+
+        // http_request: present, omits enabled + allowed_domains → intended defaults.
+        assert!(
+            cfg.http_request.enabled,
+            "omitted enabled must default true"
+        );
+        assert_eq!(
+            cfg.http_request.allowed_domains,
+            vec!["*".to_string()],
+            "omitted allowed_domains must default to the wildcard, not []"
+        );
+        assert_eq!(cfg.http_request.timeout_secs, 25, "explicit value is kept");
+        assert!(cfg.browser.enabled);
+        assert!(cfg.web_search.enabled);
+
+        // A partial [autonomy] loads and fills the rest from Default.
+        assert_eq!(cfg.autonomy.level, crate::security::AutonomyLevel::Full);
+        assert!(!cfg.autonomy.block_high_risk_commands);
+        assert!(cfg.autonomy.workspace_only);
     }
 
     // ── Environment variable overrides (Docker support) ─────────
