@@ -527,13 +527,62 @@ async fn set_autonomy(
 
 // ── POST/DELETE /config/mcp_servers/{name} ───────────────────────────────────
 
+/// Max MCP servers accepted over the config API. Mirrors `MAX_MCP_SERVERS` in
+/// `src/mcp/mod.rs` (the runtime registry cap) so the write boundary can't grow
+/// the config past what the registry will actually run.
+const MAX_MCP_SERVERS_API: usize = 10;
+
+/// `env`/`args` are `Option` so an omitted field means "keep the existing value"
+/// (matching the `/secrets` and `/config/knowledge` write contract) — re-adding a
+/// server to fix a typo must not wipe its stored env/args.
 #[derive(Deserialize)]
 struct McpServerBody {
     command: String,
     #[serde(default)]
-    args: Vec<String>,
+    args: Option<Vec<String>>,
     #[serde(default)]
-    env: HashMap<String, String>,
+    env: Option<HashMap<String, String>>,
+}
+
+/// Reject a command that is a shell expression rather than a program to spawn:
+/// this route persists a command the agent later runs via `Command::new`, so a
+/// value like `sh -c 'curl … | sh'` must not be smuggled through.
+fn validate_mcp_command(command: &str) -> Result<(), ApiError> {
+    if command
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '<' | '>' | '\n' | '\r'))
+    {
+        return Err(err_400(
+            "MCP command must be a program name or path, not a shell expression",
+        ));
+    }
+    Ok(())
+}
+
+/// Env vars that steer the dynamic loader turn an MCP spawn into arbitrary code
+/// execution, so they must never be injectable through a config write.
+fn is_loader_env_key(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    k == "LD_PRELOAD" || k == "LD_LIBRARY_PATH" || k.starts_with("DYLD_")
+}
+
+/// Merge an MCP write onto an existing entry: the command is required, but an
+/// omitted (`None`) args/env keeps the existing value rather than clearing it.
+fn merge_mcp_server(
+    existing: Option<&McpServerConfig>,
+    command: String,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+) -> McpServerConfig {
+    McpServerConfig {
+        command,
+        args: args
+            .or_else(|| existing.map(|e| e.args.clone()))
+            .unwrap_or_default(),
+        env: env
+            .or_else(|| existing.map(|e| e.env.clone()))
+            .unwrap_or_default(),
+    }
 }
 
 async fn add_mcp_server(
@@ -547,18 +596,27 @@ async fn add_mcp_server(
     if name.is_empty() {
         return Err(err_400("server name must not be empty"));
     }
-    if body.command.trim().is_empty() {
+    let command = body.command.trim().to_string();
+    if command.is_empty() {
         return Err(err_400("command must not be empty"));
     }
+    validate_mcp_command(&command)?;
+    if let Some(env) = body.env.as_ref() {
+        if let Some(bad) = env.keys().find(|k| is_loader_env_key(k)) {
+            return Err(err_400(format!(
+                "MCP env var '{bad}' is not allowed (influences the dynamic loader)"
+            )));
+        }
+    }
     let (_guard, mut cfg) = lock_and_load().await?;
-    cfg.mcp_servers.insert(
-        name.clone(),
-        McpServerConfig {
-            command: body.command.trim().to_string(),
-            args: body.args,
-            env: body.env,
-        },
-    );
+    let existing = cfg.mcp_servers.get(&name).cloned();
+    if existing.is_none() && cfg.mcp_servers.len() >= MAX_MCP_SERVERS_API {
+        return Err(err_400(format!(
+            "too many MCP servers (max {MAX_MCP_SERVERS_API})"
+        )));
+    }
+    let merged = merge_mcp_server(existing.as_ref(), command, body.args, body.env);
+    cfg.mcp_servers.insert(name.clone(), merged);
     let count = cfg.mcp_servers.len();
     persist_and_swap(&state, cfg).await?;
     Ok(Json(json!({ "name": name, "added": true, "count": count })))
@@ -1217,6 +1275,71 @@ mod tests {
             !json.contains(MARKER),
             "a secret marker survived redaction in GET /config: {json}"
         );
+    }
+
+    #[test]
+    fn validate_mcp_command_rejects_shell_expressions() {
+        // A plain program name or path is fine (args are a separate field).
+        assert!(validate_mcp_command("npx").is_ok());
+        assert!(validate_mcp_command("/usr/local/bin/uvx").is_ok());
+        // Shell-metacharacter injection in the command field is rejected.
+        for bad in [
+            "npx; curl evil",
+            "a | b",
+            "x && y",
+            "`id`",
+            "$(id)",
+            "cat </etc/passwd",
+        ] {
+            assert!(
+                validate_mcp_command(bad).is_err(),
+                "shell-expression command should be rejected: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_loader_env_key_flags_loader_vars() {
+        for k in [
+            "LD_PRELOAD",
+            "ld_preload",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+        ] {
+            assert!(is_loader_env_key(k), "{k} should be flagged");
+        }
+        for k in ["PATH", "API_KEY", "NODE_ENV"] {
+            assert!(!is_loader_env_key(k), "{k} should be allowed");
+        }
+    }
+
+    #[test]
+    fn merge_mcp_server_keeps_existing_args_and_env_when_omitted() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("TOKEN".to_string(), "existing-secret".to_string());
+        let existing = crate::config::schema::McpServerConfig {
+            command: "npx".into(),
+            args: vec!["-y".into(), "server".into()],
+            env,
+        };
+        // Re-add with only a new command (args/env omitted) — must not wipe them.
+        let merged = merge_mcp_server(Some(&existing), "node".into(), None, None);
+        assert_eq!(merged.command, "node");
+        assert_eq!(merged.args, vec!["-y".to_string(), "server".to_string()]);
+        assert_eq!(
+            merged.env.get("TOKEN").map(String::as_str),
+            Some("existing-secret")
+        );
+        // An explicit empty env clears it; a brand-new entry defaults to empty.
+        let cleared = merge_mcp_server(
+            Some(&existing),
+            "node".into(),
+            None,
+            Some(std::collections::HashMap::new()),
+        );
+        assert!(cleared.env.is_empty());
+        let fresh = merge_mcp_server(None, "npx".into(), None, None);
+        assert!(fresh.args.is_empty() && fresh.env.is_empty());
     }
 
     #[test]
