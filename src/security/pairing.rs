@@ -11,6 +11,7 @@
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,8 +34,9 @@ const LOGIN_LOCKOUT_SECS: u64 = 300; // 5 minutes
 // TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes
 #[derive(Debug, Clone)]
 pub struct PairingGuard {
-    /// Whether pairing is required at all.
-    require_pairing: bool,
+    /// Whether pairing is required at all. Interior-mutable so a `require_pairing`
+    /// change in config.toml can take effect on reload without a restart.
+    require_pairing: Arc<AtomicBool>,
     /// One-time pairing code (generated on startup, consumed on first pair).
     pairing_code: Arc<Mutex<Option<String>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
@@ -74,7 +76,7 @@ impl PairingGuard {
             None
         };
         Self {
-            require_pairing,
+            require_pairing: Arc::new(AtomicBool::new(require_pairing)),
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
             failed_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -89,7 +91,7 @@ impl PairingGuard {
 
     /// Whether pairing is required at all.
     pub fn require_pairing(&self) -> bool {
-        self.require_pairing
+        self.require_pairing.load(Ordering::Relaxed)
     }
 
     fn try_pair_blocking(&self, code: &str, client_id: &str) -> Result<Option<String>, u64> {
@@ -173,7 +175,7 @@ impl PairingGuard {
 
     /// Check if a bearer token is valid (compares against stored hashes).
     pub fn is_authenticated(&self, token: &str) -> bool {
-        if !self.require_pairing {
+        if !self.require_pairing.load(Ordering::Relaxed) {
             return true;
         }
         let hashed = hash_token(token);
@@ -231,6 +233,26 @@ impl PairingGuard {
                 "paired tokens re-synced from config.toml"
             );
             *current = next;
+        }
+    }
+
+    /// Reconcile BOTH the token set and the enforcement flag from config, so a
+    /// `require_pairing` change in config.toml takes effect on the next reload
+    /// without a restart. Previously only token revocation reloaded, so flipping
+    /// `require_pairing = true` after an incident left the control plane open
+    /// until restart while the reload appeared to succeed.
+    pub fn sync_from_config(&self, paired_tokens: &[String], require_pairing: bool) {
+        self.sync_tokens(paired_tokens);
+        let was = self
+            .require_pairing
+            .swap(require_pairing, Ordering::Relaxed);
+        if was != require_pairing {
+            tracing::warn!(
+                target: "gateway",
+                was,
+                now = require_pairing,
+                "gateway pairing enforcement changed via config.toml reload"
+            );
         }
     }
 
@@ -695,6 +717,35 @@ mod tests {
         guard.sync_tokens(&[]);
         assert!(!guard.is_authenticated(&t));
         assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn require_pairing_flip_takes_effect_without_restart() {
+        // Enforcement starts OFF: any request authenticates.
+        let guard = PairingGuard::new(false, &[]);
+        assert!(
+            guard.is_authenticated("anything"),
+            "enforcement off: allowed"
+        );
+        // A config reload flips it ON — an unpaired request is now rejected.
+        guard.sync_from_config(&[], true);
+        assert!(!guard.is_authenticated("anything"), "flip on: rejected");
+        // And back OFF, again without a restart.
+        guard.sync_from_config(&[], false);
+        assert!(
+            guard.is_authenticated("anything"),
+            "flip off: allowed again"
+        );
+    }
+
+    #[test]
+    async fn sync_from_config_still_syncs_tokens() {
+        // The token-sync half must survive the enforcement-flag addition.
+        let guard = PairingGuard::new(true, &[]);
+        let token = "zc_a_token";
+        assert!(!guard.is_authenticated(token));
+        guard.sync_from_config(&[hash_token(token)], true);
+        assert!(guard.is_authenticated(token));
     }
 
     #[test]
