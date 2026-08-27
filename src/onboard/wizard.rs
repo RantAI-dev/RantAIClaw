@@ -1611,13 +1611,18 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     };
 
     let client = build_model_fetch_client()?;
+    // Gemini takes the key as a `?key=` query param, so a transport/status error
+    // carries the full URL — including the key — in its `Display`. Strip the URL
+    // from every error before it reaches the terminal / CI logs.
     let payload: Value = client
         .get("https://generativelanguage.googleapis.com/v1beta/models")
         .query(&[("key", api_key), ("pageSize", "200")])
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|e| e.without_url())
         .context("model fetch failed: GET Gemini models")?
         .json()
+        .map_err(|e| e.without_url())
         .context("failed to parse Gemini model list response")?;
 
     Ok(parse_gemini_model_ids(&payload))
@@ -2140,7 +2145,13 @@ pub fn run_models_refresh(
         }
     }
 
-    let api_key = config.api_key.clone().unwrap_or_default();
+    // Resolve the key for the provider being PROBED, not the active provider's
+    // top-level key — a `doctor models` sweep must never send one provider's
+    // credential to another host. An empty result falls through to the
+    // provider-specific env var inside `fetch_live_models_for_provider`.
+    let api_key = config
+        .resolve_key_for_provider(&provider_name)
+        .unwrap_or_default();
     let provider_api_url = active_provider_api_url(config, &provider_name);
 
     match fetch_live_models_for_provider(&provider_name, &api_key, provider_api_url) {
