@@ -1291,6 +1291,13 @@ fn spawn_config_reloader(
 
 async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
+    // NOTE: this clones the possibly-stale in-memory snapshot, so a concurrent
+    // console/hand edit can be clobbered (plan 241 C10). The correct fix is to
+    // re-read the managed config.toml fresh before writing — but `load_or_init`
+    // re-resolves the path from HOME/env rather than honoring this config's
+    // `config_path`, so it reads the wrong file under a non-default profile. That
+    // needs the side-effect-free `Config::load_from_path` extracted in plan 243;
+    // C10 is deferred until it lands.
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
     let mut updated_cfg = { config.lock().clone() };
