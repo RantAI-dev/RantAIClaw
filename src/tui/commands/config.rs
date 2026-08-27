@@ -70,7 +70,7 @@ impl CommandHandler for ConfigCommand {
     }
 
     fn usage(&self) -> &str {
-        "/config [key] [value]"
+        "/config [model|debug] [value]"
     }
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
@@ -108,31 +108,41 @@ impl CommandHandler for ConfigCommand {
                         ctx.debug_mode
                     ))),
                     _ => Ok(CommandResult::Message(format!(
-                        "Unknown config key: {}",
-                        key
+                        "Unknown config key: {key}. Supported: model, debug. Use /setup to edit persisted config."
                     ))),
                 }
             }
             _ => {
-                // Set key = value (everything after the key is the value)
+                // Set key = value (everything after the key is the value).
+                // These are SESSION-ONLY toggles — they never touch config.toml.
                 let key = parts[0];
                 let value = parts[1..].join(" ");
                 match key {
                     "model" => {
                         ctx.model = value.clone();
-                        Ok(CommandResult::Message(format!("model set to: {}", value)))
+                        Ok(CommandResult::Message(format!(
+                            "model set to: {value} (session only — use /setup to persist)"
+                        )))
                     }
                     "debug" => {
-                        let enabled = matches!(value.as_str(), "true" | "1" | "on");
+                        let enabled = match value.trim().to_ascii_lowercase().as_str() {
+                            "true" | "1" | "on" => true,
+                            "false" | "0" | "off" => false,
+                            other => {
+                                // Reject rather than silently coercing to false.
+                                return Ok(CommandResult::Message(format!(
+                                    "debug expects a boolean (true/false), got `{other}`"
+                                )));
+                            }
+                        };
                         ctx.debug_mode = enabled;
                         Ok(CommandResult::Message(format!(
-                            "debug set to: {}",
+                            "debug set to: {} (session only — use /setup to persist)",
                             ctx.debug_mode
                         )))
                     }
                     _ => Ok(CommandResult::Message(format!(
-                        "Unknown config key: {}",
-                        key
+                        "Unknown config key: {key}. Supported: model, debug. Use /setup to edit persisted config."
                     ))),
                 }
             }
@@ -590,7 +600,36 @@ mod tests {
         let result = cmd.execute("model new-model", &mut ctx).unwrap();
 
         assert_eq!(ctx.model, "new-model");
-        assert!(matches!(result, CommandResult::Message(_)));
+        match result {
+            CommandResult::Message(m) => assert!(
+                m.contains("session only"),
+                "set message must be honest about session-only scope: {m}"
+            ),
+            _ => panic!("expected a Message"),
+        }
+    }
+
+    #[test]
+    fn config_debug_rejects_non_bool_instead_of_coercing() {
+        let cmd = ConfigCommand;
+        let mut ctx = test_context();
+        assert!(!ctx.debug_mode);
+
+        // A garbage value must NOT silently flip debug to false.
+        let result = cmd.execute("debug maybe", &mut ctx).unwrap();
+        assert!(!ctx.debug_mode);
+        match result {
+            CommandResult::Message(m) => {
+                assert!(m.contains("boolean"), "expected a rejection message: {m}");
+            }
+            _ => panic!("expected a Message"),
+        }
+
+        // A real bool still works.
+        cmd.execute("debug on", &mut ctx).unwrap();
+        assert!(ctx.debug_mode);
+        cmd.execute("debug off", &mut ctx).unwrap();
+        assert!(!ctx.debug_mode);
     }
 
     #[test]

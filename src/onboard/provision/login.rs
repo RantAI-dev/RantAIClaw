@@ -112,7 +112,12 @@ impl TuiProvisioner for LoginProvisioner {
         .await?;
         let username = recv_text(&mut responses).await?.trim().to_string();
         if username.is_empty() {
-            return leave_disabled(&events, "Empty username — console login left disabled.").await;
+            return leave_disabled(
+                &events,
+                &mut config.gateway.login,
+                "Empty username — console login left disabled.",
+            )
+            .await;
         }
 
         // Step 3 — password + confirmation
@@ -141,6 +146,7 @@ impl TuiProvisioner for LoginProvisioner {
         if password.trim().is_empty() || password != confirm {
             return leave_disabled(
                 &events,
+                &mut config.gateway.login,
                 "Passwords were empty or did not match — console login left disabled.",
             )
             .await;
@@ -194,8 +200,16 @@ impl TuiProvisioner for LoginProvisioner {
 /// write has to reach disk.
 async fn leave_disabled(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
+    login: &mut crate::config::GatewayLoginConfig,
     text: &str,
 ) -> Result<ProvisionOutcome> {
+    // Actually turn the gate off. Previously this only printed "left disabled"
+    // while an existing username/password_hash stayed in config — so the old
+    // password gate remained armed despite the message. Mirror the explicit
+    // "Skip / disable" branch.
+    login.username = None;
+    login.password_hash = None;
+    login.idle_timeout_secs = 0;
     send(
         events,
         ProvisionEvent::Message {
@@ -212,4 +226,34 @@ async fn leave_disabled(
     )
     .await?;
     Ok(ProvisionOutcome::Configured)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn leave_disabled_clears_the_login_gate() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        // Drain events so the bounded channel never blocks the sender.
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let mut login = crate::config::GatewayLoginConfig::default();
+        login.username = Some("op".into());
+        login.password_hash = Some("argon2-hash".into());
+        login.idle_timeout_secs = 900;
+
+        let outcome = leave_disabled(&tx, &mut login, "test").await.unwrap();
+        drop(tx);
+        drain.await.unwrap();
+
+        assert!(matches!(outcome, ProvisionOutcome::Configured));
+        // The message says "left disabled" — the state must actually be off.
+        assert!(login.username.is_none(), "username must be cleared");
+        assert!(
+            login.password_hash.is_none(),
+            "password_hash must be cleared"
+        );
+        assert_eq!(login.idle_timeout_secs, 0, "idle window must be cleared");
+    }
 }
