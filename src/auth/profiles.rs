@@ -417,12 +417,41 @@ impl AuthProfilesStore {
         );
         let tmp_path = self.path.with_file_name(tmp_name);
 
-        fs::write(&tmp_path, &json).await.with_context(|| {
-            format!(
-                "Failed to write temporary auth profile file at {}",
-                tmp_path.display()
-            )
-        })?;
+        // Create the temp file with owner-only permissions (0600) AT OPEN, so the
+        // OAuth access/refresh tokens it holds are never briefly world-readable
+        // under the process umask between write and a later chmod (the store sits
+        // in the config dir, which a system install leaves at 0755).
+        #[cfg(unix)]
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create temporary auth profile file at {}",
+                        tmp_path.display()
+                    )
+                })?;
+            file.write_all(&json).await.with_context(|| {
+                format!(
+                    "Failed to write temporary auth profile file at {}",
+                    tmp_path.display()
+                )
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(&tmp_path, &json).await.with_context(|| {
+                format!(
+                    "Failed to write temporary auth profile file at {}",
+                    tmp_path.display()
+                )
+            })?;
+        }
 
         fs::rename(&tmp_path, &self.path).await.with_context(|| {
             format!(
@@ -697,5 +726,28 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_store_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let profile = AuthProfile::new_token("anthropic", "default", "token-abc".into());
+        store.upsert_profile(profile, true).await.unwrap();
+
+        // The token store must be owner-only (0600) — it holds OAuth tokens.
+        let path = store.path().to_path_buf();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "auth token store must be 0600");
+
+        // And the atomic write must leave no temp residue behind.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "temp file residue: {leftover:?}");
     }
 }
