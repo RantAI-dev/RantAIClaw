@@ -237,14 +237,10 @@ pub(crate) fn maybe_restart_managed_daemon_service() -> Result<bool> {
         }
 
         // Systemd (user-level)
-        let home = directories::UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let unit_path: PathBuf = home
-            .join(".config")
-            .join("systemd")
-            .join("user")
-            .join("rantaiclaw.service");
+        // Honor XDG_CONFIG_HOME via the shared helper, so this detection matches
+        // where `service install` actually wrote the unit.
+        let unit_path: PathBuf =
+            crate::service::systemd_user_unit_dir()?.join("rantaiclaw.service");
         if !unit_path.exists() {
             return Ok(false);
         }
