@@ -120,37 +120,37 @@ fn allowlist_check_warns_on_strict_empty_allowlist_via_pure_helper() {
 
 #[test]
 fn report_text_renders_correctly() {
-    let rendered = render_text(&fixture_results(), false);
+    let rendered = render_text(&fixture_results(), &[], false);
     insta::assert_snapshot!("doctor_text", rendered);
 }
 
 #[test]
 fn report_brief_renders_correctly() {
-    let rendered = render_brief(&fixture_results());
+    let rendered = render_brief(&fixture_results(), &[]);
     insta::assert_snapshot!("doctor_brief", rendered);
 }
 
 #[test]
 fn report_json_renders_correctly() {
-    let rendered = render_json(&fixture_results());
+    let rendered = render_json(&fixture_results(), &[]);
     insta::assert_json_snapshot!("doctor_json", rendered);
 }
 
 #[test]
 fn render_dispatches_to_text() {
-    let s = render(&fixture_results(), DoctorFormat::Text);
+    let s = render(&fixture_results(), &[], DoctorFormat::Text);
     assert!(s.contains("RantaiClaw Doctor"));
 }
 
 #[test]
 fn render_dispatches_to_brief() {
-    let s = render(&fixture_results(), DoctorFormat::Brief);
+    let s = render(&fixture_results(), &[], DoctorFormat::Brief);
     assert!(s.starts_with("doctor:"));
 }
 
 #[test]
 fn render_dispatches_to_json() {
-    let s = render(&fixture_results(), DoctorFormat::Json);
+    let s = render(&fixture_results(), &[], DoctorFormat::Json);
     let v: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert_eq!(v["summary"]["total"], 4);
 }

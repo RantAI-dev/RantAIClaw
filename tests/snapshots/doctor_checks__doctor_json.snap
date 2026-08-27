@@ -37,10 +37,12 @@ expression: rendered
       "severity": "info"
     }
   ],
+  "skipped": [],
   "summary": {
     "fail": 1,
     "info": 1,
     "ok": 1,
+    "skipped": 0,
     "total": 4,
     "warn": 1
   }
