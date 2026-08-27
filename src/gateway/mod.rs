@@ -806,16 +806,6 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
         ))),
     };
 
-    // Hot-reload: reflect on-disk config edits (e.g. a provider changed in the
-    // TUI, another process) in the running gateway + the web console it serves,
-    // without a restart. Best-effort — a watcher failure just disables it.
-    spawn_config_reloader(
-        state.config.clone(),
-        state.config_fingerprint.clone(),
-        config.config_path.clone(),
-        state.pairing.clone(),
-    );
-
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
@@ -938,6 +928,25 @@ pub async fn run_gateway(
 
     let (state, app) = build_gateway_router(config.clone())?;
 
+    // Hot-reload: reflect on-disk config edits (e.g. a provider changed in the
+    // TUI, another process) in the running gateway + the web console it serves,
+    // without a restart. Best-effort — a watcher failure just disables it.
+    //
+    // Scoped to a per-invocation child token so the watcher task + its inotify
+    // registration are torn down when THIS run_gateway returns. Under the daemon
+    // supervisor the gateway restarts on failure; spawning the reloader inside
+    // build_gateway_router leaked one live task + watch per restart (recv never
+    // closes on its own), eventually exhausting max_user_watches. The child token
+    // is also cancelled transitively when the parent `shutdown` fires.
+    let reloader_shutdown = shutdown.child_token();
+    spawn_config_reloader(
+        state.config.clone(),
+        state.config_fingerprint.clone(),
+        config.config_path.clone(),
+        state.pairing.clone(),
+        reloader_shutdown.clone(),
+    );
+
     // Best-effort one-shot: derive titles for legacy sessions that never went
     // through the auto-titling path. Idempotent — a no-op once every session
     // has a title. The TUI does this too, but a gateway-only deployment never
@@ -1016,12 +1025,18 @@ pub async fn run_gateway(
     // Run the server. `with_graceful_shutdown` lets in-flight requests finish
     // (and stops accepting new connections) when `shutdown` is cancelled,
     // instead of the connection being dropped when the daemon aborts the task.
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move { shutdown.cancelled().await })
-    .await?;
+    .await;
+
+    // Tear down this invocation's config reloader (task + inotify watch) whether
+    // serving ended cleanly or with an error, so a supervised restart never
+    // stacks another live watcher on top.
+    reloader_shutdown.cancel();
+    serve_result?;
 
     Ok(())
 }
@@ -1278,6 +1293,7 @@ fn spawn_config_reloader(
     config_fingerprint: Arc<Mutex<String>>,
     config_path: std::path::PathBuf,
     pairing: Arc<PairingGuard>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
         let mut watcher = match crate::config::watcher::ConfigWatcher::watch(&config_path) {
@@ -1287,7 +1303,17 @@ fn spawn_config_reloader(
                 return;
             }
         };
-        while watcher.reload_rx.recv().await.is_some() {
+        loop {
+            // Exit on shutdown so the task (and its inotify watch) is dropped when
+            // this gateway invocation ends — otherwise every gateway restart leaked
+            // a permanently-live watch + task, exhausting max_user_watches in a loop.
+            let event = tokio::select! {
+                r = watcher.reload_rx.recv() => r,
+                () = shutdown.cancelled() => break,
+            };
+            if event.is_none() {
+                break;
+            }
             match Config::load_or_init().await {
                 Ok(fresh) => {
                     // Re-sync the pairing guard so `config.toml` is actually the
