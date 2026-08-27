@@ -224,8 +224,16 @@ pub(crate) async fn shutdown_signal() {
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
-    config
-        .config_path
+    state_file_path_for(&config.config_path)
+}
+
+/// The daemon state file that sits next to `config_path`. Split out so callers
+/// that only have the config PATH (e.g. the TUI `/config` panel, via
+/// `Config::resolve_active_paths`) can find it without a full `load_or_init`
+/// (migration + decrypt + env-override + proxy-env mutation on the render
+/// thread just to read a directory).
+pub fn state_file_path_for(config_path: &Path) -> PathBuf {
+    config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
         .join("daemon_state.json")
