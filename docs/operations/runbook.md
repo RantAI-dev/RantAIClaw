@@ -111,7 +111,7 @@ rantaiclaw service stop
 rantaiclaw service start
 ```
 
-4. If channels still fail, verify allowlists and credentials in `~/.rantaiclaw/config.toml`.
+4. If channels still fail, verify allowlists and credentials in the active profile's config (`~/.rantaiclaw/profiles/<name>/config.toml`; run `rantaiclaw config` to print the resolved path).
 
 5. If gateway is involved, verify bind/auth settings (`[gateway]`) and local reachability.
 
@@ -119,7 +119,7 @@ rantaiclaw service start
 
 Before applying config changes:
 
-1. backup `~/.rantaiclaw/config.toml`
+1. backup the active profile's config (`~/.rantaiclaw/profiles/<name>/config.toml`)
 2. apply one logical change at a time
 3. run `rantaiclaw doctor`
 4. restart daemon/service

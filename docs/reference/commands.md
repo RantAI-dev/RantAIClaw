@@ -25,9 +25,9 @@ Last verified: **July 12, 2026**.
 | `migrate` | Import from external runtimes (currently OpenClaw) |
 | `config` | Show the active config (redacted) or export its JSON schema |
 | `completions` | Generate shell completion scripts to stdout |
-| `hardware` | Discover and introspect USB hardware |
-| `peripheral` | Configure and flash peripherals |
-| `kb` | Knowledge Base CRUD + maintenance (gated by `--features kb`) |
+| `hardware` | Discover and introspect USB hardware (present in every build; real USB access needs `--features hardware`) |
+| `peripheral` | Configure and flash peripherals (needs `--features hardware` for serial/flash access) |
+| `kb` | Knowledge Base CRUD + maintenance (in the default build) |
 | `ui` | Install/run/stop the optional web console (claw-ui) |
 
 ## Command Groups
@@ -335,6 +335,8 @@ rows, and the output says when it is showing a subset.
 
 ### `hardware`
 
+The subcommands are always registered, but real USB enumeration needs the `hardware` feature (not in the default set). Without it they print `Hardware discovery requires the 'hardware' feature. Build with: cargo build --features hardware` and exit `0`.
+
 - `rantaiclaw hardware discover`
 - `rantaiclaw hardware introspect <path>`
 - `rantaiclaw hardware info [--chip <chip_name>]`
@@ -349,7 +351,7 @@ rows, and the output says when it is showing a subset.
 
 ### `kb` (Knowledge Base)
 
-Gated by `--features kb`. Off in the default build. See [kb.md](kb.md) for the full KB chapter (architecture, sidecars, HTTP API).
+Built by the `kb` feature, which is part of the **default** feature set — available in a normal `cargo build` / released binary. Drop it only with `--no-default-features`. See [kb.md](kb.md) for the full KB chapter (architecture, sidecars, HTTP API).
 
 The `kb` subcommands follow the axi-cli contract: idempotent, never interactive, TOON output by default, `--json` toggles JSON. Exit code `0` is success, `1` is an operational failure (the binary prints a TOON `error[1]{code,message}:` block to stdout).
 

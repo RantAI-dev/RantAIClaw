@@ -3843,6 +3843,83 @@ fn encrypt_optional_secret(
     Ok(())
 }
 
+/// Top-level config keys the schema recognizes, derived from the generated
+/// JSON schema so it can never drift from the struct. Computed paths that are
+/// skipped during (de)serialization (`config_path`, `workspace_dir`) are
+/// already absent from the schema's `properties`, so they are not treated as
+/// writable keys.
+fn known_top_level_config_keys() -> std::collections::HashSet<String> {
+    let schema = schemars::schema_for!(Config);
+    serde_json::to_value(&schema)
+        .ok()
+        .as_ref()
+        .and_then(|json| json.get("properties"))
+        .and_then(serde_json::Value::as_object)
+        .map(|props| props.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Case-insensitive Levenshtein distance, used only to suggest a near miss for
+/// an unrecognized key. Bounded by the two key lengths and runs at most once
+/// per unknown key, so cost is negligible.
+fn key_edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.to_ascii_lowercase().chars().collect();
+    let b: Vec<char> = b.to_ascii_lowercase().chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Nearest known key within a small edit distance, if any — a typo like
+/// `defualt_provider` resolves to `default_provider`; an entirely foreign key
+/// gets no misleading suggestion.
+fn nearest_known_key<'a>(
+    unknown: &str,
+    known: &'a std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    let threshold = (unknown.len() / 3).max(2);
+    known
+        .iter()
+        .map(|k| (key_edit_distance(unknown, k), k))
+        .filter(|(dist, _)| *dist <= threshold)
+        .min_by_key(|(dist, _)| *dist)
+        .map(|(_, k)| k.as_str())
+}
+
+/// Warn (never fail) on top-level config keys the schema does not recognize.
+/// serde ignores unknown fields, so a mistyped section or key silently loads
+/// as its default; this restores a signal without a hard `deny_unknown_fields`
+/// that would reject forward-compat keys outright.
+fn warn_on_unknown_top_level_config_keys(raw: &toml::Value, config_path: &Path) {
+    let Some(table) = raw.as_table() else {
+        return;
+    };
+    let known = known_top_level_config_keys();
+    if known.is_empty() {
+        return;
+    }
+    for key in table.keys() {
+        if known.contains(key.as_str()) {
+            continue;
+        }
+        let suggestion = nearest_known_key(key, &known)
+            .map(|hint| format!(" (did you mean `{hint}`?)"))
+            .unwrap_or_default();
+        tracing::warn!(
+            "unknown config key `{key}` in {} was ignored{suggestion}",
+            config_path.display()
+        );
+    }
+}
+
 fn config_dir_creation_error(path: &Path) -> String {
     format!(
         "Failed to create config directory: {}. If running as an OpenRC service, \
@@ -3996,8 +4073,8 @@ impl Config {
             // plug in as `migrate_vN` arms in `config::migrations`.
             // If anything changed, persist the migrated form to disk
             // so subsequent loads skip the work.
-            let mut raw: toml::Value =
-                toml::from_str(&contents).context("Failed to parse config file as TOML")?;
+            let mut raw: toml::Value = toml::from_str(&contents)
+                .with_context(|| format!("Failed to parse {} as TOML", config_path.display()))?;
             let migrated = crate::config::migrations::migrate(&mut raw)
                 .context("Failed to migrate config schema")?;
             // A credential that ended up in `api_url` sits on disk in plaintext
@@ -4050,9 +4127,18 @@ impl Config {
                     );
                 }
             }
-            let mut config: Config = raw
-                .try_into()
-                .context("Failed to deserialise (post-migration) config")?;
+            // Flag top-level keys the schema does not recognize. A mistyped
+            // section or key (`[gatway]`, `defualt_provider`) otherwise
+            // deserializes silently to the default and no-ops with no signal.
+            // Runs AFTER migration, so keys a past migration legitimately
+            // removed are already gone and never warned about.
+            warn_on_unknown_top_level_config_keys(&raw, &config_path);
+            let mut config: Config = raw.try_into().with_context(|| {
+                format!(
+                    "Failed to deserialise (post-migration) config at {}",
+                    config_path.display()
+                )
+            })?;
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
@@ -4919,6 +5005,37 @@ mod tests {
                 .is_some(),
             "schema should include reusable type definitions"
         );
+    }
+
+    #[test]
+    async fn known_top_level_keys_cover_real_fields_and_exclude_computed_paths() {
+        let known = known_top_level_config_keys();
+        assert!(known.contains("default_provider"));
+        assert!(known.contains("gateway"));
+        assert!(known.contains("channels_config"));
+        // Computed paths are serde-skipped and must not be treated as writable.
+        assert!(!known.contains("config_path"));
+        assert!(!known.contains("workspace_dir"));
+    }
+
+    #[test]
+    async fn nearest_known_key_suggests_typo_but_not_foreign_key() {
+        let known = known_top_level_config_keys();
+        assert_eq!(
+            nearest_known_key("defualt_provider", &known),
+            Some("default_provider")
+        );
+        // A key with no near neighbour gets no misleading suggestion.
+        assert_eq!(nearest_known_key("zzzzzzzzzzzz", &known), None);
+    }
+
+    #[test]
+    async fn unknown_key_warning_does_not_flag_known_keys() {
+        // The warn path must be silent (no panic, no fail) for a well-formed
+        // config; this exercises the table walk over every real top-level key.
+        let raw =
+            toml::Value::try_from(Config::default()).expect("default config serializes to toml");
+        warn_on_unknown_top_level_config_keys(&raw, Path::new("/tmp/config.toml"));
     }
 
     #[test]
