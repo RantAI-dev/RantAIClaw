@@ -83,9 +83,30 @@ pub fn finalize_channel(
     category: ProvisionerCategory,
     profile: &crate::profile::Profile,
     config: &crate::config::Config,
-) -> Option<String> {
+) -> ChannelFinalizeOutcome {
     install_core_skills_after_channel(category, profile);
-    owner_claim_guidance(category, config)
+    ChannelFinalizeOutcome {
+        owner_guidance: owner_claim_guidance(category, config),
+        // A channel's config just changed. The web console and
+        // `channel bind-telegram` reload the managed daemon after such a change
+        // (`config_api::schedule_daemon_reload` / `announce_daemon_reload`); the
+        // setup-overlay + `setup <channel>` paths did not, so the channel looked
+        // configured and did nothing until a manual restart. The driver performs
+        // the reload AFTER it saves config.toml — the daemon reloads from disk.
+        needs_daemon_reload: category == ProvisionerCategory::Channel,
+    }
+}
+
+/// What a channel provisioner's driver must act on once `run` reports
+/// [`ProvisionOutcome::Configured`]: render the owner guidance, and — after
+/// persisting the config — reload the managed daemon if one is running.
+pub struct ChannelFinalizeOutcome {
+    /// Owner-claim guidance to render, or `None` when an owner is already set.
+    pub owner_guidance: Option<String>,
+    /// Whether the managed daemon should be reloaded to pick up the new channel.
+    /// The driver reloads AFTER saving `config.toml`, since the daemon re-reads
+    /// the file on reload.
+    pub needs_daemon_reload: bool,
 }
 
 /// The note a freshly configured channel needs when nobody can approve on it
@@ -250,5 +271,27 @@ mod core_skill_hook_tests {
                 "{category:?} has no channel for anyone to own"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn finalize_channel_signals_reload() {
+        // The decision only — not a live restart — so the test needs no daemon:
+        // a configured channel requests a daemon reload (the driver performs it
+        // after saving), a non-channel category does not.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::set(tmp.path());
+        let profile = scratch_profile(tmp.path());
+        let config = crate::config::Config::default();
+
+        assert!(
+            finalize_channel(ProvisionerCategory::Channel, &profile, &config).needs_daemon_reload,
+            "a configured channel must request a daemon reload"
+        );
+        assert!(
+            !finalize_channel(ProvisionerCategory::Integration, &profile, &config)
+                .needs_daemon_reload,
+            "a non-channel provisioner must not"
+        );
     }
 }

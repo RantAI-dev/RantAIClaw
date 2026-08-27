@@ -1625,8 +1625,33 @@ async fn main() -> Result<()> {
                     // prints events to stdout, waits for Done/Fail/timeout.
                     let mut config = Config::load_or_init().await?;
                     let profile = profile::ProfileManager::active()?;
-                    run_provisioner_headless(provisioner.as_ref(), &mut config, &profile).await?;
+                    let needs_daemon_reload =
+                        run_provisioner_headless(provisioner.as_ref(), &mut config, &profile)
+                            .await?;
                     config.save().await?;
+                    if needs_daemon_reload {
+                        // Reload the managed daemon so the just-saved channel is
+                        // live — after the save (the daemon re-reads config.toml).
+                        // Blocking (shells out); run off the async worker.
+                        match tokio::task::spawn_blocking(channels::reload_managed_daemon).await {
+                            Ok(Ok(true)) => {
+                                println!(
+                                    "🔄 Reloaded the running daemon to apply the new channel."
+                                );
+                            }
+                            Ok(Ok(false)) => {
+                                println!(
+                                    "ℹ️ No managed daemon detected — start or restart it to load the new channel."
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!(
+                                    "⚠️ Saved, but couldn't reload the daemon automatically: {e}"
+                                );
+                            }
+                            Err(e) => eprintln!("⚠️ Daemon reload task panicked: {e}"),
+                        }
+                    }
                     return Ok(());
                 }
             }
@@ -2989,11 +3014,14 @@ mod tests {
 /// Run a provisioner in headless mode, printing events to stdout and
 /// waiting for completion or a timeout. Used by `rantaiclaw setup <name>
 /// --non-interactive`.
+/// Returns whether the managed daemon should be reloaded (a channel was
+/// configured). The CALLER performs the reload after it persists `config.toml`,
+/// since the daemon re-reads the file on reload.
 async fn run_provisioner_headless(
     provisioner: &dyn onboard::provision::TuiProvisioner,
     config: &mut Config,
     profile: &profile::Profile,
-) -> Result<()> {
+) -> Result<bool> {
     use onboard::provision::{ProvisionEvent, ProvisionIo};
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
@@ -3094,6 +3122,7 @@ async fn run_provisioner_headless(
         .await
     };
 
+    let mut needs_daemon_reload = false;
     match timed {
         Ok((prov_result, _)) => {
             match prov_result {
@@ -3107,11 +3136,12 @@ async fn run_provisioner_headless(
                 // A configured multi-user channel is the point at which the
                 // owner needs to be able to manage permissions from chat.
                 Ok(onboard::provision::ProvisionOutcome::Configured) => {
-                    if let Some(guidance) =
-                        onboard::provision::finalize_channel(provisioner_category, profile, config)
-                    {
+                    let finalize =
+                        onboard::provision::finalize_channel(provisioner_category, profile, config);
+                    if let Some(guidance) = finalize.owner_guidance {
                         eprintln!("\n🔐 {guidance}");
                     }
+                    needs_daemon_reload = finalize.needs_daemon_reload;
                 }
             }
         }
@@ -3120,5 +3150,5 @@ async fn run_provisioner_headless(
         }
     }
 
-    Ok(())
+    Ok(needs_daemon_reload)
 }

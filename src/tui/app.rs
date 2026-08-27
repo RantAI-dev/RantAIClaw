@@ -4198,11 +4198,12 @@ impl TuiApp {
                     // sure the skill that explains those tools is present.
                     // Runs before the config save below because it touches the
                     // profile's skills dir, not the config.
-                    if let Some(guidance) = crate::onboard::provision::finalize_channel(
+                    let finalize = crate::onboard::provision::finalize_channel(
                         prov_category,
                         &profile,
                         &config,
-                    ) {
+                    );
+                    if let Some(guidance) = finalize.owner_guidance {
                         let _ = save_failure_tx
                             .send(crate::onboard::provision::ProvisionEvent::Message {
                                 severity: crate::onboard::provision::Severity::Warn,
@@ -4235,6 +4236,48 @@ impl TuiApp {
                             // race where the next overlay would clone a
                             // stale self.config and overwrite this save.
                             let _ = save_tx.send(config);
+
+                            // Reload the managed daemon so a channel configured
+                            // here is actually live — only AFTER a successful
+                            // save (the daemon re-reads config.toml). Blocking
+                            // (shells out), so run it off the worker; best-effort
+                            // — no managed daemon means nothing to reload.
+                            if finalize.needs_daemon_reload {
+                                match tokio::task::spawn_blocking(
+                                    crate::channels::reload_managed_daemon,
+                                )
+                                .await
+                                {
+                                    Ok(Ok(true)) => {
+                                        let _ = save_failure_tx
+                                            .send(crate::onboard::provision::ProvisionEvent::Message {
+                                                severity: crate::onboard::provision::Severity::Info,
+                                                text: "Reloaded the running daemon to apply the new channel."
+                                                    .into(),
+                                            })
+                                            .await;
+                                    }
+                                    Ok(Ok(false)) => {} // no managed daemon — nothing to reload
+                                    Ok(Err(e)) => {
+                                        let _ = save_failure_tx
+                                            .send(crate::onboard::provision::ProvisionEvent::Message {
+                                                severity: crate::onboard::provision::Severity::Warn,
+                                                text: format!(
+                                                    "Saved, but couldn't reload the daemon automatically: {e}"
+                                                ),
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ = save_failure_tx
+                                            .send(crate::onboard::provision::ProvisionEvent::Message {
+                                                severity: crate::onboard::provision::Severity::Warn,
+                                                text: format!("Daemon reload task panicked: {e}"),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!(
