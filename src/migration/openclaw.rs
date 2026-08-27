@@ -90,6 +90,11 @@ pub struct MigrationSummary {
     pub skills_migrated: usize,
     pub secrets_migrated: usize,
     pub config_blocks_migrated: usize,
+    /// Set when porting `skills.entries` from `openclaw.json` failed. The
+    /// destination config is left intact (the port writes atomically only on
+    /// success), but the per-skill settings were not carried — surface it rather
+    /// than silently reporting a clean migration.
+    pub skills_port_error: Option<String>,
 }
 
 impl MigrationSummary {
@@ -103,6 +108,12 @@ impl MigrationSummary {
             self.source_root.display(),
             self.profile_name,
         );
+        if let Some(err) = &self.skills_port_error {
+            eprintln!(
+                "⚠️  Could not port per-skill settings from openclaw.json ({err}). \
+                 The config is intact; re-add those skills or hand-edit config.toml."
+            );
+        }
     }
 }
 
@@ -198,12 +209,13 @@ pub fn migrate_to_profile(
     // missing file or unparseable JSON is logged and skipped, never fails
     // the whole migration.
     let dest_config = crate::profile::paths::config_toml(profile_name);
-    if let Err(e) = port_skills_entries(&source.openclaw_json(), &dest_config) {
-        tracing::warn!(
-            error = %e,
-            "skills.entries port failed; user can hand-edit config.toml"
-        );
-    }
+    let skills_port_error = match port_skills_entries(&source.openclaw_json(), &dest_config) {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "skills.entries port failed; destination config left intact");
+            Some(e.to_string())
+        }
+    };
 
     Ok(MigrationSummary {
         source_root: source.root.clone(),
@@ -212,6 +224,7 @@ pub fn migrate_to_profile(
         skills_migrated,
         secrets_migrated,
         config_blocks_migrated,
+        skills_port_error,
     })
 }
 
@@ -346,73 +359,177 @@ fn port_skills_entries(openclaw_json: &Path, dest_config_toml: &Path) -> Result<
         }
     }
 
-    let mut toml_out = String::from(
-        "\n# Migrated from openclaw.json: per-skill enabled / api_key / env / config.\n",
-    );
+    // Build skills.entries as a typed toml structure and MERGE it into the parsed
+    // destination, so slugs, keys, and values are escaped by the serializer — a
+    // hostile slug or value in openclaw.json can no longer inject arbitrary TOML
+    // (e.g. flipping `[gateway] require_pairing`). Encrypt any literal
+    // `api_key.value` the way `Config::save` does instead of writing it plaintext.
+    let dest_text = fs::read_to_string(dest_config_toml).unwrap_or_default();
+    let mut dest: toml::Value = if dest_text.trim().is_empty() {
+        toml::Value::Table(toml::value::Table::new())
+    } else {
+        toml::from_str(&dest_text)
+            .with_context(|| format!("parse destination {}", dest_config_toml.display()))?
+    };
+
+    let encrypt = dest
+        .get("secrets")
+        .and_then(|s| s.get("encrypt"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    let store_dir = dest_config_toml.parent().unwrap_or_else(|| Path::new("."));
+    let store = crate::security::SecretStore::new(store_dir, encrypt);
+
+    let entries_tbl = dest
+        .as_table_mut()
+        .context("destination config is not a TOML table")?
+        .entry("skills".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+        .as_table_mut()
+        .context("[skills] is not a table")?
+        .entry("entries".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+        .as_table_mut()
+        .context("[skills.entries] is not a table")?;
+
+    let mut ported = 0usize;
     for (slug, entry) in entries {
-        toml_out.push_str(&format!("[skills.entries.{slug}]\n"));
-        let enabled = entry
-            .get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        toml_out.push_str(&format!("enabled = {enabled}\n"));
+        if slug.is_empty()
+            || !slug
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            tracing::warn!(slug = %slug, "skipping openclaw skill with a non-slug name");
+            continue;
+        }
 
-        // env: { K = "V" }
+        let mut e = toml::value::Table::new();
+        e.insert(
+            "enabled".to_string(),
+            toml::Value::Boolean(
+                entry
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            ),
+        );
+
         if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
-            if !env.is_empty() {
-                toml_out.push('\n');
-                toml_out.push_str(&format!("[skills.entries.{slug}.env]\n"));
-                for (k, v) in env {
-                    if let Some(s) = v.as_str() {
-                        toml_out.push_str(&format!("{k} = {}\n", toml::Value::String(s.into())));
-                    }
+            let mut env_tbl = toml::value::Table::new();
+            for (k, v) in env {
+                if let Some(s) = v.as_str() {
+                    env_tbl.insert(k.clone(), toml::Value::String(s.to_string()));
                 }
+            }
+            if !env_tbl.is_empty() {
+                e.insert("env".to_string(), toml::Value::Table(env_tbl));
             }
         }
 
-        // apiKey → api_key
         if let Some(api_key) = entry.get("apiKey").or_else(|| entry.get("api_key")) {
-            toml_out.push('\n');
-            toml_out.push_str(&format!("[skills.entries.{slug}.api_key]\n"));
-            if let Some(s) = api_key.get("source").and_then(|v| v.as_str()) {
-                toml_out.push_str(&format!("source = \"{s}\"\n"));
+            let mut ak = toml::value::Table::new();
+            let source = api_key
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("env");
+            ak.insert(
+                "source".to_string(),
+                toml::Value::String(source.to_string()),
+            );
+            if let Some(id) = api_key.get("id").and_then(|v| v.as_str()) {
+                ak.insert("id".to_string(), toml::Value::String(id.to_string()));
             }
-            if let Some(s) = api_key.get("id").and_then(|v| v.as_str()) {
-                toml_out.push_str(&format!("id = \"{s}\"\n"));
+            if let Some(value) = api_key.get("value").and_then(|v| v.as_str()) {
+                // A literal credential is encrypted at rest, matching Config::save.
+                let stored = if source == "literal" {
+                    store
+                        .encrypt(value)
+                        .context("encrypt migrated skill api_key")?
+                } else {
+                    value.to_string()
+                };
+                ak.insert("value".to_string(), toml::Value::String(stored));
             }
-            if let Some(s) = api_key.get("value").and_then(|v| v.as_str()) {
-                toml_out.push_str(&format!("value = \"{s}\"\n"));
-            }
+            e.insert("api_key".to_string(), toml::Value::Table(ak));
         }
 
-        // config: free-form
         if let Some(cfg) = entry.get("config").and_then(|v| v.as_object()) {
-            if !cfg.is_empty() {
-                toml_out.push('\n');
-                toml_out.push_str(&format!("[skills.entries.{slug}.config]\n"));
-                for (k, v) in cfg {
-                    let rendered = match v {
-                        serde_json::Value::String(s) => toml::Value::String(s.clone()).to_string(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        other => format!("\"{}\"", other.to_string().replace('"', "\\\"")),
-                    };
-                    toml_out.push_str(&format!("{k} = {rendered}\n"));
+            let mut cfg_tbl = toml::value::Table::new();
+            for (k, v) in cfg {
+                if let Some(tv) = json_to_toml(v) {
+                    cfg_tbl.insert(k.clone(), tv);
                 }
             }
+            if !cfg_tbl.is_empty() {
+                e.insert("config".to_string(), toml::Value::Table(cfg_tbl));
+            }
         }
 
-        toml_out.push('\n');
+        entries_tbl.insert(slug.clone(), toml::Value::Table(e));
+        ported += 1;
     }
 
-    let mut existing = fs::read_to_string(dest_config_toml).unwrap_or_default();
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        existing.push('\n');
-    }
-    existing.push_str(&toml_out);
-
-    fs::write(dest_config_toml, existing)
+    let serialized = toml::to_string_pretty(&dest).context("serialise migrated config")?;
+    write_config_0600(dest_config_toml, serialized.as_bytes())
         .with_context(|| format!("write {}", dest_config_toml.display()))?;
+    tracing::info!(count = ported, "ported openclaw skills.entries");
+    Ok(())
+}
+
+/// Convert a JSON value to a TOML value for the free-form `config` block.
+/// Null (which TOML cannot represent) is dropped.
+fn json_to_toml(v: &serde_json::Value) -> Option<toml::Value> {
+    Some(match v {
+        serde_json::Value::Null => return None,
+        serde_json::Value::Bool(b) => toml::Value::Boolean(*b),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(toml::Value::Integer)
+            .or_else(|| n.as_f64().map(toml::Value::Float))?,
+        serde_json::Value::String(s) => toml::Value::String(s.clone()),
+        serde_json::Value::Array(a) => {
+            toml::Value::Array(a.iter().filter_map(json_to_toml).collect())
+        }
+        serde_json::Value::Object(o) => {
+            let mut t = toml::value::Table::new();
+            for (k, val) in o {
+                if let Some(tv) = json_to_toml(val) {
+                    t.insert(k.clone(), tv);
+                }
+            }
+            toml::Value::Table(t)
+        }
+    })
+}
+
+/// Sync atomic 0600 write (temp + rename) for the migrated config, which carries
+/// secrets. Mirrors `Config::save`'s durability without needing its async path.
+fn write_config_0600(target: &Path, contents: &[u8]) -> Result<()> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).ok();
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml");
+    let tmp = parent.join(format!(".{name}.mig-tmp-{}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp, contents)?;
+    }
+    fs::rename(&tmp, target)?;
     Ok(())
 }
 
@@ -663,5 +780,80 @@ mod port_tests {
         // Just don't panic / fail
         port_skills_entries(&json_path, &toml_path).unwrap();
         assert!(!toml_path.exists());
+    }
+
+    #[test]
+    fn port_skills_entries_escapes_hostile_values_and_slugs() {
+        let tmp = TempDir::new().unwrap();
+        let json_path = tmp.path().join("openclaw.json");
+        let toml_path = tmp.path().join("config.toml");
+        // A value that tries to close its string and inject a top-level section,
+        // and a slug with TOML metacharacters. Neither may reach the output as TOML.
+        fs::write(
+            &json_path,
+            r#"{
+                "skills": {
+                    "entries": {
+                        "evil.slug]": { "enabled": true },
+                        "ok": {
+                            "enabled": true,
+                            "config": {
+                                "note": "x\"\n[gateway]\nrequire_pairing = false\nallowed_users = [\"*\"]"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        port_skills_entries(&json_path, &toml_path).unwrap();
+        let body = fs::read_to_string(&toml_path).unwrap();
+        // The output must be valid TOML that parses back into a config.
+        let parsed: toml::Value =
+            toml::from_str(&body).expect("migrated config must be valid TOML");
+        // The injected gateway section must NOT exist as a real table — it can only
+        // survive as an escaped string inside the skill's config note.
+        let injected = parsed.get("gateway").and_then(|g| g.get("require_pairing"));
+        assert!(
+            injected.is_none(),
+            "value injected a [gateway] section: {body}"
+        );
+        // The non-slug name was rejected.
+        let entries = parsed["skills"]["entries"].as_table().unwrap();
+        assert!(entries.contains_key("ok"));
+        assert!(
+            !entries.contains_key("evil.slug]"),
+            "a non-slug name must be skipped"
+        );
+    }
+
+    #[test]
+    fn port_skills_entries_encrypts_a_literal_key() {
+        let tmp = TempDir::new().unwrap();
+        let json_path = tmp.path().join("openclaw.json");
+        let toml_path = tmp.path().join("config.toml");
+        const MARKER: &str = "PLAINTEXT_SKILL_KEY_marker";
+        fs::write(
+            &json_path,
+            format!(
+                r#"{{ "skills": {{ "entries": {{ "svc": {{
+                    "enabled": true,
+                    "apiKey": {{ "source": "literal", "value": "{MARKER}" }}
+                }} }} }} }}"#
+            ),
+        )
+        .unwrap();
+
+        port_skills_entries(&json_path, &toml_path).unwrap();
+        let body = fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            !body.contains(MARKER),
+            "a literal skill key must be encrypted at rest, not written plaintext: {body}"
+        );
+        assert!(
+            body.contains("enc2:"),
+            "the stored literal key should be enc2:-prefixed ciphertext: {body}"
+        );
     }
 }
