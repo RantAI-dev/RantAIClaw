@@ -84,6 +84,18 @@ jobs:
               run: ./scripts/ci/check_provisioner_probe_hosts.sh
             - name: Channel config fields have runtime readers
               run: ./scripts/ci/check_channel_config_readers.sh
+            # ADVISORY (continue-on-error) — plan 261. Broader coverage that is
+            # not yet reliable enough to block: the whole-schema reader check has
+            # grep limits (destructured/by-value reads, shared field names) and
+            # the command-coverage check still has a documented backlog (J5/J6).
+            # Flip to blocking (remove continue-on-error) once the AST-based
+            # reader pass lands and the command reference is complete.
+            - name: Every CLI command is documented (advisory)
+              continue-on-error: true
+              run: ./scripts/ci/docs_command_coverage.sh
+            - name: All config fields have runtime readers (advisory)
+              continue-on-error: true
+              run: ./scripts/ci/check_config_readers.sh
 
     test:
         name: Test
@@ -283,6 +295,14 @@ jobs:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
                   DOCS_FILES: ${{ needs.changes.outputs.docs_files }}
               run: ./scripts/ci/docs_quality_gate.sh
+
+            # ADVISORY (continue-on-error) — plan 261. Also runs on the code side
+            # (Lint Gate) so a command added in src/ is caught; here it catches a
+            # command dropped from the reference by a docs edit. Flip to blocking
+            # once the command reference is complete (J5/J6).
+            - name: Every CLI command is documented (advisory)
+              continue-on-error: true
+              run: ./scripts/ci/docs_command_coverage.sh
 
             - name: Collect added links
               id: collect_links
