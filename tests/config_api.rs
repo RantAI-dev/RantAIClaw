@@ -209,6 +209,91 @@ async fn put_model_without_auth_returns_401() {
     );
 }
 
+/// H1: the file's doc claims `check_auth` gates every route, but only two routes
+/// had a 401 test. Cover every (method, path) at once. Each body-carrying route
+/// gets a body its `Json<_>` extractor accepts (axum runs extractors before the
+/// handler, so a bodyless PUT/POST is rejected by the extractor, not the auth
+/// gate); the body only exists so `check_auth` is the thing that fails. The
+/// high-consequence writes (`PUT /secrets`, `POST /mcp_servers`) are the point.
+#[tokio::test]
+async fn every_config_api_route_requires_auth() {
+    use serde_json::json;
+    let workspace = tempfile::tempdir().expect("tempdir creation should succeed");
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+    let client = reqwest::Client::new();
+
+    let mut routes: Vec<(reqwest::Method, &str, serde_json::Value)> = vec![
+        (reqwest::Method::GET, "/api/v1/config", json!({})),
+        (reqwest::Method::PUT, "/api/v1/config/model", json!({})),
+        (reqwest::Method::PUT, "/api/v1/config/autonomy", json!({})),
+        (reqwest::Method::GET, "/api/v1/secrets", json!({})),
+        (reqwest::Method::PUT, "/api/v1/secrets", json!({})),
+        // McpServerBody requires `command`; everything else is all-optional.
+        (
+            reqwest::Method::POST,
+            "/api/v1/config/mcp_servers/probe",
+            json!({ "command": "echo" }),
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/api/v1/config/mcp_servers/probe",
+            json!({}),
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/v1/channels/telegram",
+            json!({}),
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/api/v1/channels/telegram",
+            json!({}),
+        ),
+    ];
+    #[cfg(feature = "kb")]
+    {
+        routes.push((reqwest::Method::GET, "/api/v1/config/knowledge", json!({})));
+        routes.push((reqwest::Method::PUT, "/api/v1/config/knowledge", json!({})));
+    }
+
+    for (method, path, body) in routes {
+        let resp = client
+            .request(method.clone(), format!("{base_url}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{method} {path} request failed: {e}"));
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{method} {path} without a bearer token must be rejected"
+        );
+    }
+}
+
+/// The bypass side of the gate: when `require_pairing = false`, `check_auth`
+/// returns Ok, so an unauthenticated request is NOT rejected with 401 (it runs
+/// the handler and fails, if at all, for a different reason — a bad body, etc.).
+#[tokio::test]
+async fn require_pairing_false_bypasses_auth() {
+    let workspace = tempfile::tempdir().expect("tempdir creation should succeed");
+    let mut config = test_config(workspace.path());
+    config.gateway.require_pairing = false;
+    let base_url = spawn_test_gateway(config).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base_url}/api/v1/config"))
+        .send()
+        .await
+        .expect("request should complete");
+
+    assert_ne!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "with require_pairing=false, an unauthenticated GET must NOT be 401"
+    );
+}
+
 #[tokio::test]
 async fn get_channels_returns_200() {
     let workspace = tempfile::tempdir().expect("tempdir creation should succeed");

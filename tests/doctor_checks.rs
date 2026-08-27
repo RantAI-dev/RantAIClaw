@@ -61,7 +61,9 @@ fn ctx_with_provider(
 
 #[tokio::test]
 async fn provider_ping_succeeds_on_mock_endpoint() {
-    let _guard = MOCKITO_LOCK.lock().unwrap();
+    // Poison-tolerant: if one mockito test panics while holding the lock, the
+    // rest must still run instead of cascading into spurious "poisoned" failures.
+    let _guard = MOCKITO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut server = mockito::Server::new_async().await;
     let mock = server
         .mock("GET", "/models")
@@ -80,7 +82,9 @@ async fn provider_ping_succeeds_on_mock_endpoint() {
 
 #[tokio::test]
 async fn provider_ping_fails_on_401() {
-    let _guard = MOCKITO_LOCK.lock().unwrap();
+    // Poison-tolerant: if one mockito test panics while holding the lock, the
+    // rest must still run instead of cascading into spurious "poisoned" failures.
+    let _guard = MOCKITO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut server = mockito::Server::new_async().await;
     let _mock = server
         .mock("GET", "/models")
