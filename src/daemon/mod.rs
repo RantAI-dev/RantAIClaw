@@ -291,7 +291,14 @@ where
             }
 
             crate::health::bump_component_restart(name);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            // Race the backoff against shutdown — a SIGTERM arriving mid-backoff
+            // must stop the component promptly, not wait out the (up to
+            // max_backoff) sleep. Every `service stop`/`restart` hit this whenever
+            // a component was in its retry window.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                () = shutdown.cancelled() => break,
+            }
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
@@ -464,6 +471,31 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("component exited unexpectedly"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_stops_promptly_during_backoff() {
+        let shutdown = CancellationToken::new();
+        let handle = spawn_component_supervisor(
+            "daemon-test-backoff",
+            // Large backoff so the task is parked in the retry sleep, not spinning.
+            60,
+            60,
+            shutdown.clone(),
+            || async { anyhow::bail!("always fails") },
+        );
+
+        // Let the component fail once and enter the backoff sleep.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A shutdown arriving mid-backoff must stop the supervisor promptly
+        // instead of waiting out the full 60s sleep.
+        shutdown.cancel();
+
+        let stopped = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            stopped.is_ok(),
+            "supervisor did not stop promptly during backoff"
+        );
     }
 
     #[test]
