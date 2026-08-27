@@ -356,6 +356,11 @@ async fn lock_and_load(
 /// called while holding the [`lock_and_load`] guard so a concurrent writer can't
 /// interleave between the disk read and this save.
 async fn persist_and_swap(state: &AppState, cfg: crate::config::Config) -> Result<(), ApiError> {
+    // Reject a config the loader would refuse, at the write boundary — otherwise a
+    // console write can persist a state that then bricks the next startup (e.g.
+    // autonomy.max_actions_per_hour = 0) or an out-of-range temperature that 400s
+    // every provider call, both far from the request that caused it.
+    cfg.validate().map_err(|e| err_400(e.to_string()))?;
     cfg.save().await.map_err(err_500)?;
     *state.config.lock() = cfg;
     Ok(())
@@ -466,10 +471,10 @@ async fn set_autonomy(
             parse_level(&l).ok_or_else(|| err_400(format!("invalid autonomy level: {l}")))?;
     }
     if let Some(v) = body.auto_approve {
-        cfg.autonomy.auto_approve = v;
+        cfg.autonomy.auto_approve = validate_tool_entries(v)?;
     }
     if let Some(v) = body.always_ask {
-        cfg.autonomy.always_ask = v;
+        cfg.autonomy.always_ask = validate_tool_entries(v)?;
     }
     if let Some(v) = body.allowed_commands {
         // Validate each entry into a single basename (the shell gate matches by
@@ -564,6 +569,29 @@ fn validate_mcp_command(command: &str) -> Result<(), ApiError> {
 fn is_loader_env_key(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
     k == "LD_PRELOAD" || k == "LD_LIBRARY_PATH" || k.starts_with("DYLD_")
+}
+
+/// Validate autonomy tool-list entries. A malformed entry (empty, whitespace, or
+/// multiple tokens) can never match the gate's exact-string comparison, so it
+/// would silently fail open while being echoed back as if enforced — reject it.
+/// A well-formed but unknown name can't be caught without the full runtime tool
+/// registry (a known gap; the `"*"` wildcard is the safe catch-all). Entries are
+/// trimmed so a stray-space value doesn't quietly never match.
+fn validate_tool_entries(entries: Vec<String>) -> Result<Vec<String>, ApiError> {
+    let mut cleaned = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let t = entry.trim();
+        if t.is_empty() {
+            return Err(err_400("tool name must not be empty"));
+        }
+        if t.split_whitespace().count() != 1 {
+            return Err(err_400(format!(
+                "tool name '{entry}' must be a single token (or '*')"
+            )));
+        }
+        cleaned.push(t.to_string());
+    }
+    Ok(cleaned)
 }
 
 /// Merge an MCP write onto an existing entry: the command is required, but an
@@ -728,7 +756,7 @@ fn schedule_daemon_reload() {
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
         match tokio::task::spawn_blocking(crate::channels::reload_managed_daemon).await {
             Ok(Ok(true)) => {
-                tracing::info!(target: "gateway", "channel change: reloaded managed daemon service")
+                tracing::info!(target: "gateway", "channel change: reloaded managed daemon service");
             }
             Ok(Ok(false)) => tracing::info!(
                 target: "gateway",
@@ -739,7 +767,7 @@ fn schedule_daemon_reload() {
                 "channel change saved but managed daemon reload failed: {e}"
             ),
             Err(e) => {
-                tracing::warn!(target: "gateway", "managed daemon reload task failed to join: {e}")
+                tracing::warn!(target: "gateway", "managed daemon reload task failed to join: {e}");
             }
         }
     });
@@ -1311,6 +1339,19 @@ mod tests {
         for k in ["PATH", "API_KEY", "NODE_ENV"] {
             assert!(!is_loader_env_key(k), "{k} should be allowed");
         }
+    }
+
+    #[test]
+    fn validate_tool_entries_rejects_malformed_and_trims() {
+        // Empty / whitespace / multi-token entries can never match the exact-string
+        // gate, so they must be rejected rather than silently failing open.
+        assert!(validate_tool_entries(vec![String::new()]).is_err());
+        assert!(validate_tool_entries(vec!["   ".into()]).is_err());
+        assert!(validate_tool_entries(vec!["shell tool".into()]).is_err());
+        // Well-formed entries pass and are trimmed; `*` is allowed.
+        let ok = validate_tool_entries(vec!["  shell  ".into(), "*".into()])
+            .expect("well-formed entries should pass");
+        assert_eq!(ok, vec!["shell".to_string(), "*".to_string()]);
     }
 
     #[test]
