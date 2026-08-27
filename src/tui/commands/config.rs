@@ -559,10 +559,46 @@ fn scheduler_diag(state_file: &std::path::Path) -> (StatusKind, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::info_panel::InfoRow;
 
     fn test_context() -> TuiContext {
         let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
         ctx
+    }
+
+    /// Run `/doctor` with a fixed model and the given `provider_key_ok`, and
+    /// return the `StatusKind` of the "Model configured" row. Pins the fix for
+    /// the past false-green where `!model.is_empty()` alone reported "✓ Model
+    /// configured" on a keyless install.
+    fn doctor_model_status(provider_key_ok: Option<bool>) -> StatusKind {
+        let mut ctx = test_context();
+        ctx.model = "test-model".to_string();
+        ctx.provider_key_ok = provider_key_ok;
+        let result = DoctorCommand.execute("", &mut ctx).unwrap();
+        let CommandResult::OpenInfoPanel(panel) = result else {
+            panic!("`/doctor` must open an info panel");
+        };
+        let core = panel
+            .sections
+            .iter()
+            .find(|s| s.heading.as_deref() == Some("Core"))
+            .expect("doctor panel has a Core section");
+        core.rows
+            .iter()
+            .find_map(|r| match r {
+                InfoRow::Status { kind, label, .. } if label == "Model configured" => Some(*kind),
+                _ => None,
+            })
+            .expect("Core section has a `Model configured` row")
+    }
+
+    #[test]
+    fn doctor_model_row_reflects_provider_key_state() {
+        // Key present or provider local → Ok; a genuinely missing key → Warn
+        // (a setup gap, not a hard fail); no provider to judge → Ok.
+        assert_eq!(doctor_model_status(Some(true)), StatusKind::Ok);
+        assert_eq!(doctor_model_status(Some(false)), StatusKind::Warn);
+        assert_eq!(doctor_model_status(None), StatusKind::Ok);
     }
 
     #[test]
