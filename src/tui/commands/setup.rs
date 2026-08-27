@@ -240,4 +240,46 @@ mod tests {
             assert_eq!(category_from_arg(category_key(cat)), Some(cat));
         }
     }
+
+    // The resolver tests above prove `category_from_arg`/`provisioner_for` map
+    // correctly, but nothing exercised `SetupCommand::execute` itself — the
+    // routing from a raw arg to a `CommandResult` variant. These pin it.
+
+    #[test]
+    fn execute_full_opens_the_first_run_wizard() {
+        let (mut ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let result = SetupCommand.execute("full", &mut ctx).unwrap();
+        assert!(
+            matches!(result, CommandResult::OpenFirstRunWizard),
+            "`/setup full` must open the wizard, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn execute_provisioner_arg_opens_the_overlay() {
+        // `runtime` names both a provisioner and a category; provisioner-first
+        // resolution opens the overlay for it.
+        let (mut ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let result = SetupCommand.execute("runtime", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenSetupOverlay { provisioner } => {
+                assert_eq!(provisioner.as_deref(), Some("runtime"));
+            }
+            other => panic!("expected OpenSetupOverlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_category_only_arg_opens_the_category() {
+        // `channels` is a category but not a provisioner, so it falls through to
+        // the category overlay (the arg that used to error).
+        let (mut ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let result = SetupCommand.execute("channels", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenSetupCategory { category } => {
+                assert_eq!(category, category_key(ProvisionerCategory::Channel));
+            }
+            other => panic!("expected OpenSetupCategory, got {other:?}"),
+        }
+    }
 }
