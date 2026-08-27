@@ -92,6 +92,59 @@ fn sessions_ddl_does_not_drift_unannounced() {
     });
 }
 
+/// H3: the schema-drift gate was self-referential — snapshots are suffixed by
+/// `CURRENT_VERSION` and 27/28 migration tests assert against it, so a
+/// `CURRENT_VERSION` bump + `insta accept` with NO `migrate_vN` arm shipped
+/// green. This companion fails if a `config_schema@vN` snapshot exists without a
+/// matching `if from < N` arm in `migrations.rs`, so a bump can't skip its arm.
+#[test]
+fn every_schema_snapshot_has_a_migration_arm() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let src = std::fs::read_to_string(format!("{manifest}/src/config/migrations.rs"))
+        .expect("read migrations.rs source");
+
+    let mut checked = 0;
+    for entry in std::fs::read_dir(format!("{manifest}/tests/snapshots")).expect("read snapshots") {
+        let name = entry
+            .expect("dir entry")
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        let Some(n) = name
+            .strip_prefix("schema_drift__config_schema@v")
+            .and_then(|s| s.strip_suffix(".snap"))
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if n == 0 {
+            continue; // v0 is the implicit pre-framework baseline (no arm).
+        }
+        let arm = format!("if from < {n}");
+        assert!(
+            src.contains(&arm),
+            "config_schema@v{n} snapshot exists but migrations.rs has no `{arm}` arm — \
+             a version bump must ship its migrate_vN arm, not just an accepted snapshot"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no config_schema snapshots found — the gate is inert"
+    );
+}
+
+/// A literal pin so a `CURRENT_VERSION` bump is a deliberate two-file edit (this
+/// pin + the migration arm), not a silent `insta accept`. Update alongside a bump.
+#[test]
+fn current_version_is_pinned() {
+    assert_eq!(
+        config_migrations::CURRENT_VERSION,
+        24,
+        "CURRENT_VERSION changed — bump this pin AND add the migrate_vN arm + snapshot"
+    );
+}
+
 /// Read every CREATE statement in `sqlite_master`, normalise whitespace,
 /// and sort so the snapshot is deterministic across SQLite versions.
 fn dump_sqlite_master(conn: &Connection) -> String {

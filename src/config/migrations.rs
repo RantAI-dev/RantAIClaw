@@ -46,11 +46,25 @@ pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// if any transformation ran (caller should persist the result),
 /// `Ok(false)` if the config was already current (no write needed).
 pub fn migrate(raw: &mut Value) -> Result<bool> {
-    let from = raw
-        .get(SCHEMA_VERSION_KEY)
-        .and_then(|v| v.as_integer())
-        .map(|i| i as u32)
-        .unwrap_or(0);
+    // Parse `schema_version` strictly. `.as_integer().unwrap_or(0)` silently
+    // treated a malformed value (a string `"23"`, a float `23.0`) as version 0
+    // and re-ran the ENTIRE chain, rewriting the file on every load; a negative
+    // integer wrapped through `as u32` into a bogus "newer than this binary"
+    // error. A present-but-malformed value is a corrupt config — say so; a huge
+    // integer falls through to the too-new guard below.
+    let from = match raw.get(SCHEMA_VERSION_KEY) {
+        None => 0,
+        Some(Value::Integer(i)) if *i < 0 => anyhow::bail!(
+            "config.toml {SCHEMA_VERSION_KEY}={i} is negative; expected an integer 0..={CURRENT_VERSION}. \
+             Fix or remove the line and re-run."
+        ),
+        Some(Value::Integer(i)) => u32::try_from(*i).unwrap_or(CURRENT_VERSION + 1),
+        Some(other) => anyhow::bail!(
+            "config.toml {SCHEMA_VERSION_KEY} is malformed ({}); expected an integer 0..={CURRENT_VERSION}. \
+             Fix or remove the line and re-run.",
+            other.type_str()
+        ),
+    };
 
     if from == CURRENT_VERSION {
         return Ok(false);
@@ -375,43 +389,32 @@ fn migrate_v17(raw: &mut Value) {
 /// `enc2:`-encrypted, presence is what matters — was configured on purpose
 /// and upgrades to `enabled = true`.
 ///
-/// Env case: `KB_EMBEDDING_API_KEY` folds onto `config.knowledge` at LOAD,
-/// after this migration runs on the file — an operator supplying the key only
-/// via env has nothing in the file and would silently migrate OFF. A
-/// non-empty `KB_EMBEDDING_API_KEY` in the process environment therefore
-/// counts as evidence too.
+/// PURE: this transform depends only on `raw`. The env case — an operator who
+/// supplies the key ONLY via `KB_EMBEDDING_API_KEY`, with nothing in the file —
+/// is handled at LOAD by `apply_env_overrides`, which sets `knowledge.enabled`
+/// when it folds in a non-empty env key. Reading `std::env` here made the
+/// migration outcome depend on which process ran first, and once stamped to the
+/// current version it never re-ran — so the KB stayed off permanently with the
+/// key present. Keeping this pure honors the module contract (`:9-13`).
 fn migrate_v18(raw: &mut Value) {
     let file_key_present = raw
         .get("knowledge")
         .and_then(|k| k.get("embedding_api_key"))
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.trim().is_empty());
-    let env_key_present = std::env::var("KB_EMBEDDING_API_KEY")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    let enabled = file_key_present || env_key_present;
 
-    // Do NOT inject a `[knowledge]` table into configs that lack one — the
-    // serde default already yields `enabled = false` at load, and the
-    // v9→v10 invariant (additive fields ride on serde defaults) is pinned by
-    // test. Only two cases need writing: the table exists (set the flag per
-    // the rule), or the env carries a key with no table (the one state serde
-    // cannot represent — it must migrate ON).
+    // Do NOT inject a `[knowledge]` table into configs that lack one — the serde
+    // default already yields `enabled = false` at load, and the v9→v10 invariant
+    // (additive fields ride on serde defaults) is pinned by test. Only the
+    // existing-table case needs writing.
     let Some(table) = raw.as_table_mut() else {
         // Non-table root errors in the runner's own validation; nothing to do.
         return;
     };
-    match table.get_mut("knowledge").and_then(|k| k.as_table_mut()) {
-        Some(kt) => {
-            // Idempotent: an existing `enabled` value (v18 config re-run) wins.
-            kt.entry("enabled").or_insert(Value::Boolean(enabled));
-        }
-        None if env_key_present => {
-            let mut kt = toml::map::Map::new();
-            kt.insert("enabled".into(), Value::Boolean(true));
-            table.insert("knowledge".into(), Value::Table(kt));
-        }
-        None => {}
+    if let Some(kt) = table.get_mut("knowledge").and_then(|k| k.as_table_mut()) {
+        // Idempotent: an existing `enabled` value (v18 config re-run) wins.
+        kt.entry("enabled")
+            .or_insert(Value::Boolean(file_key_present));
     }
 }
 
@@ -794,10 +797,35 @@ backend = \"markdown\"
         assert!(migrate(&mut v).is_err());
     }
 
-    /// Serialize the v18 tests against every env-mutating test in the crate
-    /// and scrub `KB_EMBEDDING_API_KEY` for their duration — migrate_v18
-    /// reads it as configuration evidence, so an ambient value on a dev/CI
-    /// machine would flip the no-key expectations.
+    #[test]
+    fn string_version_is_rejected() {
+        // A string `schema_version = "17"` must error clearly, not fall to 0 and
+        // silently re-run the whole chain rewriting the file every load.
+        let mut v = parse("schema_version = \"17\"\n");
+        let err = migrate(&mut v).expect_err("string version must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("malformed"), "got: {msg}");
+    }
+
+    #[test]
+    fn float_version_is_rejected() {
+        let mut v = parse("schema_version = 17.0\n");
+        let err = migrate(&mut v).expect_err("float version must be rejected");
+        assert!(format!("{err:#}").contains("malformed"));
+    }
+
+    #[test]
+    fn negative_version_is_rejected() {
+        let mut v = parse("schema_version = -1\n");
+        let err = migrate(&mut v).expect_err("negative version must be rejected");
+        assert!(format!("{err:#}").contains("negative"));
+    }
+
+    /// Serialize the v18 tests against every env-mutating test in the crate and
+    /// scrub `KB_EMBEDDING_API_KEY` for their duration. `migrate_v18` is now pure
+    /// (it ignores the env), but the purity test SETS the var and the others
+    /// assert the no-key shape, so an ambient value on a dev/CI machine would
+    /// still perturb them.
     struct V18EnvGuard {
         _lock: tokio::sync::MutexGuard<'static, ()>,
         prev: Option<std::ffi::OsString>,
@@ -820,16 +848,20 @@ backend = \"markdown\"
     }
 
     #[test]
-    fn v18_env_key_alone_upgrades_on() {
-        // The env-only operator: key never written to the file. Without the
-        // env check they would silently migrate OFF and lose the KB.
+    fn v18_is_pure_ignores_env() {
+        // migrate_v18 is a pure `toml::Value` transform now — the env-only case
+        // is handled at LOAD by `apply_env_overrides`, not here. Setting the env
+        // var must NOT change the migration output (with no file key, no table
+        // is injected).
         let _guard = V18EnvGuard::scrubbed();
         std::env::set_var("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key");
         let mut v = parse("schema_version = 17\n");
         migrate(&mut v).unwrap();
         std::env::remove_var("KB_EMBEDDING_API_KEY");
-        let k = v.get("knowledge").unwrap().as_table().unwrap();
-        assert_eq!(k.get("enabled").unwrap().as_bool(), Some(true));
+        assert!(
+            v.get("knowledge").is_none(),
+            "v18 must ignore the env key — it is handled at load, not in the migration"
+        );
     }
 
     #[test]
