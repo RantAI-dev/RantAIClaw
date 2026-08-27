@@ -173,19 +173,28 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
         }
     }
     if let Some(c) = cc.whatsapp.as_ref() {
-        // Cloud API path: probe Graph if access_token + phone_number_id set.
-        if let (Some(token), Some(phone_id)) =
-            (c.access_token.as_deref(), c.phone_number_id.as_deref())
-        {
-            if !token.trim().is_empty() && !phone_id.trim().is_empty() {
-                match probe_whatsapp_cloud(&client, token, phone_id).await {
-                    Ok(()) => ok.push("whatsapp (cloud-api)".to_string()),
-                    Err(e) => bad.push(format!("whatsapp cloud: {e}")),
-                }
+        // Cloud API path: usable when access_token + phone_number_id are both set.
+        let cloud_usable = matches!(
+            (c.access_token.as_deref(), c.phone_number_id.as_deref()),
+            (Some(token), Some(phone_id)) if !token.trim().is_empty() && !phone_id.trim().is_empty()
+        );
+        // Web path: usable when a non-empty session DB path is configured.
+        let web_usable = c
+            .session_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+
+        if cloud_usable {
+            // Safe to unwrap the pair — `cloud_usable` proved both are present.
+            let token = c.access_token.as_deref().unwrap_or_default();
+            let phone_id = c.phone_number_id.as_deref().unwrap_or_default();
+            match probe_whatsapp_cloud(&client, token, phone_id).await {
+                Ok(()) => ok.push("whatsapp (cloud-api)".to_string()),
+                Err(e) => bad.push(format!("whatsapp cloud: {e}")),
             }
         }
-        // Web path: check session DB file exists.
-        if let Some(path) = c.session_path.as_deref() {
+        if web_usable {
+            let path = c.session_path.as_deref().unwrap_or_default();
             match probe_whatsapp_web(path) {
                 ProbeWebResult::Ok => ok.push("whatsapp (web)".to_string()),
                 ProbeWebResult::SessionMissing => {
@@ -195,6 +204,17 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
                 }
                 ProbeWebResult::SessionPathBad(e) => bad.push(format!("whatsapp web session: {e}")),
             }
+        }
+        // A configured WhatsApp block with neither a usable cloud pair nor a
+        // session path is broken, not absent — the offline `inspect_channels`
+        // already fails it, so the online probe must too (they used to disagree,
+        // and it read as "no channels configured" when it was the only channel).
+        if !cloud_usable && !web_usable {
+            bad.push(
+                "whatsapp: incomplete credentials — set access_token + phone_number_id (cloud) \
+                 or session_path (web)"
+                    .to_string(),
+            );
         }
     }
 
@@ -416,6 +436,28 @@ mod tests {
         let s = inspect_channels(&cfg);
         assert_eq!(s.severity, Severity::Fail);
         assert!(s.message.contains("whatsapp"));
+    }
+
+    #[tokio::test]
+    async fn online_whatsapp_incomplete_fails() {
+        // The ONLINE probe must agree with offline `inspect_channels`: a
+        // configured-but-incomplete WhatsApp block Fails, rather than reading
+        // "no channels configured" when it is the only channel. Both cloud and
+        // web are unusable here, so no network request is made.
+        let mut cfg = Config::default();
+        cfg.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+        let s = probe_channels(&cfg).await;
+        assert_eq!(s.severity, Severity::Fail, "{}", s.message);
+        assert!(s.message.contains("whatsapp"), "{}", s.message);
     }
 
     #[test]

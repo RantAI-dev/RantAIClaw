@@ -11,15 +11,15 @@ pub enum DoctorFormat {
     Brief,
 }
 
-pub fn render(results: &[CheckResult], format: DoctorFormat) -> String {
+pub fn render(results: &[CheckResult], skipped: &[String], format: DoctorFormat) -> String {
     match format {
-        DoctorFormat::Text => render_text(results, false),
-        DoctorFormat::Json => render_json_string(results),
-        DoctorFormat::Brief => render_brief(results),
+        DoctorFormat::Text => render_text(results, skipped, false),
+        DoctorFormat::Json => render_json_string(results, skipped),
+        DoctorFormat::Brief => render_brief(results, skipped),
     }
 }
 
-pub fn render_text(results: &[CheckResult], colors: bool) -> String {
+pub fn render_text(results: &[CheckResult], skipped: &[String], colors: bool) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -48,19 +48,41 @@ pub fn render_text(results: &[CheckResult], colors: bool) -> String {
         "Summary: {} ok, {} warn, {} fail, {} info",
         totals.ok, totals.warn, totals.fail, totals.info
     );
+
+    // A check that never ran is NOT a pass. Surfacing the skipped list keeps
+    // `doctor` from reading "all green" when it probed nothing (the #624 goal,
+    // which the CLI wrapper had been discarding).
+    if !skipped.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "[skipped] ({} not run)", skipped.len());
+        for name in skipped {
+            let _ = writeln!(out, "  - {name}");
+        }
+    }
     out
 }
 
-pub fn render_brief(results: &[CheckResult]) -> String {
+pub fn render_brief(results: &[CheckResult], skipped: &[String]) -> String {
     let t = totals(results);
     let total = results.len();
-    format!(
-        "doctor: {}/{} ok, {} warn, {} fail",
-        t.ok, total, t.warn, t.fail
-    )
+    if skipped.is_empty() {
+        format!(
+            "doctor: {}/{} ok, {} warn, {} fail",
+            t.ok, total, t.warn, t.fail
+        )
+    } else {
+        format!(
+            "doctor: {}/{} ok, {} warn, {} fail, {} skipped",
+            t.ok,
+            total,
+            t.warn,
+            t.fail,
+            skipped.len()
+        )
+    }
 }
 
-pub fn render_json(results: &[CheckResult]) -> Value {
+pub fn render_json(results: &[CheckResult], skipped: &[String]) -> Value {
     let items: Vec<Value> = results
         .iter()
         .map(|r| {
@@ -78,18 +100,21 @@ pub fn render_json(results: &[CheckResult]) -> Value {
     let t = totals(results);
     json!({
         "results": items,
+        "skipped": skipped,
         "summary": {
             "total": results.len(),
             "ok": t.ok,
             "warn": t.warn,
             "fail": t.fail,
             "info": t.info,
+            "skipped": skipped.len(),
         }
     })
 }
 
-fn render_json_string(results: &[CheckResult]) -> String {
-    serde_json::to_string_pretty(&render_json(results)).unwrap_or_else(|_| "{}".to_string())
+fn render_json_string(results: &[CheckResult], skipped: &[String]) -> String {
+    serde_json::to_string_pretty(&render_json(results, skipped))
+        .unwrap_or_else(|_| "{}".to_string())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -155,13 +180,23 @@ mod tests {
 
     #[test]
     fn brief_one_liner_format_is_stable() {
-        let s = render_brief(&fixture());
+        let s = render_brief(&fixture(), &[]);
         assert_eq!(s, "doctor: 1/3 ok, 1 warn, 1 fail");
     }
 
     #[test]
+    fn brief_reports_skipped_checks() {
+        let skipped = vec!["provider.ping".to_string(), "channels.auth".to_string()];
+        let s = render_brief(&fixture(), &skipped);
+        assert!(
+            s.contains("2 skipped"),
+            "brief must not hide skipped checks: {s}"
+        );
+    }
+
+    #[test]
     fn text_renderer_shows_arrow_for_hints() {
-        let s = render_text(&fixture(), false);
+        let s = render_text(&fixture(), &[], false);
         assert!(s.contains("→ run: rantaiclaw setup approvals"));
         assert!(s.contains("✓ config.schema"));
         assert!(s.contains("⚠ policy.allowlist"));
@@ -169,8 +204,16 @@ mod tests {
     }
 
     #[test]
+    fn text_renderer_lists_skipped_block() {
+        let skipped = vec!["mcp.servers".to_string()];
+        let s = render_text(&fixture(), &skipped, false);
+        assert!(s.contains("[skipped]"), "{s}");
+        assert!(s.contains("- mcp.servers"), "{s}");
+    }
+
+    #[test]
     fn text_renderer_groups_by_category() {
-        let s = render_text(&fixture(), false);
+        let s = render_text(&fixture(), &[], false);
         let cfg_pos = s.find("[config]").expect("config header");
         let live_pos = s.find("[live]").expect("live header");
         assert!(cfg_pos < live_pos, "config must precede live");
@@ -178,9 +221,12 @@ mod tests {
 
     #[test]
     fn json_renderer_emits_summary_and_results() {
-        let v = render_json(&fixture());
+        let skipped = vec!["provider.ping".to_string()];
+        let v = render_json(&fixture(), &skipped);
         assert_eq!(v["summary"]["total"], 3);
         assert_eq!(v["summary"]["fail"], 1);
+        assert_eq!(v["summary"]["skipped"], 1);
+        assert_eq!(v["skipped"][0], "provider.ping");
         assert_eq!(v["results"][0]["severity"], "ok");
         assert_eq!(v["results"][1]["hint"], "run: rantaiclaw setup approvals");
     }

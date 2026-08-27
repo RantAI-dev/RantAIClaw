@@ -2115,14 +2115,19 @@ async fn main() -> Result<()> {
                     config: lib_config,
                     offline,
                 };
-                let results = rantaiclaw::doctor::run_all(ctx, brief).await;
+                // `run_all_detailed` keeps the `skipped` list (checks that never
+                // probed, e.g. offline / no key). The CLI used `run_all`, which
+                // discarded it, so `--brief` printed "N/N ok" for a run that
+                // proved nothing — the exact false-green #624 fixed everywhere
+                // except this surface.
+                let run = rantaiclaw::doctor::run_all_detailed(ctx, brief).await;
                 let render_format = match format {
                     DoctorFormat::Text => RenderFormat::Text,
                     DoctorFormat::Json => RenderFormat::Json,
                     DoctorFormat::Brief => RenderFormat::Brief,
                 };
-                println!("{}", render(&results, render_format));
-                if rantaiclaw::doctor::report::has_failures(&results) {
+                println!("{}", render(&run.results, &run.skipped, render_format));
+                if rantaiclaw::doctor::report::has_failures(&run.results) {
                     std::process::exit(1);
                 }
                 Ok(())

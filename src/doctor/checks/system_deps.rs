@@ -5,7 +5,15 @@ use async_trait::async_trait;
 use crate::doctor::{CheckResult, DoctorCheck, DoctorContext, Severity};
 
 const REQUIRED: &[&str] = &["git", "curl", "tar"];
-const RECOMMENDED: &[&str] = &["sha256sum", "docker", "cosign"];
+
+// macOS ships `shasum`, not GNU coreutils' `sha256sum`; probing the Linux name
+// there reported the hash tool "missing" on a perfectly fine Mac.
+#[cfg(target_os = "macos")]
+const HASH_BIN: &str = "shasum";
+#[cfg(not(target_os = "macos"))]
+const HASH_BIN: &str = "sha256sum";
+
+const RECOMMENDED: &[&str] = &[HASH_BIN, "docker", "cosign"];
 
 pub struct SystemDepsCheck;
 
@@ -20,9 +28,30 @@ impl DoctorCheck for SystemDepsCheck {
     async fn run(&self, _ctx: &DoctorContext) -> CheckResult {
         // PATH scans are blocking filesystem work; keep them off the async
         // runtime so a doctor poll cannot stall an SSE chat worker.
-        let report = tokio::task::spawn_blocking(|| probe_binaries(REQUIRED, RECOMMENDED))
+        let probe = tokio::task::spawn_blocking(|| probe_binaries(REQUIRED, RECOMMENDED))
             .await
-            .unwrap_or_default();
+            .map_err(|e| e.to_string());
+        self.result_from_probe(probe)
+    }
+}
+
+impl SystemDepsCheck {
+    /// Map a probe outcome to a `CheckResult`. Split out from `run` so the
+    /// JoinError path is unit-testable: a JoinError previously fell through
+    /// `unwrap_or_default()` to an empty report — "all binaries present" — a
+    /// vacuous green. A probe that did not complete is now a warn, not a pass.
+    fn result_from_probe(&self, probe: Result<DepsReport, String>) -> CheckResult {
+        let report = match probe {
+            Ok(report) => report,
+            Err(e) => {
+                return CheckResult::warn(
+                    self.name(),
+                    format!("dependency probe did not complete: {e}"),
+                )
+                .with_category(self.category())
+                .with_hint("re-run `rantaiclaw doctor`");
+            }
+        };
 
         if !report.required_missing.is_empty() {
             return CheckResult::fail(
@@ -110,5 +139,38 @@ mod tests {
         );
         assert_eq!(r.required_missing.len(), 1);
         assert_eq!(r.recommended_missing.len(), 1);
+    }
+
+    #[test]
+    fn join_error_warns_instead_of_reporting_ok() {
+        // A failed probe task must NOT read as "all present".
+        let r = SystemDepsCheck.result_from_probe(Err("task panicked".to_string()));
+        assert_eq!(r.severity, Severity::Warn);
+        assert!(r.message.contains("did not complete"), "{}", r.message);
+    }
+
+    #[test]
+    fn empty_report_is_ok() {
+        let r = SystemDepsCheck.result_from_probe(Ok(DepsReport::default()));
+        assert_eq!(r.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn missing_required_is_fail() {
+        let r = SystemDepsCheck.result_from_probe(Ok(DepsReport {
+            required_missing: vec!["git".to_string()],
+            recommended_missing: vec![],
+        }));
+        assert_eq!(r.severity, Severity::Fail);
+    }
+
+    #[test]
+    fn hash_binary_is_platform_appropriate() {
+        // macOS uses shasum; everything else sha256sum.
+        assert!(RECOMMENDED.contains(&HASH_BIN));
+        #[cfg(target_os = "macos")]
+        assert_eq!(HASH_BIN, "shasum");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(HASH_BIN, "sha256sum");
     }
 }
