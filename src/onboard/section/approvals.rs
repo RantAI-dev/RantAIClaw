@@ -49,8 +49,24 @@ impl SetupSection for ApprovalsSection {
             eprintln!("{}", self.headless_hint());
             PolicyPreset::Smart
         };
-        if let Some(warning) = policy_writer::write_policy_files(ctx.profile, preset, false)? {
+        // Honor `--force`: without it an already-configured profile keeps its
+        // old preset (idempotent write), so `setup approvals --force` was a
+        // no-op that still claimed to set the chosen preset.
+        if let Some(warning) = policy_writer::write_policy_files(ctx.profile, preset, ctx.force)? {
             eprintln!("{warning}");
+        }
+        // When not forcing and a different preset already exists on disk, say so
+        // rather than letting the operator believe the offered preset took.
+        if !ctx.force {
+            if let Some(active) = policy_writer::read_active_preset(&ctx.profile.policy_dir()) {
+                if active != preset {
+                    eprintln!(
+                        "Existing approval preset kept: {}. Re-run with --force to switch to {}.",
+                        active.label(),
+                        preset.label()
+                    );
+                }
+            }
         }
         // The gate reads `config.autonomy`, not the marker. Without this the
         // preset chosen here was cosmetic: a fresh install that picked Strict
@@ -182,6 +198,7 @@ mod tests {
                 profile: &profile,
                 config: &mut config,
                 interactive: false,
+                force: false,
             };
             ApprovalsSection.run(&mut ctx).unwrap();
 
@@ -205,6 +222,7 @@ mod tests {
                 profile: &profile,
                 config: &mut config,
                 interactive: false,
+                force: false,
             };
             ApprovalsSection.run(&mut ctx).unwrap();
 
@@ -232,6 +250,7 @@ mod tests {
                 profile: &profile,
                 config: &mut config,
                 interactive: false,
+                force: false,
             };
             ApprovalsSection.run(&mut ctx).unwrap();
 
@@ -239,6 +258,35 @@ mod tests {
                 config.autonomy.level,
                 crate::security::AutonomyLevel::ReadOnly,
                 "config should track the Strict marker left on disk"
+            );
+        });
+    }
+
+    #[test]
+    fn force_overwrites_existing_preset() {
+        with_home(|| {
+            let profile = ProfileManager::ensure("rt-approvals-force").unwrap();
+            // Pre-existing Strict on disk.
+            policy_writer::write_policy_files(&profile, PolicyPreset::Strict, false).unwrap();
+            assert_eq!(
+                policy_writer::read_active_preset(&profile.policy_dir()),
+                Some(PolicyPreset::Strict)
+            );
+
+            let mut config = Config::default();
+            let mut ctx = SetupContext {
+                profile: &profile,
+                config: &mut config,
+                interactive: false, // headless → Smart default
+                force: true,
+            };
+            ApprovalsSection.run(&mut ctx).unwrap();
+
+            // `--force` must actually overwrite Strict → Smart, not no-op.
+            assert_eq!(
+                policy_writer::read_active_preset(&profile.policy_dir()),
+                Some(PolicyPreset::Smart),
+                "--force should overwrite the existing preset"
             );
         });
     }

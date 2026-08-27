@@ -128,10 +128,30 @@ impl TuiProvisioner for ApprovalsProvisioner {
         // The wizard saves the config after each provisioner returns.
         policy_writer::sync_config_to_active_preset(&profile.policy_dir(), config);
 
+        // Report the EFFECTIVE (on-disk) preset, not the offered one. The write
+        // above is idempotent — an existing preset is left untouched — so a
+        // profile that already had, say, Strict keeps it, and claiming "set to
+        // Smart" would be a lie. Warn when they differ and point at --force.
+        let effective = policy_writer::read_active_preset(&profile.policy_dir()).unwrap_or(preset);
+        let effective_label = effective.label();
+        if effective != preset {
+            send(
+                &events,
+                ProvisionEvent::Message {
+                    severity: Severity::Warn,
+                    text: format!(
+                        "An approval preset ({effective_label}) was already configured — keeping it. \
+                         Run `rantaiclaw setup approvals --force` to switch to {label}."
+                    ),
+                },
+            )
+            .await?;
+        }
+
         send(
             &events,
             ProvisionEvent::Done {
-                summary: format!("Approval policy set: {label}"),
+                summary: format!("Approval policy set: {effective_label}"),
             },
         )
         .await?;

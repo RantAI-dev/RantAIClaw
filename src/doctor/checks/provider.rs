@@ -102,10 +102,24 @@ impl DoctorCheck for ProviderPingCheck {
 
         let mut req = client.get(&endpoint);
         if let Some(key) = api_key {
-            req = req.bearer_auth(key);
+            for (name, value) in probe_auth_headers(provider, &key) {
+                req = req.header(name, value);
+            }
         }
 
         classify_response(self.name(), self.category(), &endpoint, req.send().await)
+    }
+}
+
+/// Auth headers for a provider validation/probe request. Anthropic needs
+/// `x-api-key` + `anthropic-version` (Bearer is only for its OAuth/setup
+/// tokens); every other provider uses `Authorization: Bearer <key>`. Shared by
+/// the doctor provider check and the setup provider provisioner so they agree.
+pub fn probe_auth_headers(provider: &str, api_key: &str) -> Vec<(String, String)> {
+    if provider == "anthropic" {
+        crate::auth::anthropic_token::anthropic_probe_headers(api_key)
+    } else {
+        vec![("Authorization".to_string(), format!("Bearer {api_key}"))]
     }
 }
 
@@ -409,5 +423,24 @@ mod tests {
     fn resolve_endpoint_handles_custom_prefix() {
         let url = resolve_endpoint("custom:https://my-api.local", None);
         assert_eq!(url.as_deref(), Some("https://my-api.local/models"));
+    }
+
+    #[test]
+    fn probe_auth_headers_uses_x_api_key_for_anthropic() {
+        let h = probe_auth_headers("anthropic", "sk-ant-api-1");
+        assert!(
+            h.iter().any(|(k, _)| k == "x-api-key"),
+            "anthropic must use x-api-key, not Bearer: {h:?}"
+        );
+        assert!(h.iter().any(|(k, _)| k == "anthropic-version"), "{h:?}");
+    }
+
+    #[test]
+    fn probe_auth_headers_uses_bearer_for_other_providers() {
+        let h = probe_auth_headers("openai", "sk-1");
+        assert_eq!(
+            h,
+            vec![("Authorization".to_string(), "Bearer sk-1".to_string())]
+        );
     }
 }

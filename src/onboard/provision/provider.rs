@@ -379,11 +379,16 @@ impl TuiProvisioner for ProviderProvisioner {
                     break;
                 };
 
-                let probe = probe_get(
-                    &validation_url,
-                    &[("Authorization", &format!("Bearer {api_key}"))],
-                )
-                .await;
+                // Anthropic rejects Bearer for a real API key — build the probe
+                // headers through the shared helper so setup agrees with doctor
+                // and a valid `sk-ant-api…` key is not reported rejected.
+                let probe_headers =
+                    crate::doctor::checks::provider::probe_auth_headers(provider_name, &api_key);
+                let header_refs: Vec<(&str, &str)> = probe_headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect();
+                let probe = probe_get(&validation_url, &header_refs).await;
 
                 match probe {
                     Ok(result) if result.status == 401 || result.status == 403 => {

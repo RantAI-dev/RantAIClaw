@@ -31,15 +31,15 @@ impl SetupSection for ProviderSection {
     }
 
     fn is_already_configured(&self, _profile: &Profile, config: &Config) -> bool {
-        // Spec §"is_already_configured for provider": presence of a
-        // configured `default_provider` with at least one credential
-        // (`api_key`) — bare provider with no key is *not* configured.
-        config.default_provider.is_some()
-            && config
-                .api_key
-                .as_deref()
-                .map(|k| !k.trim().is_empty())
-                .unwrap_or(false)
+        // Configured iff `default_provider` is set AND a credential resolves for
+        // it. Use `resolve_key_for_provider` — the same resolver every consumer
+        // (and `doctor`) reads — so a key configured via the console
+        // (`provider_api_keys`) counts, instead of only the top-level `api_key`.
+        // Reading only `api_key` re-prompted every run and duplicated the key.
+        config
+            .default_provider
+            .as_deref()
+            .is_some_and(|provider| config.resolve_key_for_provider(provider).is_some())
     }
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
@@ -51,12 +51,22 @@ impl SetupSection for ProviderSection {
         let workspace_dir = ctx.profile.workspace_dir();
         std::fs::create_dir_all(&workspace_dir).ok();
         let (provider, api_key, model, provider_api_url) = wizard::setup_provider(&workspace_dir)?;
+        let canonical = crate::providers::normalize_provider_name(&provider);
         ctx.config.default_provider = Some(provider);
-        ctx.config.api_key = if api_key.is_empty() {
-            None
+        let trimmed = api_key.trim();
+        if trimmed.is_empty() {
+            // No key entered (skip / env / OAuth supplies it). Leave the stores
+            // untouched so re-running setup does not wipe a console-configured
+            // key.
         } else {
-            Some(api_key)
-        };
+            // Write into the per-provider store every consumer reads FIRST — so a
+            // stale `provider_api_keys` entry can't shadow the freshly entered
+            // key — and keep the top-level slot in sync for the default provider.
+            ctx.config
+                .provider_api_keys
+                .insert(canonical, trimmed.to_string());
+            ctx.config.api_key = Some(trimmed.to_string());
+        }
         ctx.config.default_model = Some(model);
         if let Some(url) = provider_api_url {
             ctx.config.api_url = Some(url);
@@ -103,5 +113,27 @@ mod tests {
 
         cfg.api_key = Some("sk-test".into());
         assert!(s.is_already_configured(&dummy_profile, &cfg));
+    }
+
+    #[test]
+    fn console_configured_key_not_reprompted() {
+        let s = ProviderSection;
+        let dummy_profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp/_rt_test"),
+        };
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("openrouter".into());
+        // Key lives only in the per-provider store, as the console writes it —
+        // the top-level slot is empty.
+        cfg.provider_api_keys
+            .insert("openrouter".into(), "sk-console".into());
+        assert!(cfg.api_key.is_none());
+
+        assert!(
+            s.is_already_configured(&dummy_profile, &cfg),
+            "a provider_api_keys entry must count as configured (no re-prompt)"
+        );
     }
 }

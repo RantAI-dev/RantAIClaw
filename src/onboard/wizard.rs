@@ -266,6 +266,7 @@ fn run_one(
         profile,
         config,
         interactive,
+        force,
     };
     section.run(&mut ctx)?;
     report.visited.push(section.name().to_string());
@@ -2419,6 +2420,16 @@ pub(crate) const PROVIDER_SETUP_TIERS: &[ProviderTier] = &[
     },
 ];
 
+/// Whether an env var is set to a NON-EMPTY value. `std::env::var(..).is_ok()`
+/// treats an exported-but-empty var (`export ANTHROPIC_API_KEY=`) as "detected",
+/// so setup skipped the prompt and finished with an unusable config. Trim so
+/// whitespace-only values are also treated as absent.
+fn env_key_present(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn setup_provider(
     workspace_dir: &Path,
@@ -2606,7 +2617,7 @@ pub(crate) fn setup_provider(
                     .allow_empty_password(true)
                     .interact()?
             }
-        } else if std::env::var("GEMINI_API_KEY").is_ok() {
+        } else if env_key_present("GEMINI_API_KEY") {
             print_bullet(&format!(
                 "{} GEMINI_API_KEY environment variable detected!",
                 style("✓").green().bold()
@@ -2623,13 +2634,13 @@ pub(crate) fn setup_provider(
                 .interact()?
         }
     } else if canonical_provider_name(provider_name) == "anthropic" {
-        if std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok() {
+        if env_key_present("ANTHROPIC_OAUTH_TOKEN") {
             print_bullet(&format!(
                 "{} ANTHROPIC_OAUTH_TOKEN environment variable detected!",
                 style("✓").green().bold()
             ));
             String::new()
-        } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        } else if env_key_present("ANTHROPIC_API_KEY") {
             print_bullet(&format!(
                 "{} ANTHROPIC_API_KEY environment variable detected!",
                 style("✓").green().bold()
@@ -2650,7 +2661,7 @@ pub(crate) fn setup_provider(
                 .allow_empty_password(true)
                 .interact()?;
 
-            if key.is_empty() {
+            if key.trim().is_empty() {
                 print_bullet(&format!(
                     "Skipped. Set {} or {} or edit config.toml later.",
                     style("ANTHROPIC_API_KEY").yellow(),
@@ -2661,7 +2672,7 @@ pub(crate) fn setup_provider(
             key
         }
     } else if canonical_provider_name(provider_name) == "qwen-code" {
-        if std::env::var("QWEN_OAUTH_TOKEN").is_ok() {
+        if env_key_present("QWEN_OAUTH_TOKEN") {
             print_bullet(&format!(
                 "{} QWEN_OAUTH_TOKEN environment variable detected!",
                 style("✓").green().bold()
@@ -5645,6 +5656,21 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn env_key_present_treats_empty_as_absent() {
+        // Unique var name so this never clobbers a real provider key nor races
+        // another test reading the same variable.
+        let var = "RANTAICLAW_TEST_ENV_KEY_PRESENT";
+        std::env::set_var(var, "");
+        assert!(!env_key_present(var), "empty string must be absent");
+        std::env::set_var(var, "   ");
+        assert!(!env_key_present(var), "whitespace-only must be absent");
+        std::env::set_var(var, "sk-real");
+        assert!(env_key_present(var), "a real value must be present");
+        std::env::remove_var(var);
+        assert!(!env_key_present(var), "unset must be absent");
+    }
 
     // ── Provider setup catalog (shared CLI wizard + TUI provisioner) ──
 

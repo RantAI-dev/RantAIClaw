@@ -41,6 +41,10 @@ pub struct SetupContext<'a> {
     /// `setup` without `--non-interactive`. Headless callers should bail
     /// with `headless_hint()` rather than prompting.
     pub interactive: bool,
+    /// `true` when the operator passed `--force` (re-run an already-configured
+    /// section). Sections that write idempotent files (e.g. approvals policy)
+    /// must honor this so `--force` actually overwrites instead of no-oping.
+    pub force: bool,
 }
 
 /// One unit of onboarding. Wave 3 wires five concrete impls; later waves
