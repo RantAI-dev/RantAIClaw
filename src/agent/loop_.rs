@@ -2719,12 +2719,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .as_deref()
         .map(str::trim)
         .filter(|m| !m.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model is configured. Run `rantaiclaw setup provider`, or pass \
-                 `--model <id>` / set RANTAICLAW_MODEL. The agent does not assume a default model."
-            )
-        })?
+        .ok_or_else(|| anyhow::Error::new(crate::agent::NoModelConfigured))?
         .to_string();
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,

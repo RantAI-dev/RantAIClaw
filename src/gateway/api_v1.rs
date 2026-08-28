@@ -236,6 +236,20 @@ fn err_400(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+/// Map an agent build/run failure to a response. A missing-model configuration
+/// error is the caller's to fix (400 with the actionable hint), not a server
+/// fault; everything else is a 500. Both paths scrub any secret-looking token.
+fn map_agent_error(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
+    let sanitized = crate::providers::sanitize_api_error(&format!("{e:#}"));
+    if e.chain().any(|c| {
+        c.downcast_ref::<crate::agent::NoModelConfigured>()
+            .is_some()
+    }) {
+        return err_400(sanitized);
+    }
+    err_500(anyhow::anyhow!("{sanitized}"))
+}
+
 /// The caller may see this resource but not act on it. Used by the skill
 /// content routes for a skill someone else manages: 404 would be a lie, since
 /// the same caller can list and read its metadata.
@@ -574,7 +588,7 @@ async fn agent_chat_sync(
     // same registry `/metrics` exposes (not a throwaway per-request one).
     let mut agent = crate::agent::Agent::from_config_with_observer(&config, state.observer.clone())
         .await
-        .map_err(err_500)?;
+        .map_err(map_agent_error)?;
     // Scope this request's turn memory to its conversation. The gateway serves
     // many callers, so an unscoped agent would write every session's messages
     // into one shared pool and read them back into each other's context.
@@ -596,15 +610,9 @@ async fn agent_chat_sync(
     // Feed the agent the message plus any framed reference material; only
     // `body.message` is persisted, so context never compounds across turns.
     let turn_input = compose_turn_input(&body.message, body.context.as_deref());
-    let text = agent.turn(&turn_input).await.map_err(|e| {
-        // Scrub any secret-looking token from the error before returning it, the
-        // same way the /webhook path does (defense in depth — the provider layer
-        // already sanitizes at the HTTP-body source).
-        err_500(anyhow::anyhow!(
-            "{}",
-            crate::providers::sanitize_api_error(&format!("{e:#}"))
-        ))
-    })?;
+    // Scrub any secret-looking token, and return a 400 (not 500) when the turn
+    // failed only because no model is configured — that's the caller's to fix.
+    let text = agent.turn(&turn_input).await.map_err(map_agent_error)?;
     let mut session_id = body.session_id.clone().unwrap_or_default();
     // `agent.turn` already returned Err on failure; skip persisting an empty
     // answer so a no-op turn doesn't create or append to a session.

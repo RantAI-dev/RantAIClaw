@@ -12,7 +12,7 @@ pub mod prompt;
 mod tests;
 
 #[allow(unused_imports)]
-pub use agent::{Agent, AgentBuilder};
+pub use agent::{Agent, AgentBuilder, NoModelConfigured};
 #[allow(unused_imports)]
 pub use events::{AgentEvent, AgentEventSender, TurnResult};
 #[allow(unused_imports)]
