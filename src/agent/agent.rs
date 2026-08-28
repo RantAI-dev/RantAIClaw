@@ -47,6 +47,25 @@ fn memory_flush_tools(
     ]
 }
 
+/// The operator has not configured a model, so an agent cannot be built or run.
+/// A typed error (rather than a bare `anyhow!`) so callers — notably the gateway
+/// `/agent/chat` handler — can map it to a 400 (client must configure) instead of
+/// a 500, and so the actionable message lives in exactly one place.
+#[derive(Debug)]
+pub struct NoModelConfigured;
+
+impl std::fmt::Display for NoModelConfigured {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no model is configured. Run `rantaiclaw setup provider`, or pass \
+             `--model <id>` / set RANTAICLAW_MODEL. The agent does not assume a default model."
+        )
+    }
+}
+
+impl std::error::Error for NoModelConfigured {}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -523,12 +542,7 @@ impl Agent {
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no model is configured. Run `rantaiclaw setup provider`, or pass \
-                     `--model <id>` / set RANTAICLAW_MODEL. The agent does not assume a default model."
-                )
-            })?
+            .ok_or_else(|| anyhow::Error::new(NoModelConfigured))?
             .to_string();
 
         // Resolve the key for THIS provider (not blindly the top-level api_key,
