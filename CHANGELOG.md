@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0-alpha] — 2026-08-28
+
+Configuration and lifecycle hardening — the consolidated deep-scan of config
+loading, the config API, setup/doctor, the daemon and service lifecycle, and the
+console's configuration surfaces. **Config schema v23 → v25**: the release
+carries migrations (`migrate_v24`/`migrate_v25`) that drop dead keys and align
+serde defaults with the code, so it does **not** roll back cleanly to 0.25.0 (a
+v25 config will not load on a pre-v25 binary). claw-ui pin bumped to **v0.3.22**.
+No exposure-boundary default is widened.
+
+### Security
+
+- **`err_500` no longer leaks internal detail to the browser** — a failed config
+  write returned the absolute `config.toml` path and the gateway `host:port`
+  verbatim; the cause is now logged server-side and the response carries a
+  stable, non-specific message. (#672)
+- **Config-API secret redaction** — `api_url` credentials, proxy userinfo, and
+  MCP `args`/`env` are redacted in the config response; a recursive JSON backstop
+  covers every channel credential the typed redactor missed. (#642)
+- **Doctor no longer leaks provider credentials** in its probe output. (#643)
+- **MCP server API hardening** — loader env vars (`LD_PRELOAD`, …) can't be
+  injected through a config write. (#644)
+- **Config-API writes are validated before persisting**, so a console write can't
+  brick the next startup. (#645)
+- **`require_pairing` hot-reload**, **secret file-mode hardening**, and an
+  **openclaw-migration TOML-safety** fix. (#646, #648, #652)
+- **Config-change audit trail.** (#647)
+
+### Added
+
+- **Warn on unknown/mistyped top-level config keys** at load, with a
+  nearest-match suggestion — a `[gatway]` typo no longer silently no-ops (K2). (#670)
+- **Two advisory CI gates**: every CLI command must appear in the command
+  reference, and every `*Config` field must have a runtime reader (generalized
+  from the 15 channel structs to all 67). (#671)
+- **A gate that checks every documented config default against
+  `Config::default()`** — caught `default_model` drift on landing. (#681)
+
+### Changed
+
+- **The daemon exits non-zero on a fatal startup failure** (a refused public
+  bind, an unparseable address, a persistent port conflict) instead of retrying
+  forever behind a false "🧠 daemon started" banner; the banner is gated on the
+  gateway's first successful bind, and channels now drain cleanly on shutdown
+  instead of a bare `abort()`. (#673)
+- **`doctor models` probes provider catalogs concurrently** — wall-clock drops
+  from the sum of provider latencies to the max. (#680)
+- **Setup and doctor honesty**: sections and checks report what they actually
+  did; config env-override handling, default alignment, and migration robustness
+  were tightened (schema v24/v25). (#660, #661, #662, #663, #664)
+- **Dead config keys and the legacy-doctor path removed.** (#667, #674)
+- **Docs corrections**: config paths resolve to the active profile dir, feature
+  gating (`kb` is default, `hardware` is not), timeout defaults, and OOM build
+  advice. (#670)
+
+### Fixed
+
+- **Config persistence** — safe persistence, atomic writes with a retained
+  backup, and runtime-reload decrypt drift. (#650, #651, #653)
+- **Lifecycle** — service-unit generation, gateway bind/shutdown, the daemon
+  supervisor lifecycle and profile handoff, and auth lock + OAuth loopback. (#654,
+  #655, #656, #657, #659)
+- **Setup preserves unprompted config** instead of clobbering it. (#649)
+- **Console (claw-ui v0.3.22)** — config-panel load/error states and stale
+  snapshots, provider-secret clear/save resilience, and consistent typed API
+  error handling. (claw-ui #72, #73, #74)
+
 ## [0.25.0-alpha] — 2026-08-26
 
 Console chat surface hardening and features, consolidating a deep-scan of the web
