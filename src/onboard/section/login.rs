@@ -14,6 +14,7 @@
 use anyhow::Result;
 
 use super::{SetupContext, SetupSection};
+use crate::config::schema::GatewayLoginConfig;
 use crate::config::Config;
 use crate::profile::Profile;
 
@@ -55,9 +56,7 @@ impl SetupSection for LoginSection {
         if !enable {
             // Turn the gate off by clearing any stored credential, and drop the
             // auto-lock window with it — it is meaningless with no credential.
-            ctx.config.gateway.login.username = None;
-            ctx.config.gateway.login.password_hash = None;
-            ctx.config.gateway.login.idle_timeout_secs = 0;
+            clear_login(&mut ctx.config.gateway.login);
             return Ok(());
         }
 
@@ -80,7 +79,7 @@ impl SetupSection for LoginSection {
             let p2 = Password::with_theme(&theme)
                 .with_prompt("Confirm password")
                 .interact()?;
-            if !p1.trim().is_empty() && p1 == p2 {
+            if password_pair_is_valid(&p1, &p2) {
                 break p1;
             }
             println!("  Passwords were empty or did not match — try again.");
@@ -119,6 +118,23 @@ impl SetupSection for LoginSection {
     }
 }
 
+/// The password-confirm gate: a password is accepted only if it is non-empty
+/// (after trimming) AND matches its confirmation. Pulled out of the interactive
+/// `dialoguer` loop in `run` so the rule can be tested without a TTY.
+fn password_pair_is_valid(p1: &str, p2: &str) -> bool {
+    !p1.trim().is_empty() && p1 == p2
+}
+
+/// Turn the login gate off: clear the credential and drop the auto-lock window
+/// with it (an idle timeout is meaningless with no credential to lock). Pulled
+/// out of `run`'s decline branch so the "declining clears everything" contract
+/// is testable.
+fn clear_login(login: &mut GatewayLoginConfig) {
+    login.username = None;
+    login.password_hash = None;
+    login.idle_timeout_secs = 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +160,34 @@ mod tests {
         assert!(!LoginSection.is_already_configured(&dummy_profile(), &config));
         config.gateway.login.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$a$b".into());
         assert!(LoginSection.is_already_configured(&dummy_profile(), &config));
+    }
+
+    #[test]
+    fn password_pair_accepts_only_a_nonempty_match() {
+        assert!(password_pair_is_valid("hunter2", "hunter2"));
+        // Mismatch is rejected — the confirm loop repeats.
+        assert!(!password_pair_is_valid("hunter2", "hunter3"));
+        // Empty / whitespace-only is rejected even when the two fields match.
+        assert!(!password_pair_is_valid("", ""));
+        assert!(!password_pair_is_valid("   ", "   "));
+        // A password is compared verbatim — leading/trailing spaces are part of
+        // it, so a padded copy does NOT match a trimmed one.
+        assert!(!password_pair_is_valid(" hunter2 ", "hunter2"));
+    }
+
+    #[test]
+    fn declining_login_clears_credential_and_idle_timeout() {
+        let mut login = GatewayLoginConfig {
+            username: Some("operator".into()),
+            password_hash: Some("$argon2id$v=19$m=1,t=1,p=1$a$b".into()),
+            idle_timeout_secs: 900,
+        };
+        clear_login(&mut login);
+        assert_eq!(login.username, None);
+        assert_eq!(login.password_hash, None);
+        assert_eq!(
+            login.idle_timeout_secs, 0,
+            "the auto-lock window must drop with the credential"
+        );
     }
 }
