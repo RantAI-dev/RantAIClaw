@@ -6599,11 +6599,9 @@ level = "full"
         let mut config = Config::default();
         assert!(config.api_key.is_none());
 
-        std::env::set_var("RANTAICLAW_API_KEY", "sk-test-env-key");
+        let _g_api_key = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "sk-test-env-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-test-env-key"));
-
-        std::env::remove_var("RANTAICLAW_API_KEY");
     }
 
     #[test]
@@ -6611,12 +6609,10 @@ level = "full"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("RANTAICLAW_API_KEY");
-        std::env::set_var("API_KEY", "sk-fallback-key");
+        let _g_rc_api_key = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
+        let _g_api_key = crate::test_env::EnvGuard::set("API_KEY", "sk-fallback-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-fallback-key"));
-
-        std::env::remove_var("API_KEY");
     }
 
     #[test]
@@ -6624,18 +6620,16 @@ level = "full"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("RANTAICLAW_PROVIDER", "anthropic");
+        let _g_provider = crate::test_env::EnvGuard::set("RANTAICLAW_PROVIDER", "anthropic");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
-
-        std::env::remove_var("RANTAICLAW_PROVIDER");
     }
 
     #[test]
     async fn web_search_enabled_yes_is_true() {
         let _env_guard = env_override_lock().await;
-        std::env::remove_var("RANTAICLAW_WEB_SEARCH_ENABLED");
-        std::env::set_var("WEB_SEARCH_ENABLED", "yes");
+        let _g_rc_web_search = crate::test_env::EnvGuard::unset("RANTAICLAW_WEB_SEARCH_ENABLED");
+        let _g_web_search = crate::test_env::EnvGuard::set("WEB_SEARCH_ENABLED", "yes");
         let mut config = Config::default();
         config.web_search.enabled = false;
         config.apply_env_overrides();
@@ -6643,14 +6637,13 @@ level = "full"
             config.web_search.enabled,
             "`WEB_SEARCH_ENABLED=yes` must enable, not disable"
         );
-        std::env::remove_var("WEB_SEARCH_ENABLED");
     }
 
     #[test]
     async fn invalid_port_keeps_config_value() {
         let _env_guard = env_override_lock().await;
-        std::env::remove_var("RANTAICLAW_GATEWAY_PORT");
-        std::env::set_var("PORT", "not-a-number");
+        let _g_rc_gateway_port = crate::test_env::EnvGuard::unset("RANTAICLAW_GATEWAY_PORT");
+        let _g_port = crate::test_env::EnvGuard::set("PORT", "not-a-number");
         let mut config = Config::default();
         config.gateway.port = 8787;
         config.apply_env_overrides();
@@ -6658,7 +6651,6 @@ level = "full"
             config.gateway.port, 8787,
             "an invalid PORT must be ignored, not silently discarded to 0"
         );
-        std::env::remove_var("PORT");
     }
 
     #[test]
@@ -6700,8 +6692,9 @@ level = "full"
     #[test]
     async fn config_dir_wins_over_workspace_split() {
         let _env_guard = env_override_lock().await;
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", "/custom/cfg");
-        std::env::set_var("RANTAICLAW_WORKSPACE", "/other/workspace");
+        let _g_config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", "/custom/cfg");
+        let _g_workspace =
+            crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", "/other/workspace");
         let mut config = Config::default();
         // Simulates what `resolve_runtime_config_dirs` derives under CONFIG_DIR.
         config.workspace_dir = PathBuf::from("/custom/cfg/workspace");
@@ -6711,14 +6704,13 @@ level = "full"
             PathBuf::from("/custom/cfg/workspace"),
             "RANTAICLAW_WORKSPACE must not override workspace_dir when CONFIG_DIR is set"
         );
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
     }
 
     #[test]
     async fn kb_env_key_enables_kb() {
         let _env_guard = env_override_lock().await;
-        std::env::set_var("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key");
+        let _g_kb_key =
+            crate::test_env::EnvGuard::set("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key");
         let mut config = Config::default();
         config.knowledge.enabled = false;
         config.apply_env_overrides();
@@ -6732,7 +6724,6 @@ level = "full"
             config.knowledge.embedding_api_key.as_deref(),
             Some("rantaiclaw_test_key")
         );
-        std::env::remove_var("KB_EMBEDDING_API_KEY");
     }
 
     #[test]
@@ -6746,9 +6737,12 @@ level = "full"
             SkillsPromptInjectionMode::Full
         );
 
-        std::env::set_var("RANTAICLAW_OPEN_SKILLS_ENABLED", "true");
-        std::env::set_var("RANTAICLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
-        std::env::set_var("RANTAICLAW_SKILLS_PROMPT_MODE", "compact");
+        let _g_skills_enabled =
+            crate::test_env::EnvGuard::set("RANTAICLAW_OPEN_SKILLS_ENABLED", "true");
+        let _g_skills_dir =
+            crate::test_env::EnvGuard::set("RANTAICLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        let _g_skills_mode =
+            crate::test_env::EnvGuard::set("RANTAICLAW_SKILLS_PROMPT_MODE", "compact");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -6760,10 +6754,6 @@ level = "full"
             config.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Compact
         );
-
-        std::env::remove_var("RANTAICLAW_OPEN_SKILLS_ENABLED");
-        std::env::remove_var("RANTAICLAW_OPEN_SKILLS_DIR");
-        std::env::remove_var("RANTAICLAW_SKILLS_PROMPT_MODE");
     }
 
     #[test]
@@ -6773,8 +6763,10 @@ level = "full"
         config.skills.open_skills_enabled = true;
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
 
-        std::env::set_var("RANTAICLAW_OPEN_SKILLS_ENABLED", "maybe");
-        std::env::set_var("RANTAICLAW_SKILLS_PROMPT_MODE", "invalid");
+        let _g_skills_enabled =
+            crate::test_env::EnvGuard::set("RANTAICLAW_OPEN_SKILLS_ENABLED", "maybe");
+        let _g_skills_mode =
+            crate::test_env::EnvGuard::set("RANTAICLAW_SKILLS_PROMPT_MODE", "invalid");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -6782,8 +6774,6 @@ level = "full"
             config.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Compact
         );
-        std::env::remove_var("RANTAICLAW_OPEN_SKILLS_ENABLED");
-        std::env::remove_var("RANTAICLAW_SKILLS_PROMPT_MODE");
     }
 
     #[test]
@@ -6791,12 +6781,10 @@ level = "full"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("RANTAICLAW_PROVIDER");
-        std::env::set_var("PROVIDER", "openai");
+        let _g_rc_provider = crate::test_env::EnvGuard::unset("RANTAICLAW_PROVIDER");
+        let _g_provider = crate::test_env::EnvGuard::set("PROVIDER", "openai");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
-
-        std::env::remove_var("PROVIDER");
     }
 
     #[test]
@@ -6807,15 +6795,13 @@ level = "full"
             ..Config::default()
         };
 
-        std::env::remove_var("RANTAICLAW_PROVIDER");
-        std::env::set_var("PROVIDER", "openrouter");
+        let _g_rc_provider = crate::test_env::EnvGuard::unset("RANTAICLAW_PROVIDER");
+        let _g_provider = crate::test_env::EnvGuard::set("PROVIDER", "openrouter");
         config.apply_env_overrides();
         assert_eq!(
             config.default_provider.as_deref(),
             Some("custom:https://proxy.example.com/v1")
         );
-
-        std::env::remove_var("PROVIDER");
     }
 
     #[test]
@@ -6826,13 +6812,10 @@ level = "full"
             ..Config::default()
         };
 
-        std::env::set_var("RANTAICLAW_PROVIDER", "openrouter");
-        std::env::set_var("PROVIDER", "anthropic");
+        let _g_rc_provider = crate::test_env::EnvGuard::set("RANTAICLAW_PROVIDER", "openrouter");
+        let _g_provider = crate::test_env::EnvGuard::set("PROVIDER", "anthropic");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
-
-        std::env::remove_var("RANTAICLAW_PROVIDER");
-        std::env::remove_var("PROVIDER");
     }
 
     #[test]
@@ -6843,11 +6826,9 @@ level = "full"
             ..Config::default()
         };
 
-        std::env::set_var("GLM_API_KEY", "glm-regional-key");
+        let _g_glm_key = crate::test_env::EnvGuard::set("GLM_API_KEY", "glm-regional-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("glm-regional-key"));
-
-        std::env::remove_var("GLM_API_KEY");
     }
 
     #[test]
@@ -6858,11 +6839,9 @@ level = "full"
             ..Config::default()
         };
 
-        std::env::set_var("ZAI_API_KEY", "zai-regional-key");
+        let _g_zai_key = crate::test_env::EnvGuard::set("ZAI_API_KEY", "zai-regional-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("zai-regional-key"));
-
-        std::env::remove_var("ZAI_API_KEY");
     }
 
     #[test]
@@ -6870,11 +6849,9 @@ level = "full"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("RANTAICLAW_MODEL", "gpt-4o");
+        let _g_model = crate::test_env::EnvGuard::set("RANTAICLAW_MODEL", "gpt-4o");
         config.apply_env_overrides();
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
-
-        std::env::remove_var("RANTAICLAW_MODEL");
     }
 
     #[test]
@@ -6969,9 +6946,8 @@ level = "full"
             ..Config::default()
         };
 
-        std::env::set_var("OLLAMA_API_KEY", "ollama-env-key");
+        let _g_ollama_key = crate::test_env::EnvGuard::set("OLLAMA_API_KEY", "ollama-env-key");
         let result = config.validate();
-        std::env::remove_var("OLLAMA_API_KEY");
 
         assert!(result.is_ok(), "expected validation to pass: {result:?}");
     }
@@ -6981,15 +6957,13 @@ level = "full"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("RANTAICLAW_MODEL");
-        std::env::set_var("MODEL", "anthropic/claude-3.5-sonnet");
+        let _g_rc_model = crate::test_env::EnvGuard::unset("RANTAICLAW_MODEL");
+        let _g_model = crate::test_env::EnvGuard::set("MODEL", "anthropic/claude-3.5-sonnet");
         config.apply_env_overrides();
         assert_eq!(
             config.default_model.as_deref(),
             Some("anthropic/claude-3.5-sonnet")
         );
-
-        std::env::remove_var("MODEL");
     }
 
     #[test]
@@ -6997,11 +6971,10 @@ level = "full"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("RANTAICLAW_WORKSPACE", "/custom/workspace");
+        let _g_workspace =
+            crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", "/custom/workspace");
         config.apply_env_overrides();
         assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
-
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
     }
 
     #[test]
@@ -7011,7 +6984,7 @@ level = "full"
         let default_workspace_dir = default_config_dir.join("workspace");
         let workspace_dir = default_config_dir.join("profile-a");
 
-        std::env::set_var("RANTAICLAW_WORKSPACE", &workspace_dir);
+        let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -7021,7 +6994,6 @@ level = "full"
         assert_eq!(config_dir, workspace_dir);
         assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
 
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -7042,8 +7014,9 @@ level = "full"
             .await
             .unwrap();
 
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", &explicit_config_dir);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _g_config_dir =
+            crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", &explicit_config_dir);
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -7057,7 +7030,6 @@ level = "full"
             explicit_config_dir.join("workspace")
         );
 
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -7069,7 +7041,7 @@ level = "full"
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
         fs::create_dir_all(&default_config_dir).await.unwrap();
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
@@ -7123,14 +7095,13 @@ level = "full"
         let temp_home =
             std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_home).await.unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::remove_var("RANTAICLAW_PROFILE");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
 
         let default_config_dir = temp_home.join(".rantaiclaw");
         let default_workspace_dir = default_config_dir.join("workspace");
 
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -7145,11 +7116,6 @@ level = "full"
             temp_home.join(".rantaiclaw/profiles/default/workspace")
         );
 
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -7160,9 +7126,8 @@ level = "full"
             std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("profile-a");
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("RANTAICLAW_WORKSPACE", &workspace_dir);
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7170,12 +7135,6 @@ level = "full"
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
 
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -7187,9 +7146,8 @@ level = "full"
         let workspace_dir = temp_home.join("workspace");
         let legacy_config_path = temp_home.join(".rantaiclaw").join("config.toml");
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("RANTAICLAW_WORKSPACE", &workspace_dir);
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7197,12 +7155,6 @@ level = "full"
         assert_eq!(config.config_path, legacy_config_path);
         assert!(config.config_path.exists());
 
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -7225,9 +7177,8 @@ default_model = "legacy-model"
         .await
         .unwrap();
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("RANTAICLAW_WORKSPACE", &workspace_dir);
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7235,12 +7186,6 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
 
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -7259,9 +7204,8 @@ default_model = "legacy-model"
         .await
         .unwrap();
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
         persist_active_workspace_config_dir(&custom_config_dir)
             .await
@@ -7273,11 +7217,6 @@ default_model = "legacy-model"
         assert_eq!(config.workspace_dir, custom_config_dir.join("workspace"));
         assert_eq!(config.default_model.as_deref(), Some("persisted-profile"));
 
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -7297,24 +7236,18 @@ default_model = "legacy-model"
         .await
         .unwrap();
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
         persist_active_workspace_config_dir(&marker_config_dir)
             .await
             .unwrap();
-        std::env::set_var("RANTAICLAW_WORKSPACE", &env_workspace_dir);
+        let _g_workspace =
+            crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &env_workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
         assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -7327,8 +7260,7 @@ default_model = "legacy-model"
         let custom_config_dir = temp_home.join("profiles").join("custom-profile");
         let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
 
         persist_active_workspace_config_dir(&custom_config_dir)
             .await
@@ -7340,11 +7272,6 @@ default_model = "legacy-model"
             .unwrap();
         assert!(!marker_path.exists());
 
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -7354,11 +7281,9 @@ default_model = "legacy-model"
         let mut config = Config::default();
         let original_provider = config.default_provider.clone();
 
-        std::env::set_var("RANTAICLAW_PROVIDER", "");
+        let _g_provider = crate::test_env::EnvGuard::set("RANTAICLAW_PROVIDER", "");
         config.apply_env_overrides();
         assert_eq!(config.default_provider, original_provider);
-
-        std::env::remove_var("RANTAICLAW_PROVIDER");
     }
 
     #[test]
@@ -7367,11 +7292,9 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.gateway.port, 9393);
 
-        std::env::set_var("RANTAICLAW_GATEWAY_PORT", "8080");
+        let _g_gateway_port = crate::test_env::EnvGuard::set("RANTAICLAW_GATEWAY_PORT", "8080");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 8080);
-
-        std::env::remove_var("RANTAICLAW_GATEWAY_PORT");
     }
 
     #[test]
@@ -7379,12 +7302,10 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("RANTAICLAW_GATEWAY_PORT");
-        std::env::set_var("PORT", "9000");
+        let _g_rc_gateway_port = crate::test_env::EnvGuard::unset("RANTAICLAW_GATEWAY_PORT");
+        let _g_port = crate::test_env::EnvGuard::set("PORT", "9000");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 9000);
-
-        std::env::remove_var("PORT");
     }
 
     #[test]
@@ -7393,11 +7314,9 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.gateway.host, "127.0.0.1");
 
-        std::env::set_var("RANTAICLAW_GATEWAY_HOST", "0.0.0.0");
+        let _g_gateway_host = crate::test_env::EnvGuard::set("RANTAICLAW_GATEWAY_HOST", "0.0.0.0");
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
-
-        std::env::remove_var("RANTAICLAW_GATEWAY_HOST");
     }
 
     #[test]
@@ -7405,12 +7324,10 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("RANTAICLAW_GATEWAY_HOST");
-        std::env::set_var("HOST", "0.0.0.0");
+        let _g_rc_gateway_host = crate::test_env::EnvGuard::unset("RANTAICLAW_GATEWAY_HOST");
+        let _g_host = crate::test_env::EnvGuard::set("HOST", "0.0.0.0");
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
-
-        std::env::remove_var("HOST");
     }
 
     #[test]
@@ -7418,11 +7335,9 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("RANTAICLAW_TEMPERATURE", "0.5");
+        let _g_temperature = crate::test_env::EnvGuard::set("RANTAICLAW_TEMPERATURE", "0.5");
         config.apply_env_overrides();
         assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
-
-        std::env::remove_var("RANTAICLAW_TEMPERATURE");
     }
 
     #[test]
@@ -7435,14 +7350,12 @@ default_model = "legacy-model"
         let original_temp = config.default_temperature;
 
         // Temperature > 2.0 should be ignored
-        std::env::set_var("RANTAICLAW_TEMPERATURE", "3.0");
+        let _g_temperature = crate::test_env::EnvGuard::set("RANTAICLAW_TEMPERATURE", "3.0");
         config.apply_env_overrides();
         assert!(
             (config.default_temperature - original_temp).abs() < f64::EPSILON,
             "Temperature 3.0 should be ignored (out of range)"
         );
-
-        std::env::remove_var("RANTAICLAW_TEMPERATURE");
     }
 
     #[test]
@@ -7451,15 +7364,15 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.runtime.reasoning_enabled, None);
 
-        std::env::set_var("RANTAICLAW_REASONING_ENABLED", "false");
+        let _g_reasoning_false =
+            crate::test_env::EnvGuard::set("RANTAICLAW_REASONING_ENABLED", "false");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        std::env::set_var("RANTAICLAW_REASONING_ENABLED", "true");
+        let _g_reasoning_true =
+            crate::test_env::EnvGuard::set("RANTAICLAW_REASONING_ENABLED", "true");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(true));
-
-        std::env::remove_var("RANTAICLAW_REASONING_ENABLED");
     }
 
     #[test]
@@ -7468,11 +7381,9 @@ default_model = "legacy-model"
         let mut config = Config::default();
         config.runtime.reasoning_enabled = Some(false);
 
-        std::env::set_var("RANTAICLAW_REASONING_ENABLED", "maybe");
+        let _g_reasoning = crate::test_env::EnvGuard::set("RANTAICLAW_REASONING_ENABLED", "maybe");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
-
-        std::env::remove_var("RANTAICLAW_REASONING_ENABLED");
     }
 
     #[test]
@@ -7481,11 +7392,9 @@ default_model = "legacy-model"
         let mut config = Config::default();
         let original_port = config.gateway.port;
 
-        std::env::set_var("PORT", "not_a_number");
+        let _g_port = crate::test_env::EnvGuard::set("PORT", "not_a_number");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, original_port);
-
-        std::env::remove_var("PORT");
     }
 
     #[test]
@@ -7524,16 +7433,13 @@ default_model = "legacy-model"
         let original_max_results = config.web_search.max_results;
         let original_timeout = config.web_search.timeout_secs;
 
-        std::env::set_var("WEB_SEARCH_MAX_RESULTS", "99");
-        std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "0");
+        let _g_max_results = crate::test_env::EnvGuard::set("WEB_SEARCH_MAX_RESULTS", "99");
+        let _g_timeout = crate::test_env::EnvGuard::set("WEB_SEARCH_TIMEOUT_SECS", "0");
 
         config.apply_env_overrides();
 
         assert_eq!(config.web_search.max_results, original_max_results);
         assert_eq!(config.web_search.timeout_secs, original_timeout);
-
-        std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
-        std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
     }
 
     #[test]
@@ -7541,9 +7447,12 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("RANTAICLAW_STORAGE_PROVIDER", "postgres");
-        std::env::set_var("RANTAICLAW_STORAGE_DB_URL", "postgres://example/db");
-        std::env::set_var("RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
+        let _g_storage_provider =
+            crate::test_env::EnvGuard::set("RANTAICLAW_STORAGE_PROVIDER", "postgres");
+        let _g_storage_db_url =
+            crate::test_env::EnvGuard::set("RANTAICLAW_STORAGE_DB_URL", "postgres://example/db");
+        let _g_storage_timeout =
+            crate::test_env::EnvGuard::set("RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
 
         config.apply_env_overrides();
 
@@ -7556,10 +7465,6 @@ default_model = "legacy-model"
             config.storage.provider.config.connect_timeout_secs,
             Some(15)
         );
-
-        std::env::remove_var("RANTAICLAW_STORAGE_PROVIDER");
-        std::env::remove_var("RANTAICLAW_STORAGE_DB_URL");
-        std::env::remove_var("RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS");
     }
 
     #[test]
