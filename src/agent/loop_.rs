@@ -2164,10 +2164,20 @@ pub async fn run_with_scope(
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter");
 
+    // No hardcoded fallback: an unconfigured model must fail here with a clear
+    // fix-it hint, not silently run against a guessed model (which then 401s or
+    // hits a nonexistent model). Mirrors Agent::from_config_with_observer.
     let model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model is configured. Run `rantaiclaw setup provider`, or pass \
+                 `--model <id>` / set RANTAICLAW_MODEL. The agent does not assume a default model."
+            )
+        })?;
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -2702,10 +2712,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     tools_registry.extend(peripheral_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    // No hardcoded fallback — an unconfigured model fails with a fix-it hint
+    // rather than silently running against a guessed one.
     let model_name = config
         .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model is configured. Run `rantaiclaw setup provider`, or pass \
+                 `--model <id>` / set RANTAICLAW_MODEL. The agent does not assume a default model."
+            )
+        })?
+        .to_string();
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
