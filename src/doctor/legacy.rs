@@ -75,10 +75,38 @@ pub(crate) fn refresh_model_catalogs(
 ) -> ProbeSummary {
     let mut summary = ProbeSummary::default();
 
-    for provider_name in targets {
+    // Probe every provider concurrently. Each probe is a blocking network fetch,
+    // so a sequential sweep cost the SUM of provider latencies; scoped threads
+    // make it the MAX. Outcomes are collected in target order and printed
+    // serially below, so the report stays clean and deterministic (concurrent
+    // `println!` would interleave). Cache writes hit per-provider files, so
+    // distinct providers do not race.
+    let outcomes: Vec<Result<ModelRefreshOutcome>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|provider_name| {
+                scope.spawn(move || {
+                    crate::onboard::wizard::probe_provider_catalog_quiet(
+                        config,
+                        provider_name,
+                        force,
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("model probe thread panicked")))
+            })
+            .collect()
+    });
+
+    for (provider_name, outcome) in targets.iter().zip(outcomes) {
         println!("  [{}]", provider_name);
 
-        match crate::onboard::run_models_refresh(config, Some(provider_name), force) {
+        match outcome {
             Ok(ModelRefreshOutcome::FetchedLive { count }) => {
                 summary.ok += 1;
                 println!("    ✅ model catalog check passed ({count} models)");

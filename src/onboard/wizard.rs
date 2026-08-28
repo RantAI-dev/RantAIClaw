@@ -2223,6 +2223,76 @@ pub fn run_models_refresh(
     }
 }
 
+/// Probe one provider's model catalog and RETURN its outcome without printing
+/// anything — the quiet sibling of [`run_models_refresh`]. It exists so the
+/// `doctor models` sweep can probe every provider concurrently and then print
+/// the per-provider verdicts serially, in order (concurrent `println!` from the
+/// verbose path would interleave). The outcome logic mirrors `run_models_refresh`
+/// exactly: cache-first unless `force`, then a live fetch with a stale-cache
+/// fallback. Cache writes target the per-provider cache file, so concurrent
+/// probes of distinct providers do not race.
+pub(crate) fn probe_provider_catalog_quiet(
+    config: &Config,
+    provider_name: &str,
+    force: bool,
+) -> Result<ModelRefreshOutcome> {
+    let provider_name = provider_name.trim();
+    if provider_name.is_empty() {
+        anyhow::bail!("Provider name cannot be empty");
+    }
+    if !supports_live_model_fetch(provider_name) {
+        anyhow::bail!("Provider '{provider_name}' does not support live model discovery yet");
+    }
+
+    if !force {
+        if let Some(cached) = load_cached_models_for_provider(
+            &config.workspace_dir,
+            provider_name,
+            MODEL_CACHE_TTL_SECS,
+        )? {
+            return Ok(ModelRefreshOutcome::ServedFreshCache {
+                age_secs: cached.age_secs,
+            });
+        }
+    }
+
+    let api_key = config
+        .resolve_key_for_provider(provider_name)
+        .unwrap_or_default();
+    let provider_api_url = active_provider_api_url(config, provider_name);
+
+    match fetch_live_models_for_provider(provider_name, &api_key, provider_api_url) {
+        Ok(models) if !models.is_empty() => {
+            let count = models.len();
+            cache_live_models_for_provider(&config.workspace_dir, provider_name, &models)?;
+            Ok(ModelRefreshOutcome::FetchedLive { count })
+        }
+        Ok(_) => {
+            if let Some(stale_cache) =
+                load_any_cached_models_for_provider(&config.workspace_dir, provider_name)?
+            {
+                return Ok(ModelRefreshOutcome::ServedStaleCache {
+                    age_secs: stale_cache.age_secs,
+                    reason: StaleCacheReason::ProviderReturnedEmpty,
+                });
+            }
+            anyhow::bail!("Provider '{provider_name}' returned an empty model list")
+        }
+        Err(error) => {
+            if let Some(stale_cache) =
+                load_any_cached_models_for_provider(&config.workspace_dir, provider_name)?
+            {
+                return Ok(ModelRefreshOutcome::ServedStaleCache {
+                    age_secs: stale_cache.age_secs,
+                    reason: StaleCacheReason::FetchFailed,
+                });
+            }
+            Err(error)
+                .with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
+        }
+    }
+}
+
 // ── Step helpers ─────────────────────────────────────────────────
 
 fn print_step(current: u8, total: u8, title: &str) {
