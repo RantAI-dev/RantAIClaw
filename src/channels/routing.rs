@@ -169,10 +169,10 @@ pub(crate) fn resolved_default_provider(config: &Config) -> String {
 }
 
 pub(crate) fn resolved_default_model(config: &Config) -> String {
-    config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+    // No hardcoded fallback: an unconfigured model stays empty so the agent
+    // build refuses it with a clear "no model — run setup" error, rather than a
+    // channel silently answering with a guessed model.
+    config.default_model.clone().unwrap_or_default()
 }
 
 pub(crate) fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {

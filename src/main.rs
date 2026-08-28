@@ -1929,7 +1929,11 @@ async fn main() -> Result<()> {
 
             cli_style::section("config");
             let provider = config.default_provider.as_deref().unwrap_or("openrouter");
-            let model = config.default_model.as_deref().unwrap_or("(default)");
+            let model = config
+                .default_model
+                .as_deref()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or("(not set — run `rantaiclaw setup provider`)");
             cli_style::field("Provider", W, &format!("{provider} · {model}"));
             cli_style::field("Observ.", W, &config.observability.backend.to_string());
             // Show the preset, not just the level: Manual and Smart are both

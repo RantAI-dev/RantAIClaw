@@ -32,7 +32,9 @@ mod tests {
         let config = Config::default();
 
         assert!(config.default_provider.is_some());
-        assert!(config.default_model.is_some());
+        // `default_model` is intentionally unset on a fresh install — the agent
+        // refuses to guess one, and setup fills it in.
+        assert!(config.default_model.is_none());
         assert!(config.default_temperature > 0.0);
     }
 
