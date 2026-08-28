@@ -515,10 +515,20 @@ impl Agent {
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
+        // No model configured → refuse to guess one. A silent hardcoded
+        // fallback here is exactly what let a keyless/modelless fresh install
+        // look configured; fail fast with a fix-it hint instead.
         let model_name = config
             .default_model
             .as_deref()
-            .unwrap_or("anthropic/claude-sonnet-4-20250514")
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no model is configured. Run `rantaiclaw setup provider`, or pass \
+                     `--model <id>` / set RANTAICLAW_MODEL. The agent does not assume a default model."
+                )
+            })?
             .to_string();
 
         // Resolve the key for THIS provider (not blindly the top-level api_key,
@@ -1164,10 +1174,12 @@ pub async fn run(
         .as_deref()
         .unwrap_or("openrouter")
         .to_string();
+    // `from_config` above already refused an empty model, so this is set; no
+    // hardcoded fallback (which would drift from the real default).
     let model_name = effective_config
         .default_model
         .as_deref()
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
+        .unwrap_or_default()
         .to_string();
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
@@ -1207,6 +1219,8 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = std::env::temp_dir();
         config.memory.backend = "none".into();
+        // A fresh default has no model now; a build requires one.
+        config.default_model = Some("anthropic/claude-sonnet-4.6".into());
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let agent = Agent::from_config_with_observer(&config, observer.clone())
@@ -1216,6 +1230,26 @@ mod tests {
         assert!(
             Arc::ptr_eq(&observer, &agent.observer),
             "agent must reuse the injected observer, not build its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_refuses_to_build_without_a_configured_model() {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = std::env::temp_dir();
+        config.memory.backend = "none".into();
+        // A fresh install has no model; the agent must not guess one.
+        assert_eq!(config.default_model, None);
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let err = Agent::from_config_with_observer(&config, observer)
+            .await
+            .err()
+            .expect("a modelless config must not build an agent");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("no model") && msg.contains("setup provider"),
+            "the error must name the problem and the fix: {msg}"
         );
     }
 

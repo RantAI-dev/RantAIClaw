@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 25;
+pub const CURRENT_VERSION: u32 = 26;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -360,7 +360,17 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v25(raw);
     }
 
-    // Future migrations (v26, …) inserted here in order.
+    // v25 → v26: `default_model`'s default became empty (was
+    // `anthropic/claude-sonnet-4.6`) so a fresh install is unconfigured until
+    // setup runs and the agent refuses to guess a model. Configs that carry an
+    // EXPLICIT `default_model` keep it (a user choice); configs that lack it stay
+    // without one. No structural transform — this arm burns a version slot so the
+    // schema-defaults fingerprint can be accepted with intent (mirrors v1 → v2).
+    if from < 26 {
+        // (no transformation; default-value-only change)
+    }
+
+    // Future migrations (v27, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)

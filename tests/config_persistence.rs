@@ -23,11 +23,12 @@ fn config_default_has_expected_provider() {
 }
 
 #[test]
-fn config_default_has_expected_model() {
+fn config_default_has_no_baked_in_model() {
     let config = Config::default();
     assert!(
-        config.default_model.is_some(),
-        "default config should have a default_model"
+        config.default_model.is_none(),
+        "a fresh install must be unconfigured — the agent refuses to guess a model, \
+         and setup fills default_model in"
     );
 }
 

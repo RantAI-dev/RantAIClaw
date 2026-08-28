@@ -3413,7 +3413,11 @@ impl Default for Config {
             provider_api_keys: HashMap::new(),
             api_url: None,
             default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
+            // Empty by default: a fresh install has NO model until the operator
+            // runs setup. The agent refuses to guess one (see
+            // Agent::from_config_with_observer), and the TUI/console show the
+            // model field blank rather than a baked-in placeholder.
+            default_model: None,
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -4954,7 +4958,9 @@ mod tests {
     async fn config_default_has_sane_values() {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
-        assert!(c.default_model.as_deref().unwrap().contains("claude"));
+        // No baked-in model: a fresh install is unconfigured until setup runs,
+        // so the agent won't silently guess a model and the UI shows it blank.
+        assert_eq!(c.default_model, None);
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(!c.skills.open_skills_enabled);
