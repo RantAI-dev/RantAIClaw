@@ -50,3 +50,45 @@ impl Drop for HomeGuard {
         }
     }
 }
+
+/// Set (or clear) an arbitrary env var and put the previous value back on drop,
+/// so a test that panics between the set and its trailing `remove_var` does not
+/// leak the override into the next test sharing `ENV_LOCK`. The generic sibling
+/// of [`HomeGuard`] — for `RANTAICLAW_API_KEY`, `RANTAICLAW_PROVIDER`,
+/// `RANTAICLAW_CONFIG_DIR`, `PORT`, etc.
+///
+/// Bind it to a NAMED local (`let _guard = EnvGuard::set(...)`), never `let _ =`
+/// — the latter drops immediately and restores before the test body runs.
+///
+/// Only meaningful while `ENV_LOCK` is held.
+#[must_use = "the override is reverted the moment this guard is dropped; bind it to a named local"]
+pub(crate) struct EnvGuard {
+    key: &'static str,
+    prev: Option<OsString>,
+}
+
+impl EnvGuard {
+    /// Set `key` to `value` for the guard's lifetime.
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+
+    /// Ensure `key` is UNSET for the guard's lifetime (restoring any prior value
+    /// on drop) — the `remove_var("X"); set_var("Y", …)` precedence pattern.
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(prev) => std::env::set_var(self.key, prev),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}

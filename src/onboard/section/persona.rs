@@ -84,9 +84,10 @@ mod tests {
         // sync test (no runtime), so acquire the shared async lock via blocking.
         let _guard = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
-        std::env::remove_var("RANTAICLAW_PROFILE");
+        // Guards restore the pre-test HOME / profile on drop, so a panic between
+        // here and the asserts can't leak the tempdir override into later tests.
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
         let profile = ProfileManager::ensure("rt-iac-section").unwrap();
         let config = Config::default();
 
@@ -97,13 +98,6 @@ mod tests {
         persona::write_persona_toml(&profile, &persona).unwrap();
 
         assert!(section.is_already_configured(&profile, &config));
-
-        // Restore the pre-test HOME — leaving it pointed at the (deleted)
-        // tempdir contaminates every later test that resolves paths via HOME.
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
