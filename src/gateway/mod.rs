@@ -611,10 +611,10 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
             reasoning_enabled: config.runtime.reasoning_enabled,
         },
     )?);
-    let model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+    // Empty when unconfigured (no baked-in model): the gateway still starts and
+    // serves the console so the operator can configure a model; a chat request
+    // then fails fast in the agent loop with a clear hint.
+    let model = config.default_model.clone().unwrap_or_default();
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
