@@ -207,10 +207,31 @@ pub fn run_setup(
         return Ok(report);
     }
 
-    // Full sweep. Section count is small (5 in v0.5.0, ≤13 ever) so a
-    // saturating cast keeps clippy quiet without changing behaviour.
-    let total = u8::try_from(sections.len()).unwrap_or(u8::MAX);
+    // Full sweep.
     let mut report = SetupReport::default();
+    run_section_sweep(&sections, profile, config, interactive, force, &mut report)?;
+
+    if interactive {
+        print_setup_completion();
+    }
+    Ok(report)
+}
+
+/// Run every section in canonical order, stopping at the first failure. `report`
+/// is borrowed (not returned) so the caller — and tests — can inspect exactly
+/// which sections were visited even when a section errors: the "stop at the
+/// first failure and do not visit later sections" property. Section count is
+/// small (≤13 ever) so the saturating `u8` casts keep clippy quiet without
+/// changing behaviour.
+fn run_section_sweep(
+    sections: &[Box<dyn SetupSection>],
+    profile: &Profile,
+    config: &mut Config,
+    interactive: bool,
+    force: bool,
+    report: &mut SetupReport,
+) -> Result<()> {
+    let total = u8::try_from(sections.len()).unwrap_or(u8::MAX);
     for (idx, section) in sections.iter().enumerate() {
         let step = u8::try_from(idx + 1).unwrap_or(u8::MAX);
         run_one(
@@ -219,17 +240,13 @@ pub fn run_setup(
             config,
             interactive,
             force,
-            &mut report,
+            report,
             interactive,
             step,
             total,
         )?;
     }
-
-    if interactive {
-        print_setup_completion();
-    }
-    Ok(report)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5656,6 +5673,75 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn section_sweep_stops_at_first_failure_and_skips_later_sections() {
+        // The real "setup stops at the first failing section" property. The old
+        // integration test asserted only `!err.is_empty()` on the unknown-topic
+        // path (which errors before any section runs) — it never exercised a
+        // mid-sweep failure. A stub section fails in the middle; the sweep must
+        // propagate the error and leave the section after it unvisited.
+        struct StubSection {
+            name: &'static str,
+            fail: bool,
+        }
+        impl SetupSection for StubSection {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn description(&self) -> &'static str {
+                "stub section"
+            }
+            fn is_already_configured(&self, _profile: &Profile, _config: &Config) -> bool {
+                false
+            }
+            fn run(&self, _ctx: &mut SetupContext) -> Result<()> {
+                if self.fail {
+                    anyhow::bail!("stub section '{}' failed", self.name);
+                }
+                Ok(())
+            }
+            fn headless_hint(&self) -> &'static str {
+                "stub-hint"
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let profile = Profile {
+            name: "test".to_string(),
+            root: tmp.path().to_path_buf(),
+        };
+        let mut config = Config::default();
+        let sections: Vec<Box<dyn SetupSection>> = vec![
+            Box::new(StubSection {
+                name: "first",
+                fail: false,
+            }),
+            Box::new(StubSection {
+                name: "boom",
+                fail: true,
+            }),
+            Box::new(StubSection {
+                name: "later",
+                fail: false,
+            }),
+        ];
+
+        let mut report = SetupReport::default();
+        let err = run_section_sweep(&sections, &profile, &mut config, false, true, &mut report)
+            .expect_err("a failing section must propagate its error");
+
+        assert!(err.to_string().contains("boom"), "error propagates: {err}");
+        assert_eq!(
+            report.visited,
+            vec!["first".to_string()],
+            "only sections before the failure are visited"
+        );
+        assert!(
+            !report.visited.contains(&"later".to_string()),
+            "the section after the failure must not run"
+        );
+    }
 
     #[test]
     fn env_key_present_treats_empty_as_absent() {

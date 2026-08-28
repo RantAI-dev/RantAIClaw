@@ -1400,3 +1400,94 @@ mod choose_scroll_tests {
         assert_eq!(w.choose_scroll, 0);
     }
 }
+
+#[cfg(test)]
+mod forward_state_tests {
+    use super::*;
+    use crate::profile::Profile;
+    use std::path::PathBuf;
+
+    fn test_profile() -> Profile {
+        Profile {
+            name: "test".into(),
+            root: PathBuf::from("/tmp/rantaiclaw-test"),
+        }
+    }
+
+    fn phase_label(phase: &WizardPhase) -> String {
+        match phase {
+            WizardPhase::RunningProvisioner { name } => name.clone(),
+            WizardPhase::Welcome => "Welcome".into(),
+            WizardPhase::PickChannels => "PickChannels".into(),
+            WizardPhase::PickIntegrations => "PickIntegrations".into(),
+            WizardPhase::Complete => "Complete".into(),
+        }
+    }
+
+    // Only back()/scroll were covered; the forward machine (start_provisioners →
+    // advance_to_next_in_queue_or_picker) was not. This pins the whole forward
+    // sequence: every required provisioner in canonical order, then the two
+    // pickers, then Complete.
+    #[test]
+    fn forward_walk_runs_required_provisioners_then_pickers_in_order() {
+        let mut w = FirstRunWizard::new(test_profile());
+        assert_eq!(w.phase, WizardPhase::Welcome);
+
+        let mut trace: Vec<String> = Vec::new();
+        w.start_provisioners();
+        for _ in 0..20 {
+            trace.push(phase_label(&w.phase));
+            if w.phase == WizardPhase::Complete {
+                break;
+            }
+            w.advance_to_next_in_queue_or_picker();
+        }
+
+        assert_eq!(
+            trace,
+            [
+                "provider",
+                "approvals",
+                "login",
+                "persona",
+                "skills",
+                "PickChannels",
+                "PickIntegrations",
+                "Complete",
+            ]
+            .map(String::from)
+            .to_vec(),
+        );
+    }
+
+    // The picker path: selected options are queued in INDEX order (selection is
+    // stored sorted), regardless of the order they were toggled, and the first
+    // becomes the running phase.
+    #[test]
+    fn picker_selection_queues_in_index_order_and_runs_the_first() {
+        let mut w = FirstRunWizard::new(test_profile());
+        // Drain the required queue so the picker drives what runs next.
+        w.queue.clear();
+        w.phase = WizardPhase::PickChannels;
+        w.open_picker(vec![
+            ("telegram".into(), "Telegram".into()),
+            ("discord".into(), "Discord".into()),
+            ("slack".into(), "Slack".into()),
+        ]);
+
+        // Toggle slack (idx 2) FIRST, then telegram (idx 0).
+        w.picker_move_down();
+        w.picker_move_down();
+        w.picker_toggle();
+        w.picker_move_up();
+        w.picker_move_up();
+        w.picker_toggle();
+
+        w.apply_picker_selection();
+
+        // Index order (telegram=0, slack=2) wins over toggle order: telegram
+        // runs first, slack is queued next.
+        assert_eq!(w.current_provisioner_name(), Some("telegram"));
+        assert_eq!(w.queue, vec!["slack".to_string()]);
+    }
+}

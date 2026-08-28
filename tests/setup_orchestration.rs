@@ -184,28 +184,14 @@ fn setup_with_unknown_topic_errors_with_valid_topic_list() {
     });
 }
 
-#[test]
-fn setup_propagates_section_failures_and_stops() {
-    // Headless persona section should succeed (writes default preset). To
-    // simulate a hard stop without injecting a fake section, we exercise
-    // the unknown-topic path which returns Err *before* any section runs.
-    // The "stops at first failure" property is documented; topic errors
-    // and section errors share the same propagation path. This test pairs
-    // with `setup_with_unknown_topic_errors_with_valid_topic_list`.
-    with_home(|| {
-        let profile = ProfileManager::ensure_default().unwrap();
-        let mut config = Config::default();
-        let err = wizard::run_setup(
-            &profile,
-            &mut config,
-            Some("__never__".to_string()),
-            false,
-            true,
-        )
-        .expect_err("dispatch must fail before running any section");
-        assert!(!err.to_string().is_empty());
-    });
-}
+// The "setup stops at the first failing section (and does not visit later
+// sections)" property is covered by the unit test
+// `wizard::tests::section_sweep_stops_at_first_failure_and_skips_later_sections`,
+// which injects a stub failing section — something this integration test cannot
+// do (no canonical section fails in headless mode; they emit a hint and return
+// Ok). The former test here asserted only `!err.is_empty()` on the unknown-topic
+// path, duplicating `setup_with_unknown_topic_errors_with_valid_topic_list`
+// below without exercising a mid-sweep failure, so it was removed.
 
 #[test]
 fn onboard_alias_dispatches_to_setup_with_no_topic() {
