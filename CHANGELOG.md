@@ -36,6 +36,8 @@ claw-ui pin bumped to **v0.3.23**.
   configured — the caller's to fix, with the actionable hint in the response
   body. (#685)
 
+## [0.26.0-alpha] — 2026-08-28
+
 Configuration and lifecycle hardening — the consolidated deep-scan of config
 loading, the config API, setup/doctor, the daemon and service lifecycle, and the
 console's configuration surfaces. **Config schema v23 → v25**: the release
