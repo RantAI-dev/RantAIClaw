@@ -7,7 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.26.0-alpha] — 2026-08-28
+## [0.27.0-alpha] — 2026-08-30
+
+No baked-in default model. A fresh install no longer ships a hardcoded
+`default_model`, so the TUI/console show the model **blank** until the operator
+runs setup, and the agent **refuses to guess** a model rather than silently
+running against one that then 401s or does not exist. **Config schema v25 → v26**
+carries a no-op migrate arm (existing configs keep their explicit model; only
+fresh defaults change), so it does not roll back cleanly to a pre-v26 binary.
+claw-ui pin bumped to **v0.3.23**.
+
+### Changed
+
+- **`Config::default().default_model` is now empty.** Model resolution was
+  scattered across the agent build, both agent-loop request paths, and the
+  gateway/channels with three different hardcoded literals; all now fail fast
+  with `no model is configured. Run \`rantaiclaw setup provider\` …` (a typed
+  `agent::NoModelConfigured`). Existing on-disk configs (which carry an explicit
+  `default_model`) are unaffected; `--model` / `RANTAICLAW_MODEL` overrides still
+  resolve. `default_provider` is unchanged (still `openrouter`). (#683, #684)
+- **`rantaiclaw status`** shows `(not set — run setup)`, and the console chat
+  footer shows **"no model set"** instead of the word "default", when no model
+  is configured. (#683, claw-ui #75 / v0.3.23)
+
+### Fixed
+
+- **`POST /api/v1/agent/chat` returns 400, not 500,** when no model is
+  configured — the caller's to fix, with the actionable hint in the response
+  body. (#685)
 
 Configuration and lifecycle hardening — the consolidated deep-scan of config
 loading, the config API, setup/doctor, the daemon and service lifecycle, and the
