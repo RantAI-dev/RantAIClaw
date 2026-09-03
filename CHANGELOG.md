@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `ui install`/`ui update` now pin claw-ui v0.3.24: the console UI/UX wave
+  (claw-ui #78–#107) — every panel on the verdict-band design system, chat
+  turn-state honesty (failed tools surface in the activity header), one
+  label language across forms, and small affordance/contrast fixes.
+
 ## [0.27.0-alpha] — 2026-08-30
 
 No baked-in default model. A fresh install no longer ships a hardcoded
