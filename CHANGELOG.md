@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0-alpha] — 2026-09-04
+
+Wave 0 of the production-readiness audit: the eight verified blockers, none of
+which had reached a user before this release. Two are credential/authentication
+fixes (a Telegram bot token reaching logs, a forgeable `Authentication-Results`
+header granting owner authority over email), one is data loss (`ui install --dir`
+deleting any directory that held a `.git`), and the rest cover the MCP transport,
+the gateway's MCP lifetime, the TUI's crash-and-wreck-the-terminal path, and the
+console's framework currency. **Config schema v26 → v27**: the release adds
+`[channels_config.email] trusted_authserv_id` with a no-op migrate arm, so it
+does **not** roll back cleanly to 0.27.1-alpha (a v27 config will not load on a
+pre-v27 binary). claw-ui pin bumped to **v0.3.25**.
+
+Two behaviour changes need an operator's attention, both narrowing:
+
+- **Email owner recognition is off until `trusted_authserv_id` is set.** Mail
+  from an `approval_owners` address is dropped rather than granted owner
+  authority, and the channel says so at startup. Ordinary mail is unaffected.
+- **A configured tunnel no longer authorises a public bind.** A config that binds
+  `0.0.0.0` and relied on `[tunnel] provider` to make that acceptable now refuses
+  to start; bind `127.0.0.1` (the tunnel reaches it there) or set
+  `[gateway] allow_public_bind = true` explicitly.
+
+No exposure-boundary default is widened.
+
 ### Fixed
 
 - The gateway stops respawning every MCP server on every chat request. It
@@ -52,6 +77,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `.git` whose remote is claw-ui's own (the pre-tarball installer used
   `git clone`, and that upgrade path still works). The `remove_dir_all` call
   re-checks ownership itself rather than trusting a guard 60 lines away.
+- `CI Required Gate` — the one check branch protection is meant to require —
+  now reads every job it runs. `channel-lark` was missing from its `needs:` and
+  `docs-quality` was only checked on pushes, so both went red on a PR without
+  blocking the merge; and a `skipped` result counted as a pass, so the
+  `ci:full`-gated stages enforced nothing. The decision table moved to
+  `scripts/ci/required_gate.sh` with a self-test the job runs first, every Rust
+  stage now runs on every Rust PR, and the checks worth requiring
+  (`workflow-sanity`, `sec-audit`) no longer carry `paths:` filters that would
+  leave a required check permanently pending. (#698, #699, #700)
 
 ### Security
 
