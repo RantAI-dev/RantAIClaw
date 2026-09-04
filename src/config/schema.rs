@@ -3790,6 +3790,159 @@ async fn resolve_runtime_config_dirs(
     ))
 }
 
+/// Encrypt every plaintext credential in a raw (not yet deserialised) config,
+/// in place. Returns how many values it changed.
+///
+/// This is the raw-`toml::Value` counterpart to [`decrypt_config_secrets`] and
+/// covers the same field list. It exists for the two moments that hold a config
+/// as text rather than as a `Config`:
+///
+/// - the v27 → v28 upgrade, which runs before deserialisation, and
+/// - the profile importer, which copies a foreign config it must not reshape.
+///
+/// **Keep the list below in step with `decrypt_config_secrets`.**
+/// `raw_and_typed_secret_lists_cover_the_same_fields` fails if they diverge:
+/// it encrypts through this function and decrypts through that one.
+///
+/// Best-effort per value: a failure is logged and leaves that value plaintext
+/// rather than aborting the load or the import.
+pub(crate) fn encrypt_config_secrets_in_raw(raw: &mut toml::Value, rantaiclaw_dir: &Path) -> usize {
+    // Honour the operator's own `[secrets] encrypt` setting; `SecretStore`
+    // returns the plaintext unchanged when encryption is disabled.
+    let encrypt_enabled = raw
+        .get("secrets")
+        .and_then(|s| s.get("encrypt"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    if !encrypt_enabled {
+        return 0;
+    }
+    let store = crate::security::SecretStore::new(rantaiclaw_dir, true);
+    let mut changed = 0usize;
+
+    for path in [
+        &["api_key"][..],
+        &["knowledge", "embedding_api_key"],
+        &["knowledge", "vision_api_key"],
+        &["composio", "api_key"],
+        &["browser", "computer_use", "api_key"],
+        &["web_search", "brave_api_key"],
+        &["storage", "provider", "config", "db_url"],
+        &["channels_config", "telegram", "bot_token"],
+    ] {
+        changed += encrypt_raw_at_path(raw, path, &store);
+    }
+
+    // Maps whose every value is a credential.
+    changed += encrypt_raw_map_values(raw, &["provider_api_keys"], &store);
+    // Maps of tables with one credential field each.
+    for (table, field) in [("agents", "api_key"), ("gateway_agents", "api_key")] {
+        if let Some(entries) = raw.get_mut(table).and_then(toml::Value::as_table_mut) {
+            for (_, entry) in entries.iter_mut() {
+                changed += encrypt_raw_at_path(entry, &[field], &store);
+            }
+        }
+    }
+
+    // MCP server env: every value, not a name-shaped guess. A heuristic would
+    // miss `DATABASE_URL` and `PGPASSWORD` — the same gap the config API's
+    // redaction had to work around.
+    if let Some(servers) = raw
+        .get_mut("mcp_servers")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for (_, server) in servers.iter_mut() {
+            changed += encrypt_raw_map_values(server, &["env"], &store);
+        }
+    }
+
+    // Skill keys, but only `source = "literal"` ones — a reference to a key
+    // held elsewhere is not itself a secret.
+    if let Some(entries) = raw
+        .get_mut("skills")
+        .and_then(|s| s.get_mut("entries"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        for (_, entry) in entries.iter_mut() {
+            let is_literal = entry
+                .get("api_key")
+                .and_then(|k| k.get("source"))
+                .and_then(toml::Value::as_str)
+                == Some("literal");
+            if is_literal {
+                changed += encrypt_raw_at_path(entry, &["api_key", "value"], &store);
+            }
+        }
+    }
+
+    changed
+}
+
+/// Encrypt the string at `path` if it is present and not already ciphertext.
+fn encrypt_raw_at_path(
+    raw: &mut toml::Value,
+    path: &[&str],
+    store: &crate::security::SecretStore,
+) -> usize {
+    let mut cursor = raw;
+    let (last, parents) = match path.split_last() {
+        Some(split) => split,
+        None => return 0,
+    };
+    for key in parents {
+        match cursor.get_mut(*key) {
+            Some(next) => cursor = next,
+            None => return 0,
+        }
+    }
+    let Some(slot) = cursor.get_mut(*last) else {
+        return 0;
+    };
+    encrypt_raw_slot(slot, store)
+}
+
+/// Encrypt every string value of the table at `path`.
+fn encrypt_raw_map_values(
+    raw: &mut toml::Value,
+    path: &[&str],
+    store: &crate::security::SecretStore,
+) -> usize {
+    let mut cursor = raw;
+    for key in path {
+        match cursor.get_mut(*key) {
+            Some(next) => cursor = next,
+            None => return 0,
+        }
+    }
+    let Some(table) = cursor.as_table_mut() else {
+        return 0;
+    };
+    let mut changed = 0;
+    for (_, value) in table.iter_mut() {
+        changed += encrypt_raw_slot(value, store);
+    }
+    changed
+}
+
+fn encrypt_raw_slot(slot: &mut toml::Value, store: &crate::security::SecretStore) -> usize {
+    let Some(plain) = slot.as_str() else {
+        return 0;
+    };
+    if plain.is_empty() || crate::security::SecretStore::is_encrypted(plain) {
+        return 0;
+    }
+    match store.encrypt(plain) {
+        Ok(ciphertext) => {
+            *slot = toml::Value::String(ciphertext);
+            1
+        }
+        Err(e) => {
+            tracing::warn!("could not encrypt a config credential at rest: {e:#}");
+            0
+        }
+    }
+}
+
 pub(crate) fn decrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -3875,6 +4028,23 @@ pub(crate) fn decrypt_config_secrets(
             "config.channels_config.telegram.bot_token",
         )?;
         tg.bot_token = wrapped.unwrap_or_default();
+    }
+    // An MCP server's `env` holds the token it authenticates with. Every
+    // value is treated as a secret rather than guessing from the variable
+    // name: a name-shaped heuristic would miss `DATABASE_URL` and
+    // `PGPASSWORD`, which is the same gap the config API's redaction had to
+    // work around. Decrypting symmetrically with `save()` is what lets
+    // `McpClient::connect` still receive the plaintext it spawns with.
+    for (name, server) in &mut config.mcp_servers {
+        for (var, value) in &mut server.env {
+            let mut wrapped = Some(std::mem::take(value));
+            decrypt_optional_secret(
+                store,
+                &mut wrapped,
+                &format!("config.mcp_servers.{name}.env.{var}"),
+            )?;
+            *value = wrapped.unwrap_or_default();
+        }
     }
     // Decrypt skill literal API keys symmetrically with `save()` so
     // `src/tools/mod.rs` still reads a plaintext value in memory.
@@ -4158,6 +4328,24 @@ impl Config {
                      as the API key rather than the base URL.",
                     config_path.display()
                 );
+            }
+            // Values written before v28 are on disk in plaintext. The migration
+            // runner cannot encrypt them — it is a pure `toml::Value` transform
+            // with no access to the profile's secret key — so the one-time pass
+            // happens here, inside the write-back the bump already triggers.
+            // Gated on `migrated` so this is an upgrade step, not a rewrite of
+            // the operator's file on every load: a hand-added plaintext value
+            // is encrypted by the next `save()`, exactly like `api_key`.
+            if migrated {
+                if let Some(dir) = config_path.parent() {
+                    let encrypted = encrypt_config_secrets_in_raw(&mut raw, dir);
+                    if encrypted > 0 {
+                        tracing::info!(
+                            "encrypted {encrypted} credential(s) at rest in {}",
+                            config_path.display()
+                        );
+                    }
+                }
             }
             if migrated || stripped_credential {
                 let serialized =
@@ -4846,6 +5034,22 @@ impl Config {
             let mut wrapped = Some(std::mem::take(key));
             encrypt_optional_secret(&store, &mut wrapped, "config.provider_api_keys.*")?;
             *key = wrapped.unwrap_or_default();
+        }
+
+        // MCP server env values are credentials (Notion, Slack and GitHub
+        // tokens live here). They were the one credential path that bypassed
+        // this function entirely — the config API redacts them on the wire,
+        // which made the plaintext on disk easy to miss.
+        for (name, server) in &mut config_to_save.mcp_servers {
+            for (var, value) in &mut server.env {
+                let mut wrapped = Some(std::mem::take(value));
+                encrypt_optional_secret(
+                    &store,
+                    &mut wrapped,
+                    &format!("config.mcp_servers.{name}.env.{var}"),
+                )?;
+                *value = wrapped.unwrap_or_default();
+            }
         }
 
         // Channel bot tokens are secrets too. `bot_token` is a plain `String`, so
@@ -5730,6 +5934,21 @@ tool_dispatcher = "xml"
                 ..Default::default()
             },
         );
+        // An MCP server's `env` carries the token the server authenticates
+        // with — the same class of credential as the three above.
+        config.mcp_servers.insert(
+            "example".into(),
+            McpServerConfig {
+                command: "npx".into(),
+                args: vec!["-y".into(), "example-mcp-server".into()],
+                env: [(
+                    "EXAMPLE_API_KEY".to_string(),
+                    "neutral-mcp-key-value".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
 
         config.save().await.unwrap();
 
@@ -5760,8 +5979,15 @@ tool_dispatcher = "xml"
             ),
             "skill literal key must be encrypted at rest"
         );
+        assert!(
+            crate::security::SecretStore::is_encrypted(
+                &stored.mcp_servers["example"].env["EXAMPLE_API_KEY"]
+            ),
+            "MCP server env value must be encrypted at rest: {}",
+            stored.mcp_servers["example"].env["EXAMPLE_API_KEY"]
+        );
 
-        // One shared pass restores all three.
+        // One shared pass restores all of them.
         let store = crate::security::SecretStore::new(&dir, true);
         decrypt_config_secrets(&store, &mut stored).unwrap();
         assert_eq!(
@@ -5780,6 +6006,10 @@ tool_dispatcher = "xml"
                 .value
                 .as_deref(),
             Some("neutral-skill-key-value")
+        );
+        assert_eq!(
+            stored.mcp_servers["example"].env["EXAMPLE_API_KEY"], "neutral-mcp-key-value",
+            "the MCP server must receive the plaintext token it authenticates with"
         );
 
         let _ = fs::remove_dir_all(&dir).await;
@@ -7336,6 +7566,196 @@ level = "full"
         assert_eq!(
             resolved_workspace_dir,
             temp_home.join(".rantaiclaw/profiles/default/workspace")
+        );
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    /// v27 → v28. MCP server env values were the one credential path that
+    /// bypassed the encryption authority, so every config written before this
+    /// bump holds those tokens in plaintext. The upgrade must take them off
+    /// disk, not merely encrypt future writes.
+    /// `encrypt_config_secrets_in_raw` mirrors `decrypt_config_secrets`'s field
+    /// list on raw TOML. Two hand-maintained lists drift — that is exactly how
+    /// the KB keys and `provider_api_keys` were lost from the decrypt side
+    /// before it became the single authority. This test binds them: it encrypts
+    /// through the raw list and decrypts through the typed one, so a field
+    /// present in the typed list but missing from the raw list shows up as a
+    /// plaintext value still sitting in the serialised config.
+    #[tokio::test]
+    async fn raw_and_typed_secret_lists_cover_the_same_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "rantaiclaw_test_raw_secret_lists_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        // One distinctive plaintext per governed field.
+        let mut config = Config::default();
+        config.secrets.encrypt = true;
+        config.api_key = Some("plain-api-key".into());
+        config.knowledge.embedding_api_key = Some("plain-kb-embedding".into());
+        config.knowledge.vision_api_key = Some("plain-kb-vision".into());
+        config.composio.api_key = Some("plain-composio".into());
+        config.browser.computer_use.api_key = Some("plain-computer-use".into());
+        config.web_search.brave_api_key = Some("plain-brave".into());
+        config.storage.provider.config.db_url = Some("plain-db-url".into());
+        config
+            .provider_api_keys
+            .insert("openrouter".into(), "plain-provider".into());
+        config.channels_config.telegram = Some(
+            serde_json::from_value(serde_json::json!({
+                "bot_token": "plain-bot-token",
+                "allowed_users": ["rantaiclaw_user"],
+            }))
+            .unwrap(),
+        );
+        config.mcp_servers.insert(
+            "example".into(),
+            McpServerConfig {
+                command: "npx".into(),
+                args: Vec::new(),
+                env: [("EXAMPLE_API_KEY".to_string(), "plain-mcp-env".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        config.skills.entries.insert(
+            "x".into(),
+            SkillEntryConfig {
+                api_key: Some(SkillApiKey {
+                    source: "literal".into(),
+                    id: None,
+                    value: Some("plain-skill-literal".into()),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let plaintexts = [
+            "plain-api-key",
+            "plain-kb-embedding",
+            "plain-kb-vision",
+            "plain-composio",
+            "plain-computer-use",
+            "plain-brave",
+            "plain-db-url",
+            "plain-provider",
+            "plain-bot-token",
+            "plain-mcp-env",
+            "plain-skill-literal",
+        ];
+
+        let mut raw: toml::Value = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let changed = encrypt_config_secrets_in_raw(&mut raw, &dir);
+        assert_eq!(
+            changed,
+            plaintexts.len(),
+            "the raw list must reach every governed field"
+        );
+
+        let serialised = toml::to_string_pretty(&raw).unwrap();
+        for plain in plaintexts {
+            assert!(
+                !serialised.contains(plain),
+                "`{plain}` is still plaintext — the raw list is missing a field \
+                 `decrypt_config_secrets` governs:\n{serialised}"
+            );
+        }
+
+        // And the typed authority restores every one of them.
+        let mut restored: Config = toml::from_str(&serialised).unwrap();
+        let store = crate::security::SecretStore::new(&dir, true);
+        decrypt_config_secrets(&store, &mut restored).unwrap();
+        assert_eq!(restored.api_key.as_deref(), Some("plain-api-key"));
+        assert_eq!(
+            restored.knowledge.embedding_api_key.as_deref(),
+            Some("plain-kb-embedding")
+        );
+        assert_eq!(
+            restored.knowledge.vision_api_key.as_deref(),
+            Some("plain-kb-vision")
+        );
+        assert_eq!(restored.composio.api_key.as_deref(), Some("plain-composio"));
+        assert_eq!(
+            restored.browser.computer_use.api_key.as_deref(),
+            Some("plain-computer-use")
+        );
+        assert_eq!(
+            restored.web_search.brave_api_key.as_deref(),
+            Some("plain-brave")
+        );
+        assert_eq!(
+            restored.storage.provider.config.db_url.as_deref(),
+            Some("plain-db-url")
+        );
+        assert_eq!(restored.provider_api_keys["openrouter"], "plain-provider");
+        assert_eq!(
+            restored
+                .channels_config
+                .telegram
+                .as_ref()
+                .unwrap()
+                .bot_token,
+            "plain-bot-token"
+        );
+        assert_eq!(
+            restored.mcp_servers["example"].env["EXAMPLE_API_KEY"],
+            "plain-mcp-env"
+        );
+        assert_eq!(
+            restored.skills.entries["x"]
+                .api_key
+                .as_ref()
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("plain-skill-literal")
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    async fn load_or_init_encrypts_mcp_env_left_in_plaintext_by_an_older_version() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+
+        // What v27 wrote: the token in the clear.
+        fs::write(
+            &config_path,
+            "schema_version = 27\n\n             [mcp_servers.example]\n             command = \"npx\"\n             args = [\"-y\", \"example-mcp-server\"]\n\n             [mcp_servers.example.env]\n             EXAMPLE_API_KEY = \"neutral-mcp-key-value\"\n",
+        )
+        .await
+        .unwrap();
+
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
+
+        let config = Config::load_or_init().await.unwrap();
+
+        // The running process still gets the token it spawns the server with.
+        assert_eq!(
+            config.mcp_servers["example"].env["EXAMPLE_API_KEY"], "neutral-mcp-key-value",
+            "the loaded config must carry the plaintext the MCP client spawns with"
+        );
+
+        // On disk it is gone.
+        let on_disk = fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            !on_disk.contains("neutral-mcp-key-value"),
+            "the plaintext token must not survive the upgrade on disk:\n{on_disk}"
+        );
+        let stored: Config = toml::from_str(&on_disk).unwrap();
+        assert!(
+            crate::security::SecretStore::is_encrypted(
+                &stored.mcp_servers["example"].env["EXAMPLE_API_KEY"]
+            ),
+            "the value on disk must be ciphertext"
         );
 
         let _ = fs::remove_dir_all(temp_home).await;

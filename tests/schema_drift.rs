@@ -141,7 +141,7 @@ fn every_schema_snapshot_has_a_migration_arm() {
 fn current_version_is_pinned() {
     assert_eq!(
         config_migrations::CURRENT_VERSION,
-        27,
+        28,
         "CURRENT_VERSION changed — bump this pin AND add the migrate_vN arm + snapshot"
     );
 }

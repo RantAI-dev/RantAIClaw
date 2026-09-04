@@ -245,17 +245,73 @@ impl ProfileManager {
         }
         let dst = Self::ensure(name)?;
 
+        // 0. Carry the source's secret key across FIRST.
+        //
+        // The key lives at the source root (`.secret_key`), not under
+        // `secrets/`, so the verbatim `secrets/` copy below does not bring it.
+        // Without it every `enc2:` value in the imported config is ciphertext
+        // the new profile can never open — a silent, unrecoverable import.
+        let src_key = source_root.join(".secret_key");
+        let carried_key = src_key.is_file();
+        if carried_key {
+            let dst_key = dst_dir.join(".secret_key");
+            fs::copy(&src_key, &dst_key)
+                .with_context(|| format!("copy secret key to {}", dst_key.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&dst_key, fs::Permissions::from_mode(0o600));
+            }
+        }
+
         // 1. Translate config.toml using the OpenClaw migration helper.
         let src_config = source_root.join("config.toml");
         if src_config.is_file() {
             let body = fs::read_to_string(&src_config)
                 .with_context(|| format!("read {}", src_config.display()))?;
+
+            // Refuse an import that would produce undecryptable values rather
+            // than completing and leaving the operator to discover it at the
+            // first provider call.
+            if !carried_key && body.contains("enc2:") {
+                bail!(
+                    "{} holds encrypted values but {} has no `.secret_key` to open them. \
+                     Copy the source profile's `.secret_key` next to its config.toml and \
+                     re-run, or decrypt those values in the source first — importing them \
+                     as-is would produce a profile that can never read its own credentials.",
+                    src_config.display(),
+                    source_root.display()
+                );
+            }
+
             let (translated, _) = crate::migration::openclaw::translate_config(&body);
             let dst_config = dst.config_toml();
+
+            // The source may hold plaintext credentials; the destination is a
+            // RantaiClaw profile, where credentials are encrypted at rest.
+            let body_to_write = match toml::from_str::<toml::Value>(&translated) {
+                Ok(mut raw) => {
+                    crate::config::schema::encrypt_config_secrets_in_raw(&mut raw, &dst_dir);
+                    toml::to_string_pretty(&raw).unwrap_or(translated)
+                }
+                Err(e) => {
+                    // Preserve the operator's file rather than dropping the
+                    // import; the values are encrypted by the first `save()`.
+                    tracing::warn!(
+                        "imported config from {} could not be parsed for at-rest encryption \
+                         ({e}); writing it through unchanged",
+                        src_config.display()
+                    );
+                    translated
+                }
+            };
+
             if let Some(parent) = dst_config.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&dst_config, translated)
+            // 0600: this file now carries ciphertext, but a process umask of
+            // 022 still made the previous plaintext world-readable.
+            crate::migration::openclaw::write_config_0600(&dst_config, body_to_write.as_bytes())
                 .with_context(|| format!("write {}", dst_config.display()))?;
         }
 
@@ -430,6 +486,106 @@ mod profile_root_tests {
             Some(p) => std::env::set_var("HOME", p),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// The importer appended the source config verbatim and wrote it with
+    /// `fs::write` — so a plaintext `api_key` stayed plaintext, in a file
+    /// created with the process umask rather than 0600.
+    #[tokio::test]
+    async fn importing_a_plaintext_config_writes_it_encrypted_and_0600() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        std::env::remove_var("RANTAICLAW_PROFILE");
+
+        let source = tmp.path().join("openclaw-source");
+        fs::create_dir_all(&source).expect("source root");
+        fs::write(
+            source.join("config.toml"),
+            "default_provider = \"openrouter\"\napi_key = \"neutral-source-key-value\"\n",
+        )
+        .expect("write source config");
+
+        let profile = ProfileManager::create_clone_from_path("imported", &source, true)
+            .expect("import should succeed");
+
+        let body = fs::read_to_string(profile.config_toml()).expect("read imported config");
+        assert!(
+            !body.contains("neutral-source-key-value"),
+            "the source's plaintext credential must not survive the import:\n{body}"
+        );
+        assert!(
+            body.contains("enc2:"),
+            "the credential must be encrypted at rest:\n{body}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(profile.config_toml())
+                .expect("stat imported config")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "imported config must not be world-readable");
+        }
+    }
+
+    /// An encrypted source without its key would import ciphertext the new
+    /// profile can never open. Refuse rather than complete and let the operator
+    /// find out at the first provider call.
+    #[tokio::test]
+    async fn importing_an_encrypted_config_without_its_key_is_refused() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        std::env::remove_var("RANTAICLAW_PROFILE");
+
+        let source = tmp.path().join("encrypted-source");
+        fs::create_dir_all(&source).expect("source root");
+        fs::write(source.join("config.toml"), "api_key = \"enc2:deadbeef\"\n")
+            .expect("write source config");
+
+        let err = ProfileManager::create_clone_from_path("orphaned", &source, true)
+            .expect_err("an unopenable import must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".secret_key"),
+            "the error must name what is missing: {msg}"
+        );
+    }
+
+    /// With the key alongside it, the same source imports and stays readable.
+    #[tokio::test]
+    async fn importing_an_encrypted_config_carries_its_key_across() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        std::env::remove_var("RANTAICLAW_PROFILE");
+
+        // Mint a real key by encrypting through a store rooted at the source.
+        let source = tmp.path().join("keyed-source");
+        fs::create_dir_all(&source).expect("source root");
+        let store = crate::security::SecretStore::new(&source, true);
+        let ciphertext = store.encrypt("neutral-source-key-value").expect("encrypt");
+        fs::write(
+            source.join("config.toml"),
+            format!("api_key = \"{ciphertext}\"\n"),
+        )
+        .expect("write source config");
+        assert!(source.join(".secret_key").is_file(), "store minted a key");
+
+        let profile = ProfileManager::create_clone_from_path("keyed", &source, true)
+            .expect("import should succeed");
+
+        let imported = crate::security::SecretStore::new(&profile.root, true);
+        let body = fs::read_to_string(profile.config_toml()).expect("read imported config");
+        let stored: toml::Value = toml::from_str(&body).expect("imported config parses");
+        let value = stored["api_key"].as_str().expect("api_key present");
+        assert_eq!(
+            imported.decrypt(value).expect("the carried key opens it"),
+            "neutral-source-key-value"
+        );
     }
 
     #[test]

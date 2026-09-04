@@ -10,11 +10,14 @@
 //! 2. `MultiSelect` over the curated authed list.
 //! 3. Per-pick credential collection — masked input or OAuth.
 //! 4. Spawn-and-validate (5 s `initialize` ack); skip + warn on failure.
-//! 5. Append to `config.mcp_servers` and persist secrets to
-//!    `<profile>/secrets/api_keys.toml`.
+//! 5. Append to `config.mcp_servers`. The credential lives in that entry's
+//!    `env` and is encrypted at rest by `Config::save` — there is no second
+//!    secrets file. One used to be written to
+//!    `<profile>/secrets/api_keys.toml`; nothing ever read it, and once
+//!    `config.toml` held the encrypted value that file was the only plaintext
+//!    copy left, so it was removed.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -27,7 +30,6 @@ use tracing::{info, warn};
 
 use crate::config::schema::McpServerConfig;
 use crate::config::Config;
-use crate::profile::Profile;
 
 use super::curated::{AuthMethod, CuratedMcpServer, AUTHED, NO_AUTH};
 use super::oauth;
@@ -38,7 +40,7 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Top-level entry point. Errors here only fire on hard I/O failures
 /// — individual server validation failures are swallowed (warn + skip).
-pub async fn run_interactive(profile: &Profile, config: &mut Config) -> Result<()> {
+pub async fn run_interactive(config: &mut Config) -> Result<()> {
     let theme = ColorfulTheme::default();
 
     // 1. Zero-auth bundle.
@@ -80,7 +82,7 @@ pub async fn run_interactive(profile: &Profile, config: &mut Config) -> Result<(
 
     for idx in picks {
         let server = &AUTHED[idx];
-        match collect_and_register(profile, config, server).await {
+        match collect_and_register(config, server).await {
             Ok(()) => println!("  added {}", server.display_name),
             Err(e) => {
                 warn!(slug = server.slug, error = %e, "skipping MCP server");
@@ -92,14 +94,10 @@ pub async fn run_interactive(profile: &Profile, config: &mut Config) -> Result<(
     Ok(())
 }
 
-/// Collect credentials, validate, persist secrets, register in config.
+/// Collect credentials, validate, register in config.
 /// Bubbling an error short-circuits *only that server*; the caller
 /// catches and warns.
-async fn collect_and_register(
-    profile: &Profile,
-    config: &mut Config,
-    server: &CuratedMcpServer,
-) -> Result<()> {
+async fn collect_and_register(config: &mut Config, server: &CuratedMcpServer) -> Result<()> {
     let theme = ColorfulTheme::default();
     let env_pairs: Vec<(String, String)> = match &server.auth {
         AuthMethod::None => Vec::new(),
@@ -123,7 +121,6 @@ async fn collect_and_register(
 
     validate_mcp_startup(server, &env_pairs).await?;
     register_mcp(config, server, &env_pairs)?;
-    write_secrets(profile, &env_pairs)?;
     Ok(())
 }
 
@@ -220,82 +217,10 @@ pub async fn validate_mcp_startup(
     }
 }
 
-/// Append (or update) entries in `<profile>/secrets/api_keys.toml`.
-///
-/// Layout — flat top-level table:
-/// ```toml
-/// NOTION_API_KEY = "secret_…"
-/// SLACK_BOT_TOKEN = "xoxb-…"
-/// ```
-///
-/// Mode 0600 on Unix; secrets dir already 0700 from `ProfileManager::ensure`.
-pub fn write_secrets(profile: &Profile, env: &[(String, String)]) -> Result<()> {
-    if env.is_empty() {
-        return Ok(());
-    }
-    let path = profile.secrets_dir().join("api_keys.toml");
-    write_secrets_to(&path, env)
-}
-
-/// Path-injectable variant of [`write_secrets`] — used by tests so we
-/// don't need a real `ProfileManager` tree.
-pub fn write_secrets_to(path: &Path, env: &[(String, String)]) -> Result<()> {
-    if env.is_empty() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create secrets dir {}", parent.display()))?;
-    }
-
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let mut doc: toml::Table = if existing.trim().is_empty() {
-        toml::Table::new()
-    } else {
-        existing
-            .parse()
-            .with_context(|| format!("parse existing {}", path.display()))?
-    };
-    for (k, v) in env {
-        doc.insert(k.clone(), toml::Value::String(v.clone()));
-    }
-    let serialised = toml::to_string_pretty(&doc).context("serialise secrets table")?;
-    std::fs::write(path, serialised)
-        .with_context(|| format!("write secrets file {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    #[test]
-    fn write_secrets_creates_and_merges() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("api_keys.toml");
-
-        write_secrets_to(&path, &[("NOTION_API_KEY".into(), "secret-1".into())]).unwrap();
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("NOTION_API_KEY"));
-        assert!(body.contains("secret-1"));
-
-        // Merge: second key appends, first preserved.
-        write_secrets_to(&path, &[("SLACK_BOT_TOKEN".into(), "xoxb-2".into())]).unwrap();
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("NOTION_API_KEY"));
-        assert!(body.contains("SLACK_BOT_TOKEN"));
-    }
 
     #[test]
     fn register_mcp_writes_correct_block() {
