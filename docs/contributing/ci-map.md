@@ -25,6 +25,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Merge gate: `CI Required Gate` runs `scripts/ci/required_gate.sh`, which reads every stage result from the environment. The decision table lives in that script and is checked by `required_gate.sh --self-test`, which the same job runs first — a stage the gate stops reading fails the self-test instead of quietly becoming advisory.
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks).
+    - Checks: `Workflow Sanity (tabs)`, `Workflow Sanity (actionlint)`. Runs on every PR — see the required-check rule below.
 - `.github/workflows/pr-intake-checks.yml` (`PR Intake Checks`)
     - Purpose: pre-CI PR checks (template completeness, added-line tabs/trailing-whitespace/conflict markers) with sticky feedback comment.
 - `.github/workflows/pr-title-lint.yml` (`PR Title Lint`)
@@ -79,7 +80,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 ## Maintenance Rules
 
-- Branch protection should require only `CI Required Gate` — internal stages can change without touching protection settings. That only holds while the gate actually reads every stage: adding a job to `ci-run.yml` means adding it to the gate's `needs:`, its `env:` block, and a `--self-test` case in `scripts/ci/required_gate.sh`.
+- **A required status check must never be `paths:`-filtered.** On a run where the filter does not match, GitHub reports nothing at all, and a required check that never reports leaves the pull request pending forever. `workflow-sanity` and `sec-audit` are unfiltered on `pull_request` for exactly this reason; keep them that way, and do not add a `paths:` filter to any workflow named in the ruleset.
+- Checks safe to require today, because each one reports on every pull request: `CI Required Gate`, `Intake Checks`, `Conventional Commit Title`, `Workflow Sanity (tabs)`, `Workflow Sanity (actionlint)`, `Security Audit`, `License & Supply Chain`. Check names are the contract — renaming a job breaks the ruleset silently, so rename first and update the ruleset in the same change.
+- Branch protection should require only `CI Required Gate` for the Rust pipeline — internal stages can change without touching protection settings. That only holds while the gate actually reads every stage: adding a job to `ci-run.yml` means adding it to the gate's `needs:`, its `env:` block, and a `--self-test` case in `scripts/ci/required_gate.sh`.
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
 - Follow `docs/contributing/release-process.md` for verify-before-publish release cadence and tag discipline.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).

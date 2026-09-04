@@ -1,12 +1,18 @@
 name: Workflow Sanity
 
+# Deliberately unfiltered on `pull_request`. A `paths:` filter makes this
+# workflow report *nothing* on a run that does not match, and a required status
+# check that never reports leaves every pull request pending — so a filtered
+# workflow can never be required. Both jobs together take well under a minute,
+# which is cheaper than the class of mistake they catch.
+#
+# `push` stays scoped to `main`: a push to a feature branch is already covered
+# by that branch's pull request, and running both produced two identical checks
+# on every PR.
 on:
     pull_request:
-        paths:
-            - ".github/workflows/**"
-            - ".github/*.yml"
-            - ".github/*.yaml"
     push:
+        branches: [main]
         paths:
             - ".github/workflows/**"
             - ".github/*.yml"
@@ -21,6 +27,7 @@ permissions:
 
 jobs:
     no-tabs:
+        name: Workflow Sanity (tabs)
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
@@ -54,6 +61,7 @@ jobs:
                   PY
 
     actionlint:
+        name: Workflow Sanity (actionlint)
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
