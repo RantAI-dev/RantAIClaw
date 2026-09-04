@@ -14,7 +14,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: single consolidated Rust quality gate with internal stages.
         - `lint` — `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, plus strict delta clippy on changed Rust lines (`scripts/ci/rust_strict_delta_gate.sh`).
         - `test` — `cargo nextest run --locked --workspace`.
-        - `features` — matrix `cargo check`: `no-default-features`, `all-features`, `hardware`, `browser-native`.
+        - `features` — matrix `cargo check`: `no-default-features`, `hardware-only`, `browser-native`.
         - `e2e` — `cargo test --test agent_e2e --locked` (push to `main` only; not on PRs).
         - `bench-compile` — `cargo bench --no-run --locked` (verifies criterion benches build).
         - `build` — `cargo build --profile release-fast --locked` smoke + binary-size guard (`scripts/ci/check_binary_size.sh`).
