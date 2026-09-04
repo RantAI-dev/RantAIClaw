@@ -447,6 +447,31 @@ impl Agent {
         config: &Config,
         observer: Arc<dyn Observer>,
     ) -> Result<Self> {
+        Self::build(config, observer, None).await
+    }
+
+    /// Build an agent whose MCP tools come from an already-connected pool
+    /// instead of a fresh round of spawning.
+    ///
+    /// The gateway builds an agent per chat request; discovering MCP servers
+    /// there meant every console turn paid spawn + handshake + `tools/list` for
+    /// every server and then SIGKILLed them, losing any server-side state. The
+    /// pool's lifetime belongs to the gateway (see [`crate::mcp::discover`]).
+    /// Other callers — the TUI, the CLI — keep the owning-agent shape, so
+    /// [`Self::from_config_with_observer`] is unchanged.
+    pub async fn from_config_with_mcp_pool(
+        config: &Config,
+        observer: Arc<dyn Observer>,
+        pool: &crate::mcp::discover::McpPool,
+    ) -> Result<Self> {
+        Self::build(config, observer, Some(pool)).await
+    }
+
+    async fn build(
+        config: &Config,
+        observer: Arc<dyn Observer>,
+        pool: Option<&crate::mcp::discover::McpPool>,
+    ) -> Result<Self> {
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
             Arc::from(runtime::create_runtime(&config.runtime)?);
         let policy_dir = crate::profile::ProfileManager::active()
@@ -504,32 +529,38 @@ impl Agent {
         // `McpTool`. Failures are non-fatal (logged); the agent
         // boots without the broken server's tools, and `/mcp`
         // surfaces what happened.
-        let mcp_discovery = crate::mcp::discover::discover_mcp_tools(&config.mcp_servers).await;
-        // Build the per-server qualified-tool-name map before the
-        // tools are moved into the registry.
-        let mut mcp_tools_by_server: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for t in &mcp_discovery.tools {
-            // Tool name is `mcp__<server>__<tool>` — split to find server.
-            let name = t.name();
-            if let Some(rest) = name.strip_prefix("mcp__") {
-                if let Some((server, _)) = rest.split_once("__") {
-                    mcp_tools_by_server
-                        .entry(server.to_string())
-                        .or_default()
-                        .push(name.to_string());
+        let (mcp_tools, mcp_health, mcp_tools_by_server) = match pool {
+            Some(pool) => (pool.tools(), pool.health().to_vec(), pool.tools_by_server()),
+            None => {
+                let discovery = crate::mcp::discover::discover_mcp_tools(&config.mcp_servers).await;
+                // Build the per-server qualified-tool-name map before the
+                // tools are moved into the registry.
+                let mut by_server: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for t in &discovery.tools {
+                    // Tool name is `mcp__<server>__<tool>` — split to find server.
+                    let name = t.name();
+                    if let Some(rest) = name.strip_prefix("mcp__") {
+                        if let Some((server, _)) = rest.split_once("__") {
+                            by_server
+                                .entry(server.to_string())
+                                .or_default()
+                                .push(name.to_string());
+                        }
+                    }
                 }
+                (discovery.tools, discovery.health, by_server)
             }
-        }
-        let mcp_health = mcp_discovery.health.clone();
-        if !mcp_discovery.tools.is_empty() {
+        };
+        if !mcp_tools.is_empty() {
             tracing::info!(
                 target: "agent",
-                count = mcp_discovery.tools.len(),
-                servers = mcp_discovery.health.len(),
+                count = mcp_tools.len(),
+                servers = mcp_health.len(),
+                pooled = pool.is_some(),
                 "appending MCP tools to registry"
             );
-            tools.extend(mcp_discovery.tools);
+            tools.extend(mcp_tools);
         }
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");

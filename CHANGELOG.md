@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The gateway stops respawning every MCP server on every chat request. It
+  builds an `Agent` per request, and agent construction discovered MCP tools —
+  spawning each configured server, running the handshake and `tools/list`
+  sequentially with a 30-second per-server timeout, then SIGKILLing the lot
+  when the request's agent dropped. Every console turn paid that, threw the
+  result away, and reset any server-side state; one hung server stalled every
+  turn. MCP servers are now connected once and shared, with the pool owned by
+  the gateway and rebuilt when a hot-reloaded config changes `mcp_servers`. A
+  turn holds its pool for its whole lifetime, so a reload never pulls a client
+  out from under an in-flight tool call. The TUI and CLI keep the existing
+  one-agent-owns-its-servers shape.
+
 - MCP servers survive being long-lived. Two transport defects only mattered
   once a server outlived a single request: its stderr was piped and never
   read, so a server that logged past the pipe buffer (~64 KiB — `npx` install

@@ -237,7 +237,10 @@ pub struct Config {
 // ── MCP Servers ──────────────────────────────────────────────────
 
 /// MCP server configuration for stdio-based servers.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+// `PartialEq` so the gateway's MCP pool can tell whether a hot-reloaded config
+// still describes the servers it has running. Kept off the doc comment: that
+// text lands in the published JSON schema, and this is an implementation note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct McpServerConfig {
     /// Command to spawn (e.g., "npx", "node")
     pub command: String,
