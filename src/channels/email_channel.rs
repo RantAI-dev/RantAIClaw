@@ -392,7 +392,11 @@ impl EmailChannel {
     /// Accepts `dmarc=pass`, `spf=pass` or `dkim=pass` whose stated identifier
     /// aligns with the `From:` domain. An unaligned pass proves someone
     /// authenticated — just not the person the `From:` claims to be.
-    fn from_domain_is_authenticated(&self, parsed: &mail_parser::Message, from_addr: &str) -> bool {
+    fn sender_domain_is_authenticated(
+        &self,
+        parsed: &mail_parser::Message,
+        from_addr: &str,
+    ) -> bool {
         let Some(trusted) = self.config.trusted_authserv_id.as_deref() else {
             return false;
         };
@@ -437,7 +441,7 @@ impl EmailChannel {
             return None;
         }
 
-        let authenticated = self.from_domain_is_authenticated(parsed, &from);
+        let authenticated = self.sender_domain_is_authenticated(parsed, &from);
         if authenticated {
             return Some(from);
         }
