@@ -353,12 +353,46 @@ static CONFIG_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 /// onto on-disk truth. The caller MUST keep the returned guard in scope across
 /// the subsequent [`persist_and_swap`] for the read-modify-write to be atomic.
 async fn lock_and_load(
+    state: &AppState,
 ) -> Result<(tokio::sync::MutexGuard<'static, ()>, crate::config::Config), ApiError> {
     let guard = CONFIG_WRITE_LOCK.lock().await;
-    let cfg = crate::config::Config::load_or_init()
-        .await
-        .map_err(err_500)?;
+    let running = state.config.lock().clone();
+    // No file at the path the gateway booted with — it was deleted under the
+    // running process, or this gateway was constructed from a config that was
+    // never written. Fall back to what it is actually serving rather than
+    // re-resolving to whatever path the environment names now; that
+    // re-resolution is the defect this function exists to remove. A file that
+    // exists but fails to load still errors, so a corrupt config is not
+    // silently replaced by a stale copy.
+    let cfg = if running.config_path.exists() {
+        load_running_config(&running.config_path)
+            .await
+            .map_err(err_500)?
+    } else {
+        running
+    };
     Ok((guard, cfg))
+}
+
+/// Read the config the gateway is RUNNING, from the path it booted with.
+///
+/// Deliberately not `Config::load_or_init`: that re-resolves the path from the
+/// environment and the `active_workspace.toml` marker every time. The gateway
+/// is already bound to one file, so a marker that changed after boot made a
+/// console write read-modify-save a *different* file and swap it into the
+/// running state. The pairing-token writer already loads by path; this did not.
+///
+/// Env overrides are applied because `load_or_init` applies them and the
+/// running config was built that way. Without this, the first console write
+/// would drop an env-supplied credential out of the running process — a
+/// regression worse than the split-brain being fixed. (`save()` strips them
+/// again on the way to disk, so they never become permanent.)
+async fn load_running_config(
+    config_path: &std::path::Path,
+) -> anyhow::Result<crate::config::Config> {
+    let mut cfg = crate::config::Config::load_from_path(config_path).await?;
+    cfg.apply_env_overrides();
+    Ok(cfg)
 }
 
 /// Persist the mutated config, then swap it into the running state. Must be
@@ -444,7 +478,7 @@ async fn set_model(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let provider_changed = body.provider.is_some();
-    let (_guard, mut cfg) = lock_and_load().await?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
     if let Some(p) = body.provider {
         let new_provider = if p.trim().is_empty() {
             None
@@ -518,7 +552,7 @@ async fn set_autonomy(
     Json(body): Json<AutonomyBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let (_guard, mut cfg) = lock_and_load().await?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
     if let Some(l) = body.level {
         cfg.autonomy.level =
             parse_level(&l).ok_or_else(|| err_400(format!("invalid autonomy level: {l}")))?;
@@ -689,7 +723,7 @@ async fn add_mcp_server(
             )));
         }
     }
-    let (_guard, mut cfg) = lock_and_load().await?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
     let existing = cfg.mcp_servers.get(&name).cloned();
     if existing.is_none() && cfg.mcp_servers.len() >= MAX_MCP_SERVERS_API {
         return Err(err_400(format!(
@@ -709,7 +743,7 @@ async fn remove_mcp_server(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let (_guard, mut cfg) = lock_and_load().await?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
     let removed = cfg.mcp_servers.remove(&name).is_some();
     let count = cfg.mcp_servers.len();
     persist_and_swap(&state, cfg, "mcp_servers").await?;
@@ -907,7 +941,7 @@ async fn connect_telegram(
     // out-of-band write (e.g. a Telegram `/claim` persisting an approval owner)
     // can't be clobbered. Build on the fresh Telegram config, not the snapshot
     // taken before the `getMe` await.
-    let (_guard, mut cfg) = lock_and_load().await?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
     let tg = apply_telegram_update(
         cfg.channels_config.telegram.clone(),
         new_token.as_deref(),
@@ -974,7 +1008,7 @@ async fn disconnect_telegram(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let (_guard, mut cfg) = lock_and_load().await?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
     let was_configured = cfg.channels_config.telegram.is_some();
     cfg.channels_config.telegram = None;
     persist_and_swap(&state, cfg, "channels.telegram").await?;
@@ -1113,7 +1147,7 @@ async fn set_secrets(
     Json(body): Json<SecretsBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let (_guard, mut cfg) = lock_and_load().await?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
     apply_secrets(&mut cfg, &body).map_err(err_400)?;
     let present = api_key_present(&cfg);
     persist_and_swap(&state, cfg, "secrets").await?;
@@ -1233,7 +1267,7 @@ async fn set_knowledge(
     Json(body): Json<KnowledgeBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let (_guard, mut cfg) = lock_and_load().await?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
     if let Some(k) = body.embedding_api_key {
         let k = k.trim();
         cfg.knowledge.embedding_api_key = if k.is_empty() {
@@ -1300,6 +1334,77 @@ async fn set_knowledge(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    /// The gateway is bound to one config file from boot. `load_or_init`
+    /// re-resolves the path from the environment and the
+    /// `active_workspace.toml` marker on every call, so a marker or env var
+    /// that changed after boot made a console write read-modify-save a
+    /// DIFFERENT file and swap it into the running state.
+    #[tokio::test]
+    async fn a_console_write_reads_the_file_the_gateway_booted_with() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+
+        // The file the gateway is running.
+        let running_dir = tmp.path().join("running");
+        std::fs::create_dir_all(&running_dir).expect("running dir");
+        let running_config = running_dir.join("config.toml");
+        std::fs::write(
+            &running_config,
+            "default_model = \"model-the-gateway-is-running\"\n",
+        )
+        .expect("write running config");
+
+        // A different file the environment now points at.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere dir");
+        std::fs::write(
+            elsewhere.join("config.toml"),
+            "default_model = \"model-from-somewhere-else\"\n",
+        )
+        .expect("write other config");
+
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _g_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", &elsewhere);
+
+        let loaded = load_running_config(&running_config)
+            .await
+            .expect("load the running config");
+
+        assert_eq!(
+            loaded.default_model.as_deref(),
+            Some("model-the-gateway-is-running"),
+            "a console write must read the file the gateway booted with, not \
+             whatever the environment resolves to now"
+        );
+        assert_eq!(loaded.config_path, running_config);
+    }
+
+    /// `load_or_init` applies env overrides and the running config was built
+    /// that way. Loading by path alone would drop an env-supplied credential
+    /// out of the running process on the first console write — a regression
+    /// worse than the split-brain being fixed. (`save()` strips them again on
+    /// the way to disk, so they never become permanent.)
+    #[tokio::test]
+    async fn the_running_config_keeps_env_supplied_values() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "default_model = \"m\"\n").expect("write config");
+
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _key = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-from-the-environment");
+
+        let loaded = load_running_config(&config_path)
+            .await
+            .expect("load the running config");
+
+        assert_eq!(
+            loaded.api_key.as_deref(),
+            Some("key-from-the-environment"),
+            "an env-supplied credential must survive into the running config"
+        );
+    }
 
     #[test]
     fn err_500_does_not_leak_path() {

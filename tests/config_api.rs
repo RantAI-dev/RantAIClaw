@@ -9,10 +9,13 @@
 //! every route, and secret redaction on `GET /api/v1/config`.
 //!
 //! Mutation tests (PUT/POST) additionally set the process-global
-//! `RANTAICLAW_CONFIG_DIR` env var, because the config-api handlers persist
-//! via `Config::load_or_init()` / `cfg.save()` — resolved from that env var,
-//! not from `state.config` (see `lock_and_load`/`persist_and_swap` in
-//! `src/gateway/config_api.rs`).
+//! `RANTAICLAW_CONFIG_DIR` env var. That USED to be load-bearing: the handlers
+//! persisted via `Config::load_or_init()`, which re-resolves the path from the
+//! environment rather than using the one the gateway booted with. They now read
+//! `state.config`'s own `config_path` (see `load_running_config` in
+//! `src/gateway/config_api.rs`), so the env var no longer selects which file a
+//! write lands in. It is still set here because `cfg.save()` and the session
+//! store resolve other per-profile paths from the environment.
 //!
 //! That race is now **enforced, not requested**. This header used to ask for
 //! `--test-threads=1`; CI runs plain `cargo test`, so the instruction was

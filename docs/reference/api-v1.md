@@ -232,6 +232,13 @@ tokens, session ids, or paths.
   `500` (provider/agent error — the body is sanitized of secret-looking
   tokens before being returned).
 
+**Tool approvals on the non-streaming form.** A turn requested without the SSE
+`Accept` header has no stream for an approval modal to be raised on and no
+`approval_request` event for a client to answer, so a tool call that needs
+approval is **denied inline** and the turn continues. This is the same answer
+whether the gateway runs under systemd or in a terminal. Use the streaming form
+when a tool call may need an operator decision.
+
 ### POST /api/v1/approvals/{id}
 
 Resolves an in-browser tool-approval modal raised mid-turn by a streaming
