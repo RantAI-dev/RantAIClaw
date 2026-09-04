@@ -80,6 +80,18 @@ pub struct EmailConfig {
     /// [`EmailChannel::sender_identity`].
     #[serde(default)]
     pub require_authenticated_sender: bool,
+    /// The authserv-id of *your* mail server — the first token of the
+    /// `Authentication-Results` header it writes (RFC 8601), e.g.
+    /// `mx.example.com`.
+    ///
+    /// `Authentication-Results` is a header the receiving infrastructure
+    /// writes, but anything a sender puts in a message arrives as a header
+    /// too. Without knowing which verifier to believe there is no way to tell
+    /// the two apart, so an unset value means **email owner recognition is
+    /// off**: mail from an `approval_owners` address is dropped rather than
+    /// granted owner authority on a forgeable header.
+    #[serde(default)]
+    pub trusted_authserv_id: Option<String>,
 }
 
 impl std::fmt::Debug for EmailConfig {
@@ -102,6 +114,7 @@ impl std::fmt::Debug for EmailConfig {
             idle_timeout_secs,
             allowed_senders,
             require_authenticated_sender,
+            trusted_authserv_id,
         } = self;
 
         f.debug_struct("EmailConfig")
@@ -117,6 +130,7 @@ impl std::fmt::Debug for EmailConfig {
             .field("idle_timeout_secs", idle_timeout_secs)
             .field("allowed_senders", allowed_senders)
             .field("require_authenticated_sender", require_authenticated_sender)
+            .field("trusted_authserv_id", trusted_authserv_id)
             .finish()
     }
 }
@@ -152,6 +166,7 @@ impl Default for EmailConfig {
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
             require_authenticated_sender: false,
+            trusted_authserv_id: None,
         }
     }
 }
@@ -175,6 +190,105 @@ pub struct EmailChannel {
     /// Size/type limits for inbound images. Defaults to the shipped
     /// `[multimodal]` defaults; the factory overrides it with the operator's.
     multimodal: crate::config::MultimodalConfig,
+}
+
+/// Does one `Authentication-Results` value carry a pass, from
+/// `trusted_authserv_id`, for `from_domain`?
+///
+/// Parsed structurally rather than searched: `raw.contains("dmarc=pass")` is
+/// true of a header that says `dmarc=pass` for somebody else's domain, and a
+/// `contains(from_domain)` domain test is true of `example.com.attacker.test`.
+/// Both were real bypasses.
+fn authentication_results_pass(raw: &str, trusted_authserv_id: &str, from_domain: &str) -> bool {
+    let value = strip_cfws_comments(raw);
+    let mut clauses = value.split(';');
+
+    // RFC 8601: the first field is the authserv-id, optionally followed by a
+    // version number.
+    let Some(authserv_id) = clauses.next().and_then(|f| f.split_whitespace().next()) else {
+        return false;
+    };
+    if !authserv_id.eq_ignore_ascii_case(trusted_authserv_id) {
+        return false;
+    }
+
+    clauses.any(|clause| {
+        let mut tokens = clause.split_whitespace();
+        let Some((method, result)) = tokens.next().and_then(|t| t.split_once('=')) else {
+            return false;
+        };
+        if !result.eq_ignore_ascii_case("pass") {
+            return false;
+        }
+        // The property that names *whose* identity the method authenticated.
+        // Anything else in the clause (policy notes, `smtp.helo`) is not an
+        // identity claim about the From: domain.
+        let method = method.trim().to_ascii_lowercase();
+        let ptype = match method.as_str() {
+            "dmarc" => "header.from",
+            "dkim" => "header.d",
+            "spf" => "smtp.mailfrom",
+            _ => return false,
+        };
+        let mut named_identity = false;
+        for token in tokens {
+            let Some((key, raw_value)) = token.split_once('=') else {
+                continue;
+            };
+            if !key.eq_ignore_ascii_case(ptype) {
+                continue;
+            }
+            named_identity = true;
+            if domain_aligns(raw_value, from_domain) {
+                return true;
+            }
+        }
+        // A DMARC pass *is* the alignment check against the RFC5322 `From:` we
+        // just read, so a trusted verifier stating one without spelling out
+        // `header.from` still speaks for this message. It is only rejected when
+        // it names a different domain, which the loop above already caught.
+        // SPF and DKIM carry no such guarantee: they authenticate the envelope
+        // sender or the signing domain, which need not be the From: at all.
+        method == "dmarc" && !named_identity
+    })
+}
+
+/// Does an identifier from an `Authentication-Results` property speak for
+/// `from_domain`?
+///
+/// Equality, or a proper subdomain of it — `bounces.example.com` speaks for
+/// `example.com`. Never a substring test: `example.com.attacker.test` and
+/// `notexample.com` both contain `example.com` and neither is it.
+fn domain_aligns(identifier: &str, from_domain: &str) -> bool {
+    let domain = identifier
+        .trim()
+        .trim_matches('"')
+        .trim_end_matches('.')
+        // `smtp.mailfrom` may carry a full address rather than a bare domain.
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if domain.is_empty() {
+        return false;
+    }
+    domain == from_domain || domain.ends_with(&format!(".{from_domain}"))
+}
+
+/// Drop RFC 5322 comments — `dmarc=pass (p=none dis=none) header.from=…` — so
+/// a comment cannot hide or fake a token. Nesting is legal, so track depth.
+fn strip_cfws_comments(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth = 0usize;
+    for ch in raw.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
 }
 
 impl EmailChannel {
@@ -216,8 +330,20 @@ impl EmailChannel {
 
     /// Tell the channel which addresses carry owner authority, so it can refuse
     /// to hand that authority to an unauthenticated `From:`.
+    ///
+    /// Warns when owners are configured but no trusted verifier is: those
+    /// addresses will be refused rather than recognised, and an operator who
+    /// does not know that reads it as the channel being broken.
     #[must_use]
     pub fn with_approval_owners(mut self, owners: Vec<String>) -> Self {
+        if !owners.is_empty() && self.config.trusted_authserv_id.is_none() {
+            warn!(
+                "Email: owner recognition is off — [channels.email] trusted_authserv_id is \
+                 unset, so mail from an approval owner will be dropped rather than granted \
+                 owner authority. Set it to the authserv-id your mail server writes (the \
+                 first token of its Authentication-Results header)."
+            );
+        }
         self.approval_owners = owners;
         self
     }
@@ -252,17 +378,32 @@ impl EmailChannel {
     ///
     /// `From:` is attacker-controlled — it is a header, not a credential — so
     /// on its own it identifies nobody. `Authentication-Results` is written by
-    /// *our* MTA after it checked SPF/DKIM/DMARC, which is why it is the only
-    /// part of the message worth trusting here.
+    /// Is the `From:` domain backed by a verdict from the mail server we were
+    /// told to trust?
     ///
-    /// Read through `mail_parser`'s header API rather than a hand-rolled
-    /// scanner: a bespoke parser for a security decision is how subtle
-    /// bypasses get in, and the plan forbids it.
+    /// `Authentication-Results` (RFC 8601) is written by the *receiving*
+    /// infrastructure after it checked SPF/DKIM/DMARC. But anything a sender
+    /// puts in a message arrives as a header too, and both spellings look
+    /// identical once parsed — so the header only means something when we know
+    /// which verifier wrote it. That is `trusted_authserv_id`, and without it
+    /// this returns `false` for every message: an unconfigured deployment does
+    /// not get owner recognition over email.
     ///
-    /// Accepts `dmarc=pass`, or `spf=pass`/`dkim=pass` whose stated domain
+    /// Accepts `dmarc=pass`, `spf=pass` or `dkim=pass` whose stated identifier
     /// aligns with the `From:` domain. An unaligned pass proves someone
-    /// authenticated — just not the person the `From:` claims.
-    fn from_domain_is_authenticated(parsed: &mail_parser::Message, from_addr: &str) -> bool {
+    /// authenticated — just not the person the `From:` claims to be.
+    fn sender_domain_is_authenticated(
+        &self,
+        parsed: &mail_parser::Message,
+        from_addr: &str,
+    ) -> bool {
+        let Some(trusted) = self.config.trusted_authserv_id.as_deref() else {
+            return false;
+        };
+        let trusted = trusted.trim();
+        if trusted.is_empty() {
+            return false;
+        }
         let Some(from_domain) = from_addr.rsplit('@').next().map(str::to_lowercase) else {
             return false;
         };
@@ -270,32 +411,14 @@ impl EmailChannel {
             return false;
         }
 
-        let Some(header) = parsed.header("Authentication-Results") else {
-            return false;
-        };
-        let raw = match header.as_text() {
-            Some(t) => t.to_lowercase(),
-            None => return false,
-        };
-
-        if raw.contains("dmarc=pass") {
-            return true;
-        }
-
-        // An spf/dkim pass only counts when it names the From: domain.
-        for method in ["spf=pass", "dkim=pass"] {
-            let mut rest = raw.as_str();
-            while let Some(pos) = rest.find(method) {
-                let tail = &rest[pos + method.len()..];
-                // The domain appears in the same clause, before the next `;`.
-                let clause = tail.split(';').next().unwrap_or("");
-                if clause.contains(&from_domain) {
-                    return true;
-                }
-                rest = tail;
-            }
-        }
-        false
+        // Every `Authentication-Results` header, not just the first: a sender
+        // can add one, and the order they arrive in is not ours to rely on.
+        parsed
+            .header_values(mail_parser::HeaderName::Other(
+                "Authentication-Results".into(),
+            ))
+            .filter_map(mail_parser::HeaderValue::as_text)
+            .any(|raw| authentication_results_pass(raw, trusted, &from_domain))
     }
 
     /// The sender to attribute a message to, or `None` when it must be dropped.
@@ -318,7 +441,7 @@ impl EmailChannel {
             return None;
         }
 
-        let authenticated = Self::from_domain_is_authenticated(parsed, &from);
+        let authenticated = self.sender_domain_is_authenticated(parsed, &from);
         if authenticated {
             return Some(from);
         }
@@ -1134,6 +1257,7 @@ mod tests {
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
             require_authenticated_sender: false,
+            trusted_authserv_id: None,
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -1155,6 +1279,7 @@ mod tests {
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
             require_authenticated_sender: false,
+            trusted_authserv_id: None,
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -1454,13 +1579,121 @@ mod tests {
         channel.sender_identity(&parsed)
     }
 
+    /// A channel that trusts `mx.example.com` as its verifier — the shape a
+    /// configured deployment has.
     fn owner_channel(require_auth: bool) -> EmailChannel {
         let config = EmailConfig {
             allowed_senders: vec!["*".to_string()],
             require_authenticated_sender: require_auth,
+            trusted_authserv_id: Some("mx.example.com".to_string()),
             ..Default::default()
         };
         EmailChannel::new(config).with_approval_owners(vec!["owner@example.com".to_string()])
+    }
+
+    /// The same channel with no verifier configured, which is the default.
+    fn unconfigured_owner_channel() -> EmailChannel {
+        let config = EmailConfig {
+            allowed_senders: vec!["*".to_string()],
+            ..Default::default()
+        };
+        EmailChannel::new(config).with_approval_owners(vec!["owner@example.com".to_string()])
+    }
+
+    /// (a) The attack: `Authentication-Results` is written by the receiving
+    /// infrastructure, but a sender can put one in the message too. Reading the
+    /// first header found — whoever wrote it — handed owner authority, and on
+    /// this product that is the full tool set, shell included.
+    #[test]
+    fn a_sender_supplied_authentication_results_header_grants_nothing() {
+        let ch = owner_channel(false);
+        assert_eq!(
+            identity(
+                &ch,
+                "owner@example.com",
+                Some("attacker.test; dmarc=pass header.from=example.com")
+            ),
+            None,
+            "only the configured verifier's verdict may count"
+        );
+    }
+
+    /// (b) `dmarc=pass` anywhere in the value used to be accepted regardless of
+    /// which domain it referred to.
+    #[test]
+    fn a_trusted_pass_for_another_domain_does_not_authenticate_this_one() {
+        let ch = owner_channel(false);
+        assert_eq!(
+            identity(
+                &ch,
+                "owner@example.com",
+                Some("mx.example.com; dmarc=pass header.from=attacker.test")
+            ),
+            None
+        );
+    }
+
+    /// (c) The domain comparison was `contains`, so a domain that merely has
+    /// the owner's domain as a prefix satisfied it.
+    #[test]
+    fn a_lookalike_domain_does_not_satisfy_the_owner_domain() {
+        let ch = owner_channel(false);
+        for spoof in [
+            "example.com.attacker.test",
+            "notexample.com",
+            "example.community",
+        ] {
+            assert_eq!(
+                identity(
+                    &ch,
+                    "owner@example.com",
+                    Some(&format!("mx.example.com; spf=pass smtp.mailfrom={spoof}"))
+                ),
+                None,
+                "{spoof} must not pass for example.com"
+            );
+        }
+    }
+
+    /// (d) The genuine article still works, including a subdomain sender and
+    /// the `(comment)` syntax real verifiers emit.
+    #[test]
+    fn a_genuine_trusted_pass_for_the_owner_domain_is_accepted() {
+        let ch = owner_channel(false);
+        for header in [
+            "mx.example.com; dmarc=pass header.from=example.com",
+            "mx.example.com 1; dmarc=pass (p=none dis=none) header.from=example.com",
+            "mx.example.com; spf=pass smtp.mailfrom=bounces.example.com",
+            "mx.example.com; dkim=pass header.d=example.com; spf=fail",
+            "MX.EXAMPLE.COM; dkim=pass header.d=EXAMPLE.COM",
+        ] {
+            assert_eq!(
+                identity(&ch, "owner@example.com", Some(header)),
+                Some("owner@example.com".to_string()),
+                "should authenticate: {header}"
+            );
+        }
+    }
+
+    /// Fail closed: with no verifier configured there is no way to tell the
+    /// infrastructure's header from the sender's, so owner mail is dropped
+    /// rather than silently falling back to the old, forgeable behaviour.
+    #[test]
+    fn without_a_trusted_verifier_owner_recognition_is_off() {
+        let ch = unconfigured_owner_channel();
+        assert_eq!(
+            identity(
+                &ch,
+                "owner@example.com",
+                Some("mx.example.com; dmarc=pass header.from=example.com")
+            ),
+            None
+        );
+        // Ordinary mail is unaffected — the default deployment keeps working.
+        assert_eq!(
+            identity(&ch, "someone@example.com", None),
+            Some("someone@example.com".to_string())
+        );
     }
 
     /// The core of the defect: `From:` is a header, not a credential.
@@ -1529,7 +1762,7 @@ mod tests {
             identity(
                 &ch,
                 "someone@example.com",
-                Some("mx; dkim=pass header.d=example.com")
+                Some("mx.example.com; dkim=pass header.d=example.com")
             ),
             Some("someone@example.com".to_string())
         );
@@ -1787,6 +2020,7 @@ mod tests {
             idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
             require_authenticated_sender: false,
+            trusted_authserv_id: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();

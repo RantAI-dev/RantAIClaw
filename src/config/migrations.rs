@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 26;
+pub const CURRENT_VERSION: u32 = 27;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -370,7 +370,18 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; default-value-only change)
     }
 
-    // Future migrations (v27, …) inserted here in order.
+    // v26 → v27: `[channels.email].trusted_authserv_id` (Option<String>,
+    // default None) was added — the authserv-id of the operator's own mail
+    // server, without which an `Authentication-Results` header cannot be told
+    // from one a sender wrote. Additive field with a serde default: configs
+    // that lack it deserialise fine and keep `None`, which means email owner
+    // recognition is off until it is set. Nothing to transform; this arm burns
+    // a version slot so the schema fingerprint is accepted with intent.
+    if from < 27 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v28, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
