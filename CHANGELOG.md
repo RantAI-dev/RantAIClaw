@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP servers survive being long-lived. Two transport defects only mattered
+  once a server outlived a single request: its stderr was piped and never
+  read, so a server that logged past the pipe buffer (~64 KiB — `npx` install
+  progress is enough) blocked on its own `write` and stopped answering while
+  looking healthy; and each caller read stdout itself until it saw its own id,
+  binning every other reply, so a second concurrent call to one server waited
+  out the full 30-second timeout. A background task now owns stdout and routes
+  each reply to the caller waiting on its id, and a second task drains stderr
+  (logged at DEBUG, length-capped). A server that exits mid-request now fails
+  its caller on EOF instead of at the timeout.
+
 - The TUI no longer panics on multibyte tool output. Two sites cropped text by
   byte index — the tool-status line in the transcript and the argument values
   in the calls overlay — so an `ls` over a filename with an accented or CJK
