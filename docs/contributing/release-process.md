@@ -2,7 +2,8 @@
 
 This runbook defines the maintainers' standard release flow.
 
-Last verified: **August 8, 2026**, against `v0.18.1-alpha`.
+Last verified: **September 4, 2026**, against `v0.28.0-alpha` — every step below was
+run, including the verification build, the tag script, and the post-release checks.
 
 ## Release Goals
 
@@ -80,9 +81,31 @@ cargo test --locked --lib config::migrations
 cargo test --locked --lib sessions::migrations
 ```
 
-`schema_drift` passing **without** a snapshot update is the machine-checkable
-statement that the config schema did not move, and therefore that the release
-carries no migration and rolls back cleanly.
+These gates say the release-bump PR itself is consistent. They do **not** tell
+you whether the release rolls back cleanly, and reading them that way is a
+mistake this runbook used to make: `schema_drift` compares the working tree
+against the snapshots committed in `tests/snapshots/`, so it measures drift
+**since the last PR that moved the schema** — not since the last release. The
+PR that bumped the schema also committed the matching snapshot, so by the time
+you cut the tag the gate is green again and stays green.
+
+To find out what the release actually carries, compare the schema version at
+the previous tag with the one you are about to ship:
+
+```bash
+prev=$(git describe --tags --abbrev=0)
+git show "$prev":src/config/migrations.rs | grep 'pub const CURRENT_VERSION'
+grep 'pub const CURRENT_VERSION' src/config/migrations.rs
+```
+
+Different numbers mean the release carries a migration and does **not** roll
+back cleanly: a config written by the new binary will not load on the old one.
+Say so at the top of the changelog entry, naming both versions — 0.26.0, 0.27.0
+and 0.28.0 all do. Same check against `src/sessions/migrations.rs` for the
+sessions store.
+
+v0.28.0-alpha is the worked example: all three gates were green, and the
+release still moved the config schema from v26 to v27.
 
 ### 3) Run verification build (no publish)
 
