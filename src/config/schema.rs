@@ -232,6 +232,27 @@ pub struct Config {
     /// MCP servers managed by the runtime (`[mcp_servers.<name>]`).
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+
+    /// What `apply_env_overrides` changed on this value, remembered so
+    /// `save()` writes the operator's file rather than the environment this
+    /// run happened to have. Never serialised, and absent from the schema.
+    ///
+    /// Written by `apply_env_overrides` and read by `save()`. It is `pub` only
+    /// because `..Config::default()` outside this crate cannot see a private
+    /// field; `EnvOverrideSnapshot` keeps its own fields private, so the only
+    /// value an external caller can put here is `None`.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub env_overrides: Option<Box<EnvOverrideSnapshot>>,
+}
+
+/// The config as it was before and after `apply_env_overrides` ran, as JSON so
+/// the comparison is generic: every override present today is covered, and any
+/// override added later is covered without touching `save()`.
+#[derive(Debug, Clone)]
+pub struct EnvOverrideSnapshot {
+    before: serde_json::Value,
+    after: serde_json::Value,
 }
 
 // ── MCP Servers ──────────────────────────────────────────────────
@@ -3401,6 +3422,43 @@ pub(crate) fn default_config_schema_version() -> u32 {
     crate::config::migrations::CURRENT_VERSION
 }
 
+/// Copy back, in `target`, every value that differs between `before` and
+/// `after` — but only where `target` still holds the `after` value.
+///
+/// Walks nested objects so a change deep in the tree (`gateway.host`) is
+/// restored as precisely as a top-level one.
+fn restore_env_overridden(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    target: &mut serde_json::Value,
+) {
+    let (Some(before), Some(after), Some(target)) = (
+        before.as_object(),
+        after.as_object(),
+        target.as_object_mut(),
+    ) else {
+        return;
+    };
+
+    for (key, after_value) in after {
+        let Some(before_value) = before.get(key) else {
+            continue;
+        };
+        if before_value == after_value {
+            continue;
+        }
+        let Some(target_value) = target.get_mut(key) else {
+            continue;
+        };
+
+        if before_value.is_object() && after_value.is_object() {
+            restore_env_overridden(before_value, after_value, target_value);
+        } else if target_value == after_value {
+            *target_value = before_value.clone();
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home =
@@ -3408,6 +3466,7 @@ impl Default for Config {
         let rantaiclaw_dir = home.join(".rantaiclaw");
 
         Self {
+            env_overrides: None,
             ui: UiConfig::default(),
             schema_version: default_config_schema_version(),
             workspace_dir: rantaiclaw_dir.join("workspace"),
@@ -4334,7 +4393,28 @@ impl Config {
     }
 
     /// Apply environment variable overrides to config
+    /// Fold environment overrides onto this config, remembering what they
+    /// changed so [`Config::save`] can leave those values out of `config.toml`.
+    ///
+    /// The environment still wins at runtime — only persistence is affected.
     pub fn apply_env_overrides(&mut self) {
+        let before = serde_json::to_value(&*self).ok();
+
+        self.apply_env_overrides_inner();
+
+        // A before/after pair rather than a list of field names: every
+        // override that exists today is covered, and any override added to
+        // `apply_env_overrides_inner` later is covered with no further work.
+        if let (Some(before), Ok(after)) = (before, serde_json::to_value(&*self)) {
+            if before != after {
+                // Keep the earliest `before` — that one is the on-disk truth.
+                let before = self.env_overrides.take().map_or(before, |s| s.before);
+                self.env_overrides = Some(Box::new(EnvOverrideSnapshot { before, after }));
+            }
+        }
+    }
+
+    fn apply_env_overrides_inner(&mut self) {
         // API Key: RANTAICLAW_API_KEY or API_KEY (generic)
         if let Ok(key) = std::env::var("RANTAICLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
             if !key.is_empty() {
@@ -4675,9 +4755,41 @@ impl Config {
         set_runtime_proxy_config(self.proxy.clone());
     }
 
+    /// Undo, in `target` and for persistence only, what the environment
+    /// contributed at load — but only where nothing has changed it since.
+    ///
+    /// A value the process deliberately set after load (a TUI model switch, a
+    /// console save) is the operator's and must reach the file, even when the
+    /// environment also names that field.
+    fn strip_env_overrides(&self, target: &mut Config) -> Result<()> {
+        let Some(snapshot) = self.env_overrides.as_deref() else {
+            return Ok(());
+        };
+
+        let mut value = serde_json::to_value(&*target)
+            .context("Failed to inspect config before removing environment overrides")?;
+        restore_env_overridden(&snapshot.before, &snapshot.after, &mut value);
+
+        // Fail closed: writing a config that still carries environment values
+        // is the defect this exists to prevent, so a rebuild failure aborts
+        // the save rather than falling back to it.
+        let mut stripped: Config = serde_json::from_value(value)
+            .context("Failed to rebuild config without environment overrides")?;
+
+        // JSON carries only the serialised fields; put the skipped ones back.
+        stripped.config_path = target.config_path.clone();
+        stripped.workspace_dir = target.workspace_dir.clone();
+        stripped.env_overrides = target.env_overrides.clone();
+        *target = stripped;
+        Ok(())
+    }
+
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
+        // Before anything else: the file must describe the operator's config,
+        // not the environment this process happened to run with.
+        self.strip_env_overrides(&mut config_to_save)?;
         let rantaiclaw_dir = self
             .config_path
             .parent()
@@ -5156,6 +5268,7 @@ default_temperature = 0.7
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            env_overrides: None,
             ui: UiConfig::default(),
             schema_version: crate::config::migrations::CURRENT_VERSION,
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
@@ -5385,6 +5498,7 @@ tool_dispatcher = "xml"
 
         let config_path = dir.join("config.toml");
         let config = Config {
+            env_overrides: None,
             ui: UiConfig::default(),
             schema_version: crate::config::migrations::CURRENT_VERSION,
             workspace_dir: dir.join("workspace"),
@@ -6600,6 +6714,105 @@ level = "full"
         ] {
             std::env::remove_var(key);
         }
+    }
+
+    // ── Env overrides must not be persisted by save() ───────────
+
+    /// `load_or_init` applies env overrides onto the struct `save()`
+    /// serialises, so the first console/TUI/setup write used to bake whatever
+    /// the environment held into `config.toml` permanently. For a container
+    /// started with `RANTAICLAW_ALLOW_PUBLIC_BIND=true`, an exposure setting
+    /// meant to last one run outlived its cause.
+    #[test]
+    async fn save_does_not_persist_an_env_set_exposure_flag() {
+        let _env_guard = env_override_lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        // An unrelated value the operator did set, to prove the rest of the
+        // file survives the rewrite intact.
+        config.default_model = Some("anthropic/claude-sonnet-4.6".into());
+        assert!(!config.gateway.allow_public_bind, "off by default");
+
+        let _bind = crate::test_env::EnvGuard::set("RANTAICLAW_ALLOW_PUBLIC_BIND", "true");
+        config.apply_env_overrides();
+        assert!(
+            config.gateway.allow_public_bind,
+            "the running process must still see the override"
+        );
+
+        config.save().await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let persisted: Config = toml::from_str(&contents).unwrap();
+        assert!(
+            !persisted.gateway.allow_public_bind,
+            "an exposure flag set for one run must not outlive it in config.toml"
+        );
+        assert_eq!(
+            persisted.default_model.as_deref(),
+            Some("anthropic/claude-sonnet-4.6"),
+            "unrelated values must survive"
+        );
+    }
+
+    /// Same defect, credential class: `RANTAICLAW_API_KEY` became a stored
+    /// secret on the first save.
+    #[test]
+    async fn save_does_not_persist_an_env_supplied_credential() {
+        let _env_guard = env_override_lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        assert!(config.api_key.is_none());
+
+        let _key = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "sk-from-the-environment");
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("sk-from-the-environment"));
+
+        config.save().await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            !contents.contains("sk-from-the-environment"),
+            "an env-supplied credential must not be written to config.toml"
+        );
+        let persisted: Config = toml::from_str(&contents).unwrap();
+        assert!(persisted.api_key.is_none());
+    }
+
+    /// The other half of the contract: not persisting the *environment's*
+    /// value must not mean discarding the *operator's*. A container sets
+    /// `RANTAICLAW_MODEL`, the operator then picks a different model in the
+    /// TUI — their choice has to reach the file.
+    #[test]
+    async fn save_persists_a_value_changed_after_the_env_override() {
+        let _env_guard = env_override_lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+
+        let _model = crate::test_env::EnvGuard::set("RANTAICLAW_MODEL", "env/model");
+        config.apply_env_overrides();
+        assert_eq!(config.default_model.as_deref(), Some("env/model"));
+
+        // What a TUI model switch does.
+        config.default_model = Some("operator/model".into());
+        config.save().await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let persisted: Config = toml::from_str(&contents).unwrap();
+        assert_eq!(
+            persisted.default_model.as_deref(),
+            Some("operator/model"),
+            "a deliberate change after the override must be persisted"
+        );
     }
 
     #[test]

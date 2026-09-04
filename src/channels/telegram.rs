@@ -459,8 +459,11 @@ impl TelegramChannel {
         // `~/.rantaiclaw/config.toml`. The legacy hardcoded path missed the
         // profile layout entirely, so `/claim`/`/bind` persisted owner +
         // allowlist to a file the daemon never reads (or, on migrated installs,
-        // clobbered the compatibility symlink). We still skip env-VALUE overrides
-        // by parsing the file directly rather than going through `load_or_init`.
+        // clobbered the compatibility symlink). Parsing the file directly also
+        // means this reads the CURRENT config rather than the snapshot this
+        // process loaded at startup, so a `/claim` does not clobber changes
+        // made since. (Env values no longer need dodging here — `save()`
+        // leaves them out of the file on its own.)
         let (config_path, workspace_dir) = Config::resolve_active_paths().await?;
 
         let contents = fs::read_to_string(&config_path)
