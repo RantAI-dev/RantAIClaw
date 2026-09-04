@@ -641,21 +641,29 @@ fn find_json_end(input: &str) -> Option<usize> {
     None
 }
 
-/// Parse GLM-style tool calls from response text.
-/// GLM uses proprietary formats like:
-/// - `browser_open/url>https://example.com`
-/// - `shell/command>ls -la`
-/// - `http_request/url>https://api.example.com`
+/// Translate the name GLM uses to the name the tool is registered under.
+///
+/// Only names that differ belong here. `browser`, `browser_open` and
+/// `http_request` are registered under exactly those names, so they pass
+/// through. Nothing maps to `shell` except a name that already means a shell:
+/// routing `browser`/`web_search` there silently converted a read-only intent
+/// into command execution and bypassed those tools' own domain allowlists.
 fn map_glm_tool_alias(tool_name: &str) -> &str {
     match tool_name {
-        "browser_open" | "browser" | "web_search" | "shell" | "bash" => "shell",
-        "http_request" | "http" => "http_request",
+        "bash" => "shell",
+        "http" => "http_request",
+        // The registry name is `web_search_tool`.
+        "web_search" => "web_search_tool",
         _ => tool_name,
     }
 }
 
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 fn build_curl_command(url: &str) -> Option<String> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    if !is_http_url(url) {
         return None;
     }
 
@@ -667,6 +675,16 @@ fn build_curl_command(url: &str) -> Option<String> {
     Some(format!("curl -s '{}'", escaped))
 }
 
+/// Parse GLM-style tool calls from response text.
+///
+/// GLM uses proprietary line formats like:
+///
+/// - `browser_open/url>https://example.com`
+/// - `shell/command>ls -la`
+/// - `http_request/url>https://api.example.com`
+///
+/// Call this through [`parse_tool_calls_for_provider`], which gates it on the
+/// model actually speaking the grammar.
 fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Option<String>)> {
     let mut calls = Vec::new();
 
@@ -687,6 +705,14 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                 if let Some(gt_pos) = rest.find('>') {
                     let param_name = rest[..gt_pos].trim();
                     let value = rest[gt_pos + 1..].trim();
+
+                    // A `url` parameter must be an http(s) URL whatever tool
+                    // it names — `javascript:` and `file:` values have no
+                    // business reaching one. This used to hold only because
+                    // every URL-shaped call was rewritten into `curl`.
+                    if param_name == "url" && !is_http_url(value) {
+                        continue;
+                    }
 
                     let arguments = match tool_name {
                         "shell" => {
@@ -724,17 +750,58 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
             }
         }
 
-        // Plain URL
-        if let Some(command) = build_curl_command(line) {
-            calls.push((
-                "shell".to_string(),
-                serde_json::json!({"command": command}),
-                Some(line.to_string()),
-            ));
-        }
+        // A line that is only a URL is prose, not a tool call. It used to
+        // become a `shell` `curl`, which turned "the model quoted a link it
+        // read" into an outbound request from the operator's machine.
     }
 
     calls
+}
+
+/// True when the model actually speaks GLM's proprietary line grammar.
+///
+/// The provider key alone is not enough: GLM reached through an aggregator
+/// reports that aggregator's key, so the model name identifies it there.
+fn speaks_glm_line_grammar(provider_name: &str, model: &str) -> bool {
+    crate::providers::is_glm_alias(provider_name) || model.to_ascii_lowercase().contains("glm")
+}
+
+/// `parse_tool_calls`, plus GLM's line grammar for the models that speak it.
+///
+/// The line grammar is a last-resort fallback over unstructured prose, so it
+/// runs only when the structured parsers found nothing *and* the model is one
+/// that emits it. Applying it to every provider meant any model echoing a
+/// `word/param>value` line — from a file, a log, a fetched page — had it
+/// executed, which is exactly what the SECURITY note below forbids.
+fn parse_tool_calls_for_provider(
+    response: &str,
+    provider_name: &str,
+    model: &str,
+) -> (String, Vec<ParsedToolCall>) {
+    let (text, calls) = parse_tool_calls(response);
+    if !calls.is_empty() || !speaks_glm_line_grammar(provider_name, model) {
+        return (text, calls);
+    }
+
+    let glm_calls = parse_glm_style_tool_calls(&text);
+    if glm_calls.is_empty() {
+        return (text, calls);
+    }
+
+    let mut cleaned_text = text;
+    let mut parsed = Vec::with_capacity(glm_calls.len());
+    for (name, args, raw) in &glm_calls {
+        parsed.push(ParsedToolCall {
+            name: name.clone(),
+            arguments: args.clone(),
+            tool_call_id: None,
+        });
+        if let Some(r) = raw {
+            cleaned_text = cleaned_text.replace(r, "");
+        }
+    }
+
+    (cleaned_text.trim().to_string(), parsed)
 }
 
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
@@ -743,7 +810,8 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
 //   1. OpenAI-style JSON with `tool_calls` array (native API)
 //   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <invoke>
 //   3. Markdown code blocks with `tool_call` language
-//   4. GLM-style line-based format (e.g. `shell/command>ls`)
+//   4. GLM-style line-based format (e.g. `shell/command>ls`) — only for the
+//      models that emit it; see `parse_tool_calls_for_provider`.
 // SECURITY: We never fall back to extracting arbitrary JSON from the
 // response body, because that would enable prompt-injection attacks where
 // malicious content in emails/files/web pages mimics a tool call.
@@ -889,28 +957,6 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // GLM-style tool calls (browser_open/url>https://..., shell/command>ls, etc.)
-    if calls.is_empty() {
-        let glm_calls = parse_glm_style_tool_calls(remaining);
-        if !glm_calls.is_empty() {
-            let mut cleaned_text = remaining.to_string();
-            for (name, args, raw) in &glm_calls {
-                calls.push(ParsedToolCall {
-                    name: name.clone(),
-                    arguments: args.clone(),
-                    tool_call_id: None,
-                });
-                if let Some(r) = raw {
-                    cleaned_text = cleaned_text.replace(r, "");
-                }
-            }
-            if !cleaned_text.trim().is_empty() {
-                text_parts.push(cleaned_text.trim().to_string());
-            }
-            remaining = "";
-        }
-    }
-
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
     // here. That would enable prompt injection attacks where malicious content
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
@@ -918,7 +964,8 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // 1. OpenAI-style JSON with a "tool_calls" array
     // 2. RantaiClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
-    // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
+    // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`), and
+    //    only when the model is one that speaks them.
     // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
@@ -1667,7 +1714,8 @@ pub(crate) async fn run_structured_loop(
                 let mut parsed_text = String::new();
 
                 if calls.is_empty() {
-                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    let (fallback_text, fallback_calls) =
+                        parse_tool_calls_for_provider(&response_text, provider_name, model);
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
                     }
@@ -4590,17 +4638,27 @@ Done."#;
     // GLM-Style Tool Call Parsing
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// `browser_open` is a registered tool taking a `url`. Rewriting it into a
+    /// `shell` `curl` turned a read-only intent into command execution and
+    /// bypassed that tool's own domain allowlist.
     #[test]
-    fn parse_glm_style_browser_open_url() {
+    fn parse_glm_style_browser_open_reaches_the_browser_tool() {
         let response = "browser_open/url>https://example.com";
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(calls[0].1["command"]
-            .as_str()
-            .unwrap()
-            .contains("example.com"));
+        assert_eq!(calls[0].0, "browser_open");
+        assert_eq!(calls[0].1["url"], "https://example.com");
+    }
+
+    /// The registry name is `web_search_tool`; `web_search` is what the model
+    /// says. Mapping it to `shell` was command execution for a search.
+    #[test]
+    fn parse_glm_style_web_search_reaches_the_registered_search_tool() {
+        let response = "web_search/query>rust async runtime";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "web_search_tool");
+        assert_eq!(calls[0].1["query"], "rust async runtime");
     }
 
     #[test]
@@ -4622,13 +4680,26 @@ Done."#;
         assert_eq!(calls[0].1["method"], "GET");
     }
 
+    /// A line that is only a URL is prose. It used to become a `shell` `curl`,
+    /// so a model quoting a link out of an email, a file or a fetched page
+    /// caused an outbound request from the operator's machine.
     #[test]
-    fn parse_glm_style_plain_url() {
+    fn parse_glm_style_ignores_a_line_that_is_only_a_url() {
         let response = "https://example.com/api";
         let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+        assert!(calls.is_empty(), "a bare URL is not a tool call: {calls:?}");
+    }
+
+    /// The prompt-injection shape the rule above exists for: the model reports
+    /// what it read, and the report contains a link.
+    #[test]
+    fn parse_glm_style_ignores_a_url_quoted_from_fetched_content() {
+        let response = "The page says to visit:\nhttps://attacker.example/payload\nThat is all.";
+        let calls = parse_glm_style_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "quoted prose is not a tool call: {calls:?}"
+        );
     }
 
     #[test]
@@ -4646,17 +4717,57 @@ Done."#;
 browser_open/url>https://example.com"#;
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "shell");
+        assert_eq!(calls[1].0, "browser_open");
     }
 
     #[test]
     fn parse_glm_style_tool_call_integration() {
-        // Integration test: GLM format should be parsed in parse_tool_calls
         let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
-        let (text, calls) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls_for_provider(response, "glm", "glm-4.6");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].name, "browser_open");
         assert!(text.contains("Checking"));
         assert!(text.contains("Done"));
+    }
+
+    /// The line grammar is GLM's, not everyone's. Running it for every
+    /// provider means any model that echoes a `word/param>value` line — from
+    /// a config file, a log, a chat transcript — gets it executed.
+    #[test]
+    fn glm_line_grammar_runs_only_for_the_provider_that_speaks_it() {
+        let response = "shell/command>ls -la";
+
+        let (_, glm) = parse_tool_calls_for_provider(response, "glm", "glm-4.6");
+        assert_eq!(glm.len(), 1, "GLM still gets its own grammar");
+        assert_eq!(glm[0].name, "shell");
+
+        for (provider, model) in [("openai", "gpt-5"), ("anthropic", "claude-opus-5")] {
+            let (text, calls) = parse_tool_calls_for_provider(response, provider, model);
+            assert!(
+                calls.is_empty(),
+                "{provider} must not get GLM's grammar: {calls:?}"
+            );
+            assert_eq!(text, response, "the line stays in the reply as prose");
+        }
+    }
+
+    /// GLM reached through an aggregator keeps its grammar — the provider key
+    /// is the aggregator's, so the model name is what identifies it.
+    #[test]
+    fn glm_line_grammar_follows_the_model_through_an_aggregator() {
+        let (_, calls) =
+            parse_tool_calls_for_provider("shell/command>ls", "openrouter", "z-ai/GLM-4.6");
+        assert_eq!(calls.len(), 1);
+    }
+
+    /// `parse_tool_calls` is the structured-format parser. The line grammar
+    /// is not a structured format and no longer lives there.
+    #[test]
+    fn parse_tool_calls_does_not_apply_the_glm_line_grammar() {
+        let (text, calls) = parse_tool_calls("shell/command>ls -la");
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(text, "shell/command>ls -la");
     }
 
     #[test]
