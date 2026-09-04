@@ -9,11 +9,15 @@
 //! messages. No Content-Length header (HTTP/SSE transport uses
 //! that, stdio doesn't). Each request is exactly one line.
 //!
-//! Threading model: one `Mutex` over stdin (writer), one over stdout
-//! (reader). Multiple concurrent `request()` callers each take the
-//! stdout lock and read until they find their matching id —
-//! responses for other ids are dropped. This is acceptable because
-//! MCP tool-call traffic is low-frequency (a few calls per turn).
+//! Threading model: one background task owns stdout and routes each
+//! reply to the caller waiting on its id; callers only serialise on
+//! stdin, which they hold just long enough to write one line. Readers
+//! used to be whoever asked first — that caller read until it saw *its*
+//! id and dropped everything else, so a second concurrent call had its
+//! reply binned and waited out the full timeout. A second task drains
+//! stderr: it is piped, and a server that logs past the pipe buffer
+//! (~64 KiB) blocks on its own `write` and stops answering. Neither
+//! shape had time to appear while a client lasted one chat request.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -21,10 +25,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
 
 /// MCP protocol version we speak. The 2024-11-05 spec is widely
 /// supported by official servers (`@modelcontextprotocol/server-*`).
@@ -55,8 +61,22 @@ pub struct McpClient {
     /// Owns the child process. Drop = SIGKILL (kill_on_drop set at spawn).
     _child: Child,
     stdin: Mutex<ChildStdin>,
-    stdout: Mutex<BufReader<ChildStdout>>,
+    /// Callers waiting on a reply, keyed by request id. The reader task
+    /// fulfils an entry and removes it; a caller that gives up removes its
+    /// own. Dropping the map (reader exit) fails every waiter at once.
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     request_id: AtomicU64,
+    /// Aborted on drop so a client that goes away does not leave two tasks
+    /// reading pipes whose child is being SIGKILLed underneath them.
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 impl McpClient {
@@ -87,13 +107,29 @@ impl McpClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("MCP server `{server_name}` missing stdout pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("MCP server `{server_name}` missing stderr pipe"))?;
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let tasks = vec![
+            tokio::spawn(pump_stdout(
+                server_name.clone(),
+                stdout,
+                Arc::clone(&pending),
+            )),
+            tokio::spawn(drain_stderr(server_name.clone(), stderr)),
+        ];
 
         let client = Self {
             server_name,
             _child: child,
             stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout)),
+            pending,
             request_id: AtomicU64::new(1),
+            tasks,
         };
 
         client
@@ -186,13 +222,48 @@ impl McpClient {
             "params": params,
         });
         let payload = serde_json::to_string(&req)?;
-        {
+
+        // Register before writing: the reply can arrive while we still hold
+        // the stdin lock, and a reply with nobody waiting is dropped.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let sent = async {
             let mut stdin = self.stdin.lock().await;
             stdin.write_all(payload.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
             stdin.flush().await?;
+            Ok::<(), anyhow::Error>(())
         }
-        self.read_response_for(id, method).await
+        .await;
+        if let Err(e) = sent {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
+
+        let outcome = tokio::time::timeout(REQUEST_TIMEOUT, rx).await;
+        // Whatever happened, this id is no longer wanted. A timed-out entry
+        // left behind would pin a sender for the life of the client.
+        self.pending.lock().await.remove(&id);
+
+        let server = &self.server_name;
+        match outcome {
+            Ok(Ok(message)) => {
+                if let Some(err) = message.get("error") {
+                    anyhow::bail!("MCP `{server}` returned error for `{method}`: {err}");
+                }
+                Ok(message.get("result").cloned().unwrap_or(Value::Null))
+            }
+            // The reader dropped our sender: stdout closed, so the server is
+            // gone. Fail now rather than waiting out the timeout on a pipe
+            // nobody will ever write to.
+            Ok(Err(_)) => {
+                anyhow::bail!("MCP `{server}` server closed stdout before responding to `{method}`")
+            }
+            Err(_) => {
+                anyhow::bail!("MCP `{server}` request `{method}` timeout after {REQUEST_TIMEOUT:?}")
+            }
+        }
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -208,63 +279,83 @@ impl McpClient {
         stdin.flush().await?;
         Ok(())
     }
+}
 
-    async fn read_response_for(&self, want_id: u64, method: &str) -> Result<Value> {
-        let server = self.server_name.clone();
-        let read = async {
-            let mut stdout = self.stdout.lock().await;
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                let n = stdout
-                    .read_line(&mut buf)
-                    .await
-                    .with_context(|| format!("MCP `{server}` stdout read failed"))?;
-                if n == 0 {
-                    anyhow::bail!(
-                        "MCP `{server}` server closed stdout before responding to `{method}`"
-                    );
-                }
-                let line = buf.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let v: Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "mcp",
-                            server = %server,
-                            line = %line,
-                            error = %e,
-                            "skipping unparseable line"
-                        );
-                        continue;
-                    }
-                };
-
-                // Match by id; drop notifications / unrelated responses.
-                match v.get("id").and_then(|x| x.as_u64()) {
-                    Some(id) if id == want_id => {
-                        if let Some(err) = v.get("error") {
-                            return Err(anyhow!(
-                                "MCP `{server}` returned error for `{method}`: {err}"
-                            ));
-                        }
-                        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
-                    }
-                    _ => continue,
-                }
+/// Own stdout for the life of the connection and hand each reply to the caller
+/// waiting on its id. Notifications and replies nobody is waiting for are
+/// dropped here — which is correct, because the only reader is this task.
+///
+/// On EOF every remaining waiter is failed by dropping its sender, so a server
+/// that dies mid-request fails its caller immediately instead of at the
+/// 30-second timeout.
+async fn pump_stdout(
+    server: String,
+    stdout: ChildStdout,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(target: "mcp", server = %server, error = %e, "stdout read failed");
+                break;
             }
         };
-        tokio::time::timeout(REQUEST_TIMEOUT, read)
-            .await
-            .with_context(|| {
-                format!(
-                    "MCP `{}` request `{method}` timeout after {:?}",
-                    self.server_name, REQUEST_TIMEOUT
-                )
-            })?
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let message: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mcp",
+                    server = %server,
+                    line = %line,
+                    error = %e,
+                    "skipping unparseable line"
+                );
+                continue;
+            }
+        };
+        let Some(id) = message.get("id").and_then(Value::as_u64) else {
+            // A notification, or a reply with no id — nothing to route.
+            continue;
+        };
+        if let Some(waiter) = pending.lock().await.remove(&id) {
+            // Send failing means the caller gave up (timeout); nothing to do.
+            let _ = waiter.send(message);
+        } else {
+            tracing::debug!(target: "mcp", server = %server, id, "reply with no waiter");
+        }
+    }
+    // Dropping the senders wakes every waiter with a receive error.
+    pending.lock().await.clear();
+}
+
+/// Read stderr so the server never blocks writing to it.
+///
+/// The pipe holds ~64 KiB; a server that logs more than that with nobody
+/// reading blocks on `write` and stops answering requests, while looking alive
+/// to everything else. `npx` printing install progress is enough.
+///
+/// Logged at DEBUG, one line at a time and length-capped: server logs are
+/// diagnostics worth having when a server misbehaves, but they are also
+/// arbitrary output that may quote arguments, so they stay off by default.
+async fn drain_stderr(server: String, stderr: ChildStderr) {
+    /// Enough to identify a message; short enough that a runaway server cannot
+    /// fill the log with one line.
+    const MAX_LOGGED: usize = 512;
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let shown: String = line.chars().take(MAX_LOGGED).collect();
+        tracing::debug!(target: "mcp", server = %server, "{shown}");
     }
 }
 
