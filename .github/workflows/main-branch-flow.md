@@ -39,9 +39,9 @@ Use this with:
    - `rust_changed`
 5. Rust path stages:
    - `lint` — fmt + clippy + strict delta clippy on changed lines.
-   - `test` — `cargo nextest run --locked --workspace` (PR: only with `ci:full`).
-   - `features` — matrix `cargo check` over `no-default-features` / `all-features` / `hardware` / `browser-native` (PR: only with `ci:full`).
-   - `bench-compile` — `cargo bench --no-run --locked` (PR: only with `ci:full`).
+   - `test` — `cargo nextest run --locked --workspace`.
+   - `features` — matrix `cargo check` over `no-default-features` / `hardware-only` / `browser-native`.
+   - `bench-compile` — `cargo bench --no-run --locked`.
    - `e2e` — push-to-`main` only; never runs on PRs.
    - `build` — release-fast smoke + binary-size guard (always runs for rust changes).
 6. Docs path: `docs-quality` runs incremental markdownlint + lychee on added links.
@@ -88,7 +88,7 @@ Workflow: `.github/workflows/pub-release.yml`.
 ## Merge/Policy Notes
 
 1. Branch protection should require only `CI Required Gate` — internal stages can change without touching protection settings.
-2. PR strictness for heavy stages (`test`, `features`, `bench-compile`, `docs-quality`) is controlled by the `ci:full` label. `build` always runs for rust changes; `e2e` is push-only.
+2. Every Rust stage runs on every Rust-changing PR; none is label-gated and `e2e` is no longer push-only. `docs-quality` runs whenever docs change.
 3. `sec-audit.yml` runs on both PR and push, plus scheduled weekly.
 4. Workflow-file changes are linted by `workflow-sanity.yml` (`actionlint`, tab check); no maintainer-approval gate.
 5. Workflow-specific JavaScript helpers are organized under `.github/workflows/scripts/`.
@@ -132,7 +132,7 @@ flowchart TD
 
 ## Quick Troubleshooting
 
-1. Unexpected skipped jobs: inspect `scripts/ci/detect_change_scope.sh` outputs and confirm whether `ci:full` is required for the stage that failed.
+1. Unexpected skipped jobs: inspect `scripts/ci/detect_change_scope.sh` outputs — a Rust stage skips only when the diff touched no Rust or when `lint` failed upstream.
 2. Fork PR appears stalled: check whether Actions run approval is pending.
 3. Docker not published: confirm changed files match Docker build-input paths, or run workflow dispatch manually.
 4. PR title check failing: ensure title matches Conventional Commits (`feat|fix|chore|docs|refactor|perf|test|build|ci|style|revert`, optional scope, colon, summary).
