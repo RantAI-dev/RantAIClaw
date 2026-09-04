@@ -927,7 +927,12 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
+            // Cut forward past any tool result the count-based boundary would
+            // have separated from its `AssistantToolCalls`.
+            let drop_count = crate::agent::compaction::pairing_safe_cut(
+                &other_messages,
+                other_messages.len() - max,
+            );
             other_messages.drain(0..drop_count);
         }
 
@@ -1296,6 +1301,81 @@ mod tests {
             msg.contains("no model") && msg.contains("setup provider"),
             "the error must name the problem and the fix: {msg}"
         );
+    }
+
+    /// Build the smallest agent `trim_history` needs: it only reads
+    /// `config.max_history_messages` and rewrites `history`.
+    async fn trim_test_agent() -> Agent {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = std::env::temp_dir();
+        config.memory.backend = "none".into();
+        config.default_model = Some("anthropic/claude-sonnet-4.6".into());
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::from_config_with_observer(&config, observer)
+            .await
+            .expect("a modelled config builds an agent")
+    }
+
+    /// One tool iteration appends two separate history entries — the
+    /// `AssistantToolCalls` and the `ToolResults` answering it. A cut by
+    /// message count can land between them, leaving a tool result whose
+    /// originating call is gone. OpenAI and Anthropic both reject that
+    /// shape with a 400, so every later turn in the session fails.
+    #[tokio::test]
+    async fn trim_history_never_leaves_a_tool_result_without_its_call() {
+        let mut agent = trim_test_agent().await;
+
+        // Sweep the cap across every alignment of the three-entry cycle a
+        // tool turn produces. A single cap would pass or fail by luck: it
+        // only orphans a result when the cut happens to land on one.
+        for max in 1..=12usize {
+            agent.config.max_history_messages = max;
+            agent.history.clear();
+            for i in 0..10 {
+                agent
+                    .history
+                    .push(ConversationMessage::Chat(ChatMessage::user(format!(
+                        "ask {i}"
+                    ))));
+                agent.history.push(ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: format!("call-{i}"),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                    }],
+                });
+                agent.history.push(ConversationMessage::ToolResults(vec![
+                    crate::providers::ToolResultMessage {
+                        tool_call_id: format!("call-{i}"),
+                        content: "ok".into(),
+                    },
+                ]));
+            }
+
+            agent.trim_history();
+
+            assert!(
+                agent.history.len() <= max,
+                "the cap still holds: {} kept, max {max}",
+                agent.history.len()
+            );
+
+            let mut call_is_open = false;
+            for (idx, msg) in agent.history.iter().enumerate() {
+                match msg {
+                    ConversationMessage::AssistantToolCalls { .. } => call_is_open = true,
+                    ConversationMessage::ToolResults(_) => {
+                        assert!(
+                            call_is_open,
+                            "max={max}: history[{idx}] is a tool result whose tool call was trimmed away"
+                        );
+                        call_is_open = false;
+                    }
+                    ConversationMessage::Chat(_) => call_is_open = false,
+                }
+            }
+        }
     }
 
     struct MockProvider {
