@@ -277,6 +277,11 @@ impl TuiProvisioner for EmailProvisioner {
             // claiming to be from an approval owner is refused when
             // unauthenticated regardless of this flag.
             require_authenticated_sender: false,
+            // Owner recognition over email stays off until the operator names
+            // the authserv-id their own mail server writes; a sender can put an
+            // `Authentication-Results` header in the message too, and without a
+            // trusted verifier the two cannot be told apart.
+            trusted_authserv_id: None,
         });
 
         send(

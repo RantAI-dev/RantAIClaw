@@ -32,6 +32,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The email owner gate no longer trusts a forged `Authentication-Results`
+  header. That header is written by the receiving infrastructure, but anything
+  a sender puts in a message arrives as a header too — and the gate read the
+  first one it found without checking who wrote it. Combined with a spoofed
+  `From:` matching an owner address, a sender obtained owner authority, which
+  on this product is the full tool set, shell included. Two weaknesses
+  compounded it: `dmarc=pass` was accepted regardless of which domain it named,
+  and the domain comparison was a substring test, so
+  `example.com.attacker.test` satisfied a check for `example.com`.
+
+  **New config key** `[channels_config.email] trusted_authserv_id` names the
+  authserv-id your own mail server writes (the first token of the header).
+  Verdicts from any other verifier are ignored. **Schema version 26 → 27.**
+
+  **Operator impact**: until this key is set, email owner recognition is off —
+  mail from an `approval_owners` address is dropped rather than granted owner
+  authority, and the channel says so at startup. Ordinary (non-owner) mail is
+  unaffected.
+
 - `ui install`/`ui update` now pin claw-ui v0.3.25, which bumps Next.js
   16.0.10 → 16.3.4. The console's login gate, CSRF rejection, expected-host
   allowlist and server-side gateway-token attachment all live in the

@@ -509,19 +509,41 @@ from_address = "bot@example.com"
 poll_interval_secs = 60
 allowed_senders = ["*"]
 require_authenticated_sender = false   # optional; see below
+trusted_authserv_id = "mx.example.com" # required for owner recognition; see below
 ```
 
 Email notes — `From:` is forgeable:
 
+- **`trusted_authserv_id` is what makes the authentication headers mean
+  anything.** `Authentication-Results` (RFC 8601) is written by the receiving
+  infrastructure, but anything a sender puts in a message arrives as a header
+  too, and the two are indistinguishable once parsed. Set this to the
+  **authserv-id your own mail server writes**: the first token of the header,
+  before the first `;`. To find it, open a message that reached the mailbox and
+  read its headers —
+
+  ```
+  Authentication-Results: mx.example.com; dmarc=pass header.from=example.com
+                          ^^^^^^^^^^^^^^ this
+  ```
+
+  Verdicts from any other authserv-id are ignored, so a header the sender
+  supplied grants nothing.
+- **Unset means email owner recognition is off.** Mail from an `approval_owners`
+  address is dropped rather than granted owner authority, and the channel logs
+  that at startup. This is deliberate: there is no safe way to accept a
+  header-derived identity without knowing who wrote the header.
 - `require_authenticated_sender = true` drops mail whose `From:` domain is not
-  backed by `dmarc=pass`, or by an aligned `spf=pass`/`dkim=pass`, in the
-  `Authentication-Results` header your own MTA wrote
-  (`src/channels/email_channel.rs:254`). It is **off by default** because a relay
-  that strips that header would otherwise silence a working mailbox.
+  backed by `dmarc=pass`, or by an aligned `spf=pass`/`dkim=pass`, from that
+  trusted verifier. It is **off by default** because a relay that strips the
+  header would otherwise silence a working mailbox.
+- Alignment is exact: an identifier authenticates `example.com` when it *is*
+  `example.com` or a subdomain of it (`bounces.example.com`).
+  `example.com.attacker.test` does not.
 - The **owner path does not depend on that flag**: mail claiming to come from an
-  address in `approval_owners` is dropped when unauthenticated, always
-  (`src/channels/email_channel.rs:315-324`). Otherwise anyone could grant
-  themselves approval authority by typing a `From:` line.
+  address in `approval_owners` is dropped when unauthenticated, always.
+  Otherwise anyone could grant themselves approval authority by typing a `From:`
+  line.
 - Turn the flag on for any mailbox that is reachable from the public internet.
 
 ### 4.10 IRC
