@@ -9,14 +9,14 @@ on:
             - "src/**"
             - "crates/**"
             - "deny.toml"
+    # Unfiltered on purpose: a `paths:` filter reports nothing on a
+    # non-matching run, and a required check that never reports blocks the pull
+    # request forever. The cost is ~3.5 minutes on a docs-only PR, in parallel
+    # with jobs that take longer; the `push` trigger below keeps its filter
+    # because a push that changes no dependency has nothing to audit and no
+    # required check waiting on it.
     pull_request:
         branches: [main]
-        paths:
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "src/**"
-            - "crates/**"
-            - "deny.toml"
     schedule:
         - cron: "0 6 * * 1" # Weekly on Monday 6am UTC
 
