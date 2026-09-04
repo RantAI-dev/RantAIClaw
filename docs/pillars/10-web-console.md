@@ -13,7 +13,8 @@ through the gateway's `/api/v1` HTTP surface.
 - The gateway ↔ console contract: the `/api/v1` JSON API is the only interface
   between the two repositories (see the ADR below)
 - The exposure model: the gateway binds to `127.0.0.1` by default and refuses a
-  public bind without a tunnel or an explicit `[gateway] allow_public_bind`
+  public bind without an explicit `[gateway] allow_public_bind` — a configured
+  tunnel is not a substitute, since every provider proxies loopback
 - The optional Argon2id console login (`[gateway.login]`), off by default
 - The chat surface (sessions, streaming, in-browser tool approvals), the Status
   panel (`/status`, `/doctor`, `/insights`), and the Persona editor

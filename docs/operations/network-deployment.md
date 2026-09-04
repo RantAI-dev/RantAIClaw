@@ -112,7 +112,9 @@ If you need a **public URL** (e.g. WhatsApp webhook, external clients):
    ```
    Or use `rantaiclaw tunnel` (see tunnel docs).
 
-3. RantaiClaw will refuse `0.0.0.0` unless `allow_public_bind = true` or a tunnel is active.
+3. RantaiClaw will refuse `0.0.0.0` unless `allow_public_bind = true`. A tunnel is
+   not a substitute: providers proxy `localhost:<port>`, so keep the bind on
+   `127.0.0.1` and let the tunnel reach it there.
 
 ---
 
