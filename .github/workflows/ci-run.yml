@@ -282,7 +282,9 @@ jobs:
     docs-quality:
         name: Docs Quality
         needs: [changes]
-        if: needs.changes.outputs.docs_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        # Not label-gated: the required gate refuses a docs change whose lint did
+        # not pass, on pull requests as well as pushes, so this has to have run.
+        if: needs.changes.outputs.docs_changed == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 15
         steps:
@@ -371,109 +373,45 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, identity, lint, test, features, e2e, bench-compile, build, docs-only, non-rust, docs-quality, lint-feedback]
+        needs:
+            [
+                changes,
+                identity,
+                lint,
+                test,
+                channel-lark,
+                features,
+                e2e,
+                bench-compile,
+                build,
+                docs-only,
+                non-rust,
+                docs-quality,
+                lint-feedback,
+            ]
         runs-on: ubuntu-latest
         steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            # The decision table this job enforces, checked before it is used.
+            # The gate used to be inlined here, which is how it came to run two
+            # jobs it never read.
+            - name: Self-test the gate
+              run: ./scripts/ci/required_gate.sh --self-test
+
             - name: Enforce required status
-              shell: bash
-              run: |
-                  set -euo pipefail
-
-                  event_name="${{ github.event_name }}"
-                  rust_changed="${{ needs.changes.outputs.rust_changed }}"
-                  docs_changed="${{ needs.changes.outputs.docs_changed }}"
-                  docs_result="${{ needs.docs-quality.result }}"
-
-                  # Checked before every fast path below: §9.1 applies to docs-only
-                  # and non-Rust changes too, so an early `exit 0` must not skip it.
-                  if [ "${{ needs.identity.result }}" != "success" ]; then
-                    echo "Identity-strings gate did not pass (CLAUDE.md 9.1)."
-                    exit 1
-                  fi
-
-                  if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
-                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs-only push changed docs, but docs-quality did not pass."
-                      exit 1
-                    fi
-                    echo "Docs-only fast path passed."
-                    exit 0
-                  fi
-
-                  if [ "$rust_changed" != "true" ]; then
-                    echo "rust_changed=false (non-rust fast path)"
-                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Non-rust push changed docs, but docs-quality did not pass."
-                      exit 1
-                    fi
-                    echo "Non-rust fast path passed."
-                    exit 0
-                  fi
-
-                  lint_result="${{ needs.lint.result }}"
-                  lint_strict_delta_result="${{ needs.lint.result }}"
-                  test_result="${{ needs.test.result }}"
-                  features_result="${{ needs.features.result }}"
-                  e2e_result="${{ needs.e2e.result }}"
-                  bench_compile_result="${{ needs.bench-compile.result }}"
-                  build_result="${{ needs.build.result }}"
-
-                  echo "lint=${lint_result}"
-                  echo "lint_strict_delta=${lint_strict_delta_result}"
-                  echo "test=${test_result}"
-                  echo "features=${features_result}"
-                  echo "e2e=${e2e_result}"
-                  echo "bench_compile=${bench_compile_result}"
-                  echo "build=${build_result}"
-                  echo "docs=${docs_result}"
-
-                  # Helper: a job that was correctly skipped (no `ci:full` label, or PR-only
-                  # short-circuit for `e2e`) is treated as success here.
-                  is_ok() {
-                    case "$1" in
-                      success|skipped) return 0 ;;
-                      *) return 1 ;;
-                    esac
-                  }
-
-                  if [ "$event_name" = "pull_request" ]; then
-                    if ! is_ok "$build_result"; then
-                      echo "Required PR build job did not pass."
-                      exit 1
-                    fi
-                    # lint + test are no longer skippable on a Rust-changing PR (see the
-                    # lint/test job `if:` conditions) -> require them explicitly here rather
-                    # than via is_ok, which would accept a `skipped` result as success.
-                    if [ "$rust_changed" = "true" ]; then
-                      if [ "$lint_result" != "success" ]; then
-                        echo "Lint is required on Rust PRs."
-                        exit 1
-                      fi
-                      if [ "$test_result" != "success" ]; then
-                        echo "Unit tests are required on Rust PRs."
-                        exit 1
-                      fi
-                    fi
-                    # features/bench-compile remain gated behind `ci:full`; a skip there is fine.
-                    if ! is_ok "$features_result" || ! is_ok "$bench_compile_result"; then
-                      echo "Required PR jobs (features/bench-compile) did not pass."
-                      exit 1
-                    fi
-                    echo "PR required checks passed."
-                    exit 0
-                  fi
-
-                  if ! is_ok "$lint_result" || ! is_ok "$lint_strict_delta_result" \
-                     || ! is_ok "$test_result" || ! is_ok "$features_result" \
-                     || ! is_ok "$e2e_result" || ! is_ok "$bench_compile_result" \
-                     || ! is_ok "$build_result"; then
-                    echo "Required push CI jobs did not pass."
-                    exit 1
-                  fi
-
-                  if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                    echo "Push changed docs, but docs-quality did not pass."
-                    exit 1
-                  fi
-
-                  echo "Push required checks passed."
+              env:
+                  EVENT_NAME: ${{ github.event_name }}
+                  RUST_CHANGED: ${{ needs.changes.outputs.rust_changed }}
+                  DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+                  DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
+                  IDENTITY_RESULT: ${{ needs.identity.result }}
+                  LINT_RESULT: ${{ needs.lint.result }}
+                  TEST_RESULT: ${{ needs.test.result }}
+                  CHANNEL_LARK_RESULT: ${{ needs.channel-lark.result }}
+                  FEATURES_RESULT: ${{ needs.features.result }}
+                  E2E_RESULT: ${{ needs.e2e.result }}
+                  BENCH_COMPILE_RESULT: ${{ needs.bench-compile.result }}
+                  BUILD_RESULT: ${{ needs.build.result }}
+                  DOCS_RESULT: ${{ needs.docs-quality.result }}
+              run: ./scripts/ci/required_gate.sh
