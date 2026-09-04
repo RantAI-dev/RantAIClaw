@@ -469,12 +469,7 @@ pub fn record_run_attempt(
     duration_ms: i64,
     attempt: u32,
 ) -> Result<()> {
-    // Scrub credential-shaped substrings (api_key=…, password:… etc.) BEFORE
-    // truncating and persisting — run history is a world-readable payload sink
-    // served back over the API, so a secret in a command's stdout/stderr must
-    // not land in cleartext. Reuses the agent path's shared scrubber (plan 175).
-    let bounded_output =
-        output.map(|o| truncate_cron_output(&crate::agent::loop_::scrub_credentials(o)));
+    let bounded_output = output.map(prepare_cron_output);
     with_connection(config, |conn| {
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
@@ -518,6 +513,20 @@ pub fn record_run_attempt(
             .context("Failed to commit cron run transaction")?;
         Ok(())
     })
+}
+
+/// Prepare a cron job's output for anywhere it leaves the process.
+///
+/// Scrub credential-shaped substrings (`api_key=…`, `password:…`) BEFORE
+/// truncating, then bound the length. Reuses the agent path's shared scrubber
+/// (plan 175) rather than starting a second pattern set.
+///
+/// Both sinks use this. Run history is a world-readable payload sink served
+/// back over the API — and the announcement channel may be a group chat, a
+/// louder audience still. Protecting only the quieter path is how the raw
+/// output reached chat while the stored copy was clean.
+pub(crate) fn prepare_cron_output(output: &str) -> String {
+    truncate_cron_output(&crate::agent::loop_::scrub_credentials(output))
 }
 
 fn truncate_cron_output(output: &str) -> String {

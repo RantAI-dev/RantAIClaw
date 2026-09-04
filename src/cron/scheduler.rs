@@ -444,6 +444,24 @@ async fn record_attempt(config: &Config, job_id: &str, a: &AttemptOutcome) {
     }
 }
 
+/// What to announce for a finished job, or `None` when nothing may be.
+///
+/// Only a job that actually succeeded and whose output is not a security
+/// refusal is announced — a refused job's output is the rejected command text
+/// plus policy internals, and announcing it verbatim leaks it into the
+/// configured chat. The refusal check reads the RAW output because that is
+/// what it was written against; what comes back is the prepared string.
+///
+/// The announcement channel may be a group chat, a louder audience than the
+/// run history — which has been scrubbed and bounded since plan 175. This is
+/// where both sinks stopped disagreeing.
+fn announcement_for(success: bool, output: &str) -> Option<String> {
+    if !success || is_security_refusal(output) {
+        return None;
+    }
+    Some(crate::cron::store::prepare_cron_output(output))
+}
+
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
@@ -468,26 +486,30 @@ async fn persist_job_result(
     // policy internals; announcing it verbatim would leak it into the configured
     // chat. Delivery is best-effort: its failure is logged, never recorded as a
     // job error.
-    if success && !is_security_refusal(output) {
-        if let Err(e) = deliver_if_configured(config, job, output).await {
-            if job.delivery.best_effort {
-                tracing::warn!("Cron delivery failed (best_effort): {e}");
-            } else {
-                tracing::warn!("Cron delivery failed: {e}");
+    match announcement_for(success, output) {
+        Some(announced) => {
+            if let Err(e) = deliver_if_configured(config, job, &announced).await {
+                if job.delivery.best_effort {
+                    tracing::warn!("Cron delivery failed (best_effort): {e}");
+                } else {
+                    tracing::warn!("Cron delivery failed: {e}");
+                }
             }
         }
-    } else if job.delivery.mode.eq_ignore_ascii_case("announce") {
-        // Announce was requested but withheld: never push failed/refused output
-        // into chat. Stated once, without the raw output.
-        tracing::warn!(
-            "Cron job '{}' output withheld from delivery ({})",
-            job.id,
-            if is_security_refusal(output) {
-                "security refusal"
-            } else {
-                "job failed"
-            }
-        );
+        None if job.delivery.mode.eq_ignore_ascii_case("announce") => {
+            // Announce was requested but withheld: never push failed/refused output
+            // into chat. Stated once, without the raw output.
+            tracing::warn!(
+                "Cron job '{}' output withheld from delivery ({})",
+                job.id,
+                if is_security_refusal(output) {
+                    "security refusal"
+                } else {
+                    "job failed"
+                }
+            );
+        }
+        None => {}
     }
 
     if is_one_shot(job) {
@@ -881,6 +903,37 @@ async fn run_job_command_with_timeout(
 
 #[cfg(test)]
 mod tests {
+
+    /// The stored run history has been scrubbed since plan 175; the
+    /// announcement — which may be a group chat — was posted raw. The
+    /// protection was on the quieter path.
+    #[test]
+    fn announcement_redacts_a_credential_in_job_output() {
+        let announced = announcement_for(
+            true,
+            "deploy ok\napi_key=sk-abcdefghijklmnopqrstuvwxyz012345\ndone",
+        )
+        .expect("a successful job is announced");
+
+        assert!(
+            !announced.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
+            "the credential must not reach the announcement channel: {announced}"
+        );
+        assert!(
+            announced.contains("REDACTED"),
+            "the redaction marker should be visible: {announced}"
+        );
+        assert!(
+            announced.contains("deploy ok") && announced.contains("done"),
+            "the rest of the output must survive: {announced}"
+        );
+    }
+
+    #[test]
+    fn a_failed_job_announces_nothing() {
+        assert!(announcement_for(false, "anything at all").is_none());
+    }
+
     use super::*;
     use crate::config::Config;
     use crate::cron::{self, DeliveryConfig};
