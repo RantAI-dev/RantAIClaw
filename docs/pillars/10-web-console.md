@@ -3,8 +3,9 @@
 > **ClickUp:** _task TBD_ · **Maturity:** Beta · **Modules:** `src/gateway/api_v1.rs`, `src/webui.rs`, and the separate [claw-ui](https://github.com/RantAI-dev/claw-ui) repository
 
 The browser surface. The web console is a **separate Next.js app** (claw-ui),
-deliberately not bundled into the binary. The CLI fetches a pinned, cosign-verified
-release and runs it as its own process; the console talks to the runtime only
+deliberately not bundled into the binary. The CLI fetches a pinned release, refuses
+to install it unless its cosign signature verifies (`--allow-unverified` is the only
+way past that, and says so), and runs it as its own process; the console talks to the runtime only
 through the gateway's `/api/v1` HTTP surface.
 
 ## What this pillar covers

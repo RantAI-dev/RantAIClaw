@@ -273,7 +273,7 @@ mod tests {
         let precious = dir.join("bashrc");
         std::fs::write(&precious, "export PATH=...").expect("unrelated file");
 
-        let err = super::install(Some(dir.clone()), None, false)
+        let err = super::install(Some(dir.clone()), None, false, false)
             .expect_err("a directory this installer did not create must not be clobbered");
         assert!(
             err.to_string().contains("pass --force"),
@@ -619,9 +619,12 @@ fn run_file(dir: &Path) -> PathBuf {
 
 pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Config) -> Result<()> {
     match command {
-        crate::UiCommands::Install { dir, r#ref, force } => {
-            install(dir.clone(), r#ref.clone(), *force)
-        }
+        crate::UiCommands::Install {
+            dir,
+            r#ref,
+            force,
+            allow_unverified,
+        } => install(dir.clone(), r#ref.clone(), *force, *allow_unverified),
         crate::UiCommands::Start {
             dir,
             port,
@@ -637,7 +640,12 @@ pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Confi
             config,
         ),
         crate::UiCommands::Stop { dir } => stop(dir.clone()),
-        crate::UiCommands::Update { dir, check, force } => update(dir.clone(), *check, *force),
+        crate::UiCommands::Update {
+            dir,
+            check,
+            force,
+            allow_unverified,
+        } => update(dir.clone(), *check, *force, *allow_unverified),
         crate::UiCommands::Path { dir } => {
             println!("{}", dir.clone().unwrap_or_else(default_dir).display());
             Ok(())
@@ -667,7 +675,12 @@ fn is_managed_ui_dir(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result<()> {
+fn install(
+    dir: Option<PathBuf>,
+    git_ref: Option<String>,
+    force: bool,
+    allow_unverified: bool,
+) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
     let tag = git_ref.as_deref().unwrap_or(CLAW_UI_RELEASE);
     validate_ref(tag)?;
@@ -708,22 +721,25 @@ fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result
         artifact::verify_sha256(&archive_path, &sums_path, &archive_name)?;
         println!("✓ SHA256 verified");
 
-        // Fail closed on a missing bundle: claw-ui is signed from its first release,
-        // so an absent bundle means tampering (signature-stripping downgrade), not
-        // a legacy pre-cosign tag. Only "cosign not installed locally" degrades.
-        match artifact::verify_cosign(
+        // Fail closed on both skip paths. A missing bundle was already fatal
+        // here; "cosign not installed locally" used to degrade to SHA-only,
+        // which is verification an attacker can opt the operator out of — the
+        // checksum comes from the same origin as the archive.
+        //
+        // claw-ui v0.1.0 and v0.2.0 predate signing and carry no bundle;
+        // installing one of those by `--ref` needs --allow-unverified, which is
+        // the same explicit opt-in as a host without cosign.
+        let outcome = artifact::verify_cosign(
             &base_url,
             &archive_path,
             &archive_name,
             &work,
             CLAW_UI_COSIGN_IDENTITY,
-        )? {
-            CosignOutcome::Verified => println!("✓ cosign signature verified"),
-            CosignOutcome::CosignNotInstalled => {} // helper already warned
-            CosignOutcome::BundleMissing => bail!(
-                "no cosign signature published for {tag} — refusing to install an \
-                 unsigned console artifact (possible tampering)"
-            ),
+        )?;
+        let verified = matches!(outcome, CosignOutcome::Verified);
+        artifact::enforce_cosign(outcome, &format!("claw-ui {tag}"), allow_unverified)?;
+        if verified {
+            println!("✓ cosign signature verified");
         }
 
         // A previous console may still be running against this dir. Stop it
@@ -798,7 +814,7 @@ fn installed_ui_version(dir: &Path) -> Option<String> {
 /// `rantaiclaw ui update` — refresh the console to this binary's pinned
 /// `CLAW_UI_RELEASE`. Idempotent: a no-op (with a note) when already current
 /// unless `--force`. `--check` only reports availability without downloading.
-fn update(dir: Option<PathBuf>, check: bool, force: bool) -> Result<()> {
+fn update(dir: Option<PathBuf>, check: bool, force: bool, allow_unverified: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
     if !dir.join("server.js").exists() {
         bail!("web console not installed — run `rantaiclaw ui install` first");
@@ -825,7 +841,7 @@ fn update(dir: Option<PathBuf>, check: bool, force: bool) -> Result<()> {
     }
 
     // Re-fetch the pinned release into the managed dir (writes the marker).
-    install(Some(dir), None, true)
+    install(Some(dir), None, true, allow_unverified)
 }
 
 /// At `ui start`: if the installed console lags this binary's pinned
@@ -850,7 +866,11 @@ fn maybe_offer_ui_update(dir: &Path) {
             .interact()
             .unwrap_or(false);
         if update_now {
-            if let Err(e) = update(Some(dir.to_path_buf()), false, false) {
+            // The interactive `ui start` prompt never proceeds unverified:
+            // an operator answering "yes" to a version prompt has not been
+            // asked about signatures. `ui update --allow-unverified` is where
+            // that decision is made explicitly.
+            if let Err(e) = update(Some(dir.to_path_buf()), false, false, false) {
                 eprintln!("⚠ web console update failed: {e} — starting the current version");
             }
         }

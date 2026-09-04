@@ -113,8 +113,8 @@ Single-topic examples:
 
 ### `ui`
 
-- `rantaiclaw ui install [--dir <path>] [--ref <tag>] [--force]`
-- `rantaiclaw ui update [--check] [--force] [--dir <path>]`
+- `rantaiclaw ui install [--dir <path>] [--ref <tag>] [--force] [--allow-unverified]`
+- `rantaiclaw ui update [--check] [--force] [--dir <path>] [--allow-unverified]`
 - `rantaiclaw ui start [--dir <path>] [--port <n>] [--host <addr>] [--gateway <url>] [--token <tok>]`
 - `rantaiclaw ui stop [--dir <path>]`
 - `rantaiclaw ui path [--dir <path>]`
@@ -124,8 +124,10 @@ Install and run the optional web console ([claw-ui](https://github.com/RantAI-de
 `ui install` downloads a **signed prebuilt release artifact** — no `git`, `npm`/`bun`, or on-machine build. `--ref` is now a claw-ui **release tag** (default: the pinned release), validated against `^[A-Za-z0-9._-]+$` before it's interpolated into the download URL. The archive is verified SHA256-then-cosign, in that order, before anything is extracted:
 
 - A SHA256 mismatch always fails.
-- A **missing cosign bundle fails closed** — claw-ui is signed from its first release, so an absent bundle is treated as a possible tampering/downgrade signal, not a legacy pre-cosign tag (unlike the binary self-updater, which tolerates missing signatures on its older, pre-cosign releases).
-- Only "`cosign` not installed on this host" degrades to a warning, with SHA-only verification continuing.
+- A **missing cosign bundle fails closed.** claw-ui v0.3.0 onward is signed; v0.1.0 and v0.2.0 predate signing and carry no bundle, so installing one of those by `--ref` needs `--allow-unverified`.
+- **`cosign` not installed on this host also fails closed.** It used to degrade to a warning with SHA-only verification continuing — but `SHA256SUMS` is served from the same origin as the archive, so it says nothing about where the archive came from. Pass `--allow-unverified` to proceed anyway; the command then says plainly that the artifact was not verified.
+
+The same `--allow-unverified` flag exists on `rantaiclaw update` and `rantaiclaw ui update`. `ui start`'s interactive "update now?" prompt never proceeds unverified — an operator answering a version prompt has not been asked about signatures.
 
 `ui start` requires **Node.js ≥ 18.18** on `PATH` and serves the installed production build directly with `node server.js`, bound to the `[ui] host` address (default `127.0.0.1`, loopback-only — the standalone server binds `0.0.0.0` by default, so loopback is a deliberate exposure-boundary default). Set `--host` (per-run) or `[ui] host` (persistent) to `0.0.0.0`/a specific IP to reach it from your LAN — the console is a full agent-control surface, so enable a login first (`rantaiclaw setup login`); when bound to loopback on a remote host, `ui start` prints a ready-to-copy `ssh -L` port-forward command. It auto-starts/reuses/restarts the gateway as needed and auto-pairs a token when the gateway requires pairing. `--gateway`/`--token` override the resolved values, which otherwise fall back to `$RANTAICLAW_GATEWAY_URL`/`$RANTAICLAW_TOKEN`, then a pre-existing `.env.local` (from an older install), then `[gateway]` config. The gateway URL, bearer token, and cookie-signing secret are passed to the `node` process as environment variables — `ui start` no longer writes them to `.env.local`.
 

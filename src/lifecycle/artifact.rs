@@ -80,24 +80,69 @@ fn compute_sha256(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Tri-state outcome from `verify_cosign` so the caller can emit the right
-/// user-facing message. Distinguishes "no cosign on this host" (user-fixable:
-/// install cosign) from "no bundle published for this release" (caller
-/// decides whether that's tolerable — a legacy pre-cosign binary release — or
-/// fatal — a claw-ui release, which is signed from day one).
+/// Tri-state outcome from `verify_cosign`, so [`enforce_cosign`] can name the
+/// cause in the refusal. Distinguishes "no cosign on this host" (the operator's
+/// own machine, fixable by installing it) from "no bundle published for this
+/// release" (nothing the operator can fix, and not something any current
+/// release produces).
 pub enum CosignOutcome {
     Verified,
     CosignNotInstalled,
     BundleMissing,
 }
 
+/// Act on a [`CosignOutcome`]: anything short of `Verified` refuses, unless the
+/// operator explicitly asked to proceed unverified.
+///
+/// A control that can be skipped by a condition an attacker can arrange is not
+/// a control. An attacker who can serve the artefact can also serve a 404 for
+/// its bundle, and the SHA-256 checksum file comes from the same origin — so
+/// "bundle missing, SHA-only" was verification the attacker could opt out of on
+/// the operator's behalf. `cosign` being absent is the operator's own machine,
+/// but continuing silently made the project's strongest supply-chain control
+/// optional in practice.
+///
+/// `what` names the artefact for the message (e.g. `"rantaiclaw v0.28.0"`).
+pub fn enforce_cosign(outcome: CosignOutcome, what: &str, allow_unverified: bool) -> Result<()> {
+    let reason = match outcome {
+        CosignOutcome::Verified => return Ok(()),
+        CosignOutcome::CosignNotInstalled => {
+            "`cosign` is not on PATH, so the signature could not be checked \
+             (install it: https://docs.sigstore.dev/system_config/installation/)"
+        }
+        CosignOutcome::BundleMissing => {
+            "no cosign signature is published for it — every release this \
+             project has ever made is signed, so an absent bundle means the \
+             download did not come from a project release"
+        }
+    };
+
+    if allow_unverified {
+        eprintln!("⚠ {what} was NOT verified: {reason}.");
+        eprintln!("  Continuing because --allow-unverified was passed. The SHA-256 checksum");
+        eprintln!(
+            "  comes from the same server as the archive, so it proves nothing about origin."
+        );
+        return Ok(());
+    }
+
+    bail!(
+        "refusing to install {what}: {reason}.\n\
+         The SHA-256 checksum is served from the same origin as the archive, so it \
+         cannot stand in for a signature. Re-run with --allow-unverified to proceed anyway."
+    )
+}
+
 /// Cosign keyless-OIDC signature verification on a release archive.
 ///
 /// Returns:
 /// * `Ok(CosignOutcome::Verified)`           — bundle found and signature verified
-/// * `Ok(CosignOutcome::CosignNotInstalled)` — `cosign` not on PATH; SHA-only
-///   verification continues
+/// * `Ok(CosignOutcome::CosignNotInstalled)` — `cosign` not on PATH
 /// * `Ok(CosignOutcome::BundleMissing)`      — bundle file 404
+///
+/// This function only reports. [`enforce_cosign`] decides what an outcome
+/// means — every caller must route through it rather than matching the enum
+/// itself, or a new outcome silently becomes another way to skip verification.
 /// * `Err(_)` — bundle found but the verification itself failed (signature
 ///   mismatch, wrong identity, wrong issuer)
 ///
@@ -121,8 +166,6 @@ pub fn verify_cosign(
         .map(|s| s.success())
         .unwrap_or(false);
     if !cosign_present {
-        eprintln!("⚠ `cosign` not found on PATH — skipping signature verify.");
-        eprintln!("  Install: https://docs.sigstore.dev/system_config/installation/");
         return Ok(CosignOutcome::CosignNotInstalled);
     }
 
@@ -185,6 +228,58 @@ pub fn verify_cosign(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A verified archive is the only outcome that needs no operator decision.
+    #[test]
+    fn a_verified_archive_installs() {
+        assert!(enforce_cosign(CosignOutcome::Verified, "rantaiclaw v1.2.3", false).is_ok());
+    }
+
+    /// `cosign` missing used to print a warning and continue on the SHA-256
+    /// checksum — which is fetched from the same origin as the archive, so an
+    /// attacker who can serve one can serve the other.
+    #[test]
+    fn a_host_without_cosign_refuses_by_default() {
+        let err = enforce_cosign(
+            CosignOutcome::CosignNotInstalled,
+            "rantaiclaw v1.2.3",
+            false,
+        )
+        .expect_err("an unverifiable archive must not install");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cosign"),
+            "the error must name the cause: {msg}"
+        );
+        assert!(
+            msg.contains("--allow-unverified"),
+            "the error must name the way out: {msg}"
+        );
+    }
+
+    /// A 404 on the bundle is attacker-arrangeable: whoever serves the archive
+    /// serves the bundle URL too. Every release this project has published
+    /// carries one, so an absent bundle is never "a legacy release".
+    #[test]
+    fn a_missing_signature_refuses_by_default() {
+        let err = enforce_cosign(CosignOutcome::BundleMissing, "claw-ui v0.3.25", false)
+            .expect_err("an unsigned archive must not install");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claw-ui v0.3.25"),
+            "the error must name the artefact: {msg}"
+        );
+        assert!(msg.contains("--allow-unverified"), "{msg}");
+    }
+
+    /// The escape hatch exists — for an operator who asked for it, by name.
+    #[test]
+    fn both_skip_paths_proceed_only_on_an_explicit_opt_in() {
+        assert!(
+            enforce_cosign(CosignOutcome::CosignNotInstalled, "rantaiclaw v1.2.3", true).is_ok()
+        );
+        assert!(enforce_cosign(CosignOutcome::BundleMissing, "claw-ui v0.2.0", true).is_ok());
+    }
 
     #[test]
     fn cosign_identity_regex_is_caller_supplied() {
