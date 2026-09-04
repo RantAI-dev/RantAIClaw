@@ -124,6 +124,27 @@ pub(crate) fn compute_split_index(
     None
 }
 
+/// Move a cut index forward until it no longer orphans a tool result.
+///
+/// `AssistantToolCalls` and the `ToolResults` answering it are two separate
+/// history entries, so a cut by message count can land between them and leave
+/// a tool result whose originating call is gone — a shape OpenAI and Anthropic
+/// both reject with a 400.
+///
+/// The index only ever moves forward, so a caller that cut to satisfy a length
+/// cap still satisfies it: the orphaned results are dropped along with the call
+/// that produced them, rather than kept and sent as an invalid history.
+///
+/// `compute_split_index` needs no such adjustment — it cuts at a user message,
+/// which is never a `ToolResults`.
+pub(crate) fn pairing_safe_cut(history: &[ConversationMessage], cut: usize) -> usize {
+    let mut idx = cut;
+    while matches!(history.get(idx), Some(ConversationMessage::ToolResults(_))) {
+        idx += 1;
+    }
+    idx
+}
+
 /// Convert a slice of `ConversationMessage` into the flattened
 /// `ChatMessage` form the provider sees during compaction. Drops the
 /// original system prompt (the compaction system prompt takes its
@@ -269,6 +290,50 @@ mod tests {
             role: role.into(),
             content: content.into(),
         })
+    }
+
+    fn tool_pair() -> (ConversationMessage, ConversationMessage) {
+        (
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "c1".into(),
+                content: "ok".into(),
+            }]),
+        )
+    }
+
+    #[test]
+    fn pairing_safe_cut_drops_a_tool_result_whose_call_is_gone() {
+        let (calls, results) = tool_pair();
+        let history = vec![chat("user", "ask"), calls, results, chat("user", "next")];
+
+        // Cutting at 2 would keep the results and drop the call.
+        assert_eq!(pairing_safe_cut(&history, 2), 3);
+    }
+
+    #[test]
+    fn pairing_safe_cut_leaves_an_index_that_orphans_nothing() {
+        let (calls, results) = tool_pair();
+        let history = vec![chat("user", "ask"), calls, results, chat("user", "next")];
+
+        for cut in [0usize, 1, 3, 4] {
+            assert_eq!(pairing_safe_cut(&history, cut), cut, "cut {cut} was safe");
+        }
+    }
+
+    #[test]
+    fn pairing_safe_cut_walks_past_a_run_of_results() {
+        let (calls, results) = tool_pair();
+        let history = vec![calls, results.clone(), results, chat("user", "next")];
+
+        assert_eq!(pairing_safe_cut(&history, 1), 3);
     }
 
     #[test]
