@@ -1067,15 +1067,13 @@ impl Agent {
             // Per-turn key: `memories.key` is UNIQUE and `store` upserts on
             // conflict, so a literal key would make each turn overwrite the last
             // and leave this surface with a single row forever.
-            let _ = self
-                .memory
-                .store(
-                    &crate::memory::autosave_memory_key("user_msg"),
-                    user_message,
-                    MemoryCategory::Conversation,
-                    conversation_scope,
-                )
-                .await;
+            crate::memory::autosave_screened(
+                self.memory.as_ref(),
+                &crate::memory::autosave_memory_key("user_msg"),
+                user_message,
+                conversation_scope,
+            )
+            .await;
         }
 
         // Loader routes through recall_layered with the same conversation scope
@@ -1467,6 +1465,102 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
+    }
+
+    /// Records what actually reached the memory backend.
+    #[derive(Default)]
+    struct RecordingMemory {
+        stored: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Memory for RecordingMemory {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn store(
+            &self,
+            _k: &str,
+            content: &str,
+            _cat: MemoryCategory,
+            _sid: Option<&str>,
+        ) -> Result<()> {
+            self.stored.lock().push(content.to_string());
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _q: &str,
+            _l: usize,
+            _s: Option<&str>,
+        ) -> Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn get(&self, _k: &str) -> Result<Option<crate::memory::MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _c: Option<&MemoryCategory>,
+            _s: Option<&str>,
+        ) -> Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _k: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// Auto-save writes the raw user message into the one store that is read
+    /// back into a later prompt without anyone looking at it again. A
+    /// credential typed into the TUI landed verbatim in `brain.db`, was
+    /// returned by `memory_recall`, was served by `GET /api/v1/memory`, and
+    /// travelled back to the provider on every later recall.
+    #[tokio::test]
+    async fn turn_autosave_screens_a_credential_before_it_reaches_memory() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![crate::providers::ChatResponse {
+                text: Some("noted".into()),
+                tool_calls: vec![],
+            }]),
+        });
+
+        let mem = Arc::new(RecordingMemory::default());
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![])
+            .memory(mem.clone() as Arc<dyn Memory>)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed");
+
+        agent
+            .turn("my key is api_key=sk-abcdefghijklmnopqrstuvwxyz012345 keep it safe")
+            .await
+            .unwrap();
+
+        let stored = mem.stored.lock();
+        assert_eq!(stored.len(), 1, "the turn is still auto-saved");
+        assert!(
+            !stored[0].contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
+            "the credential must not reach memory: {}",
+            stored[0]
+        );
+        assert!(
+            stored[0].contains("REDACTED"),
+            "the redaction marker should be visible: {}",
+            stored[0]
+        );
     }
 
     #[tokio::test]

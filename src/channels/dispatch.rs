@@ -348,28 +348,13 @@ pub(crate) async fn process_channel_message(
         // established context. Screen it the same way an agent-initiated write
         // is screened — this is the path where untrusted content actually
         // arrives, and nobody reviews it in between.
-        match crate::memory::sanitize_memory_content(&msg.content) {
-            Ok(sanitized) => {
-                if !sanitized.notes.is_empty() {
-                    tracing::debug!(
-                        notes = %sanitized.notes.join("; "),
-                        "adjusted an auto-saved message before storing"
-                    );
-                }
-                let _ = ctx
-                    .memory
-                    .store(
-                        &autosave_key,
-                        &sanitized.content,
-                        crate::memory::MemoryCategory::Conversation,
-                        Some(conversation_scope.as_str()),
-                    )
-                    .await;
-            }
-            Err(reason) => {
-                tracing::warn!("skipped auto-saving a message: {reason}");
-            }
-        }
+        crate::memory::autosave_screened(
+            ctx.memory.as_ref(),
+            &autosave_key,
+            &msg.content,
+            Some(conversation_scope.as_str()),
+        )
+        .await;
     }
 
     tracing::info!("processing channel message");

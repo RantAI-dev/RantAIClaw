@@ -2419,10 +2419,13 @@ pub async fn run_with_scope(
     if let Some(msg) = message {
         // Auto-save user message to memory (skip short/trivial messages)
         if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-            let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
-                .await;
+            crate::memory::autosave_screened(
+                mem.as_ref(),
+                &autosave_memory_key("user_msg"),
+                &msg,
+                None,
+            )
+            .await;
         }
 
         // Open the same SessionStore the TUI uses so headless `agent -m`
@@ -2591,10 +2594,13 @@ pub async fn run_with_scope(
 
             // Auto-save conversation turns (skip short/trivial messages)
             if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
-                    .await;
+                crate::memory::autosave_screened(
+                    mem.as_ref(),
+                    &autosave_memory_key("user_msg"),
+                    &user_input,
+                    None,
+                )
+                .await;
             }
 
             // Inject memory + hardware RAG context into user message

@@ -148,10 +148,13 @@ scripts, so their code-executing subcommands are classified Medium.
   `rm` is blocked.
 - **Option injection is blocked**: a leading-dash git branch name is refused.
 - **Injection blocking** for `$()`, backticks, `&&`, `>`.
-- **Credential scrubbing.** Tool output is scanned for `token`/`api_key`/`password`/
-  `secret`/`bearer`/`credential` patterns and redacted (keeping a 4-char prefix for
-  context) **before** it reaches the conversation. Provider and bot tokens are scrubbed
-  from error logs too.
+- **Credential scrubbing where text leaves the process.** `token`/`api_key`/`password`/
+  `secret`/`bearer`/`credential` patterns are redacted (keeping a 4-char prefix for
+  context) before cron run history is stored and before a cron result is announced to a
+  chat; auto-saved conversation turns are screened the same way before they reach memory,
+  which is the one store re-injected into later prompts. Provider and bot tokens are
+  scrubbed from error logs too. **Tool output is not scrubbed on its way to the model** —
+  an agent asked to read a credentials file is expected to be able to read it.
 - **Rate limiting** (default 20 actions/hour) that stays correct on hosts with under an
   hour of uptime.
 - **Deny cancels the whole turn**, not just the call — otherwise the model quietly tries
