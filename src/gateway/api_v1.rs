@@ -593,6 +593,23 @@ async fn agent_chat_sync(
         crate::agent::Agent::from_config_with_mcp_pool(&config, state.observer.clone(), &mcp)
             .await
             .map_err(map_agent_error)?;
+    // A gated tool call on this path had no approval backend, so the loop fell
+    // back to the one derived from the surface name — the interactive CLI
+    // prompt. Running `rantaiclaw gateway` in a terminal made a tool call block
+    // the HTTP request on the operator's TTY until the request timed out; under
+    // systemd, with no stdin, it silently auto-denied. Same endpoint, different
+    // behaviour depending on how the process was started.
+    //
+    // Auto-deny, not the streaming path's web modal: that modal is resolved by
+    // an SSE `approval_request` event and `POST /approvals/{id}`, and this
+    // request has no stream for anyone to answer on. Denying inline is the
+    // honest answer, and it is now the same answer in both environments.
+    agent.set_approval(
+        Some(std::sync::Arc::new(
+            crate::approval::ApprovalManager::from_config(&config.autonomy),
+        )),
+        Some(std::sync::Arc::new(crate::approval::AutoDenyBackend)),
+    );
     // Scope this request's turn memory to its conversation. The gateway serves
     // many callers, so an unscoped agent would write every session's messages
     // into one shared pool and read them back into each other's context.

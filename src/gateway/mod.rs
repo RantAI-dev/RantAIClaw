@@ -1367,10 +1367,12 @@ fn try_consume_gateway_store_code(state: &AppState, code: &str) -> Option<String
 
 /// Watch `config.toml` and swap the running `Config` when it changes on disk,
 /// so a provider/model edit made elsewhere (the TUI, a direct edit) is reflected
-/// by the gateway and the web console without a restart. Reloads via
-/// `Config::load_or_init` for the exact same decrypt pass used at startup
-/// (including `provider_api_keys`). Best-effort: a watcher-setup failure logs
-/// and disables hot-reload; a failed reload keeps the current config.
+/// by the gateway and the web console without a restart. Reloads the WATCHED
+/// path via `Config::load_from_path` — the same migration and decrypt pass as
+/// startup (including `provider_api_keys`), without re-resolving which file to
+/// read — then re-applies env overrides, which `load_or_init` does at startup.
+/// Best-effort: a watcher-setup failure logs and disables hot-reload; a failed
+/// reload keeps the current config.
 fn spawn_config_reloader(
     config: Arc<Mutex<Config>>,
     config_fingerprint: Arc<Mutex<String>>,
@@ -1407,7 +1409,20 @@ fn spawn_config_reloader(
             if *config_fingerprint.lock() == fresh_fp {
                 continue;
             }
-            match Config::load_or_init().await {
+            // Load the file being WATCHED, not whatever the environment
+            // resolves to now. `load_or_init` re-resolves from env vars and the
+            // `active_workspace.toml` marker, so a marker that changed after
+            // boot made the reloader swap in a different file's contents than
+            // the one whose change triggered it.
+            //
+            // Env overrides are re-applied because `load_or_init` applies them
+            // and the running config was built that way; skipping them would
+            // drop an env-supplied credential on the first hot reload.
+            let fresh = Config::load_from_path(&config_path).await.map(|mut c| {
+                c.apply_env_overrides();
+                c
+            });
+            match fresh {
                 Ok(fresh) => {
                     // Re-sync the pairing guard so `config.toml` is actually the
                     // authority on both which tokens are valid AND whether pairing
