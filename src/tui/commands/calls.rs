@@ -112,8 +112,15 @@ fn truncate_value(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    if s.len() > MAX_ARG_VALUE_LEN {
-        format!("{}… ({} chars)", &s[..MAX_ARG_VALUE_LEN], s.len())
+    // Crop by chars, not bytes: argument values are model-authored, so the cut
+    // lands wherever the model put its text and a byte slice panics the overlay
+    // mid-codepoint. `s.len()` was also reporting bytes under a "chars" label.
+    let chars = s.chars().count();
+    if chars > MAX_ARG_VALUE_LEN {
+        format!(
+            "{} ({chars} chars)",
+            crate::tui::render::truncate_preview(&s, MAX_ARG_VALUE_LEN)
+        )
     } else {
         s
     }
@@ -122,6 +129,38 @@ fn truncate_value(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Argument values are model-authored, so the crop lands wherever the model
+    /// put its text. Slicing by byte panicked the overlay on any multibyte
+    /// character straddling the cut.
+    #[test]
+    fn truncate_value_crops_every_multibyte_width_safely() {
+        for filler in ['é', '世', '🦀'] {
+            for pad in (MAX_ARG_VALUE_LEN.saturating_sub(10))..(MAX_ARG_VALUE_LEN + 10) {
+                let raw = format!("{}{}", "a".repeat(pad), filler.to_string().repeat(20));
+                // Returning at all is the assertion: a byte crop panics.
+                let out = truncate_value(&serde_json::Value::String(raw));
+                assert!(!out.is_empty(), "pad {pad} filler {filler}");
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_value_keeps_short_values_whole_and_counts_characters() {
+        assert_eq!(
+            truncate_value(&serde_json::Value::String("ls -la".into())),
+            "ls -la"
+        );
+        let long = "世".repeat(MAX_ARG_VALUE_LEN + 5);
+        let out = truncate_value(&serde_json::Value::String(long));
+        assert!(out.contains('…'), "got {out:?}");
+        // The label says "chars", so the count must be characters, not bytes.
+        assert!(
+            out.contains(&format!("({} chars)", MAX_ARG_VALUE_LEN + 5)),
+            "got {out:?}"
+        );
+    }
+
     use crate::tui::render::PersistedToolCall;
 
     fn ctx() -> TuiContext {
