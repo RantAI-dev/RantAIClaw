@@ -2638,25 +2638,7 @@ impl TuiApp {
                     } else {
                         format!("{}s", elapsed.as_secs())
                     };
-                    let status = if ok {
-                        let preview = output_preview.lines().next().unwrap_or("").trim();
-                        if preview.is_empty() {
-                            "ok".to_string()
-                        } else if preview.len() > 60 {
-                            format!("{}…", &preview[..60])
-                        } else {
-                            preview.to_string()
-                        }
-                    } else {
-                        let preview = output_preview.lines().next().unwrap_or("").trim();
-                        if preview.is_empty() {
-                            "error".to_string()
-                        } else if preview.len() > 60 {
-                            format!("error: {}…", &preview[..60])
-                        } else {
-                            format!("error: {preview}")
-                        }
-                    };
+                    let status = tool_status_line(&output_preview, ok);
                     let line =
                         format!("{marker} {name}({args_compact}) → {status} ({elapsed_label})");
                     self.scrollback_queue.push(("_tool_log".to_string(), line));
@@ -7350,7 +7332,7 @@ fn format_tokens(n: u64) -> String {
 /// `<N args>` rather than smearing across the screen.
 #[cfg(test)]
 mod compact_args_for_log_tests {
-    use super::compact_args_for_log;
+    use super::{compact_args_for_log, tool_status_line};
 
     /// Tool arguments are model-supplied and routinely non-ASCII — a CJK
     /// search `query`, an emoji in a `path`. Cropping them with a byte
@@ -7386,6 +7368,33 @@ mod compact_args_for_log_tests {
         }
     }
 
+    /// The transcript's tool-status line cropped the first line of stdout by
+    /// byte index, so an `ls` over a filename with an accented or CJK
+    /// character panicked the render loop. Same class as the
+    /// `compact_args_for_log` crop above, missed at this site.
+    #[test]
+    fn tool_status_line_crops_every_multibyte_width_safely() {
+        for filler in ['é', '世', '🦀'] {
+            for pad in 40..70 {
+                let out = format!("{}{}", "a".repeat(pad), filler.to_string().repeat(20));
+                for ok in [true, false] {
+                    // Returning at all is the assertion: a byte crop panics.
+                    let line = tool_status_line(&out, ok);
+                    assert!(!line.is_empty(), "pad {pad} filler {filler} ok {ok}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_status_line_labels_empty_and_failed_output() {
+        assert_eq!(tool_status_line("", true), "ok");
+        assert_eq!(tool_status_line("", false), "error");
+        assert_eq!(tool_status_line("done\nmore", true), "done");
+        assert_eq!(tool_status_line("boom", false), "error: boom");
+        assert!(tool_status_line(&"b".repeat(200), true).ends_with('…'));
+    }
+
     #[test]
     fn long_values_are_cropped_with_an_ellipsis() {
         let args = serde_json::json!({ "command": "b".repeat(200) });
@@ -7409,6 +7418,25 @@ mod compact_args_for_log_tests {
     fn empty_and_non_object_args_render_nothing() {
         assert_eq!(compact_args_for_log(&serde_json::json!({})), "");
         assert_eq!(compact_args_for_log(&serde_json::json!("bare")), "");
+    }
+}
+
+/// The one-line status a finished tool call gets in the transcript: the first
+/// line of its output, cropped.
+fn tool_status_line(output_preview: &str, ok: bool) -> String {
+    const MAX_LEN: usize = 60;
+    let preview = output_preview.lines().next().unwrap_or("").trim();
+    if preview.is_empty() {
+        return if ok { "ok" } else { "error" }.to_string();
+    }
+    // Crop by chars, not bytes: this is tool stdout, so it carries filenames
+    // and model text, and a byte crop panics the render loop when it lands
+    // mid-codepoint — `ls` over an accented filename was enough.
+    let cropped = super::render::truncate_preview(preview, MAX_LEN);
+    if ok {
+        cropped
+    } else {
+        format!("error: {cropped}")
     }
 }
 
@@ -7943,15 +7971,38 @@ fn which_program(name: &str) -> bool {
 /// paste, show the cursor, and drop raw mode.
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let _ = terminal.show_cursor();
+    restore_terminal_modes();
+    Ok(())
+}
+
+/// Put the terminal back the way it was found, without needing a `Terminal`
+/// handle — the panic hook has no access to one. Every step is best-effort and
+/// idempotent, so calling this after [`restore_terminal`] (or twice) is safe.
+fn restore_terminal_modes() {
     let _ = execute!(
         io::stdout(),
+        crossterm::cursor::Show,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     );
-    disable_raw_mode()?;
+    let _ = disable_raw_mode();
     let _ = io::stdout().flush();
-    Ok(())
+}
+
+/// Chain a panic hook that restores the terminal before the default hook
+/// prints the message.
+///
+/// Without it a panic anywhere in the render loop left raw mode, the alternate
+/// screen and mouse capture switched on: the panic message was invisible and
+/// the user's shell unusable until they blindly typed `reset`. Install it after
+/// terminal setup, so a panic before that still prints normally.
+fn install_terminal_restoring_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_modes();
+        previous(info);
+    }));
 }
 
 /// Entry point for the TUI: guards TTY, builds the `Agent` + actor bridge,
@@ -8302,6 +8353,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     }
 
     let mut terminal = setup_terminal()?;
+    install_terminal_restoring_panic_hook();
 
     // The splash banner is rendered by `render_chat_pane` as the empty-chat
     // state — no separate scrollback commit needed in fullscreen mode.

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The TUI no longer panics on multibyte tool output. Two sites cropped text by
+  byte index — the tool-status line in the transcript and the argument values
+  in the calls overlay — so an `ls` over a filename with an accented or CJK
+  character killed the render loop. Both now use the char-safe crop the repo
+  already had for the same class of bug. The calls overlay was also counting
+  bytes under a `chars` label.
+- A panic in the TUI now restores the terminal before printing. There was no
+  `panic::set_hook`, and the restore ran only when the loop returned `Err`, so
+  a panic left raw mode, the alternate screen and mouse capture switched on —
+  the message was invisible and the shell unusable until the user blindly
+  typed `reset`.
 - `ui install --dir <path>` no longer deletes a directory just because it
   holds a `.git`. "Managed" meant `server.js` **or** any `.git` directory, and
   a managed target both skipped the `--force` guard and was recursively
