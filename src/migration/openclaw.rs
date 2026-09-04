@@ -504,7 +504,7 @@ fn json_to_toml(v: &serde_json::Value) -> Option<toml::Value> {
 
 /// Sync atomic 0600 write (temp + rename) for the migrated config, which carries
 /// secrets. Mirrors `Config::save`'s durability without needing its async path.
-fn write_config_0600(target: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn write_config_0600(target: &Path, contents: &[u8]) -> Result<()> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).ok();
     let name = target

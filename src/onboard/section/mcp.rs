@@ -52,14 +52,14 @@ impl SetupSection for McpSection {
         // but the stub trait is sync. Bridge here without taking an
         // opinion on the outer reactor.
         let result: Result<()> = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(setup::run_interactive(ctx.profile, ctx.config))
-            }),
+            Ok(handle) => {
+                tokio::task::block_in_place(|| handle.block_on(setup::run_interactive(ctx.config)))
+            }
             Err(_) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                rt.block_on(setup::run_interactive(ctx.profile, ctx.config))
+                rt.block_on(setup::run_interactive(ctx.config))
             }
         };
         result
