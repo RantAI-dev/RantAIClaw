@@ -930,14 +930,19 @@ pub async fn run_gateway(
     shutdown: tokio_util::sync::CancellationToken,
     ready: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) -> Result<()> {
-    // ── Security: refuse public bind without tunnel or explicit opt-in ──
-    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
-    {
+    // ── Security: refuse public bind without an explicit opt-in ──
+    //
+    // A configured tunnel is deliberately NOT a pass. Every provider proxies
+    // `localhost:<port>` (see `tunnel::cloudflare`), so a tunnel never makes a
+    // public bind necessary — and a tunnel that fails to start used to leave
+    // the control plane on `0.0.0.0` with the operator having opted into
+    // nothing. Exposure stays deny-by-default (CLAUDE.md §3.6).
+    if is_public_bind(host) && !config.gateway.allow_public_bind {
         // Fatal: no amount of retrying makes an exposed bind acceptable.
         return Err(anyhow::Error::new(GatewayStartupFatal(format!(
             "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
-             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml (NOT recommended)."
+             Fix: use --host 127.0.0.1 (default), which a tunnel proxies anyway,\n\
+             or set [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         ))));
     }
 
@@ -1005,8 +1010,12 @@ pub async fn run_gateway(
                 tunnel_url = Some(url);
             }
             Err(e) => {
+                // Not a fallback: the listener is already bound and serving.
+                // Saying "falling back to local-only" was only ever true
+                // because the bind guard above refuses a public bind without
+                // an explicit opt-in — so state what actually happened.
                 println!("⚠️  Tunnel failed to start: {e}");
-                println!("   Falling back to local-only mode.");
+                println!("   Continuing to serve on {display_addr} — no remote URL.");
             }
         }
     }
@@ -2777,6 +2786,67 @@ mod tests {
             );
             assert_eq!(addr.port(), 8080);
         }
+    }
+
+    /// A configured tunnel used to be a free pass past the public-bind guard,
+    /// but every provider proxies loopback — so a tunnel never makes a public
+    /// bind necessary, and a tunnel that fails to start left the gateway
+    /// serving the control plane on `0.0.0.0` with no operator opt-in. The
+    /// guard now depends on `allow_public_bind` alone.
+    ///
+    /// `192.0.2.1` is TEST-NET-1: routable-looking (so `is_public_bind` says
+    /// yes) but never assigned to an interface, so if the guard let this
+    /// through the bind below it fails immediately instead of listening.
+    #[tokio::test]
+    async fn public_bind_with_a_tunnel_configured_is_still_refused() {
+        let mut config = crate::config::Config::default();
+        config.tunnel.provider = "cloudflare".into();
+        config.gateway.allow_public_bind = false;
+
+        let err = super::run_gateway(
+            "192.0.2.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("a public bind without an opt-in must refuse to start");
+
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<super::GatewayStartupFatal>().is_some()),
+            "the refusal must be fatal so the supervisor stops retrying: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("Refusing to bind"),
+            "expected the bind refusal, got: {err:#}"
+        );
+    }
+
+    /// The other direction: with the operator's explicit opt-in the guard steps
+    /// aside, and startup fails later at the bind itself. Without this the test
+    /// above could pass merely because the address is unbindable.
+    #[tokio::test]
+    async fn public_bind_with_the_operator_opt_in_passes_the_guard() {
+        let mut config = crate::config::Config::default();
+        config.tunnel.provider = "none".into();
+        config.gateway.allow_public_bind = true;
+
+        let err = super::run_gateway(
+            "192.0.2.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("TEST-NET-1 is not assigned to an interface, so the bind fails");
+
+        assert!(
+            !err.to_string().contains("Refusing to bind"),
+            "the guard must not fire once allow_public_bind is set: {err:#}"
+        );
     }
 
     #[test]

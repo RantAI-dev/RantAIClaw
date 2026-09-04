@@ -373,6 +373,24 @@ a token to the browser.
 > looks protected when it is not. Leave `require_pairing = true` unless the
 > gateway is unreachable from anywhere but the local process.
 
+## `[tunnel]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `provider` | `"none"` | `none`, `cloudflare`, `tailscale`, `ngrok`, or `custom` |
+
+Each provider gets its own subsection (`[tunnel.cloudflare]`,
+`[tunnel.ngrok]`, `[tunnel.custom]`), required when that provider is selected.
+
+**A tunnel does not authorise a public bind.** Every provider proxies
+`localhost:<port>`, so the gateway stays on `127.0.0.1` and the tunnel reaches
+it there. Binding `0.0.0.0` requires `[gateway] allow_public_bind = true` and
+nothing else — configuring a tunnel used to be accepted in its place, which
+meant a tunnel that failed to start (bad token, missing binary) left the
+control plane serving on a public interface. If the tunnel fails now, the
+gateway keeps serving on whatever it was already allowed to bind and says so;
+it does not acquire a public listener along the way.
+
 ## `[ui]`
 
 Web console (`rantaiclaw ui start`) settings.

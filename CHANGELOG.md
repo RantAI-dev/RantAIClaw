@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime dependency audit so the version cannot silently rot back out of
   currency. (claw-ui #108)
 
+- The gateway no longer accepts a configured tunnel as authorisation for a
+  public bind. Every tunnel provider proxies `localhost:<port>`, so a tunnel
+  never made a public bind necessary — but the guard let one through, and a
+  tunnel that failed to start (bad token, missing binary) printed a warning
+  and served the control plane on `0.0.0.0` with the operator having opted
+  into nothing. Binding a public interface now requires
+  `[gateway] allow_public_bind = true` and nothing else.
+
+  **Breaking for one shape of deployment**: a config that binds `0.0.0.0` and
+  relies on `[tunnel] provider` to make that acceptable will now refuse to
+  start. Fix by binding `127.0.0.1` (the tunnel reaches it there) or by
+  setting `allow_public_bind = true` explicitly.
+
 ## [0.27.1-alpha] — 2026-09-03
 
 Console delivery release: rolls the claw-ui UI/UX wave out to `ui install`.
