@@ -256,6 +256,87 @@ mod gateway_action_tests {
 mod tests {
     use super::*;
 
+    /// `ui install --dir` used to treat "holds a `.git` directory" as proof it
+    /// owned the target, which both skipped the `--force` guard and licensed
+    /// the recursive wipe below. Point `--dir` at a dotfiles checkout or any
+    /// clone and it was deleted with no prompt and no backup.
+    #[test]
+    fn install_refuses_a_foreign_git_checkout_and_leaves_it_intact() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let dir = tmp.path().join("dotfiles");
+        std::fs::create_dir_all(dir.join(".git")).expect("fake checkout");
+        std::fs::write(
+            dir.join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/someone/dotfiles\n",
+        )
+        .expect("git config");
+        let precious = dir.join("bashrc");
+        std::fs::write(&precious, "export PATH=...").expect("unrelated file");
+
+        let err = super::install(Some(dir.clone()), None, false)
+            .expect_err("a directory this installer did not create must not be clobbered");
+        assert!(
+            err.to_string().contains("pass --force"),
+            "expected the non-empty refusal, got: {err:#}"
+        );
+
+        // The point of the test: nothing was deleted on the way to that error.
+        assert!(precious.exists(), "the unrelated file was deleted");
+        assert!(dir.join(".git").is_dir(), "the checkout was deleted");
+    }
+
+    /// The `.git` clause exists for a real reason — an earlier installer used
+    /// `git clone` — so a leftover from it must still be recognised. What
+    /// changed is that it has to be claw-ui's own checkout, not any repository.
+    #[test]
+    fn managed_dir_means_this_installers_own_layout() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+
+        let extracted = tmp.path().join("extracted");
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::write(extracted.join("server.js"), "// standalone entrypoint").unwrap();
+        assert!(super::is_managed_ui_dir(&extracted), "server.js is ours");
+
+        let versioned = tmp.path().join("versioned");
+        std::fs::create_dir_all(&versioned).unwrap();
+        std::fs::write(versioned.join(super::UI_VERSION_FILE), "v0.3.25").unwrap();
+        assert!(
+            super::is_managed_ui_dir(&versioned),
+            "the version file is ours"
+        );
+
+        let legacy = tmp.path().join("legacy-clone");
+        std::fs::create_dir_all(legacy.join(".git")).unwrap();
+        std::fs::write(
+            legacy.join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/RantAI-dev/claw-ui.git\n",
+        )
+        .unwrap();
+        assert!(
+            super::is_managed_ui_dir(&legacy),
+            "a claw-ui clone is the pre-tarball installer's leftover"
+        );
+
+        let foreign = tmp.path().join("foreign-clone");
+        std::fs::create_dir_all(foreign.join(".git")).unwrap();
+        std::fs::write(
+            foreign.join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:someone/notes.git\n",
+        )
+        .unwrap();
+        assert!(
+            !super::is_managed_ui_dir(&foreign),
+            "someone else's repository is not ours to delete"
+        );
+
+        let bare = tmp.path().join("no-remote");
+        std::fs::create_dir_all(bare.join(".git")).unwrap();
+        assert!(
+            !super::is_managed_ui_dir(&bare),
+            "a .git with no readable claw-ui remote is not ours either"
+        );
+    }
+
     #[test]
     fn validate_ref_accepts_a_tag_and_rejects_traversal() {
         assert!(validate_ref("v0.3.0").is_ok());
@@ -566,6 +647,26 @@ pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Confi
 
 /// Download, verify (SHA256 + cosign), and extract a signed claw-ui release
 /// archive into `dir`. No `git` clone, no on-machine JS build.
+/// Does this directory hold a console `ui install` produced? A `true` here
+/// both skips the `--force` guard and licenses the recursive wipe before
+/// extraction, so it must mean "ours", not merely "a directory".
+///
+/// `server.js` is the standalone entrypoint the installer extracts, and
+/// [`UI_VERSION_FILE`] is the marker it writes afterwards. The `.git` case
+/// covers a leftover from the pre-tarball installer, which used `git clone` —
+/// but only for claw-ui's own checkout. Treating any `.git` as ours meant
+/// `ui install --dir ~/dotfiles` deleted the operator's repository.
+fn is_managed_ui_dir(dir: &Path) -> bool {
+    if dir.join("server.js").exists() || dir.join(UI_VERSION_FILE).exists() {
+        return true;
+    }
+    // `owner/repo` appears in both the HTTPS and SSH spellings of the remote.
+    let slug = CLAW_UI_REPO.trim_start_matches("https://github.com/");
+    std::fs::read_to_string(dir.join(".git").join("config"))
+        .map(|cfg| cfg.contains(slug))
+        .unwrap_or(false)
+}
+
 fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
     let tag = git_ref.as_deref().unwrap_or(CLAW_UI_RELEASE);
@@ -576,8 +677,7 @@ fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result
     }
 
     // Refuse to clobber a non-empty dir that we did not create, unless --force.
-    // `.git` covers a directory left over from the previous git-clone-based installer.
-    let managed = dir.join("server.js").exists() || dir.join(".git").is_dir();
+    let managed = is_managed_ui_dir(&dir);
     let non_empty = dir
         .read_dir()
         .map(|mut d| d.next().is_some())
@@ -637,7 +737,22 @@ fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result
         }
 
         // Verified: safe to extract. Wipe any prior layout (managed dir).
+        //
+        // Re-assert ownership here rather than trusting the guard 60 lines up:
+        // this is a recursive delete of an operator-supplied path, and the
+        // audit found one way past that guard already. An empty directory is
+        // nobody's data, so it needs no marker.
         if dir.exists() {
+            let empty = dir
+                .read_dir()
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false);
+            if !(force || empty || is_managed_ui_dir(&dir)) {
+                bail!(
+                    "refusing to delete {} — it is not a console this installer created",
+                    dir.display()
+                );
+            }
             std::fs::remove_dir_all(&dir).with_context(|| format!("clear {}", dir.display()))?;
         }
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
