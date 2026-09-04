@@ -2920,6 +2920,28 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
 #[cfg(test)]
 mod tests {
+    use super::{headless_choice, HeadlessChoice};
+
+    /// Option 0 off a multi-select is picking an item nobody chose. For MCP
+    /// that registered a subprocess-spawning server from a documented no-op.
+    #[test]
+    fn headless_multi_select_chooses_nothing() {
+        assert_eq!(headless_choice(true, false), HeadlessChoice::SelectNone);
+        assert_eq!(headless_choice(true, true), HeadlessChoice::SelectNone);
+    }
+
+    #[test]
+    fn headless_single_choice_takes_the_first_option_once() {
+        assert_eq!(headless_choice(false, false), HeadlessChoice::TakeFirst);
+    }
+
+    /// A provisioner that re-asks a choice is retrying. Answering the same way
+    /// again spins until the 120s timeout, so the second ask cancels.
+    #[test]
+    fn headless_repeated_choice_cancels_instead_of_looping() {
+        assert_eq!(headless_choice(false, true), HeadlessChoice::Cancel);
+    }
+
     use super::*;
     use clap::{CommandFactory, Parser};
 
@@ -3023,6 +3045,29 @@ mod tests {
 /// Returns whether the managed daemon should be reloaded (a channel was
 /// configured). The CALLER performs the reload after it persists `config.toml`,
 /// since the daemon re-reads the file on reload.
+/// What an unattended run answers a `Choose` with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadlessChoice {
+    /// Multi-select: an unattended run has no basis for picking items off a
+    /// list nobody saw, and "none" is the answer that changes nothing.
+    SelectNone,
+    /// Single choice, asked once. Provisioners must order the inert option
+    /// first, because this is what takes it.
+    TakeFirst,
+    /// The same choice a second time is a retry loop. Answering it again would
+    /// spin until the 120s timeout; cancelling makes the provisioner abort and
+    /// the command report why.
+    Cancel,
+}
+
+fn headless_choice(multi: bool, asked_before: bool) -> HeadlessChoice {
+    match (multi, asked_before) {
+        (true, _) => HeadlessChoice::SelectNone,
+        (false, false) => HeadlessChoice::TakeFirst,
+        (false, true) => HeadlessChoice::Cancel,
+    }
+}
+
 async fn run_provisioner_headless(
     provisioner: &dyn onboard::provision::TuiProvisioner,
     config: &mut Config,
@@ -3047,6 +3092,8 @@ async fn run_provisioner_headless(
     // after the 120s timeout fired — events never arrived and the user
     // saw silence followed by a timeout error.
     let render_loop = async {
+        // Choice ids already answered once, so a retry loop is recognisable.
+        let mut seen_choices = std::collections::HashSet::new();
         while let Some(ev) = events_rx.recv().await {
             match ev {
                 ProvisionEvent::Message { severity, text } => {
@@ -3101,17 +3148,30 @@ async fn run_provisioner_headless(
                         .send(onboard::provision::ProvisionResponse::Text(value))
                         .await;
                 }
-                ProvisionEvent::Choose { id, label, .. } => {
-                    // Headless default: pick option 0 (the affirmative
-                    // / first choice). The provisioner authors order options
-                    // with the YES path first, so this gives sensible
-                    // automation behaviour. Pre-fix code skipped silently
-                    // and let the provisioner block on `recv_selection`
-                    // until the 120s timeout.
-                    eprintln!("[headless] choose '{label}' ({id}) — defaulting to option 0");
-                    let _ = response_tx
-                        .send(onboard::provision::ProvisionResponse::Selection(vec![0]))
-                        .await;
+                ProvisionEvent::Choose {
+                    id, label, multi, ..
+                } => {
+                    let asked_before = !seen_choices.insert(id.clone());
+                    let response = match headless_choice(multi, asked_before) {
+                        HeadlessChoice::SelectNone => {
+                            eprintln!(
+                                "[headless] choose '{label}' ({id}) — multi-select, selecting nothing"
+                            );
+                            onboard::provision::ProvisionResponse::Selection(Vec::new())
+                        }
+                        HeadlessChoice::TakeFirst => {
+                            eprintln!("[headless] choose '{label}' ({id}) — taking option 0");
+                            onboard::provision::ProvisionResponse::Selection(vec![0])
+                        }
+                        HeadlessChoice::Cancel => {
+                            eprintln!(
+                                "[headless] choose '{label}' ({id}) asked again — cancelling; \
+                                 an unattended run has no new answer to give"
+                            );
+                            onboard::provision::ProvisionResponse::Cancelled
+                        }
+                    };
+                    let _ = response_tx.send(response).await;
                 }
             }
         }
@@ -3132,12 +3192,21 @@ async fn run_provisioner_headless(
     match timed {
         Ok((prov_result, _)) => {
             match prov_result {
-                Err(e) => eprintln!("\n❌ provisioner error: {e}"),
+                // An installer or CI job can only tell success from failure by
+                // exit code, so a provisioner that did not configure anything
+                // must not return `Ok`. The caller saves the config after this
+                // returns, so failing here is also what makes "nothing saved"
+                // true rather than merely printed.
+                Err(e) => {
+                    eprintln!("\n❌ provisioner error: {e}");
+                    return Err(e.context(format!("`setup {prov_name}` failed")));
+                }
                 // Nothing was configured, so nothing gets installed — the skill
                 // would otherwise be left behind as a false "channel is set up"
                 // signal for a provisioner that bailed on a missing field.
                 Ok(onboard::provision::ProvisionOutcome::Aborted(reason)) => {
                     eprintln!("\n⏹️  provisioner stopped, nothing saved: {reason}");
+                    anyhow::bail!("`setup {prov_name}` configured nothing: {reason}");
                 }
                 // A configured multi-user channel is the point at which the
                 // owner needs to be able to manage permissions from chat.
@@ -3153,6 +3222,7 @@ async fn run_provisioner_headless(
         }
         Err(_) => {
             eprintln!("\nTimeout waiting for provisioning. The pairing session is still active — run again to retry.");
+            anyhow::bail!("`setup {prov_name}` timed out after 120s");
         }
     }
 
