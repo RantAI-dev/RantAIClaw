@@ -165,6 +165,69 @@ fn setup_force_topic_persona_writes_persona_toml() {
     assert!(!body.trim().is_empty(), "persona.toml must not be empty");
 }
 
+/// Materialise `config.toml` so a later run can be compared against it.
+fn baseline_config(home: &TempDir) -> (std::path::PathBuf, Vec<u8>) {
+    // Persona is the one headless topic that genuinely configures something,
+    // so it both materialises `config.toml` and proves the success path still
+    // saves.
+    cmd(home)
+        .args(["setup", "--non-interactive", "persona"])
+        .assert()
+        .success();
+    let path = home.path().join(".rantaiclaw/profiles/default/config.toml");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "config.toml should exist at {} after a successful headless setup: {e}",
+            path.display()
+        )
+    });
+    (path, bytes)
+}
+
+/// `setup <topic> --non-interactive` is what installers and CI run. A
+/// provisioner that aborted for a missing field used to print "nothing saved"
+/// and then exit zero **with the config saved anyway** — an installer could not
+/// tell success from failure by exit code.
+#[test]
+fn headless_setup_that_configures_nothing_fails_and_writes_nothing() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+    let (config_path, before) = baseline_config(&home);
+
+    // No bot token is reachable in an unattended run, so this cannot succeed.
+    cmd(&home)
+        .args(["setup", "--non-interactive", "telegram"])
+        .assert()
+        .failure();
+
+    let after = std::fs::read(&config_path).expect("config.toml still readable");
+    assert_eq!(
+        before, after,
+        "a headless run that configured nothing must leave config.toml byte-identical"
+    );
+}
+
+/// The headless driver answered every choice with option 0. For MCP that was
+/// "install all zero-auth servers", so a documented no-op instead registered
+/// subprocess-spawning servers into the operator's config.
+#[test]
+fn headless_mcp_setup_registers_no_servers() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+    let (config_path, _) = baseline_config(&home);
+
+    // Exit code is not asserted here — this test is about what reaches disk.
+    cmd(&home)
+        .args(["setup", "--non-interactive", "mcp"])
+        .assert();
+
+    let body = std::fs::read_to_string(&config_path).expect("config.toml readable");
+    assert!(
+        !body.contains("[mcp_servers."),
+        "an unattended run must not register MCP servers; config.toml:\n{body}"
+    );
+}
+
 #[test]
 fn setup_unknown_topic_errors_and_lists_valid_topics() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -59,15 +59,20 @@ Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker ·
 - `rantaiclaw setup --non-interactive`
 - `rantaiclaw setup whatsapp-web --non-interactive`
 
-`setup` walks every wired section (provider, channels, persona, skills, mcp, and — when built with the default `kb` feature — knowledge) skipping any that are already configured. Pass `--force` to re-run already-configured sections. Pass `--non-interactive` (or run in non-TTY context) to emit each section's headless hint and exit rather than prompting.
+`setup` walks every wired section (provider, channels, persona, skills, mcp, and — when built with the default `kb` feature — knowledge) skipping any that are already configured. Pass `--force` to re-run already-configured sections.
+
+`--non-interactive` (or a non-TTY context) behaves differently depending on whether a topic is given:
+
+- **`rantaiclaw setup --non-interactive`** — walks the sections and emits each one's headless hint instead of prompting. Exits `0`.
+- **`rantaiclaw setup <topic> --non-interactive`** — runs that topic's provisioner unattended. Text prompts take the default the provisioner declared, secret prompts get an empty value, a single-choice question takes its first option, and a multi-select selects **nothing**. The config is saved only when the provisioner reports that it configured something; a provisioner that aborted, errored or timed out exits **non-zero** and writes nothing. Scripts should check the exit code.
 
 Single-topic examples:
 - `rantaiclaw setup provider` — re-run provider section only
 - `rantaiclaw setup channels` — re-run channels section only
 - `rantaiclaw setup knowledge` — set the Knowledge Base API keys (`[knowledge].embedding_api_key` / `vision_api_key`, encrypted at rest; vision falls back to the embedding key). Env `KB_EMBEDDING_API_KEY` / `KB_EXTRACT_VISION_API_KEY` override config at load, with `OPENROUTER_API_KEY` as the final fallback. See [config-reference.md](config.md) for the gateway `GET`/`PUT /api/v1/config/knowledge` endpoints.
-- `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (120s timeout)
+- `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (120s timeout; a timeout exits non-zero)
 
-`onboard` is a legacy alias for `setup`; its behaviour is unchanged.
+`onboard` is the legacy entry point, kept for existing scripts. It is **not** an alias for `setup` — it is a separate command with its own flags (`--interactive`, `--channels-only`, `--api-key`, `--provider`, `--model`, `--memory`), documented below. New work should use `setup`.
 
 ### `onboard`
 

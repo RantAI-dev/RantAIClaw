@@ -139,9 +139,12 @@ impl TuiProvisioner for McpProvisioner {
             ProvisionEvent::Choose {
                 id: "install_zero_auth".into(),
                 label: "Install all zero-auth servers?".into(),
+                // The inert option is FIRST on purpose: an unattended run
+                // takes option 0, and "install every zero-auth server" is not
+                // something a no-op headless setup should do.
                 options: vec![
-                    "Yes — install all zero-auth servers".to_string(),
                     "No — only selected".to_string(),
+                    "Yes — install all zero-auth servers".to_string(),
                 ],
                 multi: false,
             },
@@ -150,7 +153,7 @@ impl TuiProvisioner for McpProvisioner {
 
         let install_all_zero_auth = {
             let sel = recv_selection(&mut responses).await?;
-            sel.first().copied() == Some(0)
+            sel.first().copied() == Some(1)
         };
 
         // Custom MCP server
@@ -179,8 +182,19 @@ impl TuiProvisioner for McpProvisioner {
                     .filter(|(k, _)| server.0.env_vars.contains(&k.as_str()))
                     .cloned()
                     .collect();
-                let _ = setup::register_mcp(config, server.0, &env);
-                authed_added += 1;
+                match setup::register_mcp(config, server.0, &env) {
+                    Ok(()) => authed_added += 1,
+                    Err(e) => {
+                        send(
+                            &events,
+                            ProvisionEvent::Message {
+                                severity: Severity::Warn,
+                                text: format!("{} not registered: {e}", server.0.slug),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
         }
 
@@ -192,8 +206,19 @@ impl TuiProvisioner for McpProvisioner {
         for (zero_idx, server) in NO_AUTH.iter().enumerate() {
             let global_idx = zero_idx;
             if selections.contains(&global_idx) || install_all_zero_auth {
-                let _ = setup::register_mcp(config, server, &[]);
-                zero_auth_added += 1;
+                match setup::register_mcp(config, server, &[]) {
+                    Ok(()) => zero_auth_added += 1,
+                    Err(e) => {
+                        send(
+                            &events,
+                            ProvisionEvent::Message {
+                                severity: Severity::Warn,
+                                text: format!("{} not registered: {e}", server.slug),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
         }
 
