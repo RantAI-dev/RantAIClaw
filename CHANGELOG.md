@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `ui install --dir <path>` no longer deletes a directory just because it
+  holds a `.git`. "Managed" meant `server.js` **or** any `.git` directory, and
+  a managed target both skipped the `--force` guard and was recursively
+  removed before extraction — so pointing `--dir` at a dotfiles checkout or
+  any clone destroyed it, with no prompt and no backup. A directory now counts
+  as this installer's only when it holds `server.js`, the `.version` marker, or
+  a `.git` whose remote is claw-ui's own (the pre-tarball installer used
+  `git clone`, and that upgrade path still works). The `remove_dir_all` call
+  re-checks ownership itself rather than trusting a guard 60 lines away.
+
 ### Security
 
 - `ui install`/`ui update` now pin claw-ui v0.3.25, which bumps Next.js
