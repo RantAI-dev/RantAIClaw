@@ -508,6 +508,14 @@ pub struct AppState {
     /// `WebModalApprovalBackend` registers + awaits here; `POST /api/v1/approvals/{id}`
     /// resolves it. Separate from the channel/shell registries.
     pub web_approvals: Arc<crate::security::PendingApprovals>,
+    /// MCP servers, connected once and shared by every chat request.
+    ///
+    /// The gateway builds an `Agent` per request, and agent construction used
+    /// to spawn every configured server, handshake, `tools/list`, then SIGKILL
+    /// the lot when the request's agent dropped — per console turn. The pool
+    /// moves that lifetime here; it rebuilds itself when a hot-reloaded config
+    /// changes `mcp_servers`. See [`crate::mcp::discover::McpPoolHandle`].
+    pub mcp: Arc<crate::mcp::discover::McpPoolHandle>,
 }
 
 /// Build the closure stored in [`AppState::tools_factory`].
@@ -804,6 +812,9 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
         web_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
             std::time::Duration::from_secs(300),
         ))),
+        // Connected on the first turn that needs it, then reused; rebuilt when
+        // a hot-reloaded config changes `mcp_servers`.
+        mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
     };
 
     // Build router with middleware
@@ -3115,6 +3126,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -3165,6 +3177,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -3458,6 +3471,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         }
     }
@@ -3715,6 +3729,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -3780,6 +3795,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -3857,6 +3873,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -3906,6 +3923,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -3960,6 +3978,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -4049,6 +4068,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         }
     }
@@ -4268,6 +4288,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -4324,6 +4345,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -4383,6 +4405,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
@@ -4478,6 +4501,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         }
     }

@@ -148,6 +148,7 @@ fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
             rantaiclaw::gateway::channel_approval::ChannelApprovalStore::default(),
         ),
         web_approvals: Arc::new(rantaiclaw::security::PendingApprovals::default()),
+        mcp: Arc::new(rantaiclaw::mcp::discover::McpPoolHandle::default()),
         trust_forwarded_headers: false,
         rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
         idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),

@@ -585,10 +585,14 @@ async fn agent_chat_sync(
 
     let started = std::time::Instant::now();
     // Use the gateway's shared observer so this request's metrics land in the
-    // same registry `/metrics` exposes (not a throwaway per-request one).
-    let mut agent = crate::agent::Agent::from_config_with_observer(&config, state.observer.clone())
-        .await
-        .map_err(map_agent_error)?;
+    // same registry `/metrics` exposes (not a throwaway per-request one), and
+    // the gateway's MCP pool so this turn does not respawn every configured
+    // server. The pool reconnects itself if the config changed under us.
+    let mcp = state.mcp.current(&config.mcp_servers).await;
+    let mut agent =
+        crate::agent::Agent::from_config_with_mcp_pool(&config, state.observer.clone(), &mcp)
+            .await
+            .map_err(map_agent_error)?;
     // Scope this request's turn memory to its conversation. The gateway serves
     // many callers, so an unscoped agent would write every session's messages
     // into one shared pool and read them back into each other's context.
@@ -717,6 +721,10 @@ async fn agent_chat_stream(
     let gate_tools = !config.channels_config.autonomous_tools;
     // Share the gateway observer so streamed-chat metrics reach `/metrics`.
     let observer = state.observer.clone();
+    // Resolve the MCP pool here rather than inside the spawned turn: holding an
+    // `Arc<McpPool>` for the turn's lifetime is what keeps a concurrent config
+    // reload from pulling a client out from under an in-flight tool call.
+    let mcp = state.mcp.current(&config.mcp_servers).await;
 
     // One scope per SSE turn. The turn runs inside `TURN_SCOPE = ("console",
     // turn_scope)`, so the shell tool and the Layer-A modal register their
@@ -725,7 +733,7 @@ async fn agent_chat_stream(
     let turn_scope = uuid::Uuid::new_v4().to_string();
 
     tokio::spawn(async move {
-        match crate::agent::Agent::from_config_with_observer(&config, observer).await {
+        match crate::agent::Agent::from_config_with_mcp_pool(&config, observer, &mcp).await {
             Ok(mut agent) => {
                 // Same scoping as the non-streaming path: one agent per request,
                 // pointed at the conversation it is serving.
@@ -2492,6 +2500,7 @@ mod tests {
                 crate::gateway::channel_approval::ChannelApprovalStore::default(),
             ),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
         }
     }
 
