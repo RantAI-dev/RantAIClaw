@@ -236,16 +236,21 @@ pub struct Config {
     /// What `apply_env_overrides` changed on this value, remembered so
     /// `save()` writes the operator's file rather than the environment this
     /// run happened to have. Never serialised, and absent from the schema.
+    ///
+    /// Written by `apply_env_overrides` and read by `save()`. It is `pub` only
+    /// because `..Config::default()` outside this crate cannot see a private
+    /// field; `EnvOverrideSnapshot` keeps its own fields private, so the only
+    /// value an external caller can put here is `None`.
     #[serde(skip)]
     #[schemars(skip)]
-    pub(crate) env_overrides: Option<Box<EnvOverrideSnapshot>>,
+    pub env_overrides: Option<Box<EnvOverrideSnapshot>>,
 }
 
 /// The config as it was before and after `apply_env_overrides` ran, as JSON so
 /// the comparison is generic: every override present today is covered, and any
 /// override added later is covered without touching `save()`.
 #[derive(Debug, Clone)]
-pub(crate) struct EnvOverrideSnapshot {
+pub struct EnvOverrideSnapshot {
     before: serde_json::Value,
     after: serde_json::Value,
 }
