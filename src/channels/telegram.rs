@@ -606,6 +606,22 @@ impl TelegramChannel {
         }
     }
 
+    /// Send a Telegram request, scrubbing the bot token out of any transport
+    /// error before it escapes this module. Every request URL embeds
+    /// `/bot<token>/<method>` and reqwest's `Display` appends `" for url (…)"`,
+    /// so a bare `.send().await?` hands a live credential to whatever logs the
+    /// error — `dispatch.rs` logs a failed reply at ERROR. Route every call
+    /// through here; a bare `.send().await?` in this file is the regression.
+    async fn send_scrubbed(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::Response> {
+        request
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", self.scrub_token(&e)))
+    }
+
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
         let resp = self.http_client().get(self.api_url("getMe")).send().await?;
 
@@ -1401,12 +1417,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
             }
 
-            let resp = self
+            let request = self
                 .http_client()
                 .post(self.api_url("sendMessage"))
-                .json(&html_body)
-                .send()
-                .await?;
+                .json(&html_body);
+            let resp = self.send_scrubbed(request).await?;
 
             if resp.status().is_success() {
                 if index + 1 < total {
@@ -1432,12 +1447,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
-            let plain_resp = self
+            let request = self
                 .http_client()
                 .post(self.api_url("sendMessage"))
-                .json(&plain_body)
-                .send()
-                .await?;
+                .json(&plain_body);
+            let plain_resp = self.send_scrubbed(request).await?;
             if !plain_resp.status().is_success() {
                 let status = plain_resp.status();
                 let err = plain_resp.text().await.unwrap_or_default();
@@ -1472,12 +1486,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             body["caption"] = serde_json::Value::String(cap.to_string());
         }
 
-        let resp = self
-            .http_client()
-            .post(self.api_url(method))
-            .json(&body)
-            .send()
-            .await?;
+        let request = self.http_client().post(self.api_url(method)).json(&body);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1579,12 +1589,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             form = form.text("caption", cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendDocument"))
-            .multipart(form)
-            .send()
-            .await?;
+            .multipart(form);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1618,12 +1627,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             form = form.text("caption", cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendDocument"))
-            .multipart(form)
-            .send()
-            .await?;
+            .multipart(form);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1662,12 +1670,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             form = form.text("caption", cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendPhoto"))
-            .multipart(form)
-            .send()
-            .await?;
+            .multipart(form);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1701,12 +1708,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             form = form.text("caption", cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendPhoto"))
-            .multipart(form)
-            .send()
-            .await?;
+            .multipart(form);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1745,12 +1751,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             form = form.text("caption", cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendVideo"))
-            .multipart(form)
-            .send()
-            .await?;
+            .multipart(form);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1789,12 +1794,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             form = form.text("caption", cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendAudio"))
-            .multipart(form)
-            .send()
-            .await?;
+            .multipart(form);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1833,12 +1837,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             form = form.text("caption", cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendVoice"))
-            .multipart(form)
-            .send()
-            .await?;
+            .multipart(form);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1870,12 +1873,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             body["caption"] = serde_json::Value::String(cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendDocument"))
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -1907,12 +1909,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             body["caption"] = serde_json::Value::String(cap.to_string());
         }
 
-        let resp = self
+        let request = self
             .http_client()
             .post(self.api_url("sendPhoto"))
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -2018,12 +2019,8 @@ impl Channel for TelegramChannel {
             body["message_thread_id"] = serde_json::Value::String(tid.to_string());
         }
 
-        let resp = self
-            .client
-            .post(self.api_url("sendMessage"))
-            .json(&body)
-            .send()
-            .await?;
+        let request = self.client.post(self.api_url("sendMessage")).json(&body);
+        let resp = self.send_scrubbed(request).await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
@@ -2085,12 +2082,11 @@ impl Channel for TelegramChannel {
             "text": display_text,
         });
 
-        let resp = self
+        let request = self
             .client
             .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        let resp = self.send_scrubbed(request).await?;
 
         if resp.status().is_success() {
             self.last_draft_edit
@@ -2171,12 +2167,11 @@ impl Channel for TelegramChannel {
             "parse_mode": "HTML",
         });
 
-        let resp = self
+        let request = self
             .client
             .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        let resp = self.send_scrubbed(request).await?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -2190,12 +2185,11 @@ impl Channel for TelegramChannel {
             "text": plain,
         });
 
-        let resp = self
+        let request = self
             .client
             .post(self.api_url("editMessageText"))
-            .json(&plain_body)
-            .send()
-            .await?;
+            .json(&plain_body);
+        let resp = self.send_scrubbed(request).await?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -2219,15 +2213,14 @@ impl Channel for TelegramChannel {
             }
         };
 
-        let response = self
+        let request = self
             .client
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,
                 "message_id": message_id,
-            }))
-            .send()
-            .await?;
+            }));
+        let response = self.send_scrubbed(request).await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -3395,6 +3388,35 @@ mod tests {
             json["reply_parameters"]["allow_sending_without_reply"],
             true
         );
+    }
+
+    /// Every Telegram API URL embeds the bot token, and reqwest's `Display`
+    /// appends `" for url (…)"`. A transient network fault on the send path used
+    /// to propagate that raw error up to `dispatch.rs`, which logs it at ERROR —
+    /// writing a live bot token into journald. The send path must scrub the
+    /// token before the error escapes this module.
+    #[tokio::test]
+    async fn telegram_send_error_carries_no_bot_token() {
+        const TOKEN: &str = "123:test_token_abc123";
+
+        // Bind then drop: the port is guaranteed to refuse, so the send fails
+        // inside reqwest without depending on the network.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let ch = TelegramChannel::new(TOKEN.into(), vec!["*".into()], false)
+            .with_api_base(format!("http://{addr}"));
+
+        let err = ch
+            .send(&SendMessage::new("hello", "-100200300"))
+            .await
+            .expect_err("a refused connection must fail the send");
+
+        // `{:#}` walks the whole anyhow chain, which is what a caller logging
+        // the alternate form would print.
+        let rendered = format!("{err:#}");
+        assert!(!rendered.contains(TOKEN), "token leaked: {rendered}");
     }
 
     #[tokio::test]
