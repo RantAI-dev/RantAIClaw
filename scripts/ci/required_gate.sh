@@ -38,14 +38,17 @@
 #   DOCS_RESULT
 set -euo pipefail
 
-# A job that was correctly skipped — label-gated behind `ci:full`, or a
-# push-only job on a pull request — counts as passing. Jobs that are never
-# skippable are checked with `= success` instead, so a skip there fails.
-is_ok() {
-  case "${1:-skipped}" in
-    success | skipped) return 0 ;;
-    *) return 1 ;;
-  esac
+# Every Rust stage shares one condition — Rust changed and lint succeeded —
+# so on a run that reaches the checks below, a skip is a failure. There is no
+# longer any stage this gate has to forgive for being skipped, which is why the
+# old `is_ok` helper is gone: it existed to wave through `ci:full`-gated and
+# push-only jobs, and neither exists any more.
+require_success() {
+  local label="$1" result="${2:-skipped}"
+  if [ "$result" != "success" ]; then
+    echo "$label did not pass (result: $result)."
+    return 1
+  fi
 }
 
 run_gate() {
@@ -100,45 +103,22 @@ run_gate() {
     return 0
   fi
 
+  # Lint first: everything downstream is `needs: lint`, so a lint failure
+  # skips the rest, and reporting "tests did not pass" for it would send the
+  # reader to the wrong log.
+  require_success "Lint" "$lint_result" || return 1
+  require_success "Unit tests" "$test_result" || return 1
+  require_success "channel-lark build/test" "$channel_lark_result" || return 1
+  require_success "Feature matrix" "$features_result" || return 1
+  require_success "Bench compile" "$bench_compile_result" || return 1
+  require_success "E2E" "$e2e_result" || return 1
+  require_success "Build smoke" "$build_result" || return 1
+
   if [ "$event_name" = "pull_request" ]; then
-    if ! is_ok "$build_result"; then
-      echo "Required PR build job did not pass."
-      return 1
-    fi
-    # lint, test and channel-lark share one `if:` — Rust changed and lint
-    # succeeded — so none of them is skippable on a Rust PR. A skip is a
-    # failure here, not an opt-out, which is why they are not run through
-    # `is_ok`.
-    if [ "$lint_result" != "success" ]; then
-      echo "Lint is required on Rust PRs."
-      return 1
-    fi
-    if [ "$test_result" != "success" ]; then
-      echo "Unit tests are required on Rust PRs."
-      return 1
-    fi
-    if [ "$channel_lark_result" != "success" ]; then
-      echo "channel-lark build/test is required on Rust PRs."
-      return 1
-    fi
-    # features/bench-compile remain gated behind `ci:full`; a skip is fine.
-    if ! is_ok "$features_result" || ! is_ok "$bench_compile_result"; then
-      echo "Required PR jobs (features/bench-compile) did not pass."
-      return 1
-    fi
     echo "PR required checks passed."
-    return 0
+  else
+    echo "Push required checks passed."
   fi
-
-  if ! is_ok "$lint_result" || ! is_ok "$test_result" \
-    || ! is_ok "$channel_lark_result" || ! is_ok "$features_result" \
-    || ! is_ok "$e2e_result" || ! is_ok "$bench_compile_result" \
-    || ! is_ok "$build_result"; then
-    echo "Required push CI jobs did not pass."
-    return 1
-  fi
-
-  echo "Push required checks passed."
   return 0
 }
 
@@ -170,10 +150,24 @@ if [ "${1:-}" = "--self-test" ]; then
   pr_rust_green=(
     EVENT_NAME=pull_request RUST_CHANGED=true IDENTITY_RESULT=success
     LINT_RESULT=success TEST_RESULT=success CHANNEL_LARK_RESULT=success
-    BUILD_RESULT=success FEATURES_RESULT=skipped BENCH_COMPILE_RESULT=skipped
+    FEATURES_RESULT=success BENCH_COMPILE_RESULT=success E2E_RESULT=success
+    BUILD_RESULT=success
   )
 
   expect 0 "a green Rust PR merges" "${pr_rust_green[@]}"
+
+  # No Rust stage is label-gated or push-only any more, so a skip in any of
+  # them means something went wrong upstream — never an opt-out.
+  expect 1 "a skipped feature matrix blocks a Rust PR" \
+    "${pr_rust_green[@]}" FEATURES_RESULT=skipped
+  expect 1 "a skipped bench compile blocks a Rust PR" \
+    "${pr_rust_green[@]}" BENCH_COMPILE_RESULT=skipped
+  expect 1 "a skipped e2e blocks a Rust PR" \
+    "${pr_rust_green[@]}" E2E_RESULT=skipped
+  expect 1 "a failing e2e blocks a Rust PR" \
+    "${pr_rust_green[@]}" E2E_RESULT=failure
+  expect 1 "a failing bench compile blocks a Rust PR" \
+    "${pr_rust_green[@]}" BENCH_COMPILE_RESULT=failure
 
   # regression: channel-lark ran on every Rust PR but was not in the gate's
   # `needs:`, so a failure there never blocked the merge.

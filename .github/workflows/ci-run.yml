@@ -146,11 +146,11 @@ jobs:
               run: cargo test --locked --workspace -- --test-threads=1
 
     # `channel-lark` gets its own job rather than a row in the `features` matrix
-    # below, for two reasons: that matrix is label-gated behind `ci:full` (so it
-    # would not run on the PRs that change Lark), and it only runs `cargo check`
-    # (which would not have caught the defects in `src/channels/lark.rs` — 1,774
-    # lines including a hand-rolled websocket codec and an axum server that no CI
-    # job compiled until now).
+    # below because that matrix only runs `cargo check`, which would not have
+    # caught the defects in `src/channels/lark.rs` — 1,774 lines including a
+    # hand-rolled websocket codec and an axum server that no CI job compiled
+    # until this job existed. (It also used to be the only one of the two that
+    # ran on a PR at all; the matrix is no longer label-gated.)
     #
     # Unlike `channel-matrix`, this feature has no upstream blocker: it pulls only
     # `prost`. Verified building clean at f189422 in ~3m.
@@ -174,7 +174,11 @@ jobs:
     features:
         name: Features (${{ matrix.name }})
         needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
+        # Was label-gated behind `ci:full`, which meant a feature combination
+        # only broke after merge. Each variant takes ~60-80s and they run in
+        # parallel, well inside the `build` job's ~8 minutes — so requiring
+        # them costs no wall-clock.
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 25
         strategy:
@@ -216,7 +220,10 @@ jobs:
     e2e:
         name: E2E
         needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && github.event_name != 'pull_request' && needs.lint.result == 'success'
+        # Was push-only: an end-to-end regression was invisible until it was
+        # already on `main`. ~2.5 minutes, shorter than `test` and `build`, so
+        # it hides behind them.
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 30
         steps:
@@ -231,7 +238,11 @@ jobs:
     bench-compile:
         name: Bench Compile
         needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
+        # The one stage that does cost something: ~11 minutes, which makes it
+        # the critical path on a Rust PR (previously `build`, ~8). Paid because
+        # benches live outside `--lib`/`--bin`, so nothing else notices when a
+        # signature change stops them compiling — and `main` went red for it.
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 25
         steps:

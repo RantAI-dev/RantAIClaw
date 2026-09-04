@@ -21,7 +21,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
         - `channel-lark` — `cargo test --features channel-lark --lib channels::lark`.
         - `docs-quality` — incremental `markdownlint` on changed lines + offline `lychee` on links added on changed lines.
         - `lint-feedback` — posts actionable failure comment when lint/docs gates fail on a PR.
-    - PR gating: `lint`, `test` and `channel-lark` run on every Rust-changing PR (no label needed) and are required by `CI Required Gate`; `docs-quality` runs whenever docs change and is required; `features` and `bench-compile` still require the `ci:full` label; `build` always runs for rust changes; `e2e` is push-only.
+    - PR gating: every Rust stage — `lint`, `test`, `channel-lark`, `features`, `bench-compile`, `e2e`, `build` — runs on every Rust-changing PR and is required by `CI Required Gate`. `docs-quality` runs whenever docs change and is required. No stage is label-gated: `ci:full` no longer changes what runs, and `e2e` is no longer push-only.
     - Merge gate: `CI Required Gate` runs `scripts/ci/required_gate.sh`, which reads every stage result from the environment. The decision table lives in that script and is checked by `required_gate.sh --self-test`, which the same job runs first — a stage the gate stops reading fails the self-test instead of quietly becoming advisory.
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks).
