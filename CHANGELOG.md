@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `ui install`/`ui update` now pin claw-ui v0.3.25, which bumps Next.js
+  16.0.10 → 16.3.4. The console's login gate, CSRF rejection, expected-host
+  allowlist and server-side gateway-token attachment all live in the
+  proxy/middleware layer, and the pinned version sat inside the affected range
+  of the published Middleware/Proxy bypass advisories. claw-ui CI also gained a
+  runtime dependency audit so the version cannot silently rot back out of
+  currency. (claw-ui #108)
+
 ## [0.27.1-alpha] — 2026-09-03
 
 Console delivery release: rolls the claw-ui UI/UX wave out to `ui install`.
