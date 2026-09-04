@@ -222,7 +222,12 @@ async fn api_rate_limit(
     // proxy's IP, so an IP key gives all console users one shared 600/min
     // bucket where one tab can 429 everyone. Fall back to the IP key for
     // unauthenticated routes / requests with no bearer.
-    let key = api_rate_limit_key(req.headers(), peer, state.trust_forwarded_headers);
+    let key = api_rate_limit_key(
+        req.headers(),
+        peer,
+        state.trust_forwarded_headers,
+        &state.pairing,
+    );
     if state.rate_limiter.allow_api(&key) {
         return next.run(req).await;
     }
@@ -354,12 +359,21 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
     value.parse::<IpAddr>().ok()
 }
 
+/// The client IP a trusted proxy vouched for.
+///
+/// `X-Forwarded-For` is append-only, so entries to the LEFT are whatever the
+/// client sent and the RIGHTMOST is the one our own proxy added. Reading left
+/// to right let a client choose its own value — and this key drives the
+/// `/pair` and `/login` lockouts, so a 6-digit pairing code was brute-forceable
+/// from behind a proxy.
+///
+/// This assumes exactly one trusted proxy in front of the gateway, which is
+/// what `trust_forwarded_headers` documents. Chains deeper than that need a
+/// configurable hop count; nothing asks for one yet.
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        for candidate in xff.split(',') {
-            if let Some(ip) = parse_client_ip(candidate) {
-                return Some(ip);
-            }
+        if let Some(ip) = xff.rsplit(',').find_map(parse_client_ip) {
+            return Some(ip);
         }
     }
 
@@ -370,13 +384,27 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
 }
 
 /// Rate-limit bucket key for the `/api/v1` tier: the authenticated principal
-/// (a stable hash of the bearer token) when one is present, else the peer-IP
-/// key. Keys on the token so console users behind one proxy IP get independent
-/// buckets instead of sharing one.
+/// (a stable hash of the bearer token) when the request carries one, else the
+/// peer-IP key. Keys on the token so console users behind one proxy IP get
+/// independent buckets instead of sharing one.
+///
+/// The middleware runs BEFORE authentication, so the token is only a principal
+/// once it has been checked against the same paired-token set the auth layer
+/// uses. Keying on the presented token instead handed a caller with no valid
+/// token a fresh bucket for every token they invented: the limiter never
+/// restrained them, and the key map could be made to churn.
+///
+/// `require_pairing` is checked explicitly because
+/// `PairingGuard::is_authenticated` answers `true` for ANY token when pairing
+/// is off. Consulting it alone would leave the limiter defeatable in exactly
+/// the configuration where it is the only guard in front of `agent/chat`,
+/// which spends money per request. With pairing off there is no principal, so
+/// every caller shares the network-identity bucket.
 fn api_rate_limit_key(
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
     trust_forwarded_headers: bool,
+    pairing: &PairingGuard,
 ) -> String {
     let bearer = headers
         .get("authorization")
@@ -386,7 +414,8 @@ fn api_rate_limit_key(
                 .or_else(|| s.strip_prefix("bearer "))
         })
         .map(str::trim)
-        .filter(|t| !t.is_empty());
+        .filter(|t| !t.is_empty())
+        .filter(|t| pairing.require_pairing() && pairing.is_authenticated(t));
     if let Some(token) = bearer {
         // Hash so the raw token is never a map key; 16 hex chars is ample to
         // separate principals without collision risk at console scale.
@@ -3205,31 +3234,103 @@ mod tests {
         assert!(!limiter.allow_api("127.0.0.1"));
     }
 
-    #[test]
-    fn api_rate_limit_key_prefers_the_bearer_token_over_the_peer_ip() {
-        use axum::http::HeaderValue;
-        let peer: Option<SocketAddr> = Some("10.0.0.1:5000".parse().unwrap());
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
 
-        // Two different tokens from the SAME peer IP get different buckets.
-        let mut a = HeaderMap::new();
-        a.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer token-aaa"),
-        );
-        let mut b = HeaderMap::new();
-        b.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer token-bbb"),
-        );
-        let ka = api_rate_limit_key(&a, peer, false);
-        let kb = api_rate_limit_key(&b, peer, false);
+    /// The reason for keying on the token at all: behind the BFF the console
+    /// is designed for, every browser presents the proxy's IP, so an IP key
+    /// gives all console users one shared bucket where one tab can 429
+    /// everyone. That still holds — but only for tokens that authenticate.
+    #[test]
+    fn api_rate_limit_key_separates_paired_principals_behind_one_ip() {
+        let peer: Option<SocketAddr> = Some("10.0.0.1:5000".parse().unwrap());
+        let pairing = PairingGuard::new(true, &["token-aaa".into(), "token-bbb".into()]);
+
+        let ka = api_rate_limit_key(&bearer("token-aaa"), peer, false, &pairing);
+        let kb = api_rate_limit_key(&bearer("token-bbb"), peer, false, &pairing);
         assert!(ka.starts_with("tok:"), "token key expected, got {ka}");
-        assert_ne!(ka, kb, "distinct tokens must not share a bucket");
+        assert_ne!(ka, kb, "distinct paired principals must not share a bucket");
 
         // No bearer → falls back to the peer-IP key.
-        let none = HeaderMap::new();
-        let kip = api_rate_limit_key(&none, peer, false);
+        let kip = api_rate_limit_key(&HeaderMap::new(), peer, false, &pairing);
         assert_eq!(kip, "10.0.0.1");
+    }
+
+    /// The middleware runs before authentication, so a caller with no valid
+    /// token could mint a fresh bucket for every token they invented — the
+    /// limiter never restrained them, and the key map could be made to churn.
+    #[test]
+    fn api_rate_limit_key_ignores_a_bearer_that_does_not_authenticate() {
+        let peer: Option<SocketAddr> = Some("10.0.0.1:5000".parse().unwrap());
+        let pairing = PairingGuard::new(true, &["the-real-token".into()]);
+
+        let first = api_rate_limit_key(&bearer("invented-1"), peer, false, &pairing);
+        let second = api_rate_limit_key(&bearer("invented-2"), peer, false, &pairing);
+
+        assert_eq!(
+            first, "10.0.0.1",
+            "an unauthenticated caller is keyed by network identity"
+        );
+        assert_eq!(
+            first, second,
+            "rotating invented tokens must not mint fresh buckets"
+        );
+    }
+
+    /// With pairing off there is no principal to key on, so every caller shares
+    /// the network-identity bucket. `PairingGuard::is_authenticated` answers
+    /// `true` for any token in that mode, so consulting it alone would leave
+    /// the limiter defeatable exactly where it is the only guard in front of
+    /// `agent/chat`.
+    #[test]
+    fn api_rate_limit_key_ignores_the_bearer_entirely_when_pairing_is_off() {
+        let peer: Option<SocketAddr> = Some("10.0.0.1:5000".parse().unwrap());
+        let pairing = PairingGuard::new(false, &[]);
+
+        let first = api_rate_limit_key(&bearer("anything-1"), peer, false, &pairing);
+        let second = api_rate_limit_key(&bearer("anything-2"), peer, false, &pairing);
+
+        assert_eq!(first, "10.0.0.1");
+        assert_eq!(first, second, "no pairing means no principal to key on");
+    }
+
+    /// `X-Forwarded-For` is append-only: entries to the left are whatever the
+    /// client sent, the rightmost is the one your own proxy added. Trusting
+    /// the leftmost let a client pick its own bucket — and the same key drives
+    /// the `/pair` and `/login` lockouts, so a 6-digit pairing code became
+    /// brute-forceable from behind a proxy.
+    #[test]
+    fn forwarded_client_key_ignores_entries_the_client_supplied() {
+        let peer: Option<SocketAddr> = Some("10.0.0.1:5000".parse().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            axum::http::HeaderValue::from_static("1.2.3.4, 203.0.113.9"),
+        );
+
+        let key = client_key_from_request(peer, &headers, true);
+        assert_eq!(
+            key, "203.0.113.9",
+            "the hop our own proxy appended is the trustworthy one"
+        );
+
+        // A client rotating the entries it controls cannot move its bucket.
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert(
+            "X-Forwarded-For",
+            axum::http::HeaderValue::from_static("9.9.9.9, 203.0.113.9"),
+        );
+        assert_eq!(
+            client_key_from_request(peer, &spoofed, true),
+            key,
+            "a client-supplied entry must not change the key"
+        );
     }
 
     #[test]
@@ -3386,8 +3487,10 @@ mod tests {
             HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
         );
 
+        // The rightmost entry is the hop our own proxy appended; everything to
+        // its left is client-supplied.
         let key = client_key_from_request(Some(peer), &headers, true);
-        assert_eq!(key, "198.51.100.10");
+        assert_eq!(key, "203.0.113.11");
     }
 
     #[test]
