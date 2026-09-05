@@ -105,7 +105,6 @@ impl TuiProvisioner for MemoryProvisioner {
             keyword_weight: 0.5,
             min_relevance_score: 0.4,
             embedding_cache_size: 10000,
-            chunk_max_tokens: 512,
             snapshot_enabled: false,
             snapshot_on_hygiene: true,
             auto_hydrate: true,

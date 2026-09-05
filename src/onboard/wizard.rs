@@ -575,7 +575,6 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         } else {
             0
         },
-        chunk_max_tokens: 512,
         snapshot_enabled: false,
         snapshot_on_hygiene: false,
         auto_hydrate: true,
