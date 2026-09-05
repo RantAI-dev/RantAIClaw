@@ -98,7 +98,6 @@ mod sessions {
 }
 #[cfg(feature = "remote-install")]
 mod remote;
-mod skillforge;
 mod skills;
 mod tasks;
 #[cfg(test)]

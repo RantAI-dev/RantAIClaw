@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Three modules the product advertised and could not run.** `src/runtime/wasm.rs`
+  (687 lines, 36 tests) was never declared as a module, has no `runtime-wasm` feature
+  behind it, and imported a `WasmRuntimeConfig` type that does not exist — it could not
+  compile, and `create_runtime` has no `wasm` arm. `src/observability/broadcast.rs` was
+  likewise undeclared, with no `broadcast` arm in `create_observer`. `src/skillforge/`
+  (1,118 lines) did compile, but `mod skillforge;` in `src/main.rs` was its only
+  reference anywhere: no CLI verb, no config key, no caller.
+
+### Changed
+
+- **README and pillar 4 now name the sets that exist.** `[runtime].kind` accepts
+  `native` or `docker` (not `wasm`); the observability backends are OpenTelemetry,
+  Prometheus, log and noop (not `broadcast`); skill authoring is the `author_skill`
+  tool (not `skillforge`).
+
 ## [0.29.0-alpha] — 2026-09-05
 
 Wave 1 of the production-readiness audit plus the follow-up batch it produced:
