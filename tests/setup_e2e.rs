@@ -228,6 +228,74 @@ fn headless_mcp_setup_registers_no_servers() {
     );
 }
 
+/// Plan 296 made a headless run exit non-zero when a provisioner ABORTS. The
+/// provider section slipped through: it treats a selection with no key as a
+/// completed selection, so the run reported success, saved the config, and
+/// exited zero — for an install that cannot send a single message.
+#[test]
+fn headless_provider_setup_without_a_key_anywhere_fails_and_writes_nothing() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+    let (config_path, before) = baseline_config(&home);
+
+    let assert = cmd(&home)
+        // Strip every credential the resolver would otherwise find on the
+        // developer's own machine — the point is "no key anywhere".
+        .env_remove("RANTAICLAW_API_KEY")
+        .env_remove("API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .args(["setup", "--non-interactive", "provider"])
+        .assert()
+        .failure();
+
+    let output = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("no API key"),
+        "the refusal must say what is missing; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("RANTAICLAW_API_KEY"),
+        "the refusal must name a variable that would satisfy it; got:\n{combined}"
+    );
+
+    let after = std::fs::read(&config_path).expect("config.toml still readable");
+    assert_eq!(
+        before, after,
+        "a provider run that configured nothing usable must leave config.toml byte-identical"
+    );
+}
+
+/// The other half, and the one that stops this becoming a false positive: a key
+/// supplied through the environment is a credential the agent WILL use at send
+/// time, so the same run must succeed.
+#[test]
+fn headless_provider_setup_succeeds_when_the_key_comes_from_the_environment() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+    let (config_path, _) = baseline_config(&home);
+
+    cmd(&home)
+        .env("RANTAICLAW_API_KEY", "neutral-env-supplied-key")
+        .args(["setup", "--non-interactive", "provider"])
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(&config_path).expect("config.toml readable");
+    assert!(
+        body.contains("default_provider"),
+        "a usable provider run must persist its selection:\n{body}"
+    );
+    assert!(
+        !body.contains("neutral-env-supplied-key"),
+        "an env-supplied credential must not be baked into config.toml:\n{body}"
+    );
+}
+
 #[test]
 fn setup_unknown_topic_errors_and_lists_valid_topics() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
