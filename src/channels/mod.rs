@@ -537,7 +537,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // The TUI uses `start_channels_with_cancellation` instead so it can
     // restart channels in place when a channel or skill is added
     // mid-session.
-    start_channels_with_cancellation(config, CancellationToken::new()).await
+    start_channels_with_cancellation(config, CancellationToken::new(), None).await
 }
 
 /// Build and run the channel runtime until every listener exits or
@@ -553,6 +553,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
 pub async fn start_channels_with_cancellation(
     config: Config,
     shutdown: CancellationToken,
+    // The process's observer when one is owned above (daemon mode). `None` ⇒
+    // this is a standalone `channel start` or a TUI-hosted run, which is its own
+    // process and correctly its own registry.
+    observer: Option<Arc<dyn Observer>>,
 ) -> Result<()> {
     let provider_name = routing::resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
@@ -592,8 +596,8 @@ pub async fn start_channels_with_cancellation(
         ..routing::RuntimeConfigSlot::default()
     }));
 
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = observer
+        .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let policy_dir = crate::profile::ProfileManager::active()

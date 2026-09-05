@@ -631,7 +631,12 @@ fn build_tools_factory(
 /// of truth for `AppState`/route construction; it then binds the listener,
 /// starts the optional tunnel, and serves the returned router itself.
 #[allow(clippy::too_many_lines)]
-pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
+pub fn build_gateway_router(
+    config: Config,
+    // The process's observer when one is owned above; `None` ⇒ build one. The
+    // registry inside it is what `/metrics` serves.
+    observer: Option<Arc<dyn crate::observability::Observer>>,
+) -> Result<(AppState, Router)> {
     let config_state = Arc::new(Mutex::new(config.clone()));
 
     let gateway_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -795,8 +800,8 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
     crate::health::mark_component_ok("gateway");
 
     // Build shared state
-    let observer: Arc<dyn crate::observability::Observer> =
-        Arc::from(crate::observability::create_observer(&config.observability));
+    let observer: Arc<dyn crate::observability::Observer> = observer
+        .unwrap_or_else(|| Arc::from(crate::observability::create_observer(&config.observability)));
 
     // Load webhook trigger routes from agent-runner config
     let config_dir = config
@@ -969,6 +974,12 @@ pub async fn run_gateway(
     config: Config,
     shutdown: tokio_util::sync::CancellationToken,
     ready: Option<std::sync::Arc<tokio::sync::Notify>>,
+    // The process's observer, when someone above owns one. `None` means this
+    // gateway IS the process (the standalone `gateway` command, and the tests
+    // below), so it builds its own registry — which is correct there and wrong
+    // under the daemon, where channels, cron and heartbeat had their own and
+    // `/metrics` described almost nothing.
+    observer: Option<Arc<dyn crate::observability::Observer>>,
 ) -> Result<()> {
     // ── Security: refuse public bind without an explicit opt-in ──
     //
@@ -1005,7 +1016,7 @@ pub async fn run_gateway(
         ready.notify_one();
     }
 
-    let (state, app) = build_gateway_router(config.clone())?;
+    let (state, app) = build_gateway_router(config.clone(), observer)?;
 
     // Hot-reload: reflect on-disk config edits (e.g. a provider changed in the
     // TUI, another process) in the running gateway + the web console it serves,
@@ -2842,6 +2853,91 @@ mod tests {
             assert_eq!(addr.port(), 8080);
         }
     }
+    // ── One registry per process (plan 307) ─────────────────────────────────
+
+    async fn metrics_body(app: &axum::Router) -> String {
+        use tower::ServiceExt as _;
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(res.status(), StatusCode::OK, "GET /metrics");
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The property that never held: work recorded by a component OTHER than the
+    /// gateway shows up in the `/metrics` the gateway serves.
+    ///
+    /// Under the daemon the channel runtime, cron and the heartbeat worker each
+    /// built their own `PrometheusObserver`, so each had a private registry and
+    /// `/metrics` described almost nothing. Here the caller owns the observer —
+    /// as `daemon::run` now does — records a channel message through it the way
+    /// the channel runtime would, and the served endpoint must show it.
+    #[tokio::test]
+    async fn metrics_reflect_work_recorded_through_the_injected_observer() {
+        let mut config = crate::config::Config::default();
+        config.observability.backend = "prometheus".into();
+
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+        let (_state, app) =
+            super::build_gateway_router(config, Some(observer.clone())).expect("router builds");
+
+        // Nothing has happened yet.
+        let before = metrics_body(&app).await;
+        assert!(
+            !before.contains(r#"rantaiclaw_channel_messages_total{channel="telegram""#),
+            "fixture is not clean: {before}"
+        );
+
+        // A component that is NOT the gateway records through the shared observer.
+        observer.record_event(&crate::observability::ObserverEvent::ChannelMessage {
+            channel: "telegram".into(),
+            direction: "in".into(),
+        });
+
+        let after = metrics_body(&app).await;
+        assert!(
+            after.contains(
+                r#"rantaiclaw_channel_messages_total{channel="telegram",direction="in"} 1"#
+            ),
+            "the served registry must be the injected one: {after}"
+        );
+    }
+
+    /// The other half of the contract: an observer the gateway was NOT given is
+    /// a different registry, and its work must not appear. Without this the test
+    /// above would still pass if `/metrics` served some process-wide singleton.
+    #[tokio::test]
+    async fn metrics_do_not_reflect_a_registry_the_gateway_was_not_given() {
+        let mut config = crate::config::Config::default();
+        config.observability.backend = "prometheus".into();
+
+        let (_state, app) =
+            super::build_gateway_router(config.clone(), None).expect("router builds");
+
+        let stranger: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+        stranger.record_event(&crate::observability::ObserverEvent::ChannelMessage {
+            channel: "telegram".into(),
+            direction: "in".into(),
+        });
+
+        let body = metrics_body(&app).await;
+        assert!(
+            !body.contains(r#"rantaiclaw_channel_messages_total{channel="telegram""#),
+            "a registry the gateway never received must not be served: {body}"
+        );
+    }
 
     /// A configured tunnel used to be a free pass past the public-bind guard,
     /// but every provider proxies loopback — so a tunnel never makes a public
@@ -2863,6 +2959,7 @@ mod tests {
             0,
             config,
             tokio_util::sync::CancellationToken::new(),
+            None,
             None,
         )
         .await
@@ -2893,6 +2990,7 @@ mod tests {
             0,
             config,
             tokio_util::sync::CancellationToken::new(),
+            None,
             None,
         )
         .await

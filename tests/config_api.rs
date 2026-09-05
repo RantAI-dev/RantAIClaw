@@ -88,7 +88,7 @@ async fn spawn_test_gateway(config: Config) -> String {
         .local_addr()
         .expect("bound listener should have a local addr")
         .port();
-    let (_state, router) = build_gateway_router(config)
+    let (_state, router) = build_gateway_router(config, None)
         .expect("build_gateway_router should build offline from a temp-workspace config");
     tokio::spawn(async move {
         axum::serve(listener, router)

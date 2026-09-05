@@ -1920,7 +1920,7 @@ async fn main() -> Result<()> {
             });
             // Standalone `gateway` command: no daemon supervisor to signal, so
             // no readiness Notify.
-            gateway::run_gateway(&host, port, config, shutdown, None).await
+            gateway::run_gateway(&host, port, config, shutdown, None, None).await
         }
 
         Some(Commands::Daemon { port, host }) => {

@@ -35,7 +35,7 @@ Day-2 operations. The gateway lets you reconfigure a running agent over HTTP. Th
 | Live config PATCH | Stable |
 | Daemon lifecycle | Stable |
 | Health endpoint | Stable |
-| Prometheus metrics | Stable (always-compiled today; planned feature gate) |
+| Prometheus metrics | Stable — one registry per process, fed by the gateway, channels, cron and the heartbeat worker (always-compiled today; planned feature gate) |
 | OpenTelemetry | Feature-gated (`--features observability-otel`) |
 | Cron / scheduled tasks | Stable |
 | Tunnel | Implemented · needs validation |
@@ -78,14 +78,20 @@ rantaiclaw cron pause <id> | resume <id> | remove <id>
 
 ```toml
 [gateway]
-bind = "127.0.0.1:8080"
-auth_token = "..."
+host = "127.0.0.1"
+port = 8080
+require_pairing = true
 
 [observability]
-log_dir = "~/.rantaiclaw/logs"
-prometheus = true
-otel_endpoint = "http://localhost:4317"
+backend = "prometheus"          # "none" | "log" | "prometheus" | "otel"
+otel_endpoint = "http://localhost:4318"   # backend = "otel" only
+otel_service_name = "rantaiclaw"
 ```
+
+Every key above exists. The block this doc carried until schema v29 did not:
+`[gateway] bind` / `auth_token` and `[observability] log_dir` / `prometheus` are
+not fields of anything, so a config written from it loaded as defaults and warned
+`unknown config key`.
 
 Live config:
 

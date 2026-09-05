@@ -112,7 +112,7 @@ impl Tool for CronRunTool {
         }
 
         let (success, output) =
-            cron::scheduler::run_job_manual(&self.config, &self.security, &job).await;
+            cron::scheduler::run_job_manual(&self.config, &self.security, &job, None).await;
         let status = if success { "ok" } else { "error" };
 
         Ok(ToolResult {

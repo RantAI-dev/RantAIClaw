@@ -2360,7 +2360,8 @@ impl TuiApp {
                     let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
                 }
                 crate::channels::auto_start_state::mark_starting();
-                match crate::channels::start_channels_with_cancellation(cfg, task_token).await {
+                match crate::channels::start_channels_with_cancellation(cfg, task_token, None).await
+                {
                     Ok(()) => {
                         crate::channels::auto_start_state::mark_terminated();
                     }
@@ -3499,7 +3500,8 @@ impl TuiApp {
                 let security =
                     crate::security::SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir);
                 tokio::spawn(async move {
-                    let _ = crate::cron::scheduler::run_job_manual(&cfg, &security, &job).await;
+                    let _ =
+                        crate::cron::scheduler::run_job_manual(&cfg, &security, &job, None).await;
                 });
                 self.cron_system_msg(&format!(
                     "▶ Started run of cron job {id} — reopen the job for the result."
