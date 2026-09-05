@@ -236,6 +236,36 @@ pub fn normalize_provider(provider: &str) -> Result<String> {
     }
 }
 
+/// Whether an auth profile exists for `provider`, read synchronously.
+///
+/// `AuthService::get_profile` is async and takes the store lock; this is a
+/// presence check on the same file for callers that must stay offline and
+/// cheap. `has_usable_credential` is one — `doctor` calls it on a fast path —
+/// and it only needs to know whether `rantaiclaw auth login` has been run, not
+/// what the token is. No decryption: an encrypted token is still a token.
+///
+/// Any read failure answers `false`: an unreadable or malformed store is not a
+/// credential the provider could send with either.
+pub fn has_auth_profile(state_dir: &Path, provider: &str) -> bool {
+    let Ok(provider) = normalize_provider(provider) else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(state_dir.join(profiles::PROFILES_FILENAME)) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    parsed
+        .get("profiles")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|profiles| {
+            profiles.values().any(|profile| {
+                profile.get("provider").and_then(serde_json::Value::as_str) == Some(&provider)
+            })
+        })
+}
+
 pub fn state_dir_from_config(config: &Config) -> PathBuf {
     config
         .config_path

@@ -79,14 +79,38 @@ impl DoctorCheck for ProviderPingCheck {
         // this check reported "provider responded 200 OK" for a config that
         // cannot send a single message. Local providers legitimately need no
         // key; everyone else without one is a hard fail, not a probe.
-        if api_key.is_none() && !crate::providers::provider_is_local(provider) {
+        // Same question as `config.provider_key`, so the two agree: an install
+        // authenticated by an OAuth profile, a cached token or AWS env vars is
+        // usable even with no key to send in a probe header.
+        let usable = crate::providers::has_usable_credential(
+            provider,
+            api_key.as_deref(),
+            Some(&crate::auth::state_dir_from_config(&ctx.config)),
+        );
+
+        // Usable, but not by a bearer this check could put in a header — an
+        // auth profile, a cached OAuth token, AWS request signing. Probing
+        // unauthenticated would draw a 401 and report a working install as
+        // broken, which is the same false verdict in the other direction.
+        if usable && api_key.is_none() && !crate::providers::provider_is_local(provider) {
+            return CheckResult::ok(
+                self.name(),
+                format!(
+                    "{provider} is authenticated by its own auth mode (not an API key) — \
+                     not probing; this check can only send a bearer"
+                ),
+            )
+            .with_category(self.category());
+        }
+
+        if !usable {
             // Warn, not Fail: a missing key is a setup gap (same as
             // `config.provider_key`), not a probe failure. Still refuses to
             // probe — a public endpoint answering 200 proves nothing — and
             // still surfaces it with a hint.
             return CheckResult::warn(
                 self.name(),
-                format!("no API key for {provider} — not probing; a public endpoint would answer 200 and prove nothing"),
+                format!("no credential for {provider} — not probing; a public endpoint would answer 200 and prove nothing"),
             )
             .with_category(self.category())
             .with_hint("run: rantaiclaw setup provider");
@@ -262,12 +286,53 @@ mod tests {
     /// fails on the message, not on the network.
     #[tokio::test]
     async fn ping_refuses_to_probe_without_a_key_rather_than_reporting_ok() {
+        // The check now asks `has_usable_credential`, which reads the
+        // environment — so this must own the environment, or a developer with
+        // `OPENROUTER_API_KEY` exported gets the opposite verdict.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
         let mut cfg = Config::default();
         cfg.api_key = None;
         let check = ProviderPingCheck::with_endpoint("http://127.0.0.1:1/models");
         let result = check.run(&ctx(cfg)).await;
         assert_eq!(result.severity, Severity::Warn, "msg: {}", result.message);
-        assert!(result.message.contains("no API key"), "{}", result.message);
+        assert!(
+            result.message.contains("no credential"),
+            "{}",
+            result.message
+        );
+    }
+
+    /// A provider authenticated by something that is not a bearer — an auth
+    /// profile, a cached OAuth token, AWS request signing — must not be probed
+    /// unauthenticated. The endpoint would answer 401 and this check would
+    /// report a working install as broken: the same false verdict as the bug
+    /// it replaced, pointing the other way.
+    #[tokio::test]
+    async fn ping_does_not_probe_unauthenticated_when_the_credential_is_not_a_key() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("config home");
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", home.path());
+
+        let dir = home.path().join("rantaiclaw").join("copilot");
+        std::fs::create_dir_all(&dir).expect("copilot dir");
+        std::fs::write(dir.join("access-token"), "gho_neutral_placeholder_value")
+            .expect("write token");
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("copilot".into());
+        cfg.api_key = None;
+        let check = ProviderPingCheck::with_endpoint("http://127.0.0.1:1/models");
+        let result = check.run(&ctx(cfg)).await;
+
+        assert_eq!(result.severity, Severity::Ok, "msg: {}", result.message);
+        assert!(
+            result.message.contains("not probing"),
+            "it must say it did not probe: {}",
+            result.message
+        );
     }
 
     /// Local providers have no key by design; refusing to probe them would

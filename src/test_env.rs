@@ -32,6 +32,47 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 /// instead leaves the test writing into the operator's real session history.
 ///
 /// Only meaningful while `ENV_LOCK` is held.
+/// Unset every credential variable a test must not inherit from the developer's
+/// own shell, restoring them all on drop.
+///
+/// `has_usable_credential` reads the environment, so any test asserting "no
+/// credential anywhere" passes vacuously on a machine with `OPENROUTER_API_KEY`
+/// exported — and asserts the opposite of what it means on a machine without
+/// it. Both doctor and providers need this, so it lives here rather than as a
+/// third copy.
+///
+/// Only meaningful while [`ENV_LOCK`] is held.
+pub(crate) struct CredentialEnvScrub(#[allow(dead_code)] Vec<EnvGuard>);
+
+impl CredentialEnvScrub {
+    pub(crate) fn new() -> Self {
+        Self(
+            [
+                "RANTAICLAW_API_KEY",
+                "API_KEY",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_OAUTH_TOKEN",
+                "OPENROUTER_API_KEY",
+                "GROQ_API_KEY",
+                "OLLAMA_API_KEY",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "DASHSCOPE_API_KEY",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "QWEN_OAUTH_TOKEN",
+                "QWEN_OAUTH_REFRESH_TOKEN",
+                "XDG_CONFIG_HOME",
+            ]
+            .into_iter()
+            .map(EnvGuard::unset)
+            .collect(),
+        )
+    }
+}
+
 pub(crate) struct HomeGuard(Option<OsString>);
 
 impl HomeGuard {

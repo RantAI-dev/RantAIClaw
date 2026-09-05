@@ -45,7 +45,7 @@ pub use traits::{
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MAX_API_ERROR_CHARS: usize = 200;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -852,16 +852,79 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// explicit config/api_key value) or a provider-specific env var. Providers that
 /// need no key (or none is configured/env-set) return `false`; the gateway uses
 /// this to warn when a switched provider likely can't be used.
-pub fn has_usable_credential(name: &str, config_key: Option<&str>) -> bool {
+pub fn has_usable_credential(
+    name: &str,
+    config_key: Option<&str>,
+    state_dir: Option<&Path>,
+) -> bool {
+    // Nothing is missing: these run locally and `create_provider` substitutes a
+    // placeholder where the OpenAI-compatible client wants a bearer at all.
+    // Answering here rather than at each caller is what removes the carve-outs.
+    if provider_is_local(name) {
+        return true;
+    }
+
     if resolve_provider_credential(name, config_key).is_some() {
         return true;
     }
+
     // Gemini CLI OAuth has no API key / env var but is a usable credential — it
     // is routed to the legacy cloudcode-pa path. Report it as configured so
     // `doctor` and the setup wizard don't tell CLI-authed users they're
     // unconfigured (plan 025).
-    matches!(name, "gemini" | "google" | "google-gemini")
+    if matches!(name, "gemini" | "google" | "google-gemini")
         && gemini_cli::gemini_cli_has_credentials()
+    {
+        return true;
+    }
+
+    // `BedrockProvider::new()` ignores the `key` argument entirely and reads
+    // `AwsCredentials::from_env`, so the resolver — which returns `None` for
+    // bedrock by design — can never see this. Ask the provider's own check.
+    if matches!(name, "bedrock" | "aws-bedrock") && bedrock::has_env_credentials() {
+        return true;
+    }
+
+    // `OpenAiCodexProvider::new(options)` ignores `key` too and reads an auth
+    // profile out of `<state_dir>/auth-profiles.json`.
+    //
+    // With no state dir the caller could not tell us where to look, so this
+    // branch answers `true` rather than inventing a missing credential — a
+    // false negative here would be produced by the CALL SITE, not the install.
+    if matches!(name, "openai-codex" | "openai_codex" | "codex") {
+        return state_dir.is_none_or(|dir| crate::auth::has_auth_profile(dir, name));
+    }
+
+    // Qwen OAuth resolves through `resolve_qwen_oauth_context`, not through the
+    // credential resolver — whose qwen arm only knows `DASHSCOPE_API_KEY`.
+    if is_qwen_oauth_alias(name) && qwen_oauth_has_credentials() {
+        return true;
+    }
+
+    // `CopilotProvider` falls back to a cached GitHub token before it would
+    // start an interactive device-code login. The cache is a credential it can
+    // send with; the device flow needs a human and is not reachable at send
+    // time, so it does not count.
+    if matches!(name, "copilot" | "github-copilot") && copilot::has_cached_token() {
+        return true;
+    }
+
+    false
+}
+
+/// Whether Qwen OAuth has a credential the provider would use — the env token
+/// or refresh token, or the cached credentials file `resolve_qwen_oauth_context`
+/// reads.
+fn qwen_oauth_has_credentials() -> bool {
+    read_non_empty_env(QWEN_OAUTH_TOKEN_ENV).is_some()
+        || read_non_empty_env(QWEN_OAUTH_REFRESH_TOKEN_ENV).is_some()
+        || read_qwen_oauth_cached_credentials().is_some_and(|creds| {
+            creds
+                .access_token
+                .as_deref()
+                .or(creds.refresh_token.as_deref())
+                .is_some_and(|token| !token.trim().is_empty())
+        })
 }
 
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
@@ -1810,11 +1873,15 @@ mod tests {
         }
     }
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
+    /// The CRATE-shared env lock, not a module-local one.
+    ///
+    /// `cargo test --lib` runs every unit test in one process across many
+    /// threads, so a per-module mutex does not serialise these against the
+    /// env-mutating tests in `config`, `channels` or `lifecycle` — they hold a
+    /// different lock and clobber each other's variables mid-test. This project
+    /// has already been bitten by exactly that fragmentation.
+    fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::test_env::ENV_LOCK.blocking_lock()
     }
 
     #[test]
@@ -2174,6 +2241,172 @@ mod tests {
         assert!(!is_anthropic_setup_token(None));
     }
 
+    /// Bedrock is the case that must not regress: `BedrockProvider::new()`
+    /// ignores the `key` argument entirely and reads `AwsCredentials::from_env`,
+    /// so an install authenticated only by AWS environment variables sends fine
+    /// while the resolver returns `None` for it.
+    #[test]
+    fn bedrock_is_usable_with_only_aws_env_credentials() {
+        let _env_lock = env_lock();
+        let _clear = crate::test_env::CredentialEnvScrub::new();
+
+        for name in ["bedrock", "aws-bedrock"] {
+            assert!(
+                !has_usable_credential(name, None, None),
+                "{name} with no AWS credentials is not usable"
+            );
+        }
+
+        let _id = crate::test_env::EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEPLACEHOLDER");
+        let _secret =
+            crate::test_env::EnvGuard::set("AWS_SECRET_ACCESS_KEY", "neutral-aws-secret-value");
+
+        for name in ["bedrock", "aws-bedrock"] {
+            assert!(
+                has_usable_credential(name, None, None),
+                "{name} authenticated by AWS env vars must read as usable"
+            );
+        }
+    }
+
+    /// Codex ignores `key` too: `OpenAiCodexProvider::new(options)` reads an
+    /// auth profile out of `<state_dir>/auth-profiles.json`.
+    #[test]
+    fn codex_is_usable_with_only_an_auth_profile() {
+        let _env_lock = env_lock();
+        let _clear = crate::test_env::CredentialEnvScrub::new();
+        let dir = tempfile::tempdir().expect("state dir");
+
+        for name in ["openai-codex", "codex"] {
+            assert!(
+                !has_usable_credential(name, None, Some(dir.path())),
+                "{name} with no profile is not usable"
+            );
+        }
+
+        std::fs::write(
+            dir.path().join("auth-profiles.json"),
+            r#"{"schema_version":1,"updated_at":"2026-01-01T00:00:00Z",
+                "active_profiles":{"openai-codex":"openai-codex:default"},
+                "profiles":{"openai-codex:default":{
+                    "provider":"openai-codex","profile_name":"default","kind":"oauth"}}}"#,
+        )
+        .expect("write profile store");
+
+        for name in ["openai-codex", "codex"] {
+            assert!(
+                has_usable_credential(name, None, Some(dir.path())),
+                "{name} with an auth profile must read as usable"
+            );
+        }
+    }
+
+    /// A state dir the caller could not supply must not be reported as a
+    /// missing credential — that would be a false negative invented by the
+    /// call site rather than by the install.
+    #[test]
+    fn codex_without_a_state_dir_is_not_judged() {
+        let _env_lock = env_lock();
+        let _clear = crate::test_env::CredentialEnvScrub::new();
+        assert!(
+            has_usable_credential("openai-codex", None, None),
+            "with no state dir to read, the honest answer is not `unusable`"
+        );
+    }
+
+    /// Qwen OAuth resolves through `resolve_qwen_oauth_context`, which the
+    /// credential resolver never sees: its qwen arm only knows
+    /// `DASHSCOPE_API_KEY`.
+    #[test]
+    fn qwen_oauth_is_usable_from_its_env_token() {
+        let _env_lock = env_lock();
+        let _clear = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+
+        assert!(!has_usable_credential("qwen-code", None, None));
+
+        let _token = crate::test_env::EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, "neutral-qwen-token");
+        assert!(
+            has_usable_credential("qwen-code", None, None),
+            "an env OAuth token is a credential the provider will use"
+        );
+    }
+
+    #[test]
+    fn qwen_oauth_is_usable_from_its_cached_credentials_file() {
+        let _env_lock = env_lock();
+        let _clear = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+
+        assert!(!has_usable_credential("qwen-oauth", None, None));
+
+        let creds = home.path().join(QWEN_OAUTH_CREDENTIAL_FILE);
+        std::fs::create_dir_all(creds.parent().expect("parent")).expect("qwen dir");
+        std::fs::write(&creds, r#"{"access_token":"neutral-qwen-cached-token"}"#)
+            .expect("write creds");
+
+        assert!(
+            has_usable_credential("qwen-oauth", None, None),
+            "the cached OAuth credentials the provider reads must count"
+        );
+    }
+
+    /// Copilot falls back to a cached GitHub token; without one the only path
+    /// left is an interactive device-code login, which is not a credential
+    /// reachable at send time.
+    #[test]
+    fn copilot_is_usable_from_its_cached_token() {
+        let _env_lock = env_lock();
+        let _clear = crate::test_env::CredentialEnvScrub::new();
+        let config_home = tempfile::tempdir().expect("config home");
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", config_home.path());
+
+        assert!(!has_usable_credential("copilot", None, None));
+
+        let dir = config_home.path().join("rantaiclaw").join("copilot");
+        std::fs::create_dir_all(&dir).expect("copilot dir");
+        std::fs::write(dir.join("access-token"), "gho_neutral_placeholder_value")
+            .expect("write token");
+
+        assert!(
+            has_usable_credential("copilot", None, None),
+            "a cached GitHub token is what the provider sends with"
+        );
+    }
+
+    /// A local provider needs no credential at all, so nothing is missing.
+    #[test]
+    fn local_providers_need_no_credential() {
+        let _env_lock = env_lock();
+        let _clear = crate::test_env::CredentialEnvScrub::new();
+
+        for name in ["ollama", "lmstudio", "llamacpp"] {
+            assert!(
+                has_usable_credential(name, None, None),
+                "{name} runs locally and needs no key"
+            );
+        }
+    }
+
+    /// The other direction, which matters just as much: a plain-API-key
+    /// provider with nothing anywhere must still read as unusable. A wrong
+    /// `true` here restores the original defect — an install saved that cannot
+    /// send.
+    #[test]
+    fn a_plain_key_provider_with_no_credential_anywhere_is_unusable() {
+        let _env_lock = env_lock();
+        let _clear = crate::test_env::CredentialEnvScrub::new();
+
+        for name in ["openai", "anthropic", "openrouter", "groq"] {
+            assert!(
+                !has_usable_credential(name, None, None),
+                "{name} has no credential and must not read as configured"
+            );
+        }
+    }
+
     #[test]
     fn has_usable_credential_gemini_env_and_config() {
         // Plan 025 (diagnostics): doctor/setup must see gemini env + config keys
@@ -2184,9 +2417,9 @@ mod tests {
         let prev_goog = std::env::var_os("GOOGLE_API_KEY");
         std::env::remove_var("GEMINI_API_KEY");
         std::env::remove_var("GOOGLE_API_KEY");
-        assert!(has_usable_credential("gemini", Some("cfg-key")));
+        assert!(has_usable_credential("gemini", Some("cfg-key"), None));
         std::env::set_var("GOOGLE_API_KEY", "AIzaSy-goog");
-        let via_env = has_usable_credential("gemini", None);
+        let via_env = has_usable_credential("gemini", None, None);
         match prev_g {
             Some(v) => std::env::set_var("GEMINI_API_KEY", v),
             None => std::env::remove_var("GEMINI_API_KEY"),

@@ -2949,6 +2949,7 @@ mod tests {
     #[tokio::test]
     async fn a_keyless_remote_provider_is_refused_headlessly() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
         let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
         let _b = crate::test_env::EnvGuard::unset("API_KEY");
         let _c = crate::test_env::EnvGuard::unset("OPENAI_API_KEY");
@@ -2966,6 +2967,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_provider_needs_no_key() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
         let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
         let _b = crate::test_env::EnvGuard::unset("API_KEY");
         let _c = crate::test_env::EnvGuard::unset("OLLAMA_API_KEY");
@@ -2977,20 +2979,31 @@ mod tests {
         .is_none());
     }
 
-    /// Bedrock resolves AWS AKSK inside `BedrockProvider`, and
-    /// `resolve_provider_credential` returns `None` for it BY DESIGN — so a
-    /// missing credential is not conclusive there and must not abort the run.
+    /// Bedrock used to be carved out here because `has_usable_credential` was
+    /// blind to it. It is not blind any more (plan 301), so this call site asks
+    /// the one question and gets a real answer in both directions.
     #[tokio::test]
-    async fn bedrock_is_not_judged_by_a_check_that_cannot_see_its_credentials() {
+    async fn bedrock_is_judged_on_the_credentials_it_actually_uses() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
-        let _b = crate::test_env::EnvGuard::unset("API_KEY");
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        for name in ["bedrock", "aws-bedrock"] {
+            assert!(
+                unusable_provider_after_headless_setup("provider", &config_with_provider(name))
+                    .is_some(),
+                "{name} with no AWS credentials cannot send"
+            );
+        }
+
+        let _id = crate::test_env::EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEPLACEHOLDER");
+        let _secret =
+            crate::test_env::EnvGuard::set("AWS_SECRET_ACCESS_KEY", "neutral-aws-secret-value");
 
         for name in ["bedrock", "aws-bedrock"] {
             assert!(
                 unusable_provider_after_headless_setup("provider", &config_with_provider(name))
                     .is_none(),
-                "{name} must not be refused on a check that cannot see AWS credentials"
+                "{name} authenticated by AWS env vars is a usable install"
             );
         }
     }
@@ -3000,6 +3013,7 @@ mod tests {
     #[tokio::test]
     async fn other_provisioners_are_not_judged_on_provider_credentials() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
         let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
         let _b = crate::test_env::EnvGuard::unset("API_KEY");
 
@@ -3173,14 +3187,11 @@ fn headless_choice(multi: bool, asked_before: bool) -> HeadlessChoice {
 /// NOT that question: it answers whether the provider STRUCT builds, which is
 /// true for `openrouter` even though every request would 401.
 ///
-/// Two exclusions, both traceable to existing code rather than a new list:
-///
-/// * Local providers need no key at all — `provider_is_local` reads
-///   `ProviderInfo::local`, which its own doc names as the source of truth.
-/// * Bedrock resolves AWS AKSK inside `BedrockProvider`, and
-///   `resolve_provider_credential` returns `None` for it by design, so a
-///   missing credential is not conclusive there. That gap is real and also
-///   affects `doctor` and the config API; fixing it is a separate task.
+/// There are no exclusions here any more. `has_usable_credential` answers for
+/// every auth mode the factory actually uses — local providers, AWS env vars,
+/// auth profiles, cached OAuth tokens — so this call site does not need to know
+/// which providers are special. The Bedrock carve-out this function used to
+/// carry is gone with it (plan 301).
 fn unusable_provider_after_headless_setup(
     provisioner_name: &str,
     config: &Config,
@@ -3189,13 +3200,11 @@ fn unusable_provider_after_headless_setup(
         return None;
     }
     let name = config.default_provider.as_deref()?;
-    if rantaiclaw::providers::provider_is_local(name) {
-        return None;
-    }
-    if matches!(name, "bedrock" | "aws-bedrock") {
-        return None;
-    }
-    if rantaiclaw::providers::has_usable_credential(name, config.api_key.as_deref()) {
+    if rantaiclaw::providers::has_usable_credential(
+        name,
+        config.resolve_key_for_provider(name).as_deref(),
+        Some(&crate::auth::state_dir_from_config(config)),
+    ) {
         return None;
     }
     Some(format!(
