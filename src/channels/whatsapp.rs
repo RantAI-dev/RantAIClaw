@@ -115,6 +115,16 @@ impl WhatsAppChannel {
         self
     }
 
+    /// The `[multimodal]` limits this instance carries.
+    ///
+    /// Exposed so a caller can assert it was built through
+    /// `channels::factory::build_whatsapp_cloud` rather than constructed ad hoc:
+    /// the gateway used to build its own instance and skip `with_multimodal`,
+    /// so webhook traffic ran without the operator's image caps.
+    pub(crate) fn multimodal(&self) -> &crate::config::MultimodalConfig {
+        &self.multimodal
+    }
+
     /// Apply the operator's `[multimodal]` limits to inbound images.
     #[must_use]
     pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {

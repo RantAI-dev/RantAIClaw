@@ -58,6 +58,12 @@ impl LinqChannel {
         }
     }
 
+    /// The `[multimodal]` limits this instance carries. See
+    /// `WhatsAppChannel::multimodal` — Linq carried the identical drift.
+    pub(crate) fn multimodal(&self) -> &crate::config::MultimodalConfig {
+        &self.multimodal
+    }
+
     /// Apply the operator's `[multimodal]` limits to inbound images.
     #[must_use]
     pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
