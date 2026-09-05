@@ -37,6 +37,7 @@ impl BenchProvider {
     fn text_only(text: &str) -> Self {
         Self {
             responses: Mutex::new(vec![ChatResponse {
+                usage: None,
                 text: Some(text.into()),
                 tool_calls: vec![],
             }]),
@@ -47,6 +48,7 @@ impl BenchProvider {
         Self {
             responses: Mutex::new(vec![
                 ChatResponse {
+                    usage: None,
                     text: Some(String::new()),
                     tool_calls: vec![ToolCall {
                         id: "tc1".into(),
@@ -55,6 +57,7 @@ impl BenchProvider {
                     }],
                 },
                 ChatResponse {
+                    usage: None,
                     text: Some("done".into()),
                     tool_calls: vec![],
                 },
@@ -84,6 +87,7 @@ impl Provider for BenchProvider {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
+                usage: None,
                 text: Some("done".into()),
                 tool_calls: vec![],
             });
@@ -142,6 +146,7 @@ fn bench_xml_parsing(c: &mut Criterion) {
     let dispatcher = XmlToolDispatcher;
 
     let single_tool = ChatResponse {
+        usage: None,
         text: Some(
             r#"Here is my analysis.
 <tool_call>
@@ -154,6 +159,7 @@ Let me know if you need more."#
     };
 
     let multi_tool = ChatResponse {
+        usage: None,
         text: Some(
             r#"<tool_call>
 {"name": "read_file", "arguments": {"path": "src/main.rs"}}
@@ -186,6 +192,7 @@ fn bench_native_parsing(c: &mut Criterion) {
     let dispatcher = NativeToolDispatcher;
 
     let response = ChatResponse {
+        usage: None,
         text: Some("I'll help you.".into()),
         tool_calls: vec![
             ToolCall {

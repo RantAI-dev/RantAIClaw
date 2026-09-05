@@ -238,6 +238,7 @@ mod tests {
     #[test]
     fn xml_dispatcher_parses_tool_calls() {
         let response = ChatResponse {
+            usage: None,
             text: Some(
                 "Checking\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
                     .into(),
@@ -253,6 +254,7 @@ mod tests {
     #[test]
     fn native_dispatcher_roundtrip() {
         let response = ChatResponse {
+            usage: None,
             text: Some("ok".into()),
             tool_calls: vec![crate::providers::ToolCall {
                 id: "tc1".into(),

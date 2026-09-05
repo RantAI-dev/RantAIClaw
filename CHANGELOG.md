@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Token counts are real where a provider reports them.** Every token count in
+  the product was a hard-coded zero: no client parsed the `usage` block the major
+  APIs return, and `ChatResponse` had nowhere to put one. `ChatResponse` now
+  carries `Option<ProviderUsage>`, populated on the rig path (Anthropic, OpenAI
+  and Gemini — the default backend for most providers) and summed across a turn's
+  provider calls. **`None` and `Some(0)` are different answers**: a backend that
+  reports nothing yields `None`, and the surfaces get no `Usage` event at all
+  rather than a zero that reads as a measurement. Cost is still `0.0` — pricing is
+  the enforcement half of plan 306 and is not in this change.
+
 - **Wire-shape tests for the three provider client families.** `chat` and
   `chat_stream` on `RigProvider` — the default path for Anthropic, OpenAI and
   Gemini — had no response-shape coverage; the Ollama client had none either.
@@ -28,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs on defaults — enabled, 100 MB rotation.
 
 ### Changed
+
+- **Exactly one `Usage` event per turn, on both agent paths.** The interactive
+  path emitted two (the shared loop and `Agent::turn_streaming` each sent one) and
+  the channel/gateway/CLI path emitted none on any turn that used a tool.
+  `TurnResult::usage` is now `Option<TokenUsage>`, and the gateway's SSE filter
+  that dropped zero-valued usage events is gone — nothing emits one any more.
 
 - **One metrics registry per process.** `create_observer` was called from six
   places, each building its own `PrometheusObserver` with its own registry, and

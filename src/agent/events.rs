@@ -128,7 +128,9 @@ pub enum AgentEvent {
 #[derive(Debug, Clone)]
 pub struct TurnResult {
     pub text: String,
-    pub usage: TokenUsage,
+    /// Token counts, when the provider reported them. `None` means unknown —
+    /// which is not the same as zero, and is why this is an `Option`.
+    pub usage: Option<TokenUsage>,
     pub cancelled: bool,
 }
 

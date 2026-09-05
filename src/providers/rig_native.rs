@@ -524,8 +524,13 @@ impl Provider for RigProvider {
                     .completion(req)
                     .await
                     .with_context(|| format!("rig anthropic completion failed (model={model})"))?;
+                let usage = usage_from_rig(&resp.usage);
                 let (text, tool_calls) = flatten_assistant(resp.choice);
-                Ok(ChatResponse { text, tool_calls })
+                Ok(ChatResponse {
+                    usage,
+                    text,
+                    tool_calls,
+                })
             }
             RigClient::OpenAi(c) => {
                 let m = c.completion_model(model);
@@ -533,8 +538,13 @@ impl Provider for RigProvider {
                     .completion(req)
                     .await
                     .with_context(|| format!("rig openai completion failed (model={model})"))?;
+                let usage = usage_from_rig(&resp.usage);
                 let (text, tool_calls) = flatten_assistant(resp.choice);
-                Ok(ChatResponse { text, tool_calls })
+                Ok(ChatResponse {
+                    usage,
+                    text,
+                    tool_calls,
+                })
             }
             RigClient::Gemini(c) => {
                 let m = c.completion_model(model);
@@ -542,8 +552,13 @@ impl Provider for RigProvider {
                     .completion(req)
                     .await
                     .with_context(|| format!("rig gemini completion failed (model={model})"))?;
+                let usage = usage_from_rig(&resp.usage);
                 let (text, tool_calls) = flatten_assistant(resp.choice);
-                Ok(ChatResponse { text, tool_calls })
+                Ok(ChatResponse {
+                    usage,
+                    text,
+                    tool_calls,
+                })
             }
         }
     }
@@ -584,6 +599,15 @@ impl Provider for RigProvider {
         // here but that costs the user real money. No-op for now.
         Ok(())
     }
+}
+
+/// Translate rig's non-optional `Usage` into our optional one.
+///
+/// rig fills the struct with zeros when the provider omitted the block, so a
+/// straight `Some(..)` would put "0 tokens" back on every surface as though it
+/// were measured. `ProviderUsage::from_counts` is where that collapse lives.
+fn usage_from_rig(u: &rig_core::completion::Usage) -> Option<crate::providers::ProviderUsage> {
+    crate::providers::ProviderUsage::from_counts(u.input_tokens, u.output_tokens, u.total_tokens)
 }
 
 /// Generic stream handler — works for any `CompletionModel` because
@@ -706,6 +730,7 @@ where
         Some(full_text)
     };
     Ok(ChatResponse {
+        usage: None,
         text: text_opt,
         // rig may surface a tool call via both the immediate-complete event and
         // the delta path; collapse same-id duplicates before they reach the
@@ -802,12 +827,68 @@ mod tests {
         assert_eq!(tool["input_schema"]["properties"]["city"]["type"], "string");
 
         assert_eq!(resp.text.as_deref(), Some("checking that"));
+        let usage = resp.usage.expect("anthropic reported usage in the fixture");
+        assert_eq!(usage.input_tokens, 4);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(
+            usage.total_tokens, 13,
+            "derived when the wire omits a total"
+        );
         assert_eq!(resp.tool_calls.len(), 1, "resp was {resp:?}");
         assert_eq!(resp.tool_calls[0].id, "toolu_1");
         assert_eq!(resp.tool_calls[0].name, "get_weather");
         let args: serde_json::Value =
             serde_json::from_str(&resp.tool_calls[0].arguments).expect("arguments are JSON");
         assert_eq!(args["city"], "Jakarta");
+    }
+
+    /// The rule the whole change rests on: a provider that reports nothing must
+    /// yield `None`, not `Some(0)`. rig models usage as a non-optional struct
+    /// left at zero when the block is absent, so without the collapse in
+    /// `ProviderUsage::from_counts` this fixture would put "0 tokens" back on
+    /// every surface as though it had been measured.
+    #[tokio::test]
+    async fn a_response_with_no_usage_block_reports_none_not_zero() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "type": "message",
+                    "id": "msg_no_usage",
+                    "model": "claude-3-haiku-20240307",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "no usage here"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            RigProvider::for_provider_with_url("anthropic", Some("k"), Some(&server.uri()))
+                .expect("construct");
+        let messages = vec![ChatMessage::user("hi")];
+        let resp = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "claude-3-haiku-20240307",
+                0.2,
+            )
+            .await
+            .expect("chat against the mock");
+
+        assert_eq!(resp.text.as_deref(), Some("no usage here"));
+        assert!(
+            resp.usage.is_none(),
+            "an all-zero report means unknown, not zero: {:?}",
+            resp.usage
+        );
     }
 
     #[tokio::test]
@@ -875,6 +956,10 @@ mod tests {
         );
 
         assert_eq!(resp.text.as_deref(), Some("checking that"));
+        let usage = resp.usage.expect("openai reported usage in the fixture");
+        assert_eq!(usage.input_tokens, 4);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.total_tokens, 13);
         assert_eq!(resp.tool_calls.len(), 1, "resp was {resp:?}");
         assert_eq!(resp.tool_calls[0].id, "call_1");
         assert_eq!(resp.tool_calls[0].name, "get_weather");

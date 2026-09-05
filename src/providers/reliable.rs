@@ -1706,6 +1706,7 @@ mod tests {
                 anyhow::bail!(self.error);
             }
             Ok(ChatResponse {
+                usage: None,
                 text: Some(self.response_text.to_string()),
                 tool_calls: self.tool_calls.clone(),
             })
@@ -1897,6 +1898,7 @@ mod tests {
                 anyhow::bail!("500 model {} unavailable", model);
             }
             Ok(ChatResponse {
+                usage: None,
                 text: Some(self.response_text.to_string()),
                 tool_calls: vec![],
             })
@@ -2056,6 +2058,7 @@ mod tests {
             }
             match self.stream_result {
                 Ok(text) => Ok(ChatResponse {
+                    usage: None,
                     text: Some(text.to_string()),
                     tool_calls: vec![],
                 }),

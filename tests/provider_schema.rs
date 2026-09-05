@@ -151,6 +151,7 @@ fn tool_response_message_can_embed_tool_call_id() {
 #[test]
 fn chat_response_text_only() {
     let resp = ChatResponse {
+        usage: None,
         text: Some("Hello world".into()),
         tool_calls: vec![],
     };
@@ -162,6 +163,7 @@ fn chat_response_text_only() {
 #[test]
 fn chat_response_with_tool_calls() {
     let resp = ChatResponse {
+        usage: None,
         text: Some(String::new()),
         tool_calls: vec![ToolCall {
             id: "tc_1".into(),
@@ -178,6 +180,7 @@ fn chat_response_with_tool_calls() {
 #[test]
 fn chat_response_text_or_empty_handles_none() {
     let resp = ChatResponse {
+        usage: None,
         text: None,
         tool_calls: vec![],
     };
@@ -188,6 +191,7 @@ fn chat_response_text_or_empty_handles_none() {
 #[test]
 fn chat_response_multiple_tool_calls() {
     let resp = ChatResponse {
+        usage: None,
         text: None,
         tool_calls: vec![
             ToolCall {

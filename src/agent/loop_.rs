@@ -1657,7 +1657,12 @@ pub(crate) async fn run_structured_loop(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     events: Option<AgentEventSender>,
-) -> Result<String> {
+) -> Result<(String, Option<crate::providers::ProviderUsage>)> {
+    // A turn can make several provider calls (one per tool iteration). The
+    // caller wants the turn's total, and a call that reported nothing must not
+    // drag a reported one down to zero — `merge` keeps `None` absorbing.
+    let mut turn_usage: Option<crate::providers::ProviderUsage> = None;
+
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -1757,6 +1762,7 @@ pub(crate) async fn run_structured_loop(
         let (response_text, parsed_text, tool_calls, native_tool_calls) = match chat_result {
             Ok(ChatTurnOutcome::Cancelled) => return Err(ToolLoopCancelled.into()),
             Ok(ChatTurnOutcome::Completed(resp)) => {
+                turn_usage = crate::providers::ProviderUsage::merge(turn_usage, resp.usage);
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
                     model: model.to_string(),
@@ -1851,11 +1857,7 @@ pub(crate) async fn run_structured_loop(
             history.push(ConversationMessage::Chat(ChatMessage::assistant(
                 response_text.clone(),
             )));
-            if let Some(ref tx) = events {
-                let usage = crate::cost::TokenUsage::new(model, 0, 0, 0.0, 0.0);
-                let _ = tx.send(AgentEvent::Usage(usage)).await;
-            }
-            return Ok(display_text);
+            return Ok((display_text, turn_usage));
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -1925,7 +1927,7 @@ pub(crate) async fn run_structured_loop(
                      take. Do not retry the same call.",
                     key.0, repeats
                 );
-                return force_final_summary(
+                let summary = force_final_summary(
                     provider,
                     history,
                     dispatcher,
@@ -1939,7 +1941,11 @@ pub(crate) async fn run_structured_loop(
                     on_delta.as_ref(),
                     nudge,
                 )
-                .await;
+                .await?;
+                return Ok((
+                    summary.0,
+                    crate::providers::ProviderUsage::merge(turn_usage, summary.1),
+                ));
             }
         }
 
@@ -1968,7 +1974,7 @@ pub(crate) async fn run_structured_loop(
          going from here, they can type `/continue` to extend this turn with a fresh \
          tool-call budget."
     );
-    force_final_summary(
+    let summary = force_final_summary(
         provider,
         history,
         dispatcher,
@@ -1982,7 +1988,11 @@ pub(crate) async fn run_structured_loop(
         on_delta.as_ref(),
         nudge,
     )
-    .await
+    .await?;
+    Ok((
+        summary.0,
+        crate::providers::ProviderUsage::merge(turn_usage, summary.1),
+    ))
 }
 
 /// Backwards-compatible adapter for the channel/gateway/CLI/delegate callers
@@ -2024,6 +2034,9 @@ pub(crate) async fn run_tool_call_loop(
         .map(ConversationMessage::Chat)
         .collect();
 
+    // Cloned before the loop takes ownership: the per-turn `Usage` event is
+    // emitted after it returns.
+    let events_for_usage = events.clone();
     let result = run_structured_loop(
         provider,
         &mut conv,
@@ -2050,7 +2063,25 @@ pub(crate) async fn run_tool_call_loop(
     // Flatten structured history back to provider messages for the caller, on
     // success or error, so the caller's `history` reflects the turn's work.
     *history = dispatcher.to_provider_messages(&conv);
-    result
+
+    // This adapter owns the events channel for the channel/gateway/CLI paths, so
+    // it is where their single per-turn `Usage` event is emitted. Emitted only
+    // when a provider actually reported counts: no event means "unknown", and a
+    // zero-valued one would mean "measured zero" — the distinction the whole
+    // change exists to restore.
+    let (text, usage) = result?;
+    if let (Some(tx), Some(u)) = (events_for_usage.as_ref(), usage) {
+        let _ = tx
+            .send(AgentEvent::Usage(crate::cost::TokenUsage::new(
+                model,
+                u.input_tokens,
+                u.output_tokens,
+                0.0,
+                0.0,
+            )))
+            .await;
+    }
+    Ok(text)
 }
 
 /// Append a tools-disabled nudge to history and make one final provider
@@ -2071,7 +2102,7 @@ async fn force_final_summary(
     events: Option<&AgentEventSender>,
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
     nudge: String,
-) -> Result<String> {
+) -> Result<(String, Option<crate::providers::ProviderUsage>)> {
     history.push(ConversationMessage::Chat(ChatMessage::user(nudge)));
 
     let provider_msgs = dispatcher.to_provider_messages(history);
@@ -2118,6 +2149,7 @@ async fn force_final_summary(
         }
     };
 
+    let summary_usage = resp.usage;
     let text = resp.text_or_empty().to_string();
     let display_text = if text.is_empty() {
         "[turn ended without a model response — try `/retry` or `/continue`]".to_string()
@@ -2156,7 +2188,7 @@ async fn force_final_summary(
     }
 
     history.push(ConversationMessage::Chat(ChatMessage::assistant(text)));
-    Ok(display_text)
+    Ok((display_text, summary_usage))
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -3180,6 +3212,7 @@ mod tests {
             }
 
             Ok(ChatResponse {
+                usage: None,
                 text: Some("vision-ok".to_string()),
                 tool_calls: Vec::new(),
             })
@@ -3191,10 +3224,27 @@ mod tests {
     }
 
     impl ScriptedProvider {
+        /// Like [`Self::from_text_responses`] but every reply carries token
+        /// counts, for the tests that assert the `Usage` event.
+        fn from_text_responses_with_usage(responses: Vec<&str>) -> Self {
+            let scripted = responses
+                .into_iter()
+                .map(|text| ChatResponse {
+                    usage: crate::providers::ProviderUsage::from_counts(11, 7, 0),
+                    text: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                })
+                .collect();
+            Self {
+                responses: Arc::new(Mutex::new(scripted)),
+            }
+        }
+
         fn from_text_responses(responses: Vec<&str>) -> Self {
             let scripted = responses
                 .into_iter()
                 .map(|text| ChatResponse {
+                    usage: None,
                     text: Some(text.to_string()),
                     tool_calls: Vec::new(),
                 })
@@ -5505,7 +5555,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_emits_usage_event_before_returning() {
-        let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let provider = ScriptedProvider::from_text_responses_with_usage(vec!["done"]);
         let mut history = vec![ChatMessage::user("hi")];
         let tools_registry: Vec<Box<dyn Tool>> = vec![];
         let observer = crate::observability::NoopObserver;
@@ -5535,12 +5585,61 @@ Let me check the result."#;
         .await
         .unwrap();
 
-        let mut usage_seen = false;
+        let mut usage_events = Vec::new();
         while let Ok(ev) = events_rx.try_recv() {
-            if let crate::agent::events::AgentEvent::Usage(_) = ev {
-                usage_seen = true;
+            if let crate::agent::events::AgentEvent::Usage(u) = ev {
+                usage_events.push(u);
             }
         }
-        assert!(usage_seen, "expected Usage event before loop returned");
+        assert_eq!(
+            usage_events.len(),
+            1,
+            "exactly one Usage event per turn: {usage_events:?}"
+        );
+        assert_eq!(usage_events[0].input_tokens, 11);
+        assert_eq!(usage_events[0].output_tokens, 7);
+        assert_eq!(usage_events[0].total_tokens, 18, "derived from the halves");
+    }
+
+    /// The other half: a provider that reports nothing must produce no event.
+    /// A zero-valued one reads as a measurement, which is why the gateway had
+    /// grown a filter to drop it again.
+    #[tokio::test]
+    async fn run_tool_call_loop_emits_no_usage_when_the_provider_reported_none() {
+        let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let mut history = vec![ChatMessage::user("hi")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let observer = crate::observability::NoopObserver;
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let multimodal = crate::config::MultimodalConfig::default();
+
+        run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None,
+            None,
+            None,
+            &multimodal,
+            5,
+            None,
+            None,
+            Some(events_tx),
+        )
+        .await
+        .expect("loop completes");
+
+        while let Ok(ev) = events_rx.try_recv() {
+            if let crate::agent::events::AgentEvent::Usage(u) = ev {
+                panic!("no provider reported usage, yet a Usage event was emitted: {u:?}");
+            }
+        }
     }
 }
