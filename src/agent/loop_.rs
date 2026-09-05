@@ -1197,6 +1197,10 @@ pub(crate) async fn execute_one_tool_structured(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     events: Option<&AgentEventSender>,
+    // Actor for the audit record. Every executed tool call is audited here
+    // because this is the one funnel both batch paths (parallel fast-path and
+    // serial gated loop) go through.
+    channel_name: &str,
 ) -> Result<ToolExecutionResult> {
     let id = Uuid::new_v4().to_string();
 
@@ -1217,6 +1221,15 @@ pub(crate) async fn execute_one_tool_structured(
                 })
                 .await;
         }
+        crate::security::record_tool_call(crate::security::ToolCallRecord {
+            channel: channel_name.to_string(),
+            tool: call.name.clone(),
+            risk_level: "unknown_tool".into(),
+            approved: true,
+            allowed: true,
+            success: false,
+            duration_ms: 0,
+        });
         return Ok(ToolExecutionResult {
             name: call.name.clone(),
             output: format!("Unknown tool: {}", call.name),
@@ -1289,6 +1302,18 @@ pub(crate) async fn execute_one_tool_structured(
             .await;
     }
 
+    crate::security::record_tool_call(crate::security::ToolCallRecord {
+        channel: channel_name.to_string(),
+        tool: call.name.clone(),
+        // The gate ran before this funnel: reaching it means the call was
+        // allowed, and either needed no approval or was granted one.
+        risk_level: "executed".into(),
+        approved: true,
+        allowed: true,
+        success,
+        duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+    });
+
     Ok(ToolExecutionResult {
         name: call.name.clone(),
         output,
@@ -1336,7 +1361,14 @@ pub(crate) async fn execute_tool_calls_collecting(
             })
             .collect();
         let futures = effective.iter().map(|call| {
-            execute_one_tool_structured(call, tools_registry, observer, cancellation_token, events)
+            execute_one_tool_structured(
+                call,
+                tools_registry,
+                observer,
+                cancellation_token,
+                events,
+                channel_name,
+            )
         });
         return futures_util::future::try_join_all(futures).await;
     }
@@ -1364,6 +1396,15 @@ pub(crate) async fn execute_tool_calls_collecting(
                         })
                         .await;
                 }
+                crate::security::record_tool_call(crate::security::ToolCallRecord {
+                    channel: channel_name.to_string(),
+                    tool: call.name.clone(),
+                    risk_level: "guest_ceiling".into(),
+                    approved: false,
+                    allowed: false,
+                    success: false,
+                    duration_ms: 0,
+                });
                 results.push(ToolExecutionResult {
                     name: call.name.clone(),
                     output: reason,
@@ -1396,6 +1437,15 @@ pub(crate) async fn execute_tool_calls_collecting(
                         })
                         .await;
                 }
+                crate::security::record_tool_call(crate::security::ToolCallRecord {
+                    channel: channel_name.to_string(),
+                    tool: call.name.clone(),
+                    risk_level: "foreign_cron_delivery".into(),
+                    approved: false,
+                    allowed: false,
+                    success: false,
+                    duration_ms: 0,
+                });
                 results.push(ToolExecutionResult {
                     name: call.name.clone(),
                     output: reason,
@@ -1469,6 +1519,15 @@ pub(crate) async fn execute_tool_calls_collecting(
                             call.name
                         )
                     };
+                    crate::security::record_tool_call(crate::security::ToolCallRecord {
+                        channel: channel_name.to_string(),
+                        tool: call.name.clone(),
+                        risk_level: "requires_approval".into(),
+                        approved: false,
+                        allowed: true,
+                        success: false,
+                        duration_ms: 0,
+                    });
                     results.push(ToolExecutionResult {
                         name: call.name.clone(),
                         output: msg,
@@ -1491,6 +1550,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 observer,
                 cancellation_token,
                 events,
+                channel_name,
             )
             .await?,
         );
@@ -3625,6 +3685,147 @@ mod tests {
             level: crate::security::AutonomyLevel::Supervised,
             ..crate::config::AutonomyConfig::default()
         })
+    }
+
+    // ── Tool-call audit trail (plan 305) ────────────────────────────────────
+
+    /// Wait for the best-effort `spawn_blocking` append to land, then return the
+    /// audit log's contents. Bounded so a genuinely missing write fails the test
+    /// rather than hanging it.
+    async fn audit_log_after_writes(path: &std::path::Path, want_lines: usize) -> String {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if text.lines().filter(|l| !l.trim().is_empty()).count() >= want_lines {
+                    return text;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// Both outcomes reach the trail, not just the happy one. An audit that
+    /// records only what ran would miss exactly the events an operator opens it
+    /// for — and a denial was the state this surface was in before plan 305.
+    #[tokio::test]
+    async fn a_denied_and_an_executed_tool_call_both_reach_the_audit_log() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+
+        let mgr = supervised_manager();
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+
+        // 1. Denied: no backend on a non-CLI surface ⇒ auto-deny.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        let denied = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("batch completes");
+        assert!(!denied[0].success);
+
+        // 2. Executed: the same call with an always-yes backend.
+        let ran2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools2: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran2),
+        })];
+        let backend = AlwaysYesBackend;
+        let executed = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools2,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            Some(&backend),
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("batch completes");
+        assert!(executed[0].success, "the granted call must run");
+
+        let text = audit_log_after_writes(&log_path, 2).await;
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad record ({e}): {l}")))
+            .collect();
+        assert_eq!(records.len(), 2, "one record per call: {text}");
+
+        // Order is not asserted: the appends run on blocking workers, so the
+        // two records race each other. What must hold is that both are there,
+        // whole, and carry the right verdict.
+        let denial = records
+            .iter()
+            .find(|r| r["action"]["approved"] == false)
+            .unwrap_or_else(|| panic!("no denial record: {text}"));
+        assert_eq!(denial["actor"]["channel"], "telegram");
+        assert_eq!(denial["action"]["command"], "do_thing");
+        assert_eq!(denial["result"]["success"], false);
+
+        let run = records
+            .iter()
+            .find(|r| r["action"]["approved"] == true)
+            .unwrap_or_else(|| panic!("no executed record: {text}"));
+        assert_eq!(run["action"]["command"], "do_thing");
+        assert_eq!(run["result"]["success"], true);
+
+        // The arguments must never be in the trail — for `shell` they are
+        // whatever the model composed, and for file tools they are paths.
+        assert!(
+            !text.contains("arguments"),
+            "tool arguments must not be audited: {text}"
+        );
+    }
+
+    /// The trail is only whole if every refusal path writes one. Each early
+    /// return in `execute_tool_calls_collecting` pushes a `ToolExecutionResult`
+    /// and `continue`s; a new one added without an audit call would leave a hole
+    /// that the behaviour test above cannot see, because it only drives two of
+    /// them.
+    #[test]
+    fn every_refusal_path_writes_an_audit_record() {
+        let src = include_str!("loop_.rs");
+        // Assembled at runtime so this assertion does not count itself.
+        let push = format!("results.push({} {{", "ToolExecutionResult");
+        let audit = format!("crate::security::record_{}(", "tool_call");
+
+        let sites: Vec<usize> = src.match_indices(push.as_str()).map(|(i, _)| i).collect();
+        assert!(
+            !sites.is_empty(),
+            "the refusal shape moved; update this guard"
+        );
+        for at in sites {
+            let window_start = at.saturating_sub(600);
+            let window = &src[window_start..at];
+            assert!(
+                window.contains(audit.as_str()),
+                "a refusal at byte {at} pushes a result without auditing it"
+            );
+        }
     }
 
     #[tokio::test]

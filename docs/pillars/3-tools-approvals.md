@@ -2,7 +2,7 @@
 
 > **ClickUp:** [v0.6.0 — Product Completeness Beta](https://app.clickup.com/t/86exgu406) → Setup: Approvals + Resilience: Audit log · **Maturity:** App-layer stable · **Modules:** `src/tools/`, `src/approval/`, `src/security/`
 
-The blast radius surface. Every tool call routes through one approval gate before execution. Application-layer security is already strong (allowlist, injection blocking, path traversal protection, rate limiting, basic audit log). OS-layer containment is out of scope for v0.6.0.
+The blast radius surface. Every tool call routes through one approval gate before execution. Application-layer security is already strong (allowlist, injection blocking, path traversal protection, rate limiting, tool-call audit log). OS-layer containment is out of scope for v0.6.0.
 
 ## What this pillar covers
 
@@ -11,7 +11,7 @@ The blast radius surface. Every tool call routes through one approval gate befor
 - v0.6.50 Smart/Strict UX overhaul (inline Y/A/N prompt, plan-mode Strict, cascading approvals)
 - Command allowlist + path traversal + injection blocking
 - Rate limiting (default 20 actions/hour)
-- Basic audit log under `<profile>/audit/`
+- Tool-call audit log at `<profile>/audit.log` — one JSON record per call: channel, tool name, whether it was approved, whether it was allowed, whether it succeeded, and how long it took. Tool **arguments** are never recorded.
 
 ## v0.6.50 approval UX (Claude Code parity)
 
@@ -34,7 +34,7 @@ When the agent attempts a shell command not on the active preset's allowlist:
 | Command allowlist (deny-by-default) | ✅ | TBD | TBD |
 | Injection blocking (`$()`, backticks, `&&`, `>`) | ✅ | TBD | TBD |
 | Path traversal protection | ✅ | TBD | TBD |
-| Basic audit log | ✅ | TBD | TBD |
+| Tool-call audit log | ✅ | TBD | TBD |
 
 ## Current state by maturity
 
@@ -46,7 +46,7 @@ When the agent attempts a shell command not on the active preset's allowlist:
 | Path-traversal + injection blocking | Stable |
 | Rate limiting | Stable |
 | Channel allowlist (deny-by-default) | Stable |
-| Audit log (basic) | Stable · v0.6 Resilience test verifies it survives restart + corruption |
+| Tool-call audit log | Stable · covered by `audit_log_survives_a_restart` and `a_truncated_audit_log_does_not_stop_new_records` (`src/security/audit.rs`) |
 
 ## Architecture
 
@@ -59,7 +59,7 @@ src/tools/         ← Tool trait dispatch
   ↓ execute
 src/security/      ← rate limit + audit
   ↓ result
-<profile>/audit/   ← basic audit log
+<profile>/audit.log  ← one JSON record per tool call (executed AND refused)
 ```
 
 ## Trait extension point
