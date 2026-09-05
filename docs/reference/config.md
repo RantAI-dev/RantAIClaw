@@ -233,6 +233,27 @@ Notes:
 - When `enabled = true`, the runtime tracks per-request cost estimates and enforces daily/monthly limits.
 - At `warn_at_percent` threshold, a warning is emitted but requests continue.
 
+## `[tasks]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable the task engine — both the agent's task tools and the gateway's `/tasks*` routes |
+
+Notes:
+
+- One flag governs two surfaces. Setting `enabled = false` removes the nine task
+  tools from the agent's tool registry (`task_list`, `task_get`, `task_create`,
+  `task_update_status`, `task_comment`, `task_read_comments`, `task_review`,
+  `task_create_subtask`, `task_complete_subtask`) **and** makes every `/tasks*`
+  route answer `503 Task engine is disabled`. There is no way to keep one and
+  drop the other today.
+- The nine `/tasks*` routes are served from the gateway's **root** router, not
+  from `/api/v1`, so they are outside the `api_rate_limit` layer the versioned
+  API sits behind. They require a paired bearer token whenever
+  `[gateway].require_pairing` is on, and are unauthenticated when it is off —
+  the same rule the other root routes follow.
+- State lives in `<workspace>/tasks.db`.
+
 ## `[identity]`
 
 | Key | Default | Purpose |

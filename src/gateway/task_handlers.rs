@@ -53,24 +53,39 @@ fn err_disabled() -> TaskResponse {
     )
 }
 
+/// Strip anything that tells a caller where the operator's files are.
+///
+/// Every error message this module returns is built from an `anyhow` chain, and
+/// `tasks::store::open` wraps *any* failure with `Failed to open tasks DB at
+/// <absolute path>` — so the leak is not confined to the 500s. A malformed id
+/// reaches `err_bad_request` and a missing row reaches `err_not_found` through
+/// the same `open()`, which is why all three constructors scrub rather than
+/// just the internal one. On a static literal the pass is a no-op.
+fn scrub(msg: &str) -> String {
+    crate::providers::sanitize_api_error(&super::api_v1::redact_profile_paths(msg))
+}
+
 fn err_bad_request(msg: &str) -> TaskResponse {
     (
         StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({"error": msg})),
+        Json(serde_json::json!({"error": scrub(msg)})),
     )
 }
 
 fn err_not_found(msg: &str) -> TaskResponse {
     (
         StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": msg})),
+        Json(serde_json::json!({"error": scrub(msg)})),
     )
 }
 
 fn err_internal(msg: &str) -> TaskResponse {
+    // Full chain server-side, scrubbed detail to the caller — the same split
+    // `api_v1::err_500` makes.
+    tracing::error!(error = %msg, "tasks internal error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": msg})),
+        Json(serde_json::json!({"error": scrub(msg)})),
     )
 }
 
@@ -377,5 +392,113 @@ pub async fn handle_list_events(
     match tasks::list_events(&config, &id) {
         Ok(events) => (StatusCode::OK, Json(serde_json::json!(events))),
         Err(e) => err_internal(&e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_env::{HomeGuard, ENV_LOCK};
+
+    /// Build the message `tasks::store::open` actually produces on failure, so
+    /// the assertion is against a real leak and not an invented one.
+    fn db_open_error(home: &std::path::Path) -> String {
+        format!(
+            "Failed to open tasks DB at {}/.rantaiclaw/profiles/default/workspace/tasks.db: unable to open database file",
+            home.display()
+        )
+    }
+
+    fn leaked_path(body: &serde_json::Value, home: &std::path::Path) -> bool {
+        body["error"]
+            .as_str()
+            .expect("error is a string")
+            .contains(home.to_str().expect("utf-8 temp path"))
+    }
+
+    // One test per constructor, not one aggregate: the three reach the caller
+    // through different status codes, and covering only the 500 is how the leak
+    // survived in `err_not_found` in the first place.
+
+    #[tokio::test]
+    async fn err_internal_returns_no_filesystem_path() {
+        let _lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(tmp.path());
+
+        let (status, Json(body)) = err_internal(&db_open_error(tmp.path()));
+
+        assert_eq!(status.as_u16(), 500);
+        assert!(!leaked_path(&body, tmp.path()), "body was {body}");
+    }
+
+    #[tokio::test]
+    async fn err_not_found_returns_no_filesystem_path() {
+        let _lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(tmp.path());
+
+        let (status, Json(body)) = err_not_found(&db_open_error(tmp.path()));
+
+        assert_eq!(status.as_u16(), 404);
+        assert!(!leaked_path(&body, tmp.path()), "body was {body}");
+    }
+
+    #[tokio::test]
+    async fn err_bad_request_returns_no_filesystem_path() {
+        let _lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(tmp.path());
+
+        let (status, Json(body)) = err_bad_request(&db_open_error(tmp.path()));
+
+        assert_eq!(status.as_u16(), 400);
+        assert!(!leaked_path(&body, tmp.path()), "body was {body}");
+    }
+
+    #[test]
+    fn a_static_message_survives_the_scrub_unchanged() {
+        assert_eq!(scrub("Title is required"), "Title is required");
+    }
+
+    // `scrub` is two passes, and redaction is only one of them. Without these
+    // the second pass could be deleted with every other test still green.
+
+    #[test]
+    fn scrub_removes_a_secret_looking_token() {
+        let out = scrub("upstream rejected sk-abcdef0123456789 while opening the task store");
+        assert!(!out.contains("sk-abcdef0123456789"), "was: {out}");
+    }
+
+    #[test]
+    fn scrub_truncates_an_oversized_message() {
+        let out = scrub(&"x".repeat(400));
+        assert!(
+            out.chars().count() <= 203,
+            "was {} chars",
+            out.chars().count()
+        );
+    }
+
+    /// The contract is not "the three constructors scrub" — it is "no error
+    /// body in this module is built anywhere else". A handler that inlines
+    /// a bare `(404, Json(json!({"error": e.to_string()})))` tuple would
+    /// pass every test above and reintroduce the leak, so assert the whole
+    /// surface: each of these status codes is spelled exactly once, inside its
+    /// scrubbing constructor. The tests above deliberately compare `as_u16()`
+    /// so they do not count against it.
+    #[test]
+    fn error_statuses_are_built_only_by_the_scrubbing_constructors() {
+        let src = include_str!("task_handlers.rs");
+        // Assembled at runtime: a verbatim literal here would be counted by the
+        // very scan it feeds, and the assertion would be measuring itself.
+        for variant in ["BAD_REQUEST", "NOT_FOUND", "INTERNAL_SERVER_ERROR"] {
+            let needle = format!("StatusCode::{variant}");
+            assert_eq!(
+                src.matches(needle.as_str()).count(),
+                1,
+                "{needle} is built outside its scrubbing constructor"
+            );
+        }
     }
 }

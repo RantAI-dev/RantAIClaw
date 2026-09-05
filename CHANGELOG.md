@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `native` or `docker` (not `wasm`); the observability backends are OpenTelemetry,
   Prometheus, log and noop (not `broadcast`); skill authoring is the `author_skill`
   tool (not `skillforge`).
+- **`docs/reference/config.md` documents `[tasks]`.** The key was default-on and
+  described nowhere. The new section says what `enabled` gates (the nine agent task
+  tools *and* the nine `/tasks*` gateway routes — one flag, two surfaces), and that
+  those routes sit on the root router outside the `/api/v1` rate limiter.
+
+### Security
+
+- **The `/tasks*` routes no longer return the operator's filesystem paths.**
+  `tasks::store::open` wraps any failure with `Failed to open tasks DB at <absolute
+  path>`, and the handlers echoed that string verbatim — not only on 500s, but on the
+  404 and 400 paths that reach the same `open()`. All three error constructors now
+  scrub through `redact_profile_paths` + `sanitize_api_error`, and the full chain is
+  logged server-side instead.
 
 ## [0.29.0-alpha] — 2026-09-05
 

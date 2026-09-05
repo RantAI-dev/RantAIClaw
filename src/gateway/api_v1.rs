@@ -197,7 +197,7 @@ fn should_persist(existed_at_start: bool, exists_now: bool) -> bool {
 
 /// Replace the active profile root and the home directory with placeholders so
 /// an error about a file never tells a browser where the operator's files are.
-fn redact_profile_paths(s: &str) -> String {
+pub(crate) fn redact_profile_paths(s: &str) -> String {
     let mut out = s.to_string();
     if let Ok(p) = crate::profile::ProfileManager::active() {
         let root = p.root.display().to_string();
