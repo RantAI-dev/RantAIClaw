@@ -193,13 +193,27 @@ tokens, session ids, or paths.
     "provider": "optional string override",
     "temperature": 0.7,
     "session_id": "optional — continue this session; absent/empty starts a new one",
-    "context": "optional — retrieved reference material for this turn only"
+    "context": "optional — retrieved reference material for this turn only",
+    "render_mode": "optional — `markdown` (default) or `gui`"
   }
   ```
   `temperature` must be finite and in `0.0`–`2.0` (else `400`). `context`, when
   present, is placed in the prompt as clearly-framed reference material for
   **this turn only** — it is not persisted with the user message and never
   enters replayed history, so retrieved documents do not compound across turns.
+- **`message` is the user's words.** Anything a client adds for rendering or
+  context travels in its own field, and only `message` is persisted. A client
+  that appends its own instructions to `message` gets them stored as part of the
+  user's turn and replayed on every later turn — including after the setting
+  that produced them was switched off — and shown in exported transcripts as
+  text the user never wrote.
+- **`render_mode`** says how the client will render this turn's answer.
+  `markdown` (the default, and what any unrecognised value means) changes
+  nothing. `gui` appends the generative-UI instruction to the prompt **for this
+  turn only**; it is never persisted. The instruction — and therefore the
+  component set the model is asked for — is defined by the gateway, so a client
+  selects the mode by name rather than sending prompt text. A client that still
+  appends its own instruction to `message` keeps working exactly as before.
 - **Choosing the session id**: `session_id` may name a session that does not
   exist yet. If it is UUID-shaped (`8-4-4-4-12` hex), the turn is persisted
   under exactly that id; anything else is ignored and the server mints one. This
