@@ -60,6 +60,7 @@ impl Provider for MockProvider {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
+                usage: None,
                 text: Some("done".into()),
                 tool_calls: vec![],
             });
@@ -184,6 +185,7 @@ impl Provider for RecordingProvider {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
+                usage: None,
                 text: Some("done".into()),
                 tool_calls: vec![],
             });
@@ -250,6 +252,7 @@ fn make_observer() -> Arc<dyn Observer> {
 
 fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
+        usage: None,
         text: Some(text.into()),
         tool_calls: vec![],
     }
@@ -257,6 +260,7 @@ fn text_response(text: &str) -> ChatResponse {
 
 fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
+        usage: None,
         text: Some(String::new()),
         tool_calls: calls,
     }
@@ -375,6 +379,7 @@ async fn e2e_multi_step_tool_chain() {
 async fn e2e_xml_dispatcher_tool_call() {
     let provider = Box::new(MockProvider::new(vec![
         ChatResponse {
+            usage: None,
             text: Some(
                 r#"<tool_call>
 {"name": "echo", "arguments": {"message": "xml dispatch"}}

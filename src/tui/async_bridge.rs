@@ -304,6 +304,7 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                usage: None,
                 text: Some(self.0.to_string()),
                 tool_calls: vec![],
             })
@@ -445,6 +446,7 @@ mod tests {
             ) -> anyhow::Result<ChatResponse> {
                 sleep(Duration::from_millis(300)).await;
                 Ok(ChatResponse {
+                    usage: None,
                     text: Some("late".into()),
                     tool_calls: vec![],
                 })

@@ -91,6 +91,7 @@ impl Provider for ScriptedProvider {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
+                usage: None,
                 text: Some("done".into()),
                 tool_calls: vec![],
             });
@@ -326,6 +327,7 @@ fn build_agent_with_config(
 /// Helper: create a ChatResponse with tool calls (native format).
 fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
+        usage: None,
         text: Some(String::new()),
         tool_calls: calls,
     }
@@ -334,6 +336,7 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
 /// Helper: create a plain text ChatResponse.
 fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
+        usage: None,
         text: Some(text.into()),
         tool_calls: vec![],
     }
@@ -342,6 +345,7 @@ fn text_response(text: &str) -> ChatResponse {
 /// Helper: create an XML-style tool call response.
 fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
     ChatResponse {
+        usage: None,
         text: Some(format!(
             "<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>"
         )),
@@ -779,6 +783,7 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 #[tokio::test]
 async fn turn_handles_empty_text_response() {
     let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
+        usage: None,
         text: Some(String::new()),
         tool_calls: vec![],
     }]));
@@ -792,6 +797,7 @@ async fn turn_handles_empty_text_response() {
 #[tokio::test]
 async fn turn_handles_none_text_response() {
     let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
+        usage: None,
         text: None,
         tool_calls: vec![],
     }]));
@@ -811,6 +817,7 @@ async fn turn_handles_none_text_response() {
 async fn turn_preserves_text_alongside_tool_calls() {
     let provider = Box::new(ScriptedProvider::new(vec![
         ChatResponse {
+            usage: None,
             text: Some("Let me check...".into()),
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
@@ -1189,6 +1196,7 @@ async fn multi_turn_maintains_growing_history() {
 async fn native_dispatcher_handles_stringified_arguments() {
     let dispatcher = NativeToolDispatcher;
     let response = ChatResponse {
+        usage: None,
         text: Some(String::new()),
         tool_calls: vec![ToolCall {
             id: "tc1".into(),
@@ -1213,6 +1221,7 @@ async fn native_dispatcher_handles_stringified_arguments() {
 #[test]
 fn xml_dispatcher_handles_nested_json() {
     let response = ChatResponse {
+        usage: None,
         text: Some(
             r#"<tool_call>
 {"name": "file_write", "arguments": {"path": "test.json", "content": "{\"key\": \"value\"}"}}
@@ -1235,6 +1244,7 @@ fn xml_dispatcher_handles_nested_json() {
 #[test]
 fn xml_dispatcher_handles_empty_tool_call_tag() {
     let response = ChatResponse {
+        usage: None,
         text: Some("<tool_call>\n</tool_call>\nSome text".into()),
         tool_calls: vec![],
     };
@@ -1248,6 +1258,7 @@ fn xml_dispatcher_handles_empty_tool_call_tag() {
 #[test]
 fn xml_dispatcher_handles_unclosed_tool_call() {
     let response = ChatResponse {
+        usage: None,
         text: Some("Before\n<tool_call>\n{\"name\": \"shell\"}".into()),
         tool_calls: vec![],
     };

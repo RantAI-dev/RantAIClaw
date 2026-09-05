@@ -36,6 +36,7 @@ impl Provider for StaticProvider {
         _temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
         Ok(ChatResponse {
+            usage: None,
             text: Some(self.0.into()),
             tool_calls: vec![],
         })

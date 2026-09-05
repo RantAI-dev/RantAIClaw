@@ -49,9 +49,65 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Token counts a provider reported for one call.
+///
+/// `Option<ProviderUsage>` on [`ChatResponse`] is load-bearing: `None` means the
+/// provider said nothing, and `Some(u)` means it reported these numbers. Every
+/// token count in this product used to be a hard-coded zero, and a zero that
+/// means "unknown" is exactly how that started — so a backend that reports
+/// nothing must yield `None`, never `Some(0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Kept separately because some providers report only this one.
+    pub total_tokens: u64,
+}
+
+impl ProviderUsage {
+    /// Build from raw counts, collapsing an all-zero report to `None`.
+    ///
+    /// Several client libraries model usage as a non-optional struct that is
+    /// simply left at zero when the provider omitted the block. Mapping that
+    /// straight to `Some` would reintroduce the zero-means-unknown bug through
+    /// the back door.
+    pub fn from_counts(input_tokens: u64, output_tokens: u64, total_tokens: u64) -> Option<Self> {
+        if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+            return None;
+        }
+        Some(Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: if total_tokens == 0 {
+                input_tokens.saturating_add(output_tokens)
+            } else {
+                total_tokens
+            },
+        })
+    }
+
+    /// Sum of two reports, for a turn that made more than one provider call.
+    pub fn merge(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (None, other) | (other, None) => other,
+            (Some(x), Some(y)) => Some(Self {
+                input_tokens: x.input_tokens.saturating_add(y.input_tokens),
+                output_tokens: x.output_tokens.saturating_add(y.output_tokens),
+                total_tokens: x.total_tokens.saturating_add(y.total_tokens),
+            }),
+        }
+    }
+}
+
 /// An LLM response that may contain text, tool calls, or both.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatResponse {
+    /// Token counts, when the provider reported them. `None` means unknown.
+    ///
+    /// Declared first so every construction site can name it first, which is
+    /// what `clippy::inconsistent_struct_constructor` asks for and what the
+    /// ~60 existing literals already do.
+    pub usage: Option<ProviderUsage>,
     /// Text content of the response (may be empty if only tool calls).
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
@@ -342,6 +398,7 @@ pub trait Provider: Send + Sync {
                     .chat_with_history(&modified_messages, model, temperature)
                     .await?;
                 return Ok(ChatResponse {
+                    usage: None,
                     text: Some(text),
                     tool_calls: Vec::new(),
                 });
@@ -352,6 +409,7 @@ pub trait Provider: Send + Sync {
             .chat_with_history(request.messages, model, temperature)
             .await?;
         Ok(ChatResponse {
+            usage: None,
             text: Some(text),
             tool_calls: Vec::new(),
         })
@@ -385,6 +443,7 @@ pub trait Provider: Send + Sync {
     ) -> anyhow::Result<ChatResponse> {
         let text = self.chat_with_history(messages, model, temperature).await?;
         Ok(ChatResponse {
+            usage: None,
             text: Some(text),
             tool_calls: Vec::new(),
         })
@@ -494,6 +553,53 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::ProviderUsage;
+
+    // `from_counts` and `merge` are the two halves of the "None means unknown"
+    // rule, so one test each rather than one aggregate.
+
+    #[test]
+    fn an_all_zero_report_is_unknown_not_zero() {
+        assert_eq!(ProviderUsage::from_counts(0, 0, 0), None);
+    }
+
+    #[test]
+    fn a_missing_total_is_derived_from_the_two_halves() {
+        let u = ProviderUsage::from_counts(4, 9, 0).expect("non-zero report");
+        assert_eq!(u.total_tokens, 13);
+    }
+
+    #[test]
+    fn a_reported_total_is_kept_as_reported() {
+        // Some providers count cache reads into `total` but not into the two
+        // halves; recomputing would quietly contradict the bill.
+        let u = ProviderUsage::from_counts(4, 9, 20).expect("non-zero report");
+        assert_eq!(u.total_tokens, 20);
+    }
+
+    #[test]
+    fn merging_an_unknown_with_a_known_keeps_the_known() {
+        let known = ProviderUsage::from_counts(1, 2, 3);
+        assert_eq!(ProviderUsage::merge(None, known), known);
+        assert_eq!(ProviderUsage::merge(known, None), known);
+    }
+
+    #[test]
+    fn merging_two_unknowns_stays_unknown() {
+        assert_eq!(ProviderUsage::merge(None, None), None);
+    }
+
+    #[test]
+    fn merging_two_reports_sums_every_field() {
+        let a = ProviderUsage::from_counts(1, 2, 3);
+        let b = ProviderUsage::from_counts(10, 20, 30);
+        let m = ProviderUsage::merge(a, b).expect("both known");
+        assert_eq!(
+            (m.input_tokens, m.output_tokens, m.total_tokens),
+            (11, 22, 33)
+        );
+    }
+
     use super::*;
 
     struct CapabilityMockProvider;
@@ -537,6 +643,7 @@ mod tests {
     #[test]
     fn chat_response_helpers() {
         let empty = ChatResponse {
+            usage: None,
             text: None,
             tool_calls: vec![],
         };
@@ -544,6 +651,7 @@ mod tests {
         assert_eq!(empty.text_or_empty(), "");
 
         let with_tools = ChatResponse {
+            usage: None,
             text: Some("Let me check".into()),
             tool_calls: vec![ToolCall {
                 id: "1".into(),

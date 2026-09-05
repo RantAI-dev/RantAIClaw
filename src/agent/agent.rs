@@ -344,13 +344,16 @@ impl AgentBuilder {
     }
 }
 
-/// Placeholder `TokenUsage` for turns that do not yet track real usage.
+/// Build the turn's `TokenUsage` from what the provider reported, or `None`
+/// when it reported nothing.
 ///
-/// `Agent::turn_streaming` must emit a `Usage` event before `Done`. Until the
-/// inline loop wires real token accounting from provider responses this helper
-/// produces a zero-valued record scoped to the effective model name.
-fn empty_usage(model: &str) -> TokenUsage {
-    TokenUsage::new(model.to_string(), 0, 0, 0.0, 0.0)
+/// Cost stays 0.0 — pricing is plan 306's enforcement half, and inventing a
+/// number here would repeat the mistake this replaces.
+fn turn_usage(
+    model: &str,
+    reported: Option<crate::providers::ProviderUsage>,
+) -> Option<TokenUsage> {
+    reported.map(|u| TokenUsage::new(model.to_string(), u.input_tokens, u.output_tokens, 0.0, 0.0))
 }
 
 /// Read `<policy_dir>/command_allowlist.toml` into a flat Vec of glob
@@ -1018,7 +1021,12 @@ impl Agent {
         match &result {
             Ok(tr) => {
                 if let Some(tx) = events.as_ref() {
-                    let _ = tx.send(AgentEvent::Usage(tr.usage.clone())).await;
+                    // Only when the provider reported counts. No event means
+                    // "not reported"; a zero-valued one would mean "measured
+                    // zero", which is what this change exists to stop saying.
+                    if let Some(ref usage) = tr.usage {
+                        let _ = tx.send(AgentEvent::Usage(usage.clone())).await;
+                    }
                     let _ = tx
                         .send(AgentEvent::Done {
                             final_text: tr.text.clone(),
@@ -1141,9 +1149,9 @@ impl Agent {
         self.trim_history();
 
         match result {
-            Ok(text) => Ok(TurnResult {
+            Ok((text, usage)) => Ok(TurnResult {
                 text,
-                usage: empty_usage(&effective_model),
+                usage: turn_usage(&effective_model, usage),
                 cancelled: false,
             }),
             // The shared loop signals cancellation via `ToolLoopCancelled`.
@@ -1153,7 +1161,10 @@ impl Agent {
             {
                 Ok(TurnResult {
                     text: String::new(),
-                    usage: empty_usage(&effective_model),
+                    // A cancelled turn may still have burned tokens, but the
+                    // loop's accumulator is gone with the error — reporting
+                    // zero here would be the same lie this change removes.
+                    usage: None,
                     cancelled: true,
                 })
             }
@@ -1401,6 +1412,7 @@ mod tests {
             let mut guard = self.responses.lock();
             if guard.is_empty() {
                 return Ok(crate::providers::ChatResponse {
+                    usage: None,
                     text: Some("done".into()),
                     tool_calls: vec![],
                 });
@@ -1438,6 +1450,7 @@ mod tests {
     async fn turn_without_tools_returns_text() {
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
+                usage: None,
                 text: Some("hello".into()),
                 tool_calls: vec![],
             }]),
@@ -1526,6 +1539,7 @@ mod tests {
     async fn turn_autosave_screens_a_credential_before_it_reaches_memory() {
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
+                usage: None,
                 text: Some("noted".into()),
                 tool_calls: vec![],
             }]),
@@ -1568,6 +1582,7 @@ mod tests {
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![
                 crate::providers::ChatResponse {
+                    usage: None,
                     text: Some(String::new()),
                     tool_calls: vec![crate::providers::ToolCall {
                         id: "tc1".into(),
@@ -1576,6 +1591,7 @@ mod tests {
                     }],
                 },
                 crate::providers::ChatResponse {
+                    usage: None,
                     text: Some("done".into()),
                     tool_calls: vec![],
                 },
@@ -1612,9 +1628,18 @@ mod tests {
 
     /// Build a minimal `Agent` whose mock provider returns a single text
     /// response with the given body. Shared by the streaming/delegation tests.
-    fn build_test_agent(text: &str) -> Agent {
+    ///
+    /// `reports_usage` selects which half of the usage contract the caller is
+    /// testing: a provider that reports counts must produce exactly one `Usage`
+    /// event before `Done`, and one that reports nothing must produce none.
+    fn build_test_agent_reporting(text: &str, reports_usage: bool) -> Agent {
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
+                usage: if reports_usage {
+                    crate::providers::ProviderUsage::from_counts(11, 7, 0)
+                } else {
+                    None
+                },
                 text: Some(text.to_string()),
                 tool_calls: vec![],
             }]),
@@ -1639,6 +1664,10 @@ mod tests {
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config")
+    }
+
+    fn build_test_agent(text: &str) -> Agent {
+        build_test_agent_reporting(text, true)
     }
 
     #[tokio::test]
@@ -1676,7 +1705,40 @@ mod tests {
             }
         }
         assert!(saw_done, "expected Done event");
-        assert!(saw_usage_before_done, "Usage must precede Done on success");
+        assert!(
+            saw_usage_before_done,
+            "Usage must precede Done when the provider reported counts"
+        );
+    }
+
+    /// The other half of the contract, and the reason the assertion above now
+    /// says "when the provider reported counts": a backend that reports nothing
+    /// must produce NO usage event. Emitting a zero-valued one is what made
+    /// every surface render "0 tokens" as though it were a measurement, and the
+    /// gateway grew a filter to hide it again.
+    #[tokio::test]
+    async fn turn_streaming_emits_no_usage_when_the_provider_reported_none() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let mut agent = build_test_agent_reporting("hello", false);
+
+        let result = agent
+            .turn_streaming("hi", Some(events_tx), None)
+            .await
+            .expect("turn completes");
+        assert_eq!(result.text, "hello");
+        assert!(result.usage.is_none(), "usage was {:?}", result.usage);
+
+        let mut saw_done = false;
+        while let Ok(ev) = events_rx.try_recv() {
+            match ev {
+                AgentEvent::Usage(u) => {
+                    panic!("no provider reported usage, yet a Usage event was emitted: {u:?}")
+                }
+                AgentEvent::Done { .. } => saw_done = true,
+                _ => {}
+            }
+        }
+        assert!(saw_done, "expected Done event");
     }
 
     #[tokio::test]
@@ -1747,6 +1809,7 @@ mod tests {
             ) -> Result<crate::providers::ChatResponse> {
                 sleep(Duration::from_millis(200)).await;
                 Ok(crate::providers::ChatResponse {
+                    usage: None,
                     text: Some("never delivered".into()),
                     tool_calls: vec![],
                 })

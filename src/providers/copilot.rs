@@ -378,6 +378,7 @@ impl CopilotProvider {
             .collect();
 
         Ok(ProviderChatResponse {
+            usage: None,
             text: choice.message.content,
             tool_calls,
         })

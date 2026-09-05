@@ -217,6 +217,7 @@ impl OpenRouterProvider {
             .collect::<Vec<_>>();
 
         ProviderChatResponse {
+            usage: None,
             text: message.content,
             tool_calls,
         }
@@ -523,6 +524,7 @@ impl Provider for OpenRouterProvider {
             .collect();
 
         Ok(ProviderChatResponse {
+            usage: None,
             text: if text_buf.is_empty() {
                 None
             } else {

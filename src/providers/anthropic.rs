@@ -390,6 +390,7 @@ impl AnthropicProvider {
         }
 
         ProviderChatResponse {
+            usage: None,
             text: if text_parts.is_empty() {
                 None
             } else {
