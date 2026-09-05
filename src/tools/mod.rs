@@ -39,6 +39,7 @@ pub mod cron_list;
 pub mod cron_remove;
 pub mod cron_run;
 pub mod cron_runs;
+pub(crate) mod cron_schema;
 pub mod cron_update;
 pub mod delegate;
 pub mod file_read;

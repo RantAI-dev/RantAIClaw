@@ -79,16 +79,13 @@ ask which configured channel to deliver to — do not imply a message will arriv
             "type": "object",
             "properties": {
                 "name": { "type": "string" },
-                "schedule": {
-                    "type": "object",
-                    "description": "Schedule object: {kind:'cron',expr,tz?} | {kind:'at',at} | {kind:'every',every_ms}"
-                },
+                "schedule": crate::tools::cron_schema::schedule_schema(),
                 "job_type": { "type": "string", "enum": ["shell", "agent"] },
                 "command": { "type": "string" },
                 "prompt": { "type": "string" },
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
                 "model": { "type": "string" },
-                "delivery": { "type": "object" },
+                "delivery": crate::tools::cron_schema::delivery_schema(),
                 "delete_after_run": { "type": "boolean" }
             },
             "required": ["schedule"]
@@ -105,13 +102,13 @@ ask which configured channel to deliver to — do not imply a message will arriv
         }
 
         let schedule = match args.get("schedule") {
-            Some(v) => match serde_json::from_value::<Schedule>(v.clone()) {
+            Some(v) => match crate::tools::cron_schema::parse_schedule(v) {
                 Ok(schedule) => schedule,
-                Err(e) => {
+                Err(reason) => {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Invalid schedule: {e}")),
+                        error: Some(reason),
                     });
                 }
             },
@@ -341,6 +338,154 @@ mod tests {
             &cfg.autonomy,
             &cfg.workspace_dir,
         ))
+    }
+
+    /// The reported failure: a model sent `every_ms` as `"600000"` and the tool
+    /// refused. There was no machine-readable type for the field, so a provider
+    /// doing structured decoding had nothing to constrain against — the model
+    /// was guessing, not disobeying.
+    #[tokio::test]
+    async fn every_ms_accepts_a_stringified_integer() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "every", "every_ms": "600000" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    /// The coerced value must be the SAME schedule the integer form produces —
+    /// a tolerance that quietly changed the interval would be worse than the
+    /// rejection it replaces.
+    #[tokio::test]
+    async fn a_stringified_every_ms_produces_the_same_schedule_as_the_integer() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let mut ids = Vec::new();
+        for value in [json!(600_000), json!("600000")] {
+            let result = tool
+                .execute(json!({
+                    "schedule": { "kind": "every", "every_ms": value },
+                    "job_type": "shell",
+                    "command": "echo ok"
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+            let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            ids.push(v["id"].as_str().unwrap().to_string());
+        }
+
+        let a = crate::cron::get_job(&cfg, &ids[0]).unwrap();
+        let b = crate::cron::get_job(&cfg, &ids[1]).unwrap();
+        assert_eq!(a.schedule, b.schedule);
+        assert_eq!(
+            a.schedule,
+            crate::cron::Schedule::Every { every_ms: 600_000 }
+        );
+    }
+
+    /// Tolerating `"600000"` must not tolerate nonsense, and the refusal has to
+    /// be readable by the thing that failed: serde's raw message tells a model
+    /// nothing about what to send instead.
+    #[tokio::test]
+    async fn a_schedule_it_cannot_read_is_refused_with_an_example() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        // Zero is refused too, but by `crate::cron::schedule`, which owns
+        // schedule validation and has its own message. Only the values that
+        // fail to PARSE go through the new error path.
+        for bad in [json!("ten minutes"), json!(-1), json!(0)] {
+            let result = tool
+                .execute(json!({
+                    "schedule": { "kind": "every", "every_ms": bad },
+                    "job_type": "shell",
+                    "command": "echo ok"
+                }))
+                .await
+                .unwrap();
+
+            assert!(!result.success, "{bad} must be refused");
+            let err = result.error.unwrap_or_default();
+            assert!(err.contains("every_ms"), "must name the field: {err}");
+        }
+
+        for unparseable in [json!("ten minutes"), json!(-1)] {
+            let result = tool
+                .execute(json!({
+                    "schedule": { "kind": "every", "every_ms": unparseable },
+                    "job_type": "shell",
+                    "command": "echo ok"
+                }))
+                .await
+                .unwrap();
+
+            let err = result.error.unwrap_or_default();
+            assert!(
+                err.contains(r#"{"kind": "every", "every_ms": 600000}"#),
+                "a refusal a model cannot act on is the defect: {err}"
+            );
+        }
+    }
+
+    /// The advertised schema is the only contract a model can actually read.
+    /// Asserting on it here is what stops it drifting from `Schedule` — when the
+    /// enum gains a variant, this test is what forces the schema to follow.
+    #[tokio::test]
+    async fn the_advertised_schema_types_every_ms_as_an_integer() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let schema = tool.parameters_schema();
+        let schedule = &schema["properties"]["schedule"];
+        let branches = schedule["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("schedule must declare its variants: {schedule}"));
+        assert_eq!(branches.len(), 3, "one branch per Schedule variant");
+
+        let every = branches
+            .iter()
+            .find(|b| b["properties"]["every_ms"].is_object())
+            .unwrap_or_else(|| panic!("no `every` branch: {schedule}"));
+        assert_eq!(every["properties"]["every_ms"]["type"], "integer");
+        assert_eq!(every["properties"]["every_ms"]["minimum"], 1);
+
+        // Every variant carries its own `kind` discriminator — the enum is
+        // internally tagged, so the tag belongs inside each branch.
+        for b in branches {
+            assert!(
+                b["properties"]["kind"].is_object(),
+                "each branch must pin `kind`: {b}"
+            );
+        }
+
+        // `delivery` was a bare object with no description at all — a model had
+        // no way to learn that `announce` is what actually sends anything.
+        let delivery = &schema["properties"]["delivery"];
+        assert!(
+            delivery["properties"]["mode"].is_object(),
+            "delivery must declare its fields: {delivery}"
+        );
+        assert_eq!(delivery["properties"]["mode"]["enum"][0], "announce");
+        for field in ["channel", "to", "best_effort"] {
+            assert!(
+                delivery["properties"][field].is_object(),
+                "delivery must declare `{field}`: {delivery}"
+            );
+        }
     }
 
     #[tokio::test]

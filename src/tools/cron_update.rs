@@ -68,7 +68,7 @@ impl Tool for CronUpdateTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" },
-                "patch": { "type": "object" }
+                "patch": crate::tools::cron_schema::patch_schema()
             },
             "required": ["job_id", "patch"]
         })
@@ -169,6 +169,45 @@ mod tests {
             &cfg.autonomy,
             &cfg.workspace_dir,
         ))
+    }
+
+    /// `patch` was a bare object with no description: a model could see the
+    /// parameter name and nothing else. Asserting on the emitted schema is what
+    /// keeps it tracking `CronJobPatch` as that struct changes.
+    #[tokio::test]
+    async fn the_advertised_patch_schema_declares_its_fields() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let schema = tool.parameters_schema();
+        let patch = &schema["properties"]["patch"];
+        for field in [
+            "schedule",
+            "command",
+            "prompt",
+            "name",
+            "enabled",
+            "delivery",
+            "model",
+            "session_target",
+            "delete_after_run",
+        ] {
+            assert!(
+                patch["properties"][field].is_object(),
+                "patch must declare `{field}`: {patch}"
+            );
+        }
+
+        // The nested schedule is the same typed union `cron_add` advertises,
+        // not a second, drifting copy.
+        assert_eq!(
+            patch["properties"]["schedule"]["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(3),
+            "patch.schedule must carry the typed variants: {patch}"
+        );
     }
 
     #[tokio::test]
