@@ -39,7 +39,7 @@ pub mod secrets;
 pub mod traits;
 
 #[allow(unused_imports)]
-pub use audit::{AuditEvent, AuditEventType, AuditLogger};
+pub use audit::{record_tool_call, AuditEvent, AuditEventType, AuditLogger, ToolCallRecord};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
 #[allow(unused_imports)]

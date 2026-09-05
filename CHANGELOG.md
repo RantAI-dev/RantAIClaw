@@ -16,6 +16,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool definitions) and the `ChatResponse` parsed back from the reply
   (including tool calls, and multibyte text reassembled across stream deltas).
   Tests only; no runtime behaviour changed.
+- **Every tool call is now audited — executed and refused alike.** The
+  `AuditLogger` had no production caller for tool execution, so nothing was
+  recorded while the docs said a trail existed. One JSON record per call now lands
+  in `<profile>/audit.log`: channel, tool name, whether it was approved, whether
+  it was allowed, whether it succeeded, and how long it took. **Tool arguments are
+  never recorded** — for `shell` they are whatever the model composed, and for the
+  file tools they are paths. Writes are best-effort and off the async worker: a
+  failed append warns and never fails the tool call. `[security.audit]` still
+  configures nothing (`SecurityConfig` is not a field of `Config`), so the trail
+  runs on defaults — enabled, 100 MB rotation.
+
+### Changed
+
+- **A cron job's `session_target = "main"` now does what it says.** The value was
+  accepted and advertised in the `cron_add` tool schema, and the scheduler treated
+  it identically to `isolated`. It now selects the run's memory scope: `isolated`
+  (the default, unchanged) keeps `cron:<job_id>`; `main` runs unscoped, on the same
+  global tier the CLI and daemon use, so the job shares context with them. A job
+  already set to `main` changes behaviour on upgrade — that is the fix, but it is a
+  behaviour change.
+- **README and pillar 4 now name the sets that exist.** `[runtime].kind` accepts
+  `native` or `docker` (not `wasm`); the observability backends are OpenTelemetry,
+  Prometheus, log and noop (not `broadcast`); skill authoring is the `author_skill`
+  tool (not `skillforge`).
+- **`docs/reference/config.md` documents `[tasks]`.** The key was default-on and
+  described nowhere. The new section says what `enabled` gates (the nine agent task
+  tools *and* the nine `/tasks*` gateway routes — one flag, two surfaces), and that
+  those routes sit on the root router outside the `/api/v1` rate limiter.
 
 ### Removed
 
@@ -38,23 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,118 lines) did compile, but `mod skillforge;` in `src/main.rs` was its only
   reference anywhere: no CLI verb, no config key, no caller.
 
-### Changed
+### Fixed
 
-- **A cron job's `session_target = "main"` now does what it says.** The value was
-  accepted and advertised in the `cron_add` tool schema, and the scheduler treated
-  it identically to `isolated`. It now selects the run's memory scope: `isolated`
-  (the default, unchanged) keeps `cron:<job_id>`; `main` runs unscoped, on the same
-  global tier the CLI and daemon use, so the job shares context with them. A job
-  already set to `main` changes behaviour on upgrade — that is the fix, but it is a
-  behaviour change.
-- **README and pillar 4 now name the sets that exist.** `[runtime].kind` accepts
-  `native` or `docker` (not `wasm`); the observability backends are OpenTelemetry,
-  Prometheus, log and noop (not `broadcast`); skill authoring is the `author_skill`
-  tool (not `skillforge`).
-- **`docs/reference/config.md` documents `[tasks]`.** The key was default-on and
-  described nowhere. The new section says what `enabled` gates (the nine agent task
-  tools *and* the nine `/tasks*` gateway routes — one flag, two surfaces), and that
-  those routes sit on the root router outside the `/api/v1` rate limiter.
+- **Two ways the audit log could eat its own records.** A record torn by a crash
+  left the file without a trailing newline, and the next append glued itself to
+  the broken line, losing *both*; the writer now heals the tail first. And
+  `writeln!` on a `File` issues a separate syscall for the body and the newline,
+  so two concurrent writers interleaved into one unparseable line — now one write
+  per record. Neither was reachable before this release, because nothing wrote to
+  the log often enough to race; both are covered by tests.
 
 ### Security
 

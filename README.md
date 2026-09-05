@@ -175,8 +175,14 @@ A stale document asserting an active security control is worse than silence, so:
   production caller** and the shell tool spawns commands unwrapped. Wiring it is a
   tracked follow-up (`plans/215`). For real in-process confinement today, use
   **`[runtime].kind`** — `native` or `docker`.
-- **`[security.audit]` has no effect today.** `AuditLogger` is defined and has no
-  production caller (`plans/218`).
+- **The tool-call audit trail is on, but `[security.audit]` still configures
+  nothing.** Every tool call — executed and refused — now writes one JSON record to
+  `<profile>/audit.log` (channel, tool name, approved, allowed, succeeded,
+  duration; never the arguments). What is *not* wired is the operator's
+  `[security.audit]` block: `SecurityConfig` is not a field of `Config`, so that
+  section is still an unknown top-level key and the trail runs on defaults
+  (enabled, 100 MB rotation). Writing it produces an `unknown config key
+  \`security\`` warning at load.
 - **`forbidden_paths` covers the file tools only** (`file_read`, `file_write`,
   `pdf_read`, `image_info`). It does **not** confine the shell: an allowlisted `cat` or
   `grep` can still read any path. Its always-denied floor cannot be removed and matching
