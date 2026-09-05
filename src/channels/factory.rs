@@ -28,6 +28,57 @@ use std::sync::Arc;
 /// is operator-facing. The two WhatsApp variants share the key `whatsapp` because
 /// they share `Channel::name()`; they are mutually exclusive, selected by
 /// `wa.mode`, so only one is ever built.
+/// The ONE construction of the WhatsApp Cloud channel.
+///
+/// The gateway used to build its own for the webhook path, and the two drifted:
+/// the factory applied `with_multimodal`, the gateway did not, so a WhatsApp
+/// message arriving over the webhook was processed without the operator's image
+/// caps. Both callers go through here now, so a future option cannot be added to
+/// one and forgotten in the other.
+///
+/// Cloud mode only. `is_cloud_config()` requires `phone_number_id`, which is
+/// also what makes `backend_type()` say "cloud", so this one guard covers both.
+pub(crate) fn build_whatsapp_cloud(config: &Config) -> Option<Arc<WhatsAppChannel>> {
+    let wa = config.channels_config.whatsapp.as_ref()?;
+    if !wa.is_cloud_config() {
+        return None;
+    }
+    Some(Arc::new(
+        WhatsAppChannel::new(
+            wa.access_token.clone().unwrap_or_default(),
+            wa.phone_number_id.clone().unwrap_or_default(),
+            wa.verify_token.clone().unwrap_or_default(),
+            wa.allowed_numbers.clone(),
+        )
+        .with_multimodal(config.multimodal.clone()),
+    ))
+}
+
+/// The ONE construction of the Linq channel. See [`build_whatsapp_cloud`].
+pub(crate) fn build_linq(config: &Config) -> Option<Arc<LinqChannel>> {
+    let lq = config.channels_config.linq.as_ref()?;
+    Some(Arc::new(
+        LinqChannel::new(
+            lq.api_token.clone(),
+            lq.from_phone.clone(),
+            lq.allowed_senders.clone(),
+        )
+        .with_multimodal(config.multimodal.clone()),
+    ))
+}
+
+/// The ONE construction of the Nextcloud Talk channel. See
+/// [`build_whatsapp_cloud`]. This one carries no multimodal caps on either
+/// path today — that is the channel's current shape, not a drift.
+pub(crate) fn build_nextcloud_talk(config: &Config) -> Option<Arc<NextcloudTalkChannel>> {
+    let nc = config.channels_config.nextcloud_talk.as_ref()?;
+    Some(Arc::new(NextcloudTalkChannel::new(
+        nc.base_url.clone(),
+        nc.app_token.clone(),
+        nc.allowed_users.clone(),
+    )))
+}
+
 pub(crate) fn build_configured_channels(
     config: &Config,
 ) -> Vec<(&'static str, &'static str, Arc<dyn Channel>)> {
@@ -155,20 +206,8 @@ pub(crate) fn build_configured_channels(
         match wa.backend_type() {
             "cloud" => {
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
-                if wa.is_cloud_config() {
-                    channels.push((
-                        "whatsapp",
-                        "WhatsApp",
-                        Arc::new(
-                            WhatsAppChannel::new(
-                                wa.access_token.clone().unwrap_or_default(),
-                                wa.phone_number_id.clone().unwrap_or_default(),
-                                wa.verify_token.clone().unwrap_or_default(),
-                                wa.allowed_numbers.clone(),
-                            )
-                            .with_multimodal(config.multimodal.clone()),
-                        ),
-                    ));
+                if let Some(channel) = build_whatsapp_cloud(config) {
+                    channels.push(("whatsapp", "WhatsApp", channel));
                 } else {
                     tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
                 }
@@ -202,30 +241,14 @@ pub(crate) fn build_configured_channels(
     }
 
     if let Some(ref lq) = config.channels_config.linq {
-        channels.push((
-            "linq",
-            "Linq",
-            Arc::new(
-                LinqChannel::new(
-                    lq.api_token.clone(),
-                    lq.from_phone.clone(),
-                    lq.allowed_senders.clone(),
-                )
-                .with_multimodal(config.multimodal.clone()),
-            ),
-        ));
+        let _ = lq;
+        if let Some(channel) = build_linq(config) {
+            channels.push(("linq", "Linq", channel));
+        }
     }
 
-    if let Some(ref nc) = config.channels_config.nextcloud_talk {
-        channels.push((
-            "nextcloud_talk",
-            "Nextcloud Talk",
-            Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.allowed_users.clone(),
-            )),
-        ));
+    if let Some(channel) = build_nextcloud_talk(config) {
+        channels.push(("nextcloud_talk", "Nextcloud Talk", channel));
     }
 
     if let Some(ref email_cfg) = config.channels_config.email {
@@ -381,6 +404,70 @@ pub(crate) fn warn_unused_channel_config(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config whose `[multimodal]` limits are deliberately NOT the defaults,
+    /// so a channel built without `with_multimodal` is distinguishable from one
+    /// built with it.
+    fn config_with_whatsapp_cloud() -> Config {
+        let mut config = Config::default();
+        config.multimodal.max_images = 7;
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("t".into()),
+            phone_number_id: Some("p".into()),
+            verify_token: Some("v".into()),
+            app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        });
+        config
+    }
+
+    #[test]
+    fn the_whatsapp_builder_applies_the_operators_multimodal_caps() {
+        let config = config_with_whatsapp_cloud();
+        let channel = build_whatsapp_cloud(&config).expect("cloud config builds");
+        assert_eq!(
+            channel.multimodal().max_images,
+            7,
+            "the operator's caps must reach the channel, not the struct default"
+        );
+    }
+
+    /// Linq carried the identical drift — the factory applied the caps, the
+    /// gateway did not. One test per channel that has caps, not one per change:
+    /// the contract is "every webhook channel with multimodal limits gets the
+    /// operator's", and asserting it for WhatsApp alone would leave Linq free to
+    /// regress. Nextcloud Talk carries no multimodal config on either path, so
+    /// there is nothing to assert for it.
+    #[test]
+    fn the_linq_builder_applies_the_operators_multimodal_caps() {
+        let mut config = Config::default();
+        config.multimodal.max_images = 7;
+        config.channels_config.linq = Some(crate::config::schema::LinqConfig {
+            api_token: "t".into(),
+            from_phone: "p".into(),
+            signing_secret: None,
+            allowed_senders: vec![],
+        });
+        let channel = build_linq(&config).expect("linq config builds");
+        assert_eq!(channel.multimodal().max_images, 7);
+    }
+
+    #[test]
+    fn the_whatsapp_builder_refuses_a_config_that_is_not_cloud() {
+        let mut config = config_with_whatsapp_cloud();
+        // Drop the one field `is_cloud_config` needs; the webhook path has
+        // nothing to talk to without it.
+        config
+            .channels_config
+            .whatsapp
+            .as_mut()
+            .expect("set")
+            .phone_number_id = None;
+        assert!(build_whatsapp_cloud(&config).is_none());
+    }
 
     fn config_with_telegram() -> Config {
         let mut config = Config::default();

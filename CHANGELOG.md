@@ -109,6 +109,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Webhook-delivered WhatsApp and Linq messages now run under the operator's
+  `[multimodal]` caps.** The gateway constructed its own channel instances for the
+  webhook path while the channel factory built separate ones for every other
+  transport, and the two had drifted: the factory applied `with_multimodal`, the
+  gateway did not. The same image arriving over the webhook was therefore
+  processed without the operator's limits. Both paths now go through one
+  constructor per channel, so a future option cannot be added to one and
+  forgotten in the other.
+
 - **Two ways the audit log could eat its own records.** A record torn by a crash
   left the file without a trailing newline, and the next append glued itself to
   the broken line, losing *both*; the writer now heals the tail first. And

@@ -677,20 +677,11 @@ pub fn build_gateway_router(
             })
         });
 
-    // WhatsApp channel (if configured)
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
-        .channels_config
-        .whatsapp
-        .as_ref()
-        .filter(|wa| wa.is_cloud_config())
-        .map(|wa| {
-            Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone().unwrap_or_default(),
-                wa.phone_number_id.clone().unwrap_or_default(),
-                wa.verify_token.clone().unwrap_or_default(),
-                wa.allowed_numbers.clone(),
-            ))
-        });
+    // WhatsApp channel (if configured). Built by the channel factory, not here:
+    // the gateway used to construct its own and the two drifted — the factory
+    // applied `with_multimodal`, this did not, so a WhatsApp message arriving
+    // over the webhook was processed without the operator's image caps.
+    let whatsapp_channel = crate::channels::factory::build_whatsapp_cloud(&config);
 
     // WhatsApp app secret for webhook signature verification
     // Priority: environment variable > config file
@@ -711,14 +702,8 @@ pub fn build_gateway_router(
         })
         .map(Arc::from);
 
-    // Linq channel (if configured)
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
-        Arc::new(LinqChannel::new(
-            lq.api_token.clone(),
-            lq.from_phone.clone(),
-            lq.allowed_senders.clone(),
-        ))
-    });
+    // Linq channel (if configured) — same shared construction as WhatsApp above.
+    let linq_channel = crate::channels::factory::build_linq(&config);
 
     // Linq signing secret for webhook signature verification
     // Priority: environment variable > config file
@@ -739,15 +724,8 @@ pub fn build_gateway_router(
         })
         .map(Arc::from);
 
-    // Nextcloud Talk channel (if configured)
-    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
-            Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.allowed_users.clone(),
-            ))
-        });
+    // Nextcloud Talk channel (if configured) — same shared construction.
+    let nextcloud_talk_channel = crate::channels::factory::build_nextcloud_talk(&config);
 
     // Nextcloud Talk webhook secret for signature verification
     // Priority: environment variable > config file
@@ -2853,6 +2831,42 @@ mod tests {
             assert_eq!(addr.port(), 8080);
         }
     }
+    // ── Webhook channels come from the factory (plan 309 step 2) ────────────
+
+    /// The gateway used to construct its own WhatsApp instance for the webhook
+    /// path, and skipped `with_multimodal` while the channel factory applied it.
+    /// A WhatsApp message arriving over the webhook was therefore processed
+    /// without the operator's image caps, while the same message over any other
+    /// transport was not. This asserts the gateway's instance carries them.
+    #[test]
+    fn the_gateways_whatsapp_channel_carries_the_operators_multimodal_caps() {
+        let mut config = crate::config::Config::default();
+        // Deliberately not the default, so an instance built without the
+        // operator's config is distinguishable from one built with it.
+        config.multimodal.max_images = 7;
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("t".into()),
+            phone_number_id: Some("p".into()),
+            verify_token: Some("v".into()),
+            app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        });
+
+        let (state, _app) = super::build_gateway_router(config, None).expect("router builds");
+        let wa = state
+            .whatsapp
+            .as_ref()
+            .expect("a cloud config yields a channel");
+        assert_eq!(
+            wa.multimodal().max_images,
+            7,
+            "the webhook path must run under the same caps as every other transport"
+        );
+    }
+
     // ── One registry per process (plan 307) ─────────────────────────────────
 
     async fn metrics_body(app: &axum::Router) -> String {
