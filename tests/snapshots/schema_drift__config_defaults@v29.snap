@@ -1,0 +1,308 @@
+---
+source: tests/schema_drift.rs
+assertion_line: 70
+description: "Config::default() value fingerprint. If this test fails, a DEFAULT VALUE a fresh install gets changed. Bump config::migrations::CURRENT_VERSION, add a migrate_vN function, write a unit test, then `cargo insta accept` here."
+expression: defaults
+---
+{
+  "agent": {
+    "compact_context": false,
+    "max_history_messages": 50,
+    "max_tool_iterations": 50,
+    "tool_dispatcher": "auto"
+  },
+  "agents": {},
+  "api_key": null,
+  "api_url": null,
+  "autonomy": {
+    "allowed_commands": [
+      "git",
+      "npm",
+      "cargo",
+      "ls",
+      "cat",
+      "grep",
+      "find",
+      "echo",
+      "pwd",
+      "wc",
+      "head",
+      "tail"
+    ],
+    "always_ask": [
+      "ssh",
+      "pty"
+    ],
+    "auto_approve": [
+      "file_read",
+      "memory_recall"
+    ],
+    "block_high_risk_commands": false,
+    "forbidden_paths": [
+      "/etc",
+      "/root",
+      "/home",
+      "/usr",
+      "/bin",
+      "/sbin",
+      "/lib",
+      "/opt",
+      "/boot",
+      "/dev",
+      "/proc",
+      "/sys",
+      "/var",
+      "/tmp",
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.aws",
+      "~/.config"
+    ],
+    "level": "supervised",
+    "max_actions_per_hour": 200,
+    "max_cost_per_day_cents": 500,
+    "require_approval_for_medium_risk": true,
+    "workspace_only": true
+  },
+  "browser": {
+    "allowed_domains": [],
+    "backend": "agent_browser",
+    "computer_use": {
+      "allow_remote_endpoint": false,
+      "api_key": null,
+      "endpoint": "http://127.0.0.1:8787/v1/actions",
+      "max_coordinate_x": null,
+      "max_coordinate_y": null,
+      "timeout_ms": 15000,
+      "window_allowlist": []
+    },
+    "enabled": true,
+    "native_chrome_path": null,
+    "native_headless": true,
+    "native_webdriver_url": "http://127.0.0.1:9515",
+    "session_name": null
+  },
+  "channels_config": {
+    "approval_owners": [],
+    "autonomous_tools": false,
+    "cli": true,
+    "dingtalk": null,
+    "discord": null,
+    "email": null,
+    "guest_allowed_commands": [],
+    "guest_allowed_tools": [],
+    "imessage": null,
+    "irc": null,
+    "lark": null,
+    "linq": null,
+    "matrix": null,
+    "mattermost": null,
+    "message_timeout_secs": 600,
+    "nextcloud_talk": null,
+    "qq": null,
+    "signal": null,
+    "slack": null,
+    "telegram": null,
+    "thread_replies": true,
+    "webhook": null,
+    "whatsapp": null
+  },
+  "composio": {
+    "api_key": null,
+    "enabled": false,
+    "entity_id": "default"
+  },
+  "cost": {
+    "daily_limit_usd": 10.0,
+    "enabled": false,
+    "monthly_limit_usd": 100.0,
+    "warn_at_percent": 80
+  },
+  "cron": {
+    "enabled": true,
+    "max_catchup_age_secs": 86400,
+    "max_run_history": 50
+  },
+  "default_model": null,
+  "default_provider": "openrouter",
+  "default_temperature": 0.7,
+  "embedding_routes": [],
+  "gateway": {
+    "allow_public_bind": false,
+    "api_rate_limit_per_minute": 600,
+    "host": "127.0.0.1",
+    "idempotency_max_keys": 10000,
+    "idempotency_ttl_secs": 300,
+    "login": {
+      "idle_timeout_secs": 0,
+      "password_hash": null,
+      "username": null
+    },
+    "pair_rate_limit_per_minute": 10,
+    "paired_tokens": [],
+    "port": 9393,
+    "rate_limit_max_keys": 10000,
+    "request_timeout_secs": 300,
+    "require_pairing": true,
+    "trust_forwarded_headers": false,
+    "webhook_rate_limit_per_minute": 60
+  },
+  "gateway_agents": {},
+  "hardware": {
+    "baud_rate": 115200,
+    "enabled": false,
+    "probe_target": null,
+    "serial_port": null,
+    "transport": "None",
+    "workspace_datasheets": false
+  },
+  "heartbeat": {
+    "enabled": false,
+    "interval_minutes": 30
+  },
+  "http_request": {
+    "allowed_domains": [
+      "*"
+    ],
+    "enabled": true,
+    "max_response_size": 5242880,
+    "timeout_secs": 20
+  },
+  "identity": {
+    "aieos_inline": null,
+    "aieos_path": null,
+    "format": "openclaw"
+  },
+  "knowledge": {
+    "embedding_api_key": null,
+    "enabled": false,
+    "vision_api_key": null
+  },
+  "mcp_servers": {},
+  "memory": {
+    "archive_after_days": 7,
+    "auto_hydrate": true,
+    "auto_save": true,
+    "backend": "sqlite",
+    "conversation_retention_days": 30,
+    "embedding_cache_size": 10000,
+    "embedding_dimensions": 1536,
+    "embedding_model": "text-embedding-3-small",
+    "embedding_provider": "none",
+    "hygiene_enabled": true,
+    "keyword_weight": 0.3,
+    "min_relevance_score": 0.4,
+    "purge_after_days": 30,
+    "snapshot_enabled": false,
+    "snapshot_on_hygiene": false,
+    "sqlite_open_timeout_secs": null,
+    "vector_weight": 0.7
+  },
+  "model_routes": [],
+  "multimodal": {
+    "allow_remote_fetch": false,
+    "max_image_size_mb": 5,
+    "max_images": 4
+  },
+  "observability": {
+    "backend": "none",
+    "otel_endpoint": null,
+    "otel_service_name": null
+  },
+  "peripherals": {
+    "boards": [],
+    "datasheet_dir": null,
+    "enabled": false
+  },
+  "proxy": {
+    "all_proxy": null,
+    "enabled": false,
+    "http_proxy": null,
+    "https_proxy": null,
+    "no_proxy": [],
+    "scope": "rantaiclaw",
+    "services": []
+  },
+  "query_classification": {
+    "enabled": false,
+    "rules": []
+  },
+  "reliability": {
+    "channel_initial_backoff_secs": 2,
+    "channel_max_backoff_secs": 60,
+    "fallback_providers": [],
+    "model_fallbacks": {},
+    "provider_backoff_ms": 500,
+    "provider_retries": 3,
+    "scheduler_poll_secs": 15,
+    "scheduler_retries": 2
+  },
+  "runtime": {
+    "docker": {
+      "allowed_workspace_roots": [],
+      "cpu_limit": 1.0,
+      "image": "alpine:3.20",
+      "memory_limit_mb": 512,
+      "mount_workspace": true,
+      "network": "none",
+      "read_only_rootfs": true
+    },
+    "kind": "native",
+    "reasoning_enabled": null
+  },
+  "scheduler": {
+    "enabled": true,
+    "max_concurrent": 4,
+    "max_tasks": 64
+  },
+  "schema_version": 29,
+  "secrets": {
+    "encrypt": true
+  },
+  "services": {
+    "searxng": null
+  },
+  "skills": {
+    "entries": {},
+    "install": {
+      "node_manager": "npm",
+      "prefer_brew": true
+    },
+    "open_skills_dir": null,
+    "open_skills_enabled": false,
+    "open_skills_ref": null,
+    "prompt_injection_mode": "full"
+  },
+  "storage": {
+    "provider": {
+      "config": {
+        "connect_timeout_secs": null,
+        "db_url": null,
+        "provider": "",
+        "schema": "public",
+        "table": "memories"
+      }
+    }
+  },
+  "tasks": {
+    "enabled": true
+  },
+  "tunnel": {
+    "cloudflare": null,
+    "custom": null,
+    "ngrok": null,
+    "provider": "none",
+    "tailscale": null
+  },
+  "ui": {
+    "host": "127.0.0.1"
+  },
+  "web_search": {
+    "brave_api_key": null,
+    "enabled": true,
+    "max_results": 5,
+    "provider": "duckduckgo",
+    "searxng_url": null,
+    "timeout_secs": 15
+  }
+}

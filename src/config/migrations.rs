@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 28;
+pub const CURRENT_VERSION: u32 = 29;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -397,10 +397,42 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; the encryption pass lives in `load_or_init`)
     }
 
-    // Future migrations (v29, …) inserted here in order.
+    // v28 → v29: drop `[memory].chunk_max_tokens` and `[reliability].api_keys`.
+    // Both were accepted, stored and shown back, and read by nothing that acted
+    // on them — see `migrate_v29` for the evidence. Removing them silently would
+    // break every config that carries one, so they are stripped here.
+    if from < 29 {
+        migrate_v29(raw);
+    }
+
+    // Future migrations (v30, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
+}
+
+/// v28 → v29: remove the two keys that were accepted and read by nothing.
+///
+/// `[memory].chunk_max_tokens` had no reader at all — only two writers, in the
+/// wizard and the provisioner, which wrote it into every fresh config.
+///
+/// `[reliability].api_keys` reached `ReliableProvider::rotate_key`, which
+/// advanced a round-robin index and returned a key that was then used only to
+/// build a log line. Three of the four call sites said so in the log text
+/// ("key rotation selected key ending ...X but cannot apply (Provider trait has
+/// no set_api_key)"); the fourth claimed it had "rotated API key". Applying it
+/// would need a `set_api_key` on the `Provider` trait — a change across every
+/// implementer, for a feature nobody asked for.
+fn migrate_v29(raw: &mut Value) {
+    let Some(root) = raw.as_table_mut() else {
+        return;
+    };
+    if let Some(memory) = root.get_mut("memory").and_then(Value::as_table_mut) {
+        memory.remove("chunk_max_tokens");
+    }
+    if let Some(reliability) = root.get_mut("reliability").and_then(Value::as_table_mut) {
+        reliability.remove("api_keys");
+    }
 }
 
 /// v24 → v25: remove the dead `cost.allow_override` / `cost.prices` /
@@ -882,6 +914,61 @@ backend = \"markdown\"
         let mut v = parse("schema_version = -1\n");
         let err = migrate(&mut v).expect_err("negative version must be rejected");
         assert!(format!("{err:#}").contains("negative"));
+    }
+
+    /// Both keys were accepted and read by nothing that acted on them. A config
+    /// carrying either must come out without it — and the neighbouring keys in
+    /// the same tables must survive, because the migration removes two named
+    /// keys, not two sections.
+    #[test]
+    fn v29_strips_the_keys_with_no_reader() {
+        let mut v = parse(
+            "schema_version = 28\n\
+             [memory]\nbackend = \"sqlite\"\nchunk_max_tokens = 512\n\
+             [reliability]\nprovider_retries = 3\napi_keys = [\"a\", \"b\"]\n",
+        );
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+
+        let memory = v
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory survives");
+        assert!(
+            memory.get("chunk_max_tokens").is_none(),
+            "chunk_max_tokens dropped"
+        );
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite"),
+            "kept memory keys survive"
+        );
+
+        let reliability = v
+            .get("reliability")
+            .and_then(Value::as_table)
+            .expect("reliability survives");
+        assert!(reliability.get("api_keys").is_none(), "api_keys dropped");
+        assert_eq!(
+            reliability
+                .get("provider_retries")
+                .and_then(Value::as_integer),
+            Some(3),
+            "kept reliability keys survive"
+        );
+    }
+
+    /// A config that never carried either key must not gain an empty table —
+    /// the migration removes keys, it does not create sections.
+    #[test]
+    fn v29_leaves_a_config_without_those_tables_alone() {
+        let mut v = parse("schema_version = 28\n");
+        assert!(migrate(&mut v).unwrap());
+        assert!(v.get("memory").is_none(), "no [memory] table invented");
+        assert!(
+            v.get("reliability").is_none(),
+            "no [reliability] table invented"
+        );
     }
 
     #[test]

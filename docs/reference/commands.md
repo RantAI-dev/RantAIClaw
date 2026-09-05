@@ -154,6 +154,12 @@ Notes:
 - `cron run` reuses the same manual-run path as the `cron_run` tool and the web `POST /api/v1/cron/{id}/run`: it records to run history but does not shift the schedule or consume a one-shot.
 - Mutating schedule/cron actions (CLI `cron add/add-at/add-every/once/update/remove/pause/resume/run`, the `cron_*` tools, and the `POST`/`PUT`/`DELETE` `/api/v1/cron*` endpoints) require `cron.enabled = true`; when it is false they are refused. Listing and run history stay readable. If `scheduler.enabled = false`, jobs persist but never fire — `cron list` shows a "scheduler disabled" banner.
 - Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
+- **`session_target` picks the memory scope an agent job runs with.** `isolated`
+  (the default) scopes the run to `cron:<job_id>`, so its `memory_recall` sees its
+  own rows plus the shared/global tier and nothing else. `main` runs with no scope
+  — the same global tier the CLI and daemon use — so the job shares context with
+  them. Set it through the `cron_add`/`cron_update` tools or the HTTP API; until
+  schema v29 the two values behaved identically.
 
 #### HTTP control (`/api/v1/cron*`)
 

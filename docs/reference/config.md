@@ -462,7 +462,6 @@ Notes:
 | `snapshot_on_hygiene` | `false` | run that export during the hygiene pass |
 | `auto_hydrate` | `true` | restore from `MEMORY_SNAPSHOT.md` when `brain.db` is missing or empty |
 | `sqlite_open_timeout_secs` | unset | seconds to wait when opening `brain.db`. Unset waits indefinitely; capped at 300 |
-| `chunk_max_tokens` | `512` | **not used by memory** — see the note below |
 
 ### The curated tier
 
@@ -547,13 +546,6 @@ The system prompt is built once per session, so a memory stored mid-session
 appears in the file immediately but reaches the prompt next session. Within-session
 recall covers the gap.
 
-### `chunk_max_tokens` is misplaced
-
-It sits under `[memory]` but nothing in the memory subsystem reads it — its only
-consumer is hardware datasheet RAG (`src/rag/`). Left where it is deliberately:
-relocating a key means another schema migration, and the value's behaviour is
-unchanged either way. Documented here so it is not mistaken for a memory setting.
-
 Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys, so old
@@ -565,6 +557,13 @@ Notes:
 - `response_cache_enabled`, `response_cache_ttl_minutes` and
   `response_cache_max_entries` were removed in schema v17. They configured a cache
   that was never wired to anything; the migrator strips them.
+- `chunk_max_tokens` was removed in schema v29. It sat under `[memory]` and had no
+  reader anywhere — the datasheet RAG chunker that this file used to name as its
+  consumer hard-codes 512 (`src/rag/mod.rs`). The migrator strips it.
+- `[reliability].api_keys` was removed in the same bump. It reached a round-robin
+  helper whose result was only ever put in a log line; applying a rotated key would
+  need a `set_api_key` on the `Provider` trait, which no implementer has. The
+  migrator strips it.
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 

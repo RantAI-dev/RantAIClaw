@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`[memory].chunk_max_tokens` and `[reliability].api_keys` — accepted, never
+  acted on (config schema v28 → v29).** `api_keys` reached a round-robin helper
+  whose result only ever became a log line; three of its four call sites already
+  said "cannot apply (Provider trait has no set_api_key)". `chunk_max_tokens` had
+  no reader anywhere — the datasheet RAG chunker that the docs named as its
+  consumer hard-codes 512 — and the wizard and provisioner wrote it into every
+  fresh config; both now stop. A `migrate_v29` arm strips both keys, so a config
+  carrying them still loads. **Rolling back to a pre-v29 binary needs the config
+  migrated back**: a v29 config is refused with `schema_version=29 is newer than
+  this binary supports`. Keep a copy of `config.toml` before first launch if you
+  may need to go back.
 - **Three modules the product advertised and could not run.** `src/runtime/wasm.rs`
   (687 lines, 36 tests) was never declared as a module, has no `runtime-wasm` feature
   behind it, and imported a `WasmRuntimeConfig` type that does not exist — it could not
@@ -29,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A cron job's `session_target = "main"` now does what it says.** The value was
+  accepted and advertised in the `cron_add` tool schema, and the scheduler treated
+  it identically to `isolated`. It now selects the run's memory scope: `isolated`
+  (the default, unchanged) keeps `cron:<job_id>`; `main` runs unscoped, on the same
+  global tier the CLI and daemon use, so the job shares context with them. A job
+  already set to `main` changes behaviour on upgrade — that is the fix, but it is a
+  behaviour change.
 - **README and pillar 4 now name the sets that exist.** `[runtime].kind` accepts
   `native` or `docker` (not `wasm`); the observability backends are OpenTelemetry,
   Prometheus, log and noop (not `broadcast`); skill authoring is the `author_skill`

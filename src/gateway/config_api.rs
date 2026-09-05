@@ -136,8 +136,8 @@ async fn get_config(
 /// so credentials across ALL channels — and future ones — are caught by shape:
 /// `server_password`/`nickserv_password` (IRC), `encrypt_key`/`verification_token`
 /// (Lark), `verify_token` (WhatsApp), etc. The suffixes are chosen NOT to hit
-/// non-secret look-alikes: `secrets` (a config section), `max_tokens` /
-/// `chunk_max_tokens` (counts ending in the plural `_tokens`), and
+/// non-secret look-alikes: `secrets` (a config section), `max_tokens` and
+/// other counts ending in the plural `_tokens`, and
 /// `rate_limit_max_keys` / `idempotency_max_keys` (counts ending in `_keys`).
 pub(crate) fn redact_secrets_in_json(v: &mut serde_json::Value) {
     fn is_secret_key(k: &str) -> bool {
