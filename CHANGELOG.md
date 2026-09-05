@@ -7,6 +7,203 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0-alpha] — 2026-09-05
+
+Wave 1 of the production-readiness audit plus the follow-up batch it produced:
+fourteen fixes, none of which had reached a user. Five are security fixes (MCP
+server credentials written to disk in the clear, credentials reaching the memory
+store and cron announcements unredacted, a rate limiter keyed on an unvalidated
+bearer, release signature verification that failed open), one is a session-killer
+(history trimming split tool-call pairs, so every later turn in a tool-heavy
+session got a 400), and one turned prose into outbound requests (a bare URL in a
+model's reply became a `shell` `curl`). The rest cover headless setup honesty,
+the gateway reading the config it is actually running, cron tool schemas, and one
+answer to "can this provider send?" shared by every surface that asks.
+
+**Config schema v27 → v28**: `[mcp_servers.<name>].env` values are encrypted at
+rest, so this release does **not** roll back cleanly to 0.28.0-alpha — a v28
+config refuses to load on a pre-v28 binary with `schema_version=28 is newer than
+this binary supports`. The migrate arm itself transforms nothing; the one-time
+re-encryption happens in `Config::load_or_init` during the write-back the version
+bump triggers. Keep a copy of `config.toml` before first launch if you may need
+to go back. claw-ui pin bumped to **v0.3.26**.
+
+Five behaviour changes need an operator's attention:
+
+- **`update` can now refuse on a machine without cosign.** Signature verification
+  no longer falls back to a SHA-256 check against a checksum file served from the
+  same origin as the archive. If cosign is missing or verification cannot run,
+  the update stops; pass `--allow-unverified` to proceed knowing the artifact was
+  not verified.
+- **`setup <topic> --non-interactive` now exits non-zero when it configures
+  nothing.** It previously printed "nothing saved" and returned 0, and saved the
+  config anyway. An installer or CI job that ignores exit codes will start seeing
+  failures where it previously saw silent success — including a provider section
+  that ends with no credential the agent could send with.
+- **`save()` no longer bakes environment values into `config.toml`.** A setting
+  that arrived from the environment for one run — `RANTAICLAW_ALLOW_PUBLIC_BIND`,
+  `RANTAICLAW_API_KEY` — is no longer made permanent by the first console, TUI or
+  setup write. Configs already carrying such a value keep it; this stops new ones
+  being created.
+- **The gateway's API rate limiter is keyed after authentication.** A caller
+  presenting an unrecognised bearer now shares the bucket for its network
+  identity instead of getting a fresh one per invented token. With
+  `trust_forwarded_headers` enabled, the client address is taken from the
+  right-most `X-Forwarded-For` hop (the one your proxy appended) rather than the
+  left-most (the one a client can write).
+- **MCP server `env` values are encrypted on save.** They are decrypted by the
+  same authority that governs every other stored credential, so `McpClient`
+  still spawns with the plaintext it needs. Reading `config.toml` by hand or with
+  another tool will show ciphertext where tokens used to be.
+
+No exposure-boundary default is widened.
+
+### Security
+
+- MCP server credentials no longer sit on disk in the clear. Notion, Slack and
+  GitHub tokens configured under `[mcp_servers.<name>].env` bypassed
+  `decrypt_config_secrets`, the documented single authority on which fields are
+  encrypted. The config API redacts them on the wire, which is what made the gap
+  easy to miss — the exposure was the file itself. Every value is treated as a
+  secret rather than guessed from the variable name, because a name-shaped
+  heuristic misses `DATABASE_URL` and `PGPASSWORD`. Carries config schema v28.
+
+- Credentials stop leaving the process unredacted on two paths. Auto-save: four
+  call sites screen a message before storing it as memory, and only the channel
+  dispatcher did — the agent loop's two sites and `Agent::turn` did not. Memory
+  is the one store read back into a later prompt without anyone looking at it
+  again, so a credential typed into the TUI landed verbatim in `brain.db`, was
+  returned by `memory_recall`, was served by `GET /api/v1/memory`, and travelled
+  back to the provider on every later recall. All four now go through one
+  `memory::autosave_screened`. Cron announcements were the second path.
+
+- The gateway's API rate limiter is keyed on an authenticated principal. The
+  middleware runs before authentication, so the bucket came from whatever bearer
+  the request presented: a caller with no valid token got a fresh bucket for
+  every token they invented, and the key map could be made to churn. When
+  `require_pairing` is false that limiter is the only guard in front of
+  `agent/chat`, which spends money per request. A token becomes a principal only
+  after it checks out against the same paired-token set the auth layer uses.
+
+- Client addresses are read from the right proxy hop. With
+  `trust_forwarded_headers` enabled, `X-Forwarded-For` was read left-most — the
+  hop a client controls — so a spoofed header chose the rate-limit bucket. The
+  right-most hop, the one the trusted proxy appended, is now used.
+
+- Release signature verification no longer fails open. The project signs
+  releases with keyless cosign and advertises them as cosign-verified, but two
+  outcomes skipped verification and continued on a SHA-256 check against a
+  checksum file fetched from the same origin as the archive — which whoever can
+  serve the archive can also serve. Both paths now refuse unless the operator
+  passes `--allow-unverified`. `enforce_cosign` is the single decision point, so
+  a new outcome cannot quietly become a third way to skip. There is no
+  pre-cosign release to tolerate; the cutover version was read off the releases
+  rather than assumed.
+
+### Fixed
+
+- Sessions no longer die after a few tool-heavy turns. `AssistantToolCalls` and
+  the `ToolResults` answering it are two separate history entries, but
+  `trim_history` cut by message count. A cut landing between them left a tool
+  result whose originating call was gone — a shape both OpenAI and Anthropic
+  reject with a 400, so every later turn in the session failed until the user
+  cleared it. `max_history_messages` defaults to 50 and each tool iteration
+  appends two entries, so the boundary arrives in a handful of turns. A cut
+  index is now moved forward — never back — until it is not a `ToolResults`,
+  which keeps the caller's length cap intact.
+
+- Tool calls are no longer extracted from unstructured prose for non-GLM models.
+  The rule is stated directly above the parser, because content a model echoes
+  from an email, a file or a web page could mimic a call. Three parts of the GLM
+  fallback broke it. A line that was only a URL became a `shell` `curl`, so a
+  model reporting what it had just read issued an outbound request from the
+  operator's machine — under Full autonomy, or with `curl` allowlisted, with no
+  prompt. `browser_open`, `browser` and `web_search` were aliased to `shell`
+  despite being real registered tools.
+
+- `Config::save()` writes the operator's config, not the environment's.
+  `load_or_init` folds environment overrides onto the in-memory `Config` and
+  `save()` serialised that same struct, so the first console, TUI or setup write
+  baked whatever the environment held into `config.toml` permanently. A container
+  started with `RANTAICLAW_ALLOW_PUBLIC_BIND=true` had a one-run exposure setting
+  outlive its cause, and `RANTAICLAW_API_KEY` became a stored credential.
+
+- `setup <topic> --non-interactive` fails loudly instead of exiting zero after
+  doing nothing. A provisioner that errored, aborted or timed out printed a
+  message and still returned `Ok`, and the caller saved the config regardless —
+  while the abort message said "nothing saved". All three arms now return an
+  error, which also makes "nothing saved" true rather than merely printed. It
+  also answered every choice with option 0, which for MCP's multi-select picked
+  a server the operator never asked for.
+
+- A headless provider section no longer reports success for an install that
+  cannot send. It treated a selection with no key as complete, which is
+  reasonable interactively — the operator is sitting there and may export the
+  key later — but headless it saved the config and exited zero for an install
+  that cannot send a single message, with no way for an installer to tell.
+
+- The gateway reads the config it is running. The config API and the
+  hot-reloader both called `Config::load_or_init()`, which re-resolves the config
+  path from the environment and the `active_workspace.toml` marker on every call.
+  A marker or env var that changed after boot made a console write
+  read-modify-save a *different* file and swap it into the running state, and
+  made the reloader answer a change to the watched file by loading some other
+  one. Both now load the path the gateway booted with.
+
+- Synchronous gateway chat no longer prompts a TTY. A request could block on an
+  approval prompt written to a terminal no operator was watching.
+
+- The cron tools' object parameters have real schemas. An agent reported
+  `cron_add` refusing its schedule because `every_ms` arrived as `"600000"`
+  rather than `600000`; the underlying reason was that there was no schema for
+  the field. `schedule` was a bare object whose shape lived only in a prose
+  description, so a provider doing constrained or structured decoding had nothing
+  to constrain against — the model was guessing in the absence of a type, not
+  ignoring one. `schedule`, `delivery` and `cron_update.patch` now carry schemas
+  derived from the types they deserialise into, in one module so `cron_add` and
+  `cron_update` cannot advertise different shapes for the same field. A
+  stringified integer is also accepted.
+
+- The generative-UI render instruction is no longer stored as the user's words.
+  The console appended it to the message body and the gateway persists
+  `body.message` verbatim, so it became part of the user's turn, was replayed on
+  every later turn — including after switching back to markdown — and appeared in
+  exported transcripts as text they never wrote. Render mode is now a structured
+  `render_mode` request field the gateway applies to the outgoing prompt and
+  never persists. An absent or unrecognised value means markdown, so an older
+  console keeps working.
+
+### Changed
+
+- One honest answer to "can this provider actually send?", shared by every
+  surface that asks. `has_usable_credential` knew only about plain API keys, so
+  `doctor` did not use it — it asked `resolve_key_for_provider`, which only looks
+  at config, and told operators authenticated by environment or OAuth that the
+  agent could not send while it sent fine. It now answers per auth mode, each
+  branch calling the code that consumes the credential: AWS environment
+  variables for Bedrock, auth profiles for Codex, the cached GitHub token for
+  Copilot, the OAuth env vars and cache file for Qwen, the Gemini CLI, and
+  providers that need no credential at all. `doctor`, the config API and headless
+  setup all ask it, and the per-caller carve-outs are gone. `doctor` reports "no
+  credential for X — tried config, its environment variables, and the provider's
+  own auth" instead of "no API key", and no longer probes a provider
+  unauthenticated when its credential is not a bearer it could send.
+
+- Both the config API and headless setup resolve per-provider keys. They read
+  the top-level `api_key` only, so a key stored under `provider_api_keys` — what
+  the web console writes — read as absent.
+
+### Documentation
+
+- The release runbook no longer says a green `schema_drift` means a release
+  rolls back cleanly. It means neither: the gate compares the working tree
+  against committed snapshots, so it measures drift since the last PR that moved
+  the schema, not since the last release — and the PR that bumps the schema
+  commits the matching snapshot with it. 0.28.0-alpha is the worked example: all
+  three release gates were green on the bump commit, and the release still
+  carried config schema v26 → v27. The runbook now names the release-to-release
+  check instead.
+
 ## [0.28.0-alpha] — 2026-09-04
 
 Wave 0 of the production-readiness audit: the eight verified blockers, none of
