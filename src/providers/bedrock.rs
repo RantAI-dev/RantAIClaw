@@ -60,6 +60,17 @@ impl AwsCredentials {
     }
 }
 
+/// Whether the environment carries the AWS credentials this provider sends with.
+///
+/// `BedrockProvider::new()` ignores the API key it is handed and calls
+/// `AwsCredentials::from_env`, so `providers::resolve_provider_credential` can
+/// never see this — it returns `None` for bedrock by design. This is the same
+/// check, exposed so `has_usable_credential` can ask the code that actually
+/// consumes the credential rather than re-deriving it.
+pub(crate) fn has_env_credentials() -> bool {
+    AwsCredentials::from_env().is_ok()
+}
+
 fn env_required(name: &str) -> anyhow::Result<String> {
     std::env::var(name)
         .ok()

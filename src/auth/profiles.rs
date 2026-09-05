@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
-const PROFILES_FILENAME: &str = "auth-profiles.json";
+pub(crate) const PROFILES_FILENAME: &str = "auth-profiles.json";
 const LOCK_FILENAME: &str = "auth-profiles.lock";
 const LOCK_WAIT_MS: u64 = 50;
 const LOCK_TIMEOUT_MS: u64 = 10_000;

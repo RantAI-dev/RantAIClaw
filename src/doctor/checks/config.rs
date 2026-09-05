@@ -116,26 +116,39 @@ impl DoctorCheck for ProviderKeyCheck {
                 .with_category(self.category());
         };
 
-        if crate::providers::provider_is_local(provider) {
-            return CheckResult::ok(
-                self.name(),
-                format!("{provider} runs locally — no API key needed"),
-            )
-            .with_category(self.category());
-        }
-
-        match ctx.config.resolve_key_for_provider(provider) {
-            Some(_) => CheckResult::ok(self.name(), format!("API key resolved for {provider}"))
-                .with_category(self.category()),
+        // Ask the ONE question the send path asks. `resolve_key_for_provider`
+        // answers a narrower one — "is a key in config?" — so an install
+        // authenticated by environment, by an auth profile, by AWS variables or
+        // by the Gemini CLI was told the agent could not send while it sent
+        // fine. `has_usable_credential` covers local providers too, so the
+        // separate keyless branch that used to sit here is gone.
+        let state_dir = crate::auth::state_dir_from_config(&ctx.config);
+        let resolved = ctx.config.resolve_key_for_provider(provider);
+        match (
+            crate::providers::has_usable_credential(
+                provider,
+                resolved.as_deref(),
+                Some(&state_dir),
+            ),
+            resolved,
+        ) {
+            (true, _) => {
+                CheckResult::ok(self.name(), format!("credential resolved for {provider}"))
+                    .with_category(self.category())
+            }
             // Warn, not Fail: a missing key is a setup GAP, not a breakage — a
             // fresh headless `setup --non-interactive` legitimately leaves it
             // unset, and `doctor --brief` must still exit 0 there (the
             // `setup && doctor` smoke contract, `tests/setup_e2e.rs`). Warn
             // still surfaces it as `⚠` with an actionable hint, which is the
             // whole point — doctor no longer claims a keyless config is `✓`.
-            None => CheckResult::warn(
+            (false, _) => CheckResult::warn(
                 self.name(),
-                format!("no API key for {provider} — the agent cannot send a message yet"),
+                format!(
+                    "no credential for {provider} — tried config, its environment variables, \
+                     and the provider's own auth (OAuth profile / cached token / AWS env). \
+                     The agent cannot send a message yet"
+                ),
             )
             .with_category(self.category())
             .with_hint("run: rantaiclaw setup provider"),
@@ -355,6 +368,11 @@ mod tests {
     /// 0 — but it is no longer `✓`.
     #[tokio::test]
     async fn provider_key_check_warns_when_the_active_provider_has_no_key() {
+        // This check now asks `has_usable_credential`, which reads the
+        // environment; own it, or the verdict depends on the developer's shell.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
         let cfg = Config::default();
         assert!(cfg.api_key.is_none(), "precondition: default has no key");
         let (ctx, _tmp) = ctx_with_config(cfg);
@@ -391,11 +409,51 @@ mod tests {
     /// key, does not report `✓`).
     #[tokio::test]
     async fn provider_key_check_rejects_a_blank_key() {
+        // This check now asks `has_usable_credential`, which reads the
+        // environment; own it, or the verdict depends on the developer's shell.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
         let mut cfg = Config::default();
         cfg.api_key = Some("   ".into());
         let (ctx, _tmp) = ctx_with_config(cfg);
         let result = ProviderKeyCheck.run(&ctx).await;
         assert_eq!(result.severity, Severity::Warn, "msg: {}", result.message);
+    }
+
+    /// `doctor` used to ask a NARROWER question than the send path: "is a key
+    /// in config?". An install authenticated by AWS environment variables, an
+    /// auth profile or a cached OAuth token was told the agent could not send,
+    /// while it sent fine. Both checks now ask `has_usable_credential`, so all
+    /// three surfaces give one answer.
+    #[tokio::test]
+    async fn provider_key_check_sees_a_credential_that_is_not_a_config_key() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("bedrock".into());
+        cfg.api_key = None;
+
+        let (ctx, _tmp) = ctx_with_config(cfg.clone());
+        assert_eq!(
+            ProviderKeyCheck.run(&ctx).await.severity,
+            Severity::Warn,
+            "no AWS credentials anywhere is genuinely unusable"
+        );
+
+        let _id = crate::test_env::EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEPLACEHOLDER");
+        let _secret =
+            crate::test_env::EnvGuard::set("AWS_SECRET_ACCESS_KEY", "neutral-aws-secret-value");
+
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        let result = ProviderKeyCheck.run(&ctx).await;
+        assert_eq!(
+            result.severity,
+            Severity::Ok,
+            "an install that can send must not be reported as keyless: {}",
+            result.message
+        );
     }
 
     /// Local providers need no key — failing them would be a false alarm.

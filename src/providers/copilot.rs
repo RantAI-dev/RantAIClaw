@@ -164,6 +164,23 @@ pub struct CopilotProvider {
     token_dir: PathBuf,
 }
 
+/// Whether a cached GitHub access token is on disk for this host.
+///
+/// `get_github_access_token` prefers the configured token, then this cache,
+/// then an interactive device-code login. Only the first two are credentials
+/// reachable at send time — a device flow needs a human — so this is what
+/// `has_usable_credential` asks about when no key is configured.
+pub(crate) fn has_cached_token() -> bool {
+    let Some(dir) = directories::ProjectDirs::from("", "", "rantaiclaw")
+        .map(|dir| dir.config_dir().join("copilot"))
+    else {
+        return false;
+    };
+    std::fs::read_to_string(dir.join("access-token"))
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false)
+}
+
 impl CopilotProvider {
     pub fn new(github_token: Option<&str>) -> Self {
         let token_dir = directories::ProjectDirs::from("", "", "rantaiclaw")
