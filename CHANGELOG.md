@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Wire-shape tests for the three provider client families.** `chat` and
+  `chat_stream` on `RigProvider` — the default path for Anthropic, OpenAI and
+  Gemini — had no response-shape coverage; the Ollama client had none either.
+  Four fixtures now assert the request body that leaves the process (including
+  tool definitions) and the `ChatResponse` parsed back from the reply
+  (including tool calls, and multibyte text reassembled across stream deltas).
+  Tests only; no runtime behaviour changed.
+
 ### Removed
 
 - **Three modules the product advertised and could not run.** `src/runtime/wasm.rs`

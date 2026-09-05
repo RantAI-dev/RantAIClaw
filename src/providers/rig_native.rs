@@ -717,6 +717,256 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::traits::ToolSpec;
+
+    /// A tool in the shape the agent loop actually hands the provider, so the
+    /// wire assertion is against a real payload and not a hand-shrunk one.
+    fn probe_tool() -> ToolSpec {
+        ToolSpec {
+            name: "get_weather".into(),
+            description: "Look up the weather for a city".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"]
+            }),
+        }
+    }
+
+    async fn first_request_body(server: &wiremock::MockServer) -> serde_json::Value {
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        assert_eq!(reqs.len(), 1, "expected exactly one upstream request");
+        serde_json::from_slice(&reqs[0].body).expect("request body is JSON")
+    }
+
+    // ── Wire-shape fixtures (plan 310) ──────────────────────────────────────
+    //
+    // One fixture per wire shape, not per provider. What these assert that the
+    // construction tests above cannot: the bytes that leave the process, and
+    // the `ChatResponse` parsed back out of the bytes that return. `chat` is
+    // the default path for Anthropic, OpenAI and Gemini and had no
+    // response-shape coverage at all.
+
+    #[tokio::test]
+    async fn anthropic_wire_sends_tool_definitions_and_parses_tool_use() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "type": "message",
+                    "id": "msg_wire",
+                    "model": "claude-3-haiku-20240307",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "checking that"},
+                        {"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                         "input": {"city": "Jakarta"}}
+                    ],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 4, "output_tokens": 9}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            RigProvider::for_provider_with_url("anthropic", Some("k"), Some(&server.uri()))
+                .expect("construct");
+        let messages = vec![ChatMessage::user("weather in Jakarta?")];
+        let tools = vec![probe_tool()];
+        let resp = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "claude-3-haiku-20240307",
+                0.2,
+            )
+            .await
+            .expect("chat against the mock");
+
+        let body = first_request_body(&server).await;
+        let sent = body["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no tools on the wire: {body}"));
+        let tool = sent
+            .iter()
+            .find(|t| t["name"] == "get_weather")
+            .unwrap_or_else(|| panic!("tool definition missing: {body}"));
+        assert_eq!(tool["input_schema"]["properties"]["city"]["type"], "string");
+
+        assert_eq!(resp.text.as_deref(), Some("checking that"));
+        assert_eq!(resp.tool_calls.len(), 1, "resp was {resp:?}");
+        assert_eq!(resp.tool_calls[0].id, "toolu_1");
+        assert_eq!(resp.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&resp.tool_calls[0].arguments).expect("arguments are JSON");
+        assert_eq!(args["city"], "Jakarta");
+    }
+
+    #[tokio::test]
+    async fn openai_wire_sends_tool_definitions_and_parses_tool_calls() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl_wire",
+                    "object": "chat.completion",
+                    "created": 1_700_000_000_u64,
+                    "model": "gpt-4o-mini",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "checking that",
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": "{\"city\":\"Jakarta\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 9, "total_tokens": 13}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::for_provider_with_url("openai", Some("k"), Some(&server.uri()))
+            .expect("construct");
+        let messages = vec![ChatMessage::user("weather in Jakarta?")];
+        let tools = vec![probe_tool()];
+        let resp = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "gpt-4o-mini",
+                0.2,
+            )
+            .await
+            .expect("chat against the mock");
+
+        let body = first_request_body(&server).await;
+        let sent = body["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no tools on the wire: {body}"));
+        let tool = sent
+            .iter()
+            .find(|t| t["function"]["name"] == "get_weather")
+            .unwrap_or_else(|| panic!("tool definition missing: {body}"));
+        assert_eq!(tool["type"], "function");
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["city"]["type"],
+            "string"
+        );
+
+        assert_eq!(resp.text.as_deref(), Some("checking that"));
+        assert_eq!(resp.tool_calls.len(), 1, "resp was {resp:?}");
+        assert_eq!(resp.tool_calls[0].id, "call_1");
+        assert_eq!(resp.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&resp.tool_calls[0].arguments).expect("arguments are JSON");
+        assert_eq!(args["city"], "Jakarta");
+    }
+
+    /// `chat_stream` is the path every interactive surface takes and had no
+    /// wire coverage. The text is deliberately multibyte and split across two
+    /// deltas: the reassembled result must be the whole string, not a
+    /// replacement character.
+    ///
+    /// A *byte-level* split mid-codepoint cannot be forced here — on this path
+    /// the SSE decoder is rig's, and wiremock does not control chunk
+    /// boundaries. Where the decoder is ours it is asserted directly:
+    /// `providers::openrouter::push_decoded` +
+    /// `utf8_split_across_chunks_not_lost`.
+    #[tokio::test]
+    async fn anthropic_stream_reassembles_multibyte_text_across_deltas() {
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","model":"claude-3-haiku-20240307","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cuaca cerah — "}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"30°C ☕"}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                // `set_body_string` would stamp text/plain and rig's SSE
+                // client rejects it; the raw form sets the content type.
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse.as_bytes(), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            RigProvider::for_provider_with_url("anthropic", Some("k"), Some(&server.uri()))
+                .expect("construct");
+        let messages = vec![ChatMessage::user("cuaca?")];
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+
+        let resp = provider
+            .chat_stream(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "claude-3-haiku-20240307",
+                0.2,
+                tx,
+            )
+            .await
+            .expect("stream against the mock");
+
+        let mut streamed = String::new();
+        while let Some(chunk) = rx.recv().await {
+            streamed.push_str(&chunk);
+        }
+
+        assert_eq!(
+            streamed, "cuaca cerah — 30°C ☕",
+            "chunks delivered to the caller"
+        );
+        assert_eq!(
+            resp.text.as_deref(),
+            Some("cuaca cerah — 30°C ☕"),
+            "final response text"
+        );
+        assert!(resp.tool_calls.is_empty(), "resp was {resp:?}");
+    }
 
     #[test]
     fn for_provider_rejects_unknown() {
