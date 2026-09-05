@@ -29,6 +29,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One metrics registry per process.** `create_observer` was called from six
+  places, each building its own `PrometheusObserver` with its own registry, and
+  `/metrics` served the gateway's. In daemon mode — where channels, cron and the
+  heartbeat worker do the actual work — the served endpoint therefore described
+  almost nothing. `daemon::run` now builds the observer once and hands the same
+  one to the gateway supervisor, the channels supervisor, the cron scheduler and
+  the heartbeat worker; a cron run started from the console reports into it too.
+  Standalone entry points (`gateway`, `channel start`, the TUI, one-shot CLI runs)
+  are separate processes and still build their own, which is correct. No global
+  and no static: it is passed as an argument, so `run_gateway`,
+  `start_channels_with_cancellation`, `cron::scheduler::run`,
+  `agent::run_with_scope` and the cron execution chain each gained an
+  `Option<Arc<dyn Observer>>` parameter where `None` means "build your own".
+- **`docs/pillars/7-gateway-daemon.md` documents keys that exist.** Its example
+  config named `[gateway] bind` / `auth_token` and `[observability] log_dir` /
+  `prometheus`; none of those are fields of anything, so a config copied from it
+  loaded as defaults and warned `unknown config key`.
+
 - **A cron job's `session_target = "main"` now does what it says.** The value was
   accepted and advertised in the `cron_add` tool schema, and the scheduler treated
   it identically to `isolated`. It now selects the run's memory scope: `isolated`
@@ -46,6 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those routes sit on the root router outside the `/api/v1` rate limiter.
 
 ### Removed
+
+- **Three Prometheus metrics that were always zero.** `rantaiclaw_tokens_used_last`,
+  `rantaiclaw_active_sessions` and `rantaiclaw_queue_depth` were registered and
+  scrapeable with no production emitter — every `AgentEnd` passes
+  `tokens_used: None`, and nothing sends `ActiveSessions` or `QueueDepth`. A
+  registered gauge nothing feeds reads as a measured zero, which is a worse answer
+  than no answer. The tokens gauge comes back with the emitter that fills it.
 
 - **`[memory].chunk_max_tokens` and `[reliability].api_keys` — accepted, never
   acted on (config schema v28 → v29).** `api_keys` reached a round-robin helper

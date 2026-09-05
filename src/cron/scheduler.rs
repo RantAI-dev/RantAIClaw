@@ -57,7 +57,12 @@ impl Drop for InFlightGuard {
     }
 }
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(
+    config: Config,
+    // The process's observer in daemon mode. Cron jobs are agent runs, and an
+    // agent run that builds its own registry reports into one nothing scrapes.
+    observer: Option<Arc<dyn crate::observability::Observer>>,
+) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -176,8 +181,16 @@ pub async fn run(config: Config) -> Result<()> {
         // this cycle's jobs.
         let config = working.clone();
         let security = Arc::clone(&security);
+        let batch_observer = observer.clone();
         batches.spawn(async move {
-            process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
+            process_due_jobs(
+                &config,
+                &security,
+                jobs,
+                SCHEDULER_COMPONENT,
+                batch_observer.as_ref(),
+            )
+            .await;
         });
     }
 }
@@ -186,8 +199,9 @@ pub async fn execute_job_now(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+    observer: Option<&Arc<dyn crate::observability::Observer>>,
 ) -> (bool, String, Vec<AttemptOutcome>) {
-    execute_job_with_retry(config, security, job).await
+    execute_job_with_retry(config, security, job, observer).await
 }
 
 /// Force-run a job now: execute + record run history + update
@@ -199,6 +213,7 @@ pub async fn run_job_manual(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+    observer: Option<&Arc<dyn crate::observability::Observer>>,
 ) -> (bool, String) {
     // Claim the shared in-flight registry so a second "run now" (or an overlapping
     // scheduled tick) can't double-execute the same job. The guard releases the
@@ -207,7 +222,7 @@ pub async fn run_job_manual(
     let Some(_guard) = InFlightGuard::claim(&job.id) else {
         return (false, format!("cron job '{}' is already running", job.id));
     };
-    let (success, output, attempts) = execute_job_now(config, security, job).await;
+    let (success, output, attempts) = execute_job_now(config, security, job, observer).await;
     // Record each attempt as its own row (a manual run does not deliver).
     for a in &attempts {
         record_attempt(config, &job.id, a).await;
@@ -236,6 +251,7 @@ async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+    observer: Option<&Arc<dyn crate::observability::Observer>>,
 ) -> (bool, String, Vec<AttemptOutcome>) {
     let mut attempts = Vec::new();
     let mut last_output = String::new();
@@ -249,7 +265,7 @@ async fn execute_job_with_retry(
             JobType::Agent => {
                 with_timeout(
                     Duration::from_secs(AGENT_JOB_TIMEOUT_SECS),
-                    run_agent_job(config, security, job),
+                    run_agent_job(config, security, job, observer),
                 )
                 .await
             }
@@ -288,6 +304,7 @@ async fn process_due_jobs(
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
+    observer: Option<&Arc<dyn crate::observability::Observer>>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -297,6 +314,7 @@ async fn process_due_jobs(
         let config = config.clone();
         let security = Arc::clone(security);
         let component = component.to_owned();
+        let obs = observer.cloned();
         async move {
             // Claim the job on the process-wide registry; skip if a previous
             // (long-running) invocation — scheduled or manual — is still going,
@@ -309,7 +327,8 @@ async fn process_due_jobs(
                 );
                 return (job.id.clone(), true);
             };
-            execute_and_persist_job(&config, security.as_ref(), &job, &component).await
+            execute_and_persist_job(&config, security.as_ref(), &job, &component, obs.as_ref())
+                .await
         }
     }))
     .buffer_unordered(max_concurrent);
@@ -326,11 +345,12 @@ async fn execute_and_persist_job(
     security: &SecurityPolicy,
     job: &CronJob,
     component: &str,
+    observer: Option<&Arc<dyn crate::observability::Observer>>,
 ) -> (String, bool) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
-    let (success, output, attempts) = execute_job_with_retry(config, security, job).await;
+    let (success, output, attempts) = execute_job_with_retry(config, security, job, observer).await;
     let success = persist_job_result(config, job, success, &output, &attempts).await;
 
     (job.id.clone(), success)
@@ -359,6 +379,7 @@ async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+    observer: Option<&Arc<dyn crate::observability::Observer>>,
 ) -> (bool, String) {
     if !security.can_act() {
         return (
@@ -401,6 +422,7 @@ async fn run_agent_job(
         vec![],
         "scheduler",
         memory_scope,
+        observer.cloned(),
     ))
     .await;
 
@@ -1303,7 +1325,8 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output, _attempts) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output, _attempts) =
+            execute_job_with_retry(&config, &security, &job, None).await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -1318,7 +1341,8 @@ mod tests {
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output, _attempts) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output, _attempts) =
+            execute_job_with_retry(&config, &security, &job, None).await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }
@@ -1464,7 +1488,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
@@ -1479,7 +1503,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -1495,7 +1519,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -1512,7 +1536,7 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component).await;
+        process_due_jobs(&config, &security, Vec::new(), &component, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1533,7 +1557,7 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component).await;
+        process_due_jobs(&config, &security, vec![job], &component, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1555,7 +1579,7 @@ mod tests {
         let _held = InFlightGuard::claim(&job.id).expect("fresh id must claim");
         let component = unique_component("scheduler-inflight");
 
-        process_due_jobs(&config, &security, vec![job.clone()], &component).await;
+        process_due_jobs(&config, &security, vec![job.clone()], &component, None).await;
 
         // It must have been skipped → no run recorded.
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -1576,7 +1600,7 @@ mod tests {
         // must refuse and record NO run row.
         {
             let _held = InFlightGuard::claim(&job.id).expect("fresh id must claim");
-            let (success, output) = run_job_manual(&config, &security, &job).await;
+            let (success, output) = run_job_manual(&config, &security, &job, None).await;
             assert!(!success, "a concurrent manual run must not execute");
             assert!(
                 output.contains("already running"),
@@ -1588,7 +1612,7 @@ mod tests {
             );
         }
         // Claim released → a manual run now executes and records exactly one row.
-        let (success, _) = run_job_manual(&config, &security, &job).await;
+        let (success, _) = run_job_manual(&config, &security, &job, None).await;
         assert!(success);
         assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
     }
@@ -1769,7 +1793,7 @@ mod tests {
         let before = cron::get_job(&config, &job.id).unwrap().next_run;
 
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let (ok, _) = run_job_manual(&config, &security, &job).await;
+        let (ok, _) = run_job_manual(&config, &security, &job, None).await;
         assert!(ok);
 
         let after = cron::get_job(&config, &job.id).unwrap();
@@ -1794,7 +1818,7 @@ mod tests {
         let mut job = test_job("echo ok");
         job.id = "missing-row-probe".into();
 
-        let (ok, output) = run_job_manual(&config, &security, &job).await;
+        let (ok, output) = run_job_manual(&config, &security, &job, None).await;
         assert!(ok, "the command ran successfully");
         assert!(output.contains("ok"));
         // No run row exists because the parent job row is absent — the write

@@ -502,7 +502,10 @@ async fn run_cron(
         }
     }
 
-    let (success, output) = cron::scheduler::run_job_manual(&cfg, &security, &job).await;
+    // The gateway's own observer, so a run started from the console shows up in
+    // the `/metrics` this same process serves.
+    let (success, output) =
+        cron::scheduler::run_job_manual(&cfg, &security, &job, Some(&state.observer)).await;
     Ok(Json(
         json!({ "id": job.id, "success": success, "output": output }),
     ))
