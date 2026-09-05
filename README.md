@@ -65,7 +65,11 @@ persona, skills, MCP, login, knowledge). Pass `--skip-setup` / `-SkipSetup` (or 
 | Manual | [Pick a release archive](https://github.com/RantAI-dev/RantAIClaw/releases/latest), verify against `SHA256SUMS`, extract, move into `PATH` |
 
 Every release ships cosign-signed archives plus SBOMs (`rantaiclaw.cdx.json`,
-`rantaiclaw.spdx.json`).
+`rantaiclaw.spdx.json`). `rantaiclaw update` and `rantaiclaw ui install` **refuse**
+an archive whose signature does not verify — including when `cosign` is missing
+locally, since the `SHA256SUMS` file comes from the same server as the archive.
+`--allow-unverified` is the explicit way past, and it says the artifact was not
+verified.
 
 ### First run
 

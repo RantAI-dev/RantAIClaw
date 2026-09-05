@@ -52,6 +52,12 @@ pub enum Channel {
 }
 
 #[derive(Debug, Clone)]
+// Independent CLI switches, not a state machine: each one is a flag the
+// operator passes or does not. Grouping them into sub-structs would make the
+// call site in `main.rs` describe clap's argument list less directly. The lint
+// already fired on this struct before `allow_unverified` was added; the flag
+// pushed it onto a line the strict-delta gate reads.
+#[allow(clippy::struct_excessive_bools)]
 pub struct UpdateOpts {
     /// Print version delta only, don't download. Exit 0 if up-to-date,
     /// exit 1 if an update is available.
@@ -70,6 +76,12 @@ pub struct UpdateOpts {
     /// the lightweight pre-update state snapshot still runs
     /// unconditionally regardless of this flag.
     pub backup: bool,
+    /// Proceed even though the archive's signature could not be checked.
+    ///
+    /// Off by default: the SHA-256 checksum is served from the same origin as
+    /// the archive, so it is not a substitute. An operator on a host without
+    /// `cosign` has to say so.
+    pub allow_unverified: bool,
 }
 
 pub fn run(opts: UpdateOpts) -> Result<()> {
@@ -217,32 +229,27 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
         // a compromised release server that could otherwise swap
         // archive + SHA256SUMS atomically.
         //
-        // Graceful degradation: if cosign isn't installed locally,
-        // print a warning and proceed with SHA-only. Users on
-        // air-gapped or minimal hosts shouldn't lose `update`; users
-        // with cosign get the stronger guarantee. Once cosign is in
-        // wider distros (it's already in homebrew, apt, AUR) this
-        // becomes a hard requirement in a future cut.
+        // No graceful degradation. Both skip paths — cosign absent, bundle 404
+        // — used to continue on the SHA-256 checksum alone, which is fetched
+        // from the same origin as the archive; an attacker who can serve one
+        // can serve the other. `enforce_cosign` refuses unless the operator
+        // passed --allow-unverified.
         let bundle_url = format!("{base_url}/{archive_name}.bundle");
-        match artifact::verify_cosign(
+        let outcome = artifact::verify_cosign(
             &base_url,
             &archive_path,
             &archive_name,
             &work_dir,
             RANTAICLAW_COSIGN_IDENTITY,
-        )? {
-            CosignOutcome::Verified => println!("✓ cosign signature verified ({bundle_url})"),
-            CosignOutcome::CosignNotInstalled => {
-                // Already printed the "cosign not found on PATH" warning
-                // from inside the helper. Don't double-warn with a
-                // "bundle not found" message that misrepresents the
-                // actual cause (the bundle IS published; we just can't
-                // verify it without cosign).
-            }
-            CosignOutcome::BundleMissing => println!(
-                "⚠ no cosign bundle published at {bundle_url} (pre-v0.6.44 release?). \
-                 SHA-only verification will continue."
-            ),
+        )?;
+        let verified = matches!(outcome, CosignOutcome::Verified);
+        artifact::enforce_cosign(
+            outcome,
+            &format!("rantaiclaw {target_tag}"),
+            opts.allow_unverified,
+        )?;
+        if verified {
+            println!("✓ cosign signature verified ({bundle_url})");
         }
 
         let extracted = extract_binary(&archive_path, &work_dir)?;

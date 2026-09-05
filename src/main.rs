@@ -162,6 +162,11 @@ enum UiCommands {
         /// Overwrite a non-empty target directory
         #[arg(long)]
         force: bool,
+        /// Install even though the release signature could not be checked.
+        /// The SHA-256 checksum comes from the same server as the archive, so
+        /// it proves nothing about where the archive came from.
+        #[arg(long)]
+        allow_unverified: bool,
     },
     /// Start the web console (background, serves the prebuilt production build)
     Start {
@@ -198,6 +203,9 @@ enum UiCommands {
         /// Re-download even if already up to date
         #[arg(long)]
         force: bool,
+        /// Update even though the release signature could not be checked.
+        #[arg(long)]
+        allow_unverified: bool,
     },
     /// Print the install directory
     Path {
@@ -699,6 +707,11 @@ Examples:
         /// Skip confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Update even though the release signature could not be checked.
+        /// The SHA-256 checksum is served from the same origin as the archive,
+        /// so it is not a substitute for a signature.
+        #[arg(long)]
+        allow_unverified: bool,
         /// Take a full-profile tarball backup before swapping the binary.
         /// Slower than the lightweight pre-update snapshot (which always
         /// runs); covers sessions.db + skills/* + secrets too. Mirrors
@@ -1496,6 +1509,7 @@ async fn main() -> Result<()> {
         channel,
         to,
         allow_downgrade,
+        allow_unverified,
         yes,
         backup,
         verify,
@@ -1521,6 +1535,7 @@ async fn main() -> Result<()> {
             release_base_url: std::env::var("RANTAICLAW_RELEASE_BASE_URL").ok(),
             yes: *yes,
             backup: *backup,
+            allow_unverified: *allow_unverified,
         };
         // `update::run` uses reqwest::blocking, which builds its own Tokio
         // runtime; calling it directly inside `#[tokio::main]` panics with
