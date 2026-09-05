@@ -1,6 +1,6 @@
 # Pillar 4 — Skills and MCP Ecosystem
 
-> **ClickUp:** [v0.5.0 Wave 2D/2E shipped](https://app.clickup.com/t/86exgrp1n) · **Maturity:** Stable · **Modules:** `src/skills/`, `src/mcp/`, `src/skillforge/`
+> **ClickUp:** [v0.5.0 Wave 2D/2E shipped](https://app.clickup.com/t/86exgrp1n) · **Maturity:** Stable · **Modules:** `src/skills/`, `src/mcp/`
 
 Composable, reusable agent capabilities. Skills are markdown bundles with tool wiring; MCP servers extend the tool surface to the broader Model Context Protocol ecosystem.
 
@@ -10,7 +10,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 - ClawHub multi-select skill picker (sorted by stars, SHA-256 verified install)
 - 8 MCP servers curated picker — 2 zero-auth + 6 authenticated, with inline auth (filesystem dropped in v0.6.51 — see below)
 - Spawn-and-validate at setup time (zero-auth servers)
-- SkillForge — skill authoring helper
+- `author_skill` — writes a skill bundle from chat
 
 ## Vs OpenClaw / Hermes-agent
 
@@ -20,7 +20,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 | ClawHub remote install | ✅ SHA-256 verified | n/a | n/a |
 | MCP curated picker | ✅ 9 servers | TBD | TBD |
 | Setup-time MCP validation | ✅ spawn-and-wait | TBD | TBD |
-| Skill authoring helper | ✅ `skillforge` | TBD | TBD |
+| Skill authoring helper | ✅ `author_skill` tool | TBD | TBD |
 
 ## Current state by maturity
 
@@ -32,7 +32,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 | MCP curated picker | Stable |
 | MCP zero-auth setup-time validation | Stable (added v0.5.2) |
 | Auth flow per MCP server | Stable |
-| `skillforge` authoring helper | Implemented · needs UX polish |
+| `author_skill` authoring tool | Stable |
 
 ## Architecture
 
@@ -48,7 +48,6 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 
 src/skills/        ← Skill loader + runtime
 src/mcp/           ← MCP client + auth flows
-src/skillforge/    ← Authoring helper
 ```
 
 ## Trait extension point

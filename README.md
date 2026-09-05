@@ -174,7 +174,7 @@ A stale document asserting an active security control is worse than silence, so:
   bubblewrap, firejail and Docker backends exist, but `create_sandbox` has **no
   production caller** and the shell tool spawns commands unwrapped. Wiring it is a
   tracked follow-up (`plans/215`). For real in-process confinement today, use
-  **`[runtime].kind`** — `native`, `docker` or `wasm`.
+  **`[runtime].kind`** — `native` or `docker`.
 - **`[security.audit]` has no effect today.** `AuditLogger` is defined and has no
   production caller (`plans/218`).
 - **`forbidden_paths` covers the file tools only** (`file_read`, `file_write`,
@@ -266,7 +266,7 @@ noticeably better summaries.
 
 **Skills are data, not code** — a `SKILL.md` plus tool descriptors dropped into the
 profile's skills directory, or installed from ClawHub with SHA-256 verification.
-`skillforge` helps author them (scout → evaluate → integrate).
+The `author_skill` tool writes one from chat.
 
 **MCP** extends the tool surface to the wider Model Context Protocol ecosystem, with a
 curated picker and spawn-and-validate at setup time. The `filesystem` server was
@@ -287,7 +287,7 @@ rather than a hardcoded prompt string.
 - **Gateway** — HTTP `/api/v1` with SSE streaming, plus config, cron, task and approval
   endpoints (web and channel approval relays).
 - **Observability** — `Observer` trait with OpenTelemetry (`observability-otel`),
-  Prometheus, broadcast, log and noop backends.
+  Prometheus, log and noop backends.
 - **Tunnel** — Cloudflare, ngrok, Tailscale or custom, to expose an agent without
   opening a port.
 - **Remote** — keys, registry and sessions for driving an agent from elsewhere.
