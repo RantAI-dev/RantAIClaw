@@ -608,11 +608,13 @@ mod tests {
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {
                 Ok(ChatResponse {
+                    usage: None,
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                 })
             } else {
                 Ok(ChatResponse {
+                    usage: None,
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_1".to_string(),
@@ -657,6 +659,7 @@ mod tests {
             self.chat_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ChatResponse {
+                usage: None,
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "loop".to_string(),

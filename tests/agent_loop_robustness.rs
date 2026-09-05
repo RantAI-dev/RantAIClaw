@@ -57,6 +57,7 @@ impl Provider for MockProvider {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
+                usage: None,
                 text: Some("done".into()),
                 tool_calls: vec![],
             });
@@ -177,6 +178,7 @@ fn make_observer() -> Arc<dyn Observer> {
 
 fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
+        usage: None,
         text: Some(text.into()),
         tool_calls: vec![],
     }
@@ -184,6 +186,7 @@ fn text_response(text: &str) -> ChatResponse {
 
 fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
+        usage: None,
         text: Some(String::new()),
         tool_calls: calls,
     }
@@ -356,6 +359,7 @@ async fn agent_respects_max_tool_iterations() {
 #[tokio::test]
 async fn agent_handles_empty_provider_response() {
     let provider = Box::new(MockProvider::new(vec![ChatResponse {
+        usage: None,
         text: Some(String::new()),
         tool_calls: vec![],
     }]));
@@ -369,6 +373,7 @@ async fn agent_handles_empty_provider_response() {
 #[tokio::test]
 async fn agent_handles_none_text_response() {
     let provider = Box::new(MockProvider::new(vec![ChatResponse {
+        usage: None,
         text: None,
         tool_calls: vec![],
     }]));

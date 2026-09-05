@@ -1222,7 +1222,11 @@ impl OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse { text, tool_calls }
+        ProviderChatResponse {
+            usage: None,
+            text,
+            tool_calls,
+        }
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
@@ -1549,6 +1553,7 @@ impl Provider for OpenAiCompatibleProvider {
                 );
                 let text = self.chat_with_history(messages, model, temperature).await?;
                 return Ok(ProviderChatResponse {
+                    usage: None,
                     text: Some(text),
                     tool_calls: vec![],
                 });
@@ -1585,7 +1590,11 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        Ok(ProviderChatResponse { text, tool_calls })
+        Ok(ProviderChatResponse {
+            usage: None,
+            text,
+            tool_calls,
+        })
     }
 
     async fn chat(
@@ -1633,6 +1642,7 @@ impl Provider for OpenAiCompatibleProvider {
                         .chat_via_responses(credential, &effective_messages, model)
                         .await
                         .map(|text| ProviderChatResponse {
+                            usage: None,
                             text: Some(text),
                             tool_calls: vec![],
                         })
@@ -1660,6 +1670,7 @@ impl Provider for OpenAiCompatibleProvider {
                     .chat_with_history(&fallback_messages, model, temperature)
                     .await?;
                 return Ok(ProviderChatResponse {
+                    usage: None,
                     text: Some(text),
                     tool_calls: vec![],
                 });
@@ -1670,6 +1681,7 @@ impl Provider for OpenAiCompatibleProvider {
                     .chat_via_responses(credential, &effective_messages, model)
                     .await
                     .map(|text| ProviderChatResponse {
+                        usage: None,
                         text: Some(text),
                         tool_calls: vec![],
                     })
@@ -1841,6 +1853,7 @@ impl Provider for OpenAiCompatibleProvider {
                 for piece in split_for_streaming(&visible) {
                     if text_tx.send(piece).await.is_err() {
                         return Ok(ProviderChatResponse {
+                            usage: None,
                             text: if full_text.is_empty() {
                                 None
                             } else {
@@ -1876,6 +1889,7 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         Ok(ProviderChatResponse {
+            usage: None,
             text: if full_text.is_empty() {
                 None
             } else {

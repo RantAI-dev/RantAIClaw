@@ -624,7 +624,11 @@ impl Provider for OllamaProvider {
             } else {
                 Some(response.message.content)
             };
-            return Ok(ChatResponse { text, tool_calls });
+            return Ok(ChatResponse {
+                usage: None,
+                text,
+                tool_calls,
+            });
         }
 
         // Plain text response.
@@ -636,6 +640,7 @@ impl Provider for OllamaProvider {
                     if thinking.len() > 100 { &thinking[..100] } else { thinking }
                 );
                 return Ok(ChatResponse {
+                    usage: None,
                     text: Some(format!(
                         "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
                         if thinking.len() > 200 { &thinking[..200] } else { thinking }
@@ -646,6 +651,7 @@ impl Provider for OllamaProvider {
             tracing::warn!("Ollama returned empty content with no tool calls");
         }
         Ok(ChatResponse {
+            usage: None,
             text: Some(content),
             tool_calls: vec![],
         })
@@ -691,6 +697,7 @@ impl Provider for OllamaProvider {
             .chat_with_history(request.messages, model, temperature)
             .await?;
         Ok(ChatResponse {
+            usage: None,
             text: Some(text),
             tool_calls: vec![],
         })

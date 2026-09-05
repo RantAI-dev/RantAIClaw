@@ -990,15 +990,10 @@ async fn agent_chat_stream(
         // (it would store a user message with an empty/partial assistant reply).
         let mut errored = false;
         while let Some(ev) = events_rx.recv().await {
-            // Until per-provider token accounting is wired through, the loop
-            // emits a zero-valued Usage. Rendering "0 tokens" is worse than
-            // rendering nothing (wrong data reads as real), so skip a usage
-            // event with no token counts rather than forwarding the placeholder.
-            if let crate::agent::AgentEvent::Usage(ref u) = ev {
-                if u.total_tokens == 0 {
-                    continue;
-                }
-            }
+            // The zero-skip that used to live here is gone: the loop now emits
+            // a `Usage` event ONLY when a provider reported counts, so a zero
+            // arriving would be a real measurement (or a bug worth seeing)
+            // rather than the placeholder this guard was written for.
             let payload = match ev {
                 crate::agent::AgentEvent::Chunk(text) => {
                     buffered_text.push_str(&text);
