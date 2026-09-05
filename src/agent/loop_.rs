@@ -2206,10 +2206,14 @@ pub async fn run_with_scope(
     peripheral_overrides: Vec<String>,
     surface: &str,
     conversation_id: Option<String>,
+    // The process's observer when a long-lived caller owns one (the cron
+    // scheduler under the daemon). `None` ⇒ a one-shot CLI run, its own process
+    // and correctly its own registry.
+    observer: Option<Arc<dyn Observer>>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
-    let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    let observer: Arc<dyn Observer> = observer
+        .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -2775,6 +2779,7 @@ pub async fn run(
         temperature,
         peripheral_overrides,
         surface,
+        None,
         None,
     )
     .await

@@ -78,6 +78,14 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // that exited *because* of the shutdown.
     let shutdown = CancellationToken::new();
 
+    // ONE observer for this process. The gateway serves `/metrics` from the
+    // registry inside it, so anything that builds its own — channels, cron, the
+    // heartbeat worker — reports into a registry nobody scrapes. In daemon mode
+    // those three do the actual work, which is why `/metrics` described almost
+    // nothing. Passed down as an argument; no global, no static.
+    let observer: std::sync::Arc<dyn crate::observability::Observer> =
+        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     // The gateway is held separately so we can await its drain before aborting
@@ -96,6 +104,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         fatal_tx,
         initial_backoff,
         max_backoff,
+        observer.clone(),
     );
 
     // Channels are held separately too, so shutdown can DRAIN them instead of a
@@ -108,6 +117,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     if has_supervised_channels(&config) {
         let channels_cfg = config.clone();
         let channels_shutdown = shutdown.clone();
+        let channels_observer = observer.clone();
         channels_handle = Some(spawn_component_supervisor(
             "channels",
             initial_backoff,
@@ -116,7 +126,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = channels_cfg.clone();
                 let sd = channels_shutdown.clone();
-                async move { crate::channels::start_channels_with_cancellation(cfg, sd).await }
+                let obs = channels_observer.clone();
+                async move {
+                    crate::channels::start_channels_with_cancellation(cfg, sd, Some(obs)).await
+                }
             },
         ));
     } else {
@@ -126,6 +139,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let heartbeat_observer = observer.clone();
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
@@ -133,13 +147,14 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             shutdown.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
-                Box::pin(run_heartbeat_worker(cfg))
+                Box::pin(run_heartbeat_worker(cfg, heartbeat_observer.clone()))
             },
         ));
     }
 
     if scheduler_enabled(&config) {
         let scheduler_cfg = config.clone();
+        let scheduler_observer = observer.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
@@ -147,7 +162,13 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             shutdown.clone(),
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
+                let obs = scheduler_observer.clone();
+                // Box the CALL, not the enclosing block: `scheduler::run`
+                // crossed clippy::large_futures (23 KB) once it carried the
+                // shared observer, and it is the `.await` of that future that
+                // sits on the supervisor's poll stack. Same shape as the
+                // heartbeat worker below.
+                Box::pin(crate::cron::scheduler::run(cfg, Some(obs)))
             },
         ));
     } else {
@@ -341,6 +362,7 @@ fn spawn_gateway_supervisor(
     fatal_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    observer: std::sync::Arc<dyn crate::observability::Observer>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = initial_backoff_secs.max(1);
@@ -356,6 +378,7 @@ fn spawn_gateway_supervisor(
                 config.clone(),
                 shutdown.clone(),
                 Some(ready.clone()),
+                Some(observer.clone()),
             )
             .await;
             if shutdown.is_cancelled() {
@@ -542,9 +565,10 @@ where
     })
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+async fn run_heartbeat_worker(
+    config: Config,
+    observer: std::sync::Arc<dyn crate::observability::Observer>,
+) -> Result<()> {
     let engine = crate::heartbeat::engine::HeartbeatEngine::new(
         config.heartbeat.clone(),
         config.workspace_dir.clone(),
@@ -628,6 +652,25 @@ fn has_supervised_channels(config: &Config) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// One registry per process is a wiring fact with no behavioural test that
+    /// can see it from outside: each component builds fine on its own, and the
+    /// only symptom is that `/metrics` under-reports. Assert the wiring itself —
+    /// this module builds an observer exactly once, and every component gets a
+    /// clone of it. A component reverted to `create_observer` of its own bumps
+    /// the count and fails here.
+    #[test]
+    fn the_daemon_builds_exactly_one_observer() {
+        let src = include_str!("mod.rs");
+        // Assembled at runtime so this assertion does not count itself.
+        let needle = format!("create_{}(", "observer");
+        assert_eq!(
+            src.matches(needle.as_str()).count(),
+            1,
+            "the daemon must build ONE observer and pass it down; a second call \
+             means a component reports into a registry `/metrics` never serves"
+        );
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {

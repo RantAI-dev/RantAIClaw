@@ -1,6 +1,6 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use prometheus::{
-    Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder,
 };
 
 /// Prometheus-backed observer — exposes metrics for scraping via `/metrics`.
@@ -18,11 +18,6 @@ pub struct PrometheusObserver {
     agent_duration: HistogramVec,
     tool_duration: HistogramVec,
     request_latency: Histogram,
-
-    // Gauges
-    tokens_used: prometheus::IntGauge,
-    active_sessions: GaugeVec,
-    queue_depth: GaugeVec,
 }
 
 impl PrometheusObserver {
@@ -91,24 +86,6 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
-        let tokens_used = prometheus::IntGauge::new(
-            "rantaiclaw_tokens_used_last",
-            "Tokens used in the last request",
-        )
-        .expect("valid metric");
-
-        let active_sessions = GaugeVec::new(
-            prometheus::Opts::new("rantaiclaw_active_sessions", "Number of active sessions"),
-            &[],
-        )
-        .expect("valid metric");
-
-        let queue_depth = GaugeVec::new(
-            prometheus::Opts::new("rantaiclaw_queue_depth", "Message queue depth"),
-            &[],
-        )
-        .expect("valid metric");
-
         // Register all metrics
         registry.register(Box::new(agent_starts.clone())).ok();
         registry.register(Box::new(tool_calls.clone())).ok();
@@ -118,9 +95,6 @@ impl PrometheusObserver {
         registry.register(Box::new(agent_duration.clone())).ok();
         registry.register(Box::new(tool_duration.clone())).ok();
         registry.register(Box::new(request_latency.clone())).ok();
-        registry.register(Box::new(tokens_used.clone())).ok();
-        registry.register(Box::new(active_sessions.clone())).ok();
-        registry.register(Box::new(queue_depth.clone())).ok();
 
         Self {
             registry,
@@ -132,9 +106,6 @@ impl PrometheusObserver {
             agent_duration,
             tool_duration,
             request_latency,
-            tokens_used,
-            active_sessions,
-            queue_depth,
         }
     }
 
@@ -160,16 +131,13 @@ impl Observer for PrometheusObserver {
                 provider,
                 model,
                 duration,
-                tokens_used,
+                tokens_used: _,
                 cost_usd: _,
             } => {
                 // Agent duration is recorded via the histogram with provider/model labels
                 self.agent_duration
                     .with_label_values(&[provider, model])
                     .observe(duration.as_secs_f64());
-                if let Some(t) = tokens_used {
-                    self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
-                }
             }
             ObserverEvent::ToolCallStart { tool: _ }
             | ObserverEvent::TurnComplete
@@ -210,19 +178,15 @@ impl Observer for PrometheusObserver {
             ObserverMetric::RequestLatency(d) => {
                 self.request_latency.observe(d.as_secs_f64());
             }
-            ObserverMetric::TokensUsed(t) => {
-                self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
-            }
-            ObserverMetric::ActiveSessions(s) => {
-                self.active_sessions
-                    .with_label_values(&[] as &[&str])
-                    .set(*s as f64);
-            }
-            ObserverMetric::QueueDepth(d) => {
-                self.queue_depth
-                    .with_label_values(&[] as &[&str])
-                    .set(*d as f64);
-            }
+            // Deliberately unexposed. Nothing emits these three today: every
+            // `AgentEnd` passes `tokens_used: None`, and no production caller
+            // sends `ActiveSessions` or `QueueDepth`. A registered gauge with no
+            // emitter is worse than a missing one — a scrape reads it as a
+            // measured zero. Plan 306 adds the tokens gauge back together with
+            // the emitter that fills it.
+            ObserverMetric::TokensUsed(_)
+            | ObserverMetric::ActiveSessions(_)
+            | ObserverMetric::QueueDepth(_) => {}
         }
     }
 
@@ -377,13 +341,76 @@ mod tests {
         assert!(output.contains(r#"rantaiclaw_errors_total{component="channels"} 1"#));
     }
 
+    /// The three metrics with no emitter are deliberately not in the registry:
+    /// a scrape reads a registered-but-never-set gauge as a measured zero, which
+    /// is a worse answer than not answering. This replaces
+    /// `gauge_reflects_latest_value`, which asserted that a gauge nothing fed
+    /// held the value a test had just handed it.
     #[test]
-    fn gauge_reflects_latest_value() {
+    fn metrics_with_no_emitter_are_not_exposed() {
         let obs = PrometheusObserver::new();
-        obs.record_metric(&ObserverMetric::TokensUsed(100));
         obs.record_metric(&ObserverMetric::TokensUsed(200));
+        obs.record_metric(&ObserverMetric::ActiveSessions(3));
+        obs.record_metric(&ObserverMetric::QueueDepth(42));
 
         let output = obs.encode();
-        assert!(output.contains("rantaiclaw_tokens_used_last 200"));
+        for name in [
+            "rantaiclaw_tokens_used_last",
+            "rantaiclaw_active_sessions",
+            "rantaiclaw_queue_depth",
+        ] {
+            assert!(
+                !output.contains(name),
+                "{name} has no production emitter and must not be scrapeable: {output}"
+            );
+        }
+    }
+
+    /// The counterpart: everything still exposed does have an emitter, so the
+    /// removal above cannot quietly grow.
+    #[test]
+    fn everything_exposed_has_an_emitter() {
+        let obs = PrometheusObserver::new();
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: "p".into(),
+            model: "m".into(),
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: Duration::from_millis(5),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::ChannelMessage {
+            channel: "telegram".into(),
+            direction: "in".into(),
+        });
+        obs.record_event(&ObserverEvent::HeartbeatTick);
+        obs.record_event(&ObserverEvent::Error {
+            component: "provider".into(),
+            message: "x".into(),
+        });
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "p".into(),
+            model: "m".into(),
+            duration: Duration::from_millis(5),
+            tokens_used: None,
+            cost_usd: None,
+        });
+        obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(5)));
+
+        let output = obs.encode();
+        // Every metric family the registry holds must appear after the events
+        // above — if a new one is registered without an emitter, it will not.
+        for family in obs.registry.gather() {
+            assert!(
+                output.contains(family.name()),
+                "{} is registered but nothing emitted it: {output}",
+                family.name()
+            );
+        }
+        assert!(
+            output.contains("rantaiclaw_heartbeat_ticks_total"),
+            "the fixture must actually produce output: {output}"
+        );
     }
 }
