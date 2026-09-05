@@ -2935,7 +2935,80 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::{headless_choice, HeadlessChoice};
+    use super::{headless_choice, unusable_provider_after_headless_setup, HeadlessChoice};
+
+    fn config_with_provider(name: &str) -> Config {
+        Config {
+            default_provider: Some(name.to_string()),
+            ..Config::default()
+        }
+    }
+
+    /// The defect: a headless provider run reported success for a selection
+    /// with no key, so an installer saw exit 0 for an agent that cannot send.
+    #[tokio::test]
+    async fn a_keyless_remote_provider_is_refused_headlessly() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
+        let _b = crate::test_env::EnvGuard::unset("API_KEY");
+        let _c = crate::test_env::EnvGuard::unset("OPENAI_API_KEY");
+
+        let reason =
+            unusable_provider_after_headless_setup("provider", &config_with_provider("openai"))
+                .expect("a keyless remote provider is not a usable install");
+        assert!(reason.contains("openai"), "{reason}");
+        assert!(reason.contains("RANTAICLAW_API_KEY"), "{reason}");
+    }
+
+    /// A local provider needs no key at all. Aborting on one would be a false
+    /// positive that breaks a perfectly good Ollama install — `provider_is_local`
+    /// reads `ProviderInfo::local`, the documented source of truth.
+    #[tokio::test]
+    async fn a_local_provider_needs_no_key() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
+        let _b = crate::test_env::EnvGuard::unset("API_KEY");
+        let _c = crate::test_env::EnvGuard::unset("OLLAMA_API_KEY");
+
+        assert!(unusable_provider_after_headless_setup(
+            "provider",
+            &config_with_provider("ollama")
+        )
+        .is_none());
+    }
+
+    /// Bedrock resolves AWS AKSK inside `BedrockProvider`, and
+    /// `resolve_provider_credential` returns `None` for it BY DESIGN — so a
+    /// missing credential is not conclusive there and must not abort the run.
+    #[tokio::test]
+    async fn bedrock_is_not_judged_by_a_check_that_cannot_see_its_credentials() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
+        let _b = crate::test_env::EnvGuard::unset("API_KEY");
+
+        for name in ["bedrock", "aws-bedrock"] {
+            assert!(
+                unusable_provider_after_headless_setup("provider", &config_with_provider(name))
+                    .is_none(),
+                "{name} must not be refused on a check that cannot see AWS credentials"
+            );
+        }
+    }
+
+    /// The guard is scoped to the provider section: every other provisioner
+    /// keeps the outcome its own plan gave it.
+    #[tokio::test]
+    async fn other_provisioners_are_not_judged_on_provider_credentials() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
+        let _b = crate::test_env::EnvGuard::unset("API_KEY");
+
+        assert!(unusable_provider_after_headless_setup(
+            "telegram",
+            &config_with_provider("openai")
+        )
+        .is_none());
+    }
 
     /// Option 0 off a multi-select is picking an item nobody chose. For MCP
     /// that registered a subprocess-spawning server from a documented no-op.
@@ -3083,6 +3156,56 @@ fn headless_choice(multi: bool, asked_before: bool) -> HeadlessChoice {
     }
 }
 
+/// `Some(reason)` when a headless provider section finished "successfully" with
+/// no credential the runtime could actually send with.
+///
+/// Plan 296 made a headless run exit non-zero when a provisioner ABORTS. The
+/// provider section slips through that: it treats a selection with no key as a
+/// completed selection, because an operator may intend to export the key later.
+/// Interactively that is reasonable — they are sitting there. Headless it means
+/// the run reported success for an install that cannot send a single message,
+/// and an installer or CI job has no way to tell.
+///
+/// The question is "is a credential reachable by any means the agent will use at
+/// send time", which is what `has_usable_credential` answers — including
+/// per-provider env vars, the generic `RANTAICLAW_API_KEY`/`API_KEY` fallback,
+/// MiniMax OAuth and the Gemini CLI. `create_provider(name, None).is_ok()` is
+/// NOT that question: it answers whether the provider STRUCT builds, which is
+/// true for `openrouter` even though every request would 401.
+///
+/// Two exclusions, both traceable to existing code rather than a new list:
+///
+/// * Local providers need no key at all — `provider_is_local` reads
+///   `ProviderInfo::local`, which its own doc names as the source of truth.
+/// * Bedrock resolves AWS AKSK inside `BedrockProvider`, and
+///   `resolve_provider_credential` returns `None` for it by design, so a
+///   missing credential is not conclusive there. That gap is real and also
+///   affects `doctor` and the config API; fixing it is a separate task.
+fn unusable_provider_after_headless_setup(
+    provisioner_name: &str,
+    config: &Config,
+) -> Option<String> {
+    if provisioner_name != onboard::provision::provider::PROVIDER_NAME {
+        return None;
+    }
+    let name = config.default_provider.as_deref()?;
+    if rantaiclaw::providers::provider_is_local(name) {
+        return None;
+    }
+    if matches!(name, "bedrock" | "aws-bedrock") {
+        return None;
+    }
+    if rantaiclaw::providers::has_usable_credential(name, config.api_key.as_deref()) {
+        return None;
+    }
+    Some(format!(
+        "`setup provider` selected {name} but found no API key for it — not in config, \
+         and not in the environment. Saving that would report an install the agent \
+         cannot send a single message with. Export `RANTAICLAW_API_KEY` (or {name}'s own \
+         key variable) and re-run, or run `rantaiclaw setup provider` interactively."
+    ))
+}
+
 async fn run_provisioner_headless(
     provisioner: &dyn onboard::provision::TuiProvisioner,
     config: &mut Config,
@@ -3226,6 +3349,11 @@ async fn run_provisioner_headless(
                 // A configured multi-user channel is the point at which the
                 // owner needs to be able to manage permissions from chat.
                 Ok(onboard::provision::ProvisionOutcome::Configured) => {
+                    if let Some(reason) = unusable_provider_after_headless_setup(&prov_name, config)
+                    {
+                        eprintln!("\n❌ {reason}");
+                        anyhow::bail!("{reason}");
+                    }
                     let finalize =
                         onboard::provision::finalize_channel(provisioner_category, profile, config);
                     if let Some(guidance) = finalize.owner_guidance {
