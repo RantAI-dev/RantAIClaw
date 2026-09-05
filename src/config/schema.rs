@@ -2067,9 +2067,6 @@ pub struct MemoryConfig {
     /// Max embedding cache entries before LRU eviction
     #[serde(default = "default_cache_size")]
     pub embedding_cache_size: usize,
-    /// Max tokens per chunk for document splitting
-    #[serde(default = "default_chunk_size")]
-    pub chunk_max_tokens: usize,
 
     // ── Response Cache (saves tokens on repeated prompts) ──────
     /// Enable LLM response caching to avoid paying for duplicate prompts
@@ -2127,10 +2124,6 @@ fn default_min_relevance_score() -> f64 {
 fn default_cache_size() -> usize {
     10_000
 }
-fn default_chunk_size() -> usize {
-    512
-}
-
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -2147,7 +2140,6 @@ impl Default for MemoryConfig {
             keyword_weight: default_keyword_weight(),
             min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),
-            chunk_max_tokens: default_chunk_size(),
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
@@ -2405,10 +2397,6 @@ pub struct ReliabilityConfig {
     /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
-    /// Additional API keys for round-robin rotation on rate-limit (429) errors.
-    /// The primary `api_key` is always tried first; these are extras.
-    #[serde(default)]
-    pub api_keys: Vec<String>,
     /// Per-model fallback chains. When a model fails, try these alternatives in order.
     /// Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
     #[serde(default)]
@@ -2459,7 +2447,6 @@ impl Default for ReliabilityConfig {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
             fallback_providers: Vec::new(),
-            api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),

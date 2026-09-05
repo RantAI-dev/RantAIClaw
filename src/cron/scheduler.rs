@@ -336,6 +336,25 @@ async fn execute_and_persist_job(
     (job.id.clone(), success)
 }
 
+/// The memory scope a job's run gets, which is the whole of what
+/// `session_target` selects.
+///
+/// `Isolated` (the default) scopes memory to `cron:<job_id>`, so the job's
+/// `memory_recall` returns its own rows plus the shared/global tier — not
+/// another conversation's scoped rows, which it could otherwise quote into the
+/// announced output (`memory_recall` is auto-approved).
+///
+/// `Main` is the operator asking for the opposite: no scope, which is the
+/// global tier CLI and daemon runs use (`agent::run` passes `None`). A job set
+/// to `main` therefore shares context with those runs — the point of the
+/// setting, and the reason it is not the default.
+fn memory_scope_for(job: &CronJob) -> Option<String> {
+    match job.session_target {
+        SessionTarget::Isolated => Some(format!("cron:{}", job.id)),
+        SessionTarget::Main => None,
+    }
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
@@ -366,31 +385,24 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
-    let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => {
-            // Box the agent future: `crate::agent::run_with_scope` is a ~27KB
-            // future and is awaited transitively across the whole cron execution
-            // chain (execute_job_with_retry → execute_job_now/run_job_manual/
-            // execute_and_persist_job). Boxing it once here keeps every enclosing
-            // future off the poll-loop stack (clippy::large_futures).
-            //
-            // Scope memory to `cron:<job_id>` so this job's memory_recall returns
-            // its own rows plus the shared/global tier — not another
-            // conversation's scoped rows, which it could otherwise quote into the
-            // announced output (memory_recall is auto-approved).
-            Box::pin(crate::agent::run_with_scope(
-                config.clone(),
-                Some(prefixed_prompt),
-                None,
-                model_override,
-                config.default_temperature,
-                vec![],
-                "scheduler",
-                Some(format!("cron:{}", job.id)),
-            ))
-            .await
-        }
-    };
+    let memory_scope = memory_scope_for(job);
+
+    // Box the agent future: `crate::agent::run_with_scope` is a ~27KB future and
+    // is awaited transitively across the whole cron execution chain
+    // (execute_job_with_retry → execute_job_now/run_job_manual/
+    // execute_and_persist_job). Boxing it once here keeps every enclosing future
+    // off the poll-loop stack (clippy::large_futures).
+    let run_result = Box::pin(crate::agent::run_with_scope(
+        config.clone(),
+        Some(prefixed_prompt),
+        None,
+        model_override,
+        config.default_temperature,
+        vec![],
+        "scheduler",
+        memory_scope,
+    ))
+    .await;
 
     match run_result {
         Ok(response) => (
@@ -977,6 +989,53 @@ mod tests {
             last_output: None,
             created_by: None,
         }
+    }
+
+    // ── session_target (plan 303) ───────────────────────────────────────────
+    //
+    // One test per arm, not one aggregate: the two arms are the entire contract
+    // of the setting, and before this change both produced the same scope.
+
+    #[test]
+    fn an_isolated_job_is_scoped_to_its_own_id() {
+        let mut job = test_job("echo hi");
+        job.id = "job-42".into();
+        job.session_target = SessionTarget::Isolated;
+        assert_eq!(memory_scope_for(&job).as_deref(), Some("cron:job-42"));
+    }
+
+    #[test]
+    fn a_main_job_shares_the_global_scope() {
+        let mut job = test_job("echo hi");
+        job.id = "job-42".into();
+        job.session_target = SessionTarget::Main;
+        // `None` is what `agent::run` passes — the global tier CLI and daemon
+        // runs use. Sharing it is what `session_target = "main"` promises.
+        assert_eq!(memory_scope_for(&job), None);
+    }
+
+    /// The two arms above are only worth anything if the agent call actually
+    /// receives what they return. There is one `run_with_scope` call in this
+    /// module; assert it is handed `memory_scope` and not a literal, so a future
+    /// edit cannot quietly re-hardcode the scope and keep both tests green.
+    #[test]
+    fn the_agent_call_is_handed_the_computed_scope() {
+        let src = include_str!("scheduler.rs");
+        // Assembled at runtime: a verbatim literal here would be counted by the
+        // scan it feeds, and the assertion would be measuring itself.
+        let call = format!("run_with_{}(", "scope");
+        let call = call.as_str();
+        assert_eq!(
+            src.matches(call).count(),
+            1,
+            "more than one agent call site — each needs the computed scope"
+        );
+        let after = src.split(call).nth(1).expect("call site present");
+        let args = after.split("))").next().unwrap_or_default();
+        assert!(
+            args.contains("memory_scope,"),
+            "the agent call must be passed memory_scope; args were: {args}"
+        );
     }
 
     fn unique_component(prefix: &str) -> String {

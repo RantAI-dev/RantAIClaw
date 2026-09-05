@@ -1439,7 +1439,6 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
-    .with_api_keys(reliability.api_keys.clone())
     .with_model_fallbacks(reliability.model_fallbacks.clone());
 
     Ok(Box::new(reliable))
@@ -2774,7 +2773,6 @@ mod tests {
                 "openai".into(),
                 "openai".into(),
             ],
-            api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
@@ -2813,7 +2811,6 @@ mod tests {
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["lmstudio".into(), "ollama".into()],
-            api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
@@ -2835,7 +2832,6 @@ mod tests {
             provider_retries: 1,
             provider_backoff_ms: 100,
             fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
-            api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
@@ -2861,7 +2857,6 @@ mod tests {
                 "nonexistent-provider".into(),
                 "lmstudio".into(),
             ],
-            api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
