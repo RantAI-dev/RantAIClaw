@@ -587,9 +587,14 @@ impl Tool for ComposioTool {
                     "type": "string",
                     "description": "Preferred v3 tool slug to execute (alias of action_name)"
                 },
+                // Deliberately schema-less: the shape depends on the remote
+                // action being executed, so there is nothing to declare here
+                // that would not be wrong for most actions. The cron tools'
+                // object parameters got real schemas (plan 300); this one
+                // cannot, and inventing one would teach a wrong contract.
                 "params": {
                     "type": "object",
-                    "description": "Parameters to pass to the action"
+                    "description": "Parameters to pass to the action (shape is defined by the remote action)"
                 },
                 "entity_id": {
                     "type": "string",
