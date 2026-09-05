@@ -5350,6 +5350,20 @@ mod tests {
         warn_on_unknown_top_level_config_keys(&raw, Path::new("/tmp/config.toml"));
     }
 
+    /// The README and plan 305 both state that writing `[security.*]` produces
+    /// an unknown-key warning rather than silence. That is only true while
+    /// `security` is absent from the schema — the day `SecurityConfig` becomes a
+    /// field of `Config`, the section starts parsing quietly and the warning
+    /// disappears. Pin the claim so it cannot go stale unnoticed.
+    #[test]
+    async fn security_is_not_a_known_top_level_key() {
+        let known = known_top_level_config_keys();
+        assert!(
+            !known.contains("security"),
+            "`[security.*]` now parses silently — update the README and plan 305"
+        );
+    }
+
     #[test]
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
