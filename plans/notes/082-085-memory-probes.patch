@@ -1,0 +1,208 @@
+diff --git a/src/memory/markdown.rs b/src/memory/markdown.rs
+index bc65b36..f6abd7c 100644
+--- a/src/memory/markdown.rs
++++ b/src/memory/markdown.rs
+@@ -497,4 +497,78 @@ mod tests {
+             assert!((0.0..=1.0).contains(&s), "{} out of range: {s}", e.key);
+         }
+     }
++
++    // ── temporary probes (not for merge) ───────────────────────────
++
++    /// `memory stats` renders `Total` from `count().unwrap_or(0)` and `Health`
++    /// from `health_check()`. If those two can disagree, `Total: 0` is printed
++    /// for a store that is neither empty nor readable.
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn probe_count_failure_is_visible_next_to_health() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let (_tmp, mem) = temp_workspace();
++        mem.store("a", "readable", MemoryCategory::Daily, None)
++            .await
++            .unwrap();
++        assert_eq!(mem.count().await.unwrap(), 1, "control: it counts");
++
++        let daily = mem.daily_path();
++        std::fs::set_permissions(&daily, std::fs::Permissions::from_mode(0o000)).unwrap();
++
++        let counted = mem.count().await;
++        let healthy = mem.health_check().await;
++        std::fs::set_permissions(&daily, std::fs::Permissions::from_mode(0o644)).unwrap();
++
++        assert!(counted.is_err(), "control: an unreadable file fails count()");
++        assert!(
++            !healthy,
++            "count() failed but health_check() still says healthy, so stats prints \
++             `Total: 0` + `Health: healthy` for an unreadable store"
++        );
++    }
++
++    #[tokio::test]
++    async fn probe_forget_across_two_files() {
++        let (_tmp, mem) = temp_workspace();
++        mem.store("dupe", "core copy", MemoryCategory::Core, None)
++            .await
++            .unwrap();
++        mem.store("dupe", "daily copy", MemoryCategory::Daily, None)
++            .await
++            .unwrap();
++
++        let removed = mem.forget("dupe").await.unwrap();
++        assert!(removed, "control: forget reports it removed something");
++
++        let leftover = mem.get("dupe").await.unwrap();
++        assert!(
++            leftover.is_none(),
++            "forget returned true but entry survives: {leftover:?}"
++        );
++    }
++
++    #[tokio::test]
++    async fn probe_store_same_key_twice_is_upsert() {
++        let (_tmp, mem) = temp_workspace();
++        mem.store("k", "old value", MemoryCategory::Core, None)
++            .await
++            .unwrap();
++        mem.store("k", "new value", MemoryCategory::Core, None)
++            .await
++            .unwrap();
++
++        let count = mem.count().await.unwrap();
++        assert_eq!(count, 1, "one key must count once");
++
++        let rows: Vec<_> = mem
++            .list(None, None)
++            .await
++            .unwrap()
++            .into_iter()
++            .filter(|e| e.key == "k")
++            .collect();
++        assert_eq!(rows.len(), 1, "stale row survives: {rows:?}");
++    }
+ }
+diff --git a/src/memory/sqlite.rs b/src/memory/sqlite.rs
+index 6864288..ba084cf 100644
+--- a/src/memory/sqlite.rs
++++ b/src/memory/sqlite.rs
+@@ -2743,4 +2743,44 @@ mod tests {
+ 
+         assert_eq!(mem.count().await.unwrap(), 1);
+     }
++
++    // ── temporary probes (not for merge) ───────────────────────────
++
++    /// `memory stats` prints `Total` from `count()` and the by-category
++    /// breakdown from `list()`. If `list()` is capped they disagree.
++    #[tokio::test]
++    async fn probe_list_len_matches_count_past_the_cap() {
++        let (_tmp, mem) = temp_sqlite();
++        for i in 0..1100 {
++            mem.store(&format!("k{i}"), "filler", MemoryCategory::Core, None)
++                .await
++                .unwrap();
++        }
++
++        let total = mem.count().await.unwrap();
++        assert_eq!(total, 1100, "control: count() sees every row");
++
++        let listed = mem.list(None, None).await.unwrap().len();
++        assert_eq!(
++            listed, total,
++            "stats breakdown is built from list(), which returned {listed} of {total}"
++        );
++    }
++
++    /// Control for `probe_forget_across_two_files` in the markdown backend:
++    /// the same two writes under sqlite leave one row, and forget clears it.
++    #[tokio::test]
++    async fn probe_forget_across_two_categories() {
++        let (_tmp, mem) = temp_sqlite();
++        mem.store("dupe", "core copy", MemoryCategory::Core, None)
++            .await
++            .unwrap();
++        mem.store("dupe", "daily copy", MemoryCategory::Daily, None)
++            .await
++            .unwrap();
++
++        assert_eq!(mem.count().await.unwrap(), 1, "control: upsert, not append");
++        assert!(mem.forget("dupe").await.unwrap());
++        assert!(mem.get("dupe").await.unwrap().is_none());
++    }
+ }
+diff --git a/src/tools/memory_forget.rs b/src/tools/memory_forget.rs
+index b4629d5..c6734a4 100644
+--- a/src/tools/memory_forget.rs
++++ b/src/tools/memory_forget.rs
+@@ -259,6 +259,71 @@ mod tests {
+         assert!(mem.get("temp").await.unwrap().is_some());
+     }
+ 
++    // ── temporary probes (not for merge) ───────────────────────────
++
++    /// `MEMORY.md` is injected into every system prompt (`agent/prompt.rs`).
++    /// Forgetting a core memory has to leave that projection too.
++    #[tokio::test]
++    async fn probe_forget_leaves_the_projection_stale() {
++        let (tmp, mem) = test_mem();
++        mem.store(
++            "rotation_note",
++            "staging credentials rotate weekly",
++            MemoryCategory::Core,
++            None,
++        )
++        .await
++        .unwrap();
++
++        let projected = crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
++        assert_eq!(projected, 1, "control: projection wrote the entry");
++        let before = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
++        assert!(before.contains("rotation_note"), "control: it is in the file");
++
++        let tool = MemoryForgetTool::new(mem.clone(), test_security());
++        let result = tool.execute(json!({"key": "rotation_note"})).await.unwrap();
++        assert!(result.success, "control: the tool reports success");
++        assert!(
++            mem.get("rotation_note").await.unwrap().is_none(),
++            "control: gone from the authoritative store"
++        );
++
++        let after = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
++        assert!(
++            !after.contains("rotation_note"),
++            "the prompt-injected file still holds the forgotten entry:\n{after}"
++        );
++    }
++
++    /// The gate has to decide before the tool reads memory to satisfy the
++    /// selector. `forget_blocked_in_readonly_mode` only covers `key`.
++    #[tokio::test]
++    async fn probe_readonly_gate_applies_to_the_contains_selector() {
++        let (_tmp, mem) = test_mem();
++        mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
++            .await
++            .unwrap();
++        mem.store("b", "the deploy schedule", MemoryCategory::Core, None)
++            .await
++            .unwrap();
++
++        let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
++        let tool = MemoryForgetTool::new(mem.clone(), readonly);
++        let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
++
++        assert!(!result.success);
++        assert!(
++            mem.get("a").await.unwrap().is_some() && mem.get("b").await.unwrap().is_some(),
++            "control: a read-only agent deleted nothing"
++        );
++
++        let error = result.error.unwrap_or_default();
++        assert!(
++            error.contains("read-only mode"),
++            "read-only call answered from memory contents instead of the gate: {error}"
++        );
++    }
++
+     #[tokio::test]
+     async fn forget_blocked_when_rate_limited() {
+         let (_tmp, mem) = test_mem();
