@@ -703,6 +703,98 @@ impl Provider for OllamaProvider {
 mod tests {
     use super::*;
 
+    // ── Wire-shape fixture (plan 310) ───────────────────────────────────────
+    //
+    // The construction tests above only check `normalize_base_url`. This one
+    // asserts the request that leaves the process and the `ChatResponse`
+    // parsed back from the reply.
+    //
+    // Plan 310 calls this shape "Ollama's NDJSON". It is not: `build_chat_request`
+    // hard-codes `stream: false` (src/providers/ollama.rs:177) and `send_request`
+    // parses the whole body with one `serde_json::from_slice`, so the wire
+    // carries a single JSON object. The fixture asserts what the client does.
+
+    #[tokio::test]
+    async fn ollama_wire_sends_tool_definitions_and_parses_tool_calls() {
+        use crate::providers::traits::ChatRequest as ProviderChatRequest;
+        use crate::tools::traits::ToolSpec;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "llama3.2",
+                    "created_at": "2026-09-05T00:00:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": "checking that",
+                        "tool_calls": [{
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": {"city": "Jakarta"}
+                            }
+                        }]
+                    },
+                    "done": true
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(Some(&server.uri()), None);
+        let messages = vec![ChatMessage::user("weather in Jakarta?")];
+        let tools = vec![ToolSpec {
+            name: "get_weather".into(),
+            description: "Look up the weather for a city".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"]
+            }),
+        }];
+
+        let resp = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "llama3.2",
+                0.2,
+            )
+            .await
+            .expect("chat against the mock");
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        assert_eq!(reqs.len(), 1, "expected exactly one upstream request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("request body is JSON");
+        assert_eq!(body["stream"], false, "body: {body}");
+        let sent = body["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no tools on the wire: {body}"));
+        let tool = sent
+            .iter()
+            .find(|t| t["function"]["name"] == "get_weather")
+            .unwrap_or_else(|| panic!("tool definition missing: {body}"));
+        assert_eq!(tool["type"], "function");
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["city"]["type"],
+            "string"
+        );
+
+        assert_eq!(resp.tool_calls.len(), 1, "resp was {resp:?}");
+        assert_eq!(resp.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&resp.tool_calls[0].arguments).expect("arguments are JSON");
+        assert_eq!(args["city"], "Jakarta");
+    }
+
     #[test]
     fn default_url() {
         let p = OllamaProvider::new(None, None);
