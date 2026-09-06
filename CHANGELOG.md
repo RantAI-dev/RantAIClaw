@@ -48,6 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The MCP tool-reach limitation is now stated instead of silent.** MCP tools are
+  spliced into the registry by `Agent::build`, so they reach the TUI/CLI agent and
+  the gateway's `/api/v1` chat — and **not** chat channels, cron, or the gateway's
+  own webhook path, which assemble their tool lists without the splice. Previously
+  a configured server simply produced no tools there, with no error and no log
+  line. `rantaiclaw doctor` now says so next to `mcp.startup`, and
+  `docs/reference/config.md` gains an `[mcp_servers.<name>]` section — the config
+  reference had none at all. Issue #283 stays open: making MCP reach every surface
+  needs a shared pool with one owner, which is a feature decision, not a cleanup.
+
 - **Exactly one `Usage` event per turn, on both agent paths.** The interactive
   path emitted two (the shared loop and `Agent::turn_streaming` each sent one) and
   the channel/gateway/CLI path emitted none on any turn that used a tool.
@@ -105,6 +115,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for tool calls in #723 and is not part of this. If OS-level confinement is
   funded, it returns as one backend wired into the shell tool, with its config key
   and its enforcement in the same change; git history holds the originals.
+- **The MCP supervision stack, which never ran.** `McpRegistry`, `McpHandle` and
+  `spawn_supervisor` — 492 lines describing respawn-with-backoff — had no caller
+  anywhere, and the module doc claimed crash recovery the product did not have.
+  Its own log promised "attempt n/5" while the failure counter gave up after four
+  restarts, which is how you can tell nobody ever exercised it; it also carried a
+  second process-spawn implementation alongside the live client. The lifetime that
+  is real — the gateway's connected pool, reconnecting when `mcp_servers` changes —
+  is untouched. If supervision is wanted it is built on that pool. Closes #282.
 
 - **Three Prometheus metrics that were always zero.** `rantaiclaw_tokens_used_last`,
   `rantaiclaw_active_sessions` and `rantaiclaw_queue_depth` were registered and
