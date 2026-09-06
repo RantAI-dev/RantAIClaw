@@ -207,6 +207,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it used to fall into `continue`, spinning the loop at full speed on a dead
   socket. Cancellation now sends a close frame instead of dropping the socket.
 
+- **The TUI stops showing `0` for token counts nobody reported.** The agent emits
+  a usage event only when the provider sent one, and several backends never do —
+  so the session tally sat at its zeroed default and the status line, `/usage` and
+  `/insights` all rendered `0` as though it had been measured. A turn that consumed
+  zero tokens does not exist, so that zero could only ever have meant "unknown".
+  The tally is now `Option`: the status line shows `—` (and drops the percentage,
+  which was a percentage of an unknown numerator), and the two panels say
+  **"not reported"**. Reported counts render exactly as before.
+
 - **The three webhook channels stop when they are told to.** WhatsApp Cloud, Linq
   and Nextcloud Talk receive over HTTP, so their listeners have nothing to poll —
   each slept an hour at a time and relied on the supervisor dropping its future.

@@ -568,6 +568,23 @@ impl CommandHandler for InsightsCommand {
         let session_age = ctx.started_at.elapsed();
         let age_label = format_duration(session_age);
 
+        // "not reported" rather than `0` — see `/usage`.
+        let counts = ctx.token_usage.as_ref().map_or_else(
+            || {
+                [
+                    "not reported".to_string(),
+                    "not reported".to_string(),
+                    "not reported".to_string(),
+                ]
+            },
+            |u| {
+                [
+                    u.prompt_tokens.to_string(),
+                    u.completion_tokens.to_string(),
+                    u.total_tokens.to_string(),
+                ]
+            },
+        );
         let panel = InfoPanel::new("Insights")
             .with_subtitle("session + message stats")
             .with_footer("Esc close · `/usage` for token-level breakdown")
@@ -584,9 +601,9 @@ impl CommandHandler for InsightsCommand {
             )
             .section(
                 InfoSection::new("Tokens (this session)")
-                    .key_value("Prompt", ctx.token_usage.prompt_tokens.to_string())
-                    .key_value("Completion", ctx.token_usage.completion_tokens.to_string())
-                    .key_value("Total", ctx.token_usage.total_tokens.to_string()),
+                    .key_value("Prompt", &counts[0])
+                    .key_value("Completion", &counts[1])
+                    .key_value("Total", &counts[2]),
             );
         Ok(CommandResult::OpenInfoPanel(panel))
     }

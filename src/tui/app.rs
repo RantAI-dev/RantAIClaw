@@ -2683,11 +2683,11 @@ impl TuiApp {
             }
             AgentEvent::Usage(u) => {
                 // Map the agent's cost::TokenUsage onto the TUI's tally shape.
-                self.context.token_usage = TokenUsage {
+                self.context.token_usage = Some(TokenUsage {
                     prompt_tokens: u.input_tokens,
                     completion_tokens: u.output_tokens,
                     total_tokens: u.total_tokens,
-                };
+                });
             }
             AgentEvent::Done {
                 final_text,
@@ -4839,8 +4839,14 @@ impl TuiApp {
             ])
         } else {
             // Compact context-window meter — pretty-prints big numbers.
-            let used = self.context.token_usage.total_tokens;
-            let used_label = format_tokens(used);
+            //
+            // `—` when the provider reported nothing. It used to render `0`,
+            // which reads as a measured zero; a turn that consumed no tokens
+            // does not exist, so the only thing that zero ever meant was
+            // "unknown". The percentage goes with it: a percentage of an
+            // unknown numerator is not a number.
+            let used = self.context.token_usage.as_ref().map(|u| u.total_tokens);
+            let used_label = used.map_or_else(|| "—".to_string(), format_tokens);
             // Approximate context window from configured value if available.
             let window = self.context.context_window.unwrap_or(0);
             let window_label = if window > 0 {
@@ -4848,11 +4854,15 @@ impl TuiApp {
             } else {
                 String::new()
             };
-            let pct = if window > 0 {
-                ((used as f64 / window as f64) * 100.0).round() as u32
-            } else {
-                0
-            };
+            // Integer math, rounded half-up. The float version rendered the
+            // same number and needed two lint exemptions for casts that can
+            // truncate or lose a sign; token counts are u64 and a percentage of
+            // them fits, so neither hazard has to exist here.
+            let pct = used.and_then(|used| {
+                used.saturating_mul(100)
+                    .saturating_add(window / 2)
+                    .checked_div(window)
+            });
 
             // Session age in human time.
             let age_secs = self.context.started_at.elapsed().as_secs();
@@ -4872,10 +4882,9 @@ impl TuiApp {
                     Style::default().fg(Color::Rgb(126, 226, 179)),
                 ),
                 Span::styled(
-                    if window > 0 {
-                        format!("  {pct}%")
-                    } else {
-                        String::new()
+                    match pct {
+                        Some(pct) if window > 0 => format!("  {pct}%"),
+                        _ => String::new(),
                     },
                     muted,
                 ),
@@ -6782,8 +6791,12 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
             Span::styled(notice.clone(), muted),
         ])
     } else {
-        let used = ctx.token_usage.total_tokens;
-        let used_label = format_tokens(used);
+        // `—` when nothing was reported — see the meter above for why a zero
+        // here would be a claim rather than a measurement.
+        let used_label = ctx
+            .token_usage
+            .as_ref()
+            .map_or_else(|| "—".to_string(), |u| format_tokens(u.total_tokens));
         let age_secs = ctx.started_at.elapsed().as_secs();
         let age_label = format_duration_short(age_secs);
 
@@ -9238,6 +9251,57 @@ mod submit_tests {
         registry.resolve_by_basename(&advanced, crate::security::Decision::Session);
         let _ = t1.await;
         let _ = t2.await;
+    }
+
+    /// The status pane's text, so a test can read what the operator reads.
+    fn status_pane_text(ctx: &TuiContext, w: u16, h: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_status_pane(ctx, &AppState::Ready, f, area);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// The status line rendered `0` for a session no provider reported usage
+    /// for, next to the model name, as though it were a measurement. A turn
+    /// that consumed zero tokens does not exist.
+    #[test]
+    fn the_status_line_shows_a_dash_when_no_usage_was_reported() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        assert!(ctx.token_usage.is_none(), "fixture starts unreported");
+
+        // Assert the token slot itself — the line also carries "0 msgs" and
+        // "0s", which are real zeros and must stay.
+        let text = status_pane_text(&ctx, 100, 1);
+        assert!(
+            text.contains("mock-model  │  —  │"),
+            "an unreported count must read as unknown, not as 0: {text:?}"
+        );
+    }
+
+    /// The other half: a reported count still renders as a number.
+    #[test]
+    fn the_status_line_shows_the_count_a_provider_reported() {
+        let (mut ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        ctx.token_usage = Some(crate::tui::context::TokenUsage {
+            prompt_tokens: 900,
+            completion_tokens: 334,
+            total_tokens: 1234,
+        });
+
+        let text = status_pane_text(&ctx, 100, 1);
+        assert!(
+            text.contains("mock-model  │  1.2K  │"),
+            "a reported count must be shown as a number: {text:?}"
+        );
     }
 
     fn chat_pane_buffer_text(ctx: &mut TuiContext, w: u16, h: u16) -> String {
