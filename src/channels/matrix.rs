@@ -978,9 +978,13 @@ mod tests {
         );
 
         assert_eq!(ch.room_id, "!room:matrix.org");
-        assert_eq!(ch.allowed_users.len(), 2);
-        assert!(ch.allowed_users.contains(&"@user:matrix.org".to_string()));
-        assert!(ch.allowed_users.contains(&"@other:matrix.org".to_string()));
+        // `allowed_users` became `Arc<RwLock<Vec<String>>>` when the allowlist
+        // was made runtime-mutable; these three lines still treated it as a
+        // `Vec` and never compiled, because no CI job built this module.
+        let users = ch.allowed_users.read().expect("allowlist lock");
+        assert_eq!(users.len(), 2);
+        assert!(users.contains(&"@user:matrix.org".to_string()));
+        assert!(users.contains(&"@other:matrix.org".to_string()));
     }
 
     #[test]

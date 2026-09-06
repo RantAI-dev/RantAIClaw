@@ -39,7 +39,7 @@ Run one agent across many transports simultaneously. Each channel is independent
 | DingTalk | Stable | default | n/a |
 | CLI | Built-in | always | n/a |
 | WhatsApp Web | Stable | `--features whatsapp-web` | session-DB exists |
-| Matrix (E2EE) | Feature-gated | `--features channel-matrix` | n/a |
+| Matrix (E2EE) | Under development · feature-gated | `--features channel-matrix` | n/a |
 | Lark / Feishu | Feature-gated | `--features channel-lark` | n/a |
 | iMessage | Stable (macOS only) | default | n/a |
 
@@ -53,7 +53,7 @@ Run one agent across many transports simultaneously. Each channel is independent
 | Hot-add via gateway API | Stable |
 | Doctor probes | Stable (added v0.5.2) |
 | WhatsApp Web QR (Unicode block) | Stable (added v0.5.2) |
-| Matrix E2EE on `--all-features` | Blocked on matrix-sdk recursion-limit |
+| Matrix E2EE | Under development — builds and unit-tests in CI since the `matrix-sdk` 0.18 pin; not live-verified against a homeserver, so outside the supported tier |
 | Mattermost maturation | Implemented · needs validation |
 | Nextcloud Talk | Implemented · needs validation |
 

@@ -26,10 +26,14 @@ fn short_doc_yields_single_chunk() {
 
 #[test]
 fn long_doc_splits_with_overlap() {
+    // `.as_str()` rather than `&`: under `--features channel-matrix`,
+    // matrix-sdk pulls `decancer`, whose `impl Add<Translation> for String`
+    // makes the `&String -> &str` deref coercion ambiguous. Naming the
+    // `Add<&str>` impl keeps this compiling under every feature set.
     let body = "## Section A\n".to_owned()
-        + &"alpha ".repeat(300)
+        + "alpha ".repeat(300).as_str()
         + "\n\n## Section B\n"
-        + &"beta ".repeat(300);
+        + "beta ".repeat(300).as_str();
     let chunks = chunk_document(
         &body,
         "T",
@@ -90,9 +94,9 @@ fn respects_priority_separators() {
     // splitter should prefer breaking at `\n## ` (heading) before sentence
     // boundaries. Filler that won't fit in one chunk forces splitting.
     let body = "## Alpha\n".to_owned()
-        + &"alpha-line one. alpha-line two. ".repeat(20)
+        + "alpha-line one. alpha-line two. ".repeat(20).as_str()
         + "\n## Beta\n"
-        + &"beta-line one. beta-line two. ".repeat(20);
+        + "beta-line one. beta-line two. ".repeat(20).as_str();
     let chunks = chunk_document(
         &body,
         "T",
