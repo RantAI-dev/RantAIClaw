@@ -400,6 +400,32 @@ a token to the browser.
 > looks protected when it is not. Leave `require_pairing = true` unless the
 > gateway is unreachable from anywhere but the local process.
 
+## `[mcp_servers.<name>]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `command` | — | Executable to spawn for this MCP server |
+| `args` | `[]` | Arguments passed to it |
+| `env` | `{}` | Extra environment for the subprocess (encrypted at rest since schema v28) |
+
+Notes:
+
+- **MCP tools do not reach every surface.** They are spliced into the tool
+  registry by `Agent::build`, so a configured server's tools are available to the
+  **TUI/CLI agent** and to the **gateway's `/api/v1` chat** path. They are **not**
+  available to chat channels, cron jobs, or the gateway's own webhook path — those
+  assemble their tool lists without the MCP splice. There is no error and no log
+  line when this happens; the tools are simply absent. Tracked as issue #283.
+  `rantaiclaw doctor` repeats this next to the `mcp.startup` check.
+- **There is no crash supervision.** If a server exits, it is not respawned. The
+  gateway keeps one connected pool per config and reconnects when `mcp_servers`
+  changes; nothing restarts a crashed process. A registry/handle/supervisor stack
+  that described respawn-with-backoff existed but had no caller and was removed in
+  schema-independent cleanup (plan 312).
+- The subprocess environment is stripped and rebuilt from a non-secret allowlist
+  plus the declared `env`, so an MCP server does not inherit the daemon's provider
+  keys.
+
 ## `[tunnel]`
 
 | Key | Default | Purpose |

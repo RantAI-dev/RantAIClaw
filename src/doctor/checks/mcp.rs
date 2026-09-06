@@ -14,6 +14,17 @@ use crate::doctor::{CheckResult, DoctorCheck, DoctorContext};
 
 pub struct McpStartupCheck;
 
+/// What an operator configuring an MCP server is not otherwise told.
+///
+/// MCP tools are spliced into the tool registry by `Agent::build`, so they reach
+/// the TUI/CLI agent and the gateway's `/api/v1` chat path. Chat channels, cron
+/// and the gateway's own webhook path assemble their tool lists without that
+/// splice, so a configured server is simply absent there — with no error and no
+/// log line. Silence is the actual harm (issue #283); saying it here is the fix
+/// this doctor check can make.
+const MCP_REACH_HINT: &str = "MCP tools reach the TUI/CLI agent and the gateway's \
+     /api/v1 chat only — not chat channels, cron, or gateway webhooks (issue #283)";
+
 #[async_trait]
 impl DoctorCheck for McpStartupCheck {
     fn name(&self) -> &'static str {
@@ -45,6 +56,7 @@ impl DoctorCheck for McpStartupCheck {
                 format!("{ok_count} MCP server command(s) found on PATH"),
             )
             .with_category(self.category())
+            .with_hint(MCP_REACH_HINT)
         } else {
             CheckResult::fail(
                 self.name(),
