@@ -207,6 +207,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it used to fall into `continue`, spinning the loop at full speed on a dead
   socket. Cancellation now sends a close frame instead of dropping the socket.
 
+- **A revoked Telegram bot token no longer polls forever.** Telegram reports
+  failures in the body (`{"ok": false, "error_code": …}`), and the listener slept
+  five seconds and asked again for every one of them — including `401`, `403` and
+  the `404` a wrong token produces, because the token is a path segment. Those
+  three now end the listener with an error naming the code. `409` (another process
+  holding the same token) stays retryable, because it resolves when that process
+  stops.
+
+- **The Signal listener reports a refused events stream, and honours
+  cancellation.** A `401`/`403` from signal-cli was logged and reconnected on the
+  SSE backoff forever; it now ends the listener. Everything else — 5xx, a dropped
+  stream, a connect error — still retries. The token was taken as `_cancel` and
+  never used, so shutdown waited for the supervisor to drop the future: the SSE
+  read and all three backoff sleeps now race `cancel.cancelled()`, and the
+  reconnect window grows to a minute, which is how long a shutdown used to wait.
+
 - **The Lark listener honours cancellation, in both modes.** `listen` took the
   token as `_cancel` and never passed it on, so neither the WebSocket loop nor the
   callback server ever saw it and shutdown relied on the supervisor dropping the
