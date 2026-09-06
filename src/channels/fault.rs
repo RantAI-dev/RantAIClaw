@@ -43,6 +43,24 @@ pub(crate) fn slack_error_is_fatal(error: &str) -> bool {
     )
 }
 
+/// Whether a WebSocket close code from Discord's gateway means the connection
+/// will never succeed with this configuration.
+///
+/// Discord does not answer a revoked token with an HTTP status — the handshake
+/// succeeds and the gateway closes the socket after `IDENTIFY` with `4004`. A
+/// listener that treats every close as "reconnect" therefore reconnects into
+/// the same rejection forever at the supervisor's initial backoff.
+///
+/// The listed codes are the ones whose remedy is an operator change (a new
+/// token, a different intent set, a shard count), not time:
+/// 4004 authentication failed, 4010 invalid shard, 4011 sharding required,
+/// 4012 invalid API version, 4013 invalid intents, 4014 disallowed intents.
+/// Everything else — 4000 unknown error, 4007 invalid seq, 4009 session timed
+/// out, a normal 1000/1001 — is a reconnect, and must stay one.
+pub(crate) fn discord_close_is_fatal(code: u16) -> bool {
+    matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +112,67 @@ mod tests {
         );
     }
 
+    /// Discord hard-codes `https://discord.com/api/v10/...` at every call site
+    /// and its gateway is a live WebSocket, so its listener cannot be pointed at
+    /// a local server — the same limitation Slack has above, for the same
+    /// reason, and a base-URL seam is its own change. Until then, assert the
+    /// wiring by reading. Each needle is one of the four ways this listener used
+    /// to report a fault as a clean exit.
+    #[test]
+    fn the_discord_listener_reports_its_faults_to_the_supervisor() {
+        let src = include_str!("discord.rs");
+        // Assembled at runtime so these assertions cannot count themselves.
+        for (needle, why) in [
+            (
+                format!("fault::is_fatal_auth_{}(status)", "status"),
+                "a revoked bot token answers 401 on the gateway lookup",
+            ),
+            (
+                format!("fault::discord_close_is_{}(code)", "fatal"),
+                "4004 arrives as a close frame, not an HTTP status",
+            ),
+            (
+                format!("Some(Err(e)) => return {}(", "Err"),
+                "a read error is a transport fault, not something to poll past",
+            ),
+            (
+                format!("write.send(Message::{}(None))", "Close"),
+                "cancellation owes Discord a close frame",
+            ),
+        ] {
+            assert!(src.contains(needle.as_str()), "{why} (missing: {needle})");
+        }
+    }
+
+    /// Lark's WS endpoint is issued per-connection by Feishu and its callback
+    /// host is hard-coded, so the WS half is unreachable from a test. The
+    /// webhook half *is* covered behaviourally
+    /// (`the_webhook_listener_stops_when_the_token_is_cancelled`); this pins the
+    /// two properties of the WS half that a test cannot reach.
+    #[test]
+    fn the_lark_websocket_listener_honours_cancellation_and_reports_read_faults() {
+        let src = include_str!("lark.rs");
+        let cancel_arm = format!("() = cancel.{}() => {{", "cancelled");
+        let close_frame = format!("write.send(WsMsg::{}(None))", "Close");
+        let read_fault = format!(
+            "Some(Err(e)) => {{\n                            return {}(",
+            "Err"
+        );
+        assert!(
+            src.contains(cancel_arm.as_str()),
+            "the WS loop must select on the shutdown token"
+        );
+        assert!(
+            src.contains(close_frame.as_str()),
+            "cancellation owes Feishu a close frame; dropping the socket leaves \
+             the long connection open until its own timeout"
+        );
+        assert!(
+            src.contains(read_fault.as_str()),
+            "a WS read error must return Err, or the supervisor resets its backoff"
+        );
+    }
+
     #[test]
     fn slack_credential_errors_are_fatal() {
         for e in [
@@ -105,6 +184,31 @@ mod tests {
             "missing_scope",
         ] {
             assert!(slack_error_is_fatal(e), "{e} must stop the listener");
+        }
+    }
+
+    #[test]
+    fn discord_configuration_close_codes_are_fatal() {
+        for code in [4004, 4010, 4011, 4012, 4013, 4014] {
+            assert!(
+                discord_close_is_fatal(code),
+                "{code} needs an operator change, not a retry"
+            );
+        }
+    }
+
+    #[test]
+    fn discord_reconnect_close_codes_are_transient() {
+        // 4009 (session timed out) and 4007 (invalid seq) are the ones Discord
+        // sends most often and are exactly what a reconnect is for; treating
+        // them as fatal would give up on a healthy bot.
+        for code in [
+            1000, 1001, 1006, 4000, 4001, 4002, 4003, 4005, 4007, 4008, 4009,
+        ] {
+            assert!(
+                !discord_close_is_fatal(code),
+                "{code} must stay a reconnect"
+            );
         }
     }
 
