@@ -533,6 +533,14 @@ struct AutonomyBody {
     forbidden_paths: Option<Vec<String>>,
     #[serde(default)]
     max_actions_per_hour: Option<u32>,
+    /// Accepted and ignored for one release.
+    ///
+    /// The key it wrote (`autonomy.max_cost_per_day_cents`) is gone: it was a
+    /// money ceiling that was never enforced, replaced by `[cost]
+    /// max_tokens_per_day`, which is. A console built against the old shape
+    /// still sends this field, and rejecting the whole request over it would
+    /// break every other autonomy edit in the same PATCH. Remove after the
+    /// console has shipped its side.
     #[serde(default)]
     max_cost_per_day_cents: Option<u32>,
     #[serde(default)]
@@ -589,8 +597,11 @@ async fn set_autonomy(
     if let Some(v) = body.max_actions_per_hour {
         cfg.autonomy.max_actions_per_hour = v;
     }
-    if let Some(v) = body.max_cost_per_day_cents {
-        cfg.autonomy.max_cost_per_day_cents = v;
+    if body.max_cost_per_day_cents.is_some() {
+        tracing::info!(
+            "ignoring max_cost_per_day_cents: the money ceiling was never enforced and is \
+             replaced by [cost] max_tokens_per_day"
+        );
     }
     if let Some(v) = body.workspace_only {
         cfg.autonomy.workspace_only = v;
@@ -1341,6 +1352,33 @@ async fn set_knowledge(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    /// A console built before the token ceiling still sends
+    /// `max_cost_per_day_cents` in its autonomy PATCH. The key it wrote is gone,
+    /// but rejecting the request over it would break every other autonomy edit
+    /// in the same body — an operator changing their allowlist would get a 400
+    /// because of a field they never touched.
+    #[test]
+    fn an_autonomy_body_still_deserialises_with_the_retired_money_key() {
+        let body: AutonomyBody = serde_json::from_value(serde_json::json!({
+            "level": "full",
+            "max_actions_per_hour": 300,
+            "max_cost_per_day_cents": 500,
+        }))
+        .expect("the retired key must not fail the whole request");
+
+        assert_eq!(body.level.as_deref(), Some("full"));
+        assert_eq!(
+            body.max_actions_per_hour,
+            Some(300),
+            "the fields that still exist are applied"
+        );
+        assert_eq!(
+            body.max_cost_per_day_cents,
+            Some(500),
+            "and the retired one is parsed, then ignored by `set_autonomy`"
+        );
+    }
 
     /// The gateway is bound to one config file from boot. `load_or_init`
     /// re-resolves the path from the environment and the

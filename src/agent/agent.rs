@@ -119,6 +119,11 @@ pub struct Agent {
     /// `None` falls back to the CLI prompt for the `cli` channel. The console
     /// sets a `WebModalApprovalBackend`.
     approval_backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
+    /// The process's token ledger: the daily ceiling this agent's turns are
+    /// checked against, and the operator's optional prices used to report money.
+    /// `None` on bare-builder agents (tests, custom embeds); `from_config` sets
+    /// it whenever `[cost] enabled` is on.
+    ledger: Option<Arc<crate::cost::CostTracker>>,
 }
 
 pub struct AgentBuilder {
@@ -143,6 +148,7 @@ pub struct AgentBuilder {
     security: Option<Arc<SecurityPolicy>>,
     approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
     approval_backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
+    ledger: Option<Arc<crate::cost::CostTracker>>,
 }
 
 impl AgentBuilder {
@@ -169,6 +175,7 @@ impl AgentBuilder {
             security: None,
             approval_manager: None,
             approval_backend: None,
+            ledger: None,
         }
     }
 
@@ -340,6 +347,7 @@ impl AgentBuilder {
             memory_recall_scope: crate::tools::memory_recall::ConversationScope::default(),
             approval_manager: self.approval_manager,
             approval_backend: self.approval_backend,
+            ledger: self.ledger,
         })
     }
 }
@@ -347,13 +355,21 @@ impl AgentBuilder {
 /// Build the turn's `TokenUsage` from what the provider reported, or `None`
 /// when it reported nothing.
 ///
-/// Cost stays 0.0 — pricing is plan 306's enforcement half, and inventing a
-/// number here would repeat the mistake this replaces.
+/// Priced only where the operator configured a price for this model. Without a
+/// ledger — or without an entry for the model — `cost_usd` stays `None`, which
+/// the surfaces render as "not reported". A `0.0` here would be a claim about
+/// spend that nothing measured.
 fn turn_usage(
+    ledger: Option<&crate::cost::CostTracker>,
     model: &str,
     reported: Option<crate::providers::ProviderUsage>,
 ) -> Option<TokenUsage> {
-    reported.map(|u| TokenUsage::new(model.to_string(), u.input_tokens, u.output_tokens, 0.0, 0.0))
+    reported.map(|u| {
+        ledger.map_or_else(
+            || TokenUsage::new(model.to_string(), u.input_tokens, u.output_tokens, None),
+            |l| l.usage_for(model, u.input_tokens, u.output_tokens),
+        )
+    })
 }
 
 /// Read `<policy_dir>/command_allowlist.toml` into a flat Vec of glob
@@ -633,6 +649,10 @@ impl Agent {
                 agent.mcp_health = mcp_health;
                 agent.mcp_tools_by_server = mcp_tools_by_server;
                 agent.memory_recall_scope = memory_recall_scope;
+                // Every agent built from a real config is subject to the daily
+                // token ceiling. Bare-builder agents (tests, embeds) are not —
+                // they have no workspace to keep a ledger in.
+                agent.ledger = crate::cost::ledger_for(config);
                 agent
             })
     }
@@ -762,6 +782,9 @@ impl Agent {
             None,
             None,
             None,
+            // The flush spends real tokens, so it counts against the ceiling
+            // and is recorded like any other turn.
+            self.ledger.as_deref(),
         )
         .await;
 
@@ -1143,17 +1166,29 @@ impl Agent {
             cancel.cloned(),
             None,
             events.cloned(),
+            self.ledger.as_deref(),
         )
         .await;
 
         self.trim_history();
 
         match result {
-            Ok((text, usage)) => Ok(TurnResult {
-                text,
-                usage: turn_usage(&effective_model, usage),
-                cancelled: false,
-            }),
+            Ok((text, usage)) => {
+                let usage = turn_usage(self.ledger.as_deref(), &effective_model, usage);
+                // Record before returning: the ledger is what the next turn's
+                // ceiling check reads, so a turn that is not recorded is a turn
+                // the brake never sees.
+                if let (Some(ledger), Some(u)) = (self.ledger.as_deref(), usage.as_ref()) {
+                    if let Err(e) = ledger.record_usage(u.clone()) {
+                        tracing::warn!("failed to record token usage: {e:#}");
+                    }
+                }
+                Ok(TurnResult {
+                    text,
+                    usage,
+                    cancelled: false,
+                })
+            }
             // The shared loop signals cancellation via `ToolLoopCancelled`.
             Err(e)
                 if e.downcast_ref::<crate::agent::loop_::ToolLoopCancelled>()

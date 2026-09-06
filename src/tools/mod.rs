@@ -486,7 +486,8 @@ pub fn all_tools_with_runtime(
             },
         )
         .with_parent_tools(parent_tools)
-        .with_multimodal_config(root_config.multimodal.clone());
+        .with_multimodal_config(root_config.multimodal.clone())
+        .with_ledger(crate::cost::ledger_for(root_config));
         tool_arcs.push(Arc::new(delegate_tool));
     }
 

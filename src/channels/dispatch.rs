@@ -592,6 +592,7 @@ pub(crate) async fn process_channel_message(
                 Some(cancellation_token.clone()),
                 delta_tx,
                 None,
+                ctx.ledger.as_deref(),
             ),
             ),
         ) => LlmExecutionResult::Completed(result),

@@ -2577,6 +2577,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
         }
