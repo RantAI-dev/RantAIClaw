@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`rantaiclaw_channel_enqueue_rejected_total{channel,reason}`.** Counts inbound
+  webhook messages the dispatch queue refused, labelled `full` (the queue is
+  saturated) or `closed` (no dispatch loop is running). A message that never
+  reaches the agent is otherwise invisible from the outside; the sender is
+  answered `503` with a `Retry-After` and its idempotency claim is released, so
+  the platform's own retry can deliver it.
+
 - **`[tasks].api_enabled`, default `false` (config schema v29 → v30).** The nine
   `/tasks*` gateway routes are now opt-in. They are undocumented in `api-v1.md`,
   sit outside the `/api/v1` rate limiter and have no known consumer, so a fresh
@@ -48,7 +55,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The MCP tool-reach limitation is now stated instead of silent.** MCP tools are
+- **WhatsApp, Linq and Nextcloud Talk turns now run in the channel dispatch loop,
+  not in the gateway.** Each webhook handler ran its own turn: its own
+  conversation history, keyed by *sender* while every polling channel keyed by
+  *room*; its own `Y/A/N` tool-approval prompt and parser; no write to the
+  channel history store, so a daemon restart wiped those threads while Telegram's
+  came back; and no MCP tools. The handlers now verify the signature, dedupe,
+  parse, and hand the message to the same `run_message_dispatch_loop` every other
+  channel uses. **Three user-visible consequences.** Conversations on these three
+  channels are now keyed by room: a group thread is one conversation for everyone
+  in it, and one person speaking in two rooms has two. Tool approvals are answered
+  with `/approve <tool>` / `/deny <tool>` (the wording every other channel already
+  used) instead of `Y`/`A`/`N`. And a webhook turn now queues behind
+  `max_in_flight` alongside polling-channel traffic rather than being spawned
+  free — **a concurrency change**: a busy daemon can now refuse a webhook with
+  `503` where it previously accepted every one. The queue holds 100 messages.
+
+ is now stated instead of silent.** MCP tools are
   spliced into the registry by `Agent::build`, so they reach the TUI/CLI agent and
   the gateway's `/api/v1` chat — and **not** chat channels, cron, or the gateway's
   own webhook path, which assemble their tool lists without the splice. Previously
@@ -99,6 +122,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those routes sit on the root router outside the `/api/v1` rate limiter.
 
 ### Removed
+
+- **The gateway's second tool-approval flow.** `ChannelApprovalStore` and the
+  `Y`/`A`/`N` prompt+parser (`src/gateway/channel_approval.rs`) existed only to
+  serve the three webhook handlers, which now use the channel relay like
+  everything else. Two approval languages for one product, chosen by which
+  transport a message arrived on, is a thing to have one of.
 
 - **The sandbox layer, which enforced nothing.** `create_sandbox` and its
   Landlock, bubblewrap, firejail and Docker backends — 1,129 lines and 29 tests —

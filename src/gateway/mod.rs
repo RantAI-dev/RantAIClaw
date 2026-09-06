@@ -8,7 +8,6 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api_v1;
-pub mod channel_approval;
 pub mod config_api;
 pub mod cron_api;
 pub mod task_handlers;
@@ -60,18 +59,6 @@ pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
-}
-
-fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
-    format!("whatsapp_{}_{}", msg.sender, msg.id)
-}
-
-fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
-    format!("linq_{}_{}", msg.sender, msg.id)
-}
-
-fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
-    format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -530,9 +517,15 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Webhook trigger routes loaded from agent-runner config
     pub webhook_routes: Arc<Vec<WebhookRoute>>,
-    /// Turn-based in-chat tool-approval state for chat channels
-    /// (WhatsApp/Linq/Nextcloud) when `autonomous_tools` is off.
-    pub channel_approvals: Arc<channel_approval::ChannelApprovalStore>,
+    /// Where a verified, parsed webhook message is handed to the process's one
+    /// channel dispatch loop.
+    ///
+    /// The gateway used to run the turn itself, with its own conversation
+    /// history keyed by *sender* while the dispatch loop keyed by *room* — two
+    /// histories for one conversation, and no session persistence on this path
+    /// at all. It now only enqueues; the turn, the reply and the session write
+    /// belong to dispatch (plan 313).
+    pub channel_bus: Arc<crate::channels::ChannelBus>,
     /// In-browser modal tool-approval registry for the console SSE chat. The
     /// `WebModalApprovalBackend` registers + awaits here; `POST /api/v1/approvals/{id}`
     /// resolves it. Separate from the channel/shell registries.
@@ -636,7 +629,11 @@ pub fn build_gateway_router(
     // The process's observer when one is owned above; `None` ⇒ build one. The
     // registry inside it is what `/metrics` serves.
     observer: Option<Arc<dyn crate::observability::Observer>>,
+    // The process's channel bus. `None` ⇒ an empty one: an inbound webhook is
+    // then refused with 503 rather than accepted into a queue nothing drains.
+    channel_bus: Option<Arc<crate::channels::ChannelBus>>,
 ) -> Result<(AppState, Router)> {
+    let channel_bus = channel_bus.unwrap_or_default();
     let config_state = Arc::new(Mutex::new(config.clone()));
 
     let gateway_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -817,7 +814,7 @@ pub fn build_gateway_router(
         nextcloud_talk_webhook_secret,
         observer,
         webhook_routes,
-        channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+        channel_bus,
         // In-browser (console SSE) modal tool-approval registry. 5-minute
         // deadline auto-denies an unanswered modal so a paused turn never
         // hangs forever (secure default, mirrors the channel relay).
@@ -958,6 +955,11 @@ pub async fn run_gateway(
     // under the daemon, where channels, cron and heartbeat had their own and
     // `/metrics` described almost nothing.
     observer: Option<Arc<dyn crate::observability::Observer>>,
+    // The process's channel bus, when a channel supervisor above owns one (the
+    // daemon). `None` means this gateway IS the process — the standalone
+    // `gateway` command — so it builds the one channel runtime itself and
+    // drains the bus, because otherwise nothing would.
+    channel_bus: Option<Arc<crate::channels::ChannelBus>>,
 ) -> Result<()> {
     // ── Security: refuse public bind without an explicit opt-in ──
     //
@@ -994,7 +996,35 @@ pub async fn run_gateway(
         ready.notify_one();
     }
 
-    let (state, app) = build_gateway_router(config.clone(), observer)?;
+    // Standalone: own the channel runtime. Listeners are deliberately NOT
+    // started — a bare `gateway` command has never polled Telegram and starting
+    // to would be a different program. Best-effort: a gateway that cannot build
+    // a channel runtime must still serve the console so the operator can fix the
+    // configuration; inbound webhooks then answer 503 with the reason.
+    let channel_bus = match channel_bus {
+        Some(bus) => bus,
+        None => {
+            let bus = Arc::new(crate::channels::ChannelBus::default());
+            match crate::channels::spawn_webhook_dispatch(
+                &config,
+                // A child token, so a supervisor restart of this gateway tears
+                // its dispatch loop down instead of leaving a second one behind.
+                shutdown.child_token(),
+                Arc::clone(&bus),
+            )
+            .await
+            {
+                Ok(Some(_handle)) => {}
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    "Channel dispatch unavailable — inbound webhooks will be refused: {e:#}"
+                ),
+            }
+            bus
+        }
+    };
+
+    let (state, app) = build_gateway_router(config.clone(), observer, Some(channel_bus))?;
 
     // Hot-reload: reflect on-disk config edits (e.g. a provider changed in the
     // TUI, another process) in the running gateway + the web console it serves,
@@ -1699,9 +1729,9 @@ async fn run_gateway_chat_with_multimodal(
         approval_manager.as_ref(),
         "webhook",
         None, // no origin chat — gateway/web has no cron_add push channel
-        // Gateway has its own turn-based, owner-gated approval flow
-        // (`channel_approval`); the inline backend stays the name-derived
-        // default (auto-deny) here.
+        // The console SSE chat resolves approvals in-browser through
+        // `web_approvals`; this path has no interactive surface, so the inline
+        // backend stays the name-derived default (auto-deny) here.
         None,
         guest_gate,
         &multimodal_config,
@@ -1736,133 +1766,6 @@ async fn run_gateway_chat_with_multimodal(
         tool_calls,
         denied_tools,
     })
-}
-
-/// Drive one chat-channel turn (WhatsApp/Linq/Nextcloud) including the
-/// turn-based in-chat tool-approval flow. Returns the text to send back.
-///
-/// Flow:
-/// - If the sender has a pending approval and this message reads as
-///   Y/A/N, resolve it: on deny, decline; on allow, replay the original
-///   request with the pending tool(s) allow-listed.
-/// - Otherwise run the message normally. If the model wanted a tool that
-///   needed approval, store it pending and ask Y/A/N instead of replying.
-///
-/// With `[channels_config] autonomous_tools = true` nothing is ever
-/// denied, so this degrades to a plain agent turn.
-/// Build the per-role capability ceiling for a channel `sender`: `None` if the
-/// sender is an approval owner (full toolset), else a `GuestGate` from
-/// `guest_allowed_tools` / `guest_allowed_commands` + the safe auto-approve set.
-/// Applies regardless of `autonomous_tools`.
-fn build_guest_gate(state: &AppState, sender: &str) -> Option<crate::approval::GuestGate> {
-    let cfg = state.config.lock();
-    let cc = &cfg.channels_config;
-    if crate::approval::can_approve(&cc.approval_owners, sender) {
-        None
-    } else {
-        Some(crate::approval::GuestGate::new(
-            cfg.autonomy.auto_approve.clone(),
-            &cc.guest_allowed_tools,
-            &cc.guest_allowed_commands,
-        ))
-    }
-}
-
-async fn process_channel_chat(
-    state: &AppState,
-    provider_label: &str,
-    channel_name: &str,
-    sender: &str,
-    message: &str,
-) -> anyhow::Result<String> {
-    // Single source of truth for conversation identity (PR4 foundation).
-    // Behaviour-preserving for the no-thread case; thread-aware when channel
-    // adapters start plumbing a thread id through.
-    let key = crate::channels::conversation::ConversationKey::new(channel_name, sender).resolve();
-    // Prior conversation turns so the bot remembers the exchange.
-    let prior = state.channel_approvals.history(&key);
-    // Per-role capability ceiling: owner ⇒ None (full toolset); guest ⇒ limited.
-    let guest_gate = build_guest_gate(state, sender);
-
-    // A pending prompt is awaiting this sender's decision.
-    if let Some((original, tools)) = state.channel_approvals.take_pending(&key) {
-        match channel_approval::parse_approval_reply(message) {
-            Some(channel_approval::ApprovalReply::Deny) => {
-                return Ok("Okay — I won't do that. Anything else?".to_string());
-            }
-            Some(reply) => {
-                // Allow / Always require OWNER authority — a separate, smaller
-                // gate than channel chat access. The sender who can talk to the
-                // bot is NOT automatically allowed to approve a privileged tool
-                // call (otherwise any group member or paired user could approve
-                // their own request). Deny is handled above and is safe for
-                // anyone. Re-stash the pending request on refusal so a real
-                // owner can still approve it.
-                let owners = { state.config.lock().channels_config.approval_owners.clone() };
-                if !crate::approval::can_approve(&owners, sender) {
-                    state.channel_approvals.set_pending(&key, original, tools);
-                    return Ok("You're not authorized to approve tool actions here. \
-                         Ask an owner to reply Y or A."
-                        .to_string());
-                }
-                if reply == channel_approval::ApprovalReply::Always {
-                    state.channel_approvals.remember_always(&key, &tools);
-                }
-                // Replay the original request with the pending tool(s) (and
-                // any always-allowed ones) approved so they now execute.
-                let mut allow = state.channel_approvals.allowlisted(&key);
-                allow.extend(tools.iter().cloned());
-                let result = run_gateway_chat_with_multimodal(
-                    state,
-                    provider_label,
-                    &original,
-                    &allow,
-                    &prior,
-                    guest_gate.as_ref(),
-                )
-                .await?;
-                return Ok(finalize_channel_turn(state, &key, &original, result));
-            }
-            // Not a Y/A/N reply — the sender moved on. The pending request
-            // has already been taken (dropped); fall through to treat this
-            // as a fresh message.
-            None => {}
-        }
-    }
-
-    let allow = state.channel_approvals.allowlisted(&key);
-    let result = run_gateway_chat_with_multimodal(
-        state,
-        provider_label,
-        message,
-        &allow,
-        &prior,
-        guest_gate.as_ref(),
-    )
-    .await?;
-    Ok(finalize_channel_turn(state, &key, message, result))
-}
-
-/// If a turn produced denied tools, stash them pending and return the
-/// Y/A/N prompt; otherwise record the exchange in history and return the
-/// agent's reply.
-fn finalize_channel_turn(
-    state: &AppState,
-    key: &str,
-    message: &str,
-    result: GatewayChatResult,
-) -> String {
-    if result.denied_tools.is_empty() {
-        // Remember the completed exchange so the next message has context.
-        state
-            .channel_approvals
-            .append_turn(key, message, &result.response);
-        return result.response;
-    }
-    state
-        .channel_approvals
-        .set_pending(key, message.to_string(), result.denied_tools.clone());
-    channel_approval::format_prompt(&result.denied_tools)
 }
 
 /// Webhook request body
@@ -2135,6 +2038,80 @@ fn finish_inbound(state: &AppState, channel: &str, platform_id: &str, succeeded:
     }
 }
 
+/// How long to tell a platform to wait when its message could not be queued.
+///
+/// Two values because the two refusals have different shapes: a full queue
+/// drains in seconds, while a missing dispatch loop means the channel runtime is
+/// down or restarting and a fast retry would only be refused again.
+const ENQUEUE_RETRY_AFTER_FULL_SECS: u64 = 5;
+const ENQUEUE_RETRY_AFTER_CLOSED_SECS: u64 = 30;
+
+/// Hand verified, parsed webhook messages to the process's channel dispatch loop.
+///
+/// This is the whole of the gateway's job on an inbound channel message. The
+/// turn, the reply, the session write and the approval prompt all belong to
+/// dispatch, which owns the one `ChannelRuntimeContext` (plan 313). What stays
+/// here is idempotency: the platform's message id is only visible at the HTTP
+/// edge.
+///
+/// The claim is opened before the hand-off and released if the hand-off fails,
+/// so a refused message can be retried by the platform. A message that *is*
+/// queued is marked done, not left in flight: we have accepted responsibility
+/// for it, and a redelivery inside the TTL must not run the turn a second time.
+async fn enqueue_inbound(
+    state: &AppState,
+    channel: &str,
+    messages: Vec<crate::channels::traits::ChannelMessage>,
+) -> axum::response::Response {
+    for msg in messages {
+        if !begin_inbound(state, channel, &msg.id) {
+            continue;
+        }
+        let platform_id = msg.id.clone();
+
+        tracing::info!(
+            "{channel} message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        match state.channel_bus.try_send(msg).await {
+            Ok(()) => finish_inbound(state, channel, &platform_id, true),
+            Err(rejection) => {
+                // Release the claim: this message never reached the agent, so
+                // the platform's own retry must be able to.
+                finish_inbound(state, channel, &platform_id, false);
+                let (reason, retry_after) = match rejection {
+                    crate::channels::BusRejection::Full => ("full", ENQUEUE_RETRY_AFTER_FULL_SECS),
+                    crate::channels::BusRejection::Closed => {
+                        ("closed", ENQUEUE_RETRY_AFTER_CLOSED_SECS)
+                    }
+                };
+                tracing::warn!(
+                    "{channel}: refused an inbound message — dispatch queue {reason}. Answering 503; the platform should retry in {retry_after}s."
+                );
+                state.observer.record_event(
+                    &crate::observability::traits::ObserverEvent::ChannelEnqueueRejected {
+                        channel: channel.to_string(),
+                        reason: reason.to_string(),
+                    },
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": "dispatch_unavailable",
+                        "detail": format!("Message dispatch queue is {reason}; retry shortly."),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
+}
+
 async fn handle_whatsapp_verify(
     State(state): State<AppState>,
     Query(params): Query<WhatsAppVerifyQuery>,
@@ -2193,9 +2170,7 @@ async fn handle_whatsapp_message(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
-    // Rate-limited like `/webhook`: this endpoint is publicly reachable and
-    // every request costs a signature verification at minimum.
+) -> axum::response::Response {
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
@@ -2206,14 +2181,16 @@ async fn handle_whatsapp_message(
                 "error": "Too many webhook requests. Please retry later.",
                 "retry_after": RATE_LIMIT_WINDOW_SECS,
             })),
-        );
+        )
+            .into_response();
     }
 
     let Some(ref wa) = state.whatsapp else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "WhatsApp not configured"})),
-        );
+        )
+            .into_response();
     };
 
     // ── Security: X-Hub-Signature-256 is the ONLY authentication for this
@@ -2228,7 +2205,8 @@ async fn handle_whatsapp_message(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Webhook authentication not configured"})),
-        );
+        )
+            .into_response();
     };
 
     let signature = headers
@@ -2248,7 +2226,8 @@ async fn handle_whatsapp_message(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Invalid signature"})),
-        );
+        )
+            .into_response();
     }
 
     // Parse JSON body
@@ -2256,7 +2235,8 @@ async fn handle_whatsapp_message(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+        )
+            .into_response();
     };
 
     // Handle on-demand store-minted pairing codes (`/bind`/`/claim`) first so an
@@ -2272,81 +2252,10 @@ async fn handle_whatsapp_message(
 
     if messages.is_empty() {
         // Acknowledge the webhook even if no messages (could be status updates)
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response();
     }
 
-    // ACK first, then run the turns. The webhook used to await the full LLM
-    // turn before returning 200, so a slow turn blew past Meta's ACK deadline,
-    // Meta retried, and the same message was processed again — a duplicate
-    // reply and duplicate token spend on the ordinary path. The idempotency
-    // entries opened in the spawned task still release on failure, so a
-    // genuine retry is not lost.
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-    let state_bg = state.clone();
-    let wa_bg = Arc::clone(wa);
-    tokio::spawn(async move {
-        let state = state_bg;
-        let wa = wa_bg;
-        for msg in &messages {
-            // The platform id, so a redelivery is skipped rather than answered
-            // twice. WhatsApp's signature scheme carries no timestamp or nonce,
-            // so this is the only replay control available here.
-            if !begin_inbound(&state, "whatsapp", &msg.id) {
-                continue;
-            }
-
-            tracing::info!(
-                "WhatsApp message from {}: {}",
-                msg.sender,
-                truncate_with_ellipsis(&msg.content, 50)
-            );
-
-            if state.auto_save {
-                let key = whatsapp_memory_key(msg);
-                let _ = state
-                    .mem
-                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                    .await;
-            }
-
-            match process_channel_chat(
-                &state,
-                &provider_label,
-                "whatsapp",
-                &msg.sender,
-                &msg.content,
-            )
-            .await
-            {
-                Ok(reply) => {
-                    if let Err(e) = wa.send(&SendMessage::new(reply, &msg.reply_target)).await {
-                        tracing::error!("Failed to send WhatsApp reply: {e}");
-                    }
-                    finish_inbound(&state, "whatsapp", &msg.id, true);
-                }
-                Err(e) => {
-                    tracing::error!("LLM error for WhatsApp message: {e:#}");
-                    let _ = wa
-                        .send(&SendMessage::new(
-                            "Sorry, I couldn't process your message right now.",
-                            &msg.reply_target,
-                        ))
-                        .await;
-                    // Released, not retired: the platform's own retry must be
-                    // able to reach the agent after a transient failure.
-                    finish_inbound(&state, "whatsapp", &msg.id, false);
-                }
-            }
-        }
-    });
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    enqueue_inbound(&state, "whatsapp", messages).await
 }
 
 /// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
@@ -2355,7 +2264,7 @@ async fn handle_linq_webhook(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     // Rate-limited like `/webhook`: this endpoint is publicly reachable and
     // every request costs a signature verification at minimum.
     let rate_key =
@@ -2368,14 +2277,16 @@ async fn handle_linq_webhook(
                 "error": "Too many webhook requests. Please retry later.",
                 "retry_after": RATE_LIMIT_WINDOW_SECS,
             })),
-        );
+        )
+            .into_response();
     }
 
     let Some(ref linq) = state.linq else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Linq not configured"})),
-        );
+        )
+            .into_response();
     };
 
     // ── Security: the X-Webhook-Signature is the ONLY authentication for this
@@ -2389,7 +2300,8 @@ async fn handle_linq_webhook(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Webhook authentication not configured"})),
-        );
+        )
+            .into_response();
     };
 
     let timestamp = headers
@@ -2418,7 +2330,8 @@ async fn handle_linq_webhook(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Invalid signature"})),
-        );
+        )
+            .into_response();
     }
 
     // Parse JSON body
@@ -2426,7 +2339,8 @@ async fn handle_linq_webhook(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+        )
+            .into_response();
     };
 
     // Intercept `/bind` / `/claim` self-onboarding BEFORE the allowlist gate in
@@ -2453,7 +2367,7 @@ async fn handle_linq_webhook(
                 if let Err(e) = linq.send(&SendMessage::new(reply, &reply_target)).await {
                     tracing::error!("Failed to send Linq pairing reply: {e}");
                 }
-                return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+                return (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response();
             }
         }
     }
@@ -2467,67 +2381,10 @@ async fn handle_linq_webhook(
 
     if messages.is_empty() {
         // Acknowledge the webhook even if no messages (could be status/delivery events)
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response();
     }
 
-    // ACK first, then run the turns — see the WhatsApp handler for why.
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-    let state_bg = state.clone();
-    let linq_bg = Arc::clone(linq);
-    tokio::spawn(async move {
-        let state = state_bg;
-        let linq = linq_bg;
-        for msg in &messages {
-            // Linq's signature enforces a 300-second window but no nonce, so a
-            // captured POST is replayable inside it; this closes that too.
-            if !begin_inbound(&state, "linq", &msg.id) {
-                continue;
-            }
-
-            tracing::info!(
-                "Linq message from {}: {}",
-                msg.sender,
-                truncate_with_ellipsis(&msg.content, 50)
-            );
-
-            if state.auto_save {
-                let key = linq_memory_key(msg);
-                let _ = state
-                    .mem
-                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                    .await;
-            }
-
-            match process_channel_chat(&state, &provider_label, "linq", &msg.sender, &msg.content)
-                .await
-            {
-                Ok(reply) => {
-                    if let Err(e) = linq.send(&SendMessage::new(reply, &msg.reply_target)).await {
-                        tracing::error!("Failed to send Linq reply: {e}");
-                    }
-                    finish_inbound(&state, "linq", &msg.id, true);
-                }
-                Err(e) => {
-                    tracing::error!("LLM error for Linq message: {e:#}");
-                    let _ = linq
-                        .send(&SendMessage::new(
-                            "Sorry, I couldn't process your message right now.",
-                            &msg.reply_target,
-                        ))
-                        .await;
-                    finish_inbound(&state, "linq", &msg.id, false);
-                }
-            }
-        }
-    });
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    enqueue_inbound(&state, "linq", messages).await
 }
 
 /// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
@@ -2536,7 +2393,7 @@ async fn handle_nextcloud_talk_webhook(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     // Rate-limited like `/webhook`: this endpoint is publicly reachable and
     // every request costs a signature verification at minimum.
     let rate_key =
@@ -2549,14 +2406,16 @@ async fn handle_nextcloud_talk_webhook(
                 "error": "Too many webhook requests. Please retry later.",
                 "retry_after": RATE_LIMIT_WINDOW_SECS,
             })),
-        );
+        )
+            .into_response();
     }
 
     let Some(ref nextcloud_talk) = state.nextcloud_talk else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Nextcloud Talk not configured"})),
-        );
+        )
+            .into_response();
     };
 
     // ── Security: the HMAC signature is the ONLY authentication for this public
@@ -2570,7 +2429,8 @@ async fn handle_nextcloud_talk_webhook(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Webhook authentication not configured"})),
-        );
+        )
+            .into_response();
     };
 
     let random = headers
@@ -2601,7 +2461,8 @@ async fn handle_nextcloud_talk_webhook(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Invalid signature"})),
-        );
+        )
+            .into_response();
     }
 
     // Record the nonce: the scheme signs `random || body`, so a captured
@@ -2611,7 +2472,8 @@ async fn handle_nextcloud_talk_webhook(
         return (
             StatusCode::OK,
             Json(serde_json::json!({"status": "duplicate"})),
-        );
+        )
+            .into_response();
     }
     finish_inbound(&state, "nextcloud_talk_nonce", random, true);
 
@@ -2620,87 +2482,25 @@ async fn handle_nextcloud_talk_webhook(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+        )
+            .into_response();
     };
 
     // Intercept on-demand store-minted `/bind`/`/claim` pairing codes before the
     // allowlist gate (which lives in `parse_webhook_payload`) so unenrolled actors
     // can self-onboard without a daemon restart. Consumes the message when handled.
     if nextcloud_talk.try_handle_store_pairing(&payload).await {
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response();
     }
 
     // Parse messages from webhook payload
     let messages = nextcloud_talk.parse_webhook_payload(&payload);
     if messages.is_empty() {
         // Acknowledge webhook even if payload does not contain actionable user messages.
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response();
     }
 
-    // ACK first, then run the turns — see the WhatsApp handler for why.
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-    let state_bg = state.clone();
-    let talk_bg = Arc::clone(nextcloud_talk);
-    tokio::spawn(async move {
-        let state = state_bg;
-        let nextcloud_talk = talk_bg;
-        for msg in &messages {
-            if !begin_inbound(&state, "nextcloud_talk", &msg.id) {
-                continue;
-            }
-
-            tracing::info!(
-                "Nextcloud Talk message from {}: {}",
-                msg.sender,
-                truncate_with_ellipsis(&msg.content, 50)
-            );
-
-            if state.auto_save {
-                let key = nextcloud_talk_memory_key(msg);
-                let _ = state
-                    .mem
-                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                    .await;
-            }
-
-            match process_channel_chat(
-                &state,
-                &provider_label,
-                "nextcloud_talk",
-                &msg.sender,
-                &msg.content,
-            )
-            .await
-            {
-                Ok(reply) => {
-                    if let Err(e) = nextcloud_talk
-                        .send(&SendMessage::new(reply, &msg.reply_target))
-                        .await
-                    {
-                        tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                    }
-                    finish_inbound(&state, "nextcloud_talk", &msg.id, true);
-                }
-                Err(e) => {
-                    tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                    let _ = nextcloud_talk
-                        .send(&SendMessage::new(
-                            "Sorry, I couldn't process your message right now.",
-                            &msg.reply_target,
-                        ))
-                        .await;
-                    finish_inbound(&state, "nextcloud_talk", &msg.id, false);
-                }
-            }
-        }
-    });
-
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    enqueue_inbound(&state, "nextcloud_talk", messages).await
 }
 
 /// Webhook trigger request body (optional — payload is forwarded to the skill)
@@ -2855,7 +2655,7 @@ mod tests {
             allowed_numbers: vec![],
         });
 
-        let (state, _app) = super::build_gateway_router(config, None).expect("router builds");
+        let (state, _app) = super::build_gateway_router(config, None, None).expect("router builds");
         let wa = state
             .whatsapp
             .as_ref()
@@ -2903,8 +2703,8 @@ mod tests {
 
         let observer: std::sync::Arc<dyn crate::observability::Observer> =
             std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-        let (_state, app) =
-            super::build_gateway_router(config, Some(observer.clone())).expect("router builds");
+        let (_state, app) = super::build_gateway_router(config, Some(observer.clone()), None)
+            .expect("router builds");
 
         // Nothing has happened yet.
         let before = metrics_body(&app).await;
@@ -2937,7 +2737,7 @@ mod tests {
         config.observability.backend = "prometheus".into();
 
         let (_state, app) =
-            super::build_gateway_router(config.clone(), None).expect("router builds");
+            super::build_gateway_router(config.clone(), None, None).expect("router builds");
 
         let stranger: std::sync::Arc<dyn crate::observability::Observer> =
             std::sync::Arc::from(crate::observability::create_observer(&config.observability));
@@ -2975,6 +2775,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             None,
             None,
+            None,
         )
         .await
         .expect_err("a public bind without an opt-in must refuse to start");
@@ -3004,6 +2805,7 @@ mod tests {
             0,
             config,
             tokio_util::sync::CancellationToken::new(),
+            None,
             None,
             None,
         )
@@ -3078,20 +2880,25 @@ mod tests {
         );
     }
 
-    /// Each handler used to await the full LLM turn before returning 200, so a
-    /// slow turn blew past the platform's ACK deadline, the platform retried,
-    /// and the same message was processed again — no attacker required.
+    /// The gateway must not run a channel turn. It verifies, dedupes, parses and
+    /// hands the message to the dispatch loop — and the HTTP answer it gives is
+    /// the *result* of that hand-off, so a refused enqueue cannot be ACKed.
     ///
-    /// Nextcloud Talk is now covered behaviourally by
-    /// `nextcloud_talk_webhook_acks_while_the_turn_is_still_running`, which
-    /// parks the provider and asserts the ACK still returns. This source check
-    /// remains for WhatsApp and Linq, whose handlers no test constructs — and it
-    /// is weaker than it looks: it finds a `tokio::spawn(` before the turn, which
-    /// an implementation that spawns and then immediately awaits would satisfy.
+    /// This replaces a guard that looked for `tokio::spawn(` before the turn
+    /// call. That property is gone: there is no turn here to spawn away from,
+    /// and a guard that keeps passing after the thing it protects has been
+    /// deleted is worse than no guard. The property now asserted is decision 4
+    /// of the plan — the enqueue is the handler's last act, above the ACK, so
+    /// per-sender order is the order the platform delivered in.
+    ///
+    /// Needles are assembled at runtime: a literal here would match this test's
+    /// own text if the `#[cfg(test)]` split ever stopped excluding it.
     #[test]
-    fn every_public_webhook_handler_acks_before_processing() {
+    fn every_public_webhook_handler_hands_off_instead_of_running_a_turn() {
         let src = include_str!("mod.rs");
         let production = src.split("#[cfg(test)]").next().expect("source");
+        let enqueue = format!("{}(&state,", "enqueue_inbound");
+        let spawn = format!("tokio::{}(", "spawn");
 
         for handler in [
             "async fn handle_whatsapp_message(",
@@ -3102,24 +2909,34 @@ mod tests {
                 .split(handler)
                 .nth(1)
                 .unwrap_or_else(|| panic!("{handler} exists"));
-            let end = body.find("\nasync fn ").unwrap_or(body.len());
+            // Stop at the function's own closing brace: the next item is a doc
+            // comment, so slicing at the next `async fn` would swallow it and
+            // make "the last line" someone else's text.
+            let end = body.find("\n}\n").map_or(body.len(), |i| i + 2);
             let body = &body[..end];
 
-            let spawn_at = body
-                .find("tokio::spawn(")
-                .unwrap_or_else(|| panic!("{handler} must move the turn off the ACK path"));
-            let turn_at = body
-                .find("process_channel_chat(")
-                .unwrap_or_else(|| panic!("{handler} runs a turn"));
             assert!(
-                spawn_at < turn_at,
-                "{handler} must spawn before running the turn, not await it inline"
+                body.contains(&enqueue),
+                "{handler} must hand the message to the dispatch loop"
             );
-            // And the entry still releases on failure, or one transient error
-            // drops the message forever.
             assert!(
-                body.contains(", false);"),
-                "{handler} must abort its idempotency entry on a failed turn"
+                !body.contains(&spawn),
+                "{handler} must not run the turn itself, in the background or otherwise"
+            );
+            // The hand-off is the last statement, so its outcome IS the status
+            // code. An ACK written above it would be a 200 for a message the
+            // queue refused.
+            let last = body
+                .trim_end()
+                .trim_end_matches('}')
+                .trim_end()
+                .lines()
+                .next_back()
+                .expect("a handler body")
+                .trim();
+            assert!(
+                last.starts_with(&enqueue),
+                "{handler} must end with the hand-off, not ACK above it (found: {last})"
             );
         }
     }
@@ -3154,7 +2971,7 @@ mod tests {
                 .split(handler)
                 .nth(1)
                 .unwrap_or_else(|| panic!("{handler} exists"));
-            let end = body.find("\nasync fn ").unwrap_or(body.len());
+            let end = body.find("\n}\n").map_or(body.len(), |i| i + 2);
             let body = &body[..end];
 
             assert!(
@@ -3162,18 +2979,35 @@ mod tests {
                 "{handler} must rate-limit; it is publicly reachable"
             );
             assert!(
-                body.contains(&format!("begin_inbound(&state, \"{channel}\"")),
-                "{handler} must run the platform id through the idempotency store"
-            );
-            assert!(
-                body.contains(&format!("finish_inbound(&state, \"{channel}\"")),
-                "{handler} must retire or release the entry it opened"
+                body.contains(&format!("enqueue_inbound(&state, \"{channel}\"")),
+                "{handler} must hand its messages on under its own channel name"
             );
             assert!(
                 !body.contains("String::from_utf8_lossy("),
                 "{handler} must verify the bytes it parses"
             );
         }
+
+        // Idempotency moved into the shared hand-off (plan 313), so assert it
+        // there rather than three times over. Both halves matter: the claim
+        // before the hand-off, and the release when the hand-off is refused —
+        // without the release one full queue drops the message forever.
+        let hand_off = production
+            .split("async fn enqueue_inbound(")
+            .nth(1)
+            .expect("the hand-off exists");
+        let hand_off = &hand_off[..hand_off.find("\n}\n").map_or(hand_off.len(), |i| i + 2)];
+        assert!(
+            hand_off.contains(&format!("{}(state, channel, &msg.id)", "begin_inbound")),
+            "the hand-off must run the platform id through the idempotency store"
+        );
+        assert!(
+            hand_off.contains(&format!(
+                "{}(state, channel, &platform_id, false)",
+                "finish_inbound"
+            )),
+            "a refused hand-off must release its claim so the platform can retry"
+        );
     }
 
     /// A loopback peer for handlers that now take `ConnectInfo`. The rate
@@ -3280,7 +3114,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3331,7 +3165,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer,
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3699,7 +3533,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3778,23 +3612,6 @@ mod tests {
         assert!(key1.starts_with("webhook_msg_"));
         assert!(key2.starts_with("webhook_msg_"));
         assert_ne!(key1, key2);
-    }
-
-    #[test]
-    fn whatsapp_memory_key_includes_sender_and_message_id() {
-        let msg = ChannelMessage {
-            sender_aliases: Vec::new(),
-            id: "wamid-123".into(),
-            sender: "+1234567890".into(),
-            reply_target: "+1234567890".into(),
-            content: "hello".into(),
-            channel: "whatsapp".into(),
-            timestamp: 1,
-            thread_ts: None,
-        };
-
-        let key = whatsapp_memory_key(&msg);
-        assert_eq!(key, "whatsapp_+1234567890_wamid-123");
     }
 
     #[derive(Default)]
@@ -3957,7 +3774,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4023,7 +3840,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4101,7 +3918,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4151,7 +3968,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4206,7 +4023,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4296,7 +4113,7 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4316,8 +4133,21 @@ mod tests {
     /// As [`signed_nextcloud`], with the anti-replay nonce chosen separately —
     /// for tests that need to vary the message id and the nonce independently.
     fn signed_nextcloud_with_nonce(secret: &str, id: &str, nonce: &str) -> (HeaderMap, Bytes) {
+        signed_nextcloud_from(secret, id, nonce, "user_a", "room-token", "hello")
+    }
+
+    /// A signed Nextcloud Talk message with every field a conversation-identity
+    /// test needs to vary: who sent it, which room it landed in, and what it said.
+    fn signed_nextcloud_from(
+        secret: &str,
+        id: &str,
+        nonce: &str,
+        actor: &str,
+        room: &str,
+        text: &str,
+    ) -> (HeaderMap, Bytes) {
         let body = format!(
-            r#"{{"type":"message","object":{{"token":"room-token"}},"message":{{"id":"{id}","actorType":"users","actorId":"user_a","message":"hello"}}}}"#
+            r#"{{"type":"message","object":{{"token":"{room}"}},"message":{{"id":"{id}","actorType":"users","actorId":"{actor}","message":"{text}"}}}}"#
         );
         let random = nonce;
         let signature = compute_nextcloud_signature_hex(secret, random, &body);
@@ -4345,15 +4175,551 @@ mod tests {
         calls.load(Ordering::SeqCst)
     }
 
+    // ── Plan 313: the gateway hands off, the dispatch loop runs the turn ──
+    //
+    // These drive the real seam: a real `ChannelBus`, a real
+    // `run_message_dispatch_loop` over a real `ChannelRuntimeContext`, with the
+    // Nextcloud Talk handler as the entry point. They exist because the two
+    // halves the gateway used to own — conversation identity and history
+    // persistence — were silently different from the ones every polling channel
+    // got, and only an end-to-end path can show which one a webhook now uses.
+
+    /// A channel that records what dispatch sent it. Named `nextcloud_talk` so
+    /// the dispatch loop's `channels_by_name` lookup finds it for messages the
+    /// Nextcloud Talk handler parsed.
+    #[derive(Default)]
+    struct RecordingChannel {
+        sent: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl crate::channels::Channel for RecordingChannel {
+        fn name(&self) -> &str {
+            "nextcloud_talk"
+        }
+
+        async fn send(&self, message: &crate::channels::SendMessage) -> anyhow::Result<()> {
+            self.sent
+                .lock()
+                .push((message.recipient.clone(), message.content.clone()));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Records the conversation each turn was handed. That recording is the
+    /// oracle for conversation identity: what a turn can see *is* its
+    /// conversation, so two turns that share history are two turns where the
+    /// second saw the first one's text.
+    #[derive(Default)]
+    struct HistoryRecordingProvider {
+        seen: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for HistoryRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.seen.lock().push(vec![message.to_string()]);
+            Ok("ack".into())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[crate::providers::ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.seen
+                .lock()
+                .push(messages.iter().map(|m| m.content.clone()).collect());
+            Ok("ack".into())
+        }
+    }
+
+    /// A live bus drained by a real dispatch loop, plus handles on what it did.
+    struct DispatchHarness {
+        bus: Arc<crate::channels::ChannelBus>,
+        channel: Arc<RecordingChannel>,
+        provider: Arc<HistoryRecordingProvider>,
+    }
+
+    /// What a test wants the dispatch loop to be, beyond the default.
+    #[derive(Default)]
+    struct DispatchOptions {
+        /// Open the same `ChannelHistoryStore` the daemon opens, so a test can
+        /// reopen it afterwards and read what the turn left behind.
+        persist_history: bool,
+        /// Replaces the recording provider. The recording one is the oracle for
+        /// conversation identity; a test about tools wants its own.
+        provider: Option<Arc<dyn Provider>>,
+        tools: Vec<Box<dyn crate::tools::Tool>>,
+        /// Arms the in-chat approval relay. Needs owners too — dispatch keeps the
+        /// gate closed rather than letting a channel approve for itself.
+        approval: Option<Arc<crate::approval::ApprovalManager>>,
+        approval_owners: Vec<String>,
+    }
+
+    /// Start a dispatch loop over `workspace`, and publish its sender.
+    async fn spawn_dispatch(workspace: &std::path::Path, persist_history: bool) -> DispatchHarness {
+        spawn_dispatch_with(
+            workspace,
+            DispatchOptions {
+                persist_history,
+                ..DispatchOptions::default()
+            },
+        )
+        .await
+    }
+
+    async fn spawn_dispatch_with(
+        workspace: &std::path::Path,
+        options: DispatchOptions,
+    ) -> DispatchHarness {
+        let DispatchOptions {
+            persist_history,
+            provider: provider_override,
+            tools,
+            approval,
+            approval_owners,
+        } = options;
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn crate::channels::Channel> = channel_impl.clone();
+        let mut channels_by_name = std::collections::HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryRecordingProvider::default());
+        let provider: Arc<dyn Provider> =
+            provider_override.unwrap_or_else(|| provider_impl.clone());
+
+        let history_store = persist_history.then(|| {
+            Arc::new(
+                crate::channels::history_store::ChannelHistoryStore::open(workspace)
+                    .expect("history store opens in a temp workspace"),
+            )
+        });
+
+        let ctx = Arc::new(crate::channels::ChannelRuntimeContext {
+            runtime_config: Arc::new(std::sync::Mutex::new(
+                crate::channels::routing::RuntimeConfigSlot::default(),
+            )),
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(MockMemory),
+            tools_registry: Arc::new(tools),
+            observer: Arc::new(crate::observability::NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 4,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            history_store,
+            provider_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: crate::providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.to_path_buf()),
+            message_timeout_secs: 30,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: approval,
+            approval_owners: Arc::new(approval_owners),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let bus = Arc::new(crate::channels::ChannelBus::default());
+        bus.publish(tx).await;
+        tokio::spawn(crate::channels::dispatch::run_message_dispatch_loop(
+            rx,
+            ctx,
+            1,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+
+        DispatchHarness {
+            bus,
+            channel: channel_impl,
+            provider: provider_impl,
+        }
+    }
+
+    /// Wait until the recording channel has sent `n` messages, or give up.
+    ///
+    /// Returns what it saw, so a caller asserting "exactly n" fails loudly on
+    /// a timeout instead of on an empty vector.
+    async fn wait_for_sends(channel: &RecordingChannel, n: usize) -> Vec<(String, String)> {
+        for _ in 0..600 {
+            {
+                let sent = channel.sent.lock();
+                if sent.len() >= n {
+                    return sent.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        channel.sent.lock().clone()
+    }
+
+    /// A bus that accepts, with nothing draining it beyond the queue itself.
+    ///
+    /// For tests whose subject is the HTTP contract, not the turn: the receiver
+    /// must be kept alive by the caller, or the bus reports itself closed.
+    async fn accepting_bus() -> (
+        Arc<crate::channels::ChannelBus>,
+        tokio::sync::mpsc::Receiver<ChannelMessage>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let bus = Arc::new(crate::channels::ChannelBus::default());
+        bus.publish(tx).await;
+        (bus, rx)
+    }
+
+    async fn post_nextcloud(state: &AppState, headers: HeaderMap, body: Bytes) -> StatusCode {
+        handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body)
+            .await
+            .status()
+    }
+
+    /// A webhook conversation belongs to the **room**, not to the person who
+    /// spoke in it.
+    ///
+    /// The gateway used to run these turns with history keyed
+    /// `ConversationKey::new(channel, sender)` while every polling channel keyed
+    /// on `reply_target`. One product, two conversation identities, decided by
+    /// which transport the message happened to arrive on. Routing webhooks
+    /// through the same dispatch loop settles it on the room key.
+    #[tokio::test]
+    async fn a_webhook_conversation_is_keyed_by_room_not_by_sender() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let harness = spawn_dispatch(workspace.path(), false).await;
+
+        let secret = "nextcloud-test-secret";
+        let mut state = nextcloud_state(
+            Arc::new(MockProvider::default()),
+            secret,
+            GatewayRateLimiter::new(100, 100, 100, 100),
+            IdempotencyStore::new(Duration::from_mins(5), 1000),
+        );
+        state.channel_bus = Arc::clone(&harness.bus);
+
+        for (id, actor, room, text) in [
+            ("m1", "user_a", "room-1", "first"),
+            ("m2", "user_b", "room-2", "second"),
+            ("m3", "user_a", "room-1", "third"),
+        ] {
+            let (headers, body) = signed_nextcloud_from(secret, id, id, actor, room, text);
+            assert_eq!(post_nextcloud(&state, headers, body).await, StatusCode::OK);
+            // One at a time: the assertions below are about what each turn could
+            // see, which is only well defined if the previous one finished.
+            wait_for_sends(&harness.channel, 1).await;
+        }
+
+        let sent = wait_for_sends(&harness.channel, 3).await;
+        assert_eq!(sent.len(), 3, "every message must get a reply: {sent:?}");
+        assert_eq!(
+            sent.iter().map(|(to, _)| to.as_str()).collect::<Vec<_>>(),
+            vec!["room-1", "room-2", "room-1"],
+            "each reply goes back to the room the message came from"
+        );
+
+        let seen = harness.provider.seen.lock().clone();
+        assert_eq!(seen.len(), 3, "three turns ran: {seen:?}");
+
+        let second_turn = seen[1].join("\n");
+        assert!(
+            second_turn.contains("second"),
+            "the second turn must see its own message: {second_turn}"
+        );
+        assert!(
+            !second_turn.contains("first"),
+            "a different room must not inherit another room's history: {second_turn}"
+        );
+
+        let third_turn = seen[2].join("\n");
+        assert!(
+            third_turn.contains("first"),
+            "the same room continues its own conversation: {third_turn}"
+        );
+    }
+
+    /// A tool that records that it ran. The assertion is about who was asked
+    /// before it ran, not what it returned.
+    #[derive(Default)]
+    struct ProbeTool {
+        runs: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for ProbeTool {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn description(&self) -> &str {
+            "records that it ran"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "probed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// Asks for the `probe` tool on the first turn, then answers plainly.
+    #[derive(Default)]
+    struct ProbeCallingProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for ProbeCallingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(
+                    "<tool_call>\n{\"name\":\"probe\",\"arguments\":{}}\n</tool_call>".to_string(),
+                );
+            }
+            Ok("probe done".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[crate::providers::ChatMessage],
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.chat_with_system(None, "", model, temperature).await
+        }
+    }
+
+    /// A tool approval over a webhook channel is answered with `/approve <tool>`
+    /// — the same words every polling channel uses.
+    ///
+    /// The gateway ran its own approval flow on this path: a `Y/A/N` prompt with
+    /// its own parser and its own pending store. Two approval languages for one
+    /// product, chosen by the transport the message arrived on. Routing webhooks
+    /// through dispatch retires the second one; the store and parser behind it
+    /// are deleted in this change.
+    #[tokio::test]
+    async fn an_approval_over_a_webhook_channel_uses_the_slash_approve_relay() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let approval =
+            crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig {
+                level: crate::security::AutonomyLevel::Supervised,
+                always_ask: vec!["probe".to_string()],
+                ..crate::config::AutonomyConfig::default()
+            });
+        let harness = spawn_dispatch_with(
+            workspace.path(),
+            DispatchOptions {
+                provider: Some(Arc::new(ProbeCallingProvider::default())),
+                tools: vec![Box::new(ProbeTool {
+                    runs: Arc::clone(&runs),
+                })],
+                approval: Some(Arc::new(approval)),
+                approval_owners: vec!["user_a".to_string()],
+                ..DispatchOptions::default()
+            },
+        )
+        .await;
+
+        let secret = "nextcloud-test-secret";
+        let mut state = nextcloud_state(
+            Arc::new(MockProvider::default()),
+            secret,
+            GatewayRateLimiter::new(100, 100, 100, 100),
+            IdempotencyStore::new(Duration::from_mins(5), 1000),
+        );
+        state.channel_bus = Arc::clone(&harness.bus);
+
+        let (headers, body) =
+            signed_nextcloud_from(secret, "m1", "m1", "user_a", "room-1", "run the probe");
+        assert_eq!(post_nextcloud(&state, headers, body).await, StatusCode::OK);
+
+        let prompt = wait_for_sends(&harness.channel, 1).await;
+        assert_eq!(prompt.len(), 1, "the owner must be asked: {prompt:?}");
+        assert!(
+            prompt[0].1.contains("/approve probe"),
+            "the prompt must use the relay's own words: {}",
+            prompt[0].1
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the tool must not run before it is approved"
+        );
+
+        // The owner answers in the same room, over the same webhook.
+        let (headers, body) =
+            signed_nextcloud_from(secret, "m2", "m2", "user_a", "room-1", "/approve probe");
+        assert_eq!(post_nextcloud(&state, headers, body).await, StatusCode::OK);
+
+        for _ in 0..600 {
+            if runs.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "`/approve probe` from an owner must release the call: {:?}",
+            harness.channel.sent.lock()
+        );
+    }
+
+    /// A webhook turn survives a restart, because it is written to the same
+    /// `brain.db` every polling channel writes to.
+    ///
+    /// It never was before: the gateway kept these turns in an in-process map it
+    /// owned, so a daemon restart wiped every WhatsApp/Linq/Nextcloud thread
+    /// while Telegram's came back.
+    #[tokio::test]
+    async fn a_webhook_turn_is_persisted_to_the_channel_history_store() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let harness = spawn_dispatch(workspace.path(), true).await;
+
+        let secret = "nextcloud-test-secret";
+        let mut state = nextcloud_state(
+            Arc::new(MockProvider::default()),
+            secret,
+            GatewayRateLimiter::new(100, 100, 100, 100),
+            IdempotencyStore::new(Duration::from_mins(5), 1000),
+        );
+        state.channel_bus = Arc::clone(&harness.bus);
+
+        let (headers, body) =
+            signed_nextcloud_from(secret, "m1", "m1", "user_a", "room-1", "remember this");
+        assert_eq!(post_nextcloud(&state, headers, body).await, StatusCode::OK);
+        assert_eq!(wait_for_sends(&harness.channel, 1).await.len(), 1);
+
+        // Reopen the store the way a restarted daemon does.
+        let reopened = crate::channels::history_store::ChannelHistoryStore::open(workspace.path())
+            .expect("history store reopens");
+        let loaded = reopened.load_all().expect("history loads");
+        let all = loaded
+            .values()
+            .flatten()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("remember this"),
+            "the turn must be on disk after the reply went out: {loaded:?}"
+        );
+    }
+
+    /// When the dispatch loop is down, an inbound webhook is refused — with a
+    /// `Retry-After`, and with its idempotency claim released so the platform's
+    /// own retry is not swallowed as a duplicate.
+    ///
+    /// The alternative the plan rejected is 200-and-drop: the platform stops
+    /// retrying and the message is gone with nothing recording that it existed.
+    #[tokio::test]
+    async fn a_webhook_is_refused_and_retryable_when_dispatch_is_down() {
+        let secret = "nextcloud-test-secret";
+        // No `spawn_dispatch`: the state's bus has never had a sender published,
+        // which is exactly what a restarting channel runtime looks like.
+        let mut state = nextcloud_state(
+            Arc::new(MockProvider::default()),
+            secret,
+            GatewayRateLimiter::new(100, 100, 100, 100),
+            IdempotencyStore::new(Duration::from_mins(5), 1000),
+        );
+        // A real registry, so the refusal has to be countable and not just
+        // logged. A dropped message that no metric records is a silent one.
+        let observer = Arc::new(crate::observability::PrometheusObserver::new());
+        state.observer = observer.clone();
+
+        let (headers, body) = signed_nextcloud(secret, "m1");
+        let response =
+            handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().contains_key(header::RETRY_AFTER),
+            "a refusal must tell the platform when to come back"
+        );
+        let metrics = observer.encode();
+        assert!(
+            metrics.contains(
+                r#"rantaiclaw_channel_enqueue_rejected_total{channel="nextcloud_talk",reason="closed"} 1"#
+            ),
+            "the refusal must reach the process registry: {metrics}"
+        );
+
+        // The claim was released, so the platform's retry is processed rather
+        // than discarded as a redelivery. A fresh nonce keeps the anti-replay
+        // gate out of the way; the message id is the same one.
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let harness = spawn_dispatch(workspace.path(), false).await;
+        state.channel_bus = Arc::clone(&harness.bus);
+        let (headers, body) =
+            signed_nextcloud_from(secret, "m1", "retry-nonce", "user_a", "room-1", "hello");
+        assert_eq!(
+            post_nextcloud(&state, headers, body).await,
+            StatusCode::OK,
+            "the retry of a refused message must be accepted, not deduplicated away"
+        );
+        assert_eq!(wait_for_sends(&harness.channel, 1).await.len(), 1);
+    }
+
     /// The defect: every handler awaited the full LLM turn before returning
     /// 200, so a slow turn blew past the platform's ACK deadline, the platform
     /// retried, and the same message was processed again — no attacker needed.
     ///
-    /// This replaces a source-position assertion that read the handler's text
-    /// looking for `tokio::spawn(` before `process_channel_chat(`. That check
-    /// passes against any spawn, including one that is awaited immediately.
+    /// The fix used to be "spawn the turn"; plan 313 removed the turn from this
+    /// process path entirely. So the property asserted now is the stronger one:
+    /// the handler answers having only *queued* the message, with a provider
+    /// that would never have answered.
     #[tokio::test]
-    async fn nextcloud_talk_webhook_acks_while_the_turn_is_still_running() {
+    async fn nextcloud_talk_webhook_acks_without_running_a_turn() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let harness = spawn_dispatch(workspace.path(), false).await;
+
+        // Parked, and wired into the gateway's own AppState: if the handler ran
+        // a turn of its own, it would block here forever.
         let release = Arc::new(tokio::sync::Notify::new());
         let provider_impl = Arc::new(ParkedProvider {
             calls: AtomicUsize::new(0),
@@ -4362,96 +4728,95 @@ mod tests {
         let provider: Arc<dyn Provider> = provider_impl.clone();
 
         let secret = "nextcloud-test-secret";
-        let state = nextcloud_state(
+        let mut state = nextcloud_state(
             provider,
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
             IdempotencyStore::new(Duration::from_mins(5), 1000),
         );
+        state.channel_bus = Arc::clone(&harness.bus);
         let (headers, body) = signed_nextcloud(secret, "msg-1");
 
-        // The ACK must not wait on the turn. Generous bound: the point is that
-        // it does not block on a provider that never answers, not that it is fast.
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             handle_nextcloud_talk_webhook(State(state), test_peer(), headers, body),
         )
         .await
-        .expect("the handler must ACK without awaiting the turn")
-        .into_response();
+        .expect("the handler must answer without awaiting a turn");
         assert_eq!(response.status(), StatusCode::OK);
 
-        // And the turn really was in flight, still parked, when that ACK went out.
         assert_eq!(
-            wait_for_calls(&provider_impl.calls, 1).await,
-            1,
-            "the turn should have started"
+            provider_impl.calls.load(Ordering::SeqCst),
+            0,
+            "the gateway must not call a provider on the webhook path at all"
         );
+        // And the message really was handed on, rather than dropped quietly.
+        assert_eq!(wait_for_sends(&harness.channel, 1).await.len(), 1);
         release.notify_waiters();
     }
 
     /// A platform that never sees an ACK redelivers the same message. That
-    /// redelivery must not run the turn a second time — the user would get two
-    /// answers and pay for two.
+    /// redelivery must not reach the agent a second time — the user would get
+    /// two answers and pay for two.
     ///
-    /// The control is the load-bearing half. "One provider call" is also what a
-    /// harness returns when nothing reaches the provider at all, or when some
+    /// The control is the load-bearing half. "One message on the bus" is also
+    /// what a harness produces when nothing reaches the bus at all, or when some
     /// gate ahead of the dedup — the anti-replay nonce, the rate limiter —
-    /// swallows the second request. So the same harness, the same wait budget,
-    /// first has to show two distinct messages arriving as two calls.
+    /// swallows the second request. So the same harness first has to show two
+    /// distinct messages arriving as two.
     #[tokio::test]
-    async fn nextcloud_talk_webhook_runs_a_redelivered_message_once() {
+    async fn nextcloud_talk_webhook_enqueues_a_redelivered_message_once() {
         let secret = "nextcloud-test-secret";
 
-        async fn post(state: &AppState, headers: HeaderMap, body: Bytes) -> StatusCode {
-            handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body)
-                .await
-                .into_response()
-                .status()
-        }
-
         // Control: two different messages, two different nonces => two turns.
-        let control_provider = Arc::new(MockProvider::default());
-        let control = nextcloud_state(
-            control_provider.clone(),
+        let control_workspace = tempfile::tempdir().expect("temp workspace");
+        let control_harness = spawn_dispatch(control_workspace.path(), false).await;
+        let mut control = nextcloud_state(
+            Arc::new(MockProvider::default()),
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
             IdempotencyStore::new(Duration::from_mins(5), 1000),
         );
+        control.channel_bus = Arc::clone(&control_harness.bus);
         for id in ["control-1", "control-2"] {
             let (headers, body) = signed_nextcloud(secret, id);
-            assert_eq!(post(&control, headers, body).await, StatusCode::OK);
+            assert_eq!(
+                post_nextcloud(&control, headers, body).await,
+                StatusCode::OK
+            );
         }
         assert_eq!(
-            wait_for_calls(&control_provider.calls, 2).await,
+            wait_for_sends(&control_harness.channel, 2).await.len(),
             2,
-            "two distinct messages must reach the provider twice — \
+            "two distinct messages must produce two turns — \
              without this the dedup assertion below proves nothing"
         );
 
         // The real case: one message, delivered twice under distinct nonces, so
         // the anti-replay gate lets both through and the message-id dedup is
         // what decides.
-        let provider = Arc::new(MockProvider::default());
-        let state = nextcloud_state(
-            provider.clone(),
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let harness = spawn_dispatch(workspace.path(), false).await;
+        let mut state = nextcloud_state(
+            Arc::new(MockProvider::default()),
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
             IdempotencyStore::new(Duration::from_mins(5), 1000),
         );
+        state.channel_bus = Arc::clone(&harness.bus);
         for nonce in ["nonce-a", "nonce-b"] {
             let (headers, body) = signed_nextcloud_with_nonce(secret, "redelivered", nonce);
             assert_eq!(
-                post(&state, headers, body).await,
+                post_nextcloud(&state, headers, body).await,
                 StatusCode::OK,
                 "a redelivery is ACKed, not refused — the platform must stop retrying"
             );
         }
 
-        // Wait for the second call the same way the control did, so a pass here
-        // is a real absence and not a race we outran.
+        // Wait for a second turn the same way the control did, so a pass here is
+        // a real absence and not a race we outran.
         assert_eq!(
-            wait_for_calls(&provider.calls, 2).await,
+            wait_for_sends(&harness.channel, 2).await.len(),
             1,
             "the redelivered message must run exactly one turn"
         );
@@ -4466,12 +4831,14 @@ mod tests {
 
         let secret = "nextcloud-test-secret";
         // One webhook per window, from the shared loopback peer `test_peer` keys on.
-        let state = nextcloud_state(
+        let mut state = nextcloud_state(
             provider,
             secret,
             GatewayRateLimiter::new(100, 1, 100, 100),
             IdempotencyStore::new(Duration::from_mins(5), 1000),
         );
+        let (bus, _rx) = accepting_bus().await;
+        state.channel_bus = bus;
 
         let (headers, body) = signed_nextcloud(secret, "burst-1");
         let first = handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body)
@@ -4516,7 +4883,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4573,7 +4940,7 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4633,7 +5000,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4729,7 +5096,7 @@ mod tests {
                 .flatten(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4899,15 +5266,17 @@ mod tests {
         }
     }
 
-    /// A correct signature → 200. The turn itself runs in a spawned task since
-    /// #495 (ACK before processing), so the provider counter is deliberately
-    /// NOT asserted here — it would be a race, and the rejection cases above are
-    /// where the counter carries the meaning.
+    /// A correct signature → 200. The turn does not run here at all: since plan
+    /// 313 the handler only queues the message, so the provider counter is not
+    /// the oracle on this path — the rejection cases above are where it carries
+    /// the meaning.
     #[tokio::test]
     async fn webhook_with_a_valid_signature_is_accepted() {
         for endpoint in AUTH_ENDPOINTS {
             let provider_impl = Arc::new(MockProvider::default());
-            let state = auth_test_state(endpoint, Some("test-webhook-secret"), &provider_impl);
+            let mut state = auth_test_state(endpoint, Some("test-webhook-secret"), &provider_impl);
+            let (bus, _rx) = accepting_bus().await;
+            state.channel_bus = bus;
             let body = auth_test_body(endpoint);
             let headers = auth_test_headers(endpoint, "test-webhook-secret", body);
             let status = call_webhook(endpoint, state, headers, body).await;
@@ -4925,11 +5294,13 @@ mod tests {
     #[tokio::test]
     async fn nextcloud_talk_rejects_a_replayed_nonce() {
         let provider_impl = Arc::new(MockProvider::default());
-        let state = auth_test_state(
+        let mut state = auth_test_state(
             Endpoint::NextcloudTalk,
             Some("test-webhook-secret"),
             &provider_impl,
         );
+        let (bus, _rx) = accepting_bus().await;
+        state.channel_bus = bus;
         let body = auth_test_body(Endpoint::NextcloudTalk);
         let headers = auth_test_headers(Endpoint::NextcloudTalk, "test-webhook-secret", body);
 

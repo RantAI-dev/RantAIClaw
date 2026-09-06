@@ -2576,9 +2576,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-            channel_approvals: Arc::new(
-                crate::gateway::channel_approval::ChannelApprovalStore::default(),
-            ),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
         }

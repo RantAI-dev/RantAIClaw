@@ -2360,7 +2360,8 @@ impl TuiApp {
                     let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
                 }
                 crate::channels::auto_start_state::mark_starting();
-                match crate::channels::start_channels_with_cancellation(cfg, task_token, None).await
+                match crate::channels::start_channels_with_cancellation(cfg, task_token, None, None)
+                    .await
                 {
                     Ok(()) => {
                         crate::channels::auto_start_state::mark_terminated();
