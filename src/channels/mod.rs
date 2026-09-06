@@ -37,6 +37,7 @@ pub mod discord;
 pub mod dispatch;
 pub mod email_channel;
 pub mod factory;
+pub(crate) mod fault;
 
 // `src/cron/scheduler.rs` builds channels to resolve a delivery target, so the
 // construction table keeps its `crate::channels::` path.

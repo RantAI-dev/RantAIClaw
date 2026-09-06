@@ -134,6 +134,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A revoked Slack or Mattermost token no longer becomes a reconnect storm.**
+  `Channel::listen`'s contract is that a transport or auth fault returns `Err`,
+  and the listener supervisor doubles its backoff only when it sees one. Both
+  polling listeners swallowed *every* error — including a 401 — back into their
+  loop, so the supervisor kept resetting to the initial delay and re-polled the
+  platform at the poll rate forever, while `health_check` still reported green.
+  A 401/403 (and Slack's `200 OK` with `{"ok": false, "error": "invalid_auth"}`,
+  which no status check can see) now ends the listener with an error naming the
+  credential. Transient failures — 5xx, 429, timeouts, resets — still retry,
+  because turning a blip into a give-up is the failure in the other direction.
+- **The Mattermost listener honours cancellation.** It ignored the token it was
+  handed and only stopped when its future was dropped; its 3-second poll interval
+  is now raced against `cancel.cancelled()`.
+
 - **The Matrix channel compiles again, and its tests run for the first time.**
   `matrix-sdk` 0.16 overflowed the rustc type-check recursion budget, so no CI job
   could build `src/channels/matrix.rs` — 1,194 lines and 31 tests checked by
