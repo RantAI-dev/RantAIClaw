@@ -145,6 +145,7 @@ fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
         webhook_secret_hash: None,
         pairing: Arc::new(PairingGuard::new(require_pairing, tokens)),
         channel_bus: Arc::new(rantaiclaw::channels::ChannelBus::default()),
+        ledger: None,
         web_approvals: Arc::new(rantaiclaw::security::PendingApprovals::default()),
         mcp: Arc::new(rantaiclaw::mcp::discover::McpPoolHandle::default()),
         trust_forwarded_headers: false,

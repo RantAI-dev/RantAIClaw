@@ -319,6 +319,10 @@ pub(crate) struct ChannelRuntimeContext {
     /// is disabled (non-sqlite memory backends, or an open failure) and history
     /// stays in-memory only, exactly as before.
     pub(crate) history_store: Option<Arc<history_store::ChannelHistoryStore>>,
+    /// The process's token ledger: the daily ceiling every channel turn is
+    /// checked against, and the operator's optional prices used to report money.
+    /// `None` when `[cost] enabled = false`.
+    pub(crate) ledger: Option<Arc<crate::cost::CostTracker>>,
     pub(crate) provider_cache: ProviderCacheMap,
     pub(crate) route_overrides: RouteSelectionMap,
     pub(crate) api_key: Option<String>,
@@ -967,6 +971,7 @@ pub(crate) async fn build_channel_runtime(
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(seeded_histories)),
         history_store,
+        ledger: crate::cost::ledger_for(&config),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),

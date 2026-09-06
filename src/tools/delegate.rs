@@ -33,6 +33,10 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// The process's token ledger. A sub-agent turn spends real tokens, so it
+    /// counts against the same daily ceiling and lands in the same record —
+    /// otherwise a delegating heartbeat spends without the brake ever seeing it.
+    ledger: Option<Arc<crate::cost::CostTracker>>,
 }
 
 impl DelegateTool {
@@ -63,6 +67,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            ledger: None,
         }
     }
 
@@ -99,6 +104,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            ledger: None,
         }
     }
 
@@ -109,6 +115,12 @@ impl DelegateTool {
     }
 
     /// Attach multimodal configuration for sub-agent tool loops.
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Option<Arc<crate::cost::CostTracker>>) -> Self {
+        self.ledger = ledger;
+        self
+    }
+
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
@@ -413,6 +425,7 @@ impl DelegateTool {
                 None,
                 None,
                 None,
+                self.ledger.as_deref(),
             ),
         )
         .await;

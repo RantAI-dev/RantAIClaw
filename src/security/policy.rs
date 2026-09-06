@@ -93,7 +93,6 @@ pub struct PolicyFields {
     pub block_high_risk_commands: bool,
     pub require_approval_for_medium_risk: bool,
     pub max_actions_per_hour: u32,
-    pub max_cost_per_day_cents: u32,
     /// Tools that always prompt, and tools that never do. Read by
     /// `ApprovalManager`, not by the gate — they live here because they are
     /// `[autonomy]` config like everything else in this struct, and the two
@@ -114,7 +113,6 @@ impl PolicyFields {
             block_high_risk_commands: c.block_high_risk_commands,
             require_approval_for_medium_risk: c.require_approval_for_medium_risk,
             max_actions_per_hour: c.max_actions_per_hour,
-            max_cost_per_day_cents: c.max_cost_per_day_cents,
             always_ask: c.always_ask.clone(),
             auto_approve: c.auto_approve.clone(),
         }
@@ -198,7 +196,6 @@ impl Default for SecurityPolicy {
                 "~/.config".into(),
             ],
             max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: false,
             // Matches `AutonomyConfig::default()`: the high-blast-radius pair
@@ -1351,7 +1348,6 @@ mod tests {
             block_high_risk_commands: true,
             require_approval_for_medium_risk: false,
             max_actions_per_hour: 99,
-            max_cost_per_day_cents: 4242,
             ..crate::config::AutonomyConfig::default()
         };
         policy.apply_config(&next);
@@ -1365,7 +1361,6 @@ mod tests {
         assert!(!f.require_approval_for_medium_risk);
         assert_eq!(f.max_actions_per_hour, 99);
         // No production reader today, so this assertion is its only coverage.
-        assert_eq!(f.max_cost_per_day_cents, 4242);
     }
 
     /// Replaces `set_autonomy_hot_swaps_across_clones`. Tools clone the policy
@@ -1850,7 +1845,6 @@ mod tests {
             allowed_commands: vec!["docker".into()],
             forbidden_paths: vec!["/secret".into()],
             max_actions_per_hour: 100,
-            max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
             ..crate::config::AutonomyConfig::default()
@@ -1863,7 +1857,6 @@ mod tests {
         assert_eq!(policy.fields().allowed_commands, vec!["docker"]);
         assert_eq!(policy.fields().forbidden_paths, vec!["/secret"]);
         assert_eq!(policy.fields().max_actions_per_hour, 100);
-        assert_eq!(policy.fields().max_cost_per_day_cents, 1000);
         assert!(!policy.fields().require_approval_for_medium_risk);
         assert!(!policy.fields().block_high_risk_commands);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
@@ -1879,7 +1872,6 @@ mod tests {
         assert!(!p.fields().allowed_commands.is_empty());
         assert!(!p.fields().forbidden_paths.is_empty());
         assert!(p.fields().max_actions_per_hour > 0);
-        assert!(p.fields().max_cost_per_day_cents > 0);
         assert!(p.fields().require_approval_for_medium_risk);
         // Easy-mode default: high-risk commands are no longer hard-blocked.
         assert!(!p.fields().block_high_risk_commands);
@@ -2403,7 +2395,6 @@ mod tests {
             allowed_commands: vec![],
             forbidden_paths: vec![],
             max_actions_per_hour: 10,
-            max_cost_per_day_cents: 100,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             ..crate::config::AutonomyConfig::default()

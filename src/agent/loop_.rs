@@ -1048,6 +1048,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    ledger: Option<&crate::cost::CostTracker>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1068,6 +1069,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        ledger,
     )
     .await
 }
@@ -1657,7 +1659,19 @@ pub(crate) async fn run_structured_loop(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     events: Option<AgentEventSender>,
+    // The process's token ledger. `None` ⇒ no accounting on this path (tests,
+    // and callers that have no workspace to write one into).
+    ledger: Option<&crate::cost::CostTracker>,
 ) -> Result<(String, Option<crate::providers::ProviderUsage>)> {
+    // The daily ceiling, checked before the turn does any work. This is the
+    // whole of the enforcement: a turn's size is not knowable before it runs, so
+    // the guard notices that the day's budget is already gone rather than trying
+    // to predict this turn. Refusing here is what makes an unattended runaway —
+    // heartbeat, cron — stop instead of billing until someone looks.
+    if let Some(ledger) = ledger {
+        ledger.ensure_within_ceiling()?;
+    }
+
     // A turn can make several provider calls (one per tool iteration). The
     // caller wants the turn's total, and a call that reported nothing must not
     // drag a reported one down to zero — `merge` keeps `None` absorbing.
@@ -2023,6 +2037,7 @@ pub(crate) async fn run_tool_call_loop(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     events: Option<AgentEventSender>,
+    ledger: Option<&crate::cost::CostTracker>,
 ) -> Result<String> {
     let dispatcher: Box<dyn ToolDispatcher> = if provider.supports_native_tools() {
         Box::new(NativeToolDispatcher)
@@ -2057,6 +2072,7 @@ pub(crate) async fn run_tool_call_loop(
         cancellation_token,
         on_delta,
         events,
+        ledger,
     )
     .await;
 
@@ -2070,16 +2086,24 @@ pub(crate) async fn run_tool_call_loop(
     // zero-valued one would mean "measured zero" — the distinction the whole
     // change exists to restore.
     let (text, usage) = result?;
-    if let (Some(tx), Some(u)) = (events_for_usage.as_ref(), usage) {
-        let _ = tx
-            .send(AgentEvent::Usage(crate::cost::TokenUsage::new(
-                model,
-                u.input_tokens,
-                u.output_tokens,
-                0.0,
-                0.0,
-            )))
-            .await;
+    if let Some(u) = usage {
+        // Priced only where the operator configured a price; `usage_for`
+        // returns `cost_usd: None` otherwise, which the surfaces render as
+        // "not reported".
+        let record = ledger.map_or_else(
+            || crate::cost::TokenUsage::new(model, u.input_tokens, u.output_tokens, None),
+            |l| l.usage_for(model, u.input_tokens, u.output_tokens),
+        );
+        // Record before emitting: the ledger is what the next turn's ceiling
+        // check reads, and a failed write must not be silent.
+        if let Some(ledger) = ledger {
+            if let Err(e) = ledger.record_usage(record.clone()) {
+                tracing::warn!("failed to record token usage: {e:#}");
+            }
+        }
+        if let Some(tx) = events_for_usage.as_ref() {
+            let _ = tx.send(AgentEvent::Usage(record)).await;
+        }
     }
     Ok(text)
 }
@@ -2246,6 +2270,9 @@ pub async fn run_with_scope(
     // ── Wire up agnostic subsystems ──────────────────────────────
     let observer: Arc<dyn Observer> = observer
         .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
+    // The daily token ceiling for this run. Cron and the heartbeat come through
+    // here, and they are the unattended paths the ceiling exists for.
+    let ledger = crate::cost::ledger_for(&config);
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -2584,6 +2611,7 @@ pub async fn run_with_scope(
             None,
             None,
             None,
+            ledger.as_deref(),
         )
         .await?;
         final_output = response.clone();
@@ -2740,6 +2768,7 @@ pub async fn run_with_scope(
                 None,
                 None,
                 None,
+                ledger.as_deref(),
             )
             .await
             {
@@ -3004,6 +3033,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        crate::cost::ledger_for(&config).as_deref(),
     )
     .await
 }
@@ -3240,6 +3270,15 @@ mod tests {
             }
         }
 
+        /// How many scripted replies are still unconsumed — the oracle for
+        /// "the provider was never called".
+        fn remaining(&self) -> usize {
+            self.responses
+                .lock()
+                .expect("responses lock should be valid")
+                .len()
+        }
+
         fn from_text_responses(responses: Vec<&str>) -> Self {
             let scripted = responses
                 .into_iter()
@@ -3383,6 +3422,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3430,6 +3470,7 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             3,
+            None,
             None,
             None,
             None,
@@ -3488,6 +3529,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3527,6 +3569,7 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             3,
+            None,
             None,
             None,
             None,
@@ -3656,6 +3699,7 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             None,
             None,
@@ -5297,6 +5341,118 @@ Let me check the result."#;
         );
     }
 
+    // ── The daily token ceiling (plan 306 steps 3-4) ────────────────────────
+
+    fn ledger_with_ceiling(
+        dir: &std::path::Path,
+        max_tokens_per_day: u64,
+    ) -> crate::cost::CostTracker {
+        crate::cost::CostTracker::new(
+            crate::config::schema::CostConfig {
+                enabled: true,
+                max_tokens_per_day,
+                warn_at_percent: 80,
+                prices: std::collections::HashMap::new(),
+            },
+            dir,
+        )
+        .expect("a ledger in a temp workspace")
+    }
+
+    async fn turn_against(
+        provider: &ScriptedProvider,
+        ledger: Option<&crate::cost::CostTracker>,
+    ) -> Result<String> {
+        let mut history = vec![ChatMessage::user("hi")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let observer = NoopObserver;
+        let multimodal = crate::config::MultimodalConfig::default();
+        run_tool_call_loop(
+            provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            None,
+            None,
+            &multimodal,
+            5,
+            None,
+            None,
+            None,
+            ledger,
+        )
+        .await
+    }
+
+    /// Step 4's verification, which could not be written before: spend the
+    /// day's tokens, and the next turn is refused **before** the provider is
+    /// called.
+    ///
+    /// "Before" is the load-bearing word. A ceiling checked after the call would
+    /// bill for the turn it was supposed to prevent, which is precisely the
+    /// unattended runaway this exists to stop.
+    #[tokio::test]
+    async fn a_turn_is_refused_once_the_daily_token_ceiling_is_spent() {
+        let tmp = tempfile::TempDir::new().expect("temp workspace");
+        // 15, so one 18-token turn spends it. The turn that crosses the line is
+        // allowed to finish — the ceiling is checked before a turn starts, not
+        // mid-flight — and the next one is refused.
+        let ledger = ledger_with_ceiling(tmp.path(), 15);
+
+        // First turn: the day is untouched, so it runs; its 18 tokens land.
+        let provider = ScriptedProvider::from_text_responses_with_usage(vec!["one"]);
+        assert_eq!(turn_against(&provider, Some(&ledger)).await.unwrap(), "one");
+        assert_eq!(ledger.daily_tokens().unwrap(), 18, "the turn was recorded");
+
+        // Second turn: the ceiling is spent. The provider is scripted with a
+        // response it must never be asked for.
+        let provider = ScriptedProvider::from_text_responses_with_usage(vec!["two"]);
+        let err = turn_against(&provider, Some(&ledger))
+            .await
+            .expect_err("the ceiling must refuse the turn");
+        assert!(
+            err.to_string().contains("Daily token ceiling reached"),
+            "the refusal must say why: {err}"
+        );
+        assert_eq!(
+            provider.remaining(),
+            1,
+            "the provider must not have been called"
+        );
+    }
+
+    /// The load-bearing other half: a ceiling that refused everything would pass
+    /// the test above and stop a product that was inside its budget.
+    #[tokio::test]
+    async fn turns_inside_the_ceiling_are_not_refused() {
+        let tmp = tempfile::TempDir::new().expect("temp workspace");
+        let ledger = ledger_with_ceiling(tmp.path(), 1_000_000);
+
+        for expected in ["one", "two", "three"] {
+            let provider = ScriptedProvider::from_text_responses_with_usage(vec![expected]);
+            assert_eq!(
+                turn_against(&provider, Some(&ledger)).await.unwrap(),
+                expected
+            );
+        }
+        assert_eq!(ledger.daily_tokens().unwrap(), 54, "all three recorded");
+    }
+
+    /// No ledger at all — a bare-builder agent, or `[cost] enabled = false` —
+    /// still runs. Accounting is opt-out, not a hard dependency of the loop.
+    #[tokio::test]
+    async fn a_turn_without_a_ledger_is_unbraked() {
+        let provider = ScriptedProvider::from_text_responses_with_usage(vec!["fine"]);
+        assert_eq!(turn_against(&provider, None).await.unwrap(), "fine");
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_emits_chunk_events_when_events_some() {
         // Long enough to cross STREAM_CHUNK_MIN_CHARS (80) several times, so the
@@ -5332,6 +5488,7 @@ Let me check the result."#;
             None,
             None,            // on_delta: None
             Some(events_tx), // events: Some
+            None,
         )
         .await
         .expect("loop succeeds");
@@ -5433,6 +5590,7 @@ Let me check the result."#;
             None,
             None,
             Some(events_tx),
+            None,
         )
         .await
         .expect("loop succeeds");
@@ -5530,6 +5688,7 @@ Let me check the result."#;
             Some(token),
             None,
             Some(events_tx),
+            None,
         )
         .await;
         assert!(res.is_err(), "expected cancellation error");
@@ -5581,6 +5740,7 @@ Let me check the result."#;
             None,
             None,
             Some(events_tx),
+            None,
         )
         .await
         .unwrap();
@@ -5632,6 +5792,7 @@ Let me check the result."#;
             None,
             None,
             Some(events_tx),
+            None,
         )
         .await
         .expect("loop completes");
