@@ -64,7 +64,7 @@ conflation is the thing this table exists to prevent.
 | iMessage | built and unit-tested | default feature; CI. Note it needs macOS to run at all |
 | Webhook (generic) | built and unit-tested | gateway endpoint; handler-level auth tests |
 | Lark/Feishu | built and unit-tested | `channel-lark` is not a default feature, but it has its own CI job that builds **and tests** it |
-| Matrix (E2EE) | **unbuildable** | `matrix-sdk` 0.16 exceeds the type-check recursion budget; no CI job compiles it and its 1,168-line module is checked by nothing. Options are costed in [the dependency write-up](../project/2026-08-14-dependency-decisions.md) |
+| Matrix (E2EE) | built and unit-tested | `channel-matrix` is not a default feature, but it has its own CI job that builds **and tests** it — same shape as Lark. It was unbuildable until the pin moved to `matrix-sdk` 0.18: 0.16 exceeded the type-check recursion budget, so no job compiled it and its 31 tests had never run. Not live-verified against a real homeserver, so it stays outside the supported tier |
 
 ### What ships in a release binary
 
@@ -74,8 +74,9 @@ Release binaries are built with **default features only**
 - every "built in" channel above ships;
 - **Lark ships in no release binary** — it needs a source build with
   `--features channel-lark`;
-- **Matrix ships in no release binary** and cannot currently be built from
-  source either.
+- **Matrix ships in no release binary** — it needs a source build with
+  `--features channel-matrix`, on **rustc 1.93 or newer** (`matrix-sdk` declares
+  that MSRV; the rest of RantaiClaw builds on 1.91). It does build there now.
 
 The README's channel table carries the same columns; the two are meant to agree.
 

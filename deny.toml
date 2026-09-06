@@ -35,12 +35,15 @@ ignore = [
     # implements fixed-size bitmap ops with no I/O and no untrusted-input
     # surface in our usage. Unblocks when matrix-sdk moves off imbl.
     #
-    # REVIEW BY 2026-11-15. Reached only through `channel-matrix`, which has not
-    # compiled since 0.16 and ships in no release binary — so this suppresses an
-    # advisory for code no user runs. The decision to keep waiting is recorded in
-    # docs/project/2026-08-14-dependency-decisions.md §5.1; waiting without a date
-    # is what made it invisible for months. On that date, re-make the choice
-    # (fork / pin / drop) rather than re-defer it.
+    # REVIEW BY 2026-11-15. Reached only through `channel-matrix`, which ships in
+    # no release binary — so this suppresses an advisory for code no default
+    # build contains. It DOES compile again as of the `matrix-sdk` 0.18 pin
+    # (plan 304), which removes the "code no user runs" half of the old
+    # justification: an operator who builds `--features channel-matrix` now runs
+    # it. The path is unchanged — bitmaps via imbl via eyeball-im via matrix-sdk.
+    # The 2026-08-14 write-up (§5.1) recorded a fork/pin/drop choice that the
+    # 0.18 bump answered differently; on the review date, re-make it against the
+    # current graph rather than re-defer.
     "RUSTSEC-2026-0247",
     # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete.
     "RUSTSEC-2025-0141",

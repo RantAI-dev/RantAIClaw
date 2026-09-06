@@ -1,5 +1,15 @@
 # Matrix E2EE Guide
 
+> **Matrix is behind a build feature and is not in the supported tier.** Release
+> binaries carry no Matrix support: it needs a source build with
+> `cargo build --features channel-matrix`, and that build needs **rustc 1.93 or
+> newer** — `matrix-sdk` declares it, while the rest of RantaiClaw builds on
+> 1.91. The channel ships labelled **under development** — it builds and its
+> tests run in CI (`Channel Matrix (build + test)`), but it has not been driven
+> live against a real homeserver as part of a release, which is what the
+> supported tier requires. Everything below assumes a binary built with that
+> feature.
+
 This guide explains how to run RantaiClaw reliably in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
 
 It focuses on the common failure mode reported by users:
