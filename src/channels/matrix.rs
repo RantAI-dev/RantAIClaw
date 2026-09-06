@@ -1,5 +1,6 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
@@ -539,6 +540,21 @@ impl MatrixChannel {
     }
 }
 
+/// Whether a `matrix-sdk` error means this session will never sync again.
+///
+/// The homeserver reports a forgotten or revoked access token as an `errcode`,
+/// not a transport failure, so the sync loop saw it as "retry" and asked again
+/// every five seconds for as long as the daemon ran.
+///
+/// Deliberately narrow: a homeserver restart, a timeout and a 5xx must stay
+/// retryable, or a blip becomes a give-up.
+fn matrix_error_is_fatal(error: &matrix_sdk::Error) -> bool {
+    matches!(
+        error.client_api_error_kind(),
+        Some(ErrorKind::UnknownToken(_) | ErrorKind::MissingToken | ErrorKind::UserDeactivated)
+    )
+}
+
 #[async_trait]
 impl Channel for MatrixChannel {
     fn name(&self) -> &str {
@@ -573,7 +589,7 @@ impl Channel for MatrixChannel {
     async fn listen(
         &self,
         tx: mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         let target_room_id = self.target_room_id().await?;
         self.ensure_room_supported(&target_room_id).await?;
@@ -690,14 +706,30 @@ impl Channel for MatrixChannel {
         client
             .sync_with_result_callback(sync_settings, |sync_result| {
                 let tx = tx.clone();
+                let cancel = cancel.clone();
                 async move {
-                    if tx.is_closed() {
+                    if tx.is_closed() || cancel.is_cancelled() {
+                        // `LoopCtrl::Break` is the teardown this SDK offers: the
+                        // sync loop ends between requests instead of the future
+                        // being dropped mid-request by the supervisor.
                         return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
                     }
 
                     if let Err(error) = sync_result {
+                        // A homeserver that has forgotten this access token
+                        // answers every sync the same way forever. Reporting it
+                        // as "retrying..." kept the supervisor's backoff at its
+                        // initial delay and `health_check` green.
+                        if matrix_error_is_fatal(&error) {
+                            return Err(error);
+                        }
                         tracing::warn!("Matrix sync error: {error}, retrying...");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        // Cancellable: the old bare sleep meant a shutdown waited
+                        // out five seconds per failed sync.
+                        tokio::select! {
+                            () = cancel.cancelled() => {}
+                            () = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
+                        }
                     }
 
                     Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Continue)
@@ -729,6 +761,60 @@ impl Channel for MatrixChannel {
 
 #[cfg(test)]
 mod tests {
+    // ── The supervised-listener fault contract (plan 308) ───────────────────
+
+    /// Build the error a homeserver actually sends, so the classifier is tested
+    /// against the shape it will meet rather than a stand-in.
+    fn homeserver_error(kind: matrix_sdk::ruma::api::error::ErrorKind) -> matrix_sdk::Error {
+        use matrix_sdk::ruma::api::client::uiaa::UiaaResponse;
+        use matrix_sdk::ruma::api::error::{
+            Error as RumaError, ErrorBody, FromHttpResponseError, StandardErrorBody,
+        };
+        use matrix_sdk::ruma::exports::http::StatusCode;
+
+        let body = ErrorBody::Standard(StandardErrorBody::new(kind, "test".to_owned()));
+        let api_error = RumaError::new(StatusCode::UNAUTHORIZED, body);
+        matrix_sdk::Error::Http(Box::new(matrix_sdk::HttpError::Api(Box::new(
+            FromHttpResponseError::Server(UiaaResponse::MatrixError(api_error)),
+        ))))
+    }
+
+    /// A homeserver that has forgotten this access token answers every sync the
+    /// same way forever. The loop reported it as "retrying...", so the
+    /// supervisor's backoff never escalated and `health_check` stayed green.
+    #[test]
+    fn a_forgotten_access_token_is_fatal() {
+        use matrix_sdk::ruma::api::error::ErrorKind;
+        for kind in [
+            ErrorKind::UnknownToken(matrix_sdk::ruma::api::error::UnknownTokenErrorData::new()),
+            ErrorKind::MissingToken,
+            ErrorKind::UserDeactivated,
+        ] {
+            assert!(
+                super::matrix_error_is_fatal(&homeserver_error(kind.clone())),
+                "{kind:?} means this session will never sync again"
+            );
+        }
+    }
+
+    /// The load-bearing half: a classifier that called everything fatal would
+    /// pass the test above and give up on a homeserver that was merely
+    /// restarting.
+    #[test]
+    fn a_transient_homeserver_error_is_not_fatal() {
+        use matrix_sdk::ruma::api::error::ErrorKind;
+        for kind in [
+            ErrorKind::Unknown,
+            ErrorKind::NotFound,
+            ErrorKind::Forbidden,
+        ] {
+            assert!(
+                !super::matrix_error_is_fatal(&homeserver_error(kind.clone())),
+                "{kind:?} must stay retryable"
+            );
+        }
+    }
+
     use super::*;
 
     fn make_channel() -> MatrixChannel {
