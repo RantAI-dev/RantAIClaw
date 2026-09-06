@@ -517,6 +517,10 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Webhook trigger routes loaded from agent-runner config
     pub webhook_routes: Arc<Vec<WebhookRoute>>,
+    /// The process's token ledger: the daily ceiling every gateway turn is
+    /// checked against, and the operator's optional prices used to report money.
+    /// `None` when `[cost] enabled = false`.
+    pub ledger: Option<Arc<crate::cost::CostTracker>>,
     /// Where a verified, parsed webhook message is handed to the process's one
     /// channel dispatch loop.
     ///
@@ -815,6 +819,7 @@ pub fn build_gateway_router(
         observer,
         webhook_routes,
         channel_bus,
+        ledger: crate::cost::ledger_for(&config),
         // In-browser (console SSE) modal tool-approval registry. 5-minute
         // deadline auto-denies an unanswered modal so a paused turn never
         // hangs forever (secure default, mirrors the channel relay).
@@ -1739,6 +1744,7 @@ async fn run_gateway_chat_with_multimodal(
         None, // no cancellation token
         None, // no streaming delta channel
         None, // no event sender
+        state.ledger.as_deref(),
     )
     .await?;
 
@@ -3115,6 +3121,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3166,6 +3173,7 @@ mod tests {
             observer,
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3534,6 +3542,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3775,6 +3784,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3841,6 +3851,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3919,6 +3930,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -3969,6 +3981,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4024,6 +4037,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4114,6 +4128,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4329,6 +4344,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(std::sync::Mutex::new(HashMap::new())),
             history_store,
+            ledger: None,
             provider_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             route_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
             api_key: None,
@@ -4884,6 +4900,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -4941,6 +4958,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -5001,6 +5019,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
@@ -5097,6 +5116,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),

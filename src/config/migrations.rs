@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 30;
+pub const CURRENT_VERSION: u32 = 31;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -420,10 +420,47 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only field)
     }
 
-    // Future migrations (v31, …) inserted here in order.
+    // v30 → v31: one enforced ceiling, denominated in tokens. Drops the three
+    // money keys that were never enforced anywhere.
+    if from < 31 {
+        migrate_v31(raw);
+    }
+
+    // Future migrations (v32, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
+}
+
+/// v30 → v31: replace three unenforced money limits with one token ceiling.
+///
+/// `[autonomy].max_cost_per_day_cents` was displayed by `status` under a
+/// security heading and checked by nothing. `[cost].daily_limit_usd` and
+/// `monthly_limit_usd` were read by `CostTracker::check_budget`, which had no
+/// caller — and could not have worked if it did, because there is no price
+/// source in the product: `[cost.prices]` was itself deleted as dead in v25, so
+/// every recorded cost was `0.00` and no spend could ever reach a dollar limit.
+///
+/// The replacement, `[cost].max_tokens_per_day`, is enforced before every turn.
+/// Nothing is carried across: cents and dollars cannot be converted into tokens
+/// without the prices that do not exist, and an invented conversion would be the
+/// same fabricated number this change removes. An operator who set a money limit
+/// gets the new default and a CHANGELOG entry saying so.
+///
+/// `[cost.prices]` is **not** re-created here. It is optional, empty by default,
+/// and used only for reporting; a migration that invented entries would be
+/// inventing prices.
+fn migrate_v31(raw: &mut Value) {
+    let Some(root) = raw.as_table_mut() else {
+        return;
+    };
+    if let Some(autonomy) = root.get_mut("autonomy").and_then(Value::as_table_mut) {
+        autonomy.remove("max_cost_per_day_cents");
+    }
+    if let Some(cost) = root.get_mut("cost").and_then(Value::as_table_mut) {
+        cost.remove("daily_limit_usd");
+        cost.remove("monthly_limit_usd");
+    }
 }
 
 /// v28 → v29: remove the two keys that were accepted and read by nothing.
@@ -960,6 +997,59 @@ backend = \"markdown\"
         assert_eq!(
             tasks.get("api_enabled").and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    /// Three money limits, none of them enforced, replaced by one token ceiling
+    /// that is. Nothing is converted: cents cannot become tokens without the
+    /// prices this product does not have.
+    #[test]
+    fn v31_drops_the_three_unenforced_money_limits() {
+        let mut v = parse(
+            "schema_version = 30\n\
+             [autonomy]\nlevel = \"supervised\"\nmax_actions_per_hour = 200\nmax_cost_per_day_cents = 500\n\
+             [cost]\nenabled = true\ndaily_limit_usd = 10.0\nmonthly_limit_usd = 100.0\nwarn_at_percent = 80\n",
+        );
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+
+        let autonomy = v
+            .get("autonomy")
+            .and_then(Value::as_table)
+            .expect("autonomy survives");
+        assert!(
+            autonomy.get("max_cost_per_day_cents").is_none(),
+            "the unenforced money ceiling is dropped"
+        );
+        assert_eq!(
+            autonomy
+                .get("max_actions_per_hour")
+                .and_then(Value::as_integer),
+            Some(200),
+            "the ceiling that IS enforced survives — this removes named keys, \
+             not the section"
+        );
+
+        let cost = v
+            .get("cost")
+            .and_then(Value::as_table)
+            .expect("cost survives");
+        assert!(
+            cost.get("daily_limit_usd").is_none(),
+            "daily dollars dropped"
+        );
+        assert!(
+            cost.get("monthly_limit_usd").is_none(),
+            "monthly dollars dropped"
+        );
+        assert_eq!(
+            cost.get("warn_at_percent").and_then(Value::as_integer),
+            Some(80),
+            "the warning threshold survives — it now measures tokens"
+        );
+        assert!(
+            cost.get("prices").is_none(),
+            "prices are not invented by a migration"
         );
     }
 

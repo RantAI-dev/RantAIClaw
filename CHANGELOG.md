@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One enforced daily ceiling, denominated in tokens (config schema v30 → v31).**
+  `[cost] max_tokens_per_day` (default **2,000,000**) is checked **before every
+  turn**, on every surface that shares a workspace: the TUI, `agent run`, chat
+  channels, the gateway, cron and sub-agents (`delegate`). A turn that crosses
+  the line is allowed to finish; the next one is refused with an error naming the
+  numbers and the key. `0` keeps the accounting and drops the ceiling.
+  **`[cost] enabled` now defaults to `true`** — it was `false`, which meant the
+  only runaway brake in the product was off on every install, and a brake that is
+  off by default is not a brake. Usage lands in
+  `<workspace>/state/costs.jsonl`; the day rolls over at UTC midnight.
+
+- **`[cost.prices]` is back, as an optional operator-supplied table used only for
+  reporting.** It was deleted as a dead key in schema v25 because nothing read
+  it; it now has a reader. Keyed by the model id the provider reports, with
+  `input_per_million` / `output_per_million`. A model with no entry — the default
+  for every model — reports **"not reported"** rather than `0.00`, and a price
+  with a missing, zero, negative or non-finite side is not a usable price: the
+  record reports nothing rather than half a number. **Nothing is enforced in
+  money.**
+
 - **`rantaiclaw_channel_enqueue_rejected_total{channel,reason}`.** Counts inbound
   webhook messages the dispatch queue refused, labelled `full` (the queue is
   saturated) or `closed` (no dispatch loop is running). A message that never
@@ -122,6 +142,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those routes sit on the root router outside the `/api/v1` rate limiter.
 
 ### Removed
+
+- **Three money limits that were never enforced (config schema v30 → v31).**
+  `[autonomy] max_cost_per_day_cents` was printed by `rantaiclaw status` under a
+  security heading and checked by nothing. `[cost] daily_limit_usd` and
+  `monthly_limit_usd` were read by `CostTracker::check_budget`, which had no
+  caller — and could not have worked if it had one, because there is no price
+  source in the product: `[cost.prices]` was itself deleted as dead in v25, so
+  every recorded cost was `0.00` and no spend could reach a dollar limit. The
+  migration drops all three. **Nothing is converted**: cents cannot become tokens
+  without the prices that did not exist, and an invented conversion would be the
+  fabricated number this change removes — an install that had set a money limit
+  gets the new token default. `status` now shows `Tokens/day`. The gateway's
+  `PATCH /api/v1/config/autonomy` still **accepts and ignores**
+  `max_cost_per_day_cents` for one release, so a console built against the old
+  shape does not have its other autonomy edits rejected along with it.
 
 - **The gateway's second tool-approval flow.** `ChannelApprovalStore` and the
   `Y`/`A`/`N` prompt+parser (`src/gateway/channel_approval.rs`) existed only to

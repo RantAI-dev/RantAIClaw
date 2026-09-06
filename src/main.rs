@@ -2014,13 +2014,22 @@ async fn main() -> Result<()> {
                 W,
                 &config.autonomy.max_actions_per_hour.to_string(),
             );
+            // The enforced ceiling, in the unit it is actually enforced in.
+            // This line used to print a dollar figure from
+            // `autonomy.max_cost_per_day_cents`, under a security heading, for a
+            // limit nothing checked.
             cli_style::field(
-                "Cost/day",
+                "Tokens/day",
                 W,
-                &format!(
-                    "${:.2}",
-                    f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
-                ),
+                &if config.cost.enabled {
+                    if config.cost.max_tokens_per_day == 0 {
+                        "no ceiling".to_string()
+                    } else {
+                        config.cost.max_tokens_per_day.to_string()
+                    }
+                } else {
+                    "accounting off".to_string()
+                },
             );
 
             cli_style::section("peripherals");

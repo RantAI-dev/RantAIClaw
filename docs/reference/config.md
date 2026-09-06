@@ -223,15 +223,41 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable cost tracking |
-| `daily_limit_usd` | `10.00` | Daily spending limit in USD |
-| `monthly_limit_usd` | `100.00` | Monthly spending limit in USD |
-| `warn_at_percent` | `80` | Warn when spending reaches this percentage of limit |
+| `enabled` | `true` | Count token usage and enforce the daily ceiling |
+| `max_tokens_per_day` | `2000000` | Daily ceiling in **tokens**; `0` keeps counting and drops the ceiling |
+| `warn_at_percent` | `80` | Warn when usage reaches this percentage of the ceiling |
+| `prices` | `{}` | Optional per-model prices, **reporting only** |
 
 Notes:
 
-- When `enabled = true`, the runtime tracks per-request cost estimates and enforces daily/monthly limits.
-- At `warn_at_percent` threshold, a warning is emitted but requests continue.
+- **The ceiling is denominated in tokens, not money.** It is a brake on
+  unattended runaway — a cron job or a channel that keeps going with nobody
+  watching — and stopping that needs a ceiling on something the product can
+  count. Tokens are counted exactly; dollars are not, because RantaiClaw ships
+  no price table.
+- It is checked **before a turn starts**, across every surface sharing the
+  workspace: the TUI, `agent run`, chat channels, the gateway, cron and
+  sub-agents (`delegate`). A turn that crosses the line is allowed to finish;
+  the next one is refused with an error naming the numbers and this key.
+- Usage is appended to `<workspace>/state/costs.jsonl`. The day rolls over at
+  UTC midnight.
+- `enabled = false` turns off the ceiling **and** the usage record together.
+
+### `[cost.prices]` — optional, reporting only
+
+Nothing is enforced in money. Supply prices only if you want spend reported:
+
+```toml
+[cost.prices."anthropic/claude-sonnet-4"]
+input_per_million = 3.0
+output_per_million = 15.0
+```
+
+Keyed by the model id as the provider reports it. A model with no entry — the
+default for every model — reports **"not reported"** rather than `0.00`, in the
+TUI's `/usage` and `/insights` panels and in the web console's totals. A price
+with a missing, zero, negative or non-finite side is not a usable price and the
+record reports nothing rather than half a number.
 
 ## `[tasks]`
 
@@ -461,7 +487,6 @@ Web console (`rantaiclaw ui start`) settings.
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
 | `forbidden_paths` | `[]` | explicit path denylist |
 | `max_actions_per_hour` | `200` | per-policy action budget |
-| `max_cost_per_day_cents` | `500` | per-policy daily cost ceiling (cents); tracked for reporting only — not enforced as a hard stop |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `false` | hard block for high-risk commands |
 | `auto_approve` | `["file_read", "memory_recall"]` | tool operations always auto-approved |

@@ -722,32 +722,66 @@ impl Default for IdentityConfig {
 
 // ── Cost tracking and budget enforcement ───────────────────────────
 
-/// Cost tracking and budget enforcement configuration (`[cost]` section).
+/// Token accounting and the daily ceiling (`[cost]` section).
+///
+/// **The ceiling is denominated in tokens, not money.** It exists to stop
+/// unattended runaway — the heartbeat running a turn per task per tick, cron
+/// running with nobody watching — and stopping that needs a ceiling on
+/// something the product can count. After plan 306 steps 1-2 tokens are counted
+/// exactly; dollars are not, because there is no price source unless an operator
+/// supplies one (see [`CostConfig::prices`]).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CostConfig {
-    /// Enable cost tracking (default: false)
-    #[serde(default)]
+    /// Count token usage and enforce [`CostConfig::max_tokens_per_day`].
+    ///
+    /// **Default `true`.** It was `false`, which meant the only runaway brake in
+    /// the product was off on every install — and a brake that is off by default
+    /// is not a brake. Turning it off disables both the daily ceiling and the
+    /// usage record it is computed from.
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Daily spending limit in USD (default: 10.00)
-    #[serde(default = "default_daily_limit")]
-    pub daily_limit_usd: f64,
+    /// Daily ceiling in **tokens**, counted across every surface. `0` disables
+    /// the ceiling while leaving accounting on.
+    ///
+    /// The default is deliberately generous — it is a runaway brake, not a
+    /// budget. A supervised human session will not reach it; a heartbeat stuck
+    /// in a loop will.
+    #[serde(default = "default_max_tokens_per_day")]
+    pub max_tokens_per_day: u64,
 
-    /// Monthly spending limit in USD (default: 100.00)
-    #[serde(default = "default_monthly_limit")]
-    pub monthly_limit_usd: f64,
-
-    /// Warn when spending reaches this percentage of limit (default: 80)
+    /// Warn when usage reaches this percentage of the ceiling (default: 80)
     #[serde(default = "default_warn_percent")]
     pub warn_at_percent: u8,
+
+    /// Optional per-model prices, supplied by the operator, used **only for
+    /// reporting**. Nothing is enforced in money.
+    ///
+    /// Keyed by the model id as the provider reports it (e.g.
+    /// `"anthropic/claude-sonnet-4"`). A model with no entry reports "not
+    /// reported" rather than `0.00` — a wrong number is worse than none.
+    ///
+    /// This key existed before and was deleted as dead in schema v25 because
+    /// nothing read it. It is back because it now has a reader, and because the
+    /// alternative — a price table bundled with the binary — goes stale silently
+    /// and then reports confidently wrong numbers.
+    #[serde(default)]
+    pub prices: std::collections::HashMap<String, ModelPrice>,
 }
 
-fn default_daily_limit() -> f64 {
-    10.0
+/// What one model costs, per million tokens, as the operator recorded it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+pub struct ModelPrice {
+    /// USD per million input (prompt) tokens.
+    pub input_per_million: f64,
+    /// USD per million output (completion) tokens.
+    pub output_per_million: f64,
 }
 
-fn default_monthly_limit() -> f64 {
-    100.0
+/// 2,000,000 tokens/day. Roughly a full day of heavy supervised use on a large
+/// model, and far below what a heartbeat loop reaches in an hour.
+fn default_max_tokens_per_day() -> u64 {
+    2_000_000
 }
 
 fn default_warn_percent() -> u8 {
@@ -757,10 +791,10 @@ fn default_warn_percent() -> u8 {
 impl Default for CostConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            daily_limit_usd: default_daily_limit(),
-            monthly_limit_usd: default_monthly_limit(),
+            enabled: true,
+            max_tokens_per_day: default_max_tokens_per_day(),
             warn_at_percent: default_warn_percent(),
+            prices: std::collections::HashMap::new(),
         }
     }
 }
@@ -2200,12 +2234,6 @@ pub struct AutonomyConfig {
     /// Maximum tool actions per hour per policy — the primary runaway guard
     /// actually enforced in the agent loop. Default: `200`.
     pub max_actions_per_hour: u32,
-    /// Per-policy daily cost ceiling in cents. NOTE: currently tracked for
-    /// reporting/telemetry only — it is not enforced as a hard stop in the
-    /// agent loop, so it will not interrupt a turn. The enforced runaway guard
-    /// is `max_actions_per_hour`.
-    pub max_cost_per_day_cents: u32,
-
     /// Require explicit approval for medium-risk shell commands.
     #[serde(default = "default_true")]
     pub require_approval_for_medium_risk: bool,
@@ -2275,7 +2303,6 @@ impl Default for AutonomyConfig {
                 "~/.config".into(),
             ],
             max_actions_per_hour: 200,
-            max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: false,
             auto_approve: default_auto_approve(),
@@ -5302,7 +5329,6 @@ mod tests {
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
         assert_eq!(a.max_actions_per_hour, 200);
-        assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
         // Easy-mode default: high-risk commands are no longer hard-blocked.
         assert!(!a.block_high_risk_commands);
@@ -5420,7 +5446,6 @@ default_temperature = 0.7
                 allowed_commands: vec!["docker".into()],
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
-                max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
                 auto_approve: vec!["file_read".into()],
