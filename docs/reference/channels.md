@@ -759,6 +759,13 @@ If a channel appears connected but does not respond:
    webhook mode refuses to start without `verification_token`.
 3b. If tool calls are being denied rather than the channel being silent, this is
    the approval model, not the transport — see [§4b](#4b-approval-and-roles).
+3c. A `503` from `/whatsapp`, `/linq` or `/nextcloud-talk` means the message was
+   verified but could not be queued: either the channel dispatch loop is not
+   running (the daemon is starting or the channels component is restarting) or its
+   queue of 100 is full. The response carries a `Retry-After` and the message is
+   **not** marked as seen, so the platform's retry is processed normally. Watch
+   `rantaiclaw_channel_enqueue_rejected_total` on `/metrics` to tell a saturated
+   queue (`reason="full"`) from a stopped one (`reason="closed"`).
 4. Confirm transport mode assumptions:
    - polling/websocket channels do not need public inbound HTTP
    - webhook channels do need reachable HTTPS callback

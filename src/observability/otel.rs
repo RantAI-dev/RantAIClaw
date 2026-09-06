@@ -312,6 +312,16 @@ impl Observer for OtelObserver {
                     ],
                 );
             }
+            ObserverEvent::ChannelEnqueueRejected { channel, reason } => {
+                self.errors.add(
+                    1,
+                    &[
+                        KeyValue::new("component", "channel_enqueue"),
+                        KeyValue::new("channel", channel.clone()),
+                        KeyValue::new("reason", reason.clone()),
+                    ],
+                );
+            }
             ObserverEvent::HeartbeatTick => {
                 self.heartbeat_ticks.add(1, &[]);
             }

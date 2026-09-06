@@ -3006,7 +3006,7 @@ async fn channel_error_replies_are_sanitized_before_delivery() {
     .unwrap();
     drop(tx);
 
-    run_message_dispatch_loop(rx, runtime_ctx, 1).await;
+    run_message_dispatch_loop(rx, runtime_ctx, 1, CancellationToken::new()).await;
 
     let sent_messages = channel_impl.sent_messages.lock().await;
     assert_eq!(sent_messages.len(), 1, "the error arm must still reply");
@@ -3473,7 +3473,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
     drop(tx);
 
     let started = Instant::now();
-    run_message_dispatch_loop(rx, runtime_ctx, 2).await;
+    run_message_dispatch_loop(rx, runtime_ctx, 2, CancellationToken::new()).await;
     let elapsed = started.elapsed();
 
     assert!(
@@ -3565,7 +3565,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
         .unwrap();
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+    run_message_dispatch_loop(rx, runtime_ctx, 4, CancellationToken::new()).await;
     send_task.await.unwrap();
 
     let sent_messages = channel_impl.sent_messages.lock().await;
@@ -3668,7 +3668,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         .unwrap();
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+    run_message_dispatch_loop(rx, runtime_ctx, 4, CancellationToken::new()).await;
     send_task.await.unwrap();
 
     let sent_messages = channel_impl.sent_messages.lock().await;
@@ -5247,4 +5247,114 @@ fn memory_scope_does_not_merge_a_dm_into_a_group() {
         conversation_memory_scope(&dm),
         conversation_history_key(&dm)
     );
+}
+
+// ── Plan 313: the bus between the gateway and the dispatch loop ──
+
+/// A message is refused when nothing is draining, and it says which of the two
+/// reasons applies.
+///
+/// The gateway answers `503` on either, but with different `Retry-After`
+/// values, so collapsing them into one "no" would tell a platform to come back
+/// at the wrong time — and would hide a stopped runtime behind a busy one.
+#[tokio::test]
+async fn the_bus_reports_closed_before_a_runtime_publishes_and_after_it_clears() {
+    let bus = crate::channels::ChannelBus::default();
+    let msg = || traits::ChannelMessage {
+        id: "m1".into(),
+        sender: "user_a".into(),
+        reply_target: "room-1".into(),
+        content: "hello".into(),
+        channel: "nextcloud_talk".into(),
+        timestamp: 0,
+        thread_ts: None,
+        sender_aliases: Vec::new(),
+    };
+
+    assert_eq!(
+        bus.try_send(msg()).await,
+        Err(crate::channels::BusRejection::Closed),
+        "nothing has published a sender yet"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    bus.publish(tx).await;
+    assert_eq!(bus.try_send(msg()).await, Ok(()));
+    assert_eq!(
+        bus.try_send(msg()).await,
+        Err(crate::channels::BusRejection::Full),
+        "a saturated queue is a different answer from a stopped one"
+    );
+
+    rx.recv().await.expect("the queued message");
+    assert_eq!(bus.try_send(msg()).await, Ok(()), "space freed up");
+
+    // What `run_channel_runtime` does when its loop ends: a webhook arriving
+    // during a restart must be refused, not queued into a bus nothing drains.
+    bus.clear().await;
+    assert_eq!(
+        bus.try_send(msg()).await,
+        Err(crate::channels::BusRejection::Closed)
+    );
+}
+
+/// The dispatch loop ends when the shutdown token fires, even though a sender
+/// is still held open.
+///
+/// It used to end only when every `Sender` dropped, which was safe while the
+/// listeners were the only producers. The gateway now holds one for as long as
+/// its `AppState` lives, so without the token a daemon shutdown would wait on
+/// the HTTP server's state to be dropped.
+#[tokio::test]
+async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() {
+    let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
+    let ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(HashMap::new()),
+        provider: Arc::new(ToolCallingProvider),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(Vec::new()),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 1,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(Vec::new()),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(
+            Vec::<String>::new(),
+            &[],
+            &[],
+        )),
+    });
+
+    let shutdown = CancellationToken::new();
+    let loop_handle = tokio::spawn(run_message_dispatch_loop(rx, ctx, 1, shutdown.clone()));
+
+    shutdown.cancel();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), loop_handle)
+        .await
+        .expect("the loop must end on cancellation, not wait for the sender to drop")
+        .expect("the loop task must not panic");
+
+    // The sender outlived the loop — which is the whole point.
+    drop(tx);
 }

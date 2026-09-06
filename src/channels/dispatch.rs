@@ -846,6 +846,12 @@ pub(crate) async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
+    // The loop used to end only when every `Sender` dropped, which was true
+    // while the listeners were the only producers. The gateway now holds one
+    // too (plan 313), so sender-drop alone would keep this alive until the HTTP
+    // server's state is dropped — a shutdown ordering hazard. The token ends it
+    // regardless of who still holds a sender.
+    shutdown: CancellationToken,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
@@ -855,7 +861,10 @@ pub(crate) async fn run_message_dispatch_loop(
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
-    while let Some(mut msg) = rx.recv().await {
+    while let Some(mut msg) = tokio::select! {
+        () = shutdown.cancelled() => None,
+        m = rx.recv() => m,
+    } {
         // One place decides whether replies thread. Channels fill `thread_ts`
         // unconditionally; clearing it here — before the message reaches the
         // agent, the approval relay, or history — means a channel added later

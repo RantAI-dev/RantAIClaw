@@ -86,6 +86,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
 
+    // ONE bus handle for this process. The channels supervisor publishes its
+    // sender into it on every (re)start and clears it on exit; the gateway
+    // enqueues parsed webhook messages through it instead of running a second
+    // dispatch implementation (plan 313).
+    let channel_bus = std::sync::Arc::new(crate::channels::ChannelBus::default());
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     // The gateway is held separately so we can await its drain before aborting
@@ -105,6 +111,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         initial_backoff,
         max_backoff,
         observer.clone(),
+        std::sync::Arc::clone(&channel_bus),
     );
 
     // Channels are held separately too, so shutdown can DRAIN them instead of a
@@ -118,6 +125,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         let channels_cfg = config.clone();
         let channels_shutdown = shutdown.clone();
         let channels_observer = observer.clone();
+        let channels_bus = std::sync::Arc::clone(&channel_bus);
         channels_handle = Some(spawn_component_supervisor(
             "channels",
             initial_backoff,
@@ -127,8 +135,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 let cfg = channels_cfg.clone();
                 let sd = channels_shutdown.clone();
                 let obs = channels_observer.clone();
+                let bus = std::sync::Arc::clone(&channels_bus);
                 async move {
-                    crate::channels::start_channels_with_cancellation(cfg, sd, Some(obs)).await
+                    crate::channels::start_channels_with_cancellation(cfg, sd, Some(obs), Some(bus))
+                        .await
                 }
             },
         ));
@@ -363,6 +373,10 @@ fn spawn_gateway_supervisor(
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     observer: std::sync::Arc<dyn crate::observability::Observer>,
+    // The process's channel bus, so a verified webhook is enqueued onto the same
+    // dispatch loop the channel supervisor drains rather than running a second
+    // turn implementation here (plan 313).
+    channel_bus: std::sync::Arc<crate::channels::ChannelBus>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = initial_backoff_secs.max(1);
@@ -379,6 +393,7 @@ fn spawn_gateway_supervisor(
                 shutdown.clone(),
                 Some(ready.clone()),
                 Some(observer.clone()),
+                Some(std::sync::Arc::clone(&channel_bus)),
             )
             .await;
             if shutdown.is_cancelled() {

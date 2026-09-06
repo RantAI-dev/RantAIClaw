@@ -44,6 +44,9 @@ impl Observer for LogObserver {
             ObserverEvent::ChannelMessage { channel, direction } => {
                 info!(channel = %channel, direction = %direction, "channel.message");
             }
+            ObserverEvent::ChannelEnqueueRejected { channel, reason } => {
+                info!(channel = %channel, reason = %reason, "channel.enqueue_rejected");
+            }
             ObserverEvent::HeartbeatTick => {
                 info!("heartbeat.tick");
             }

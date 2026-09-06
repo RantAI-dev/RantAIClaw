@@ -11,6 +11,7 @@ pub struct PrometheusObserver {
     agent_starts: IntCounterVec,
     tool_calls: IntCounterVec,
     channel_messages: IntCounterVec,
+    channel_enqueue_rejected: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
 
@@ -42,6 +43,15 @@ impl PrometheusObserver {
                 "Total channel messages",
             ),
             &["channel", "direction"],
+        )
+        .expect("valid metric");
+
+        let channel_enqueue_rejected = IntCounterVec::new(
+            prometheus::Opts::new(
+                "rantaiclaw_channel_enqueue_rejected_total",
+                "Inbound channel messages refused by the dispatch queue",
+            ),
+            &["channel", "reason"],
         )
         .expect("valid metric");
 
@@ -90,6 +100,9 @@ impl PrometheusObserver {
         registry.register(Box::new(agent_starts.clone())).ok();
         registry.register(Box::new(tool_calls.clone())).ok();
         registry.register(Box::new(channel_messages.clone())).ok();
+        registry
+            .register(Box::new(channel_enqueue_rejected.clone()))
+            .ok();
         registry.register(Box::new(heartbeat_ticks.clone())).ok();
         registry.register(Box::new(errors.clone())).ok();
         registry.register(Box::new(agent_duration.clone())).ok();
@@ -101,6 +114,7 @@ impl PrometheusObserver {
             agent_starts,
             tool_calls,
             channel_messages,
+            channel_enqueue_rejected,
             heartbeat_ticks,
             errors,
             agent_duration,
@@ -159,6 +173,11 @@ impl Observer for PrometheusObserver {
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages
                     .with_label_values(&[channel, direction])
+                    .inc();
+            }
+            ObserverEvent::ChannelEnqueueRejected { channel, reason } => {
+                self.channel_enqueue_rejected
+                    .with_label_values(&[channel, reason])
                     .inc();
             }
             ObserverEvent::HeartbeatTick => {
