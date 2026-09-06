@@ -61,6 +61,21 @@ pub(crate) fn discord_close_is_fatal(code: u16) -> bool {
     matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
 }
 
+/// Whether a Telegram `error_code` from `getUpdates` means the bot token is
+/// finished.
+///
+/// Telegram reports failures in the body — `{"ok": false, "error_code": …}` —
+/// so the status alone does not classify it, and it answers a **404** for a
+/// token that does not exist because the token is a path segment. `getUpdates`
+/// is a real method, so a 404 on it can only mean the token is wrong.
+///
+/// `409` (another process is polling the same token) is deliberately absent: it
+/// resolves on its own when the other process stops, and the listener already
+/// backs off for it.
+pub(crate) fn telegram_error_code_is_fatal(code: i64) -> bool {
+    matches!(code, 401 | 403 | 404)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +199,30 @@ mod tests {
             "missing_scope",
         ] {
             assert!(slack_error_is_fatal(e), "{e} must stop the listener");
+        }
+    }
+
+    #[test]
+    fn telegram_credential_error_codes_are_fatal() {
+        // 404 included on purpose: the token is a path segment, so a wrong one
+        // makes a real method look like a missing route.
+        for code in [401, 403, 404] {
+            assert!(
+                telegram_error_code_is_fatal(code),
+                "{code} means the bot token is finished"
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_transient_error_codes_are_not_fatal() {
+        // 409 is the one that matters: it means another process holds the same
+        // token, which resolves when that process stops.
+        for code in [0, 400, 409, 420, 429, 500, 502, 503] {
+            assert!(
+                !telegram_error_code_is_fatal(code),
+                "{code} must stay retryable"
+            );
         }
     }
 

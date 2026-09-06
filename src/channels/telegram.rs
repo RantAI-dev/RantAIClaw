@@ -2342,6 +2342,18 @@ impl Channel for TelegramChannel {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown Telegram API error");
 
+                // A dead token is not something to poll past. `getUpdates`
+                // answered `ok: false` with 401/403/404 forever while the
+                // listener slept five seconds and asked again, so the
+                // supervisor's backoff never escalated and `health_check`
+                // reported green the whole time.
+                if super::fault::telegram_error_code_is_fatal(error_code) {
+                    anyhow::bail!(
+                        "Telegram rejected the bot token (error_code={error_code}): {description}. \
+                         Check `bot_token` — retrying will not fix this."
+                    );
+                }
+
                 if error_code == 409 {
                     tracing::warn!(
                         "Telegram polling conflict (409): {description}. \
@@ -3366,6 +3378,83 @@ mod tests {
             Some("4242"),
             "anchor = the message"
         );
+    }
+
+    // ── The supervised-listener fault contract (plan 308) ───────────────────
+
+    /// Drive `listen` against a Bot API that answers `getUpdates` with `body`.
+    ///
+    /// `cancel_after` is for the transient cases, which are *supposed* to keep
+    /// polling: without a canceller they would run until the outer timeout, and
+    /// the test would prove nothing except that it hung.
+    async fn poll_against(
+        body: serde_json::Value,
+        cancel_after: Option<std::time::Duration>,
+    ) -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false)
+            .with_api_base(server.uri());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        if let Some(after) = cancel_after {
+            let token = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                token.cancel();
+            });
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), ch.listen(tx, cancel))
+            .await
+            .expect("listener must not hang")
+    }
+
+    /// `Channel::listen`'s contract: an auth fault returns `Err`, which is the
+    /// only thing that makes the supervisor escalate its backoff. Telegram
+    /// reports a dead token in the body, so the listener swallowed it into a
+    /// five-second poll loop that ran forever while `health_check` stayed green.
+    #[tokio::test]
+    async fn a_revoked_bot_token_returns_err_instead_of_polling_forever() {
+        let err = poll_against(
+            serde_json::json!({"ok": false, "error_code": 401, "description": "Unauthorized"}),
+            None,
+        )
+        .await
+        .expect_err("a revoked token must end the listener");
+        assert!(
+            err.to_string().contains("401"),
+            "the error must name what happened: {err}"
+        );
+    }
+
+    /// The token is a path segment, so a wrong one makes a real method look like
+    /// a missing route. Telegram's answer to a bad token is `404`.
+    #[tokio::test]
+    async fn a_not_found_bot_token_returns_err() {
+        poll_against(
+            serde_json::json!({"ok": false, "error_code": 404, "description": "Not Found"}),
+            None,
+        )
+        .await
+        .expect_err("404 on getUpdates can only mean the token is wrong");
+    }
+
+    /// The load-bearing half. A classifier that called everything fatal would
+    /// pass the two tests above and turn every 409 — another process holding the
+    /// same token, which resolves on its own — into a listener that gives up.
+    #[tokio::test]
+    async fn a_polling_conflict_keeps_retrying() {
+        poll_against(
+            serde_json::json!({"ok": false, "error_code": 409, "description": "Conflict"}),
+            Some(std::time::Duration::from_millis(500)),
+        )
+        .await
+        .expect("409 must stay retryable, not end the listener");
     }
 
     #[tokio::test]
