@@ -207,6 +207,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it used to fall into `continue`, spinning the loop at full speed on a dead
   socket. Cancellation now sends a close frame instead of dropping the socket.
 
+- **The three webhook channels stop when they are told to.** WhatsApp Cloud, Linq
+  and Nextcloud Talk receive over HTTP, so their listeners have nothing to poll —
+  each slept an hour at a time and relied on the supervisor dropping its future.
+  `traits.rs` calls that drop a backstop for channels with nothing to tear down,
+  not the contract. Each now awaits its cancellation token and returns, which also
+  removes three hour-long timers that did nothing.
+
 - **A wrong email password is reported instead of retried forever.**
   `listen_with_idle` retried every failure in its own loop, on its own backoff
   ladder that duplicated the supervisor's — so a rejected IMAP login looked
