@@ -2656,14 +2656,27 @@ impl Default for CronConfig {
 /// Task engine configuration (`[tasks]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TasksConfig {
-    /// Enable the task engine. Default: true.
+    /// Enable the task engine — the store and the agent's nine task tools.
+    /// Default: true.
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// Serve the nine `/tasks*` HTTP routes. Default: **false**.
+    ///
+    /// Separate from [`Self::enabled`] on purpose: the routes are undocumented,
+    /// sit outside the `/api/v1` rate limiter and have no consumer, so they are
+    /// not served by default — but turning the engine off to close them would
+    /// take the agent's task tools with it.
+    #[serde(default)]
+    pub api_enabled: bool,
 }
 
 impl Default for TasksConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            api_enabled: false,
+        }
     }
 }
 
