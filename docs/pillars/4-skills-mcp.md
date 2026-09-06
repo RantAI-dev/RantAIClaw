@@ -32,6 +32,8 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 | MCP curated picker | Stable |
 | MCP zero-auth setup-time validation | Stable (added v0.5.2) |
 | Auth flow per MCP server | Stable |
+| MCP tool **reach** | Partial — TUI/CLI agent and the gateway's `/api/v1` chat only. Chat channels, cron and gateway webhooks get no MCP tools, silently (issue #283) |
+| MCP crash supervision | **None.** A crashed server is not respawned. The gateway keeps one connected pool and reconnects on config change; the respawn-with-backoff stack that used to be in `src/mcp` had no caller and was deleted (plan 312, issue #282) |
 | `author_skill` authoring tool | Stable |
 
 ## Architecture
