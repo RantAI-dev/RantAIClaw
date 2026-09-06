@@ -188,6 +188,49 @@ mod tests {
         );
     }
 
+    /// A refused IMAP login needs a TLS handshake with a real server to
+    /// reproduce, so the half `an_unreachable_server_keeps_retrying_until_the_
+    /// token_is_cancelled` cannot reach is pinned by reading. The two needles
+    /// are the whole point of the change: login failures are classified apart
+    /// from everything else, and the classification is acted on.
+    #[test]
+    fn the_email_listener_separates_a_refused_login_from_a_flaky_network() {
+        let src = include_str!("email_channel.rs");
+        // Assembled at runtime so this assertion does not count itself.
+        let classify = format!("ImapConnectError::{}(anyhow!(", "Auth");
+        let act = format!("Err(ImapConnectError::{}(e)) => {{", "Auth");
+        assert!(
+            src.contains(classify.as_str()),
+            "a rejected password must be classified apart from a dropped socket"
+        );
+        assert!(
+            src.contains(act.as_str()),
+            "the reconnect loop must act on that classification, not retry it forever"
+        );
+    }
+
+    /// The Matrix sync loop needs a homeserver, so the classifier is unit-tested
+    /// in `matrix.rs` against a real SDK error and the wiring is pinned here.
+    ///
+    /// `include_str!` works whether or not `channel-matrix` is enabled, which is
+    /// the point: the file is compiled by one CI job on a different toolchain,
+    /// and this guard runs in every build.
+    #[test]
+    fn the_matrix_listener_reports_a_dead_session_and_honours_cancellation() {
+        let src = include_str!("matrix.rs");
+        let fatal = format!("if matrix_error_is_{}(&error) {{", "fatal");
+        let stop = format!("tx.is_closed() || cancel.is_{}()", "cancelled");
+        assert!(
+            src.contains(fatal.as_str()),
+            "a forgotten access token must end the listener, not be retried"
+        );
+        assert!(
+            src.contains(stop.as_str()),
+            "the sync loop must break on the shutdown token instead of waiting \
+             to have its future dropped"
+        );
+    }
+
     #[test]
     fn slack_credential_errors_are_fatal() {
         for e in [
