@@ -237,16 +237,22 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `true` | Enable the task engine — both the agent's task tools and the gateway's `/tasks*` routes |
+| `enabled` | `true` | The task engine: the store and the agent's nine task tools |
+| `api_enabled` | `false` | Serve the nine `/tasks*` HTTP routes |
 
 Notes:
 
-- One flag governs two surfaces. Setting `enabled = false` removes the nine task
-  tools from the agent's tool registry (`task_list`, `task_get`, `task_create`,
+- **Two flags, two surfaces.** `enabled = false` removes the nine task tools from
+  the agent's tool registry (`task_list`, `task_get`, `task_create`,
   `task_update_status`, `task_comment`, `task_read_comments`, `task_review`,
-  `task_create_subtask`, `task_complete_subtask`) **and** makes every `/tasks*`
-  route answer `503 Task engine is disabled`. There is no way to keep one and
-  drop the other today.
+  `task_create_subtask`, `task_complete_subtask`) **and** stops the HTTP routes.
+  `api_enabled = false` — the default — stops only the routes; the agent keeps
+  its tools. Until schema v30 there was one flag for both, so closing the HTTP
+  surface meant cutting a working capability.
+- **The HTTP routes are off on a fresh install.** They answer `503` naming
+  `api_enabled` until an operator turns them on. They are undocumented in
+  `api-v1.md`, sit outside the `/api/v1` rate limiter, and have no known
+  consumer — the console does not call them.
 - The nine `/tasks*` routes are served from the gateway's **root** router, not
   from `/api/v1`, so they are outside the `api_rate_limit` layer the versioned
   API sits behind. They require a paired bearer token whenever
