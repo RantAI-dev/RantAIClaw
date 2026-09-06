@@ -1,3 +1,4 @@
+use super::fault;
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -424,19 +425,34 @@ impl Channel for DiscordChannel {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
 
         // Get Gateway URL
-        let gw_resp: serde_json::Value = self
+        // Classify the status before parsing. A revoked token answers `401` with
+        // a JSON error body, which parses fine as a `Value`; the old code then
+        // found no `url` field, fell back to the hard-coded gateway host, and
+        // connected — so the credential failure only surfaced as a close frame
+        // several steps later, and as `Ok(())` after that.
+        let gw_http = self
             .http_client()
             .get("https://discord.com/api/v10/gateway/bot")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
-            .await?
-            .json()
             .await?;
+        let status = gw_http.status();
+        if fault::is_fatal_auth_status(status) {
+            anyhow::bail!(
+                "Discord rejected the bot token ({status}); check `bot_token` — retrying will not fix this"
+            );
+        }
+        if !status.is_success() {
+            anyhow::bail!("Discord gateway lookup failed with {status}");
+        }
+        let gw_resp: serde_json::Value = gw_http.json().await?;
 
+        // No fallback host: an answer without a `url` is not an answer, and
+        // guessing one turned a clear failure into a confusing one.
         let gw_url = gw_resp
             .get("url")
             .and_then(|u| u.as_str())
-            .unwrap_or("wss://gateway.discord.gg");
+            .ok_or_else(|| anyhow::anyhow!("Discord gateway lookup returned no url"))?;
 
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
         tracing::info!("Discord: connecting to gateway...");
@@ -494,6 +510,11 @@ impl Channel for DiscordChannel {
             tokio::select! {
                 () = cancel.cancelled() => {
                     tracing::info!("Discord channel shutting down");
+                    // Close the socket rather than dropping it: the contract in
+                    // `traits.rs` asks for the platform's own teardown, and a
+                    // dropped WebSocket leaves Discord holding the session open
+                    // until its own timeout.
+                    let _ = write.send(Message::Close(None)).await;
                     break;
                 }
                 _ = hb_rx.recv() => {
@@ -506,8 +527,33 @@ impl Channel for DiscordChannel {
                 msg = read.next() => {
                     let msg = match msg {
                         Some(Ok(Message::Text(t))) => t,
-                        Some(Ok(Message::Close(_))) | None => break,
-                        _ => continue,
+                        // A close code is the only place Discord reports a dead
+                        // credential: the HTTP handshake succeeds and the
+                        // gateway hangs up after IDENTIFY with 4004. Reporting
+                        // every close as a clean exit reset the supervisor's
+                        // backoff, so a revoked token reconnected at the initial
+                        // delay forever.
+                        Some(Ok(Message::Close(frame))) => {
+                            let code = frame.as_ref().map_or(0, |f| u16::from(f.code));
+                            let reason = frame
+                                .as_ref()
+                                .map(|f| f.reason.to_string())
+                                .unwrap_or_default();
+                            if fault::discord_close_is_fatal(code) {
+                                anyhow::bail!(
+                                    "Discord closed the gateway with {code} ({reason}); \
+                                     this needs a configuration change, not a retry"
+                                );
+                            }
+                            tracing::info!("Discord: gateway closed with {code}; reconnecting");
+                            break;
+                        }
+                        None => break,
+                        // A read error is a transport fault, not something to
+                        // poll past: `continue` on a broken stream spun this
+                        // loop at full speed against a dead socket.
+                        Some(Err(e)) => return Err(anyhow::anyhow!("Discord gateway read failed: {e}")),
+                        Some(Ok(_)) => continue,
                     };
 
                     let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {

@@ -427,7 +427,11 @@ impl LarkChannel {
     /// WS long-connection event loop.  Returns Ok(()) when the connection closes
     /// (the caller reconnects).
     #[allow(clippy::too_many_lines)]
-    async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen_ws(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
         // Resolve who we are before the first group message arrives, so the
         // mention gate has something to compare against.
         self.ensure_bot_identity().await;
@@ -486,6 +490,16 @@ impl LarkChannel {
             tokio::select! {
                 biased;
 
+                // First arm, and `biased` means it is checked first: a shutdown
+                // must not wait out a ping interval. The close frame is the
+                // teardown `traits.rs` asks for — dropping the socket leaves the
+                // long connection open on Feishu's side until its own timeout.
+                () = cancel.cancelled() => {
+                    tracing::info!("Lark: shutting down the WS connection");
+                    let _ = write.send(WsMsg::Close(None)).await;
+                    break;
+                }
+
                 _ = hb_interval.tick() => {
                     seq = seq.wrapping_add(1);
                     let ping = PbFrame {
@@ -524,7 +538,13 @@ impl LarkChannel {
                             }
                         }
                         None => { tracing::info!("Lark: WS closed — reconnecting"); break; }
-                        Some(Err(e)) => { tracing::error!("Lark: WS read error: {e}"); break; }
+                        // A transport fault, reported as one: breaking to `Ok`
+                        // told the supervisor the listener had finished cleanly,
+                        // so its backoff reset and a dead socket reconnected at
+                        // the initial delay indefinitely.
+                        Some(Err(e)) => {
+                            return Err(anyhow::anyhow!("Lark: WS read failed: {e}"));
+                        }
                     };
 
                     let frame = match PbFrame::decode(&raw[..]) {
@@ -1152,12 +1172,16 @@ impl Channel for LarkChannel {
     async fn listen(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         use crate::config::schema::LarkReceiveMode;
+        // The token used to stop here (`_cancel`), so neither mode saw it:
+        // shutdown relied on the supervisor dropping the future, which sends no
+        // WebSocket close and gives the callback server no chance to finish the
+        // requests it is serving.
         match self.receive_mode {
-            LarkReceiveMode::Websocket => self.listen_ws(tx).await,
-            LarkReceiveMode::Webhook => self.listen_http(tx).await,
+            LarkReceiveMode::Websocket => self.listen_ws(tx, cancel).await,
+            LarkReceiveMode::Webhook => self.listen_http(tx, cancel).await,
         }
     }
 
@@ -1189,6 +1213,7 @@ impl LarkChannel {
     pub async fn listen_http(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         use axum::{extract::State, routing::post, Json, Router};
 
@@ -1377,7 +1402,12 @@ impl LarkChannel {
         tracing::info!("Lark event callback server listening on {addr}");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        // Graceful shutdown is this mode's protocol teardown: in-flight event
+        // callbacks finish and the port is released, instead of the future being
+        // dropped mid-request and the socket lingering.
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { cancel.cancelled().await })
+            .await?;
 
         Ok(())
     }
@@ -1774,6 +1804,45 @@ mod placeholder_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Webhook mode must stop when the supervisor cancels it.
+    ///
+    /// `listen` took the token as `_cancel` and neither mode ever saw it, so
+    /// shutdown depended entirely on the supervisor dropping the future: the
+    /// callback server was killed mid-request and the port released only when
+    /// the task was reaped. Port 0 so the test binds whatever is free.
+    #[tokio::test]
+    async fn the_webhook_listener_stops_when_the_token_is_cancelled() {
+        let mut channel = LarkChannel::new(
+            "cli_test_app_id".into(),
+            "test_app_secret".into(),
+            "test_verification_token".into(),
+            Some(0),
+            vec!["ou_testuser123".into()],
+        );
+        channel.receive_mode = crate::config::schema::LarkReceiveMode::Webhook;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let listening = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { channel.listen(tx, cancel).await }
+        });
+
+        // Give the server a moment to bind, so the cancellation lands on a
+        // running `axum::serve` rather than before it starts.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), listening)
+            .await
+            .expect("the listener must return on cancellation, not wait to be dropped")
+            .expect("the listener task must not panic");
+        assert!(
+            outcome.is_ok(),
+            "a cancelled listener finished for a reason that is not a fault: {outcome:?}"
+        );
+    }
 
     fn make_channel() -> LarkChannel {
         LarkChannel::new(
