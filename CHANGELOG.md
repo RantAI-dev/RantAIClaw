@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0-alpha] — 2026-09-06
+
+Wave 2 of the production-readiness audit, complete: all twelve plans landed, in
+twenty commits. Where Wave 1 fixed things that were wrong, Wave 2 mostly deleted
+things that were not there — a sandbox layer with no caller, an MCP supervisor
+that never ran, config keys nothing read — and then built the one guard the
+product was missing: **an enforced daily token ceiling**. Eight channel listeners
+learned to tell their supervisor when a credential is dead and three more learned
+to stop when they are asked to, the gateway stopped running a second, divergent
+copy of the channel turn loop, and every surface that prints a token count stopped
+printing `0` when nobody reported one.
+
+**This is the first release in three that changes behaviour on an install that is
+already running.** Read the next section before upgrading.
+
+### Operator-visible behaviour changes
+
+**1. A daily token ceiling is now enforced — and on some installs it switches
+itself on.**
+
+`[cost] max_tokens_per_day` defaults to **2,000,000 tokens/day**, checked before
+every turn on every surface (TUI, `agent run`, chat channels, the gateway, cron,
+sub-agents). Past it, a turn is refused with an error naming the numbers and the
+key; at **80%** (`warn_at_percent`) a warning is logged first.
+
+**To turn it off, before you upgrade or after:**
+
+```toml
+[cost]
+max_tokens_per_day = 0   # no ceiling; usage is still counted
+# or
+enabled = false          # no ceiling and no usage record
+```
+
+Whether it switches on depends on what your `config.toml` already says, and the
+two cases were measured, not assumed:
+
+| your `config.toml` | after upgrade |
+|---|---|
+| carries `[cost] enabled = false` (what `Config::save()` has always written) | **unchanged** — no ceiling, no accounting |
+| has no `[cost]` section at all (hand-written / minimal configs) | `enabled` becomes `true`, ceiling active at 2,000,000 |
+| fresh install | ceiling active at 2,000,000 |
+
+Sizing: a heavy session with a large context can spend 50,000–150,000 tokens per
+turn, so 2,000,000 is tens of turns in a day, shared across every surface using
+the same workspace. It is a runaway brake — for a cron job or a channel that keeps
+going with nobody watching — not a budget. The failure mode it must not cause is
+"my agent stopped mid-afternoon and I do not know why": the refusal message names
+the used/limit numbers and the key, the 80% warning arrives first, and usage is on
+disk in `<workspace>/state/costs.jsonl`. The day rolls over at UTC midnight.
+
+**2. Config schema v28 → v31 — three migrations in one release.** This release
+does **not** roll back cleanly: a v31 config refuses to load on a 0.29.0-alpha
+binary with `schema_version=31 is newer than this binary supports`. Keep a copy of
+`config.toml` before first launch if you may need to go back.
+
+- **v28 → v29** drops `[memory].chunk_max_tokens` and `[reliability].api_keys`
+  from your file. Neither had a reader that acted on it. If you listed rotation
+  keys under `api_keys`, you were never getting rotation — the code advanced an
+  index and used the result to build a log line.
+- **v29 → v30** adds `[tasks].api_enabled`, default `false`. Nothing is
+  transformed, but see item 3.
+- **v30 → v31** drops `[autonomy].max_cost_per_day_cents`,
+  `[cost].daily_limit_usd` and `[cost].monthly_limit_usd`. **Nothing is
+  converted** — none of the three was ever enforced, and cents cannot become
+  tokens without prices this product does not ship. If you had set a money limit,
+  you now have the token default above.
+
+The sessions store is unchanged (v1).
+
+**3. The nine `/tasks*` HTTP routes are off by default.** They answer `503`
+naming the key until you set `[tasks].api_enabled = true`. `[tasks].enabled`
+still governs the task store and the agent's nine task tools, which are
+unaffected — the two used to be one flag.
+
+**4. `[security.sandbox]` and `[security.resources]` are gone from the code.**
+They were never part of the config schema, so **no migration removes them from
+your file** — they will keep sitting there, ignored, with the same warning the
+loader already emitted. They enforced nothing: the shell tool spawned commands
+unwrapped. The confinement that does work is **`[runtime].kind`** (`native` /
+`docker`), which the shell tool actually goes through.
+
+**5. Unstable channels will reconnect differently.** Eight listeners — Slack,
+Mattermost, Discord, Lark, Telegram, Signal, Email, Matrix — now return an error
+to their supervisor on a transport or auth fault instead of swallowing it. The
+supervisor escalates its backoff on an error and resets only on a clean exit, so a
+flapping channel now backs off further between attempts, and a **dead credential
+stops retrying** instead of reconnecting at poll rate forever. Three more —
+WhatsApp Cloud, Linq, Nextcloud Talk — gained cancellation; they have no transport
+to fault.
+
+**6. `rantaiclaw gateway` standalone queues webhook turns.** The three webhook
+handlers hand their message to the same dispatch loop every other channel uses,
+so a webhook turn now waits behind `max_in_flight` instead of being spawned free.
+A busy daemon can answer `503` + `Retry-After` to a webhook it previously
+accepted; the message is not marked seen, so the platform's own retry delivers it.
+Conversations on those three channels are now keyed by **room** rather than by
+sender, and tool approvals there use `/approve <tool>` like everywhere else
+instead of `Y`/`A`/`N`.
+
+**7. Matrix builds again**, has a `Channel Matrix (build + test)` CI job, and
+stays feature-gated (`--features channel-matrix`), out of every release binary,
+and labelled under development. Building that feature needs **rustc 1.93+**; the
+crate's own MSRV stays 1.91 and the release build is untouched.
+
+claw-ui pin bumped to **v0.3.27**.
+
 ### Added
 
 - **claw-ui pinned to v0.3.27.** Carries the console half of two changes in this
