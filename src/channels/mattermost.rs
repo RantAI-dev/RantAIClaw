@@ -253,7 +253,7 @@ impl Channel for MattermostChannel {
     async fn listen(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let channel_id = self
             .channel_id
@@ -270,7 +270,13 @@ impl Channel for MattermostChannel {
         tracing::info!("Mattermost channel listening on {}...", channel_id);
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // The poll interval is also the shutdown window: without racing the
+            // token here the listener only stops when its future is dropped,
+            // which is what `Channel::listen`'s contract asks it not to rely on.
+            tokio::select! {
+                () = cancel.cancelled() => return Ok(()),
+                () = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+            }
 
             let resp = match self
                 .http_client()
@@ -289,6 +295,16 @@ impl Channel for MattermostChannel {
                     continue;
                 }
             };
+
+            // A wrong or revoked token is not something backoff fixes. Returning
+            // `Err` is what makes the supervisor escalate instead of re-polling
+            // at the same rate forever (`Channel::listen` contract, traits.rs).
+            if crate::channels::fault::is_fatal_auth_status(resp.status()) {
+                anyhow::bail!(
+                    "Mattermost authentication failed ({}); check the bot token",
+                    resp.status()
+                );
+            }
 
             let data: serde_json::Value = match resp.json().await {
                 Ok(d) => d,
@@ -592,6 +608,85 @@ fn normalize_mattermost_content(
 
 #[cfg(test)]
 mod tests {
+    // ── The supervised-listener fault contract (plan 308) ───────────────────
+
+    async fn listen_against(
+        status: u16,
+        cancel_after: Option<std::time::Duration>,
+    ) -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_json(serde_json::json!({ "order": [], "posts": {} })),
+            )
+            .mount(&server)
+            .await;
+
+        let ch = MattermostChannel::new(
+            server.uri(),
+            "dead-token".into(),
+            Some("chan".into()),
+            vec!["*".into()],
+            false,
+            false,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        // The poll interval is 3s, so a canceller must fire AFTER the first
+        // request or it wins the race and the test measures nothing. The
+        // transient case needs one; the fatal cases must return on their own.
+        if let Some(after) = cancel_after {
+            let token = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                token.cancel();
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(20), ch.listen(tx, cancel))
+            .await
+            .expect("listener must not hang")
+    }
+
+    /// The contract in `traits.rs`: an auth fault returns `Err`, which is the
+    /// only thing that makes `supervisor::spawn_supervised_listener` escalate
+    /// its backoff. Swallowing it turns a revoked token into a poll-rate
+    /// reconnect storm while `health_check` still reports green.
+    #[tokio::test]
+    async fn a_revoked_token_returns_err_instead_of_polling_forever() {
+        let err = listen_against(401, None)
+            .await
+            .expect_err("401 must reach the supervisor");
+        assert!(
+            err.to_string().contains("authentication failed"),
+            "was: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_response_is_also_fatal() {
+        let err = listen_against(403, None)
+            .await
+            .expect_err("403 must reach the supervisor");
+        assert!(
+            err.to_string().contains("authentication failed"),
+            "was: {err}"
+        );
+    }
+
+    /// The other half, and the one that matters for not over-correcting: a 5xx
+    /// is exactly what backoff exists for, so the listener must keep polling
+    /// rather than give up on the credential.
+    #[tokio::test]
+    async fn a_server_error_does_not_end_the_listener() {
+        let result = listen_against(503, Some(std::time::Duration::from_secs(5))).await;
+        assert!(
+            result.is_ok(),
+            "a 5xx must stay retryable, got: {:?}",
+            result.err()
+        );
+    }
     /// The migration's contract: same observable threading, new mechanism.
     #[test]
     fn mattermost_threading_survives_the_migration() {
