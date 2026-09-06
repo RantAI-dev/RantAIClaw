@@ -277,6 +277,15 @@ impl Channel for SlackChannel {
                 }
             };
 
+            // See the Mattermost arm: a dead credential must reach the
+            // supervisor as `Err`, not be retried at the poll rate forever.
+            if crate::channels::fault::is_fatal_auth_status(resp.status()) {
+                anyhow::bail!(
+                    "Slack authentication failed ({}); check the bot token",
+                    resp.status()
+                );
+            }
+
             let data: serde_json::Value = match resp.json().await {
                 Ok(d) => d,
                 Err(e) => {
@@ -284,6 +293,20 @@ impl Channel for SlackChannel {
                     continue;
                 }
             };
+
+            // Slack answers 200 with `{"ok": false, "error": "..."}`, so the
+            // status check above cannot see a revoked token on its own.
+            if data.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+                let err = data
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if crate::channels::fault::slack_error_is_fatal(err) {
+                    anyhow::bail!("Slack authentication failed ({err}); check the bot token");
+                }
+                tracing::warn!("Slack poll returned ok=false ({err}); retrying");
+                continue;
+            }
 
             if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                 // Messages come newest-first, reverse to process oldest first
