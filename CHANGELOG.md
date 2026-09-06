@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **claw-ui pinned to v0.3.27.** Carries the console half of two changes in this
+  release: the totals tile stops reporting `0 tokens` / `$0.00` for a thread no
+  provider reported usage for (#112), and the Tools panel retires the money cost
+  cap the backend no longer enforces (#113). Also a contract table covering every
+  call `api.ts` exports (#111).
+
 - **One enforced daily ceiling, denominated in tokens (config schema v30 → v31).**
   `[cost] max_tokens_per_day` (default **2,000,000**) is checked **before every
   turn**, on every surface that shares a workspace: the TUI, `agent run`, chat
