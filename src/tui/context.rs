@@ -82,7 +82,13 @@ pub struct TuiContext {
     /// lines. Cleared on click, Esc, copy, and any history replacement
     /// (`/compress`, `/clear`) — anchors don't survive those.
     pub selection: Option<super::selection::Selection>,
-    pub token_usage: TokenUsage,
+    /// `None` until a provider reports usage for this session.
+    ///
+    /// Not a zeroed tally: a turn that used zero tokens does not exist, so a
+    /// rendered `0` could only ever mean "nobody told us" — and half the
+    /// backends (and every tool-only turn) tell us nothing. Every surface that
+    /// reads this must say so rather than print the zero.
+    pub token_usage: Option<TokenUsage>,
     /// Total context window of the active model, in tokens. Used by the
     /// status bar to display a `used/window  pct%` meter. `None` when the
     /// provider didn't surface a window size.
@@ -236,7 +242,7 @@ impl TuiContext {
             last_window_start: 0,
             last_chat_provenance: Vec::new(),
             selection: None,
-            token_usage: TokenUsage::default(),
+            token_usage: None,
             context_window: None,
             started_at: std::time::Instant::now(),
             last_error: None,
@@ -706,7 +712,7 @@ impl TuiContext {
         self.input_buffer.clear();
         self.pending_pastes.clear();
         self.scroll_offset = 0;
-        self.token_usage = TokenUsage::default();
+        self.token_usage = None;
         self.last_error = None;
         // `/new` empties the transcript — selection anchors are stale.
         self.selection = None;
