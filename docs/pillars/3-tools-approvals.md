@@ -2,7 +2,7 @@
 
 > **ClickUp:** [v0.6.0 — Product Completeness Beta](https://app.clickup.com/t/86exgu406) → Setup: Approvals + Resilience: Audit log · **Maturity:** App-layer stable · **Modules:** `src/tools/`, `src/approval/`, `src/security/`
 
-The blast radius surface. Every tool call routes through one approval gate before execution. Application-layer security is already strong (allowlist, injection blocking, path traversal protection, rate limiting, tool-call audit log). OS-layer containment is out of scope for v0.6.0.
+The blast radius surface. Every tool call routes through one approval gate before execution. Application-layer security is already strong (allowlist, injection blocking, path traversal protection, rate limiting, tool-call audit log). OS-layer containment is `[runtime].kind` (`native` / `docker`) and nothing else: the unwired `Sandbox` trait and its four backends were deleted in plan 305 rather than kept as a promise.
 
 ## What this pillar covers
 

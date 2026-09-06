@@ -254,10 +254,11 @@ indexmap = "2"
 calamine = { version = "0.36", optional = true }
 docx-rs = { version = "0.4", optional = true }
 
-# Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
+# Raspberry Pi GPIO (Linux only) — target-specific to avoid compile failure on macOS.
+# The `landlock` crate lived here for the sandbox backend plan 305 deleted; it had
+# no other consumer, so it goes with it.
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
-landlock = { version = "0.4" }
 
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]
@@ -286,14 +287,6 @@ peripheral-rpi = ["rppal"]
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations
 fantoccini = ["browser-native"]
-# Sandbox feature aliases used by cfg(feature = "sandbox-*")
-# sandbox-landlock is now a no-op: landlock compiles automatically on Linux
-# (via [target.'cfg(target_os = "linux")'.dependencies]) without requiring a flag.
-# Keep for backward compatibility with build scripts that pass --features sandbox-landlock.
-sandbox-landlock = []
-sandbox-bubblewrap = []
-# Backward-compatible alias for older invocations
-landlock = ["sandbox-landlock"]
 # probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG

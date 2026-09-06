@@ -90,6 +90,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **The sandbox layer, which enforced nothing.** `create_sandbox` and its
+  Landlock, bubblewrap, firejail and Docker backends — 1,129 lines and 29 tests —
+  had **no production caller**: the shell tool spawned commands unwrapped, and
+  `[security.sandbox]` selected between four things nothing constructed. It also
+  carried a **second process-spawn implementation**, so any future change to how
+  commands are spawned would have had to be mirrored into code nobody ran.
+  **What confines commands is `[runtime].kind`** (`native` / `docker`), which the
+  shell tool actually goes through; the docs that described the sandbox now say
+  so. The `[security.resources]` keys go too — `setrlimit` appears nowhere in the
+  source, so nothing ever implemented them. The `landlock` crate dependency and
+  the `sandbox-landlock` / `sandbox-bubblewrap` / `landlock` feature flags had no
+  remaining consumer and are gone with it. **The audit log stays** — it was wired
+  for tool calls in #723 and is not part of this. If OS-level confinement is
+  funded, it returns as one backend wired into the shell tool, with its config key
+  and its enforcement in the same change; git history holds the originals.
+
 - **Three Prometheus metrics that were always zero.** `rantaiclaw_tokens_used_last`,
   `rantaiclaw_active_sessions` and `rantaiclaw_queue_depth` were registered and
   scrapeable with no production emitter — every `AgentEnd` passes

@@ -4,6 +4,10 @@
 >
 > This document describes proposed approaches and may include hypothetical commands or config.
 > For current runtime behavior, see [config-reference.md](../reference/config.md), [operations-runbook.md](../operations/runbook.md), and [troubleshooting.md](../start/troubleshooting.md).
+>
+> The `SandboxConfig` / `SandboxBackend` types this proposal builds on **no longer
+> exist**: the unwired sandbox layer was deleted in plan 305. The design below is
+> kept as a record of the intent, not as a description of types you can call.
 
 ## Core Principle
 >
