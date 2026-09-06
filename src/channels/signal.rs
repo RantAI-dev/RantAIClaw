@@ -430,6 +430,18 @@ impl SignalChannel {
     }
 }
 
+/// Sleep for `delay`, or stop early if the supervisor cancels.
+///
+/// Returns `true` when it was cancelled, so the caller can leave. A bare
+/// `sleep` here meant a shutdown request waited out the whole backoff
+/// window, which grows to a minute.
+async fn sleep_or_cancel(delay: Duration, cancel: &tokio_util::sync::CancellationToken) -> bool {
+    tokio::select! {
+        () = cancel.cancelled() => true,
+        () = tokio::time::sleep(delay) => false,
+    }
+}
+
 #[async_trait]
 impl Channel for SignalChannel {
     fn name(&self) -> &str {
@@ -470,7 +482,7 @@ impl Channel for SignalChannel {
     async fn listen(
         &self,
         tx: mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         let mut url = reqwest::Url::parse(&format!("{}/api/v1/events", self.http_url))?;
         url.query_pairs_mut().append_pair("account", &self.account);
@@ -492,13 +504,27 @@ impl Channel for SignalChannel {
                 Ok(r) => {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
+                    // A rejected account or a signal-cli that refuses this
+                    // caller is not a blip: reconnecting cannot fix it, and
+                    // swallowing it kept the supervisor's backoff at its initial
+                    // delay forever.
+                    if super::fault::is_fatal_auth_status(status) {
+                        anyhow::bail!(
+                            "signal-cli refused the events stream ({status}); \
+                             check the account and the daemon's own access rules"
+                        );
+                    }
                     tracing::warn!("Signal SSE returned {status}: {body}");
-                    tokio::time::sleep(backoff.next_delay()).await;
+                    if sleep_or_cancel(backoff.next_delay(), &cancel).await {
+                        return Ok(());
+                    }
                     continue;
                 }
                 Err(e) => {
                     tracing::warn!("Signal SSE connect error: {e}, retrying...");
-                    tokio::time::sleep(backoff.next_delay()).await;
+                    if sleep_or_cancel(backoff.next_delay(), &cancel).await {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -514,7 +540,14 @@ impl Channel for SignalChannel {
             let mut buffer: Vec<u8> = Vec::new();
             let mut current_data = String::new();
 
-            while let Some(chunk) = bytes_stream.next().await {
+            while let Some(chunk) = tokio::select! {
+                // The stream is a long-lived read, so shutdown has to race it:
+                // without this arm the listener only stopped when the supervisor
+                // dropped its future, which abandons the HTTP connection instead
+                // of closing it.
+                () = cancel.cancelled() => None,
+                chunk = bytes_stream.next() => chunk,
+            } {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
@@ -597,9 +630,16 @@ impl Channel for SignalChannel {
             // used to sleep a literal 2 seconds, so a stream that was accepted
             // and immediately ended reconnected at a fixed rate forever, and
             // never escalated toward the cap.
+            if cancel.is_cancelled() {
+                tracing::info!("Signal channel shutting down");
+                return Ok(());
+            }
+
             let delay = backoff.next_delay();
             tracing::debug!("Signal SSE stream ended, reconnecting in {delay:?}...");
-            tokio::time::sleep(delay).await;
+            if sleep_or_cancel(delay, &cancel).await {
+                return Ok(());
+            }
         }
     }
 
@@ -647,6 +687,89 @@ impl Channel for SignalChannel {
 
 #[cfg(test)]
 mod tests {
+    // ── The supervised-listener fault contract (plan 308) ───────────────────
+
+    /// Drive `listen` against a signal-cli that answers the events stream with
+    /// `status`.
+    ///
+    /// `cancel_after` is for the transient cases, which are *supposed* to keep
+    /// reconnecting: without a canceller they would run until the outer timeout
+    /// and the test would prove only that it hung.
+    async fn listen_against(
+        status: u16,
+        cancel_after: Option<std::time::Duration>,
+    ) -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+
+        let ch = SignalChannel::new(
+            server.uri(),
+            "+1234567890".to_string(),
+            None,
+            vec!["*".to_string()],
+            false,
+            false,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        if let Some(after) = cancel_after {
+            let token = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                token.cancel();
+            });
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), ch.listen(tx, cancel))
+            .await
+            .expect("listener must not hang")
+    }
+
+    /// `Channel::listen`'s contract: an auth fault returns `Err`, the only thing
+    /// that makes the supervisor escalate its backoff. A refused account was
+    /// logged and retried on the SSE backoff forever.
+    #[tokio::test]
+    async fn a_refused_events_stream_returns_err_instead_of_reconnecting_forever() {
+        for status in [401, 403] {
+            let err = listen_against(status, None)
+                .await
+                .expect_err("a refused stream must end the listener");
+            assert!(
+                err.to_string().contains(&status.to_string()),
+                "the error must name what happened: {err}"
+            );
+        }
+    }
+
+    /// The load-bearing half: a classifier that called every non-2xx fatal would
+    /// pass the test above and give up on a signal-cli that was merely
+    /// restarting.
+    #[tokio::test]
+    async fn a_server_error_keeps_reconnecting() {
+        listen_against(503, Some(std::time::Duration::from_millis(500)))
+            .await
+            .expect("a 5xx must stay retryable, not end the listener");
+    }
+
+    /// The listener took its token as `_cancel` and never looked at it, so a
+    /// shutdown had to wait for the supervisor to drop the future — abandoning
+    /// the HTTP connection instead of closing it, and only after the backoff
+    /// window, which grows to a minute.
+    #[tokio::test]
+    async fn the_listener_stops_when_the_token_is_cancelled() {
+        let started = std::time::Instant::now();
+        listen_against(503, Some(std::time::Duration::from_millis(300)))
+            .await
+            .expect("a cancelled listener finished for a reason that is not a fault");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "cancellation must not wait out the reconnect backoff"
+        );
+    }
+
     /// The reset used to fire on a 2xx, before a single event was read, so a
     /// server that accepted and immediately dropped reconnected every two
     /// seconds forever without escalating toward the cap.
