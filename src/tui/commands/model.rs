@@ -147,15 +147,33 @@ impl CommandHandler for UsageCommand {
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         use crate::tui::widgets::{InfoPanel, InfoSection};
 
-        let u = &ctx.token_usage;
+        // "not reported" rather than `0`: the agent emits a usage event only
+        // when the provider sent one, and several backends never do. A zero
+        // here claimed a measurement that was never taken.
+        let counts = ctx.token_usage.as_ref().map_or_else(
+            || {
+                [
+                    "not reported".to_string(),
+                    "not reported".to_string(),
+                    "not reported".to_string(),
+                ]
+            },
+            |u| {
+                [
+                    u.prompt_tokens.to_string(),
+                    u.completion_tokens.to_string(),
+                    u.total_tokens.to_string(),
+                ]
+            },
+        );
         let panel = InfoPanel::new("Token Usage")
             .with_subtitle("this session")
             .with_footer("Esc close · `/insights` for cumulative stats")
             .section(
                 InfoSection::new("Tokens")
-                    .key_value("Prompt", u.prompt_tokens.to_string())
-                    .key_value("Completion", u.completion_tokens.to_string())
-                    .key_value("Total", u.total_tokens.to_string()),
+                    .key_value("Prompt", &counts[0])
+                    .key_value("Completion", &counts[1])
+                    .key_value("Total", &counts[2]),
             )
             .section(
                 InfoSection::new("Model")
@@ -178,6 +196,59 @@ mod tests {
     fn test_context() -> TuiContext {
         let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
         ctx
+    }
+
+    /// Rows from every section of the panel a command produced, as
+    /// `"key = value"` — enough to assert what an operator would read.
+    fn panel_rows(result: &CommandResult) -> Vec<String> {
+        let CommandResult::OpenInfoPanel(panel) = result else {
+            panic!("expected an info panel");
+        };
+        panel
+            .sections
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .filter_map(|row| match row {
+                crate::tui::widgets::InfoRow::KeyValue { key, value } => {
+                    Some(format!("{key} = {value}"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `/usage` used to render `0` for a session no provider reported usage
+    /// for. A turn that consumed zero tokens does not exist, so that zero could
+    /// only ever have meant "nobody told us" — and several backends never do.
+    #[test]
+    fn usage_says_not_reported_when_no_provider_reported() {
+        let mut ctx = test_context();
+        assert!(ctx.token_usage.is_none(), "fixture starts unreported");
+
+        let result = UsageCommand.execute("", &mut ctx).expect("panel");
+        let rows = panel_rows(&result);
+        for key in ["Prompt", "Completion", "Total"] {
+            assert!(
+                rows.contains(&format!("{key} = not reported")),
+                "{key} must not be shown as a measured zero: {rows:?}"
+            );
+        }
+    }
+
+    /// The other half: real numbers still render as numbers.
+    #[test]
+    fn usage_shows_the_counts_a_provider_reported() {
+        let mut ctx = test_context();
+        ctx.token_usage = Some(crate::tui::context::TokenUsage {
+            prompt_tokens: 120,
+            completion_tokens: 34,
+            total_tokens: 154,
+        });
+
+        let rows = panel_rows(&UsageCommand.execute("", &mut ctx).expect("panel"));
+        assert!(rows.contains(&"Prompt = 120".to_string()), "{rows:?}");
+        assert!(rows.contains(&"Completion = 34".to_string()), "{rows:?}");
+        assert!(rows.contains(&"Total = 154".to_string()), "{rows:?}");
     }
 
     #[test]
