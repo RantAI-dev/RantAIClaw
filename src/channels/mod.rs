@@ -44,7 +44,7 @@ pub(crate) mod fault;
 pub(crate) use factory::build_one;
 pub mod format;
 pub mod history;
-mod history_store;
+pub(crate) mod history_store;
 pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
@@ -538,7 +538,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // The TUI uses `start_channels_with_cancellation` instead so it can
     // restart channels in place when a channel or skill is added
     // mid-session.
-    start_channels_with_cancellation(config, CancellationToken::new(), None).await
+    start_channels_with_cancellation(config, CancellationToken::new(), None, None).await
 }
 
 /// Build and run the channel runtime until every listener exits or
@@ -551,14 +551,94 @@ pub async fn start_channels(config: Config) -> Result<()> {
 /// senders, which closes the dispatch loop and returns `Ok(())`. This lets
 /// the TUI tear the runtime down and respawn it with fresh config/skills
 /// without leaking listener tasks.
-pub async fn start_channels_with_cancellation(
-    config: Config,
-    shutdown: CancellationToken,
+/// The live message bus, so a holder that is not the channel runtime can put a
+/// parsed message onto it.
+///
+/// **Why a handle and not the `Sender` itself.** The signed-off design said the
+/// process entry point would construct the runtime and pass it down. That cannot
+/// work verbatim: `spawn_component_supervisor` RESTARTS the channels closure on
+/// failure, and [`ChannelRuntime`] owns a `Receiver`, which is neither clonable
+/// nor reusable across restarts. A moved-in runtime would leave the gateway
+/// holding a sender to a dead bus after the first restart. The handle keeps the
+/// invariant that matters — **one `ChannelRuntimeContext` alive per process** —
+/// while letting the runtime be rebuilt underneath it. Same shape as
+/// `McpPoolHandle` (plan 287).
+#[derive(Default)]
+pub struct ChannelBus {
+    tx: tokio::sync::RwLock<Option<tokio::sync::mpsc::Sender<traits::ChannelMessage>>>,
+}
+
+/// Why an enqueue was refused, so the caller can answer the platform correctly.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BusRejection {
+    /// No dispatch loop is running — the channel runtime is down or restarting.
+    Closed,
+    /// The loop is running but its queue is full.
+    Full,
+}
+
+impl ChannelBus {
+    /// Publish the sender of a freshly built runtime.
+    pub async fn publish(&self, tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) {
+        *self.tx.write().await = Some(tx);
+    }
+
+    /// Forget the sender when its runtime stops, so an enqueue is refused
+    /// rather than accepted into a bus nothing is draining.
+    pub async fn clear(&self) {
+        *self.tx.write().await = None;
+    }
+
+    /// Put a parsed message onto the bus, or say why not.
+    ///
+    /// `try_send`, never `send`: blocking here would hold an HTTP handler open
+    /// behind the agent's work, which is the coupling the whole plan removes.
+    pub async fn try_send(
+        &self,
+        msg: traits::ChannelMessage,
+    ) -> std::result::Result<(), BusRejection> {
+        let guard = self.tx.read().await;
+        let Some(tx) = guard.as_ref() else {
+            return Err(BusRejection::Closed);
+        };
+        match tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(BusRejection::Full),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(BusRejection::Closed),
+        }
+    }
+}
+
+/// Everything a channel turn needs, built exactly once per process.
+///
+/// Split out of [`start_channels_with_cancellation`] by plan 313 so the gateway
+/// can hold the bus `Sender` without constructing a second
+/// [`ChannelRuntimeContext`]. Two contexts would mean two provider caches, two
+/// route-override maps and two conversation-history maps for one process, and
+/// duplicated state drifts — which is the defect the plan exists to remove, in a
+/// new disguise.
+pub(crate) struct ChannelRuntime {
+    pub(crate) ctx: Arc<ChannelRuntimeContext>,
+    /// The configured channels, so the caller can decide whether to supervise
+    /// listeners for them. The daemon does; the gateway does not — it receives
+    /// over HTTP and only needs somewhere to put what it parsed.
+    pub(crate) channels: Vec<Arc<dyn Channel>>,
+    pub(crate) tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+    pub(crate) rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
+    pub(crate) max_in_flight_messages: usize,
+    pub(crate) initial_backoff_secs: u64,
+    pub(crate) max_backoff_secs: u64,
+}
+
+/// Build the one runtime context for this process.
+pub(crate) async fn build_channel_runtime(
+    config: &Config,
     // The process's observer when one is owned above (daemon mode). `None` ⇒
     // this is a standalone `channel start` or a TUI-hosted run, which is its own
     // process and correctly its own registry.
     observer: Option<Arc<dyn Observer>>,
-) -> Result<()> {
+) -> Result<Option<ChannelRuntime>> {
+    let config = config.clone();
     let provider_name = routing::resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -770,7 +850,7 @@ pub async fn start_channels_with_cancellation(
 
     if channels.is_empty() {
         tracing::info!("No channels configured. Run `rantaiclaw onboard` to set up channels.");
-        return Ok(());
+        return Ok(None);
     }
 
     let effective_backend = memory::effective_memory_backend_name(
@@ -803,19 +883,6 @@ pub async fn start_channels_with_cancellation(
 
     // Single message bus — all channels send messages here
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
-
-    // Spawn a listener for each channel
-    let mut handles = Vec::new();
-    for ch in &channels {
-        handles.push(supervisor::spawn_supervised_listener(
-            ch.clone(),
-            tx.clone(),
-            initial_backoff_secs,
-            max_backoff_secs,
-            shutdown.clone(),
-        ));
-    }
-    drop(tx); // Drop our copy so rx closes when all channels stop
 
     let channels_by_name = Arc::new(
         channels
@@ -945,9 +1012,112 @@ pub async fn start_channels_with_cancellation(
         )),
     });
 
-    dispatch::run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    Ok(Some(ChannelRuntime {
+        ctx: runtime_ctx,
+        channels,
+        tx,
+        rx,
+        max_in_flight_messages,
+        initial_backoff_secs,
+        max_backoff_secs,
+    }))
+}
 
-    // Wait for all channel tasks
+/// Start every configured channel's listener and run the shared dispatch loop.
+///
+/// Builds the process's one [`ChannelRuntime`] when none is handed in. The
+/// daemon hands one in so the gateway can share its bus; `channel start` and the
+/// TUI pass `None` because each is its own process.
+pub async fn start_channels_with_cancellation(
+    config: Config,
+    shutdown: CancellationToken,
+    observer: Option<Arc<dyn Observer>>,
+    // The process's bus handle when something else needs to reach this runtime
+    // — the gateway, in daemon mode. `None` ⇒ nobody else is producing.
+    bus: Option<Arc<ChannelBus>>,
+) -> Result<()> {
+    let Some(runtime) = build_channel_runtime(&config, observer).await? else {
+        return Ok(());
+    };
+    run_channel_runtime(runtime, shutdown, bus).await
+}
+
+/// Build the process's one channel runtime and drain its bus, **without**
+/// starting any listener.
+///
+/// For `rantaiclaw gateway` standalone: that process has no channel supervisor,
+/// yet it serves webhooks, so it must own the runtime itself (plan 313). It must
+/// NOT also spawn the listeners — a bare `gateway` command has never polled
+/// Telegram and starting to would be a different program.
+///
+/// `Ok(None)` when no channel is configured; the bus then stays empty and an
+/// inbound webhook is refused rather than accepted into a queue nothing drains.
+pub(crate) async fn spawn_webhook_dispatch(
+    config: &Config,
+    shutdown: CancellationToken,
+    bus: Arc<ChannelBus>,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    let Some(runtime) = build_channel_runtime(config, None).await? else {
+        return Ok(None);
+    };
+    let ChannelRuntime {
+        ctx,
+        tx,
+        rx,
+        max_in_flight_messages,
+        ..
+    } = runtime;
+    bus.publish(tx).await;
+    Ok(Some(tokio::spawn(async move {
+        dispatch::run_message_dispatch_loop(rx, ctx, max_in_flight_messages, shutdown).await;
+        bus.clear().await;
+    })))
+}
+
+/// Supervise the listeners and run the dispatch loop for an already-built runtime.
+pub(crate) async fn run_channel_runtime(
+    runtime: ChannelRuntime,
+    shutdown: CancellationToken,
+    bus: Option<Arc<ChannelBus>>,
+) -> Result<()> {
+    let ChannelRuntime {
+        ctx,
+        channels,
+        tx,
+        rx,
+        max_in_flight_messages,
+        initial_backoff_secs,
+        max_backoff_secs,
+    } = runtime;
+
+    let mut handles = Vec::new();
+    for ch in &channels {
+        handles.push(supervisor::spawn_supervised_listener(
+            ch.clone(),
+            tx.clone(),
+            initial_backoff_secs,
+            max_backoff_secs,
+            shutdown.clone(),
+        ));
+    }
+    // Publish before dropping our copy: the bus keeps its own clone, so the
+    // gateway can enqueue for as long as this runtime lives. Cleared on exit so
+    // an inbound webhook during a restart is refused rather than accepted into a
+    // bus nothing is draining.
+    if let Some(ref bus) = bus {
+        bus.publish(tx.clone()).await;
+    }
+    // Drop our copy so `rx` closes when all listeners stop. Any sender the
+    // gateway holds keeps the loop alive past that, which is why the loop also
+    // watches the shutdown token.
+    drop(tx);
+
+    dispatch::run_message_dispatch_loop(rx, ctx, max_in_flight_messages, shutdown.clone()).await;
+
+    if let Some(ref bus) = bus {
+        bus.clear().await;
+    }
+
     for h in handles {
         let _ = h.await;
     }

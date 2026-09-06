@@ -144,9 +144,7 @@ fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
         tools_factory: Arc::new(|_: &Config| Vec::new()),
         webhook_secret_hash: None,
         pairing: Arc::new(PairingGuard::new(require_pairing, tokens)),
-        channel_approvals: Arc::new(
-            rantaiclaw::gateway::channel_approval::ChannelApprovalStore::default(),
-        ),
+        channel_bus: Arc::new(rantaiclaw::channels::ChannelBus::default()),
         web_approvals: Arc::new(rantaiclaw::security::PendingApprovals::default()),
         mcp: Arc::new(rantaiclaw::mcp::discover::McpPoolHandle::default()),
         trust_forwarded_headers: false,

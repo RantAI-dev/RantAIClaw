@@ -442,7 +442,7 @@ mod tests {
         // all with pairing off is the surface's own documented shape.
         config.gateway.require_pairing = false;
         let (_state, app) =
-            crate::gateway::build_gateway_router(config, None).expect("router builds");
+            crate::gateway::build_gateway_router(config, None, None).expect("router builds");
         let res = app
             .oneshot(
                 axum::http::Request::builder()

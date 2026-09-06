@@ -54,6 +54,18 @@ pub enum ObserverEvent {
         /// `"inbound"` or `"outbound"`.
         direction: String,
     },
+    /// A parsed inbound channel message could not be handed to the dispatch
+    /// loop, because no loop is running or its queue is saturated.
+    ///
+    /// The sender was answered `503` and the idempotency claim released, so the
+    /// message is not lost — but it never reached the agent, and that is
+    /// invisible from the outside unless it is counted.
+    ChannelEnqueueRejected {
+        /// Channel name (e.g. `"whatsapp"`).
+        channel: String,
+        /// `"closed"` (no dispatch loop) or `"full"` (queue saturated).
+        reason: String,
+    },
     /// Periodic heartbeat tick from the runtime keep-alive loop.
     HeartbeatTick,
     /// An error occurred in a named component.
