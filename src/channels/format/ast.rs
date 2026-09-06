@@ -607,7 +607,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n"
-            + &" ".repeat(depth * 2)
+            // `+ &String` compiles only while nothing else implements
+            // `Add<_> for String`. Under `--features channel-matrix`,
+            // matrix-sdk pulls `decancer`, which adds
+            // `impl Add<Translation> for String` and makes the deref
+            // coercion ambiguous. `as_str()` names the `Add<&str>` impl.
+            + " ".repeat(depth * 2).as_str()
             + "- deepest"
     }
 

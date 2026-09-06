@@ -61,6 +61,7 @@ run_gate() {
   local lint_result="${LINT_RESULT:-skipped}"
   local test_result="${TEST_RESULT:-skipped}"
   local channel_lark_result="${CHANNEL_LARK_RESULT:-skipped}"
+  local channel_matrix_result="${CHANNEL_MATRIX_RESULT:-skipped}"
   local features_result="${FEATURES_RESULT:-skipped}"
   local e2e_result="${E2E_RESULT:-skipped}"
   local bench_compile_result="${BENCH_COMPILE_RESULT:-skipped}"
@@ -72,6 +73,7 @@ run_gate() {
   echo "lint=${lint_result}"
   echo "test=${test_result}"
   echo "channel_lark=${channel_lark_result}"
+  echo "channel_matrix=${channel_matrix_result}"
   echo "features=${features_result}"
   echo "e2e=${e2e_result}"
   echo "bench_compile=${bench_compile_result}"
@@ -109,6 +111,7 @@ run_gate() {
   require_success "Lint" "$lint_result" || return 1
   require_success "Unit tests" "$test_result" || return 1
   require_success "channel-lark build/test" "$channel_lark_result" || return 1
+  require_success "channel-matrix build/test" "$channel_matrix_result" || return 1
   require_success "Feature matrix" "$features_result" || return 1
   require_success "Bench compile" "$bench_compile_result" || return 1
   require_success "E2E" "$e2e_result" || return 1
@@ -150,6 +153,7 @@ if [ "${1:-}" = "--self-test" ]; then
   pr_rust_green=(
     EVENT_NAME=pull_request RUST_CHANGED=true IDENTITY_RESULT=success
     LINT_RESULT=success TEST_RESULT=success CHANNEL_LARK_RESULT=success
+    CHANNEL_MATRIX_RESULT=success
     FEATURES_RESULT=success BENCH_COMPILE_RESULT=success E2E_RESULT=success
     BUILD_RESULT=success
   )
@@ -176,6 +180,15 @@ if [ "${1:-}" = "--self-test" ]; then
   expect 1 "a skipped channel-lark blocks a Rust PR" \
     "${pr_rust_green[@]}" CHANNEL_LARK_RESULT=skipped
 
+  # Same pair for channel-matrix. Both arms, not just the failure one: a job
+  # that reports nothing is how a required check silently stops guarding, and
+  # `channel-matrix` exists precisely because this channel was guarded by
+  # nothing for months.
+  expect 1 "a failing channel-matrix blocks a Rust PR" \
+    "${pr_rust_green[@]}" CHANNEL_MATRIX_RESULT=failure
+  expect 1 "a skipped channel-matrix blocks a Rust PR" \
+    "${pr_rust_green[@]}" CHANNEL_MATRIX_RESULT=skipped
+
   # regression: docs were only checked on pushes.
   expect 1 "failing docs lint blocks a Rust PR" \
     "${pr_rust_green[@]}" DOCS_CHANGED=true DOCS_RESULT=failure
@@ -199,11 +212,13 @@ if [ "${1:-}" = "--self-test" ]; then
 
   expect 0 "a green push merges" \
     EVENT_NAME=push RUST_CHANGED=true IDENTITY_RESULT=success LINT_RESULT=success \
-    TEST_RESULT=success CHANNEL_LARK_RESULT=success FEATURES_RESULT=success \
+    TEST_RESULT=success CHANNEL_LARK_RESULT=success CHANNEL_MATRIX_RESULT=success \
+    FEATURES_RESULT=success \
     E2E_RESULT=success BENCH_COMPILE_RESULT=success BUILD_RESULT=success
   expect 1 "a failing e2e blocks a push" \
     EVENT_NAME=push RUST_CHANGED=true IDENTITY_RESULT=success LINT_RESULT=success \
-    TEST_RESULT=success CHANNEL_LARK_RESULT=success FEATURES_RESULT=success \
+    TEST_RESULT=success CHANNEL_LARK_RESULT=success CHANNEL_MATRIX_RESULT=success \
+    FEATURES_RESULT=success \
     E2E_RESULT=failure BENCH_COMPILE_RESULT=success BUILD_RESULT=success
 
   if [ "$failures" -gt 0 ]; then

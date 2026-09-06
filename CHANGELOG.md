@@ -109,6 +109,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Matrix channel compiles again, and its tests run for the first time.**
+  `matrix-sdk` 0.16 overflowed the rustc type-check recursion budget, so no CI job
+  could build `src/channels/matrix.rs` — 1,194 lines and 31 tests checked by
+  nothing, with a type error in the test module nobody had ever seen. The pin
+  moves to 0.18, which type-checks at the default limit; the three stale test
+  assertions are fixed (`allowed_users` became `Arc<RwLock<Vec<String>>>` when the
+  allowlist was made runtime-mutable); and a **`Channel Matrix (build + test)` CI
+  job** now builds and tests it on every Rust PR, wired into the required-status
+  gate. Matrix stays feature-gated (`--features channel-matrix`), ships in no
+  release binary, and remains outside the supported tier — labelled *under
+  development* — because it has not been driven live against a homeserver.
+  **Building with `--features channel-matrix` now needs rustc 1.93 or newer**;
+  `matrix-sdk` declares that MSRV and no release of it both type-checks and
+  builds on 1.92. Nothing else moved: the crate's declared MSRV stays 1.91, every
+  other CI job stays on 1.92.0, and the release build is untouched — an
+  unactivated optional dependency does not impose its `rust-version`.
+
 - **Webhook-delivered WhatsApp and Linq messages now run under the operator's
   `[multimodal]` caps.** The gateway constructed its own channel instances for the
   webhook path while the channel factory built separate ones for every other

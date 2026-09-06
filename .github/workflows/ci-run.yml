@@ -152,8 +152,8 @@ jobs:
     # until this job existed. (It also used to be the only one of the two that
     # ran on a PR at all; the matrix is no longer label-gated.)
     #
-    # Unlike `channel-matrix`, this feature has no upstream blocker: it pulls only
-    # `prost`. Verified building clean at f189422 in ~3m.
+    # It pulls only `prost`, so it is cheap. Verified building clean at f189422
+    # in ~3m. `channel-matrix` now has its own job below for the same reason.
     channel-lark:
         name: Channel Lark (build + test)
         needs: [changes, lint]
@@ -171,6 +171,54 @@ jobs:
             - name: Build and test channel-lark
               run: cargo test --locked --features channel-lark --lib channels::lark
 
+    # `channel-matrix` gets its own job for the same reason `channel-lark` does,
+    # and for a sharper one: until the pin moved to matrix-sdk 0.18 this channel
+    # could not be compiled at all (0.16 overflowed the rustc type-check
+    # recursion budget), so its 1,194 lines and 31 tests were checked by nothing
+    # and its test module carried a type error that had never been seen. A
+    # channel with no CI job is exactly how that rotted unnoticed.
+    #
+    # Not `paths:`-filtered on purpose. A filtered job reports nothing on PRs
+    # that miss the filter, and a required check that never reports leaves the
+    # PR pending forever (#699). It runs on the same `rust_changed` condition as
+    # every other Rust job; the rust-cache keyed `channel-matrix` keeps the
+    # matrix-sdk tree warm so only the first run pays for its ~67 extra crates.
+    channel-matrix:
+        name: Channel Matrix (build + test)
+        needs: [changes, lint]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        runs-on: ubuntu-latest
+        timeout-minutes: 35
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            # 1.93, not the 1.92.0 every other job pins: matrix-sdk 0.17 and 0.18
+            # both declare `rust-version = "1.93"`, and there is no matrix-sdk
+            # release that both type-checks at the default recursion limit AND
+            # builds on 1.92. Confined to this job on purpose — moving the repo
+            # to 1.93 would touch ten workflow pins, the release build and the
+            # crate's declared MSRV (1.91), which is a product decision and not a
+            # side effect of a channel fix.
+            #
+            # Nothing else is affected: `channel-matrix` is not a default feature,
+            # and `cargo +1.92.0 check --lib` passes with matrix-sdk 0.18 in
+            # Cargo.lock — an unactivated optional dependency does not impose its
+            # rust-version on the build.
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.93.0
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: channel-matrix
+            - name: Build and test channel-matrix
+              run: cargo test --locked --features channel-matrix --lib channels::matrix
+            # `--lib` alone is not enough to claim the feature builds. Turning it
+            # on pulls `decancer`, whose `impl Add<Translation> for String` makes
+            # `String + &String` ambiguous — which broke two integration tests
+            # (`tests/kb/chunk_test.rs`) that no `--lib` run touches. Checking
+            # every target is what makes "builds with channel-matrix" true.
+            - name: Check every target under channel-matrix
+              run: cargo check --locked --features channel-matrix --all-targets
+
     features:
         name: Features (${{ matrix.name }})
         needs: [changes, lint]
@@ -184,13 +232,13 @@ jobs:
         strategy:
             fail-fast: false
             matrix:
-                # `all-features` is intentionally omitted: matrix-sdk-0.16
-                # blows past the type-check recursion budget under
-                # --all-features, and the fix has to land upstream (a
-                # `#![recursion_limit]` bump in their lib.rs). Track via
-                # a follow-up issue and re-add the entry once matrix-sdk
-                # ships a build that type-checks at the default 128 limit
-                # or we patch them via [patch.crates-io].
+                # `all-features` is still omitted, but no longer because of
+                # matrix-sdk: 0.18 type-checks at the default limit, and
+                # `channel-matrix` has its own job above. What `all-features`
+                # would additionally pull is the hardware/probe/postgres set
+                # (rppal, probe-rs and ~50 of its deps, tokio-postgres), which
+                # is a separate cost question from this one. Re-adding it is a
+                # follow-up, not a side effect of the matrix pin bump.
                 include:
                     - name: no-default-features
                       args: --no-default-features
@@ -391,6 +439,7 @@ jobs:
                 lint,
                 test,
                 channel-lark,
+                channel-matrix,
                 features,
                 e2e,
                 bench-compile,
@@ -420,6 +469,7 @@ jobs:
                   LINT_RESULT: ${{ needs.lint.result }}
                   TEST_RESULT: ${{ needs.test.result }}
                   CHANNEL_LARK_RESULT: ${{ needs.channel-lark.result }}
+                  CHANNEL_MATRIX_RESULT: ${{ needs.channel-matrix.result }}
                   FEATURES_RESULT: ${{ needs.features.result }}
                   E2E_RESULT: ${{ needs.e2e.result }}
                   BENCH_COMPILE_RESULT: ${{ needs.bench-compile.result }}
