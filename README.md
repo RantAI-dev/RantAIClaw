@@ -170,11 +170,14 @@ scripts, so their code-executing subcommands are classified Medium.
 
 A stale document asserting an active security control is worse than silence, so:
 
-- **`[security.sandbox]` has no effect today.** The `Sandbox` trait and its Landlock,
-  bubblewrap, firejail and Docker backends exist, but `create_sandbox` has **no
-  production caller** and the shell tool spawns commands unwrapped. Wiring it is a
-  tracked follow-up (`plans/215`). For real in-process confinement today, use
-  **`[runtime].kind`** — `native` or `docker`.
+- **There is no OS sandbox layer, and `[security.sandbox]` is gone.** A `Sandbox`
+  trait with Landlock, bubblewrap, firejail and Docker backends used to exist here
+  with no production caller — the shell tool spawned commands unwrapped, and the
+  config key selected between four things nothing constructed. It was deleted
+  rather than left as a promise. **What confines commands is `[runtime].kind`** —
+  `native` or `docker` — which the shell tool actually goes through. Writing
+  `[security.*]` produces an `unknown config key` warning at load, as it did
+  before; that has not changed.
 - **The tool-call audit trail is on, but `[security.audit]` still configures
   nothing.** Every tool call — executed and refused — now writes one JSON record to
   `<profile>/audit.log` (channel, tool name, approved, allowed, succeeded,
