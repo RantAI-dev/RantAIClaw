@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[tasks].api_enabled`, default `false` (config schema v29 → v30).** The nine
+  `/tasks*` gateway routes are now opt-in. They are undocumented in `api-v1.md`,
+  sit outside the `/api/v1` rate limiter and have no known consumer, so a fresh
+  install stops serving them; they answer `503` naming the key until an operator
+  turns them on. **`[tasks].enabled` keeps its `true` default** and its meaning —
+  the task store and the agent's nine task tools — because the two used to be one
+  flag, and closing the HTTP surface meant cutting a working agent capability.
+  An install that was using those routes must set `api_enabled = true`.
+
 - **Token counts are real where a provider reports them.** Every token count in
   the product was a hard-coded zero: no client parsed the `usage` block the major
   APIs return, and `ChatResponse` had nowhere to put one. `ChatResponse` now

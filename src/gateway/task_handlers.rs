@@ -46,6 +46,39 @@ fn require_auth(state: &AppState, headers: &HeaderMap) -> Option<TaskResponse> {
     None
 }
 
+/// The two flags every `/tasks*` handler must clear, in one place.
+///
+/// `tasks.enabled` governs the task engine as a whole — the store and the nine
+/// agent tools. `tasks.api_enabled` governs ONLY this HTTP surface and defaults
+/// to `false`: the routes are undocumented, sit outside the `/api/v1` rate
+/// limiter, and have no consumer (claw-ui does not call them), so they are not
+/// served to every install by default. Turning the engine off would have taken
+/// the agent's task tools with it, which is why this is a second key rather than
+/// a flipped default on the first.
+///
+/// Read per request, not at route registration, so a hot-reloaded config takes
+/// effect without a restart — the same shape `cron_api::ensure_cron_enabled`
+/// uses.
+fn api_gate(config: &crate::config::Config) -> Option<TaskResponse> {
+    if !config.tasks.enabled {
+        return Some(err_disabled());
+    }
+    if !config.tasks.api_enabled {
+        return Some(err_api_disabled());
+    }
+    None
+}
+
+fn err_api_disabled() -> TaskResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "The /tasks HTTP API is off. Set [tasks].api_enabled = true to serve it. \
+                      The agent's task tools are unaffected by this flag."
+        })),
+    )
+}
+
 fn err_disabled() -> TaskResponse {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -139,8 +172,8 @@ pub async fn handle_list_tasks(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     let filter = match query.to_filter() {
@@ -163,8 +196,8 @@ pub async fn handle_create_task(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     if body.title.trim().is_empty() {
@@ -186,8 +219,8 @@ pub async fn handle_get_task(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     match tasks::get_task_detail(&config, &id) {
@@ -206,8 +239,8 @@ pub async fn handle_update_task(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     // Validate status transition if status is being changed
@@ -239,8 +272,8 @@ pub async fn handle_delete_task(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     match tasks::delete_task(&config, &id) {
@@ -259,8 +292,8 @@ pub async fn handle_review_task(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     let task = match tasks::get_task(&config, &id) {
@@ -329,8 +362,8 @@ pub async fn handle_list_comments(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     match tasks::list_comments(&config, &id) {
@@ -349,8 +382,8 @@ pub async fn handle_add_comment(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     if body.content.trim().is_empty() {
@@ -385,8 +418,8 @@ pub async fn handle_list_events(
         return err;
     }
     let config = state.config.lock();
-    if !config.tasks.enabled {
-        return err_disabled();
+    if let Some(refusal) = api_gate(&config) {
+        return refusal;
     }
 
     match tasks::list_events(&config, &id) {
@@ -399,6 +432,104 @@ pub async fn handle_list_events(
 mod tests {
     use super::*;
     use crate::test_env::{HomeGuard, ENV_LOCK};
+
+    // ── The HTTP surface is opt-in (plan 311) ───────────────────────────────
+
+    async fn tasks_status(mut config: crate::config::Config) -> u16 {
+        use tower::ServiceExt as _;
+        // `require_auth` runs before the gate, so pairing has to be off for this
+        // to measure the gate rather than the bearer check. That it answers at
+        // all with pairing off is the surface's own documented shape.
+        config.gateway.require_pairing = false;
+        let (_state, app) =
+            crate::gateway::build_gateway_router(config, None).expect("router builds");
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tasks")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        res.status().as_u16()
+    }
+
+    /// The default. The nine routes are undocumented, sit outside the
+    /// `/api/v1` rate limiter and have no consumer, so a fresh install must not
+    /// serve them.
+    #[tokio::test]
+    async fn the_tasks_api_is_off_on_a_default_config() {
+        let config = crate::config::Config::default();
+        assert!(
+            !config.tasks.api_enabled,
+            "the default must be off, not merely gated"
+        );
+        assert_eq!(tasks_status(config).await, 503);
+    }
+
+    /// The other half: the operator can turn it on, and it serves.
+    #[tokio::test]
+    async fn the_tasks_api_serves_once_the_operator_enables_it() {
+        let _lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(tmp.path());
+
+        let mut config = crate::config::Config::default();
+        config.tasks.api_enabled = true;
+        config.workspace_dir = tmp.path().to_path_buf();
+        assert_eq!(tasks_status(config).await, 200);
+    }
+
+    /// `api_enabled` governs ONLY the HTTP surface. Turning the engine off is a
+    /// different, larger statement — it takes the agent's nine task tools with
+    /// it — and it must still refuse, with the engine's own message.
+    #[tokio::test]
+    async fn the_engine_flag_still_refuses_even_with_the_api_enabled() {
+        let mut config = crate::config::Config::default();
+        config.tasks.enabled = false;
+        config.tasks.api_enabled = true;
+
+        let refusal = api_gate(&config).expect("a disabled engine refuses");
+        assert_eq!(refusal.0.as_u16(), 503);
+        let body = refusal.1 .0;
+        assert_eq!(body["error"], "Task engine is disabled");
+    }
+
+    #[test]
+    fn the_api_refusal_names_the_key_and_says_the_tools_are_unaffected() {
+        let mut config = crate::config::Config::default();
+        config.tasks.api_enabled = false;
+        let refusal = api_gate(&config).expect("a disabled API refuses");
+        let msg = refusal.1 .0["error"]
+            .as_str()
+            .expect("error is a string")
+            .to_string();
+        assert!(msg.contains("api_enabled"), "was: {msg}");
+        assert!(msg.contains("task tools are unaffected"), "was: {msg}");
+    }
+
+    /// The contract is not "one handler checks the gate" — it is "no `/tasks*`
+    /// handler serves without it". Nine handlers exist; a tenth added without
+    /// the call would be served on a default install, which is the state this
+    /// plan exists to end.
+    #[test]
+    fn every_task_handler_goes_through_the_gate() {
+        let src = include_str!("task_handlers.rs");
+        // Assembled at runtime so this assertion does not count itself.
+        // Split so the source of this line does not itself contain the needle.
+        let handler = format!("pub async fn {}_", "handle");
+        // The handler call site, not the bare function name: the tests below
+        // call `api_gate` directly and would otherwise be counted as handlers.
+        let gate = format!("if let Some(refusal) = api_{}(&config) {{", "gate");
+        let handlers = src.matches(handler.as_str()).count();
+        let gates = src.matches(gate.as_str()).count();
+        assert_eq!(handlers, 9, "handler count moved; update this guard");
+        assert_eq!(
+            gates, handlers,
+            "{handlers} handlers but {gates} gate calls — one serves ungated"
+        );
+    }
 
     /// Build the message `tasks::store::open` actually produces on failure, so
     /// the assertion is against a real leak and not an invented one.

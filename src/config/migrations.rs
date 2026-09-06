@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 29;
+pub const CURRENT_VERSION: u32 = 30;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -405,7 +405,22 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v29(raw);
     }
 
-    // Future migrations (v30, …) inserted here in order.
+    // v29 → v30: `[tasks].api_enabled` (bool, default `false`) was added — the
+    // nine `/tasks*` HTTP routes are now opt-in, separately from
+    // `[tasks].enabled`, which keeps governing the store and the agent's task
+    // tools. Additive field with a serde default: a config that lacks it
+    // deserialises fine and gains `false` on the next write, so there is nothing
+    // to transform. This arm exists only to burn a version slot so the
+    // schema_drift fingerprint can be accepted with intent.
+    //
+    // The default is a behaviour change for an install that was relying on those
+    // routes: they answer 503 until `api_enabled = true`. Deliberate — the
+    // surface is undocumented, unrate-limited and has no known consumer.
+    if from < 30 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v31, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -914,6 +929,38 @@ backend = \"markdown\"
         let mut v = parse("schema_version = -1\n");
         let err = migrate(&mut v).expect_err("negative version must be rejected");
         assert!(format!("{err:#}").contains("negative"));
+    }
+
+    /// A config written before v30 has no `[tasks].api_enabled`, and must come
+    /// out of the migration still without one — the serde default supplies
+    /// `false` at load, and inventing the key here would write a value the
+    /// operator never chose into their file.
+    #[test]
+    fn v30_does_not_invent_the_tasks_api_key() {
+        let mut v = parse("schema_version = 29\n[tasks]\nenabled = true\n");
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        let tasks = v
+            .get("tasks")
+            .and_then(Value::as_table)
+            .expect("tasks survives");
+        assert!(
+            tasks.get("api_enabled").is_none(),
+            "the migration must not write a key the operator did not set"
+        );
+        assert_eq!(tasks.get("enabled").and_then(Value::as_bool), Some(true));
+    }
+
+    /// And the value an operator DID set must survive the bump untouched.
+    #[test]
+    fn v30_keeps_an_explicit_tasks_api_setting() {
+        let mut v = parse("schema_version = 29\n[tasks]\napi_enabled = true\n");
+        assert!(migrate(&mut v).unwrap());
+        let tasks = v.get("tasks").and_then(Value::as_table).expect("tasks");
+        assert_eq!(
+            tasks.get("api_enabled").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     /// Both keys were accepted and read by nothing that acted on them. A config
