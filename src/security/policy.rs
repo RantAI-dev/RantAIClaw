@@ -989,8 +989,9 @@ impl SecurityPolicy {
     /// pdf_read/image_info), NOT the shell tool. An allowlisted `cat`/`grep` in
     /// the shell can still read any path — `forbidden_paths` does not confine
     /// shell reads. Use a lower autonomy level or `[runtime].kind` for shell
-    /// confinement (OS sandboxing via `[security.sandbox]` is a roadmap item,
-    /// not yet wired).
+    /// confinement — that is the only OS-level containment this product has.
+    /// `[security.sandbox]` used to be named here as a roadmap item; the layer
+    /// it configured was deleted in plan 305 rather than left as a promise.
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Directories that are ALWAYS denied to file tools, independent of the
         // operator's `forbidden_paths` config. The config list can only ADD to

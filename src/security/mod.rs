@@ -1,34 +1,24 @@
-//! Security subsystem for policy enforcement, sandboxing, and secret management.
+//! Security subsystem for policy enforcement, auditing, and secret management.
 //!
 //! This module provides the security infrastructure for RantaiClaw. The core type
 //! [`SecurityPolicy`] defines autonomy levels, workspace boundaries, and
 //! access-control rules that are enforced across the tool and runtime subsystems.
 //! [`PairingGuard`] implements device pairing for channel authentication, and
-//! [`SecretStore`] handles encrypted credential storage.
+//! [`SecretStore`] handles encrypted credential storage. [`AuditLogger`] writes
+//! the tool-call trail, wired at the agent's approval chokepoint.
 //!
-//! The [`Sandbox`] trait defined in [`traits`] abstracts OS-level isolation
-//! backends (Docker, Firejail, Bubblewrap, Landlock), and [`AuditLogger`]
-//! defines a security-event log. **Neither is currently wired into the runtime**
-//! (as of 2026-08): `create_sandbox` and `AuditLogger` have no production
-//! callers, so `[security.sandbox]`/`[security.audit]` config has no effect
-//! today. In-process command confinement is available via `[runtime].kind`.
-//! Wiring these is tracked in `plans/215`/`plans/218`.
+//! **There is no sandbox layer here.** A `Sandbox` trait with Docker, Firejail,
+//! Bubblewrap and Landlock backends used to live in this module; it had no
+//! production caller, `[security.sandbox]` configured nothing, and it carried a
+//! second process-spawn implementation that any change to command spawning would
+//! have had to be mirrored into. It was deleted in plan 305 — git history holds
+//! it. **What confines commands today is `[runtime].kind`** (`native` /
+//! `docker`), which the shell tool actually goes through.
 //!
-//! # Extension
-//!
-//! To add a new sandbox backend, implement [`Sandbox`] in a new submodule and
-//! register it in [`detect::create_sandbox`]. See `AGENTS.md` §7.5 for security
-//! change guidelines.
+//! If OS-level confinement is funded, it returns as ONE backend wired into the
+//! shell tool, with its config key and its enforcement in the same change.
 
 pub mod audit;
-#[cfg(feature = "sandbox-bubblewrap")]
-pub mod bubblewrap;
-pub mod detect;
-pub mod docker;
-#[cfg(target_os = "linux")]
-pub mod firejail;
-#[cfg(target_os = "linux")]
-pub mod landlock;
 pub mod login;
 pub mod pairing;
 pub mod pairing_store;
@@ -36,12 +26,9 @@ pub mod pending;
 pub mod policy;
 pub mod runtime_overlay;
 pub mod secrets;
-pub mod traits;
 
 #[allow(unused_imports)]
 pub use audit::{record_tool_call, AuditEvent, AuditEventType, AuditLogger, ToolCallRecord};
-#[allow(unused_imports)]
-pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 #[allow(unused_imports)]
@@ -49,8 +36,6 @@ pub use pending::{current_turn_scope, Decision, PendingApprovals, PendingRequest
 pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
-#[allow(unused_imports)]
-pub use traits::{NoopSandbox, Sandbox};
 
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
