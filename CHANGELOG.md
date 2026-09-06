@@ -207,6 +207,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it used to fall into `continue`, spinning the loop at full speed on a dead
   socket. Cancellation now sends a close frame instead of dropping the socket.
 
+- **A wrong email password is reported instead of retried forever.**
+  `listen_with_idle` retried every failure in its own loop, on its own backoff
+  ladder that duplicated the supervisor's — so a rejected IMAP login looked
+  exactly like a flaky network and the supervisor was told about neither.
+  `connect_imap` now separates a refused login from everything before it (DNS,
+  TCP, TLS), and a refused login ends the listener. The channel also honours its
+  cancellation token for the first time: the IDLE wait — which defaults to **29
+  minutes** — races `cancel.cancelled()`, the reconnect sleeps do too, and a
+  cancelled session issues `LOGOUT` so the server releases the mailbox.
+
+- **The Matrix listener reports a dead session and stops when asked.** Every sync
+  error was logged as "retrying..." and slept five seconds, including
+  `M_UNKNOWN_TOKEN` — which a homeserver that has forgotten this access token
+  answers with forever. That now ends the listener; `M_FORBIDDEN`, `M_NOT_FOUND`
+  and transport failures still retry. The token was taken as `_cancel`, so the
+  sync loop only stopped when its future was dropped mid-request; it now breaks
+  between requests, and the five-second retry sleep is cancellable.
+
 - **A revoked Telegram bot token no longer polls forever.** Telegram reports
   failures in the body (`{"ok": false, "error_code": …}`), and the listener slept
   five seconds and asked again for every one of them — including `401`, `403` and

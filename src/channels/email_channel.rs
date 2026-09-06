@@ -656,12 +656,14 @@ impl EmailChannel {
     }
 
     /// Connect to IMAP server with TLS and authenticate
-    async fn connect_imap(&self) -> Result<ImapSession> {
+    async fn connect_imap(&self) -> std::result::Result<ImapSession, ImapConnectError> {
         let addr = format!("{}:{}", self.config.imap_host, self.config.imap_port);
         debug!("Connecting to IMAP server at {}", addr);
 
         // Connect TCP
-        let tcp = TcpStream::connect(&addr).await?;
+        let tcp = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| ImapConnectError::Transient(e.into()))?;
 
         // Establish TLS using rustls
         let certs = RootCertStore {
@@ -671,17 +673,27 @@ impl EmailChannel {
             .with_root_certificates(certs)
             .with_no_client_auth();
         let tls_stream: TlsConnector = Arc::new(config).into();
-        let sni: DnsName = self.config.imap_host.clone().try_into()?;
-        let stream = tls_stream.connect(sni.into(), tcp).await?;
+        let sni: DnsName = self
+            .config
+            .imap_host
+            .clone()
+            .try_into()
+            .map_err(|e| ImapConnectError::Transient(anyhow!("invalid IMAP host: {e}")))?;
+        let stream = tls_stream
+            .connect(sni.into(), tcp)
+            .await
+            .map_err(|e| ImapConnectError::Transient(e.into()))?;
 
         // Create IMAP client
         let client = async_imap::Client::new(stream);
 
-        // Login
+        // Login. Separated from everything above because the two need opposite
+        // answers: a refused password is not something backoff fixes, while a
+        // dropped TCP connection is exactly what backoff is for.
         let session = client
             .login(&self.config.username, &self.config.password)
             .await
-            .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?;
+            .map_err(|(e, _)| ImapConnectError::Auth(anyhow!("IMAP login failed: {e}")))?;
 
         debug!("IMAP login successful");
         Ok(session)
@@ -808,6 +820,7 @@ impl EmailChannel {
     async fn wait_for_changes(
         &self,
         session: ImapSession,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(IdleWaitResult, ImapSession)> {
         let idle_timeout = Duration::from_secs(self.config.idle_timeout_secs);
 
@@ -820,8 +833,17 @@ impl EmailChannel {
         // wait() returns (future, stop_source) - we only need the future
         let (wait_future, _stop_source) = idle.wait();
 
-        // Wait for server notification or timeout
-        let result = timeout(idle_timeout, wait_future).await;
+        // Wait for server notification, timeout, or shutdown. The shutdown arm
+        // is the point of the token: `idle_timeout` defaults to 29 minutes, so
+        // without it a stopping daemon waited on a socket that had nothing to
+        // say.
+        let result = tokio::select! {
+            () = cancel.cancelled() => {
+                let session = idle.done().await?;
+                return Ok((IdleWaitResult::Cancelled, session));
+            }
+            result = timeout(idle_timeout, wait_future) => result,
+        };
 
         match result {
             Ok(Ok(response)) => {
@@ -850,14 +872,44 @@ impl EmailChannel {
     }
 
     /// Main IDLE-based listen loop with automatic reconnection
-    async fn listen_with_idle(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen_with_idle(
+        &self,
+        tx: mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_mins(1);
 
         loop {
-            match self.run_idle_session(&tx).await {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+
+            let session = match self.connect_imap().await {
+                Ok(session) => session,
+                // A refused password is reported, not retried. This loop used to
+                // swallow it and reconnect forever on its own backoff ladder,
+                // duplicating the supervisor's while telling it nothing — so the
+                // supervisor kept resetting to its initial delay and
+                // `health_check` was the only thing that knew.
+                Err(ImapConnectError::Auth(e)) => {
+                    return Err(e.context(
+                        "IMAP rejected the configured credentials; retrying will not fix this",
+                    ));
+                }
+                Err(ImapConnectError::Transient(e)) => {
+                    error!("IMAP connect failed: {e}. Reconnecting in {backoff:?}...");
+                    if sleep_or_cancel(backoff, &cancel).await {
+                        return Ok(());
+                    }
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    continue;
+                }
+            };
+
+            match self.run_idle_session(session, &tx, &cancel).await {
                 Ok(()) => {
-                    // Clean exit (channel closed)
+                    // Clean exit (channel closed, or shutdown)
                     return Ok(());
                 }
                 Err(e) => {
@@ -865,7 +917,9 @@ impl EmailChannel {
                         "IMAP session error: {}. Reconnecting in {:?}...",
                         e, backoff
                     );
-                    sleep(backoff).await;
+                    if sleep_or_cancel(backoff, &cancel).await {
+                        return Ok(());
+                    }
                     // Exponential backoff with cap
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                 }
@@ -874,10 +928,12 @@ impl EmailChannel {
     }
 
     /// Run a single IDLE session until error or clean shutdown
-    async fn run_idle_session(&self, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
-        // Connect and authenticate
-        let mut session = self.connect_imap().await?;
-
+    async fn run_idle_session(
+        &self,
+        mut session: ImapSession,
+        tx: &mpsc::Sender<ChannelMessage>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
         // Select the mailbox
         session.select(&self.config.imap_folder).await?;
         info!(
@@ -890,7 +946,7 @@ impl EmailChannel {
 
         loop {
             // Enter IDLE and wait for changes (consumes session, returns it via result)
-            match self.wait_for_changes(session).await {
+            match self.wait_for_changes(session, cancel).await {
                 Ok((IdleWaitResult::NewMail, returned_session)) => {
                     debug!("New mail notification received");
                     session = returned_session;
@@ -903,6 +959,14 @@ impl EmailChannel {
                 }
                 Ok((IdleWaitResult::Interrupted, _)) => {
                     info!("IDLE interrupted, exiting");
+                    return Ok(());
+                }
+                Ok((IdleWaitResult::Cancelled, mut session)) => {
+                    // The teardown the contract names: LOGOUT, so the server
+                    // releases the mailbox instead of waiting out its own idle
+                    // timeout on a connection nobody is on the other end of.
+                    info!("Email channel shutting down");
+                    let _ = session.logout().await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -1050,6 +1114,40 @@ enum IdleWaitResult {
     NewMail,
     Timeout,
     Interrupted,
+    /// The supervisor asked the listener to stop while it was in IDLE.
+    Cancelled,
+}
+
+/// Why an IMAP session could not be established.
+///
+/// The distinction the listener needs and could not make: `listen_with_idle`
+/// retried *everything* in its own loop, forever, so a wrong password looked
+/// exactly like a flaky network and the supervisor was never told either had
+/// happened.
+enum ImapConnectError {
+    /// The server refused these credentials. Retrying cannot fix it.
+    Auth(anyhow::Error),
+    /// Anything before or around login — DNS, TCP, TLS, a server hiccup.
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for ImapConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auth(e) | Self::Transient(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Sleep for `delay`, or stop early if the supervisor cancels.
+///
+/// Returns `true` when it was cancelled. A bare `sleep` here made a shutdown
+/// wait out the reconnect window, which grows to a minute.
+async fn sleep_or_cancel(delay: Duration, cancel: &tokio_util::sync::CancellationToken) -> bool {
+    tokio::select! {
+        () = cancel.cancelled() => true,
+        () = sleep(delay) => false,
+    }
 }
 
 #[async_trait]
@@ -1098,17 +1196,19 @@ impl Channel for EmailChannel {
     async fn listen(
         &self,
         tx: mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         info!(
             "Starting email channel with IDLE support on {}",
             self.config.imap_folder
         );
-        self.listen_with_idle(tx).await
+        self.listen_with_idle(tx, cancel).await
     }
 
     async fn health_check(&self) -> bool {
         // Fully async health check - attempt IMAP connection
+        // Both failure kinds are the same answer here: the probe asks whether a
+        // session can be opened at all.
         match timeout(Duration::from_secs(10), self.connect_imap()).await {
             Ok(Ok(mut session)) => {
                 // Try to logout cleanly
@@ -1130,6 +1230,52 @@ impl Channel for EmailChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The supervised-listener fault contract (plan 308) ───────────────────
+
+    /// The listener must keep retrying a server it cannot reach — and must stop
+    /// when the supervisor says so, without waiting out the reconnect window.
+    ///
+    /// Both halves in one test on purpose: a listener that returned `Err` on a
+    /// refused TCP connection would fail the first assertion, and one that
+    /// ignored its token (as this did — `_cancel`) would fail the second by
+    /// running until the outer timeout.
+    #[tokio::test]
+    async fn an_unreachable_server_keeps_retrying_until_the_token_is_cancelled() {
+        let mut config = EmailConfig::default();
+        // Port 1 on loopback: nothing listens, so `connect` is refused
+        // immediately and the loop spends its time in the backoff sleep, which
+        // is exactly where a shutdown used to get stuck.
+        config.imap_host = "127.0.0.1".to_string();
+        config.imap_port = 1;
+        config.username = "test_user".to_string();
+        config.password = "test_password".to_string();
+        config.allowed_senders = vec!["*".to_string()];
+        let channel = EmailChannel::new(config);
+
+        let (tx, _rx) = mpsc::channel(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            // After the first couple of retries, so the backoff has grown past
+            // the initial second and cancellation has something to interrupt.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            canceller.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = timeout(Duration::from_secs(20), channel.listen(tx, cancel))
+            .await
+            .expect("the listener must return on cancellation, not run to the timeout");
+        assert!(
+            outcome.is_ok(),
+            "a refused TCP connection is transient, not a listener-ending fault: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancellation must not wait out the reconnect backoff"
+        );
+    }
 
     #[test]
     fn default_smtp_port_uses_tls_port() {
