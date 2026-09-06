@@ -492,7 +492,7 @@ impl Channel for LinqChannel {
     async fn listen(
         &self,
         _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         // Linq uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /linq endpoint.
@@ -501,10 +501,11 @@ impl Channel for LinqChannel {
             Configure Linq webhook to POST to your gateway's /linq endpoint."
         );
 
-        // Keep the task alive — it will be cancelled when the channel shuts down
-        loop {
-            tokio::time::sleep(std::time::Duration::from_hours(1)).await;
-        }
+        // Wait for shutdown — see the WhatsApp listener for why this is not an
+        // hour-long sleep the supervisor has to drop.
+        cancel.cancelled().await;
+        tracing::info!("Linq channel shutting down");
+        Ok(())
     }
 
     async fn health_check(&self) -> bool {
@@ -645,6 +646,32 @@ mod tests {
             "+15551234567".into(),
             vec!["+1234567890".into()],
         )
+    }
+
+    /// This channel receives over HTTP, so its listener has nothing to poll —
+    /// but it still has to end when the supervisor says so. It slept an hour at
+    /// a time and relied on its future being dropped, which `traits.rs` calls a
+    /// backstop for channels with nothing to tear down, not the contract.
+    #[tokio::test]
+    async fn the_listener_returns_when_the_token_is_cancelled() {
+        let ch = make_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let listening = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { ch.listen(tx, cancel).await }
+        });
+
+        cancel.cancel();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), listening)
+            .await
+            .expect("the listener must return on cancellation, not sleep an hour")
+            .expect("the listener task must not panic");
+        assert!(
+            outcome.is_ok(),
+            "a cancelled listener finished for a reason that is not a fault: {outcome:?}"
+        );
     }
 
     #[test]
