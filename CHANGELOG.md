@@ -195,6 +195,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handed and only stopped when its future was dropped; its 3-second poll interval
   is now raced against `cancel.cancelled()`.
 
+- **A revoked Discord bot token no longer reconnects forever.** Discord answers a
+  dead token in two places the listener ignored: `401` on the gateway lookup, and
+  close code `4004` after `IDENTIFY`. The lookup's status was never read — a `401`
+  body parses fine as JSON, so the missing `url` field fell back to a hard-coded
+  gateway host and connected anyway — and every close frame was reported as a
+  clean exit, which resets the supervisor's backoff. The status is now classified
+  before the body is parsed, there is no fallback host, and close codes that need
+  an operator change (`4004`, `4010`–`4014`) end the listener with an error while
+  `4007`/`4009`/`1000` stay reconnects. A gateway **read error** returns `Err` too:
+  it used to fall into `continue`, spinning the loop at full speed on a dead
+  socket. Cancellation now sends a close frame instead of dropping the socket.
+
+- **The Lark listener honours cancellation, in both modes.** `listen` took the
+  token as `_cancel` and never passed it on, so neither the WebSocket loop nor the
+  callback server ever saw it and shutdown relied on the supervisor dropping the
+  future. WebSocket mode now closes the socket on cancellation; webhook mode uses
+  `axum`'s graceful shutdown, so in-flight event callbacks finish and the port is
+  released. A WebSocket **read error** returns `Err` rather than breaking to
+  `Ok(())`, which had been resetting the supervisor's backoff on a dead socket.
+
 - **The Matrix channel compiles again, and its tests run for the first time.**
   `matrix-sdk` 0.16 overflowed the rustc type-check recursion budget, so no CI job
   could build `src/channels/matrix.rs` — 1,194 lines and 31 tests checked by
