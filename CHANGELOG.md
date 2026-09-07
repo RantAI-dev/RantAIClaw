@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`release-process.md` now says what alpha means, and what beta and stable would require.**
+  Over a hundred `-alpha` releases had shipped and the document contained no occurrence of
+  "beta" or "stable" — not thin, absent. The alpha section names the three things that
+  actually happened in the last three releases (schema v28 → v31, a rollback that does not
+  migrate a schema back down, a default that switched itself on), and the beta/stable exit
+  criteria are measurable rather than adjectival. Waves 4 and 5 are judged against that table,
+  which is why it is written before them.
+- **The README says what alpha means, above the install command.** It had not mentioned the
+  word anywhere.
+- **`Workflow Sanity (release tag ancestry)`** — asserts that every release tag still points at
+  a commit reachable from `main`. `pub-release.yml` already refused to *publish* a detached
+  tag and that guard works; what it cannot see is a history rewrite performed after a release,
+  which is exactly what detached `v0.30.0-alpha`. This runs on pull requests, with a closed
+  two-entry exemption list justified in `release-process.md`.
 - **Two documentation gates that block, replacing two that only reported.**
   `docs_command_coverage.sh` had a nine-command exemption list and ran with
   `continue-on-error: true`; the list is gone, the exemption mechanism is documented as
@@ -38,6 +52,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One release profile everywhere.** `pub-release.yml` built `--profile release-fast` while
+  the Dockerfile built `--release`, so two artefacts of the same version differed in
+  `codegen-units` (8 vs 1) and only one of them was measured. The Dockerfile now builds the
+  profile that actually ships. The size gate's comment described `codegen-units=1` — the
+  profile that does not ship — and now describes the one that does.
+- **The binary-size gate runs on Windows.** It was `if: runner.os != 'Windows'`, so the one
+  target whose binary nobody measures by hand was also the one CI skipped.
+- **Pillar 8's footprint numbers are measured, not estimated.** Binary **34.5 MiB**
+  (36,170,960 bytes) against a claimed `~12 MB`; idle RSS **27.4 MiB** against `~15 MB`; cold
+  start under 10 ms against `< 200ms`. Method, date, toolchain and scope sit next to them —
+  one target and one process, with the other five release targets stated as unmeasured rather
+  than implied. Real headroom under the 35 MB safeguard is **~0.5 MiB**, not ~1 MiB.
 - `crossterm` 0.28 → 0.29, because ratatui 0.30's backend is built on 0.29 and leaving ours
   at 0.28 put two copies of it in the build. The graph now carries one. Three further
   duplicates went with it: `rustix` 0.38, `linux-raw-sys` 0.4 and `windows-sys` 0.59.
@@ -47,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`backup/pre-trailer-strip-2026-09-07` is now on `origin` in both repositories.** It was
+  local-only, which meant `94d7b18` (RantaiClaw) and `0f12c71` (claw-ui) — the commits their
+  **signed** release assets name — stayed reachable on their remotes *only* because a tag
+  pointed at them. One accidental tag deletion and a signed artefact would have referenced a
+  commit that no longer existed. Neither tag was moved or deleted, and both releases are
+  recorded in `release-process.md` as known-divergent-but-content-identical.
 - Two pinned actions in `pub-docker-img.yml` carried version comments naming `v4` while the
   SHA was `actions/upload-artifact` v6.0.0 and `actions/download-artifact` v7.0.0. The pins
   were correct and unchanged; the comments a reviewer audits them by were not.

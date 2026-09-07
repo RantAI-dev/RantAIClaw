@@ -38,6 +38,31 @@ knowledge base, run skills, and act on a schedule without anyone watching.
 Written for RantAI's agent platform, where it runs inside containers as the execution
 engine for agents operating 24/7 against real integrations.
 
+## What "alpha" means here
+
+Every release so far is tagged `-alpha`, and the label is doing real work — read this before
+you put it somewhere that matters.
+
+- **The config schema moves.** It went v28 → v31 across the last three releases. Migrations
+  are written and tested on the way up; **downgrading after an upgrade is not supported.**
+- **Rollback is partial.** `rantaiclaw rollback` restores the previous binary and a config
+  snapshot. It does not migrate a newer on-disk schema back down.
+- **Defaults change, sometimes on their own.** The daily token ceiling
+  (`[cost] max_tokens_per_day`) switched *itself on* at 2,000,000 tokens/day for installs
+  that had never set it.
+- **Four channels are supported** — Telegram, Discord, Slack, WhatsApp Cloud. The rest ship
+  labelled *under development*.
+- **`rantaiclaw update --channel stable` still installs these.** That channel filters on
+  GitHub's prerelease flag, not on the version suffix, and these releases are published with
+  the flag off.
+
+Read the changelog before upgrading. What alpha, beta and stable would each require is
+written down in [`docs/contributing/release-process.md`](docs/contributing/release-process.md);
+the exit criteria are measurable, and nothing is claimed for this release that has not been.
+
+Fine for evaluation, personal use, and internal automation where someone reads release notes.
+Not yet something to leave upgrading unattended.
+
 ## Install
 
 ```bash

@@ -77,6 +77,30 @@ jobs:
     # remote script are the same hole — the code that runs is chosen after review.
     # Both halves are asserted here because pinning that nothing enforces drifts back
     # on the next pull request that adds a step.
+    # A release tag that stops being reachable from `main` breaks bisect across
+    # that release and makes `git describe` unable to name it — and when the tag
+    # is what keeps a signed artefact's commit alive, it is a supply-chain
+    # problem rather than a cosmetic one. `pub-release.yml` already refuses to
+    # publish such a tag, but that guard runs at release time and cannot see a
+    # rewrite performed afterwards. This one runs on every pull request.
+    release-tags:
+        name: Workflow Sanity (release tag ancestry)
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  # Tags and full history: the check is entirely about reachability.
+                  fetch-depth: 0
+                  fetch-tags: true
+
+            - name: Self-test the exemption logic
+              run: ./scripts/ci/check_release_tag_ancestry.sh --self-test
+
+            - name: Every release tag is reachable from main
+              run: ./scripts/ci/check_release_tag_ancestry.sh
+
     pinned-sources:
         name: Workflow Sanity (pinned sources)
         runs-on: ubuntu-latest

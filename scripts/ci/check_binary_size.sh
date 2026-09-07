@@ -26,8 +26,11 @@
 #             agent's usefulness out of the box; gating `rantaiclaw kb`
 #             behind a build flag meant shipped binaries had no KB at all.
 #
-# Release profile is already maximally tuned (opt-level=z, lto=fat,
-# strip=true, panic=abort, codegen-units=1). The 5MB target is kept
+# This gate measures the SHIPPED profile, `release-fast` — opt-level=z,
+# lto=fat, strip=true, panic=abort, and codegen-units=**8**. It previously
+# described `codegen-units=1`, which is `[profile.release]`: the profile the
+# release workflow does not build. As of 2026-09-07 the Dockerfile builds
+# `release-fast` too, so one profile ships everywhere. The 5MB target is kept
 # aspirational; safeguard/advisory get raised one tier when the floor
 # moves so the gate stays honest without silently disabling.
 #
