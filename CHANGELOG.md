@@ -37,11 +37,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ratatui-crossterm`, but the APIs this console uses are unchanged, and the
   `unstable-rendered-line-info` feature it depends on still exists.
 
+### Added
+
+- **CI now builds at the MSRV the crate declares.** `Cargo.toml` says
+  `rust-version = "1.91"`, and until now nothing compiled at it: nine jobs pin 1.92.0, the
+  `channel-matrix` job 1.93.0 and the Dockerfile `rust:1.93-slim`. The new
+  `MSRV (declared rust-version)` job reads `rust-version` out of `Cargo.toml` rather than
+  pinning a number of its own — so raising the declaration cannot leave CI still proving the
+  old one — and runs `cargo check --locked --all-targets` at it. It is wired into
+  `CI Required Gate`, with self-test cases for both a failing and a skipped result, because a
+  job the gate does not read is advisory while looking mandatory.
+  **1.91 was verified to build before this landed; the declaration was accurate, only
+  untested.**
+
 ### Fixed
 
 - Two pinned actions in `pub-docker-img.yml` carried version comments naming `v4` while the
   SHA was `actions/upload-artifact` v6.0.0 and `actions/download-artifact` v7.0.0. The pins
   were correct and unchanged; the comments a reviewer audits them by were not.
+- **Dependabot was dammed shut in all three ecosystems, not just one.** Every
+  `open-pull-requests-limit` was full — cargo 3/3, github-actions 1/1, docker 1/1 — by pull
+  requests as old as 2026-04-20, so no newer update could be opened at all, including a
+  security patch. Limits raised to 10 / 5 / 3 and the five stale requests closed so the
+  updater re-proposes against the current lockfile.
 
 ### Documentation
 

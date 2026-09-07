@@ -30,6 +30,7 @@
 #   IDENTITY_RESULT       result of each job, as GitHub reports it:
 #   LINT_RESULT             success | failure | cancelled | skipped
 #   TEST_RESULT
+#   MSRV_RESULT
 #   CHANNEL_LARK_RESULT
 #   FEATURES_RESULT
 #   E2E_RESULT
@@ -60,6 +61,7 @@ run_gate() {
   local identity_result="${IDENTITY_RESULT:-skipped}"
   local lint_result="${LINT_RESULT:-skipped}"
   local test_result="${TEST_RESULT:-skipped}"
+  local msrv_result="${MSRV_RESULT:-skipped}"
   local channel_lark_result="${CHANNEL_LARK_RESULT:-skipped}"
   local channel_matrix_result="${CHANNEL_MATRIX_RESULT:-skipped}"
   local features_result="${FEATURES_RESULT:-skipped}"
@@ -72,6 +74,7 @@ run_gate() {
   echo "identity=${identity_result}"
   echo "lint=${lint_result}"
   echo "test=${test_result}"
+  echo "msrv=${msrv_result}"
   echo "channel_lark=${channel_lark_result}"
   echo "channel_matrix=${channel_matrix_result}"
   echo "features=${features_result}"
@@ -110,6 +113,7 @@ run_gate() {
   # reader to the wrong log.
   require_success "Lint" "$lint_result" || return 1
   require_success "Unit tests" "$test_result" || return 1
+  require_success "MSRV check" "$msrv_result" || return 1
   require_success "channel-lark build/test" "$channel_lark_result" || return 1
   require_success "channel-matrix build/test" "$channel_matrix_result" || return 1
   require_success "Feature matrix" "$features_result" || return 1
@@ -137,7 +141,7 @@ if [ "${1:-}" = "--self-test" ]; then
     # Run in a subshell so each case gets a clean environment.
     (
       unset EVENT_NAME RUST_CHANGED DOCS_ONLY DOCS_CHANGED IDENTITY_RESULT \
-        LINT_RESULT TEST_RESULT CHANNEL_LARK_RESULT FEATURES_RESULT \
+        LINT_RESULT TEST_RESULT MSRV_RESULT CHANNEL_LARK_RESULT FEATURES_RESULT \
         E2E_RESULT BENCH_COMPILE_RESULT BUILD_RESULT DOCS_RESULT
       export "$@"
       run_gate >/dev/null 2>&1
@@ -152,8 +156,8 @@ if [ "${1:-}" = "--self-test" ]; then
 
   pr_rust_green=(
     EVENT_NAME=pull_request RUST_CHANGED=true IDENTITY_RESULT=success
-    LINT_RESULT=success TEST_RESULT=success CHANNEL_LARK_RESULT=success
-    CHANNEL_MATRIX_RESULT=success
+    LINT_RESULT=success TEST_RESULT=success MSRV_RESULT=success
+    CHANNEL_LARK_RESULT=success CHANNEL_MATRIX_RESULT=success
     FEATURES_RESULT=success BENCH_COMPILE_RESULT=success E2E_RESULT=success
     BUILD_RESULT=success
   )
@@ -207,18 +211,26 @@ if [ "${1:-}" = "--self-test" ]; then
   expect 1 "a failing feature matrix blocks a Rust PR" \
     "${pr_rust_green[@]}" FEATURES_RESULT=failure
 
+  # The MSRV job is what stops `rust-version` being an unchecked claim, so both
+  # arms again: a job nobody reads guards nothing, which is the exact shape this
+  # file was extracted to fix.
+  expect 1 "a failing MSRV check blocks a Rust PR" \
+    "${pr_rust_green[@]}" MSRV_RESULT=failure
+  expect 1 "a skipped MSRV check blocks a Rust PR" \
+    "${pr_rust_green[@]}" MSRV_RESULT=skipped
+
   expect 0 "a non-Rust, non-docs PR merges" \
     EVENT_NAME=pull_request IDENTITY_RESULT=success
 
   expect 0 "a green push merges" \
     EVENT_NAME=push RUST_CHANGED=true IDENTITY_RESULT=success LINT_RESULT=success \
-    TEST_RESULT=success CHANNEL_LARK_RESULT=success CHANNEL_MATRIX_RESULT=success \
-    FEATURES_RESULT=success \
+    TEST_RESULT=success MSRV_RESULT=success CHANNEL_LARK_RESULT=success \
+    CHANNEL_MATRIX_RESULT=success FEATURES_RESULT=success \
     E2E_RESULT=success BENCH_COMPILE_RESULT=success BUILD_RESULT=success
   expect 1 "a failing e2e blocks a push" \
     EVENT_NAME=push RUST_CHANGED=true IDENTITY_RESULT=success LINT_RESULT=success \
-    TEST_RESULT=success CHANNEL_LARK_RESULT=success CHANNEL_MATRIX_RESULT=success \
-    FEATURES_RESULT=success \
+    TEST_RESULT=success MSRV_RESULT=success CHANNEL_LARK_RESULT=success \
+    CHANNEL_MATRIX_RESULT=success FEATURES_RESULT=success \
     E2E_RESULT=failure BENCH_COMPILE_RESULT=success BUILD_RESULT=success
 
   if [ "$failures" -gt 0 ]; then
