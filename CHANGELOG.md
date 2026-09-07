@@ -16,8 +16,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs_api_route_coverage.sh` does the same for HTTP: every route the gateway registers must
   appear in `docs/reference/api-v1.md`, which until now was a rule the page asked for and
   nothing enforced.
+- **`SECURITY.md`, which the repository has been pointing at without having.**
+  `.github/ISSUE_TEMPLATE/config.yml` links to the security policy and `CODEOWNERS` reserves
+  the path; the file itself did not exist, so a reporter following either link arrived
+  nowhere. It states supported versions (the newest release only — there are no maintained
+  back branches), the private reporting route, an explicit in/out-of-scope list, and a 7-day
+  acknowledgement aim with a 90-day disclosure window. Scope matters here: local tools ship
+  enabled on purpose, so "the agent runs shell commands" is the product, while a path
+  *around* a configured limit is a vulnerability. Linked from the README's Security section.
+
+- **CI now builds at the MSRV the crate declares.** `Cargo.toml` says
+  `rust-version = "1.91"`, and until now nothing compiled at it: nine jobs pin 1.92.0, the
+  `channel-matrix` job 1.93.0 and the Dockerfile `rust:1.93-slim`. The new
+  `MSRV (declared rust-version)` job reads `rust-version` out of `Cargo.toml` rather than
+  pinning a number of its own — so raising the declaration cannot leave CI still proving the
+  old one — and runs `cargo check --locked --all-targets` at it. It is wired into
+  `CI Required Gate`, with self-test cases for both a failing and a skipped result, because a
+  job the gate does not read is advisory while looking mandatory.
+  **1.91 was verified to build before this landed; the declaration was accurate, only
+  untested.**
+
+### Changed
+
+- `crossterm` 0.28 → 0.29, because ratatui 0.30's backend is built on 0.29 and leaving ours
+  at 0.28 put two copies of it in the build. The graph now carries one. Three further
+  duplicates went with it: `rustix` 0.38, `linux-raw-sys` 0.4 and `windows-sys` 0.59.
+- No TUI source changed. `ratatui` 0.30 split into `ratatui-core` / `ratatui-widgets` /
+  `ratatui-crossterm`, but the APIs this console uses are unchanged, and the
+  `unstable-rendered-line-info` feature it depends on still exists.
+
+### Fixed
+
+- Two pinned actions in `pub-docker-img.yml` carried version comments naming `v4` while the
+  SHA was `actions/upload-artifact` v6.0.0 and `actions/download-artifact` v7.0.0. The pins
+  were correct and unchanged; the comments a reviewer audits them by were not.
+- **Dependabot was dammed shut in all three ecosystems, not just one.** Every
+  `open-pull-requests-limit` was full — cargo 3/3, github-actions 1/1, docker 1/1 — by pull
+  requests as old as 2026-04-20, so no newer update could be opened at all, including a
+  security patch. Limits raised to 10 / 5 / 3 and the five stale requests closed so the
+  updater re-proposes against the current lockfile.
 
 ### Security
+
+- **`.gitignore` now covers the agent scratchpads**, `plans/` above all. These are working
+  notes that name security holes before those holes are fixed, and one `git add -A` publishes
+  them to a public repository. That already happened once: a branch on `origin` carried 283
+  of them, including the audit index, until it was deleted on 2026-09-07.
+  `plans/notes/017-loop-conflict.md` is untracked here; it stays in history and in every
+  release tag from `v0.10.0-alpha`, which no ignore rule can change.
 
 - **The release job that mints the signatures no longer runs an unpinned remote script.**
   `pub-release.yml` fetched `anchore/syft`'s installer from the project's `main` branch and
@@ -31,12 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newest commit within the major it already used, so this is a pin and not an upgrade.
 - **`Workflow Sanity (pinned sources)` now enforces both.** A pull request that adds an
   unpinned `uses:`, or pipes a remote script into a shell, fails.
-
-### Fixed
-
-- Two pinned actions in `pub-docker-img.yml` carried version comments naming `v4` while the
-  SHA was `actions/upload-artifact` v6.0.0 and `actions/download-artifact` v7.0.0. The pins
-  were correct and unchanged; the comments a reviewer audits them by were not.
+- **`ratatui` 0.29 → 0.30.2, which moves the TUI off three advisories.** `lru` goes
+  0.12.5 → 0.18.4, clearing RUSTSEC-2026-0002 and RUSTSEC-2026-0253 (both unsound,
+  memory-corruption class, patched in 0.16.3 and 0.18.2 respectively), and `paste` 1.0.15
+  leaves the graph entirely, so the RUSTSEC-2024-0436 suppression in `deny.toml` — whose
+  own comment said it "unblocks only on a ratatui 0.30 upgrade" — is deleted rather than
+  re-deferred.
 
 ### Documentation
 
@@ -74,6 +120,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `supports_streaming`; the MCP-reach row still called the gap "silent" after Wave 2 made
   `doctor` report it; and the `--all-features` row still blamed the matrix-sdk recursion
   limit, which the 0.18 pin resolved.
+- **Four agent-harness configs were tracked with nothing saying which one wins.**
+  `.coderabbit.yaml`, `.gemini/style-guide.md` and the thirteen files under `.opencode/` —
+  four of which restate this repository's architecture and security boundaries — could each
+  drift from `CLAUDE.md`, the document that actually governs. Every one of them now opens by
+  saying so: where it and `CLAUDE.md` disagree, `CLAUDE.md` wins and the harness file is the
+  bug. They are kept rather than deleted; the ambiguity was the problem, not their existence.
 - `docs/contributing/actions-source-policy.md` recorded SHA pinning as "deferred to Phase 2"
   and carried a Phase 1 allowlist that had drifted from the workflows in both directions —
   it listed `useblacksmith/*` and `DavidAnson/markdownlint-cli2-action@*`, which no workflow

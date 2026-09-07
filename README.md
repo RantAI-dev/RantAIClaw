@@ -119,6 +119,9 @@ The most active area of the codebase, and the part to read first if you are eval
 this for production. Authorisation is **three independent axes**, not one setting — and the
 limits of each are stated below rather than implied away.
 
+Found a vulnerability? [`SECURITY.md`](SECURITY.md) has the private reporting route, what is
+in scope, and what to expect. Please do not open a public issue for one.
+
 ### 1. Autonomy level — how free the agent is
 
 `ReadOnly` · `Supervised` · `Full`, reached through the presets you actually see:

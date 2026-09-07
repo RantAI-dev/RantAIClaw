@@ -46,6 +46,23 @@ state/
 docs/superpowers/plans/
 docs/superpowers/specs/
 
+# Agent scratchpads. These are working notes, not product docs, and several of
+# them name security holes before those holes are fixed — so a stray
+# `git add -A` publishes them to a public AGPL repository. That is not
+# hypothetical: `plans/` was committed once already, on a branch that reached
+# `origin` and carried 283 of these files until 2026-09-07.
+#
+# `.superpowers/sdd/` self-ignored via its own nested `.gitignore`, which left
+# any *new* subdirectory uncovered; the rule belongs here instead.
+plans/
+.agents/
+.codegraph/
+.rtk/
+.superpowers/
+
+# Runtime lockfile written beside the binary, not source.
+skills-lock.json
+
 # Local product experiments live as separate repos and are not pushed here.
 product/
 

@@ -1,12 +1,19 @@
 version: 2
 
+# `open-pull-requests-limit` is a dam, not a throttle. Each ecosystem below sat
+# at its limit for months — cargo 3/3 (#23 from 2026-04-20, #83, #86), actions
+# 1/1 (#50) and docker 1/1 (#11) — so no newer update, security or otherwise,
+# could be opened at all until a human cleared one by hand. The limits are
+# raised so a single stale or conflicting pull request cannot hold the whole
+# queue shut; review load is managed by grouping, which is already configured.
+
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: daily
     target-branch: main
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
     groups:
@@ -22,7 +29,7 @@ updates:
     schedule:
       interval: daily
     target-branch: main
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 5
     labels:
       - "ci"
       - "dependencies"
@@ -39,7 +46,7 @@ updates:
     schedule:
       interval: daily
     target-branch: main
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 3
     labels:
       - "ci"
       - "dependencies"
