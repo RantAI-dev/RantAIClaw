@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SECURITY.md`, which the repository has been pointing at without having.**
+  `.github/ISSUE_TEMPLATE/config.yml` links to the security policy and `CODEOWNERS` reserves
+  the path; the file itself did not exist, so a reporter following either link arrived
+  nowhere. It states supported versions (the newest release only — there are no maintained
+  back branches), the private reporting route, an explicit in/out-of-scope list, and a 7-day
+  acknowledgement aim with a 90-day disclosure window. Scope matters here: local tools ship
+  enabled on purpose, so "the agent runs shell commands" is the product, while a path
+  *around* a configured limit is a vulnerability. Linked from the README's Security section.
+
 ### Security
+
+- **`.gitignore` now covers the agent scratchpads**, `plans/` above all. These are working
+  notes that name security holes before those holes are fixed, and one `git add -A` publishes
+  them to a public repository. That already happened once: a branch on `origin` carried 283
+  of them, including the audit index, until it was deleted on 2026-09-07.
+  `plans/notes/017-loop-conflict.md` is untracked here; it stays in history and in every
+  release tag from `v0.10.0-alpha`, which no ignore rule can change.
 
 - **The release job that mints the signatures no longer runs an unpinned remote script.**
   `pub-release.yml` fetched `anchore/syft`'s installer from the project's `main` branch and
@@ -30,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **Four agent-harness configs were tracked with nothing saying which one wins.**
+  `.coderabbit.yaml`, `.gemini/style-guide.md` and the thirteen files under `.opencode/` —
+  four of which restate this repository's architecture and security boundaries — could each
+  drift from `CLAUDE.md`, the document that actually governs. Every one of them now opens by
+  saying so: where it and `CLAUDE.md` disagree, `CLAUDE.md` wins and the harness file is the
+  bug. They are kept rather than deleted; the ambiguity was the problem, not their existence.
 - `docs/contributing/actions-source-policy.md` recorded SHA pinning as "deferred to Phase 2"
   and carried a Phase 1 allowlist that had drifted from the workflows in both directions —
   it listed `useblacksmith/*` and `DavidAnson/markdownlint-cli2-action@*`, which no workflow

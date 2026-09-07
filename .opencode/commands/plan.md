@@ -3,6 +3,10 @@ description: Plan a RantAIClaw change without editing.
 agent: architect
 ---
 
+> **`CLAUDE.md` governs.** This file configures one agent harness; the repository's
+> engineering protocol lives in `CLAUDE.md`. Where the two disagree, `CLAUDE.md` wins
+> and this file is the thing that is wrong.
+
 Read `CLAUDE.md` and `AGENTS.md` first.
 
 Analyze the request against RantAIClaw architecture.

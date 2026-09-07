@@ -1,5 +1,9 @@
 # Documentation Contract Skill
 
+> **`CLAUDE.md` governs.** This file configures one agent harness; the repository's
+> engineering protocol lives in `CLAUDE.md`. Where the two disagree, `CLAUDE.md` wins
+> and this file is the thing that is wrong.
+
 Docs are a product surface.
 
 If behavior changes affect CLI, config, provider, channel, runtime, tools, gateway, bootstrap, or troubleshooting, update the related docs.
