@@ -213,7 +213,7 @@ rustls-native-certs = { version = "0.8", optional = true }
 nusb = { version = "0.2", default-features = false, optional = true }
 
 # probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.31", optional = true }
+probe-rs = { version = "0.32", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.12", optional = true }
