@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The release job that mints the signatures no longer runs an unpinned remote script.**
+  `pub-release.yml` fetched `anchore/syft`'s installer from the project's `main` branch and
+  piped it into a shell, inside the job that holds `contents: write`, `packages: write`,
+  `id-token: write` and `attestations: write` and produces the cosign signatures. A
+  compromise of that branch would have executed beside the signing credentials. It is now a
+  version-pinned release tarball verified against a SHA-256 literal before it runs.
+- **Every GitHub Action is pinned to a commit SHA.** Eighteen `uses:` references still
+  pointed at moving tags — ten `Swatinem/rust-cache@v2`, four `docker/setup-buildx-action@v3`,
+  three `docker/build-push-action@v6`, one `docker/login-action@v3`. Each is pinned to the
+  newest commit within the major it already used, so this is a pin and not an upgrade.
+- **`Workflow Sanity (pinned sources)` now enforces both.** A pull request that adds an
+  unpinned `uses:`, or pipes a remote script into a shell, fails.
 - **`ratatui` 0.29 → 0.30.2, which moves the TUI off three advisories.** `lru` goes
   0.12.5 → 0.18.4, clearing RUSTSEC-2026-0002 and RUSTSEC-2026-0253 (both unsound,
   memory-corruption class, patched in 0.16.3 and 0.18.2 respectively), and `paste` 1.0.15
@@ -24,6 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - No TUI source changed. `ratatui` 0.30 split into `ratatui-core` / `ratatui-widgets` /
   `ratatui-crossterm`, but the APIs this console uses are unchanged, and the
   `unstable-rendered-line-info` feature it depends on still exists.
+
+### Fixed
+
+- Two pinned actions in `pub-docker-img.yml` carried version comments naming `v4` while the
+  SHA was `actions/upload-artifact` v6.0.0 and `actions/download-artifact` v7.0.0. The pins
+  were correct and unchanged; the comments a reviewer audits them by were not.
+
+### Documentation
+
+- `docs/contributing/actions-source-policy.md` recorded SHA pinning as "deferred to Phase 2"
+  and carried a Phase 1 allowlist that had drifted from the workflows in both directions —
+  it listed `useblacksmith/*` and `DavidAnson/markdownlint-cli2-action@*`, which no workflow
+  uses, and omitted `Swatinem/*` and `github/codeql-action`, which they do. Rewritten as
+  Phase 2, with the actions-in-use list derived by a command rather than maintained by hand.
+  The repository-side allowlist could not be re-exported without admin and is flagged as
+  unverified rather than restated.
 
 ## [0.30.0-alpha] — 2026-09-06
 

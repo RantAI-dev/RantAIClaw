@@ -70,7 +70,7 @@ jobs:
               with:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
             - name: Run rust quality gate
               run: ./scripts/ci/rust_quality_gate.sh
             - name: Run strict lint delta gate
@@ -114,7 +114,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
             - name: Free up runner disk space
               # `cargo test --locked --workspace` links ~32 debug test binaries,
               # each carrying the full rantaiclaw lib + heavy deps (matrix-sdk,
@@ -165,7 +165,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
               with:
                   key: channel-lark
             - name: Build and test channel-lark
@@ -206,7 +206,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.93.0
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
               with:
                   key: channel-matrix
             - name: Build and test channel-matrix
@@ -254,7 +254,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
               with:
                   key: features-${{ matrix.name }}
             - name: Install Linux system dependencies for all-features
@@ -279,7 +279,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
             - name: Run integration / E2E tests
               run: cargo test --test agent_e2e --locked --verbose
 
@@ -298,7 +298,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
             - name: Verify benchmarks compile
               run: cargo bench --no-run --locked
 
@@ -314,7 +314,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
             - name: Build binary (smoke check)
               run: cargo build --profile release-fast --locked --verbose
             - name: Check binary size
