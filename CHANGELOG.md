@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Two documentation gates that block, replacing two that only reported.**
+  `docs_command_coverage.sh` had a nine-command exemption list and ran with
+  `continue-on-error: true`; the list is gone, the exemption mechanism is documented as
+  something a reviewer must agree to, and both CI sites are blocking. A new
+  `docs_api_route_coverage.sh` does the same for HTTP: every route the gateway registers must
+  appear in `docs/reference/api-v1.md`, which until now was a rule the page asked for and
+  nothing enforced.
 - **`SECURITY.md`, which the repository has been pointing at without having.**
   `.github/ISSUE_TEMPLATE/config.yml` links to the security policy and `CODEOWNERS` reserves
   the path; the file itself did not exist, so a reporter following either link arrived
@@ -17,6 +24,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acknowledgement aim with a 90-day disclosure window. Scope matters here: local tools ship
   enabled on purpose, so "the agent runs shell commands" is the product, while a path
   *around* a configured limit is a vulnerability. Linked from the README's Security section.
+
+- **CI now builds at the MSRV the crate declares.** `Cargo.toml` says
+  `rust-version = "1.91"`, and until now nothing compiled at it: nine jobs pin 1.92.0, the
+  `channel-matrix` job 1.93.0 and the Dockerfile `rust:1.93-slim`. The new
+  `MSRV (declared rust-version)` job reads `rust-version` out of `Cargo.toml` rather than
+  pinning a number of its own — so raising the declaration cannot leave CI still proving the
+  old one — and runs `cargo check --locked --all-targets` at it. It is wired into
+  `CI Required Gate`, with self-test cases for both a failing and a skipped result, because a
+  job the gate does not read is advisory while looking mandatory.
+  **1.91 was verified to build before this landed; the declaration was accurate, only
+  untested.**
+
+### Changed
+
+- `crossterm` 0.28 → 0.29, because ratatui 0.30's backend is built on 0.29 and leaving ours
+  at 0.28 put two copies of it in the build. The graph now carries one. Three further
+  duplicates went with it: `rustix` 0.38, `linux-raw-sys` 0.4 and `windows-sys` 0.59.
+- No TUI source changed. `ratatui` 0.30 split into `ratatui-core` / `ratatui-widgets` /
+  `ratatui-crossterm`, but the APIs this console uses are unchanged, and the
+  `unstable-rendered-line-info` feature it depends on still exists.
+
+### Fixed
+
+- Two pinned actions in `pub-docker-img.yml` carried version comments naming `v4` while the
+  SHA was `actions/upload-artifact` v6.0.0 and `actions/download-artifact` v7.0.0. The pins
+  were correct and unchanged; the comments a reviewer audits them by were not.
+- **Dependabot was dammed shut in all three ecosystems, not just one.** Every
+  `open-pull-requests-limit` was full — cargo 3/3, github-actions 1/1, docker 1/1 — by pull
+  requests as old as 2026-04-20, so no newer update could be opened at all, including a
+  security patch. Limits raised to 10 / 5 / 3 and the five stale requests closed so the
+  updater re-proposes against the current lockfile.
 
 ### Security
 
@@ -46,41 +84,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own comment said it "unblocks only on a ratatui 0.30 upgrade" — is deleted rather than
   re-deferred.
 
-### Changed
-
-- `crossterm` 0.28 → 0.29, because ratatui 0.30's backend is built on 0.29 and leaving ours
-  at 0.28 put two copies of it in the build. The graph now carries one. Three further
-  duplicates went with it: `rustix` 0.38, `linux-raw-sys` 0.4 and `windows-sys` 0.59.
-- No TUI source changed. `ratatui` 0.30 split into `ratatui-core` / `ratatui-widgets` /
-  `ratatui-crossterm`, but the APIs this console uses are unchanged, and the
-  `unstable-rendered-line-info` feature it depends on still exists.
-
-### Added
-
-- **CI now builds at the MSRV the crate declares.** `Cargo.toml` says
-  `rust-version = "1.91"`, and until now nothing compiled at it: nine jobs pin 1.92.0, the
-  `channel-matrix` job 1.93.0 and the Dockerfile `rust:1.93-slim`. The new
-  `MSRV (declared rust-version)` job reads `rust-version` out of `Cargo.toml` rather than
-  pinning a number of its own — so raising the declaration cannot leave CI still proving the
-  old one — and runs `cargo check --locked --all-targets` at it. It is wired into
-  `CI Required Gate`, with self-test cases for both a failing and a skipped result, because a
-  job the gate does not read is advisory while looking mandatory.
-  **1.91 was verified to build before this landed; the declaration was accurate, only
-  untested.**
-
-### Fixed
-
-- Two pinned actions in `pub-docker-img.yml` carried version comments naming `v4` while the
-  SHA was `actions/upload-artifact` v6.0.0 and `actions/download-artifact` v7.0.0. The pins
-  were correct and unchanged; the comments a reviewer audits them by were not.
-- **Dependabot was dammed shut in all three ecosystems, not just one.** Every
-  `open-pull-requests-limit` was full — cargo 3/3, github-actions 1/1, docker 1/1 — by pull
-  requests as old as 2026-04-20, so no newer update could be opened at all, including a
-  security patch. Limits raised to 10 / 5 / 3 and the five stale requests closed so the
-  updater re-proposes against the current lockfile.
-
 ### Documentation
 
+- **Nine CLI commands were undocumented, one of them the default.** `chat` — what you get by
+  running `rantaiclaw` with no subcommand — plus `auth`, `permissions`, `personality`,
+  `profile`, `session`, `insights`, `rollback` and `uninstall` now have reference sections
+  written from the `--help` output of a binary built at this commit. `update` had no section
+  at all, and `autonomy`, `memory` and `update` were missing from the top-level table.
+- **`update --channel stable` does not mean what it sounds like**, and now says so: the
+  channel filters on GitHub's *prerelease* flag (`src/lifecycle/update.rs:546`), not on the
+  tag. Every release is tagged `-alpha` and published with that flag off, so the default
+  channel installs alpha builds.
+- **`doctor` and `doctor models` say which one they are.** They answer different questions —
+  one reads local configuration and runtime state, the other asks providers over the network
+  which models they serve — and a green `doctor` was being read as "my model works". Both
+  commands now name the other in their own output, and `commands.md` has a table of the
+  difference.
+- **Seventeen registered HTTP routes were missing from `api-v1.md`**: all of
+  `/api/v1/config/*`, `/api/v1/cron/*`, `/api/v1/secrets`, `/api/v1/memory/{key}`,
+  `/api/v1/channels/telegram`, and the five `/tasks*` routes. Notable contract facts now
+  written down: `PUT /api/v1/config/autonomy` **accepts and ignores**
+  `max_cost_per_day_cents` (replaced by `[cost] max_tokens_per_day`), `POST /api/v1/cron`
+  returns `403` for agent jobs when `approval_owners` is configured, and `GET /api/v1/config`
+  redacts by key *name* only.
+- **`CLAUDE.md` contradicted itself in six places.** Three sections required EN/ZH/JA/RU
+  navigation parity while two others declared the docs English-only and warned against
+  promising translations that do not exist; the pillar list said nine when there are ten; and
+  the collection tree was described as "forthcoming Phase B" when all twelve directories
+  exist and only the hub, TOC and inventory remain at `docs/` root.
+- **Pillar maturity tables now say when they were last read, and only where that is true.**
+  Pillars 2, 4, 8 and 9 were re-read against the code and carry a 2026-09-07 stamp; the other
+  six are marked **not re-read**, because moving a date without doing the work behind it is
+  the drift these tables already had. Three rows were wrong: per-provider SSE streaming said
+  "OpenRouter only … in v0.6.0" when every concrete provider returns `true` from
+  `supports_streaming`; the MCP-reach row still called the gap "silent" after Wave 2 made
+  `doctor` report it; and the `--all-features` row still blamed the matrix-sdk recursion
+  limit, which the 0.18 pin resolved.
 - **Four agent-harness configs were tracked with nothing saying which one wins.**
   `.coderabbit.yaml`, `.gemini/style-guide.md` and the thirteen files under `.opencode/` —
   four of which restate this repository's architecture and security boundaries — could each

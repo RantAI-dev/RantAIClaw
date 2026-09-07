@@ -90,9 +90,10 @@ jobs:
             # the command-coverage check still has a documented backlog (J5/J6).
             # Flip to blocking (remove continue-on-error) once the AST-based
             # reader pass lands and the command reference is complete.
-            - name: Every CLI command is documented (advisory)
-              continue-on-error: true
+            - name: Every CLI command is documented
               run: ./scripts/ci/docs_command_coverage.sh
+            - name: Every HTTP route is documented
+              run: ./scripts/ci/docs_api_route_coverage.sh
             - name: All config fields have runtime readers (advisory)
               continue-on-error: true
               run: ./scripts/ci/check_config_readers.sh
@@ -411,9 +412,10 @@ jobs:
             # (Lint Gate) so a command added in src/ is caught; here it catches a
             # command dropped from the reference by a docs edit. Flip to blocking
             # once the command reference is complete (J5/J6).
-            - name: Every CLI command is documented (advisory)
-              continue-on-error: true
+            - name: Every CLI command is documented
               run: ./scripts/ci/docs_command_coverage.sh
+            - name: Every HTTP route is documented
+              run: ./scripts/ci/docs_api_route_coverage.sh
 
             - name: Collect added links
               id: collect_links

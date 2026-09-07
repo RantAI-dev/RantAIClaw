@@ -150,7 +150,7 @@ Required:
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
 - `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware/peripherals-design.md`
 - `src/runtime/` — runtime adapters (currently native)
-- `docs/` — task-oriented documentation system (hubs, unified TOC, references, operations, security proposals, multilingual guides)
+- `docs/` — task-oriented documentation system (hubs, unified TOC, references, operations, security proposals)
 - `.github/` — CI, templates, automation workflows
 
 ## 4.1 Documentation System Contract (Required)
@@ -162,9 +162,9 @@ Canonical entry points (English-only — multilingual parity was claimed in earl
 - root README: `README.md`
 - docs hub: `docs/README.md`
 - unified TOC: `docs/SUMMARY.md`
-- pillar docs: `docs/pillars/1-setup.md` … `docs/pillars/9-docs-adoption.md` — one doc per product pillar, mirrors the ClickUp `[Product]` task
+- pillar docs: `docs/pillars/1-setup.md` … `docs/pillars/10-web-console.md` — **ten** docs, one per product pillar, mirroring the ClickUp `[Product]` task
 
-Collection trees (forthcoming Phase B — files currently still at `docs/` root):
+Collection trees (**migrated** — all twelve exist; only the hub, the TOC and the inventory remain at `docs/` root):
 
 - `docs/start/` — install, first-run, troubleshooting
 - `docs/reference/` — commands, config, providers, channels, tools, extending
@@ -216,7 +216,7 @@ When uncertain, classify as higher risk.
 5. **Document impact**
     - Update docs/PR notes for behavior, risk, side effects, and rollback.
     - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
-    - If docs entry points changed, keep EN/ZH/JA/RU README + docs-hub navigation aligned.
+    - If docs entry points changed, keep README + docs-hub navigation aligned. The docs are English-only (§4.1); there is no translation set to keep in step.
 6. **Respect queue hygiene**
     - If stacked PR: declare `Depends on #...`.
     - If replacing old PR: declare `Supersedes #...`.
@@ -304,9 +304,8 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Treat docs navigation as product UX: preserve clear pathing from README -> docs hub -> SUMMARY -> category index.
 - Keep top-level nav concise; avoid duplicative links across adjacent nav blocks.
 - When runtime surfaces change, update related references (`commands/providers/channels/config/runbook/troubleshooting`).
-- Keep multilingual entry-point parity for EN/ZH/JA/RU when nav or key wording changes.
+- Keep the README and docs-hub entry points in step when nav or key wording changes. English-only — see §4.1.
 - For docs snapshots, add new date-stamped files for new sprints rather than rewriting historical context.
-
 
 ## 8) Validation Matrix
 
@@ -333,7 +332,7 @@ Additional expectations by change type:
 
 - **Docs/template-only**:
     - run markdown lint and link-integrity checks
-    - if touching README/docs-hub/SUMMARY/collection indexes, verify EN/ZH/JA/RU navigation parity
+    - if touching README/docs-hub/SUMMARY/collection indexes, verify the navigation still resolves
     - if touching bootstrap docs/scripts, run `bash -n bootstrap.sh scripts/bootstrap.sh scripts/install.sh`
 - **Workflow changes**: validate YAML syntax; run workflow lint/sanity checks when available.
 - **Security/runtime/gateway/tools**: include at least one boundary/failure-mode validation.

@@ -152,6 +152,28 @@ fn render_dispatches_to_brief() {
     assert!(s.starts_with("doctor:"));
 }
 
+// `doctor` and `doctor models` answer different questions — one reads local
+// configuration and runtime state, the other asks providers over the network
+// which models they serve. Reading a green `doctor` as "my model works" is the
+// confusion this text exists to prevent, so the text is asserted rather than
+// left to whoever edits the renderer next.
+#[test]
+fn text_report_says_it_does_not_probe_providers() {
+    let s = render(&fixture_results(), &[], DoctorFormat::Text);
+    assert!(
+        s.contains("configuration and runtime health"),
+        "the header should say what this command covers: {s}"
+    );
+    assert!(
+        s.contains("does not ask a provider"),
+        "the report should disclaim provider probing: {s}"
+    );
+    assert!(
+        s.contains("rantaiclaw doctor models"),
+        "the report should name the command that does probe providers: {s}"
+    );
+}
+
 #[test]
 fn render_dispatches_to_json() {
     let s = render(&fixture_results(), &[], DoctorFormat::Json);

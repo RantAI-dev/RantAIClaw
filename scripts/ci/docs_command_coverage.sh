@@ -20,28 +20,24 @@
 # mention in commands.md: a backtick code-span, a `rantaiclaw <cmd>` usage, or a
 # section heading.
 #
-# ADVISORY BACKLOG: commands already known-missing are listed in KNOWN_MISSING
-# with the plan that adds them. A command NOT on that list and NOT in the docs is
-# a NEW drift and fails the check. When plans 260-J5/J6 land the full command
-# reference, empty KNOWN_MISSING and flip this step to blocking in ci-run.yml.
+# NO BACKLOG. This check is blocking, and KNOWN_MISSING is empty. It carried nine
+# commands for months — `permissions`, `auth`, `chat`, `rollback`, `uninstall`,
+# `session`, `insights`, `personality`, `profile`, one of which (`chat`) is the
+# DEFAULT command — each annotated "deferred follow-up", while the CI step was
+# `continue-on-error: true`. An advisory gate with an exemption list is a list,
+# not a gate: nothing had to act on it, so nothing did.
+#
+# Keep the list empty. If a command genuinely must go undocumented, that is a
+# conversation in the pull request, not a line added here.
 
 set -euo pipefail
 
 MAIN="src/main.rs"
 DOCS="docs/reference/commands.md"
 
-# cmd<TAB>reason — each MUST name the plan/finding that adds it. Delete the line
-# when the command is documented.
+# Deliberately empty; see the note above. Adding an entry here makes the check
+# stop checking that command, so an entry needs a reviewer to agree to it.
 KNOWN_MISSING=$(cat <<'EOF'
-permissions	plan 260 J5 (command-reference regen) — deferred follow-up
-auth	plan 260 J5 (command-reference regen) — deferred follow-up
-chat	plan 260 J5 (command-reference regen) — deferred follow-up
-rollback	plan 260 J5 (command-reference regen) — deferred follow-up
-uninstall	plan 260 J5 (command-reference regen) — deferred follow-up
-session	plan 260 J5 (command-reference regen) — deferred follow-up
-insights	plan 260 J5 (command-reference regen) — deferred follow-up
-personality	plan 260 J5 (command-reference regen) — deferred follow-up
-profile	plan 260 J5 (command-reference regen) — deferred follow-up
 EOF
 )
 

@@ -26,6 +26,9 @@ The docs are a product surface. They have to convince a new visitor in 30 second
 
 ## Current state by maturity
 
+_Rows below were read against the code on **2026-09-07**. A row with no evidence behind it is
+a claim, not a status; where a row could not be settled by reading, it says so._
+
 | Surface | Maturity |
 |---|---|
 | Entry hub | Implemented · needs further slimming |

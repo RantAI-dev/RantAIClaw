@@ -779,6 +779,22 @@ should check the encoded size and say so plainly rather than surfacing a bare
   response — `limit` bounds the response size, not the underlying query.
 - **Status codes**: `200`, `401`.
 
+### GET /api/v1/memory/{key}
+
+- **Auth**: bearer-gated.
+- **Path param**: `key` — the exact memory key. No prefix matching.
+- **Response** `200`: the stored entry.
+- **`404`** with `{"error": "not_found", "detail": "no memory with key '<key>'"}` when the key
+  does not exist. This is the one memory route that 404s rather than returning an empty result.
+- **Status codes**: `200`, `401`, `404`, `500`.
+
+### DELETE /api/v1/memory/{key}
+
+- **Auth**: bearer-gated.
+- **Response** `200`: `{ "key": "...", "removed": true }`. `removed` is `false` when the key
+  was not there — deleting a missing key is **not** an error on this verb, unlike `GET`.
+- **Status codes**: `200`, `401`, `500`.
+
 ### GET /api/v1/memory/stats
 
 - **Auth**: bearer-gated.
@@ -968,6 +984,131 @@ is created first.
   panics — not for an ordinary fetch failure).
 
 ---
+
+## Config
+
+These are the routes the web console writes settings through. All are bearer-gated.
+
+### GET /api/v1/config
+
+- **Request**: none.
+- **Response** `200`: the whole active config as JSON, **redacted**. A key is blanked when its
+  name ends in `_token`, or is exactly `token` or `paired_tokens`. Redaction is by key name,
+  so a secret stored under a name outside that set is returned in full.
+- **Status codes**: `200`, `401`, `500`.
+
+### PUT /api/v1/config/model
+
+- **Request**: every field optional; omitted fields are left unchanged.
+  ```json
+  { "provider": "openrouter", "model": "...", "temperature": 0.7 }
+  ```
+- **Response** `200`: `{ "default_provider": "...", "default_model": "...", "default_temperature": 0.7 }`
+- **Status codes**: `200`, `400`, `401`, `500`.
+
+### PUT /api/v1/config/autonomy
+
+- **Request**: all fields optional.
+  ```json
+  {
+    "level": "supervised",
+    "auto_approve": ["..."],
+    "always_ask": ["..."],
+    "allowed_commands": ["..."],
+    "forbidden_paths": ["..."],
+    "max_actions_per_hour": 20
+  }
+  ```
+- **`max_cost_per_day_cents` is accepted and ignored**, with a warning in the response. The
+  money ceiling it referred to was never enforced; it was replaced by
+  `[cost] max_tokens_per_day`. Sending it does not fail the request — it does nothing.
+- **Response** `200`: `{ "level": "...", "max_actions_per_hour": 20, ... }`
+- **Status codes**: `200`, `400` (unparseable `level`, or a rejected command entry), `401`.
+
+### GET / PUT /api/v1/secrets
+
+- **GET response** `200`: `{ "provider": "...", "api_url": "...", "api_key_present": true, "encrypt_at_rest": true }` — presence, never the key.
+- **PUT request**: `{ "api_key": "...", "api_url": "..." }`, both optional.
+- **PUT response** `200`: `{ "ok": true, "api_key_present": true }`
+- **Status codes**: `200`, `400`, `401`, `500`.
+
+### GET / PUT /api/v1/config/knowledge
+
+- **PUT request**: `{ "enabled": true, "embedding_api_key": "...", "vision_api_key": "..." }`, all optional.
+- **Response** `200`: `{ "enabled": true, "embedding_configured": true, "vision_configured": false, "source": "..." }`
+- Enabling probes the embedding key before persisting, so a bad key fails the request rather
+  than being written and failing later.
+- **Status codes**: `200`, `400`, `401`, `500`.
+
+### POST / DELETE /api/v1/config/mcp_servers/{name}
+
+- **POST request**: `{ "command": "...", "args": ["..."], "env": { "KEY": "value" } }` — `command` required.
+  `env` is encrypted at rest.
+- **POST response** `200`: `{ "name": "...", "added": true, "count": 3 }`
+- **DELETE response** `200`: `{ "name": "...", "removed": true, "count": 2 }`
+- **Status codes**: `200`, `400`, `401`, `500`.
+
+### POST / DELETE /api/v1/channels/telegram
+
+Marked experimental in the source. Connects or disconnects a Telegram channel and **restarts
+the channel runtime**.
+
+- **POST request**: `{ "bot_token": "...", "allowed_users": ["..."] }`
+- **POST response** `200`: `{ "connected": true, "channel": "telegram", "bot_username": "...", "allowed_users": [...], "warning": null, "restarts_runtime": true, "note": "..." }`
+- **DELETE response** `200`: `{ "disconnected": true, "channel": "telegram", "restarts_runtime": true }`
+- **Status codes**: `200`, `400`, `401`, `500`.
+
+## Cron
+
+### GET /api/v1/cron
+
+- **Response** `200`: `{ "jobs": [...], "count": 2, "cron_enabled": true, "scheduler_enabled": true }`
+  The two booleans are separate on purpose: jobs can exist while nothing runs them.
+- **Status codes**: `200`, `401`.
+
+### POST /api/v1/cron
+
+- Creates a job. An `agent` job requires a non-empty `prompt`.
+- **`403` when `approval_owners` is configured**: agent cron jobs cannot be created over HTTP
+  in that case, and must come from an owner channel or the CLI. This is deliberate — an HTTP
+  caller is not an identified owner.
+- **Status codes**: `200`, `400`, `401`, `403`, `500`.
+
+### PUT / DELETE /api/v1/cron/{id}
+
+- **PUT** updates a job and returns the updated job. A `command` job whose command the
+  security policy rejects fails `400` with `command blocked by security policy: <cmd>`.
+- **DELETE response** `200`: `{ "id": "...", "deleted": true }`
+- **Status codes**: `200`, `400`, `401`, `404`, `500`.
+
+### POST /api/v1/cron/{id}/run
+
+- Runs a job immediately.
+- **Response** `200`: `{ "id": "...", "success": true, "output": "..." }`
+- **Status codes**: `200`, `401`, `404`, `500`.
+
+### GET /api/v1/cron/{id}/runs
+
+- **Response** `200`: `{ "runs": [...], "count": 10 }` — run history, credential-scrubbed
+  before storage.
+- **Status codes**: `200`, `401`, `404`.
+
+## Tasks
+
+**These are not under `/api/v1`.** They are mounted at the gateway root, and are listed here
+because nothing else documents them.
+
+| Route | Methods |
+|---|---|
+| `/tasks` | `GET` list, `POST` create |
+| `/tasks/{id}` | `GET`, `PUT`, `DELETE` |
+| `/tasks/{id}/review` | `POST` |
+| `/tasks/{id}/comments` | `GET` list, `POST` add |
+| `/tasks/{id}/events` | `GET` |
+
+Handlers live in `src/gateway/task_handlers.rs`. Treat the shapes there as the contract until
+this section is filled in against them — this entry exists so the surface is discoverable, and
+it is explicitly less detailed than the rest of this page.
 
 ## Maintenance
 
