@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newest commit within the major it already used, so this is a pin and not an upgrade.
 - **`Workflow Sanity (pinned sources)` now enforces both.** A pull request that adds an
   unpinned `uses:`, or pipes a remote script into a shell, fails.
+- **`ratatui` 0.29 → 0.30.2, which moves the TUI off three advisories.** `lru` goes
+  0.12.5 → 0.18.4, clearing RUSTSEC-2026-0002 and RUSTSEC-2026-0253 (both unsound,
+  memory-corruption class, patched in 0.16.3 and 0.18.2 respectively), and `paste` 1.0.15
+  leaves the graph entirely, so the RUSTSEC-2024-0436 suppression in `deny.toml` — whose
+  own comment said it "unblocks only on a ratatui 0.30 upgrade" — is deleted rather than
+  re-deferred.
+
+### Changed
+
+- `crossterm` 0.28 → 0.29, because ratatui 0.30's backend is built on 0.29 and leaving ours
+  at 0.28 put two copies of it in the build. The graph now carries one. Three further
+  duplicates went with it: `rustix` 0.38, `linux-raw-sys` 0.4 and `windows-sys` 0.59.
+- No TUI source changed. `ratatui` 0.30 split into `ratatui-core` / `ratatui-widgets` /
+  `ratatui-crossterm`, but the APIs this console uses are unchanged, and the
+  `unstable-rendered-line-info` feature it depends on still exists.
 
 ### Fixed
 
