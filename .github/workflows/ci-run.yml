@@ -154,6 +154,56 @@ jobs:
     #
     # It pulls only `prost`, so it is cheap. Verified building clean at f189422
     # in ~3m. `channel-matrix` now has its own job below for the same reason.
+    # `Cargo.toml` declares `rust-version`, and until this job existed nothing
+    # built at it: every other Rust job pins 1.92.0, the `channel-matrix` job
+    # 1.93.0 and the Dockerfile `rust:1.93-slim`. A declared MSRV that no build
+    # exercises is a claim, and this repository treats claims as things that get
+    # checked.
+    #
+    # The toolchain is read out of `Cargo.toml` rather than pinned here on
+    # purpose. Pinning it would mean the job tests a number that can silently
+    # drift from the declaration it is supposed to defend — raising
+    # `rust-version` would leave this job still proving the old one. Reading it
+    # makes the manifest the single source, so whatever it declares is what CI
+    # compiles.
+    msrv:
+        name: MSRV (declared rust-version)
+        needs: [changes, lint]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Read the declared MSRV
+              id: declared
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  line="$(grep -m1 -E '^rust-version[[:space:]]*=' Cargo.toml || true)"
+                  version="$(printf '%s' "$line" | sed -E 's/.*"([^"]+)".*/\1/')"
+                  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+                    echo "::error file=Cargo.toml::could not parse rust-version (read '${version}')"
+                    exit 1
+                  fi
+                  echo "Declared MSRV: ${version}"
+                  echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: ${{ steps.declared.outputs.version }}
+
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+              with:
+                  key: msrv-${{ steps.declared.outputs.version }}
+
+            # `--all-targets`, not `--lib`: the binary crate root recompiles the
+            # library as a second crate, and tests and benches use APIs the lib
+            # alone never reaches. "Builds at the MSRV" is only true if every
+            # target does.
+            - name: Check every target at the declared MSRV
+              run: cargo check --locked --all-targets
+
     channel-lark:
         name: Channel Lark (build + test)
         needs: [changes, lint]
@@ -438,6 +488,7 @@ jobs:
                 identity,
                 lint,
                 test,
+                msrv,
                 channel-lark,
                 channel-matrix,
                 features,
@@ -468,6 +519,7 @@ jobs:
                   IDENTITY_RESULT: ${{ needs.identity.result }}
                   LINT_RESULT: ${{ needs.lint.result }}
                   TEST_RESULT: ${{ needs.test.result }}
+                  MSRV_RESULT: ${{ needs.msrv.result }}
                   CHANNEL_LARK_RESULT: ${{ needs.channel-lark.result }}
                   CHANNEL_MATRIX_RESULT: ${{ needs.channel-matrix.result }}
                   FEATURES_RESULT: ${{ needs.features.result }}
