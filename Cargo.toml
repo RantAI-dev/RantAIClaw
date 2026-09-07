@@ -168,8 +168,8 @@ tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
 
 # TUI framework
-ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
-crossterm = { version = "0.28", optional = true }
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+crossterm = { version = "0.29", optional = true }
 # Display width for row truncation. ratatui already builds this crate, so
 # depending on it directly adds no compilation — and counting `chars()` is
 # simply wrong for the CJK skill summaries ClawHub now returns.
