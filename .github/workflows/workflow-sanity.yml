@@ -70,3 +70,54 @@ jobs:
 
             - name: Lint GitHub workflows
               uses: rhysd/actionlint@393031adb9afb225ee52ae2ccd7a5af5525e03e8 # v1.7.11
+
+    # The release job that mints cosign signatures holds contents/packages/id-token/
+    # attestations write. Whatever it executes runs beside those credentials, so the
+    # rule is: everything a workflow runs is fixed by digest. A moving tag and a piped
+    # remote script are the same hole — the code that runs is chosen after review.
+    # Both halves are asserted here because pinning that nothing enforces drifts back
+    # on the next pull request that adds a step.
+    pinned-sources:
+        name: Workflow Sanity (pinned sources)
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Fail on unpinned actions or piped remote scripts
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python - <<'PY'
+                  from __future__ import annotations
+
+                  import pathlib
+                  import re
+                  import sys
+
+                  USES = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)")
+                  PINNED = re.compile(r"^[^@]+@[0-9a-f]{40}$")
+                  # curl/wget whose output is piped straight into an interpreter.
+                  PIPED = re.compile(r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|d)?sh\b")
+
+                  root = pathlib.Path(".github/workflows")
+                  bad: list[str] = []
+                  for path in sorted([*root.rglob("*.yml"), *root.rglob("*.yaml")]):
+                    for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                      match = USES.match(line)
+                      if match:
+                        ref = match.group(1)
+                        # Local composite actions and docker:// refs carry no tag to move.
+                        if not ref.startswith(("./", "docker://")) and not PINNED.match(ref):
+                          bad.append(f"{path}:{lineno}: unpinned action `{ref}` (use a 40-char commit SHA)")
+                      if PIPED.search(line):
+                        bad.append(f"{path}:{lineno}: remote script piped into a shell")
+
+                  if bad:
+                    print("Unpinned sources found:")
+                    for entry in bad:
+                      print(f"- {entry}")
+                    sys.exit(1)
+                  print("All action uses are SHA-pinned and no workflow pipes a remote script.")
+                  PY
