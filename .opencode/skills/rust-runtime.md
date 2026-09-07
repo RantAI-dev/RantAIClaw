@@ -1,5 +1,9 @@
 # Rust Runtime Skill
 
+> **`CLAUDE.md` governs.** This file configures one agent harness; the repository's
+> engineering protocol lives in `CLAUDE.md`. Where the two disagree, `CLAUDE.md` wins
+> and this file is the thing that is wrong.
+
 For Rust changes:
 
 - Prefer explicit types and straightforward control flow.

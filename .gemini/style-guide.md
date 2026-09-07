@@ -1,5 +1,9 @@
 # RantaiClaw Code Style Guide
 
+> **`CLAUDE.md` governs.** This file configures one agent harness; the repository's
+> engineering protocol lives in `CLAUDE.md`. Where the two disagree, `CLAUDE.md` wins
+> and this file is the thing that is wrong.
+
 This style guide provides instructions for Gemini Code Assist when reviewing pull requests for the RantaiClaw project.
 
 ## Project Overview

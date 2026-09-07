@@ -1,5 +1,9 @@
 # Security Boundary Skill
 
+> **`CLAUDE.md` governs.** This file configures one agent harness; the repository's
+> engineering protocol lives in `CLAUDE.md`. Where the two disagree, `CLAUDE.md` wins
+> and this file is the thing that is wrong.
+
 High-risk surfaces:
 
 - `src/security/**`

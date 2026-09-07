@@ -3,6 +3,10 @@ description: Review current diff for RantAIClaw correctness and architecture ris
 agent: reviewer
 ---
 
+> **`CLAUDE.md` governs.** This file configures one agent harness; the repository's
+> engineering protocol lives in `CLAUDE.md`. Where the two disagree, `CLAUDE.md` wins
+> and this file is the thing that is wrong.
+
 Review `git diff`.
 
 Check:
