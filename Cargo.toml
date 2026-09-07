@@ -129,7 +129,7 @@ ring = "0.17"
 # Approval gate — glob matching for command allowlist + forbidden_paths
 globset = "0.4"
 # Approval gate — round-trip TOML for command_allowlist.toml preserving comments
-toml_edit = { version = "0.22", default-features = false }
+toml_edit = { version = "0.23", default-features = false }
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, optional = true }
