@@ -25,7 +25,7 @@ through the gateway's `/api/v1` HTTP surface.
 
 - **Loopback by default.** The console is only reachable from the same host
   unless the operator opts into a tunnel or a public bind. When the gateway is
-  reachable beyond localhost *and* no console login is configured, it prints a
+  reachable beyond localhost _and_ no console login is configured, it prints a
   startup warning: anyone who can reach the port can drive the agent.
 - **Server-side credentials.** The gateway bearer token is held by the console's
   server-side BFF; the browser holds only a signed session cookie. The browser
@@ -36,6 +36,10 @@ through the gateway's `/api/v1` HTTP surface.
   [ADR 0001](../contributing/adr/0001-gateway-console-api-contract.md).
 
 ## Current state by maturity
+
+_**Not re-read on 2026-09-07.** The truth pass of that date covered pillars 2, 4, 8 and 9
+only; these rows still carry whatever date the section they came from carried. Treat them as
+unverified rather than current._
 
 | Area | State |
 |---|---|

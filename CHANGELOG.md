@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tag and that guard works; what it cannot see is a history rewrite performed after a release,
   which is exactly what detached `v0.30.0-alpha`. This runs on pull requests, with a closed
   two-entry exemption list justified in `release-process.md`.
+- **Two documentation gates that block, replacing two that only reported.**
+  `docs_command_coverage.sh` had a nine-command exemption list and ran with
+  `continue-on-error: true`; the list is gone, the exemption mechanism is documented as
+  something a reviewer must agree to, and both CI sites are blocking. A new
+  `docs_api_route_coverage.sh` does the same for HTTP: every route the gateway registers must
+  appear in `docs/reference/api-v1.md`, which until now was a rule the page asked for and
+  nothing enforced.
 - **`SECURITY.md`, which the repository has been pointing at without having.**
   `.github/ISSUE_TEMPLATE/config.yml` links to the security policy and `CODEOWNERS` reserves
   the path; the file itself did not exist, so a reporter following either link arrived
@@ -111,6 +118,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **Nine CLI commands were undocumented, one of them the default.** `chat` — what you get by
+  running `rantaiclaw` with no subcommand — plus `auth`, `permissions`, `personality`,
+  `profile`, `session`, `insights`, `rollback` and `uninstall` now have reference sections
+  written from the `--help` output of a binary built at this commit. `update` had no section
+  at all, and `autonomy`, `memory` and `update` were missing from the top-level table.
+- **`update --channel stable` does not mean what it sounds like**, and now says so: the
+  channel filters on GitHub's *prerelease* flag (`src/lifecycle/update.rs:546`), not on the
+  tag. Every release is tagged `-alpha` and published with that flag off, so the default
+  channel installs alpha builds.
+- **`doctor` and `doctor models` say which one they are.** They answer different questions —
+  one reads local configuration and runtime state, the other asks providers over the network
+  which models they serve — and a green `doctor` was being read as "my model works". Both
+  commands now name the other in their own output, and `commands.md` has a table of the
+  difference.
+- **Seventeen registered HTTP routes were missing from `api-v1.md`**: all of
+  `/api/v1/config/*`, `/api/v1/cron/*`, `/api/v1/secrets`, `/api/v1/memory/{key}`,
+  `/api/v1/channels/telegram`, and the five `/tasks*` routes. Notable contract facts now
+  written down: `PUT /api/v1/config/autonomy` **accepts and ignores**
+  `max_cost_per_day_cents` (replaced by `[cost] max_tokens_per_day`), `POST /api/v1/cron`
+  returns `403` for agent jobs when `approval_owners` is configured, and `GET /api/v1/config`
+  redacts by key *name* only.
+- **`CLAUDE.md` contradicted itself in six places.** Three sections required EN/ZH/JA/RU
+  navigation parity while two others declared the docs English-only and warned against
+  promising translations that do not exist; the pillar list said nine when there are ten; and
+  the collection tree was described as "forthcoming Phase B" when all twelve directories
+  exist and only the hub, TOC and inventory remain at `docs/` root.
+- **Pillar maturity tables now say when they were last read, and only where that is true.**
+  Pillars 2, 4, 8 and 9 were re-read against the code and carry a 2026-09-07 stamp; the other
+  six are marked **not re-read**, because moving a date without doing the work behind it is
+  the drift these tables already had. Three rows were wrong: per-provider SSE streaming said
+  "OpenRouter only … in v0.6.0" when every concrete provider returns `true` from
+  `supports_streaming`; the MCP-reach row still called the gap "silent" after Wave 2 made
+  `doctor` report it; and the `--all-features` row still blamed the matrix-sdk recursion
+  limit, which the 0.18 pin resolved.
 - **Four agent-harness configs were tracked with nothing saying which one wins.**
   `.coderabbit.yaml`, `.gemini/style-guide.md` and the thirteen files under `.opencode/` —
   four of which restate this repository's architecture and security boundaries — could each

@@ -203,6 +203,8 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     }
 
     println!("🩺 RantaiClaw Doctor — Model Catalog Probe");
+    println!("  Asks each provider over the network which models it serves.");
+    println!("  For configuration and local runtime health, run `rantaiclaw doctor`.");
     println!("  Providers to probe: {}", targets.len());
     println!(
         "  Mode: {}",

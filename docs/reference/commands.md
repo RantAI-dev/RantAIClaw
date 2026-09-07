@@ -2,7 +2,19 @@
 
 This reference is derived from the current CLI surface (`rantaiclaw --help`).
 
-Last verified: **July 12, 2026**.
+**What "verified" means here**, because a date on a document is a claim:
+
+- **Command coverage is checked continuously and blocks CI.**
+  `scripts/ci/docs_command_coverage.sh` compares every variant of `enum Commands` in
+  `src/main.rs` against this file on every Rust change. It has no exemption list. A command
+  that exists and is not here fails the build.
+- **Flags, subcommands and behaviour are checked by hand.** Nothing enforces those, so they
+  carry a date:
+  - **September 7, 2026** — `autonomy`, `auth`, `chat`, `insights`, `permissions`,
+    `personality`, `profile`, `rollback`, `session`, `uninstall`, `update`, and the
+    `doctor` / `doctor models` split. Written from the `--help` output of a binary built at
+    that commit.
+  - **July 12, 2026** — every other section.
 
 ## Top-Level Commands
 
@@ -10,7 +22,9 @@ Last verified: **July 12, 2026**.
 |---|---|
 | `setup` | Canonical setup wizard (replaces `onboard`) |
 | `onboard` | Legacy alias for `setup` |
+| `autonomy` | Show or switch the approval-policy preset for the active profile |
 | `agent` | Run interactive chat or single-message mode |
+| `chat` | Start the interactive TUI — **the default when no subcommand is given** |
 | `gateway` | Start webhook and WhatsApp HTTP gateway |
 | `daemon` | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
 | `service` | Manage user-level OS service lifecycle |
@@ -29,6 +43,16 @@ Last verified: **July 12, 2026**.
 | `peripheral` | Configure and flash peripherals (needs `--features hardware` for serial/flash access) |
 | `kb` | Knowledge Base CRUD + maintenance (in the default build) |
 | `ui` | Install/run/stop the optional web console (claw-ui) |
+| `memory` | Agent memory: list, get, add, recall, reindex, stats, clear |
+| `update` | Self-replace the binary against a published GitHub release |
+| `auth` | Manage provider subscription auth profiles (OAuth / setup tokens) |
+| `permissions` | Owners and the non-owner (guest) capability ceiling, shared by all multi-user channels |
+| `personality` | Show, list, or set the active persona preset |
+| `profile` | Create, clone, switch, and delete profiles |
+| `session` | Browse, search, and rename past sessions |
+| `insights` | Cumulative session/message statistics (CLI parity for the TUI `/insights`) |
+| `rollback` | Restore config and binary from a pre-update snapshot |
+| `uninstall` | Remove profile data, optionally the binary |
 
 ## Command Groups
 
@@ -449,6 +473,186 @@ Show whether the Knowledge Base is active, whether a key resolves (and from wher
 Toggle `[knowledge].enabled` and persist it. `enable` refuses when no embedding key resolves anywhere (config or env) — it will not persist a config the gateway then rejects. `disable` keeps the credentials, so re-activation is one command. While disabled, the data subcommands (`search`, `ingest`, `list`, …) answer a `kb_disabled` TOON error with exit 1.
 
 In the TUI, `/kb` shows the same status and `/kb enable` / `/kb disable` toggle it.
+
+### `doctor` and `doctor models`
+
+**These answer different questions, and the difference is the point.**
+
+| | `rantaiclaw doctor` | `rantaiclaw doctor models` |
+|---|---|---|
+| Question | Is this install configured and healthy? | Which models does each provider actually serve? |
+| Network | Only the `live` checks (provider ping, channel auth, MCP startup), which `--brief` and `--offline` skip | Always. It fetches each provider's catalog |
+| Credentials | Checks a key **resolves**, and from where | Checks a provider **accepts** it |
+| Exit code | 1 if any check fails | 0 unless probing itself errors |
+
+A green `doctor` does **not** mean your model works — it means a credential was found. Both
+commands now say which one they are in their own output.
+
+`doctor` options:
+
+| Flag | Description | Default |
+|---|---|---|
+| `--format <FORMAT>` | `text`, `json` (CI), or `brief` (one-liner, e.g. `doctor: 6/8 ok, 1 warn, 1 fail`) | `text` |
+| `--brief` | Skip the slow `live` checks | `false` |
+| `--offline` | Report every live check as `Info: skipped (offline)` | `false` |
+
+Checks that never ran are listed under `[skipped]` rather than counted as passes — a check
+that did not run is not a pass.
+
+`doctor models` options:
+
+| Flag | Description | Default |
+|---|---|---|
+| `--provider <PROVIDER>` | Probe one provider instead of all known ones | all |
+| `--use-cache` | Prefer cached catalogs; skip the forced live refresh | `false` |
+
+### `update`
+
+Self-replaces the binary from a published GitHub release. Verifies SHA-256 against
+`SHA256SUMS`, swaps atomically on Unix, and on Windows stages the new binary for a self-swap
+on next launch. Every run writes a snapshot first — see [`rollback`](#rollback).
+
+| Flag | Description | Default |
+|---|---|---|
+| `--check` | Print the version delta only, download nothing. **Exit 1 if a newer version exists**, 0 if current | |
+| `--channel <CHANNEL>` | `stable`, or `prerelease` to include alpha/beta/rc | `stable` |
+| `--to <TAG>` | Pin to a specific release tag, e.g. `v0.6.2-alpha` | |
+| `--allow-downgrade` | Permit `--to` an older version | `false` |
+
+`RANTAICLAW_RELEASE_BASE_URL` redirects the download at an internal mirror.
+
+**`stable` does not mean what it sounds like.** The channel filters on GitHub's
+_prerelease_ flag (`src/lifecycle/update.rs:546`, `Channel::Stable => !r.prerelease`), not on
+the tag. Every release so far is tagged `-alpha` and published with that flag **off**, so
+`--channel stable` — the default — installs alpha builds. `prerelease` is a superset, not a
+different set: today it resolves to the same release.
+
+### `chat`
+
+Starts the interactive TUI. **This is the default — `rantaiclaw` with no subcommand runs
+`chat`.**
+
+| Flag | Description |
+|---|---|
+| `--resume <ID>` | Resume a specific session by ID |
+| `-m`, `--message <TEXT>` | Single-message mode; prints the reply and exits, no TUI |
+| `--model <MODEL>` | Override the model for this run, e.g. `anthropic:claude-sonnet-4-20250514` |
+| `--profile <NAME>` | Run against a different profile without changing the active marker |
+
+`agent run -m` and `chat -m` both answer one message. `agent` is the headless entry point;
+`chat` is the TUI's, and its `-m` exists so a script can use the same command a human types.
+
+### `auth`
+
+Provider **subscription** authentication — OAuth logins and setup tokens — as opposed to the
+API keys `setup provider` writes into config. Both can be present; credential precedence is
+documented in [`providers.md`](providers.md).
+
+| Subcommand | Description |
+|---|---|
+| `login` | Log in with OpenAI Codex OAuth |
+| `paste-redirect` | Finish OAuth by pasting the redirect URL or auth code |
+| `paste-token` | Paste a setup/auth token (Anthropic subscription auth) |
+| `setup-token` | Alias for `paste-token`, interactive by default |
+| `refresh` | Refresh an OpenAI Codex access token from its refresh token |
+| `logout` | Remove an auth profile |
+| `use` | Set the active auth profile for a provider |
+| `list` | List auth profiles |
+| `status` | Active profile and token expiry |
+
+### `permissions`
+
+The per-role permission model shared by **all** multi-user channels. Owners get the full
+toolset; everyone else is a guest, held to a capability ceiling that is never escalated.
+
+| Subcommand | Description |
+|---|---|
+| `show` | Current owners and the guest capability ceiling |
+| `add <target> <value>` | Add an entry. Targets: `owner`, `tool`, `command` (aliases: `owners`, `tools`, `commands`, `cmd`) |
+| `remove <target> <value>` | Remove an entry |
+
+```bash
+rantaiclaw permissions add owner 123456789          # Telegram numeric user ID
+rantaiclaw permissions add owner alice              # Slack/Discord/etc username
+rantaiclaw permissions add tool shell               # let guests use the shell tool
+rantaiclaw permissions add command 'kubectl get *'  # ...but only these commands
+```
+
+Adding `tool shell` without a `command` entry gives guests a shell with no allowed
+commands, which denies everything — the two are meant to be set together.
+
+### `personality`
+
+| Subcommand | Description |
+|---|---|
+| `show` | Active persona preset for the current profile |
+| `list` | Available presets |
+| `set <preset>` | Switch preset, e.g. `rantaiclaw personality set concise_pro` |
+
+### `profile`
+
+Each profile is a self-contained `~/.rantaiclaw/profiles/<name>/` directory with its own
+config, persona, workspace, memory, skills, sessions, policy, secrets and runtime state. The
+`default` profile is created on first run.
+
+| Subcommand | Description |
+|---|---|
+| `list` | All profiles |
+| `create <name> [--clone <src>]` | Create, optionally cloning an existing profile |
+| `use <name>` | Switch the active profile |
+| `clone <src> <dst>` | Clone under a new name |
+| `delete <name>` | Delete; refuses the active profile unless `--force` |
+| `current` | Print the active profile name |
+
+To switch for a single invocation without moving the active marker, use the global
+`-p <name>` flag or the `RANTAICLAW_PROFILE` environment variable. Precedence is
+**CLI flag > env var > active-profile file > `default`**.
+
+### `session`
+
+Browse the active profile's
+`~/.rantaiclaw/profiles/<name>/sessions/sessions.db`. Session IDs accept a unique prefix.
+
+| Subcommand | Description |
+|---|---|
+| `list [--limit N]` | Recent sessions; 50 by default |
+| `get <id-prefix>` | Show a session's messages |
+| `search <query>` | Full-text search across all session messages |
+| `title <id-prefix> <text>` | Rename a session |
+
+### `insights`
+
+Cumulative session and message statistics for the active profile — the CLI parity command for
+the TUI's `/insights`. No subcommands.
+
+### `rollback`
+
+Undo a `rantaiclaw update`. Every update writes a snapshot of config plus active-profile state
+to `~/.rantaiclaw/.update-snapshots/<timestamp>/` **and** keeps the previous binary as
+`rantaiclaw.old` beside the live one. `rollback` restores both, newest snapshot by default.
+
+| Flag | Description |
+|---|---|
+| `--list` | Show available snapshots and exit without restoring |
+| `--snapshot <PATH>` | Restore a specific snapshot rather than the newest |
+| `-y`, `--yes` | Skip the confirmation prompt |
+
+### `uninstall`
+
+Removes profile data, and optionally the binary. By default it removes **only the active
+profile**. It calls `service uninstall` first when a daemon unit is installed, and makes a
+best-effort attempt to comment out `PATH` amendments the installer added to shell rc files.
+
+| Flag | Description |
+|---|---|
+| `--all` | Remove every profile and the whole `~/.rantaiclaw/` root |
+| `--purge` | Full wipe **and** self-delete the binary |
+| `--keep-secrets` | Wipe profiles but keep `.secret_key` |
+| `--dry-run` | Print the plan, change nothing |
+| `-y`, `--yes` | Skip the confirmation prompt |
+
+`--dry-run` first is the cheap habit here: `--all` and `--purge` are not recoverable, and
+`rollback` does not undo them.
 
 ## Validation Tip
 

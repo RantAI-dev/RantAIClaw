@@ -24,6 +24,9 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 
 ## Current state by maturity
 
+_Rows below were read against the code on **2026-09-07**. A row with no evidence behind it is
+a claim, not a status; where a row could not be settled by reading, it says so._
+
 | Surface | Maturity |
 |---|---|
 | Skills runtime | Stable |
@@ -32,7 +35,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 | MCP curated picker | Stable |
 | MCP zero-auth setup-time validation | Stable (added v0.5.2) |
 | Auth flow per MCP server | Stable |
-| MCP tool **reach** | Partial — TUI/CLI agent and the gateway's `/api/v1` chat only. Chat channels, cron and gateway webhooks get no MCP tools, silently (issue #283) |
+| MCP tool **reach** | Partial — TUI/CLI agent and the gateway's `/api/v1` chat only. Chat channels, cron and gateway webhooks get no MCP tools. **No longer silent**: `rantaiclaw doctor` says so next to `mcp.startup` and `docs/reference/config.md` documents it (Wave 2). Issue #283 — making the reach universal — stays open |
 | MCP crash supervision | **None.** A crashed server is not respawned. The gateway keeps one connected pool and reconnects on config change; the respawn-with-backoff stack that used to be in `src/mcp` had no caller and was deleted (plan 312, issue #282) |
 | `author_skill` authoring tool | Stable |
 

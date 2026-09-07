@@ -23,8 +23,8 @@ pub fn render_text(results: &[CheckResult], skipped: &[String], colors: bool) ->
     use std::fmt::Write as _;
 
     let mut out = String::new();
-    let _ = writeln!(out, "RantaiClaw Doctor");
-    let _ = writeln!(out, "─────────────────");
+    let _ = writeln!(out, "RantaiClaw Doctor — configuration and runtime health");
+    let _ = writeln!(out, "─────────────────────────────────────────────────────");
 
     let mut current_cat = "";
     for r in results {
@@ -59,6 +59,22 @@ pub fn render_text(results: &[CheckResult], skipped: &[String], colors: bool) ->
             let _ = writeln!(out, "  - {name}");
         }
     }
+
+    // `doctor` and `doctor models` answer different questions, and reading one
+    // as the other is how a working key gets blamed for a missing model. This
+    // command asks whether a credential *resolves*; it does not ask any
+    // provider whether it accepts it, or which models it serves. Saying so in
+    // the output is cheaper than the support round-trip.
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "This checks configuration and local runtime state. It does not ask a provider"
+    );
+    let _ = writeln!(
+        out,
+        "which models it serves — run `rantaiclaw doctor models` for that."
+    );
+
     out
 }
 
