@@ -25,6 +25,9 @@ Talk to any model from one binary. Native adapters for the leaders, OpenRouter a
 
 ## Current state by maturity
 
+_Rows below were read against the code on **2026-09-07**. A row with no evidence behind it is
+a claim, not a status; where a row could not be settled by reading, it says so._
+
 | Surface | Maturity |
 |---|---|
 | OpenAI adapter | Stable |
@@ -38,7 +41,7 @@ Talk to any model from one binary. Native adapters for the leaders, OpenRouter a
 | Qwen | Stable |
 | Llama family (groq / fireworks / together / nvidia / llamacpp) | Stable |
 | DeepSeek | Stable; needs model-id refresh |
-| Per-provider SSE streaming | OpenRouter only — Anthropic / OpenAI / Gemini / Groq / Mistral / xAI in v0.6.0 |
+| Per-provider SSE streaming | **All providers.** Every concrete implementation returns `true` from `supports_streaming` — `OpenRouterProvider` (`src/providers/openrouter.rs:406`), `CompatibleProvider` (`compatible.rs:1714`) and `RigProvider` (`rig_native.rs:505`), which is what Anthropic/OpenAI/Gemini route through by default. The trait default is still `false`, so a new adapter that forgets to override it silently falls back to non-streaming |
 
 ## Architecture
 

@@ -32,6 +32,9 @@ Three numbers define this pillar: cold start, RAM, binary size. The install pipe
 
 ## Current state by maturity
 
+_Rows below were read against the code on **2026-09-07**. A row with no evidence behind it is
+a claim, not a status; where a row could not be settled by reading, it says so._
+
 | Surface | Maturity |
 |---|---|
 | `curl \| bash` one-liner | Stable (v0.4.1) |
@@ -41,7 +44,7 @@ Three numbers define this pillar: cold start, RAM, binary size. The install pipe
 | Multi-target build matrix | Stable (v0.5.1) |
 | Verify-artifacts gate before publish | Stable |
 | Weekly verification-only run | Stable |
-| `--all-features` build | All except `channel-matrix` (matrix-sdk recursion-limit) |
+| `--all-features` build | Still omitted from CI, but **no longer because of matrix-sdk** — 0.18 type-checks at the default recursion limit and `channel-matrix` has its own job. What `--all-features` would add now is the hardware/probe/postgres set (`rppal`, `probe-rs` + ~50 deps, `tokio-postgres`); that is a build-cost question, not a compile failure (`.github/workflows/ci-run.yml:236-239`) |
 
 ## Architecture
 

@@ -28,6 +28,10 @@ State that survives restarts. Multi-profile workspace layout, pluggable memory b
 
 ## Current state by maturity
 
+_**Not re-read on 2026-09-07.** The truth pass of that date covered pillars 2, 4, 8 and 9
+only; these rows still carry whatever date the section they came from carried. Treat them as
+unverified rather than current._
+
 | Surface | Maturity |
 |---|---|
 | Profile system | Stable (v0.5.0 Wave 1) |
