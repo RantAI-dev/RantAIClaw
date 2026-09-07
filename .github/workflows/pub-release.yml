@@ -157,7 +157,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
             - name: Schema-drift snapshots + migration round-trip
               run: |
                   export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
@@ -240,7 +240,7 @@ jobs:
                   toolchain: 1.92.0
                   targets: ${{ matrix.target }}
 
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
             - name: Install cross-compilation toolchain (Linux)
               if: runner.os == 'Linux' && matrix.cross_compiler != ''
@@ -395,9 +395,26 @@ jobs:
               with:
                   path: artifacts
 
-            - name: Install syft
+            # This job holds contents/packages/id-token/attestations write and mints the
+            # cosign signatures users are told to trust. Everything it executes is pinned
+            # by digest: the installer script this replaced was fetched from anchore/syft
+            # `main` and piped into a shell, so a compromise of that branch would have run
+            # beside the signing keys. Bump by editing both values together.
+            - name: Install syft (pinned, checksum-verified)
+              shell: bash
+              env:
+                  SYFT_VERSION: 1.51.1
+                  SYFT_SHA256: 8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3
               run: |
-                  curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+                  set -euo pipefail
+                  tarball="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+                  curl -sSfL --retry 3 -o "$tarball" \
+                    "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${tarball}"
+                  echo "${SYFT_SHA256}  ${tarball}" | sha256sum -c -
+                  tar -xzf "$tarball" syft
+                  sudo install -m 0755 syft /usr/local/bin/syft
+                  rm -f "$tarball" syft
+                  syft version
 
             - name: Generate SBOM (CycloneDX)
               run: |
@@ -448,10 +465,10 @@ jobs:
                   done < <(find artifacts -type f ! -name '*.sig' ! -name '*.pem' ! -name '*.bundle' -print0)
 
             - name: Setup Docker Buildx
-              uses: docker/setup-buildx-action@v3
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
             - name: Log in to Container Registry
-              uses: docker/login-action@v3
+              uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
               with:
                   registry: ${{ env.REGISTRY }}
                   username: ${{ github.actor }}
@@ -514,7 +531,7 @@ jobs:
               # continue-on-error so a transient registry hiccup still
               # doesn't lose the release that was already published above.
               continue-on-error: true
-              uses: docker/build-push-action@v6
+              uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
               env:
                   DOCKER_BUILD_SUMMARY: false
                   DOCKER_BUILD_RECORD_UPLOAD: false
