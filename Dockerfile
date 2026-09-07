@@ -24,10 +24,16 @@ RUN mkdir -p src benches crates/robot-kit/src \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > benches/kb_retrieval.rs \
     && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs
+# `release-fast`, not `release`, because that is the profile `pub-release.yml`
+# ships. They differ only in `codegen-units` (8 vs 1), but building the image
+# with a profile no published binary uses meant two artefacts of the same
+# version behaved differently under load, and the size gate measured only one of
+# them. Matching the shipped binary is the point; if the shipping profile ever
+# changes, this changes with it.
 RUN --mount=type=cache,id=rantaiclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rantaiclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=rantaiclaw-target,target=/app/target,sharing=locked \
-    cargo build --release --locked
+    cargo build --profile release-fast --locked
 RUN rm -rf src benches crates/robot-kit/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
@@ -38,8 +44,8 @@ COPY firmware/ firmware/
 RUN --mount=type=cache,id=rantaiclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rantaiclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=rantaiclaw-target,target=/app/target,sharing=locked \
-    cargo build --release --locked && \
-    cp target/release/rantaiclaw /app/rantaiclaw && \
+    cargo build --profile release-fast --locked && \
+    cp target/release-fast/rantaiclaw /app/rantaiclaw && \
     strip /app/rantaiclaw
 
 # Prepare runtime directory structure and default config inline (no extra stage)

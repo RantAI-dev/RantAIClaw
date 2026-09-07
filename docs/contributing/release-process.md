@@ -2,8 +2,13 @@
 
 This runbook defines the maintainers' standard release flow.
 
-Last verified: **September 4, 2026**, against `v0.28.0-alpha` — every step below was
-run, including the verification build, the tag script, and the post-release checks.
+**Maintainer Procedure last verified: September 4, 2026**, against `v0.28.0-alpha` — every
+step in that section was run, including the verification build, the tag script, and the
+post-release checks. That date covers the procedure only.
+
+The maturity contract and the rewrite rule below were **written 2026-09-07** and are policy,
+not a procedure that has been executed. Where they cite repository state — tag ancestry,
+merge-bases, tree identity — those were checked on that date with the commands shown.
 
 ## Release Goals
 
@@ -11,6 +16,100 @@ run, including the verification build, the tag script, and the post-release chec
 - Publish only from code already in `main`.
 - Verify multi-target artifacts before publish.
 - Keep release cadence regular even with high PR volume.
+
+## What alpha means, and what would end it
+
+Over a hundred `-alpha` releases have shipped and this document said nothing about what the
+label warned anyone about. A label that never changes stops carrying information, so here is
+what it currently means and what would have to be true to drop it.
+
+Note that **the update channel's `stable` is a different word.** `rantaiclaw update
+--channel stable` filters on GitHub's *prerelease* flag, not on the version suffix
+(`src/lifecycle/update.rs:546`). Every release so far is tagged `-alpha` and published with
+that flag off, so `stable` — the default channel — installs alpha builds. That is a
+packaging detail; the maturity below is the product claim.
+
+### alpha — where the project is now
+
+**What an operator is being warned about**, each of which happened in the last three releases:
+
+- **The config schema may move under you.** v28 → v31 across three releases. Migrations are
+  written and tested, but a downgrade after an upgrade is not supported.
+- **Rollback may not be clean.** `rantaiclaw rollback` restores the previous binary and a
+  config snapshot; it does not migrate a newer on-disk schema back down.
+- **Defaults may change.** The `[cost] max_tokens_per_day` ceiling switched *itself on* at
+  2,000,000 tokens/day for installs that had never set it.
+- **Not every channel is verified.** Four are supported (Telegram, Discord, Slack, WhatsApp
+  Cloud); the rest ship labelled *under development*.
+
+**Suitable for**: evaluation, personal use, non-critical internal automation where an
+operator reads the changelog before upgrading.
+
+**Not suitable for**: anything where an unattended upgrade is expected to be safe.
+
+### beta — the exit criteria from alpha
+
+All of these, measured, not asserted:
+
+| Criterion | How it is checked |
+|---|---|
+| **No schema break within a minor version.** A `0.x.y` → `0.x.z` upgrade never migrates. | The schema-drift gate already runs per release; add the minor-version comparison to it. |
+| **Three consecutive releases with no P0 hotfix.** | Release history. A P0 is anything that made a released binary unusable for a default install. |
+| **Every supported-tier channel verified live** against a real workspace, per release. | A recorded run per channel, not a passing unit test. |
+| **Memory stable over a 72-hour soak** at a defined message rate, with RSS recorded at start and end. | A soak run whose numbers go in the release notes. |
+| **Clean rollback across one version boundary**, verified by actually doing it. | Upgrade, use, roll back, confirm the profile still loads. |
+| **Documented footprint** — binary size per target, idle RSS, cold start — measured for the release being cut. | `docs/pillars/8-install-release.md`, with the date and method. |
+
+### stable — the exit criteria from beta
+
+| Criterion | How it is checked |
+|---|---|
+| **Six months in beta** with no criterion above regressing. | Release history. |
+| **A deprecation policy exists and has been honoured once** — a config key removed with a release of warning first. | The key's removal commit and the release that warned. |
+| **Security reports have a measured response time** against `SECURITY.md`'s 7-day acknowledgement aim. | The advisory record. |
+| **The supported channel tier is unchanged for three releases.** | `CHANNEL_CATALOG`. |
+| **`--all-features` builds in CI.** | A CI job, not a local run. |
+
+Waves 4 and 5 of the production-readiness effort are judged against this table. It is written
+before them on purpose: exit criteria invented after the work they measure are not criteria.
+
+## Published history is not rewritten
+
+On 2026-09-07 `origin/main` was force-pushed in **both** repositories to strip
+`Co-authored-by: Claude` / `Claude-Session:` trailers from 22 commits. The trees were
+byte-identical and the shipped bytes were correct, but the release tags had been cut *before*
+the rewrite, so they still point at pre-rewrite commits that are no longer on `main`.
+
+**The rule, going forward: do not rewrite published history.** If it is ever unavoidable,
+decide *before* the push which of these applies to every tag pointing into the rewritten
+range, and record the choice:
+
+1. re-cut the tag onto the rewritten commit — only if nothing signed names the old SHA; or
+2. preserve the pre-rewrite commit by **pushing a branch** that keeps it reachable.
+
+The release workflow already refuses a tag that is not reachable from `origin/main`
+(`.github/workflows/pub-release.yml`, in the `prepare` job). That guard runs at release time
+and it works — verified 2026-09-07 against the current repository state, where it rejects
+`v0.30.0-alpha` and passes `v0.29.0-alpha`. What it cannot catch is a rewrite performed
+*after* a release, which is exactly what happened. Hence the rule above, and the check in
+`scripts/ci/check_release_tag_ancestry.sh`.
+
+### Known-divergent releases (content-identical, not to be re-cut)
+
+| Repo | Tag | Tagged commit | Merge-base with `main` | Trees |
+|---|---|---|---|---|
+| RantaiClaw | `v0.30.0-alpha` | `94d7b18` | `4df441f` (`v0.29.0-alpha`) | identical (`git diff 94d7b18 ae5924a` is empty) |
+| claw-ui | `v0.3.27` | `0f12c71` | `eaaa002` (`v0.3.26`) | identical |
+
+**Neither tag is to be moved or deleted.** RantaiClaw's `release-manifest.json` is itself a
+**signed** release asset naming `"source_sha": "94d7b18…"`, and claw-ui `v0.3.27` ships a
+cosign `.bundle`. Moving either tag would put it in conflict with its own signed provenance.
+
+Both pre-rewrite commits are now kept reachable independently of their tags by
+`backup/pre-trailer-strip-2026-09-07`, **pushed to `origin` in both repositories on
+2026-09-07**. Before that push they survived only because a tag pointed at them, which meant
+one accidental tag deletion would have left a signed artefact naming a commit that no longer
+existed. Do not delete that branch either.
 
 ## Standard Cadence
 

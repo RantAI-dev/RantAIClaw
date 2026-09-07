@@ -319,8 +319,12 @@ jobs:
                   fi
                   "$CARGO_BIN" build --profile release-fast --locked --target ${{ matrix.target }}
 
-            - name: Check binary size (Unix)
-              if: runner.os != 'Windows'
+            # Runs on Windows too. It used to be `if: runner.os != 'Windows'`,
+            # so the one target whose binary nobody measured was the one where a
+            # regression would be least likely to be noticed by hand. The script
+            # is bash and the Windows runner has it; `stat -c%s` works there.
+            - name: Check binary size
+              shell: bash
               run: ./scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release-fast/${{ matrix.artifact }}" "${{ matrix.target }}"
 
             - name: Package (Unix)
