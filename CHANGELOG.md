@@ -92,6 +92,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **All six release targets are measured, and the size gate stops crying wolf.** The earlier pass
+  measured one target because cross-compiling six did not fit on the development machine's disk.
+  It did not have to: the artefacts are published. Measuring the shipped `v0.30.0-alpha` binaries
+  gives **20.48 MiB (aarch64-darwin) to 34.48 MiB (x86_64-linux)** — and the spread is the finding.
+  Size pressure is **one target's problem, not the platform's**: the same source is 14 MiB clear
+  of the cap on aarch64-darwin and **0.52 MiB** from it on x86_64-linux.
+  `check_binary_size.sh` warned on *every* target of *every* release, because its 5 MB aspiration
+  is below all six. That number is now reported rather than warned on — a warning that always
+  fires is training, not information — and the 30 MB advisory is kept, because it fires on exactly
+  one of the six and means "this one is close to the cap". Both ends were mutated: a file 40 bytes
+  over the safeguard errors and exits 1; a 1 MB file stays silent.
+- **Idle RSS for the gateway and the daemon, not just the TUI.** Those are the processes an
+  operator actually leaves running, and they were the ones not measured: **gateway 26.7 MiB**
+  (flat at every sample) and **daemon 30.3 MiB** (settling 29,768 → 31,032 kB over the first 30 s,
+  then flat — the channel runtime, scheduler and heartbeat coming up, not a leak). Pillar 8's
+  comparison row now carries all three instead of the TUI's number alone.
+
 - **`docs/reference/channels.md` records what the supported tier has actually been driven
   against.** The tier is the owner's 2026-09-04 decision and says what this project stands
   behind; on its own it is not a record that anything was run. A new table under §0.1 says
