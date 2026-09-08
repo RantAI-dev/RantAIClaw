@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0-alpha] — 2026-09-08
+
+Two waves in one tag. Wave 3 landed on `main` on 2026-09-07 and was never cut, so
+everything it did has been sitting unreleased for a day; this release ships Wave 3,
+Wave 4 and the channel-label split together.
+
+**Rolls back cleanly to v0.30.0-alpha.** The config schema stays at **31** and the
+sessions store at **1**, so a config this binary writes still loads on the previous
+one. Rolling back past v0.30.0-alpha does not work — v0.29.0-alpha reads schema 28.
+
+What an operator will actually notice:
+
+- **A configured MCP server now reaches chat channels and cron**, not only the TUI
+  and the gateway's `/api/v1` chat. Issue #283 is closed. The gateway's own
+  `/webhook` path remains the one surface without MCP tools, and now says so
+  instead of leaving it to be discovered.
+- **An MCP server that dies is respawned.** Before this, one crashed server made
+  every later call to it fail for the life of the process, with no log line at any
+  level, while the other servers kept working.
+- **`channel start` and `channels run` drain on SIGTERM.** Both printed a graceful
+  stop they did not perform; a turn in flight was severed and the process exited
+  143.
+- **The channel catalog carries two axes**, support and verification, because one
+  word was answering two questions. Four channels are supported, one has been
+  driven against a real platform, and "supported but not yet verified" is now a
+  named, legitimate state rather than a gap someone will close by demoting three
+  channels.
+- **The web console needs this runtime.** claw-ui **v0.3.28** reads both axes;
+  against an older gateway it still lists the channels but claims no tier.
+
 ### Added
 
 - **`GET /api/v1/channels` serves both axes.** Each entry gains `support` and `verification`
