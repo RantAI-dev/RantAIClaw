@@ -71,6 +71,13 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
+    // One MCP pool for the scheduler's whole life. Every job that needs an MCP
+    // tool shares these server processes; connecting per job would spawn a
+    // child process per scheduled run, which is the mistake #697 fixed for the
+    // gateway. The pool reconnects itself when `mcp_servers` changes, so a
+    // config edit mid-cycle is picked up without restarting the daemon.
+    let mcp = Arc::new(crate::mcp::discover::McpPoolHandle::default());
+
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
     // Due-job batches run on their own tasks so a slow or hung job can never
@@ -182,6 +189,7 @@ pub async fn run(
         let config = working.clone();
         let security = Arc::clone(&security);
         let batch_observer = observer.clone();
+        let batch_mcp = Arc::clone(&mcp);
         batches.spawn(async move {
             process_due_jobs(
                 &config,
@@ -189,6 +197,7 @@ pub async fn run(
                 jobs,
                 SCHEDULER_COMPONENT,
                 batch_observer.as_ref(),
+                Some(&batch_mcp),
             )
             .await;
         });
@@ -200,8 +209,9 @@ pub async fn execute_job_now(
     security: &SecurityPolicy,
     job: &CronJob,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
+    mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
 ) -> (bool, String, Vec<AttemptOutcome>) {
-    execute_job_with_retry(config, security, job, observer).await
+    execute_job_with_retry(config, security, job, observer, mcp).await
 }
 
 /// Force-run a job now: execute + record run history + update
@@ -214,6 +224,7 @@ pub async fn run_job_manual(
     security: &SecurityPolicy,
     job: &CronJob,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
+    mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
 ) -> (bool, String) {
     // Claim the shared in-flight registry so a second "run now" (or an overlapping
     // scheduled tick) can't double-execute the same job. The guard releases the
@@ -222,7 +233,7 @@ pub async fn run_job_manual(
     let Some(_guard) = InFlightGuard::claim(&job.id) else {
         return (false, format!("cron job '{}' is already running", job.id));
     };
-    let (success, output, attempts) = execute_job_now(config, security, job, observer).await;
+    let (success, output, attempts) = execute_job_now(config, security, job, observer, mcp).await;
     // Record each attempt as its own row (a manual run does not deliver).
     for a in &attempts {
         record_attempt(config, &job.id, a).await;
@@ -252,6 +263,7 @@ async fn execute_job_with_retry(
     security: &SecurityPolicy,
     job: &CronJob,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
+    mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
 ) -> (bool, String, Vec<AttemptOutcome>) {
     let mut attempts = Vec::new();
     let mut last_output = String::new();
@@ -265,7 +277,7 @@ async fn execute_job_with_retry(
             JobType::Agent => {
                 with_timeout(
                     Duration::from_secs(AGENT_JOB_TIMEOUT_SECS),
-                    run_agent_job(config, security, job, observer),
+                    run_agent_job(config, security, job, observer, mcp),
                 )
                 .await
             }
@@ -305,6 +317,7 @@ async fn process_due_jobs(
     jobs: Vec<CronJob>,
     component: &str,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
+    mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -315,6 +328,7 @@ async fn process_due_jobs(
         let security = Arc::clone(security);
         let component = component.to_owned();
         let obs = observer.cloned();
+        let pool = mcp.cloned();
         async move {
             // Claim the job on the process-wide registry; skip if a previous
             // (long-running) invocation — scheduled or manual — is still going,
@@ -327,8 +341,15 @@ async fn process_due_jobs(
                 );
                 return (job.id.clone(), true);
             };
-            execute_and_persist_job(&config, security.as_ref(), &job, &component, obs.as_ref())
-                .await
+            execute_and_persist_job(
+                &config,
+                security.as_ref(),
+                &job,
+                &component,
+                obs.as_ref(),
+                pool.as_ref(),
+            )
+            .await
         }
     }))
     .buffer_unordered(max_concurrent);
@@ -346,11 +367,13 @@ async fn execute_and_persist_job(
     job: &CronJob,
     component: &str,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
+    mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
 ) -> (String, bool) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
-    let (success, output, attempts) = execute_job_with_retry(config, security, job, observer).await;
+    let (success, output, attempts) =
+        execute_job_with_retry(config, security, job, observer, mcp).await;
     let success = persist_job_result(config, job, success, &output, &attempts).await;
 
     (job.id.clone(), success)
@@ -380,6 +403,7 @@ async fn run_agent_job(
     security: &SecurityPolicy,
     job: &CronJob,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
+    mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
 ) -> (bool, String) {
     if !security.can_act() {
         return (
@@ -423,6 +447,7 @@ async fn run_agent_job(
         "scheduler",
         memory_scope,
         observer.cloned(),
+        mcp.cloned(),
     ))
     .await;
 
@@ -1326,7 +1351,7 @@ mod tests {
         let job = test_job("sh ./retry-once.sh");
 
         let (success, output, _attempts) =
-            execute_job_with_retry(&config, &security, &job, None).await;
+            execute_job_with_retry(&config, &security, &job, None, None).await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -1342,7 +1367,7 @@ mod tests {
         let job = test_job("ls always_missing_for_retry_test");
 
         let (success, output, _attempts) =
-            execute_job_with_retry(&config, &security, &job, None).await;
+            execute_job_with_retry(&config, &security, &job, None, None).await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }
@@ -1488,7 +1513,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job, None).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None, None).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
@@ -1503,7 +1528,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job, None).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None, None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -1519,7 +1544,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job, None).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None, None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -1536,7 +1561,7 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component, None).await;
+        process_due_jobs(&config, &security, Vec::new(), &component, None, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1557,7 +1582,7 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component, None).await;
+        process_due_jobs(&config, &security, vec![job], &component, None, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1579,7 +1604,15 @@ mod tests {
         let _held = InFlightGuard::claim(&job.id).expect("fresh id must claim");
         let component = unique_component("scheduler-inflight");
 
-        process_due_jobs(&config, &security, vec![job.clone()], &component, None).await;
+        process_due_jobs(
+            &config,
+            &security,
+            vec![job.clone()],
+            &component,
+            None,
+            None,
+        )
+        .await;
 
         // It must have been skipped → no run recorded.
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -1600,7 +1633,7 @@ mod tests {
         // must refuse and record NO run row.
         {
             let _held = InFlightGuard::claim(&job.id).expect("fresh id must claim");
-            let (success, output) = run_job_manual(&config, &security, &job, None).await;
+            let (success, output) = run_job_manual(&config, &security, &job, None, None).await;
             assert!(!success, "a concurrent manual run must not execute");
             assert!(
                 output.contains("already running"),
@@ -1612,7 +1645,7 @@ mod tests {
             );
         }
         // Claim released → a manual run now executes and records exactly one row.
-        let (success, _) = run_job_manual(&config, &security, &job, None).await;
+        let (success, _) = run_job_manual(&config, &security, &job, None, None).await;
         assert!(success);
         assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
     }
@@ -1793,7 +1826,7 @@ mod tests {
         let before = cron::get_job(&config, &job.id).unwrap().next_run;
 
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let (ok, _) = run_job_manual(&config, &security, &job, None).await;
+        let (ok, _) = run_job_manual(&config, &security, &job, None, None).await;
         assert!(ok);
 
         let after = cron::get_job(&config, &job.id).unwrap();
@@ -1818,7 +1851,7 @@ mod tests {
         let mut job = test_job("echo ok");
         job.id = "missing-row-probe".into();
 
-        let (ok, output) = run_job_manual(&config, &security, &job, None).await;
+        let (ok, output) = run_job_manual(&config, &security, &job, None, None).await;
         assert!(ok, "the command ran successfully");
         assert!(output.contains("ok"));
         // No run row exists because the parent job row is absent — the write

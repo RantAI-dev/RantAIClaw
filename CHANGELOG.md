@@ -129,6 +129,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP tools now reach chat channels and cron — issue #283 closed.** A configured MCP server
+  reached the TUI/CLI agent and the gateway's `/api/v1` chat and **nothing else**, because those
+  two build an `Agent` (which splices MCP in) while the channel runtime and the cron/one-shot
+  agent path assemble their own registries and never did. There was no error and no log line;
+  the tools were simply absent, which is why it survived two waves of reading.
+  The channel runtime connects **one pool when it starts** and every turn shares it. The cron
+  scheduler owns **one pool for its whole life**, so a hundred scheduled jobs share one set of
+  server processes; a one-shot `cron run` spawns its own and drops them with the registry, which
+  is right for a process that exits. Connecting per message or per job would be the
+  spawn-per-request mistake #697 fixed for the gateway, so which one a caller gets is an explicit
+  argument rather than a default.
+  **Driven, with three real `@modelcontextprotocol/server-*` processes**: the channel runtime logs
+  `MCP tools added to the channel runtime count=36 servers=3`; a cron job called
+  `mcp__filesystem__write_file` and the file appeared on disk; and under the daemon two scheduled
+  runs both logged `pooled=true surface=scheduler` with **no second spawn** for the second run.
+  Each subsystem keeps its own pool, so a daemon running channels, the scheduler and gateway chat
+  with three servers configured runs up to nine server processes — bounded by subsystem count,
+  never by traffic.
+- **The gateway's own `/webhook` path still has no MCP tools, and now says so.** Its registry
+  comes from a **synchronous** `ToolsFactory` closure and connecting a pool must await, so it is a
+  signature change to a shared factory rather than a wiring fix. `config.md`, the `mcp` module doc
+  and the `mcp.startup` doctor hint all name it as the one remaining surface instead of leaving it
+  to be discovered.
+
 - **`channel start` and `channels run` ignored every shutdown signal.** Both called
   `start_channels`, which passed a `CancellationToken` **nobody ever cancelled**, so SIGTERM took
   the default "terminate immediately" disposition and severed whatever channel turn was in
