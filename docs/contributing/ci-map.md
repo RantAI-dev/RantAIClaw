@@ -13,15 +13,17 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/ci-run.yml` (`CI`)
     - Purpose: single consolidated Rust quality gate with internal stages.
         - `lint` — `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, plus strict delta clippy on changed Rust lines (`scripts/ci/rust_strict_delta_gate.sh`).
-        - `test` — `cargo nextest run --locked --workspace`.
+        - `test` — `cargo test --locked --workspace -- --test-threads=1`. Not `nextest`: it was tried and the runner SIGTERM'd or hit the job cap on this codebase. `--test-threads=1` because many unit tests mutate process-global env behind per-file locks that do not serialize across modules.
+        - `msrv` — `cargo check --all-targets` at the toolchain `Cargo.toml`'s `rust-version` field declares, read out of the manifest rather than pinned in the workflow so the job cannot defend a number the manifest no longer says.
         - `features` — matrix `cargo check`: `no-default-features`, `hardware-only`, `browser-native`.
-        - `e2e` — `cargo test --test agent_e2e --locked` (push to `main` only; not on PRs).
+        - `e2e` — `cargo test --test agent_e2e --locked --verbose`. Runs on PRs; it was push-only until an end-to-end regression turned out to be invisible until after merge.
         - `bench-compile` — `cargo bench --no-run --locked` (verifies criterion benches build).
         - `build` — `cargo build --profile release-fast --locked` smoke + binary-size guard (`scripts/ci/check_binary_size.sh`).
         - `channel-lark` — `cargo test --features channel-lark --lib channels::lark`.
+        - `channel-matrix` — `cargo test --locked --features channel-matrix --lib channels::matrix`, **pinned to rustc 1.93.0 — the only job in this repository that does not build at the pin every other job uses.** `matrix-sdk` 0.17 and 0.18 both declare `rust-version = "1.93"`, and no `matrix-sdk` release both type-checks at the default recursion limit and builds on 1.92. It is confined to this job on purpose: moving the whole repo to 1.93 would touch ten workflow pins, the release build and the crate's declared MSRV of 1.91, which is a product decision rather than a side effect of a channel fix. **Anyone raising or lowering a toolchain pin has to account for this job separately.** Matrix is not a default feature, and `cargo +1.92.0 check --lib` passes with `matrix-sdk` 0.18 in `Cargo.lock` — an unactivated optional dependency does not impose its `rust-version` on the build.
         - `docs-quality` — incremental `markdownlint` on changed lines + offline `lychee` on links added on changed lines.
         - `lint-feedback` — posts actionable failure comment when lint/docs gates fail on a PR.
-    - PR gating: every Rust stage — `lint`, `test`, `channel-lark`, `features`, `bench-compile`, `e2e`, `build` — runs on every Rust-changing PR and is required by `CI Required Gate`. `docs-quality` runs whenever docs change and is required. No stage is label-gated: `ci:full` no longer changes what runs, and `e2e` is no longer push-only.
+    - PR gating: every Rust stage — `lint`, `test`, `msrv`, `channel-lark`, `channel-matrix`, `features`, `bench-compile`, `e2e`, `build` — runs on every Rust-changing PR and is required by `CI Required Gate`. That list is the one `scripts/ci/required_gate.sh` actually reads; if it and this line ever disagree, the script is right. `docs-quality` runs whenever docs change and is required. No stage is label-gated: `ci:full` no longer changes what runs, and `e2e` is no longer push-only.
     - Merge gate: `CI Required Gate` runs `scripts/ci/required_gate.sh`, which reads every stage result from the environment. The decision table lives in that script and is checked by `required_gate.sh --self-test`, which the same job runs first — a stage the gate stops reading fails the self-test instead of quietly becoming advisory.
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks).
@@ -69,7 +71,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 ## Fast Triage Guide
 
-1. `CI Required Gate` failing: the job prints every stage result it read before deciding; find the non-`success` one, then look at that stage's own logs (`lint`, `test`, `channel-lark`, `features`, `e2e`, `bench-compile`, `build`, `docs-quality`).
+1. `CI Required Gate` failing: the job prints every stage result it read before deciding; find the non-`success` one, then look at that stage's own logs (`lint`, `test`, `msrv`, `channel-lark`, `channel-matrix`, `features`, `e2e`, `bench-compile`, `build`, `docs-quality`).
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
 4. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.

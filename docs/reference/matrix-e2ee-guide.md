@@ -12,6 +12,38 @@
 
 This guide explains how to run RantaiClaw reliably in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
 
+## What in this guide is verified, and what is not
+
+The distinction matters more here than in most references: this guide describes
+an encrypted transport, and a confident sentence about encryption that nobody
+checked is worse than no sentence.
+
+**Verified, at 2026-09-08:**
+
+- The channel builds and its tests run —
+  `cargo test --locked --features channel-matrix --lib channels::matrix`: **33
+  tests, all passing**, and CI runs the same command on every Rust PR
+  (`Channel Matrix (build + test)`).
+- Replies are sent as markdown: `matrix.rs` calls
+  `RoomMessageEventContent::text_markdown`, and `send_content_uses_markdown_formatting`
+  asserts the resulting event carries a `formatted_body`. So §4.E is checked.
+- A configured `[channels_config.matrix]` in a build without the feature reports
+  as *not configured* rather than silently missing (`channels/mod.rs`).
+
+**Not verified — read the rest of this guide as guidance, not as a record:**
+
+- **No RantaiClaw release or test run has ever completed a message round trip
+  against a real homeserver.** That is what keeps Matrix outside the supported
+  tier ([channels.md §0](channels.md#0-maturity-tiers)), and it means §3's
+  validation flow is a procedure nobody here has executed end to end.
+- The E2EE key-sharing, device-trust and key-backup behaviour in §4.D is
+  client-side and homeserver-side behaviour. RantaiClaw delegates all of it to
+  `matrix-sdk`; none of it is exercised by a test in this repository.
+
+If you run the §3 flow against a real homeserver, the promotion checklist in
+[channels.md §0](channels.md#how-a-channel-is-promoted) is what turns that into
+a tier change — including writing down what broke.
+
 It focuses on the common failure mode reported by users:
 
 > “Matrix is configured correctly, checks pass, but the bot does not respond.”
