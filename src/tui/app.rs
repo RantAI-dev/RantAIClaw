@@ -2517,7 +2517,7 @@ impl TuiApp {
         );
         self.context.channels_summary = crate::channels::channel_status_roster(&config)
             .into_iter()
-            .map(|(name, configured)| (name.to_string(), configured))
+            .map(|(name, configured, maturity)| (name.to_string(), configured, maturity))
             .collect();
         let new_channels = channels_fingerprint(&config);
         let new_channels_count = crate::channels::configured_channel_count(&config);
@@ -7007,8 +7007,8 @@ fn render_splash_lines(ctx: &TuiContext, area_width: u16, area_height: u16) -> V
     let channels: Vec<String> = ctx
         .channels_summary
         .iter()
-        .filter(|(_, configured)| *configured)
-        .map(|(name, _)| name.clone())
+        .filter(|(_, configured, _)| *configured)
+        .map(|(name, _, _)| name.clone())
         .collect();
     if channels.is_empty() {
         for line in wrap_text(
@@ -7186,8 +7186,8 @@ fn render_splash_compact(ctx: &TuiContext, area_width: u16) -> Vec<Line<'static>
     let channels: Vec<String> = ctx
         .channels_summary
         .iter()
-        .filter(|(_, configured)| *configured)
-        .map(|(name, _)| name.clone())
+        .filter(|(_, configured, _)| *configured)
+        .map(|(name, _, _)| name.clone())
         .collect();
     let skills: Vec<String> = ctx
         .available_skills
@@ -8357,7 +8357,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     );
     app.context.channels_summary = crate::channels::channel_status_roster(&app_config)
         .into_iter()
-        .map(|(name, configured)| (name.to_string(), configured))
+        .map(|(name, configured, maturity)| (name.to_string(), configured, maturity))
         .collect();
     if configured_channels > 0 {
         // Spawn the channel runtime as a cancellable supervisor (stored on
@@ -8812,7 +8812,7 @@ mod tests {
     fn roster_includes_qq_and_matches_the_shared_catalog() {
         let rows = crate::channels::channel_status_roster(&crate::config::Config::default());
         assert!(
-            rows.iter().any(|(name, _)| *name == "QQ"),
+            rows.iter().any(|(name, _, _)| *name == "QQ"),
             "QQ must appear in the roster: {rows:?}"
         );
         assert_eq!(
@@ -8831,11 +8831,11 @@ mod tests {
         let cfg = crate::config::Config::default();
         let status: Vec<&str> = crate::channels::channel_status_roster(&cfg)
             .into_iter()
-            .map(|(n, _)| n)
+            .map(|(n, _, _)| n)
             .collect();
         let configured: Vec<&str> = crate::channels::channel_roster(&cfg)
             .into_iter()
-            .map(|(n, _)| n)
+            .map(|(n, _, _)| n)
             .collect();
         assert_eq!(status, configured);
     }
@@ -8852,10 +8852,13 @@ mod tests {
         c
     }
 
-    fn is_configured(rows: &[(&'static str, bool)], name: &str) -> bool {
+    fn is_configured(
+        rows: &[(&'static str, bool, crate::channels::ChannelMaturity)],
+        name: &str,
+    ) -> bool {
         rows.iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, c)| *c)
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, c, _)| *c)
             .unwrap()
     }
 

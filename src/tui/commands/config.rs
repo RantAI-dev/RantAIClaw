@@ -203,7 +203,7 @@ impl CommandHandler for DoctorCommand {
 
         // Channels probe — read live auto_start_state.
         let mut channels = InfoSection::new("Channels");
-        let configured_count = ctx.channels_summary.iter().filter(|(_, c)| *c).count();
+        let configured_count = ctx.channels_summary.iter().filter(|(_, c, _)| *c).count();
         channels = match crate::channels::auto_start_state::snapshot() {
             crate::channels::auto_start_state::AutoStartState::NotDispatched => {
                 if configured_count == 0 {
@@ -232,9 +232,13 @@ impl CommandHandler for DoctorCommand {
                     "failed — see /channels for the error",
                 ),
         };
-        for (name, configured) in &ctx.channels_summary {
+        for (name, configured, maturity) in &ctx.channels_summary {
             if *configured {
-                channels = channels.status_with(StatusKind::Ok, name.clone(), "configured");
+                channels = channels.status_with(
+                    StatusKind::Ok,
+                    name.clone(),
+                    crate::channels::channel_roster_note(true, *maturity),
+                );
             }
         }
 
@@ -360,13 +364,21 @@ pub struct ChannelsCommand;
 fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
     use crate::channels::auto_start_state::{snapshot, AutoStartState};
 
-    let rows: Vec<(String, bool)> = ctx.channels_summary.clone();
-    let configured_count = rows.iter().filter(|(_, c)| *c).count();
-    let not_configured: Vec<String> = rows
-        .iter()
-        .filter(|(_, c)| !*c)
-        .map(|(n, _)| n.clone())
-        .collect();
+    let rows: Vec<(String, bool, crate::channels::ChannelMaturity)> = ctx.channels_summary.clone();
+    let configured_count = rows.iter().filter(|(_, c, _)| *c).count();
+    // Split by tier rather than one flat list: the tier is the whole point of
+    // this section for an operator deciding what to turn on next, and a bare
+    // name says nothing about whether anyone has driven it.
+    let unconfigured_by_tier = |want: crate::channels::ChannelMaturity| -> Vec<String> {
+        rows.iter()
+            .filter(|(_, c, m)| !*c && *m == want)
+            .map(|(n, _, _)| n.clone())
+            .collect()
+    };
+    let not_configured_supported =
+        unconfigured_by_tier(crate::channels::ChannelMaturity::Supported);
+    let not_configured_under_development =
+        unconfigured_by_tier(crate::channels::ChannelMaturity::UnderDevelopment);
 
     // Auto-start state — drives the per-channel status icon + the footer
     // diagnostic. Mirrors the v0.6.6 logic but renders into typed rows.
@@ -480,9 +492,13 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
             AutoStartState::Failed { .. } => StatusKind::Fail,
             AutoStartState::NotDispatched => StatusKind::Info,
         };
-        for (name, configured) in &rows {
+        for (name, configured, maturity) in &rows {
             if *configured {
-                sec = sec.status_with(kind, name.clone(), polling_label);
+                sec = sec.status_with(
+                    kind,
+                    name.clone(),
+                    format!("{polling_label} · {}", maturity.label()),
+                );
             }
         }
         panel = panel.section(sec);
@@ -495,8 +511,18 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
 
     // Not configured — compact comma-separated list (visual breathing
     // room — keep the panel from blowing up to 30 lines).
-    if !not_configured.is_empty() {
-        panel = panel.section(InfoSection::new("Not configured").inline_list(not_configured));
+    if !not_configured_supported.is_empty() {
+        panel =
+            panel.section(InfoSection::new("Not configured").inline_list(not_configured_supported));
+    }
+    if !not_configured_under_development.is_empty() {
+        panel = panel.section(
+            InfoSection::new(format!(
+                "Not configured · {}",
+                crate::channels::ChannelMaturity::UnderDevelopment.label()
+            ))
+            .inline_list(not_configured_under_development),
+        );
     }
 
     // Log pointer — always there because anyone debugging Telegram needs it.

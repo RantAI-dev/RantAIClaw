@@ -3173,7 +3173,7 @@ fn every_configured_channel_is_built_by_the_factory() {
         .map(|(key, _, _)| key)
         .collect();
 
-    for (key, display) in CHANNEL_CATALOG {
+    for (key, display, _) in CHANNEL_CATALOG {
         if NON_CHANNEL_CATALOG_KEYS.contains(&key) {
             continue;
         }
@@ -3198,12 +3198,18 @@ fn roster_covers_exactly_the_catalog() {
     let roster = admin::channel_roster(&config);
 
     assert_eq!(roster.len(), CHANNEL_CATALOG.len());
-    for ((key, display), (roster_display, configured)) in CHANNEL_CATALOG.iter().zip(&roster) {
+    for ((key, display, maturity), (roster_display, configured, roster_maturity)) in
+        CHANNEL_CATALOG.iter().zip(&roster)
+    {
         assert_eq!(display, roster_display, "roster order follows the catalog");
         assert_eq!(
             *configured,
             channel_is_configured(key, &config),
             "{display} disagrees with the catalog's own predicate"
+        );
+        assert_eq!(
+            maturity, roster_maturity,
+            "{display}'s tier must come from the catalog, not from the roster"
         );
     }
 }
@@ -3222,7 +3228,7 @@ fn the_api_channel_list_covers_every_catalog_channel() {
     let config = config_with_every_channel();
     let api = crate::gateway::api_v1::configured_channel_keys(&config);
 
-    for (key, display) in CHANNEL_CATALOG {
+    for (key, display, _) in CHANNEL_CATALOG {
         // Feature-gated channels are absent from a build that cannot run them.
         if !channel_is_configured(key, &config) {
             continue;
@@ -3289,7 +3295,7 @@ fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
 
     let advertised: Vec<&str> = CHANNEL_CATALOG
         .iter()
-        .map(|(key, _)| *key)
+        .map(|(key, _, _)| *key)
         .filter(|key| channel_supports_announce_delivery(key))
         .collect();
 
@@ -5384,4 +5390,82 @@ async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() 
 
     // The sender outlived the loop — which is the whole point.
     drop(tx);
+}
+
+// ── Plan 319: one source of truth for channel maturity ──────────────────────
+
+/// The tier decision itself, pinned at its source.
+///
+/// Four is the owner's 2026-09-04 call. Promotion is plan 321's job and needs a
+/// driven round trip behind it, so a fifth appearing without one fails here as
+/// well as in `scripts/ci/check_channel_maturity.sh` — the gate checks the
+/// static surfaces, this checks the value the runtime actually renders.
+#[test]
+fn catalog_declares_sixteen_channels_and_four_supported() {
+    assert_eq!(CHANNEL_CATALOG.len(), 16);
+
+    let supported: Vec<&str> = CHANNEL_CATALOG
+        .iter()
+        .filter(|(_, _, maturity)| *maturity == ChannelMaturity::Supported)
+        .map(|(key, _, _)| *key)
+        .collect();
+
+    assert_eq!(
+        supported,
+        vec!["telegram", "discord", "slack", "whatsapp"],
+        "the supported tier changed — that is a promise to operators, not a refactor"
+    );
+}
+
+/// Every catalog row reaches `/api/v1/channels`, carrying its own tier.
+///
+/// The endpoint used to return only `configured` + `count`, so a client could
+/// not learn a channel existed — which is why the console kept a second
+/// hand-typed catalog. This asserts the whole surface: all sixteen rows, each
+/// field, and that `configured` still means exactly what it meant before.
+#[test]
+fn api_catalog_entries_carry_every_row_with_its_tier() {
+    let config = config_with_every_channel();
+    let entries = crate::channels::channel_catalog_entries(&config);
+
+    assert_eq!(entries.len(), CHANNEL_CATALOG.len());
+    for ((key, label, maturity), entry) in CHANNEL_CATALOG.iter().zip(&entries) {
+        assert_eq!(*key, entry.key, "catalog order is the wire order");
+        assert_eq!(*label, entry.label);
+        assert_eq!(
+            *maturity, entry.maturity,
+            "{key}'s tier must come from the catalog, not from the endpoint"
+        );
+        assert_eq!(
+            entry.configured,
+            channel_is_configured(key, &config),
+            "{key}'s `configured` changed meaning — the old field is a contract"
+        );
+    }
+
+    // The compatibility half: the pre-existing `configured` list is still
+    // exactly the configured subset of the new one.
+    let old_shape = crate::gateway::api_v1::configured_channel_keys(&config);
+    let from_entries: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.configured)
+        .map(|e| e.key)
+        .collect();
+    assert_eq!(
+        old_shape, from_entries,
+        "`configured` and `channels[].configured` must not disagree"
+    );
+}
+
+/// A tier is rendered from the catalog, never typed at the surface.
+#[test]
+fn roster_note_states_the_tier_for_both_configured_states() {
+    assert_eq!(
+        channel_roster_note(true, ChannelMaturity::Supported),
+        "configured · supported"
+    );
+    assert_eq!(
+        channel_roster_note(false, ChannelMaturity::UnderDevelopment),
+        "not configured · under development"
+    );
 }

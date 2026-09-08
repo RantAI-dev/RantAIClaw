@@ -337,10 +337,12 @@ pub(crate) fn warn_on_risky_approval_owners(owners: &[String]) {
     }
 }
 
-pub(crate) fn channel_roster(config: &Config) -> Vec<(&'static str, bool)> {
+pub(crate) fn channel_roster(
+    config: &Config,
+) -> Vec<(&'static str, bool, crate::channels::ChannelMaturity)> {
     CHANNEL_CATALOG
         .iter()
-        .map(|(key, display)| (*display, channel_is_configured(key, config)))
+        .map(|(key, display, maturity)| (*display, channel_is_configured(key, config), *maturity))
         .collect()
 }
 
@@ -372,16 +374,12 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         crate::ChannelCommands::List => {
             crate::cli_style::section("channels");
             crate::cli_style::status_row(true, "CLI", 14, "always");
-            for (name, configured) in channel_roster(config) {
+            for (name, configured, maturity) in channel_roster(config) {
                 crate::cli_style::status_row(
                     configured,
                     name,
                     14,
-                    if configured {
-                        "configured"
-                    } else {
-                        "not configured"
-                    },
+                    &crate::channels::channel_roster_note(configured, maturity),
                 );
             }
             if !cfg!(feature = "channel-matrix") {

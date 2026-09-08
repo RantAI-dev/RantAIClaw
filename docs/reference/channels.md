@@ -26,7 +26,74 @@ This is the most common symptom (same class as issue #499). Check these in order
 
 ---
 
-## 0. Verification Status
+## 0. Maturity Tiers
+
+Verification status (§0.1, below) records **what evidence exists** for a channel.
+Maturity records **what we are willing to claim** about it. They are different
+questions, and only maturity is a promise to the operator.
+
+The owner named four channels as the supported tier on 2026-09-04. That decision
+now lives in exactly one place a program can read — `CHANNEL_CATALOG` in
+`src/channels/mod.rs` — and every surface that shows a tier renders it from
+there. The table below is the human copy, and
+`scripts/ci/check_channel_maturity.sh` fails the build if it drifts from the
+catalog.
+
+| Tier | Means |
+|---|---|
+| **supported** | Someone has driven it against the real platform and we expect it to work. `channel doctor` probes it. A bug here is a bug we own |
+| **under development** | It compiles, has unit tests, and may well work — but nobody has watched a message arrive, `channel doctor` does not probe it, and it is not part of what an alpha release claims |
+
+"Under development" is not "broken". Twelve of these channels have tests and
+several are in use. It is the absence of one specific piece of evidence, and the
+checklist below says exactly which.
+
+### How a channel is promoted
+
+Promotion needs all four, in this order:
+
+1. **A real account exists** for the platform, and its credential is available to
+   whoever runs the check. Without this the rest is theatre.
+2. **A round trip was driven**: a message sent from the platform reached the
+   agent, the agent's reply arrived back, and it was *read on a real client* —
+   not asserted against a recorded fixture.
+3. **What broke was written down.** A promotion with no observations is a claim,
+   not a promotion. If nothing broke, say that.
+4. **`channel doctor` probes it** — the key is in `PROBED_KEYS`
+   (`src/doctor/checks/channels.rs`). A channel claiming the supported tier that
+   the doctor cannot check is a claim with no ongoing evidence behind it, and
+   `probed_keys_cover_the_supported_tier` fails the build for it.
+
+Failing any of the four leaves the channel **under development**, with the reason
+recorded. That is the checklist working, not the channel failing.
+
+| Channel (catalog key) | Tier |
+|---|---|
+| `telegram` | supported |
+| `discord` | supported |
+| `slack` | supported |
+| `mattermost` | under development |
+| `webhook` | under development |
+| `imessage` | under development |
+| `matrix` | under development |
+| `signal` | under development |
+| `whatsapp` | supported |
+| `linq` | under development |
+| `nextcloud_talk` | under development |
+| `email` | under development |
+| `irc` | under development |
+| `lark` | under development |
+| `dingtalk` | under development |
+| `qq` | under development |
+
+`webhook` is in the catalog because operators think of it as a channel, but it is
+served by the gateway and is not a `Channel` implementer, so the checklist above
+cannot be run against it at all. It stays under development by that fact rather
+than by a default.
+
+---
+
+## 0.1 Verification Status
 
 Seventeen channels are wired. **One has been driven against a real platform.**
 That is not a defect in itself, but it is the difference between "it compiles
@@ -238,7 +305,7 @@ cutting a code fence.
 | Slack | LightMarkup (`<url\|text>`) | `**bold**` → `*bold*`, links → `<url\|text>`, tables → ASCII fence, `&`/`<`/`>` escaped per Slack's text field |
 | WhatsApp (Cloud + Web) | LightMarkup (`text (url)`) | `**bold**` → `*bold*`, links → `text (url)`, tables → ASCII fence |
 | Signal, QQ, Linq, IRC, iMessage, Nextcloud Talk, Lark, Email, CLI | Plain | all markup stripped to readable text: headings uppercased, emphasis removed, links → `text (url)`, tables → aligned ASCII |
-| Matrix | *(not wired)* | The renderer itself shipped; what is missing is the four-line `render_target()` wiring in `matrix.rs`, which is blocked because the module does not compile ([§0](#0-verification-status)). Matrix renders GFM natively, so nothing leaks in the meantime |
+| Matrix | *(not wired)* | The renderer itself shipped; what is missing is the four-line `render_target()` wiring in `matrix.rs`, which is blocked because the module does not compile ([§0](#01-verification-status)). Matrix renders GFM natively, so nothing leaks in the meantime |
 
 Notes:
 

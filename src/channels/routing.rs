@@ -25,7 +25,7 @@ use std::time::SystemTime;
 /// it predates the shared one and operators have it set.
 pub(crate) fn channel_thread_replies(cc: &crate::config::ChannelsConfig) -> HashMap<String, bool> {
     let mut out = HashMap::new();
-    for (name, _) in CHANNEL_CATALOG {
+    for (name, _, _) in CHANNEL_CATALOG {
         out.insert((*name).to_string(), cc.thread_replies);
     }
     if let Some(c) = cc.mattermost.as_ref() {

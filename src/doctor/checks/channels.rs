@@ -29,6 +29,43 @@ use crate::doctor::{CheckResult, DoctorCheck, DoctorContext, Severity};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The channel keys `inspect_channels` and `probe_channels` actually check.
+///
+/// Everything else in `CHANNEL_CATALOG` is configured-but-unprobed, and used to
+/// be invisible here: a config carrying only `[channels_config.irc]` reported
+/// "no channels configured". `probed_keys_cover_the_supported_tier` pins that
+/// this list keeps up with promotions — a channel promoted to `Supported`
+/// without a probe would claim the tier with no ongoing evidence behind it.
+const PROBED_KEYS: [&str; 4] = ["telegram", "discord", "slack", "whatsapp"];
+
+/// Configured channels this check does not probe, with their tier.
+///
+/// Reads the tier from `CHANNEL_CATALOG` rather than restating it, so promoting
+/// a channel changes this line without anyone editing the doctor.
+fn unprobed_note(config: &crate::config::Config) -> Option<String> {
+    let unprobed: Vec<String> = crate::channels::channel_catalog_entries(config)
+        .into_iter()
+        .filter(|e| e.configured && !PROBED_KEYS.contains(&e.key))
+        .map(|e| format!("{} ({})", e.key, e.maturity.label()))
+        .collect();
+    if unprobed.is_empty() {
+        return None;
+    }
+    Some(format!("not probed: {}", unprobed.join(", ")))
+}
+
+/// Append the unprobed list to a summary message without changing its severity.
+///
+/// Severity is deliberately untouched: an unprobed channel is missing evidence,
+/// not a failure, and raising it would change `doctor`'s exit code for every
+/// operator running a channel outside the supported tier.
+fn with_unprobed(mut summary: ChannelSummary, config: &crate::config::Config) -> ChannelSummary {
+    if let Some(note) = unprobed_note(config) {
+        summary.message = format!("{} · {note}", summary.message);
+    }
+    summary
+}
+
 pub struct ChannelsAuthCheck;
 
 #[async_trait]
@@ -44,11 +81,11 @@ impl DoctorCheck for ChannelsAuthCheck {
         if ctx.offline {
             // Config-only sanity — same shape as before, just bucketed
             // honestly so users understand what the check did.
-            let summary = inspect_channels(&ctx.config);
+            let summary = with_unprobed(inspect_channels(&ctx.config), &ctx.config);
             return summarize(self.name(), self.category(), &summary);
         }
 
-        let summary = probe_channels(&ctx.config).await;
+        let summary = with_unprobed(probe_channels(&ctx.config).await, &ctx.config);
         summarize(self.name(), self.category(), &summary)
     }
 }
@@ -374,6 +411,66 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
         }
+    }
+
+    /// Every channel claiming the supported tier must be one this check probes.
+    ///
+    /// The two lists happen to coincide today. They are separate decisions, and
+    /// plan 321 promotes into the catalog — so a promotion that forgets the
+    /// probe would ship a supported channel with no ongoing evidence, which is
+    /// the exact claim the tier is supposed to carry.
+    #[test]
+    fn probed_keys_cover_the_supported_tier() {
+        let unprobed: Vec<&str> = crate::channels::CHANNEL_CATALOG
+            .iter()
+            .filter(|(_, _, maturity)| *maturity == crate::channels::ChannelMaturity::Supported)
+            .map(|(key, _, _)| *key)
+            .filter(|key| !PROBED_KEYS.contains(key))
+            .collect();
+        assert!(
+            unprobed.is_empty(),
+            "supported but not probed by `channel doctor`: {unprobed:?} — add a probe \
+             or leave the channel under development"
+        );
+    }
+
+    /// A configured channel outside `PROBED_KEYS` used to vanish from this
+    /// check entirely: an IRC-only config reported "no channels configured".
+    #[test]
+    fn unprobed_channels_are_named_with_their_tier() {
+        let mut cfg = Config::default();
+        cfg.channels_config.irc = Some(crate::config::schema::IrcConfig {
+            server: "irc.example.com".into(),
+            port: 6697,
+            nickname: "rantaiclaw_bot".into(),
+            username: None,
+            channels: vec!["#rantaiclaw".into()],
+            allowed_users: vec![],
+            server_password: None,
+            nickserv_password: None,
+            sasl_password: None,
+            verify_tls: None,
+            allow_insecure_tls_with_password: false,
+        });
+
+        let note = unprobed_note(&cfg).expect("a configured, unprobed channel must be named");
+        assert!(
+            note.contains("irc (under development)"),
+            "the note must name the channel and its tier, got: {note}"
+        );
+
+        let summary = with_unprobed(inspect_channels(&cfg), &cfg);
+        assert_eq!(
+            summary.severity,
+            Severity::Info,
+            "an unprobed channel is missing evidence, not a failure — raising the \
+             severity would change `doctor`'s exit code for every operator"
+        );
+        assert!(
+            summary.message.contains("irc"),
+            "an IRC-only config reported `no channels configured`, got: {}",
+            summary.message
+        );
     }
 
     #[test]

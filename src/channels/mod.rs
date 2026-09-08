@@ -362,8 +362,8 @@ pub(crate) struct ChannelRuntimeContext {
     pub(crate) guest_gate: Arc<crate::approval::GuestGate>,
 }
 
-/// Every channel type this build knows about: `(key, display)` in a stable,
-/// operator-facing order.
+/// Every channel type this build knows about: `(key, display, maturity)` in a
+/// stable, operator-facing order.
 ///
 /// `key` is the lowercase `Channel::name()` value, which is what
 /// `build_configured_channels` emits and what cron delivery selects on.
@@ -376,24 +376,117 @@ pub(crate) struct ChannelRuntimeContext {
 /// `channel list` and the doctor report it, but it is **not** a `Channel`
 /// implementer — it is served by the gateway — so the factory never builds it.
 /// `channel_keys_are_buildable_or_documented` pins that exception.
-pub(crate) const CHANNEL_CATALOG: [(&str, &str); 16] = [
-    ("telegram", "Telegram"),
-    ("discord", "Discord"),
-    ("slack", "Slack"),
-    ("mattermost", "Mattermost"),
-    ("webhook", "Webhook"),
-    ("imessage", "iMessage"),
-    ("matrix", "Matrix"),
-    ("signal", "Signal"),
-    ("whatsapp", "WhatsApp"),
-    ("linq", "Linq"),
-    ("nextcloud_talk", "Nextcloud Talk"),
-    ("email", "Email"),
-    ("irc", "IRC"),
-    ("lark", "Lark"),
-    ("dingtalk", "DingTalk"),
-    ("qq", "QQ"),
+///
+/// `maturity` is the owner's 2026-09-04 tier decision, and this row is the only
+/// place it is written down. Every surface that shows a tier renders
+/// [`ChannelMaturity::label`] from here; a surface that cannot read it at
+/// runtime (the docs table, the config-schema comments) is pinned by
+/// `scripts/ci/check_channel_maturity.sh` instead of trusted.
+///
+/// Rows stay on one line: that gate parses them.
+pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelMaturity); 16] = [
+    ("telegram", "Telegram", ChannelMaturity::Supported),
+    ("discord", "Discord", ChannelMaturity::Supported),
+    ("slack", "Slack", ChannelMaturity::Supported),
+    (
+        "mattermost",
+        "Mattermost",
+        ChannelMaturity::UnderDevelopment,
+    ),
+    // `webhook` is not a `Channel` implementer at all — the gateway serves it —
+    // so it was never in the four the owner named, and the promotion checklist
+    // in `docs/reference/channels.md` cannot even be run against it. It is
+    // `UnderDevelopment` by that fact, not by falling through a default.
+    ("webhook", "Webhook", ChannelMaturity::UnderDevelopment),
+    ("imessage", "iMessage", ChannelMaturity::UnderDevelopment),
+    ("matrix", "Matrix", ChannelMaturity::UnderDevelopment),
+    ("signal", "Signal", ChannelMaturity::UnderDevelopment),
+    ("whatsapp", "WhatsApp", ChannelMaturity::Supported),
+    ("linq", "Linq", ChannelMaturity::UnderDevelopment),
+    (
+        "nextcloud_talk",
+        "Nextcloud Talk",
+        ChannelMaturity::UnderDevelopment,
+    ),
+    ("email", "Email", ChannelMaturity::UnderDevelopment),
+    ("irc", "IRC", ChannelMaturity::UnderDevelopment),
+    ("lark", "Lark", ChannelMaturity::UnderDevelopment),
+    ("dingtalk", "DingTalk", ChannelMaturity::UnderDevelopment),
+    ("qq", "QQ", ChannelMaturity::UnderDevelopment),
 ];
+
+/// How mature a channel is: the supported tier the owner named on 2026-09-04,
+/// or everything else.
+///
+/// Two values, not a ladder. A third ("beta", "deprecated") would need a
+/// definition in `docs/reference/channels.md` and a promotion rule before it
+/// meant anything, and neither exists.
+///
+/// `pub` rather than `pub(crate)` because `TuiContext` is public and carries it,
+/// and because it is already public over the wire on `/api/v1/channels`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelMaturity {
+    /// Driven against the real platform and expected to work.
+    Supported,
+    /// Compiles and has tests; nobody has watched a message arrive.
+    UnderDevelopment,
+}
+
+impl ChannelMaturity {
+    /// The operator-facing label, defined exactly once.
+    ///
+    /// Every surface renders this rather than typing its own string. The
+    /// console's hand-typed catalog copy is what this plan exists to prevent,
+    /// and a hand-typed label is the same failure one layer down —
+    /// `check_channel_maturity.sh` fails if a second copy appears in `src/`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::UnderDevelopment => "under development",
+        }
+    }
+}
+
+/// One catalog row as an API client sees it.
+///
+/// Lives here rather than in the gateway so the endpoint cannot grow its own
+/// idea of what a channel is — which is how the console ended up with a
+/// hand-typed copy of the catalog.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ChannelCatalogEntry {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub maturity: ChannelMaturity,
+    pub configured: bool,
+}
+
+/// The whole catalog, in catalog order, with each row's configured state.
+pub(crate) fn channel_catalog_entries(config: &Config) -> Vec<ChannelCatalogEntry> {
+    CHANNEL_CATALOG
+        .iter()
+        .map(|(key, label, maturity)| ChannelCatalogEntry {
+            key,
+            label,
+            maturity: *maturity,
+            configured: channel_is_configured(key, config),
+        })
+        .collect()
+}
+
+/// The `note` column `channel list` and `status` print for one roster row.
+///
+/// Both surfaces used to print only "configured"/"not configured", so an
+/// operator could not tell a driven channel from one nobody has ever watched a
+/// message arrive on. Rendered here so the two cannot word it differently.
+pub(crate) fn channel_roster_note(configured: bool, maturity: ChannelMaturity) -> String {
+    let state = if configured {
+        "configured"
+    } else {
+        "not configured"
+    };
+    format!("{state} · {}", maturity.label())
+}
 
 /// The one channel key in [`CHANNEL_CATALOG`] that is not a `Channel`
 /// implementer: the webhook is served by the gateway, so the factory never
@@ -429,7 +522,7 @@ pub(crate) fn channel_is_configured(key: &str, config: &Config) -> bool {
 /// Every channel key in [`CHANNEL_CATALOG`], for callers that need to validate
 /// a user-supplied surface name against the one canonical list.
 pub(crate) fn channel_catalog_keys() -> Vec<&'static str> {
-    CHANNEL_CATALOG.iter().map(|(key, _)| *key).collect()
+    CHANNEL_CATALOG.iter().map(|(key, _, _)| *key).collect()
 }
 
 /// Whether `key`'s config block carries the credential it needs to run.
@@ -512,12 +605,13 @@ pub(crate) fn channel_has_credentials(key: &str, config: &Config) -> bool {
 
 /// Roster keyed on credential presence rather than section presence.
 ///
-/// The `(display label, ready?)` shape the TUI status panel needs, derived from
-/// the same [`CHANNEL_CATALOG`] as [`channel_roster`] so the two cannot drift.
-pub(crate) fn channel_status_roster(config: &Config) -> Vec<(&'static str, bool)> {
+/// The `(display label, ready?, maturity)` shape the TUI status panel needs,
+/// derived from the same [`CHANNEL_CATALOG`] as [`channel_roster`] so the two
+/// cannot drift.
+pub(crate) fn channel_status_roster(config: &Config) -> Vec<(&'static str, bool, ChannelMaturity)> {
     CHANNEL_CATALOG
         .iter()
-        .map(|(key, display)| (*display, channel_has_credentials(key, config)))
+        .map(|(key, display, maturity)| (*display, channel_has_credentials(key, config), *maturity))
         .collect()
 }
 
@@ -525,7 +619,7 @@ pub(crate) fn channel_status_roster(config: &Config) -> Vec<(&'static str, bool)
 pub(crate) fn configured_channel_count(config: &Config) -> usize {
     CHANNEL_CATALOG
         .iter()
-        .filter(|(key, _)| channel_has_credentials(key, config))
+        .filter(|(key, _, _)| channel_has_credentials(key, config))
         .count()
 }
 
