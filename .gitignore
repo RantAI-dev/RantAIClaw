@@ -78,3 +78,10 @@ artifacts/
 tests/fixtures/sample-text.pdf
 tests/fixtures/sample-8-page.pdf
 dev-sandbox/
+
+# Per-developer agent-harness configuration. `docs/agents/` holds the issue-tracker,
+# triage-label and domain-doc conventions the mattpocock/skills set reads; both it and
+# `CLAUDE.local.md` describe one person's local tooling, so they stay out of the repo
+# for the same reason the OpenCode/Gemini/CodeRabbit configs were removed.
+docs/agents/
+CLAUDE.local.md

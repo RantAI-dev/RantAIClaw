@@ -161,7 +161,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   four instruction sets for tools nobody here runs. Neither Gemini Code Assist nor CodeRabbit
   has ever reviewed a pull request in this repository. `AGENTS.md` stays: it is the one
   cross-harness entry point contributors and other tools look for by convention, and all it
-  does is point at `CLAUDE.md`.
+  does is point at `CLAUDE.md`. It no longer calls itself the *OpenCode* execution protocol,
+  which stopped being true the moment the OpenCode config went — it is now addressed to any
+  agent that reads `AGENTS.md` by convention, and carries the same `CLAUDE.md governs` clause
+  the removed harness files had. `.gitignore` also stops the replacement from recurring:
+  per-developer harness configuration (`docs/agents/`, `CLAUDE.local.md`) is ignored rather
+  than tracked.
 - `docs/contributing/actions-source-policy.md` recorded SHA pinning as "deferred to Phase 2"
   and carried a Phase 1 allowlist that had drifted from the workflows in both directions —
   it listed `useblacksmith/*` and `DavidAnson/markdownlint-cli2-action@*`, which no workflow
