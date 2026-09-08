@@ -1784,7 +1784,7 @@ async fn main() -> Result<()> {
         }?;
         // Auto-start channels if user said yes during wizard
         if std::env::var("RANTAICLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
-            channels::start_channels(config).await?;
+            run_channels_until_signal(config).await?;
         }
         return Ok(());
     }
@@ -2185,11 +2185,11 @@ async fn main() -> Result<()> {
         },
 
         Some(Commands::Channel { channel_command }) => match channel_command {
-            ChannelCommands::Start => channels::start_channels(config).await,
+            ChannelCommands::Start => run_channels_until_signal(config).await,
             ChannelCommands::Run => {
                 // Friendly banner so users arriving from the TUI's wizard
                 // know exactly what they ran and how to stop it. The actual
-                // supervisor is the same `start_channels` path the daemon
+                // supervisor is the same `start_channels_with_cancellation` path the daemon
                 // and `channel start` use — this just wraps it with UX.
                 println!("🛰️  rantaiclaw channels run");
                 println!(
@@ -2202,7 +2202,7 @@ async fn main() -> Result<()> {
                 println!("   Tip: to keep polling after closing this terminal:");
                 println!("        nohup rantaiclaw channels run > rantaiclaw-channels.log 2>&1 &");
                 println!("        (or `systemd-run --user --unit=rantaiclaw-channels rantaiclaw channels run`)");
-                channels::start_channels(config).await
+                run_channels_until_signal(config).await
             }
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
@@ -2587,6 +2587,31 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Run the channel runtime until a shutdown signal, then let it drain.
+///
+/// `channel start` and `channels run` used to call `start_channels`, which
+/// passes a `CancellationToken` nobody ever cancels — so SIGTERM took the
+/// default "terminate immediately" disposition and severed whatever turn was
+/// in flight. `channels run` prints "Press Ctrl-C to stop, or send SIGTERM to
+/// PID n", which promised a stop the process did not perform.
+///
+/// The listener side of the contract already worked: `supervisor.rs` sleeps its
+/// backoff inside a `select!` on the token, so a cancel during a 60-second
+/// backoff window stops immediately rather than waiting it out. Only the CLI
+/// entrypoint never sent one. This is the same three-line wiring the standalone
+/// `gateway` command and the daemon already use, via the same shared
+/// `daemon::shutdown_signal`.
+async fn run_channels_until_signal(config: config::Config) -> Result<()> {
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown_trigger = shutdown.clone();
+    tokio::spawn(async move {
+        daemon::shutdown_signal().await;
+        info!("Shutdown signal received; stopping channel listeners");
+        shutdown_trigger.cancel();
+    });
+    channels::start_channels_with_cancellation(config, shutdown, None, None).await
+}
+
 async fn handle_permissions_command(
     permissions_command: PermissionsCommands,
     config: Config,

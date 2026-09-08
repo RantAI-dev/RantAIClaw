@@ -86,6 +86,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`docs/reference/channels.md` records what the supported tier has actually been driven
+  against.** The tier is the owner's 2026-09-04 decision and says what this project stands
+  behind; on its own it is not a record that anything was run. A new table under §0.1 says
+  plainly that **three of the four supported channels — Discord, Slack, WhatsApp Cloud — have no
+  credential in any profile or environment here and have never been driven**, and Telegram's row
+  now carries its 2026-09-08 re-drive: `channel doctor` healthy, 45 s of clean long-polling, and
+  a revoked token producing a rising 2→4→8→16→32→60 s backoff with the token absent from every
+  log line. The inbound half was not re-driven — a bot cannot message itself.
+
 - **`channels.auth` names configured channels it does not probe.** `doctor` probes exactly four
   keys, so a config carrying only `[channels_config.irc]` reported **"no channels configured"** —
   the check was silent about twelve of the sixteen. It now appends, for example,
@@ -113,6 +122,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unstable-rendered-line-info` feature it depends on still exists.
 
 ### Fixed
+
+- **`channel start` and `channels run` ignored every shutdown signal.** Both called
+  `start_channels`, which passed a `CancellationToken` **nobody ever cancelled**, so SIGTERM took
+  the default "terminate immediately" disposition and severed whatever channel turn was in
+  flight. `channels run` prints *"Press Ctrl-C to stop, or send SIGTERM to PID n"* — a graceful
+  stop it did not perform. The listener side of the contract already worked: `supervisor.rs`
+  sleeps its backoff inside a `select!` on the token, so a cancel during a 60-second backoff
+  window stops at once instead of waiting it out. Only the CLI entrypoint never sent one. It now
+  uses the same three-line wiring the standalone `gateway` command and the daemon already use,
+  through the same shared `daemon::shutdown_signal`. The `RANTAICLAW_AUTOSTART_CHANNELS=1`
+  onboarding path is routed through it too — it had the same gap.
+  **Observed**: SIGTERM during a backoff window now logs `Shutdown signal received; stopping
+  channel listeners` and exits **0 in 15 ms**, where it previously exited **143** with no log.
+- **`channels::start_channels` is deleted.** With both foreground callers routed through the
+  signal-aware path it had none left, and its whole remaining character was "the entrypoint that
+  silently ignores shutdown signals" — a trap for whoever called it next. The public-surface test
+  in `mod_tests.rs` is updated deliberately, which is what that test exists to force.
 
 - **`docs/contributing/ci-map.md` was missing two of the nine required CI stages, and misdescribed
   two more.** It listed neither `msrv` nor `channel-matrix` — in the stage list, in the

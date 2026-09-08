@@ -5,14 +5,16 @@
 //! defined in [`traits`], which provides a uniform interface for sending messages,
 //! listening for incoming messages, health checking, and typing indicators.
 //!
-//! Channels are instantiated by [`start_channels`] based on the runtime configuration.
+//! Channels are instantiated by [`start_channels_with_cancellation`] based on the
+//! runtime configuration.
 //! The subsystem manages per-sender conversation history, concurrent message processing
 //! with configurable parallelism, and exponential-backoff reconnection for resilience.
 //!
 //! # Extension
 //!
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
-//! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
+//! [`start_channels_with_cancellation`]. See `AGENTS.md` §7.2 for the full change
+//! playbook.
 
 pub mod admin;
 
@@ -626,18 +628,6 @@ pub(crate) fn configured_channel_count(config: &Config) -> usize {
 /// Canonical channel roster: `(display label, configured?)` for every channel
 /// type in a stable order, derived from [`CHANNEL_CATALOG`] rather than
 /// maintained beside it.
-
-/// Start all configured channels and route messages to the agent
-#[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
-    // Backward-compatible entrypoint for the foreground `channels run` /
-    // daemon callers (`main.rs`): they own the whole process and stop on
-    // Ctrl-C, so they never need to cancel the runtime programmatically.
-    // The TUI uses `start_channels_with_cancellation` instead so it can
-    // restart channels in place when a channel or skill is added
-    // mid-session.
-    start_channels_with_cancellation(config, CancellationToken::new(), None, None).await
-}
 
 /// Build and run the channel runtime until every listener exits or
 /// `shutdown` is cancelled.

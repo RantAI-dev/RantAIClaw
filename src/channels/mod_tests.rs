@@ -5214,7 +5214,6 @@ fn channels_module_public_surface_is_the_documented_ten() {
         "build_system_prompt_with_mode".to_string(),
         "channel_supports_announce_delivery".to_string(),
         "doctor_channels".to_string(),
-        "start_channels".to_string(),
         "start_channels_with_cancellation".to_string(),
     ];
     assert_eq!(
