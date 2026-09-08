@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`docs/reference/config.md` states that the MCP client speaks tools only.** It implements
+  `initialize`, `tools/list` and `tools/call`; `resources/*` and `prompts/*` are not
+  implemented, so a server exposing only those contributes nothing and appears as a server with
+  no tools. The subset was real and undocumented — a silent subset of a published protocol is a
+  support burden.
+
 - **Channel maturity has one source, and six surfaces read it.** The owner's 2026-09-04
   decision — Telegram, Discord, Slack and WhatsApp Cloud are supported, the other twelve ship
   labelled *under development* — was written down nowhere a program could read, so no surface
@@ -139,6 +145,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signal-aware path it had none left, and its whole remaining character was "the entrypoint that
   silently ignores shutdown signals" — a trap for whoever called it next. The public-surface test
   in `mod_tests.rs` is updated deliberately, which is what that test exists to force.
+- **An MCP server that dies is now respawned instead of failing every later call
+  forever.** Driving three real `@modelcontextprotocol/server-*` processes through the gateway
+  and killing one mid-session showed the state this replaces: every subsequent call to that
+  server returned `Error: Broken pipe (os error 32)` for the life of the process, **with no log
+  line at any level**, while the other two servers kept working. The client's own module doc
+  claimed a `supervisor.rs` handled "crash recovery" — that file was deleted in Wave 2 as
+  never-wired and nothing took over. `McpClient` now owns its spawn parameters and swaps the
+  whole connection: on a dead-pipe, closed-stdout or timed-out request it respawns the server,
+  redoes the `initialize` handshake **before** publishing the new connection, and retries the
+  call once. Concurrent callers against one dead server produce one new process, not one each.
+  A respawn that fails backs off 1 s doubling to 30 s, with **no attempt cap** — a cap would
+  leave a server that recovers on its own unreachable until the whole process restarts. Both the
+  death and the recovery log at `warn`.
+- **`docs/reference/config.md` said "There is no crash supervision. If a server exits, it is not
+  respawned."** True when written, wrong as of this change, and corrected — including what is
+  still absent: this is per-connection recovery, so a server that dies and is never called again
+  is noticed by nothing.
 
 - **`docs/contributing/ci-map.md` was missing two of the nine required CI stages, and misdescribed
   two more.** It listed neither `msrv` nor `channel-matrix` — in the stage list, in the

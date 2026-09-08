@@ -443,11 +443,22 @@ Notes:
   assemble their tool lists without the MCP splice. There is no error and no log
   line when this happens; the tools are simply absent. Tracked as issue #283.
   `rantaiclaw doctor` repeats this next to the `mcp.startup` check.
-- **There is no crash supervision.** If a server exits, it is not respawned. The
-  gateway keeps one connected pool per config and reconnects when `mcp_servers`
-  changes; nothing restarts a crashed process. A registry/handle/supervisor stack
-  that described respawn-with-backoff existed but had no caller and was removed in
-  schema-independent cleanup (plan 312).
+- **A server that dies is respawned on the next call to it.** Killing a server
+  mid-session used to leave every later call to it returning
+  `Broken pipe (os error 32)` for the life of the process, with no log line at any
+  level, while the other servers kept working. The client now respawns and redoes
+  the `initialize` handshake before retrying the call once. A respawn that itself
+  fails backs off — 1 s, doubling to 30 s — and the tool result says how long until
+  the next attempt. There is **no attempt cap**: a cap would leave a server that
+  recovers on its own unreachable until the whole process restarts. Both the death
+  and the recovery are logged at `warn` on the `mcp` target.
+  This is per-connection recovery, not a supervisor: nothing watches an idle
+  server, so a server that dies and is never called again is noticed by nothing.
+- **The client speaks tools only.** It implements `initialize`, `tools/list` and
+  `tools/call`. MCP's `resources/*` and `prompts/*` are **not implemented** — a
+  server that exposes only resources or only prompts contributes nothing to the
+  agent and appears as a server with no tools. This is a deliberate subset, stated
+  here because a silent subset of a published protocol is a support burden.
 - The subprocess environment is stripped and rebuilt from a non-secret allowlist
   plus the declared `env`, so an MCP server does not inherit the daemon's provider
   keys.

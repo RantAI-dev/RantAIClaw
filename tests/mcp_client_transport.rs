@@ -122,3 +122,125 @@ exit 0
         "should fail on EOF, not on the request timeout: {err:#}"
     );
 }
+
+/// A server that dies under a live client is respawned on the next call.
+///
+/// Driving three real `@modelcontextprotocol/server-*` processes through the
+/// gateway and killing one mid-session showed the state this replaces: every
+/// later call returned `Error: Broken pipe (os error 32)` for the life of the
+/// process, with no log line at any level, while the other two servers kept
+/// working. The module doc claimed a `supervisor.rs` handled "crash recovery";
+/// that file was deleted in Wave 2 and nothing took over.
+///
+/// The fixture writes a file on its first run and a different one on its
+/// second, so the assertion is that a *new process* answered — not merely that
+/// a call succeeded.
+#[tokio::test]
+async fn a_server_that_dies_is_respawned_on_the_next_call() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("runs");
+
+    // Each run appends a line, then serves exactly one request before exiting
+    // if this is the first run. `exit` closes stdout, which is what the client
+    // sees as a dead connection.
+    let script = format!(
+        r#"
+echo run >> {marker}
+runs=$(wc -l < {marker})
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *initialize*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"capabilities":{{}}}}}}\n' "$id" ;;
+    *) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"run-%s"}}]}}}}\n' "$id" "$runs"
+       if [ "$runs" -eq 1 ]; then exit 0; fi ;;
+  esac
+done
+"#,
+        marker = marker.display()
+    );
+
+    let client = connect(&script).await;
+
+    let first = client
+        .call("noop", serde_json::json!({}))
+        .await
+        .expect("the first call is served by the first process");
+    assert_eq!(first, "run-1");
+
+    // The fixture exited after answering, so this call opens on a dead pipe.
+    let second = client
+        .call("noop", serde_json::json!({}))
+        .await
+        .expect("a dead server must be respawned rather than failing forever");
+    assert_eq!(
+        second, "run-2",
+        "the reply must come from a second process, not a cached first one"
+    );
+
+    let runs = std::fs::read_to_string(&marker).expect("marker file");
+    assert_eq!(
+        runs.lines().count(),
+        2,
+        "exactly one respawn, not a new process per call"
+    );
+}
+
+/// A server whose command cannot be spawned at all backs off instead of
+/// forking a new process on every tool call.
+#[tokio::test]
+async fn a_server_that_cannot_respawn_backs_off_instead_of_retrying_at_full_rate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("runs");
+
+    // Serves one request, then exits AND makes itself unspawnable by deleting
+    // the helper the next spawn would need.
+    let helper = dir.path().join("helper");
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").expect("write helper");
+    let script = format!(
+        r#"
+echo run >> {marker}
+test -f {helper} || exit 7
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *initialize*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"capabilities":{{}}}}}}\n' "$id" ;;
+    *) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"ok"}}]}}}}\n' "$id"
+       rm -f {helper}
+       exit 0 ;;
+  esac
+done
+"#,
+        marker = marker.display(),
+        helper = helper.display()
+    );
+
+    let client = connect(&script).await;
+    client
+        .call("noop", serde_json::json!({}))
+        .await
+        .expect("first call");
+
+    // The respawn produces a process that exits immediately, so the handshake
+    // fails and the client must refuse rather than spawn again on every call.
+    let second = client.call("noop", serde_json::json!({})).await;
+    assert!(
+        second.is_err(),
+        "a server that cannot come back must report it"
+    );
+
+    let third = client.call("noop", serde_json::json!({})).await;
+    let msg = format!("{:#}", third.expect_err("still down"));
+    assert!(
+        msg.contains("next respawn attempt in"),
+        "the second failure must be refused by the backoff, not another spawn: {msg}"
+    );
+
+    let runs = std::fs::read_to_string(&marker).expect("marker file");
+    assert!(
+        runs.lines().count() <= 2,
+        "backoff must stop the client spawning a process per call, saw {} runs",
+        runs.lines().count()
+    );
+}

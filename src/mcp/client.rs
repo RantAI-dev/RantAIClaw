@@ -1,9 +1,16 @@
 //! Stdio JSON-RPC client for Model Context Protocol servers.
 //!
-//! Pairs with `handle.rs` (process lifecycle) and `supervisor.rs`
-//! (crash recovery). This module owns the **protocol** — sending
-//! `initialize`, `tools/list`, `tools/call` over the child's stdin
-//! and matching responses by id on stdout.
+//! This module owns both the **protocol** — sending `initialize`,
+//! `tools/list`, `tools/call` over the child's stdin and matching
+//! responses by id on stdout — and the **process lifecycle**: spawning
+//! the server, and respawning it when it dies under a live client.
+//!
+//! It used to say it paired with `handle.rs` and `supervisor.rs` for
+//! "crash recovery". Those two files were deleted in Wave 2 as never-wired,
+//! so for a while nothing recovered from a crash at all: killing a server
+//! mid-session left every later call returning `Broken pipe (os error 32)`
+//! for the life of the process, with no log line at any level. Reconnect
+//! now lives here, where the connection does.
 //!
 //! Wire format per MCP spec: newline-delimited JSON-RPC 2.0
 //! messages. No Content-Length header (HTTP/SSE transport uses
@@ -29,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 /// MCP protocol version we speak. The 2024-11-05 spec is widely
@@ -40,6 +47,16 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// before giving up. Most MCP tool calls return in <1s; 30s is the
 /// outer envelope for slow filesystem / network operations.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// First wait after a failed respawn, doubling to [`RECONNECT_BACKOFF_MAX`].
+///
+/// A server that dies because its command is now wrong will fail every
+/// respawn, and retrying that at full rate on every tool call turns one dead
+/// server into a fork bomb. There is deliberately **no attempt cap**: a cap
+/// would make a server that recovers on its own unreachable until the whole
+/// process restarts, which is the state this exists to end.
+const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// One tool exposed by a connected MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,8 +73,22 @@ pub struct McpToolInfo {
 /// Wrapped in `Arc` across `McpTool` instances so dropping the agent
 /// (and therefore all tools) terminates the child process via
 /// `kill_on_drop(true)`.
-pub struct McpClient {
-    server_name: String,
+/// Everything needed to spawn this server again after it dies.
+///
+/// Kept beside the connection rather than in the pool: the pool hands out
+/// `Arc<McpClient>`, so by the time a call fails the config that produced it is
+/// several layers away.
+struct SpawnSpec {
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
+
+/// One live stdio connection to one server process.
+///
+/// Swapped wholesale on reconnect: a half-replaced connection — new child, old
+/// waiters — is the shape that produces replies routed to the wrong caller.
+struct Conn {
     /// Owns the child process. Drop = SIGKILL (kill_on_drop set at spawn).
     _child: Child,
     stdin: Mutex<ChildStdin>,
@@ -65,18 +96,35 @@ pub struct McpClient {
     /// fulfils an entry and removes it; a caller that gives up removes its
     /// own. Dropping the map (reader exit) fails every waiter at once.
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    request_id: AtomicU64,
-    /// Aborted on drop so a client that goes away does not leave two tasks
+    /// Aborted on drop so a connection that goes away does not leave two tasks
     /// reading pipes whose child is being SIGKILLed underneath them.
     tasks: Vec<JoinHandle<()>>,
 }
 
-impl Drop for McpClient {
+impl Drop for Conn {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
         }
     }
+}
+
+/// When the next respawn may be attempted, and how long to wait after that.
+struct ReconnectState {
+    next_allowed: std::time::Instant,
+    backoff: Duration,
+}
+
+pub struct McpClient {
+    server_name: String,
+    spawn: SpawnSpec,
+    /// The current connection. Read-locked for the length of one snapshot, so a
+    /// reconnect never blocks a call that is already in flight on the old one.
+    conn: RwLock<Arc<Conn>>,
+    request_id: AtomicU64,
+    /// Serialises respawns. Held across the spawn so ten concurrent tool calls
+    /// against a dead server produce one new process, not ten.
+    reconnect: Mutex<ReconnectState>,
 }
 
 impl McpClient {
@@ -88,6 +136,38 @@ impl McpClient {
         env: &HashMap<String, String>,
     ) -> Result<Self> {
         let server_name = server_name.into();
+        let spawn = SpawnSpec {
+            command: command.to_string(),
+            args: args.to_vec(),
+            env: env.clone(),
+        };
+        let conn = Self::spawn_conn(&server_name, &spawn)?;
+        let client = Self {
+            server_name,
+            spawn,
+            conn: RwLock::new(Arc::new(conn)),
+            request_id: AtomicU64::new(1),
+            reconnect: Mutex::new(ReconnectState {
+                next_allowed: std::time::Instant::now(),
+                backoff: RECONNECT_BACKOFF_INITIAL,
+            }),
+        };
+        client
+            .initialize_handshake()
+            .await
+            .context("MCP initialize handshake failed")?;
+        Ok(client)
+    }
+
+    /// Spawn one server process and wire up its three pipes.
+    ///
+    /// Deliberately does **not** handshake: `connect` handshakes through the
+    /// client so the first request also exercises the request path, and
+    /// `reconnect` handshakes on the new connection before publishing it.
+    fn spawn_conn(server_name: &str, spawn: &SpawnSpec) -> Result<Conn> {
+        let command = spawn.command.as_str();
+        let args = spawn.args.as_slice();
+        let env = &spawn.env;
         let mut cmd = Command::new(command);
         cmd.args(args);
         crate::mcp::apply_hardened_env(&mut cmd, env);
@@ -116,34 +196,37 @@ impl McpClient {
             Arc::new(Mutex::new(HashMap::new()));
         let tasks = vec![
             tokio::spawn(pump_stdout(
-                server_name.clone(),
+                server_name.to_string(),
                 stdout,
                 Arc::clone(&pending),
             )),
-            tokio::spawn(drain_stderr(server_name.clone(), stderr)),
+            tokio::spawn(drain_stderr(server_name.to_string(), stderr)),
         ];
 
-        let client = Self {
-            server_name,
+        Ok(Conn {
             _child: child,
             stdin: Mutex::new(stdin),
             pending,
-            request_id: AtomicU64::new(1),
             tasks,
-        };
-
-        client
-            .initialize_handshake()
-            .await
-            .context("MCP initialize handshake failed")?;
-        Ok(client)
+        })
     }
 
     /// Send `initialize` + `notifications/initialized`. Required
     /// before any other request per spec.
     async fn initialize_handshake(&self) -> Result<()> {
+        let conn = self.snapshot().await;
+        self.handshake_on(&conn).await
+    }
+
+    /// The handshake, against one specific connection.
+    ///
+    /// Takes the connection explicitly because `reconnect` runs it on a
+    /// connection that is not published yet — going through `request` there
+    /// would handshake the dead one it is replacing.
+    async fn handshake_on(&self, conn: &Conn) -> Result<()> {
         let _server_caps = self
-            .request(
+            .request_on(
+                conn,
                 "initialize",
                 json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -155,7 +238,8 @@ impl McpClient {
                 }),
             )
             .await?;
-        self.notify("notifications/initialized", json!({})).await?;
+        self.notify_on(conn, "notifications/initialized", json!({}))
+            .await?;
         Ok(())
     }
 
@@ -213,7 +297,102 @@ impl McpClient {
         &self.server_name
     }
 
+    /// Send one request, and if the connection turns out to be dead, respawn
+    /// the server once and send it again.
+    ///
+    /// The retry is deliberately at this level rather than inside
+    /// `request_on`: a caller that gets `Broken pipe` back cannot tell a dead
+    /// server from a failed tool, and before this every call after a server
+    /// died returned that error forever with nothing logged.
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let conn = self.snapshot().await;
+        let first = self.request_on(&conn, method, params.clone()).await;
+        let Err(e) = first else {
+            return first;
+        };
+        if !is_connection_dead(&e) {
+            return Err(e);
+        }
+        tracing::warn!(
+            target: "mcp",
+            server = %self.server_name,
+            method = %method,
+            error = %e,
+            "MCP connection is dead; respawning the server"
+        );
+        let fresh = self.reconnect(&conn).await?;
+        self.request_on(&fresh, method, params).await
+    }
+
+    /// The current connection, held only long enough to clone the `Arc`.
+    async fn snapshot(&self) -> Arc<Conn> {
+        Arc::clone(&*self.conn.read().await)
+    }
+
+    /// Replace `dead` with a freshly spawned, handshaken connection.
+    ///
+    /// Returns the connection to retry on. If another caller already replaced
+    /// `dead` while this one was waiting, that replacement is returned and no
+    /// second process is spawned.
+    async fn reconnect(&self, dead: &Arc<Conn>) -> Result<Arc<Conn>> {
+        let mut state = self.reconnect.lock().await;
+
+        let current = self.snapshot().await;
+        if !Arc::ptr_eq(&current, dead) {
+            return Ok(current);
+        }
+
+        let now = std::time::Instant::now();
+        if now < state.next_allowed {
+            let wait = state.next_allowed - now;
+            anyhow::bail!(
+                "MCP `{}` server is down; next respawn attempt in {:.0}s",
+                self.server_name,
+                wait.as_secs_f64()
+            );
+        }
+
+        match Self::spawn_conn(&self.server_name, &self.spawn) {
+            Ok(conn) => {
+                let conn = Arc::new(conn);
+                // Handshake on the new connection before publishing it: a
+                // server that spawns but fails `initialize` is not usable, and
+                // swapping it in would trade a dead pipe for a live one that
+                // rejects every call.
+                if let Err(e) = self.handshake_on(&conn).await {
+                    state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    state.next_allowed = std::time::Instant::now() + state.backoff;
+                    anyhow::bail!(
+                        "MCP `{}` respawned but failed its handshake: {e}",
+                        self.server_name
+                    );
+                }
+                *self.conn.write().await = Arc::clone(&conn);
+                state.backoff = RECONNECT_BACKOFF_INITIAL;
+                state.next_allowed = std::time::Instant::now();
+                tracing::warn!(
+                    target: "mcp",
+                    server = %self.server_name,
+                    "MCP server respawned after its connection died"
+                );
+                Ok(conn)
+            }
+            Err(e) => {
+                state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                state.next_allowed = std::time::Instant::now() + state.backoff;
+                tracing::warn!(
+                    target: "mcp",
+                    server = %self.server_name,
+                    error = %e,
+                    backoff_secs = state.backoff.as_secs(),
+                    "MCP server respawn failed"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    async fn request_on(&self, conn: &Conn, method: &str, params: Value) -> Result<Value> {
         let id = self.request_id.fetch_add(1, Ordering::Relaxed);
         let req = json!({
             "jsonrpc": "2.0",
@@ -226,10 +405,10 @@ impl McpClient {
         // Register before writing: the reply can arrive while we still hold
         // the stdin lock, and a reply with nobody waiting is dropped.
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        conn.pending.lock().await.insert(id, tx);
 
         let sent = async {
-            let mut stdin = self.stdin.lock().await;
+            let mut stdin = conn.stdin.lock().await;
             stdin.write_all(payload.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
             stdin.flush().await?;
@@ -237,14 +416,14 @@ impl McpClient {
         }
         .await;
         if let Err(e) = sent {
-            self.pending.lock().await.remove(&id);
+            conn.pending.lock().await.remove(&id);
             return Err(e);
         }
 
         let outcome = tokio::time::timeout(REQUEST_TIMEOUT, rx).await;
         // Whatever happened, this id is no longer wanted. A timed-out entry
-        // left behind would pin a sender for the life of the client.
-        self.pending.lock().await.remove(&id);
+        // left behind would pin a sender for the life of the connection.
+        conn.pending.lock().await.remove(&id);
 
         let server = &self.server_name;
         match outcome {
@@ -266,19 +445,47 @@ impl McpClient {
         }
     }
 
-    async fn notify(&self, method: &str, params: Value) -> Result<()> {
+    async fn notify_on(&self, conn: &Conn, method: &str, params: Value) -> Result<()> {
         let req = json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
         });
         let payload = serde_json::to_string(&req)?;
-        let mut stdin = self.stdin.lock().await;
+        let mut stdin = conn.stdin.lock().await;
         stdin.write_all(payload.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
         Ok(())
     }
+}
+
+/// Whether this error means the server process is gone, rather than the tool
+/// call failing on its own terms.
+///
+/// Three shapes, and all three were observed by killing a real
+/// `@modelcontextprotocol/server-filesystem` mid-session:
+///
+/// * the write to stdin fails — `Broken pipe (os error 32)`;
+/// * the reader task drops our sender because stdout hit EOF;
+/// * the child died between the write and the reply, so nothing ever answers
+///   and the request times out.
+///
+/// A timeout is included on purpose even though a slow-but-alive server can
+/// also produce one. The cost of being wrong is one extra respawn of a server
+/// that was merely slow; the cost of being wrong the other way is the state
+/// this replaces — every call failing forever.
+fn is_connection_dead(e: &anyhow::Error) -> bool {
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        return matches!(
+            io.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+        );
+    }
+    let text = e.to_string();
+    text.contains("closed stdout before responding") || text.contains("timeout after")
 }
 
 /// Own stdout for the life of the connection and hand each reply to the caller
