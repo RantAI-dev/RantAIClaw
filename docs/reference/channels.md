@@ -115,7 +115,7 @@ conflation is the thing this table exists to prevent.
 
 | Channel | Status | Evidence |
 |---|---|---|
-| Telegram | **live-verified** — 2026-07, bot account | driven during the markdown-renderer effort; the reply rendering was read on a real client |
+| Telegram | **live-verified** — 2026-07, bot account; re-driven 2026-09-08 | driven during the markdown-renderer effort; the reply rendering was read on a real client. Re-driven 2026-09-08 against the same bot: `channel doctor` reports healthy, the listener long-polls clean for 45 s, and a revoked token produces a rising 2→4→8→16→32→60 s backoff with the token absent from every log line. **The inbound round trip was not re-driven** — a bot cannot message itself, so that half needs a person |
 | Discord | built and unit-tested | default feature; `cargo test --lib channels::discord` runs in CI |
 | Slack | built and unit-tested | default feature; CI |
 | Mattermost | built and unit-tested | default feature; CI |
@@ -146,6 +146,25 @@ Release binaries are built with **default features only**
   that MSRV; the rest of RantaiClaw builds on 1.91). It does build there now.
 
 The README's channel table carries the same columns; the two are meant to agree.
+
+### What the supported tier has actually been driven against
+
+The supported tier is the owner's 2026-09-04 decision (§0). It is a statement of
+intent about what this project stands behind; it is **not**, by itself, a record
+that anything was run. As of 2026-09-08:
+
+| Supported channel | Credential available here | Driven |
+|---|---|---|
+| Telegram | yes | 2026-07, re-driven 2026-09-08 (see the row above) |
+| Discord | **no** | never |
+| Slack | **no** | never |
+| WhatsApp Cloud | **no** | never |
+
+Three of the four have no credential in any profile or environment on the
+machine this was checked from, so nobody can drive them without an account being
+provisioned first. They stay in the supported tier because the tier is the
+owner's call, not the executor's — but the gap between "supported" and "driven"
+is written down here rather than left for a reader to assume away.
 
 ### How a row becomes live-verified
 
