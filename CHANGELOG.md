@@ -102,6 +102,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **claw-ui pinned to v0.3.28.** Carries the console half of this release, and needs this
+  runtime to render it: the channels panel reads the two-axis catalog (`support` plus
+  `verification`) only this gateway serves, and against an older one it still lists the channels
+  but claims no tier. The MCP panel also gains the `env` map the API had accepted all along,
+  with stored values masked. `ui install` and `ui update` fetch that tag by default; `--ref`
+  still overrides per invocation.
+
 - **A channel now carries two labels, because one word was answering two questions and getting
   one of them wrong.** The catalog said Discord, Slack and WhatsApp Cloud were `Supported`, and
   `channels.md` defined *supported* as "someone has driven it against the real platform" three
