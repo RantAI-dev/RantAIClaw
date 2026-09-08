@@ -131,7 +131,7 @@ conflation is the thing this table exists to prevent.
 | iMessage | built and unit-tested | default feature; CI. Note it needs macOS to run at all |
 | Webhook (generic) | built and unit-tested | gateway endpoint; handler-level auth tests |
 | Lark/Feishu | built and unit-tested | `channel-lark` is not a default feature, but it has its own CI job that builds **and tests** it |
-| Matrix (E2EE) | built and unit-tested | `channel-matrix` is not a default feature, but it has its own CI job that builds **and tests** it — same shape as Lark. It was unbuildable until the pin moved to `matrix-sdk` 0.18: 0.16 exceeded the type-check recursion budget, so no job compiled it and its 31 tests had never run. Not live-verified against a real homeserver, so it stays outside the supported tier |
+| Matrix (E2EE) | built and unit-tested | `channel-matrix` is not a default feature, but it has its own CI job that builds **and tests** it — same shape as Lark. It was unbuildable until the pin moved to `matrix-sdk` 0.18: 0.16 exceeded the type-check recursion budget, so no job compiled it and its tests had never run. Re-confirmed 2026-09-08: `cargo test --locked --features channel-matrix --lib channels::matrix` builds and runs **33 tests, all passing**. Not live-verified against a real homeserver, so it stays outside the supported tier |
 
 ### What ships in a release binary
 
@@ -229,9 +229,13 @@ Operational notes:
 Matrix and Lark support are controlled at compile time.
 
 - Default builds do **not** include Matrix or Lark. They do include WhatsApp Web:
-  `default = ["tui", "whatsapp-web", "remote-install", "kb"]` (`Cargo.toml:253`).
+  `default = ["tui", "whatsapp-web", "remote-install", "kb"]` (`Cargo.toml:268`).
   WhatsApp Web mode therefore ships **enabled** — read the
   [security warning](#47-whatsapp) before configuring it.
+- **No release binary carries Matrix or Lark.** `pub-release.yml` builds with default
+  features only, so an operator who installs a release and configures
+  `[channels_config.matrix]` gets a channel that reports as not configured. Running
+  either one means building from source.
 - Typical local check with only hardware support:
 
 ```bash
@@ -242,6 +246,16 @@ cargo check --features hardware
 
 ```bash
 cargo check --features hardware,channel-matrix
+```
+
+  To actually **run** it, build the binary rather than checking it, and note the
+  toolchain: `matrix-sdk` declares `rust-version = "1.93"`, while the rest of
+  RantaiClaw builds on 1.91. Matrix is the only part of this repository that
+  needs a newer compiler than the crate's own declared MSRV.
+
+```bash
+rustup toolchain install 1.93.0
+cargo +1.93.0 build --release --features channel-matrix
 ```
 
 - Enable Lark explicitly when needed:
@@ -305,7 +319,7 @@ cutting a code fence.
 | Slack | LightMarkup (`<url\|text>`) | `**bold**` → `*bold*`, links → `<url\|text>`, tables → ASCII fence, `&`/`<`/`>` escaped per Slack's text field |
 | WhatsApp (Cloud + Web) | LightMarkup (`text (url)`) | `**bold**` → `*bold*`, links → `text (url)`, tables → ASCII fence |
 | Signal, QQ, Linq, IRC, iMessage, Nextcloud Talk, Lark, Email, CLI | Plain | all markup stripped to readable text: headings uppercased, emphasis removed, links → `text (url)`, tables → aligned ASCII |
-| Matrix | *(not wired)* | The renderer itself shipped; what is missing is the four-line `render_target()` wiring in `matrix.rs`, which is blocked because the module does not compile ([§0](#01-verification-status)). Matrix renders GFM natively, so nothing leaks in the meantime |
+| Matrix | *(not wired)* | `matrix.rs` declares no `render_target()`, so it takes the trait default. It never calls the renderer at all: `send()` passes the model's text straight to `RoomMessageEventContent::text_markdown`, which Matrix renders natively as GFM — so nothing leaks, and the wiring buys formatting control rather than fixing a defect. **This row used to say the wiring was "blocked because the module does not compile"; that has not been true since the pin moved to `matrix-sdk` 0.18** ([§0.1](#01-verification-status)) |
 
 Notes:
 

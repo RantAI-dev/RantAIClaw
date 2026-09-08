@@ -114,6 +114,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`docs/contributing/ci-map.md` was missing two of the nine required CI stages, and misdescribed
+  two more.** It listed neither `msrv` nor `channel-matrix` — in the stage list, in the
+  "every Rust stage" sentence, or in the failure-triage list — while
+  `scripts/ci/required_gate.sh` has blocked merges on both since Wave 2. It also documented the
+  test stage as `cargo nextest run`, which the workflow's own comment records as abandoned
+  (`cargo test --locked --workspace -- --test-threads=1` is what runs), and marked `e2e` as
+  "push to `main` only; not on PRs" two lines above the sentence saying it is no longer
+  push-only. The `channel-matrix` entry now also carries **why that job pins rustc 1.93 when
+  every other job pins 1.92** — the next person moving a toolchain pin has to account for it
+  separately.
+- **`channels.md` said the Matrix reply wiring was "blocked because the module does not
+  compile".** It has compiled since the `matrix-sdk` 0.18 pin. The row now states the actual
+  situation: `matrix.rs` declares no `render_target()`, never calls the renderer, and passes
+  text to `text_markdown` for Matrix to render as GFM — so the wiring buys formatting control
+  rather than fixing a leak. Re-confirmed on 2026-09-08 that the channel builds and its **33
+  tests pass**; the file's `Cargo.toml:253` reference (now `:268`) was corrected too.
+- **`channels.md` told an operator to `cargo check` a channel it never told them how to run.**
+  The build-feature section now gives the actual build command, states that **no release binary
+  carries Matrix or Lark**, and names the rustc 1.93 requirement — Matrix is the only part of
+  this repository that needs a newer compiler than the crate's declared MSRV of 1.91.
+- **The Matrix E2EE guide now separates what is verified from what is guidance.** It describes an
+  encrypted transport, and it contained a validation flow and E2EE troubleshooting steps with
+  nothing saying whether anyone had run them. A new section lists what is checked (the build, 33
+  tests, the `formatted_body` assertion, the feature-gate reporting) against what is not (no
+  message round trip against a real homeserver has ever been completed here; the key-sharing and
+  device-trust behaviour is `matrix-sdk`'s and is exercised by no test in this repository).
+
 - **`docs/reference/api-v1.md` no longer documents a gap that was closed.** Its
   `GET /api/v1/channels` entry described a "fixed, hardcoded set of seven" channels and a
   **Known gap** that Matrix, Linq, IRC and Lark would never appear. The endpoint has been
