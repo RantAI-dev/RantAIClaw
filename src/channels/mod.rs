@@ -379,73 +379,200 @@ pub(crate) struct ChannelRuntimeContext {
 /// implementer — it is served by the gateway — so the factory never builds it.
 /// `channel_keys_are_buildable_or_documented` pins that exception.
 ///
-/// `maturity` is the owner's 2026-09-04 tier decision, and this row is the only
-/// place it is written down. Every surface that shows a tier renders
-/// [`ChannelMaturity::label`] from here; a surface that cannot read it at
+/// Each row carries **two independent facts**, because one word could not hold
+/// both and started lying the moment a channel was committed to but not yet
+/// driven:
+///
+/// * `support` is the owner's 2026-09-04 tier decision. It says what the project
+///   undertakes to support, and a bug in a `Supported` channel is a bug we own.
+///   Moving it is an owner decision.
+/// * `verification` says whether anyone has driven the channel against the real
+///   platform. It is evidence, and the checklist in `docs/reference/channels.md`
+///   decides it.
+///
+/// `Supported` + `NotDriven` is a legitimate state, not a gap to be tidied away.
+/// It describes three channels today and it means exactly "we commit to this and
+/// nobody has driven it yet". Demoting such a channel would discard the owner's
+/// decision in order to make a label look consistent.
+///
+/// This row is the only place either value is written down. Every surface that
+/// shows them renders [`ChannelSupport::label`] and
+/// [`ChannelVerification::label`] from here; a surface that cannot read them at
 /// runtime (the docs table, the config-schema comments) is pinned by
 /// `scripts/ci/check_channel_maturity.sh` instead of trusted.
 ///
 /// Rows stay on one line: that gate parses them.
-pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelMaturity); 16] = [
-    ("telegram", "Telegram", ChannelMaturity::Supported),
-    ("discord", "Discord", ChannelMaturity::Supported),
-    ("slack", "Slack", ChannelMaturity::Supported),
+pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerification); 16] = [
+    (
+        "telegram",
+        "Telegram",
+        ChannelSupport::Supported,
+        ChannelVerification::Driven,
+    ),
+    (
+        "discord",
+        "Discord",
+        ChannelSupport::Supported,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "slack",
+        "Slack",
+        ChannelSupport::Supported,
+        ChannelVerification::NotDriven,
+    ),
     (
         "mattermost",
         "Mattermost",
-        ChannelMaturity::UnderDevelopment,
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
     ),
     // `webhook` is not a `Channel` implementer at all — the gateway serves it —
     // so it was never in the four the owner named, and the promotion checklist
     // in `docs/reference/channels.md` cannot even be run against it. It is
     // `UnderDevelopment` by that fact, not by falling through a default.
-    ("webhook", "Webhook", ChannelMaturity::UnderDevelopment),
-    ("imessage", "iMessage", ChannelMaturity::UnderDevelopment),
-    ("matrix", "Matrix", ChannelMaturity::UnderDevelopment),
-    ("signal", "Signal", ChannelMaturity::UnderDevelopment),
-    ("whatsapp", "WhatsApp", ChannelMaturity::Supported),
-    ("linq", "Linq", ChannelMaturity::UnderDevelopment),
+    (
+        "webhook",
+        "Webhook",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "imessage",
+        "iMessage",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "matrix",
+        "Matrix",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "signal",
+        "Signal",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "whatsapp",
+        "WhatsApp",
+        ChannelSupport::Supported,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "linq",
+        "Linq",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
     (
         "nextcloud_talk",
         "Nextcloud Talk",
-        ChannelMaturity::UnderDevelopment,
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
     ),
-    ("email", "Email", ChannelMaturity::UnderDevelopment),
-    ("irc", "IRC", ChannelMaturity::UnderDevelopment),
-    ("lark", "Lark", ChannelMaturity::UnderDevelopment),
-    ("dingtalk", "DingTalk", ChannelMaturity::UnderDevelopment),
-    ("qq", "QQ", ChannelMaturity::UnderDevelopment),
+    (
+        "email",
+        "Email",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "irc",
+        "IRC",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "lark",
+        "Lark",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "dingtalk",
+        "DingTalk",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "qq",
+        "QQ",
+        ChannelSupport::UnderDevelopment,
+        ChannelVerification::NotDriven,
+    ),
 ];
 
-/// How mature a channel is: the supported tier the owner named on 2026-09-04,
-/// or everything else.
+/// What the project commits to for a channel. The owner's decision, not a
+/// measurement.
+///
+/// This used to be called `ChannelMaturity` and its `Supported` arm was
+/// documented as "driven against the real platform and expected to work". Those
+/// are two claims, and the second one was false for three of the four channels
+/// carrying it. The commitment is what survives here; the evidence moved to
+/// [`ChannelVerification`].
 ///
 /// Two values, not a ladder. A third ("beta", "deprecated") would need a
-/// definition in `docs/reference/channels.md` and a promotion rule before it
-/// meant anything, and neither exists.
+/// definition in `docs/reference/channels.md` and a rule for reaching it before
+/// it meant anything, and neither exists.
 ///
 /// `pub` rather than `pub(crate)` because `TuiContext` is public and carries it,
 /// and because it is already public over the wire on `/api/v1/channels`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ChannelMaturity {
-    /// Driven against the real platform and expected to work.
+pub enum ChannelSupport {
+    /// The project undertakes to support this channel. A bug here is a bug we
+    /// own, and `channel doctor` probes it. Says nothing about evidence.
     Supported,
-    /// Compiles and has tests; nobody has watched a message arrive.
+    /// Ships, but outside what an alpha release claims.
     UnderDevelopment,
 }
 
-impl ChannelMaturity {
+impl ChannelSupport {
     /// The operator-facing label, defined exactly once.
     ///
     /// Every surface renders this rather than typing its own string. The
-    /// console's hand-typed catalog copy is what this plan exists to prevent,
-    /// and a hand-typed label is the same failure one layer down —
+    /// console's hand-typed catalog copy is what plan 319 deleted, and a
+    /// hand-typed label is the same failure one layer down:
     /// `check_channel_maturity.sh` fails if a second copy appears in `src/`.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Supported => "supported",
             Self::UnderDevelopment => "under development",
+        }
+    }
+}
+
+/// Whether anyone has driven this channel against the real platform. Evidence,
+/// not a promise.
+///
+/// Independent of [`ChannelSupport`] on purpose. `Supported` + `NotDriven` is
+/// the honest description of Discord, Slack and WhatsApp Cloud today: the owner
+/// committed to them on 2026-04-09 and nobody has watched a message arrive yet.
+/// Collapsing the two axes back into one word is what produced a document that
+/// defined "supported" as "has been driven" three lines above a sentence saying
+/// one channel had been driven, next to a catalog marking four supported.
+///
+/// The checklist in `docs/reference/channels.md` decides this axis. It cannot
+/// decide the other one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelVerification {
+    /// A round trip was driven against a real account and read on a real client.
+    Driven,
+    /// Nobody has watched a message arrive. Not a claim that it is broken.
+    NotDriven,
+}
+
+impl ChannelVerification {
+    /// The operator-facing label, defined exactly once. See
+    /// [`ChannelSupport::label`] for why it lives in one place.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Driven => "verified",
+            Self::NotDriven => "not yet verified",
         }
     }
 }
@@ -459,7 +586,14 @@ impl ChannelMaturity {
 pub(crate) struct ChannelCatalogEntry {
     pub key: &'static str,
     pub label: &'static str,
-    pub maturity: ChannelMaturity,
+    /// What the project commits to.
+    pub support: ChannelSupport,
+    /// The same value under the name plan 319 published. Kept so a client
+    /// written against that field keeps working; the two can never disagree
+    /// because both are read from one catalog column.
+    pub maturity: ChannelSupport,
+    /// Whether anyone has driven it. New here.
+    pub verification: ChannelVerification,
     pub configured: bool,
 }
 
@@ -467,10 +601,12 @@ pub(crate) struct ChannelCatalogEntry {
 pub(crate) fn channel_catalog_entries(config: &Config) -> Vec<ChannelCatalogEntry> {
     CHANNEL_CATALOG
         .iter()
-        .map(|(key, label, maturity)| ChannelCatalogEntry {
+        .map(|(key, label, support, verification)| ChannelCatalogEntry {
             key,
             label,
-            maturity: *maturity,
+            support: *support,
+            maturity: *support,
+            verification: *verification,
             configured: channel_is_configured(key, config),
         })
         .collect()
@@ -478,16 +614,27 @@ pub(crate) fn channel_catalog_entries(config: &Config) -> Vec<ChannelCatalogEntr
 
 /// The `note` column `channel list` and `status` print for one roster row.
 ///
-/// Both surfaces used to print only "configured"/"not configured", so an
-/// operator could not tell a driven channel from one nobody has ever watched a
-/// message arrive on. Rendered here so the two cannot word it differently.
-pub(crate) fn channel_roster_note(configured: bool, maturity: ChannelMaturity) -> String {
+/// Both axes, always, in a fixed order. Suppressing the verification word for
+/// an under-development channel would read as "we did not say", and a reader
+/// cannot tell a suppressed value from an absent one. Three states have to be
+/// distinguishable at a glance:
+///
+/// ```text
+/// configured · supported · verified
+/// configured · supported · not yet verified
+/// configured · under development · not yet verified
+/// ```
+pub(crate) fn channel_roster_note(
+    configured: bool,
+    support: ChannelSupport,
+    verification: ChannelVerification,
+) -> String {
     let state = if configured {
         "configured"
     } else {
         "not configured"
     };
-    format!("{state} · {}", maturity.label())
+    format!("{state} · {} · {}", support.label(), verification.label())
 }
 
 /// The one channel key in [`CHANNEL_CATALOG`] that is not a `Channel`
@@ -524,7 +671,7 @@ pub(crate) fn channel_is_configured(key: &str, config: &Config) -> bool {
 /// Every channel key in [`CHANNEL_CATALOG`], for callers that need to validate
 /// a user-supplied surface name against the one canonical list.
 pub(crate) fn channel_catalog_keys() -> Vec<&'static str> {
-    CHANNEL_CATALOG.iter().map(|(key, _, _)| *key).collect()
+    CHANNEL_CATALOG.iter().map(|(key, _, _, _)| *key).collect()
 }
 
 /// Whether `key`'s config block carries the credential it needs to run.
@@ -607,13 +754,22 @@ pub(crate) fn channel_has_credentials(key: &str, config: &Config) -> bool {
 
 /// Roster keyed on credential presence rather than section presence.
 ///
-/// The `(display label, ready?, maturity)` shape the TUI status panel needs,
-/// derived from the same [`CHANNEL_CATALOG`] as [`channel_roster`] so the two
-/// cannot drift.
-pub(crate) fn channel_status_roster(config: &Config) -> Vec<(&'static str, bool, ChannelMaturity)> {
+/// The `(display label, ready?, support, verification)` shape the TUI status
+/// panel needs, derived from the same [`CHANNEL_CATALOG`] as [`channel_roster`]
+/// so the two cannot drift.
+pub(crate) fn channel_status_roster(
+    config: &Config,
+) -> Vec<(&'static str, bool, ChannelSupport, ChannelVerification)> {
     CHANNEL_CATALOG
         .iter()
-        .map(|(key, display, maturity)| (*display, channel_has_credentials(key, config), *maturity))
+        .map(|(key, display, support, verification)| {
+            (
+                *display,
+                channel_has_credentials(key, config),
+                *support,
+                *verification,
+            )
+        })
         .collect()
 }
 
@@ -621,7 +777,7 @@ pub(crate) fn channel_status_roster(config: &Config) -> Vec<(&'static str, bool,
 pub(crate) fn configured_channel_count(config: &Config) -> usize {
     CHANNEL_CATALOG
         .iter()
-        .filter(|(key, _, _)| channel_has_credentials(key, config))
+        .filter(|(key, _, _, _)| channel_has_credentials(key, config))
         .count()
 }
 

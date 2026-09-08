@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GET /api/v1/channels` serves both axes.** Each entry gains `support` and `verification`
+  alongside the fields the previous release published. `maturity` stays as a deprecated alias
+  for `support`, read from the same catalog column so the two cannot disagree, and a test
+  asserts that on the wire. New clients should read `support`.
+- **`check_channel_maturity.sh` checks both axes on both static surfaces.** A docs row or a
+  config-schema comment that renders the support label and forgets the verification one now
+  fails the build, which is the specific failure the split exists to prevent. The two counts are
+  asserted separately, because a single combined check would pass while a channel moved from one
+  axis to the other.
+
 - **`docs/reference/config.md` states that the MCP client speaks tools only.** It implements
   `initialize`, `tools/list` and `tools/call`; `resources/*` and `prompts/*` are not
   implemented, so a server exposing only those contributes nothing and appears as a server with
@@ -91,6 +101,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untested.**
 
 ### Changed
+
+- **A channel now carries two labels, because one word was answering two questions and getting
+  one of them wrong.** The catalog said Discord, Slack and WhatsApp Cloud were `Supported`, and
+  `channels.md` defined *supported* as "someone has driven it against the real platform" three
+  lines above a sentence reading "One has been driven against a real platform." All three
+  statements were in the repository at once and they could not all be true.
+  `CHANNEL_CATALOG` now carries a **support** axis (`supported` / `under development`, the
+  owner's 2026-09-04 product commitment) and a **verification** axis (`verified` /
+  `not yet verified`, whether anyone has driven a round trip). Nothing was demoted: the tier
+  decision stands, and what changed is that the evidence stopped borrowing its word.
+  `channels.md` §0 now names **supported + not yet verified** as a legitimate state rather than
+  a gap, because that is the honest description of three channels today, and a contributor
+  reading the old text would have "fixed" it by discarding an owner decision.
+  `committed_but_undriven_is_a_legitimate_state` fails if that set ever changes, so the demotion
+  cannot happen quietly.
+- **The promotion checklist moved onto the verification axis, where all four of its items
+  already lived.** Every one of them is about evidence and none is about commitment. The
+  document now says outright that no checklist can move the support axis, in either direction:
+  a channel can be committed to before anyone drives it, and driving one does not commit the
+  project to it.
+- **`channel list`, `status`, `doctor` and the TUI print both labels**, always and in a fixed
+  order, so the three states an operator can meet read differently at a glance:
+  `configured · supported · verified`, `configured · supported · not yet verified`, and
+  `configured · under development · not yet verified`. Suppressing the second label for an
+  under-development channel would leave a reader unable to tell a suppressed value from an
+  absent one.
+- **`doctor` coverage still follows the support axis.** `probed_keys_cover_the_supported_tier`
+  requires a probe for every supported channel whether or not it has been driven. Narrowing it
+  to the driven set would have stopped probing three channels the owner committed to, which is
+  the opposite of what splitting the axes is for.
+- **`docs/reference/channels.md` said "Seventeen channels are wired" against a sixteen-row
+  catalog.** The number was typed rather than derived. `check_channel_maturity.sh` now spells
+  out the catalog length and fails when the sentence disagrees with it.
 
 - **All six release targets are measured, and the size gate stops crying wolf.** The earlier pass
   measured one target because cross-compiling six did not fit on the development machine's disk.

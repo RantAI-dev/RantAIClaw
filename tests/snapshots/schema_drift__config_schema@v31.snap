@@ -805,7 +805,7 @@ expression: pretty
           "default": true
         },
         "dingtalk": {
-          "description": "DingTalk channel configuration. Maturity: **under development**.",
+          "description": "DingTalk channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/DingTalkConfig"
@@ -817,7 +817,7 @@ expression: pretty
           "default": null
         },
         "discord": {
-          "description": "Discord bot channel configuration. Maturity: **supported**.",
+          "description": "Discord bot channel configuration. Support: **supported**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/DiscordConfig"
@@ -829,7 +829,7 @@ expression: pretty
           "default": null
         },
         "email": {
-          "description": "Email channel configuration. Maturity: **under development**.",
+          "description": "Email channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/EmailConfig"
@@ -857,7 +857,7 @@ expression: pretty
           }
         },
         "imessage": {
-          "description": "iMessage channel configuration (macOS only). Maturity: **under development**.",
+          "description": "iMessage channel configuration (macOS only). Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/IMessageConfig"
@@ -869,7 +869,7 @@ expression: pretty
           "default": null
         },
         "irc": {
-          "description": "IRC channel configuration. Maturity: **under development**.",
+          "description": "IRC channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/IrcConfig"
@@ -881,7 +881,7 @@ expression: pretty
           "default": null
         },
         "lark": {
-          "description": "Lark/Feishu channel configuration. Maturity: **under development**.",
+          "description": "Lark/Feishu channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/LarkConfig"
@@ -893,7 +893,7 @@ expression: pretty
           "default": null
         },
         "linq": {
-          "description": "Linq Partner API channel configuration. Maturity: **under development**.",
+          "description": "Linq Partner API channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/LinqConfig"
@@ -905,7 +905,7 @@ expression: pretty
           "default": null
         },
         "matrix": {
-          "description": "Matrix channel configuration. Maturity: **under development**.",
+          "description": "Matrix channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/MatrixConfig"
@@ -917,7 +917,7 @@ expression: pretty
           "default": null
         },
         "mattermost": {
-          "description": "Mattermost bot channel configuration. Maturity: **under development**.",
+          "description": "Mattermost bot channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/MattermostConfig"
@@ -936,7 +936,7 @@ expression: pretty
           "minimum": 0
         },
         "nextcloud_talk": {
-          "description": "Nextcloud Talk bot channel configuration. Maturity: **under development**.",
+          "description": "Nextcloud Talk bot channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/NextcloudTalkConfig"
@@ -948,7 +948,7 @@ expression: pretty
           "default": null
         },
         "qq": {
-          "description": "QQ Official Bot channel configuration. Maturity: **under development**.",
+          "description": "QQ Official Bot channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/QQConfig"
@@ -960,7 +960,7 @@ expression: pretty
           "default": null
         },
         "signal": {
-          "description": "Signal channel configuration. Maturity: **under development**.",
+          "description": "Signal channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/SignalConfig"
@@ -972,7 +972,7 @@ expression: pretty
           "default": null
         },
         "slack": {
-          "description": "Slack bot channel configuration. Maturity: **supported**.",
+          "description": "Slack bot channel configuration. Support: **supported**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/SlackConfig"
@@ -984,7 +984,7 @@ expression: pretty
           "default": null
         },
         "telegram": {
-          "description": "Telegram bot channel configuration. Maturity: **supported**.",
+          "description": "Telegram bot channel configuration. Support: **supported**. Verification: **verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/TelegramConfig"
@@ -1001,7 +1001,7 @@ expression: pretty
           "default": true
         },
         "webhook": {
-          "description": "Webhook channel configuration. Maturity: **under development**.",
+          "description": "Webhook channel configuration. Support: **under development**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/WebhookConfig"
@@ -1013,7 +1013,7 @@ expression: pretty
           "default": null
         },
         "whatsapp": {
-          "description": "WhatsApp channel configuration (Cloud API or Web mode). Maturity: **supported**.",
+          "description": "WhatsApp channel configuration (Cloud API or Web mode). Support: **supported**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/WhatsAppConfig"

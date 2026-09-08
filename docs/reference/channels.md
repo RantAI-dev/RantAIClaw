@@ -26,79 +26,120 @@ This is the most common symptom (same class as issue #499). Check these in order
 
 ---
 
-## 0. Maturity Tiers
+## 0. Two axes: support and verification
 
-Verification status (§0.1, below) records **what evidence exists** for a channel.
-Maturity records **what we are willing to claim** about it. They are different
-questions, and only maturity is a promise to the operator.
+Every channel carries two labels, because there are two different questions and
+one word could not answer both.
 
-The owner named four channels as the supported tier on 2026-09-04. That decision
-now lives in exactly one place a program can read — `CHANNEL_CATALOG` in
-`src/channels/mod.rs` — and every surface that shows a tier renders it from
-there. The table below is the human copy, and
-`scripts/ci/check_channel_maturity.sh` fails the build if it drifts from the
-catalog.
+The single label this replaced defined *supported* as "someone has driven it".
+Three of the four supported channels had never been driven, so the definition and
+the catalog contradicted each other from the day the tier was set. Splitting the
+label fixes the contradiction without demoting anything.
 
-| Tier | Means |
-|---|---|
-| **supported** | Someone has driven it against the real platform and we expect it to work. `channel doctor` probes it. A bug here is a bug we own |
-| **under development** | It compiles, has unit tests, and may well work — but nobody has watched a message arrive, `channel doctor` does not probe it, and it is not part of what an alpha release claims |
+| Axis | Values | What it says | Who moves it |
+|---|---|---|---|
+| **support** | `supported`, `under development` | What the project undertakes. A bug in a supported channel is a bug we own, and `channel doctor` probes it | The owner. It is a product commitment |
+| **verification** | `verified`, `not yet verified` | Whether anyone has driven a round trip against the real platform | The checklist below, once the evidence exists |
 
-"Under development" is not "broken". Twelve of these channels have tests and
-several are in use. It is the absence of one specific piece of evidence, and the
-checklist below says exactly which.
+Both live in `CHANNEL_CATALOG` (`src/channels/mod.rs`), one row per channel, and
+every surface renders them from there. `scripts/ci/check_channel_maturity.sh`
+fails the build when this table drifts from that catalog, on either axis.
 
-### How a channel is promoted
+### The three states, and why the middle one is not a bug
 
-Promotion needs all four, in this order:
+| State | Reads as | Means |
+|---|---|---|
+| supported + verified | `supported · verified` | We commit to it and somebody has watched a message arrive |
+| **supported + not yet verified** | `supported · not yet verified` | **We commit to it and nobody has driven it yet. This is a legitimate state** |
+| under development + not yet verified | `under development · not yet verified` | Ships, outside what an alpha claims, and undriven |
+
+The middle state describes Discord, Slack and WhatsApp Cloud today. It is not an
+oversight and it is not something to tidy away. The owner committed to those
+three on 2026-09-04; nobody has driven them because no credential for them exists
+on any machine this project has run on. Both halves of that sentence are true at
+once, and the two labels say so.
+
+**Do not "fix" it by demoting them.** Moving a channel off the support axis
+discards an owner decision so that a label looks consistent, which is the
+opposite of what this split is for. `committed_but_undriven_is_a_legitimate_state`
+in `src/channels/mod_tests.rs` fails if that set changes, so the demotion cannot
+happen quietly.
+
+"Under development" is not "broken" either. Twelve of these channels have tests
+and several are in use.
+
+### How a channel becomes verified
+
+This checklist governs the **verification** axis only. Every item is about
+evidence, and none of them is about commitment. Read together, they answer one
+question: has somebody actually watched this work.
+
+**No checklist can move the support axis.** That is the owner deciding what the
+project undertakes to support, and evidence is not a substitute for that decision
+in either direction. A channel can be committed to before anyone drives it, and
+driving a channel does not by itself commit the project to it.
+
+`not yet verified` becomes `verified` when all four hold, in this order:
 
 1. **A real account exists** for the platform, and its credential is available to
    whoever runs the check. Without this the rest is theatre.
 2. **A round trip was driven**: a message sent from the platform reached the
-   agent, the agent's reply arrived back, and it was *read on a real client* —
+   agent, the agent's reply arrived back, and it was *read on a real client*,
    not asserted against a recorded fixture.
-3. **What broke was written down.** A promotion with no observations is a claim,
-   not a promotion. If nothing broke, say that.
+3. **What broke was written down.** A verification with no observations is a
+   claim, not a verification. If nothing broke, say that.
 4. **`channel doctor` probes it** — the key is in `PROBED_KEYS`
-   (`src/doctor/checks/channels.rs`). A channel claiming the supported tier that
-   the doctor cannot check is a claim with no ongoing evidence behind it, and
-   `probed_keys_cover_the_supported_tier` fails the build for it.
+   (`src/doctor/checks/channels.rs`).
 
-Failing any of the four leaves the channel **under development**, with the reason
+Failing any of the four leaves the channel `not yet verified`, with the reason
 recorded. That is the checklist working, not the channel failing.
 
-| Channel (catalog key) | Tier |
-|---|---|
-| `telegram` | supported |
-| `discord` | supported |
-| `slack` | supported |
-| `mattermost` | under development |
-| `webhook` | under development |
-| `imessage` | under development |
-| `matrix` | under development |
-| `signal` | under development |
-| `whatsapp` | supported |
-| `linq` | under development |
-| `nextcloud_talk` | under development |
-| `email` | under development |
-| `irc` | under development |
-| `lark` | under development |
-| `dingtalk` | under development |
-| `qq` | under development |
+Item 4 needs one clarification, because it is the one place the two axes touch.
+`probed_keys_cover_the_supported_tier` requires every **supported** channel to
+have a doctor probe, whether or not it has been driven. Doctor coverage follows
+the commitment, not the evidence: narrowing it to the driven set would stop
+probing three channels the owner committed to.
+
+| Channel (catalog key) | Support | Verification |
+|---|---|---|
+| `telegram` | supported | verified |
+| `discord` | supported | not yet verified |
+| `slack` | supported | not yet verified |
+| `mattermost` | under development | not yet verified |
+| `webhook` | under development | not yet verified |
+| `imessage` | under development | not yet verified |
+| `matrix` | under development | not yet verified |
+| `signal` | under development | not yet verified |
+| `whatsapp` | supported | not yet verified |
+| `linq` | under development | not yet verified |
+| `nextcloud_talk` | under development | not yet verified |
+| `email` | under development | not yet verified |
+| `irc` | under development | not yet verified |
+| `lark` | under development | not yet verified |
+| `dingtalk` | under development | not yet verified |
+| `qq` | under development | not yet verified |
 
 `webhook` is in the catalog because operators think of it as a channel, but it is
 served by the gateway and is not a `Channel` implementer, so the checklist above
-cannot be run against it at all. It stays under development by that fact rather
-than by a default.
+cannot be run against it at all. It is under development by that fact rather than
+by a default, and it can never become verified while that stays true.
 
 ---
 
-## 0.1 Verification Status
+## 0.1 Build and test evidence, per channel
 
-Seventeen channels are wired. **One has been driven against a real platform.**
-That is not a defect in itself, but it is the difference between "it compiles
-and has tests" and "someone watched a message arrive", and an operator choosing a
-channel deserves to know which they are getting.
+**Sixteen channels are wired. One has been driven against a real platform.**
+
+That count is the length of `CHANNEL_CATALOG`, and
+`scripts/ci/check_channel_maturity.sh` fails the build if this sentence and the
+catalog disagree. It said "seventeen" until 2026-09-08, against a sixteen-row
+catalog, because it was typed rather than derived.
+
+This section refines the **verification** axis of §0; it does not compete with
+it. §0 answers one binary question, has anyone driven this. The table here says
+what evidence a channel does have short of that, which is the useful thing to
+know about the fifteen that answer "no". A channel is `verified` in §0 exactly
+when it is **live-verified** here.
 
 The vocabulary is borrowed from
 [`kb-providers.md`](kb-providers.md), which already publishes this distinction.
@@ -338,7 +379,7 @@ cutting a code fence.
 | Slack | LightMarkup (`<url\|text>`) | `**bold**` → `*bold*`, links → `<url\|text>`, tables → ASCII fence, `&`/`<`/`>` escaped per Slack's text field |
 | WhatsApp (Cloud + Web) | LightMarkup (`text (url)`) | `**bold**` → `*bold*`, links → `text (url)`, tables → ASCII fence |
 | Signal, QQ, Linq, IRC, iMessage, Nextcloud Talk, Lark, Email, CLI | Plain | all markup stripped to readable text: headings uppercased, emphasis removed, links → `text (url)`, tables → aligned ASCII |
-| Matrix | *(not wired)* | `matrix.rs` declares no `render_target()`, so it takes the trait default. It never calls the renderer at all: `send()` passes the model's text straight to `RoomMessageEventContent::text_markdown`, which Matrix renders natively as GFM — so nothing leaks, and the wiring buys formatting control rather than fixing a defect. **This row used to say the wiring was "blocked because the module does not compile"; that has not been true since the pin moved to `matrix-sdk` 0.18** ([§0.1](#01-verification-status)) |
+| Matrix | *(not wired)* | `matrix.rs` declares no `render_target()`, so it takes the trait default. It never calls the renderer at all: `send()` passes the model's text straight to `RoomMessageEventContent::text_markdown`, which Matrix renders natively as GFM — so nothing leaks, and the wiring buys formatting control rather than fixing a defect. **This row used to say the wiring was "blocked because the module does not compile"; that has not been true since the pin moved to `matrix-sdk` 0.18** ([§0.1](#01-build-and-test-evidence-per-channel)) |
 
 Notes:
 

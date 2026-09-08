@@ -34,14 +34,14 @@ checked is worse than no sentence.
 
 - **No RantaiClaw release or test run has ever completed a message round trip
   against a real homeserver.** That is what keeps Matrix outside the supported
-  tier ([channels.md §0](channels.md#0-maturity-tiers)), and it means §3's
+  tier ([channels.md §0](channels.md#0-two-axes-support-and-verification)), and it means §3's
   validation flow is a procedure nobody here has executed end to end.
 - The E2EE key-sharing, device-trust and key-backup behaviour in §4.D is
   client-side and homeserver-side behaviour. RantaiClaw delegates all of it to
   `matrix-sdk`; none of it is exercised by a test in this repository.
 
 If you run the §3 flow against a real homeserver, the promotion checklist in
-[channels.md §0](channels.md#how-a-channel-is-promoted) is what turns that into
+[channels.md §0](channels.md#how-a-channel-becomes-verified) is what turns that into
 a tier change — including writing down what broke.
 
 It focuses on the common failure mode reported by users:

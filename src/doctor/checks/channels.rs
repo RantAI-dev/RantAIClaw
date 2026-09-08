@@ -46,7 +46,14 @@ fn unprobed_note(config: &crate::config::Config) -> Option<String> {
     let unprobed: Vec<String> = crate::channels::channel_catalog_entries(config)
         .into_iter()
         .filter(|e| e.configured && !PROBED_KEYS.contains(&e.key))
-        .map(|e| format!("{} ({})", e.key, e.maturity.label()))
+        .map(|e| {
+            format!(
+                "{} ({}, {})",
+                e.key,
+                e.support.label(),
+                e.verification.label()
+            )
+        })
         .collect();
     if unprobed.is_empty() {
         return None;
@@ -417,14 +424,18 @@ mod tests {
     ///
     /// The two lists happen to coincide today. They are separate decisions, and
     /// plan 321 promotes into the catalog — so a promotion that forgets the
-    /// probe would ship a supported channel with no ongoing evidence, which is
-    /// the exact claim the tier is supposed to carry.
+    /// probe would ship a supported channel with no ongoing evidence.
+    ///
+    /// This follows the **support** axis, not the verification axis, and must
+    /// keep doing so. Narrowing it to the driven set would quietly stop probing
+    /// three channels the owner committed to, which is the opposite of what
+    /// splitting the axes is for.
     #[test]
     fn probed_keys_cover_the_supported_tier() {
         let unprobed: Vec<&str> = crate::channels::CHANNEL_CATALOG
             .iter()
-            .filter(|(_, _, maturity)| *maturity == crate::channels::ChannelMaturity::Supported)
-            .map(|(key, _, _)| *key)
+            .filter(|(_, _, support, _)| *support == crate::channels::ChannelSupport::Supported)
+            .map(|(key, _, _, _)| *key)
             .filter(|key| !PROBED_KEYS.contains(key))
             .collect();
         assert!(
@@ -436,8 +447,12 @@ mod tests {
 
     /// A configured channel outside `PROBED_KEYS` used to vanish from this
     /// check entirely: an IRC-only config reported "no channels configured".
+    ///
+    /// Both axes are named, because "not probed: irc (under development)" left
+    /// the reader to guess whether the missing probe was the reason nobody had
+    /// driven it or a consequence of that.
     #[test]
-    fn unprobed_channels_are_named_with_their_tier() {
+    fn unprobed_channels_are_named_with_both_axes() {
         let mut cfg = Config::default();
         cfg.channels_config.irc = Some(crate::config::schema::IrcConfig {
             server: "irc.example.com".into(),
@@ -455,8 +470,8 @@ mod tests {
 
         let note = unprobed_note(&cfg).expect("a configured, unprobed channel must be named");
         assert!(
-            note.contains("irc (under development)"),
-            "the note must name the channel and its tier, got: {note}"
+            note.contains("irc (under development, not yet verified)"),
+            "the note must name the channel and both axes, got: {note}"
         );
 
         let summary = with_unprobed(inspect_channels(&cfg), &cfg);

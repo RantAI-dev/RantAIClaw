@@ -1985,12 +1985,12 @@ async fn main() -> Result<()> {
 
             cli_style::section("channels");
             cli_style::status_row(true, "CLI", CH_W, "always");
-            for (name, configured, maturity) in channels::channel_roster(&config) {
+            for (name, configured, support, verification) in channels::channel_roster(&config) {
                 cli_style::status_row(
                     configured,
                     name,
                     CH_W,
-                    &channels::channel_roster_note(configured, maturity),
+                    &channels::channel_roster_note(configured, support, verification),
                 );
             }
 

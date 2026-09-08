@@ -141,14 +141,20 @@ pub struct TuiContext {
     /// so the user can see whether their Telegram / Discord / etc. is
     /// actually being polled by this process. `0` means TUI-only mode.
     pub channels_autostart_count: usize,
-    /// Snapshot of `(name, configured, maturity)` rows at TUI startup. Used by
-    /// `/channels` and `/platforms` to render the table without needing
-    /// live access to the on-disk config. Refreshed by `reload_config`.
+    /// Snapshot of `(name, configured, support, verification)` rows at TUI
+    /// startup. Used by `/channels` and `/platforms` to render the table without
+    /// needing live access to the on-disk config. Refreshed by `reload_config`.
     ///
-    /// The maturity comes from `CHANNEL_CATALOG`, not from a copy kept here —
-    /// a hand-typed tier in the TUI is the same drift the console's duplicate
-    /// catalog produced.
-    pub channels_summary: Vec<(String, bool, crate::channels::ChannelMaturity)>,
+    /// Both axes come from `CHANNEL_CATALOG`, not from a copy kept here. A
+    /// hand-typed tier in the TUI is the same drift the console's duplicate
+    /// catalog produced, and carrying only one of the two axes is how one word
+    /// came to answer two questions in the first place.
+    pub channels_summary: Vec<(
+        String,
+        bool,
+        crate::channels::ChannelSupport,
+        crate::channels::ChannelVerification,
+    )>,
     /// The approval boundary a channel message meets: `(approval owner count,
     /// autonomous_tools)`. Precomputed like `channels_summary` so the panel
     /// does not carry `Config`.
