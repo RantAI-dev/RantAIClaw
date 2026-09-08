@@ -152,12 +152,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `supports_streaming`; the MCP-reach row still called the gap "silent" after Wave 2 made
   `doctor` report it; and the `--all-features` row still blamed the matrix-sdk recursion
   limit, which the 0.18 pin resolved.
-- **Four agent-harness configs were tracked with nothing saying which one wins.**
-  `.coderabbit.yaml`, `.gemini/style-guide.md` and the thirteen files under `.opencode/` —
-  four of which restate this repository's architecture and security boundaries — could each
-  drift from `CLAUDE.md`, the document that actually governs. Every one of them now opens by
-  saying so: where it and `CLAUDE.md` disagree, `CLAUDE.md` wins and the harness file is the
-  bug. They are kept rather than deleted; the ambiguity was the problem, not their existence.
+- **Sixteen tracked files configured agent harnesses this project does not use; they are
+  gone.** `.coderabbit.yaml`, `.gemini/style-guide.md`, `opencode.jsonc` and the thirteen
+  files under `.opencode/` each restated some part of this repository's architecture, review
+  priorities or security boundaries, and each could drift from `CLAUDE.md`, the document that
+  actually governs. An earlier pass in this same unreleased cycle kept them and gave each a
+  `CLAUDE.md governs` header — which settled *which one wins* but left the repository carrying
+  four instruction sets for tools nobody here runs. Neither Gemini Code Assist nor CodeRabbit
+  has ever reviewed a pull request in this repository. `AGENTS.md` stays: it is the one
+  cross-harness entry point contributors and other tools look for by convention, and all it
+  does is point at `CLAUDE.md`.
 - `docs/contributing/actions-source-policy.md` recorded SHA pinning as "deferred to Phase 2"
   and carried a Phase 1 allowlist that had drifted from the workflows in both directions —
   it listed `useblacksmith/*` and `DavidAnson/markdownlint-cli2-action@*`, which no workflow
