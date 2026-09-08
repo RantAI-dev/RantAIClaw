@@ -1,8 +1,10 @@
-# AGENTS.md — OpenCode Execution Protocol for RantAIClaw
+# AGENTS.md — Agent Execution Protocol for RantAIClaw
 
 `CLAUDE.md` is the canonical repository constitution. Follow it.
 
-This file is the short operational protocol for OpenCode agents.
+This file is the short operational protocol for any coding agent that reads
+`AGENTS.md` by convention. It is a summary, not a second source of truth: where it and
+`CLAUDE.md` disagree, `CLAUDE.md` wins and this file is the bug.
 
 ## Mandatory First Step
 
@@ -74,3 +76,4 @@ For code changes, prefer:
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+```
