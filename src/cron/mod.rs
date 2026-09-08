@@ -301,7 +301,10 @@ async fn run_job_report(config: &Config, id: &str) -> Result<String> {
     let job = get_job(config, id)?;
     let security =
         crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    let (ok, output) = crate::cron::scheduler::run_job_manual(config, &security, &job, None).await;
+    // A one-shot `cron run` from the CLI owns its process: its MCP servers are
+    // spawned for this run and die with it.
+    let (ok, output) =
+        crate::cron::scheduler::run_job_manual(config, &security, &job, None, None).await;
     // Label matches the recorded run-history status: a policy refusal reads
     // "refused", not "error".
     let status = crate::cron::scheduler::run_status(ok, &output);

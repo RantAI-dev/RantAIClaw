@@ -2266,6 +2266,12 @@ pub async fn run_with_scope(
     // scheduler under the daemon). `None` ⇒ a one-shot CLI run, its own process
     // and correctly its own registry.
     observer: Option<Arc<dyn Observer>>,
+    // The caller's MCP pool, for the same reason and with the same shape as
+    // `observer`. The cron scheduler owns one for its whole life, so a hundred
+    // scheduled jobs share one set of server processes. `None` ⇒ a one-shot run,
+    // which spawns its own and drops them with the registry — correct there, and
+    // the spawn-per-request mistake if a long-lived caller ever passes `None`.
+    mcp: Option<Arc<crate::mcp::discover::McpPoolHandle>>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let observer: Arc<dyn Observer> = observer
@@ -2327,6 +2333,36 @@ pub async fn run_with_scope(
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
+    }
+
+    // MCP tools. Issue #283: this path — cron jobs and one-shot CLI runs — built
+    // its registry without them, so a configured server reached the TUI/CLI
+    // agent and the gateway chat and nothing else, silently.
+    //
+    // A pooled caller reuses its servers across runs; a one-shot spawns its own
+    // and drops them with the registry. Both are correct for their caller, and
+    // which one you get is the caller's choice rather than a default, because
+    // getting it wrong in the pooled direction is a process per scheduled job.
+    if !config.mcp_servers.is_empty() {
+        let mcp_tools = match mcp.as_ref() {
+            Some(handle) => handle.current(&config.mcp_servers).await.tools(),
+            None => {
+                crate::mcp::discover::discover_mcp_tools(&config.mcp_servers)
+                    .await
+                    .tools
+            }
+        };
+        if !mcp_tools.is_empty() {
+            tracing::info!(
+                target: "mcp",
+                count = mcp_tools.len(),
+                servers = config.mcp_servers.len(),
+                pooled = mcp.is_some(),
+                surface = %surface,
+                "MCP tools added to the run registry"
+            );
+            tools_registry.extend(mcp_tools);
+        }
     }
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -2841,6 +2877,9 @@ pub async fn run(
         peripheral_overrides,
         surface,
         None,
+        None,
+        // A one-shot CLI run owns its process, so it spawns its own servers and
+        // drops them with the registry.
         None,
     )
     .await

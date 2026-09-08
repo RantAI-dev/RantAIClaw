@@ -14,13 +14,23 @@
 //!
 //! # Where MCP tools actually reach
 //!
-//! Not everywhere, and the gap is wider than it looks: MCP tools are spliced into
-//! the registry by `Agent::build`, so they reach the **TUI/CLI interactive agent**
-//! and the **gateway's `/api/v1` chat path** (which uses the pool). They do NOT
-//! reach chat channels, cron, or the gateway's own webhook path — each of those
-//! assembles its tool list from `tools::all_tools_with_runtime` with no MCP
-//! splice. Tracked in issue #283; making it reach everywhere needs a shared pool
-//! with one owner, which is a feature decision rather than a cleanup.
+//! The **TUI/CLI interactive agent** and the **gateway's `/api/v1` chat** get them
+//! through `Agent::build`. **Chat channels** and **cron** get them because each
+//! now splices the pool into the registry it assembles itself — that was issue
+//! #283, and the reason it survived two waves of reading is that the tools were
+//! simply absent, with no error and no log line.
+//!
+//! Ownership is per subsystem rather than per process: the channel runtime holds
+//! one pool for its life, the cron scheduler holds one for its life, the gateway
+//! holds one. A one-shot run spawns its own and drops them when it exits. So a
+//! daemon with three configured servers can run up to nine server processes —
+//! bounded by subsystem count, never by traffic, which is the property that
+//! matters.
+//!
+//! One surface is still without them: the gateway's own **`/webhook`** path. Its
+//! registry comes from a synchronous `ToolsFactory` closure and connecting a pool
+//! must await, so that one is a signature change to a shared factory rather than
+//! a wiring fix.
 
 pub mod client;
 pub mod curated;

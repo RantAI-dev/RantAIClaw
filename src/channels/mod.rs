@@ -836,6 +836,31 @@ pub(crate) async fn build_channel_runtime(
         all_tools.extend(peripheral_tools);
     }
 
+    // MCP tools, from one pool for the life of this runtime.
+    //
+    // Issue #283: a configured MCP server reached the TUI/CLI agent and the
+    // gateway's `/api/v1` chat and nothing else, because those paths build an
+    // `Agent` (which splices MCP in) while the channel runtime assembles its own
+    // registry here and never did. There was no error and no log line — the
+    // tools were simply absent, which is the part that made it hard to notice.
+    //
+    // Connected once, here, rather than per message: `McpPool::connect` spawns a
+    // child process per server, and doing that per inbound message is the
+    // spawn-per-request mistake #697 fixed for the gateway. The returned
+    // `McpTool`s each hold an `Arc` of their client, so the clients outlive this
+    // `pool` binding and stay alive exactly as long as the registry does.
+    if !config.mcp_servers.is_empty() {
+        let pool = crate::mcp::discover::McpPool::connect(&config.mcp_servers).await;
+        let mcp_tools = pool.tools();
+        tracing::info!(
+            target: "mcp",
+            count = mcp_tools.len(),
+            servers = config.mcp_servers.len(),
+            "MCP tools added to the channel runtime"
+        );
+        all_tools.extend(mcp_tools);
+    }
+
     let tools_registry = Arc::new(all_tools);
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);

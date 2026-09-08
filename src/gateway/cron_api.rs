@@ -505,7 +505,16 @@ async fn run_cron(
     // The gateway's own observer, so a run started from the console shows up in
     // the `/metrics` this same process serves.
     let (success, output) =
-        cron::scheduler::run_job_manual(&cfg, &security, &job, Some(&state.observer)).await;
+        // The gateway already keeps a pool for its chat path; a manually
+        // triggered job reuses it rather than spawning a second set.
+        cron::scheduler::run_job_manual(
+            &cfg,
+            &security,
+            &job,
+            Some(&state.observer),
+            Some(&state.mcp),
+        )
+        .await;
     Ok(Json(
         json!({ "id": job.id, "success": success, "output": output }),
     ))

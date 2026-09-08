@@ -5468,3 +5468,68 @@ fn roster_note_states_the_tier_for_both_configured_states() {
         "not configured · under development"
     );
 }
+
+// ── Plan 324 step 3: MCP reaches the channel runtime (issue #283) ───────────
+
+/// A configured MCP server's tools are in the registry the channel runtime
+/// hands to every turn.
+///
+/// Before this, `Agent::build` spliced MCP in and the channel runtime — which
+/// never builds an `Agent` — assembled its own registry without it. A server
+/// configured for a Telegram bot contributed nothing, with no error and no log
+/// line. The absence is what made it survive two waves of reading.
+///
+/// The fixture is a POSIX-shell MCP server, the same shape
+/// `tests/mcp_client_transport.rs` uses: a real child process speaking real
+/// stdio JSON-RPC, so this asserts the wiring rather than a mock of it.
+#[tokio::test]
+async fn a_configured_mcp_server_reaches_the_channel_tool_registry() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+
+    let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *initialize*) printf '{"jsonrpc":"2.0","id":%s,"result":{"capabilities":{}}}\n' "$id" ;;
+    *tools/list*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"d","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    config.channels_config.telegram = Some(crate::config::TelegramConfig {
+        bot_token: "111111111:not-a-real-token".into(),
+        allowed_users: vec!["*".into()],
+        stream_mode: crate::config::StreamMode::default(),
+        draft_update_interval_ms: 1000,
+        interrupt_on_new_message: false,
+        mention_only: false,
+    });
+    config.mcp_servers.insert(
+        "fixture".to_string(),
+        crate::config::schema::McpServerConfig {
+            command: "sh".into(),
+            args: vec!["-c".into(), script.to_string()],
+            env: std::collections::HashMap::new(),
+        },
+    );
+
+    let runtime = build_channel_runtime(&config, None)
+        .await
+        .expect("the runtime builds")
+        .expect("a configured channel means a runtime");
+
+    let names: Vec<&str> = runtime
+        .ctx
+        .tools_registry
+        .iter()
+        .map(|t| t.name())
+        .collect();
+    assert!(
+        names.contains(&"mcp__fixture__ping"),
+        "the MCP server's tool must be in the channel registry (issue #283); got {names:?}"
+    );
+}

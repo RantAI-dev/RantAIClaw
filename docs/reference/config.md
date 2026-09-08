@@ -436,13 +436,26 @@ a token to the browser.
 
 Notes:
 
-- **MCP tools do not reach every surface.** They are spliced into the tool
-  registry by `Agent::build`, so a configured server's tools are available to the
-  **TUI/CLI agent** and to the **gateway's `/api/v1` chat** path. They are **not**
-  available to chat channels, cron jobs, or the gateway's own webhook path — those
-  assemble their tool lists without the MCP splice. There is no error and no log
-  line when this happens; the tools are simply absent. Tracked as issue #283.
-  `rantaiclaw doctor` repeats this next to the `mcp.startup` check.
+- **MCP tools reach the TUI/CLI agent, the gateway's `/api/v1` chat, chat channels
+  and cron.** The last two were added by closing issue #283: the channel runtime
+  and the cron/one-shot agent path assemble their own registries and used to do it
+  without the MCP splice, so a configured server contributed nothing there with no
+  error and no log line.
+  - The **channel runtime** connects one pool when it starts and every channel turn
+    shares it. Not per message — that would be a child process per inbound message.
+  - The **cron scheduler** owns one pool for its whole life, so a hundred scheduled
+    jobs share one set of server processes. A one-shot `cron run` or `rantaiclaw
+    agent` invocation spawns its own and drops them with the registry, which is
+    correct for a process that exits.
+  - Each subsystem keeps its **own** pool, so a daemon running channels *and* the
+    scheduler *and* gateway chat with three configured servers runs up to nine
+    server processes. That is the price of not sharing state across subsystem
+    boundaries, and it is still bounded by subsystem count rather than by traffic.
+- **The gateway's own `/webhook` path still has no MCP tools.** Its registry comes
+  from a **synchronous** `ToolsFactory` closure, and connecting a pool needs to
+  await. That is a signature change to a shared factory rather than a wiring fix,
+  so it is left as the one remaining surface — named here rather than left to be
+  discovered.
 - **A server that dies is respawned on the next call to it.** Killing a server
   mid-session used to leave every later call to it returning
   `Broken pipe (os error 32)` for the life of the process, with no log line at any
