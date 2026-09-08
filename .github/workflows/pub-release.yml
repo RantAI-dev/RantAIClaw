@@ -120,6 +120,33 @@ jobs:
                       echo "::error::Tag ${release_tag} is not reachable from origin/main. Release tags must be cut from main."
                       exit 1
                     fi
+
+                    # The tag names a version; this is the only gate that sees
+                    # every publish. `cut_release_tag.sh` makes the same check,
+                    # but a tag pushed by hand never runs it — and v0.5.1 was
+                    # published from a commit whose Cargo.toml read 0.5.0, so
+                    # its binary reports `rantaiclaw 0.5.0`. Failing here costs
+                    # one job; failing after the matrix costs a signed release
+                    # that lies about its own version.
+                    cargo_version="$(
+                      git -C "$tmp_repo" show "refs/tags/${release_tag}:Cargo.toml" \
+                        | awk '/^\[package\]/ { in_package = 1; next }
+                               /^\[/           { in_package = 0 }
+                               in_package && /^version[[:space:]]*=/ {
+                                   sub(/^version[[:space:]]*=[[:space:]]*"/, "")
+                                   sub(/".*$/, "")
+                                   print
+                                   exit
+                               }'
+                    )"
+                    if [[ -z "$cargo_version" ]]; then
+                      echo "::error::Could not read the [package] version from Cargo.toml at ${release_tag}."
+                      exit 1
+                    fi
+                    if [[ "$release_tag" != "v${cargo_version}" ]]; then
+                      echo "::error::Tag ${release_tag} disagrees with Cargo.toml at that tag (version = ${cargo_version}, expected tag v${cargo_version}). The published binaries would report ${cargo_version}."
+                      exit 1
+                    fi
                   fi
 
                   {
