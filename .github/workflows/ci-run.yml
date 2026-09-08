@@ -84,6 +84,11 @@ jobs:
               run: ./scripts/ci/check_provisioner_probe_hosts.sh
             - name: Channel config fields have runtime readers
               run: ./scripts/ci/check_channel_config_readers.sh
+            # Blocking, and deliberately run on BOTH sides: a tier is changed in
+            # src/ and rendered in docs/, so either edit alone leaves a surface
+            # stale. The docs-side copy is in `docs-quality` below.
+            - name: Channel maturity surfaces match the catalog
+              run: ./scripts/ci/check_channel_maturity.sh
             # ADVISORY (continue-on-error) — plan 261. Broader coverage that is
             # not yet reliable enough to block: the whole-schema reader check has
             # grep limits (destructured/by-value reads, shared field names) and
@@ -416,6 +421,12 @@ jobs:
               run: ./scripts/ci/docs_command_coverage.sh
             - name: Every HTTP route is documented
               run: ./scripts/ci/docs_api_route_coverage.sh
+
+            # Blocking. Catches the docs half: a maturity table row edited to
+            # disagree with CHANNEL_CATALOG touches no Rust file, so the Lint
+            # Gate copy of this check never runs for it.
+            - name: Channel maturity surfaces match the catalog
+              run: ./scripts/ci/check_channel_maturity.sh
 
             - name: Collect added links
               id: collect_links

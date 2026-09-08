@@ -2793,37 +2793,37 @@ pub struct CustomTunnelConfig {
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     pub cli: bool,
-    /// Telegram bot channel configuration.
+    /// Telegram bot channel configuration. Maturity: **supported**.
     pub telegram: Option<TelegramConfig>,
-    /// Discord bot channel configuration.
+    /// Discord bot channel configuration. Maturity: **supported**.
     pub discord: Option<DiscordConfig>,
-    /// Slack bot channel configuration.
+    /// Slack bot channel configuration. Maturity: **supported**.
     pub slack: Option<SlackConfig>,
-    /// Mattermost bot channel configuration.
+    /// Mattermost bot channel configuration. Maturity: **under development**.
     pub mattermost: Option<MattermostConfig>,
-    /// Webhook channel configuration.
+    /// Webhook channel configuration. Maturity: **under development**.
     pub webhook: Option<WebhookConfig>,
-    /// iMessage channel configuration (macOS only).
+    /// iMessage channel configuration (macOS only). Maturity: **under development**.
     pub imessage: Option<IMessageConfig>,
-    /// Matrix channel configuration.
+    /// Matrix channel configuration. Maturity: **under development**.
     pub matrix: Option<MatrixConfig>,
-    /// Signal channel configuration.
+    /// Signal channel configuration. Maturity: **under development**.
     pub signal: Option<SignalConfig>,
-    /// WhatsApp channel configuration (Cloud API or Web mode).
+    /// WhatsApp channel configuration (Cloud API or Web mode). Maturity: **supported**.
     pub whatsapp: Option<WhatsAppConfig>,
-    /// Linq Partner API channel configuration.
+    /// Linq Partner API channel configuration. Maturity: **under development**.
     pub linq: Option<LinqConfig>,
-    /// Nextcloud Talk bot channel configuration.
+    /// Nextcloud Talk bot channel configuration. Maturity: **under development**.
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
-    /// Email channel configuration.
+    /// Email channel configuration. Maturity: **under development**.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
-    /// IRC channel configuration.
+    /// IRC channel configuration. Maturity: **under development**.
     pub irc: Option<IrcConfig>,
-    /// Lark/Feishu channel configuration.
+    /// Lark/Feishu channel configuration. Maturity: **under development**.
     pub lark: Option<LarkConfig>,
-    /// DingTalk channel configuration.
+    /// DingTalk channel configuration. Maturity: **under development**.
     pub dingtalk: Option<DingTalkConfig>,
-    /// QQ Official Bot channel configuration.
+    /// QQ Official Bot channel configuration. Maturity: **under development**.
     pub qq: Option<QQConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth

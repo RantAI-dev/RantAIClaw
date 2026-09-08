@@ -890,18 +890,35 @@ is created first.
 - **Request**: none.
 - **Response** `200`:
   ```json
-  { "configured": ["telegram", "whatsapp"], "count": 2 }
+  {
+    "configured": ["telegram", "whatsapp"],
+    "count": 2,
+    "channels": [
+      { "key": "telegram", "label": "Telegram", "maturity": "supported", "configured": true },
+      { "key": "irc", "label": "IRC", "maturity": "under_development", "configured": false }
+    ]
+  }
   ```
-  `configured` lists which of a **fixed, hardcoded set of seven** channel
-  types (`telegram`, `discord`, `slack`, `mattermost`, `imessage`, `signal`,
-  `whatsapp`) have a config section present. This is read-only — it does not
-  report health/connection status, only "configured or not."
-  **Known gap**: `config::schema::ChannelsConfig` also has `matrix`, `linq`,
-  `irc`, and `lark` sub-configs; this endpoint does not check them, so a
-  Matrix/IRC/Lark/Linq channel that is configured will not appear in
-  `configured` even though it is active. Confirmed by comparing the checks
-  in `channels_list` (`src/gateway/api_v1.rs`) against the full field list in
-  `ChannelsConfig` (`src/config/schema.rs`) — not something this doc invents.
+  `channels` is the complete catalog — every channel type this build knows
+  about, in the runtime's own order, whether configured or not. It is derived
+  from `CHANNEL_CATALOG` (`src/channels/mod.rs`), which is also what the factory
+  builds from, so a channel cannot exist in one and not the other.
+  `maturity` is `"supported"` or `"under_development"`; the two tiers are
+  defined, with the promotion checklist, in
+  [`channels.md` §0](channels.md#0-maturity-tiers).
+
+  `configured` and `count` are unchanged and mean exactly what they meant: the
+  keys whose config section is present, and how many. They are the same set as
+  the entries of `channels` with `"configured": true`, and a test asserts the
+  two cannot disagree. This is read-only — none of it reports health or
+  connection status.
+
+  **Previously documented gap, now closed**: this endpoint used to check a
+  hardcoded list of seven channels, so a configured Matrix, Linq, IRC or Lark
+  channel never appeared. It has been derived from the catalog since the
+  channel-roster unification; the `channels` array closes the remaining half,
+  which was that a client could not learn a channel *existed* at all — the
+  reason the web console carried its own hand-typed copy of the catalog.
 - **Status codes**: `200`, `401`.
 
 ---

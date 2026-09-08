@@ -317,6 +317,81 @@ async fn get_channels_returns_200() {
     );
 }
 
+/// Plan 319: the endpoint publishes the whole catalog, with a tier per row.
+///
+/// A client previously could not learn that a channel *existed* — only that one
+/// was configured — which is why the web console shipped a second, hand-typed
+/// copy of the catalog. This asserts the whole surface a client sees: every row,
+/// every field, the tier vocabulary, and that the pre-existing `configured` and
+/// `count` fields still mean what they meant.
+#[tokio::test]
+async fn get_channels_publishes_the_catalog_with_maturity() {
+    let workspace = tempfile::tempdir().expect("tempdir creation should succeed");
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base_url}/api/v1/channels"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("request should complete");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("body should parse as JSON");
+
+    let channels = body["channels"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`channels` must be an array, got: {body}"));
+    assert_eq!(
+        channels.len(),
+        16,
+        "every catalog channel must be published, got: {body}"
+    );
+
+    let mut supported = 0;
+    for entry in channels {
+        for field in ["key", "label", "maturity", "configured"] {
+            assert!(
+                entry.get(field).is_some(),
+                "a channel entry is missing `{field}`: {entry}"
+            );
+        }
+        match entry["maturity"].as_str() {
+            Some("supported") => supported += 1,
+            Some("under_development") => {}
+            other => panic!("unknown maturity {other:?} in {entry}"),
+        }
+        assert!(entry["configured"].is_boolean(), "in {entry}");
+    }
+    assert_eq!(
+        supported, 4,
+        "the supported tier is a promise to operators, not a refactor: {body}"
+    );
+
+    // The compatibility half: the old fields still mean what they meant.
+    let from_catalog: Vec<&str> = channels
+        .iter()
+        .filter(|e| e["configured"] == serde_json::Value::Bool(true))
+        .map(|e| e["key"].as_str().expect("key is a string"))
+        .collect();
+    let configured: Vec<&str> = body["configured"]
+        .as_array()
+        .expect("`configured` must still be an array")
+        .iter()
+        .map(|k| k.as_str().expect("key is a string"))
+        .collect();
+    assert_eq!(
+        configured, from_catalog,
+        "`configured` and `channels[].configured` must not disagree: {body}"
+    );
+    assert_eq!(
+        body["count"]
+            .as_u64()
+            .expect("`count` must still be a number"),
+        configured.len() as u64
+    );
+}
+
 // ── Plan 103: /config/knowledge carries `enabled`; key probed on activation ──
 
 #[tokio::test]

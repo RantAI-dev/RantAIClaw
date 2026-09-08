@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Channel maturity has one source, and six surfaces read it.** The owner's 2026-09-04
+  decision — Telegram, Discord, Slack and WhatsApp Cloud are supported, the other twelve ship
+  labelled *under development* — was written down nowhere a program could read, so no surface
+  showed it and the README promised a label the code did not carry. `CHANNEL_CATALOG`
+  (`src/channels/mod.rs`) now holds a `ChannelMaturity` per row, and `channel list`, `status`,
+  the TUI's `/channels` and `/doctor` panels, `channels.auth` and `/api/v1/channels` all render
+  that one value. The operator-facing string is defined once, in `ChannelMaturity::label()`.
+- **`GET /api/v1/channels` returns the whole catalog.** It previously answered only
+  `{"configured": [...], "count": n}`, so a client could not learn that a channel *existed* —
+  which is why the web console carried a second, hand-typed copy of the catalog whose own
+  comment admitted the drift risk. The response gains `channels`: `key`, `label`, `maturity`
+  and `configured` for all sixteen. `configured` and `count` are untouched and a test asserts
+  they cannot disagree with the new array, so nothing written against the old shape breaks.
+- **`Channel maturity surfaces match the catalog`, a blocking CI gate.** Two surfaces cannot
+  read the catalog at runtime: the tier table in `docs/reference/channels.md` and the
+  config-schema doc comments the console renders. The gate checks every catalog row against
+  both — not a sampled one — refuses a second hand-typed copy of the label anywhere in `src/`,
+  and fails if the supported count moves off four without the promotion evidence. It runs on
+  the Rust side *and* in `Docs Quality`, because editing the docs table alone touches no Rust
+  file. It was mutated five ways (flip a catalog row, edit either static surface alone,
+  duplicate the label string, wrap a row over lines) and rejected each.
+- **`docs/reference/channels.md` §0 defines both tiers and the promotion checklist** plan 321
+  works against: a real account, a driven round trip read on a real client, the observations
+  written down, and a `channel doctor` probe. A label without a definition is decoration.
+  `probed_keys_cover_the_supported_tier` fails the build if a channel claims the supported tier
+  that the doctor cannot check.
+- **The config JSON Schema fingerprint moved, and no schema version did.** The tier is written
+  into the `ChannelsConfig` field doc comments, which `schemars` publishes as `description`
+  strings — so `config_schema_does_not_drift_unannounced` tripped, exactly as its own comment
+  says cosmetic changes should. The accepted snapshot changes **16 lines, every one of them a
+  `description`**: no key, type, required field or default moved, and
+  `config_defaults_do_not_drift_unannounced` still passes untouched. `CURRENT_VERSION` therefore
+  stays at **31** — bumping it would make every install run a migration that does nothing.
+
 - **`release-process.md` now says what alpha means, and what beta and stable would require.**
   Over a hundred `-alpha` releases had shipped and the document contained no occurrence of
   "beta" or "stable" — not thin, absent. The alpha section names the three things that
@@ -52,6 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`channels.auth` names configured channels it does not probe.** `doctor` probes exactly four
+  keys, so a config carrying only `[channels_config.irc]` reported **"no channels configured"** —
+  the check was silent about twelve of the sixteen. It now appends, for example,
+  `not probed: irc (under development)`. Severity is deliberately unchanged: missing evidence is
+  not a failure, and raising it would change `doctor`'s exit code for every operator running a
+  channel outside the supported tier.
+
 - **One release profile everywhere.** `pub-release.yml` built `--profile release-fast` while
   the Dockerfile built `--release`, so two artefacts of the same version differed in
   `codegen-units` (8 vs 1) and only one of them was measured. The Dockerfile now builds the
@@ -72,6 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unstable-rendered-line-info` feature it depends on still exists.
 
 ### Fixed
+
+- **`docs/reference/api-v1.md` no longer documents a gap that was closed.** Its
+  `GET /api/v1/channels` entry described a "fixed, hardcoded set of seven" channels and a
+  **Known gap** that Matrix, Linq, IRC and Lark would never appear. The endpoint has been
+  derived from `CHANNEL_CATALOG` since the channel-roster unification; the page had not caught
+  up, so the reference told operators a configured Matrix channel was invisible when it was not.
 
 - **`backup/pre-trailer-strip-2026-09-07` is now on `origin` in both repositories.** It was
   local-only, which meant `94d7b18` (RantaiClaw) and `0f12c71` (claw-ui) — the commits their

@@ -2363,10 +2363,17 @@ async fn channels_list(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let configured = configured_channel_keys(&state.config.lock());
+    let config = state.config.lock();
+    let configured = configured_channel_keys(&config);
+    // `channels` is additive: `configured` and `count` still mean exactly what
+    // they meant, so a client written against the old shape keeps working.
+    // Before this, a client could not learn that a channel *exists* — only that
+    // one was configured — which is why the console kept its own catalog copy.
+    let channels = crate::channels::channel_catalog_entries(&config);
     Ok(Json(serde_json::json!({
         "configured": configured,
         "count": configured.len(),
+        "channels": channels,
     })))
 }
 
