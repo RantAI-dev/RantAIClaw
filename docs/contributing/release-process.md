@@ -192,10 +192,22 @@ To find out what the release actually carries, compare the schema version at
 the previous tag with the one you are about to ship:
 
 ```bash
-prev=$(git describe --tags --abbrev=0)
+new=vX.Y.Z   # the tag you are about to cut
+# Not `git describe` — see the sentence below the block.
+prev=$(scripts/ci/check_release_tag_ancestry.sh --list-release-tags \
+    | grep -vFx "$new" | tail -n1)
+echo "previous release: $prev"
 git show "$prev":src/config/migrations.rs | grep 'pub const CURRENT_VERSION'
 grep 'pub const CURRENT_VERSION' src/config/migrations.rs
 ```
+
+`git describe --tags --abbrev=0` is the obvious way to write that line and it is
+wrong here: it walks ancestry, so it silently skips a release tag that a history
+rewrite detached from `main`, and this repository has one — run at `8dcefe0~1` it
+answers `v0.29.0-alpha`, jumping straight over `v0.30.0-alpha` and pointing the
+comparison below at schema 28 instead of 31. The recipe above orders by version
+instead, over the same tag set `check_release_tag_ancestry.sh` defines, so there
+is one definition of "a release tag" rather than two.
 
 Different numbers mean the release carries a migration and does **not** roll
 back cleanly: a config written by the new binary will not load on the old one.
@@ -233,6 +245,19 @@ This script enforces:
 - `HEAD == origin/main`
 - non-duplicate tag
 - semver-like tag format
+- the tag matches the `[package]` version in `Cargo.toml`
+
+`pub-release.yml`'s `prepare` job makes that last check again, on the tag it is
+about to publish, and fails before any artefact is built. The duplication is
+deliberate: a tag pushed by hand never runs this script, and `prepare` is the
+only gate every publish passes through.
+
+**One existing tag would fail it.** `v0.5.1` was cut from a commit whose
+`Cargo.toml` still read `0.5.0`, so its published binary answers
+`rantaiclaw 0.5.0`. The tag stays where it is — it names a signed release, and
+the "Known-divergent releases" rule above applies for the same reason — but
+re-running a manual publish against `v0.5.1` will now be refused, which is the
+correct outcome.
 
 ### 5) Monitor publish run
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Assert every release tag still points at a commit reachable from `main`.
 #
-# Usage: scripts/ci/check_release_tag_ancestry.sh [--self-test]
+# Usage: scripts/ci/check_release_tag_ancestry.sh [--self-test | --list-release-tags]
 #
 # Why this exists
 # ---------------
@@ -34,6 +34,14 @@ EOF
 
 BASE_REF="${BASE_REF:-origin/main}"
 
+# The one definition of "a release tag", in version order. `--list-release-tags`
+# exports it so the previous-tag recipe in docs/contributing/release-process.md
+# can share it instead of spelling out a second, drifting version of the same
+# glob-and-sort.
+list_release_tags() {
+    git tag --list 'v*' | sort -V
+}
+
 is_known() {
     printf '%s\n' "$KNOWN_DIVERGENT" | grep -q "^$1	"
 }
@@ -62,11 +70,16 @@ run_check() {
         echo "         and \`git describe\` cannot name it. Published history was probably"
         echo "         rewritten — see docs/contributing/release-process.md."
         failures=$((failures + 1))
-    done < <(git tag --list 'v*' | sort -V)
+    done < <(list_release_tags)
 
     echo "checked $checked release tag(s); $failures unrecorded divergence(s)"
     [ "$failures" -eq 0 ]
 }
+
+if [ "${1:-}" = "--list-release-tags" ]; then
+    list_release_tags
+    exit 0
+fi
 
 # --self-test proves the two arms without needing a broken repository: a tag that
 # IS an ancestor must pass, and the exemption must be the only thing keeping the

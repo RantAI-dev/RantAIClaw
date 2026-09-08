@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The runbook told the maintainer to find the previous release with `git describe
+  --tags --abbrev=0`, and at `8dcefe0~1` that answers `v0.29.0-alpha`.** It walks ancestry, so
+  it steps straight over `v0.30.0-alpha`, which the 2026-09-07 trailer-strip force-push
+  detached from `main`. A maintainer following the recipe compares schema 28 against 31 and
+  writes "this release carries a migration and does not roll back cleanly" into public release
+  notes, when for anyone sitting on v0.30.0-alpha the rollback is clean. The file is internal;
+  the sentence it produces is not. The recipe now orders release tags by version, and it takes
+  the list from `check_release_tag_ancestry.sh --list-release-tags` rather than spelling out a
+  second copy of the glob-and-sort, so "a release tag" keeps one definition. Verified at
+  `8dcefe0~1`: the old line returns `v0.29.0-alpha`, the new one returns `v0.30.0-alpha`.
+- **Nothing checked that a release tag matched the version it claims, and one release already
+  did not.** `cut_release_tag.sh` verified the tag format, a clean tree, `HEAD == origin/main`
+  and non-duplication, with zero references to `Cargo.toml`; `pub-release.yml` did not check
+  either. Sweeping all 134 tags found **`v0.5.1`, published 2026-04-28, cut from a commit whose
+  `Cargo.toml` still read `0.5.0`** — its release binary answers `rantaiclaw 0.5.0`, confirmed
+  by downloading it. The check now exists in both places: in the script, which refuses before
+  it touches the network and prints both values; and in `pub-release.yml`'s `prepare` job,
+  because a tag pushed by hand never runs the script and `prepare` is the only gate every
+  publish passes through. It fails before a single artefact is built. Seen to refuse and seen
+  to accept, in both places.
+
 ## [0.31.0-alpha] — 2026-09-08
 
 Two waves in one tag. Wave 3 landed on `main` on 2026-09-07 and was never cut, so
