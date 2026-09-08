@@ -2793,37 +2793,37 @@ pub struct CustomTunnelConfig {
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     pub cli: bool,
-    /// Telegram bot channel configuration. Maturity: **supported**.
+    /// Telegram bot channel configuration. Support: **supported**. Verification: **verified**.
     pub telegram: Option<TelegramConfig>,
-    /// Discord bot channel configuration. Maturity: **supported**.
+    /// Discord bot channel configuration. Support: **supported**. Verification: **not yet verified**.
     pub discord: Option<DiscordConfig>,
-    /// Slack bot channel configuration. Maturity: **supported**.
+    /// Slack bot channel configuration. Support: **supported**. Verification: **not yet verified**.
     pub slack: Option<SlackConfig>,
-    /// Mattermost bot channel configuration. Maturity: **under development**.
+    /// Mattermost bot channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub mattermost: Option<MattermostConfig>,
-    /// Webhook channel configuration. Maturity: **under development**.
+    /// Webhook channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub webhook: Option<WebhookConfig>,
-    /// iMessage channel configuration (macOS only). Maturity: **under development**.
+    /// iMessage channel configuration (macOS only). Support: **under development**. Verification: **not yet verified**.
     pub imessage: Option<IMessageConfig>,
-    /// Matrix channel configuration. Maturity: **under development**.
+    /// Matrix channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub matrix: Option<MatrixConfig>,
-    /// Signal channel configuration. Maturity: **under development**.
+    /// Signal channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub signal: Option<SignalConfig>,
-    /// WhatsApp channel configuration (Cloud API or Web mode). Maturity: **supported**.
+    /// WhatsApp channel configuration (Cloud API or Web mode). Support: **supported**. Verification: **not yet verified**.
     pub whatsapp: Option<WhatsAppConfig>,
-    /// Linq Partner API channel configuration. Maturity: **under development**.
+    /// Linq Partner API channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub linq: Option<LinqConfig>,
-    /// Nextcloud Talk bot channel configuration. Maturity: **under development**.
+    /// Nextcloud Talk bot channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
-    /// Email channel configuration. Maturity: **under development**.
+    /// Email channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
-    /// IRC channel configuration. Maturity: **under development**.
+    /// IRC channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub irc: Option<IrcConfig>,
-    /// Lark/Feishu channel configuration. Maturity: **under development**.
+    /// Lark/Feishu channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub lark: Option<LarkConfig>,
-    /// DingTalk channel configuration. Maturity: **under development**.
+    /// DingTalk channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub dingtalk: Option<DingTalkConfig>,
-    /// QQ Official Bot channel configuration. Maturity: **under development**.
+    /// QQ Official Bot channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub qq: Option<QQConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth

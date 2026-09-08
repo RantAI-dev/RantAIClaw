@@ -3173,7 +3173,7 @@ fn every_configured_channel_is_built_by_the_factory() {
         .map(|(key, _, _)| key)
         .collect();
 
-    for (key, display, _) in CHANNEL_CATALOG {
+    for (key, display, _, _) in CHANNEL_CATALOG {
         if NON_CHANNEL_CATALOG_KEYS.contains(&key) {
             continue;
         }
@@ -3198,8 +3198,10 @@ fn roster_covers_exactly_the_catalog() {
     let roster = admin::channel_roster(&config);
 
     assert_eq!(roster.len(), CHANNEL_CATALOG.len());
-    for ((key, display, maturity), (roster_display, configured, roster_maturity)) in
-        CHANNEL_CATALOG.iter().zip(&roster)
+    for (
+        (key, display, support, verification),
+        (roster_display, configured, roster_support, roster_verification),
+    ) in CHANNEL_CATALOG.iter().zip(&roster)
     {
         assert_eq!(display, roster_display, "roster order follows the catalog");
         assert_eq!(
@@ -3208,8 +3210,12 @@ fn roster_covers_exactly_the_catalog() {
             "{display} disagrees with the catalog's own predicate"
         );
         assert_eq!(
-            maturity, roster_maturity,
-            "{display}'s tier must come from the catalog, not from the roster"
+            support, roster_support,
+            "{display}'s support tier must come from the catalog, not from the roster"
+        );
+        assert_eq!(
+            verification, roster_verification,
+            "{display}'s verification must come from the catalog, not from the roster"
         );
     }
 }
@@ -3228,7 +3234,7 @@ fn the_api_channel_list_covers_every_catalog_channel() {
     let config = config_with_every_channel();
     let api = crate::gateway::api_v1::configured_channel_keys(&config);
 
-    for (key, display, _) in CHANNEL_CATALOG {
+    for (key, display, _, _) in CHANNEL_CATALOG {
         // Feature-gated channels are absent from a build that cannot run them.
         if !channel_is_configured(key, &config) {
             continue;
@@ -3295,7 +3301,7 @@ fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
 
     let advertised: Vec<&str> = CHANNEL_CATALOG
         .iter()
-        .map(|(key, _, _)| *key)
+        .map(|(key, _, _, _)| *key)
         .filter(|key| channel_supports_announce_delivery(key))
         .collect();
 
@@ -5393,26 +5399,73 @@ async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() 
 
 // ── Plan 319: one source of truth for channel maturity ──────────────────────
 
-/// The tier decision itself, pinned at its source.
+/// The support axis, pinned at its source.
 ///
-/// Four is the owner's 2026-09-04 call. Promotion is plan 321's job and needs a
-/// driven round trip behind it, so a fifth appearing without one fails here as
-/// well as in `scripts/ci/check_channel_maturity.sh` — the gate checks the
-/// static surfaces, this checks the value the runtime actually renders.
+/// Four is the owner's 2026-09-04 call. It is a product commitment, so it moves
+/// when the owner moves it and not because a checklist passed. A fifth appearing
+/// fails here and in `scripts/ci/check_channel_maturity.sh`: the gate checks the
+/// static surfaces, this checks the value the runtime renders.
 #[test]
 fn catalog_declares_sixteen_channels_and_four_supported() {
     assert_eq!(CHANNEL_CATALOG.len(), 16);
 
     let supported: Vec<&str> = CHANNEL_CATALOG
         .iter()
-        .filter(|(_, _, maturity)| *maturity == ChannelMaturity::Supported)
-        .map(|(key, _, _)| *key)
+        .filter(|(_, _, support, _)| *support == ChannelSupport::Supported)
+        .map(|(key, _, _, _)| *key)
         .collect();
 
     assert_eq!(
         supported,
         vec!["telegram", "discord", "slack", "whatsapp"],
         "the supported tier changed — that is a promise to operators, not a refactor"
+    );
+}
+
+/// The verification axis, pinned separately from the one above.
+///
+/// Separately on purpose. These are two different facts, and a single assertion
+/// covering both would pass while one of them silently moved. Telegram is the
+/// only channel anyone has driven (#770); the other three supported channels
+/// have no credential on any machine this project has run on.
+#[test]
+fn catalog_declares_exactly_one_driven_channel() {
+    let driven: Vec<&str> = CHANNEL_CATALOG
+        .iter()
+        .filter(|(_, _, _, verification)| *verification == ChannelVerification::Driven)
+        .map(|(key, _, _, _)| *key)
+        .collect();
+
+    assert_eq!(
+        driven,
+        vec!["telegram"],
+        "the driven set changed — that is evidence, and it moves only when a \
+         round trip was actually run and written down"
+    );
+}
+
+/// `Supported` + `NotDriven` is a state the catalog is allowed to be in.
+///
+/// This test exists to stop a future contributor "fixing" the inconsistency by
+/// demoting Discord, Slack and WhatsApp. Those three carry the owner's
+/// commitment and no evidence, and that combination is the honest answer, not a
+/// gap. If this assertion ever fails because the set became empty, check that
+/// somebody drove them rather than that somebody demoted them.
+#[test]
+fn committed_but_undriven_is_a_legitimate_state() {
+    let committed_undriven: Vec<&str> = CHANNEL_CATALOG
+        .iter()
+        .filter(|(_, _, support, verification)| {
+            *support == ChannelSupport::Supported && *verification == ChannelVerification::NotDriven
+        })
+        .map(|(key, _, _, _)| *key)
+        .collect();
+
+    assert_eq!(
+        committed_undriven,
+        vec!["discord", "slack", "whatsapp"],
+        "the committed-but-undriven set changed; demoting one of these discards \
+         an owner decision to make a label look tidy"
     );
 }
 
@@ -5428,12 +5481,20 @@ fn api_catalog_entries_carry_every_row_with_its_tier() {
     let entries = crate::channels::channel_catalog_entries(&config);
 
     assert_eq!(entries.len(), CHANNEL_CATALOG.len());
-    for ((key, label, maturity), entry) in CHANNEL_CATALOG.iter().zip(&entries) {
+    for ((key, label, support, verification), entry) in CHANNEL_CATALOG.iter().zip(&entries) {
         assert_eq!(*key, entry.key, "catalog order is the wire order");
         assert_eq!(*label, entry.label);
         assert_eq!(
-            *maturity, entry.maturity,
-            "{key}'s tier must come from the catalog, not from the endpoint"
+            *support, entry.support,
+            "{key}'s support tier must come from the catalog, not from the endpoint"
+        );
+        assert_eq!(
+            *support, entry.maturity,
+            "`maturity` is the compatibility alias for `support` and must never diverge"
+        );
+        assert_eq!(
+            *verification, entry.verification,
+            "{key}'s verification must come from the catalog, not from the endpoint"
         );
         assert_eq!(
             entry.configured,
@@ -5456,16 +5517,33 @@ fn api_catalog_entries_carry_every_row_with_its_tier() {
     );
 }
 
-/// A tier is rendered from the catalog, never typed at the surface.
+/// Both axes are rendered from the catalog, never typed at the surface, and the
+/// three states an operator can encounter read differently at a glance.
+///
+/// The middle case is the one that matters. Before the split it rendered
+/// identically to the first, so a channel nobody had driven looked exactly like
+/// the one that had been.
 #[test]
-fn roster_note_states_the_tier_for_both_configured_states() {
+fn roster_note_distinguishes_all_three_states() {
     assert_eq!(
-        channel_roster_note(true, ChannelMaturity::Supported),
-        "configured · supported"
+        channel_roster_note(true, ChannelSupport::Supported, ChannelVerification::Driven),
+        "configured · supported · verified"
     );
     assert_eq!(
-        channel_roster_note(false, ChannelMaturity::UnderDevelopment),
-        "not configured · under development"
+        channel_roster_note(
+            true,
+            ChannelSupport::Supported,
+            ChannelVerification::NotDriven
+        ),
+        "configured · supported · not yet verified"
+    );
+    assert_eq!(
+        channel_roster_note(
+            false,
+            ChannelSupport::UnderDevelopment,
+            ChannelVerification::NotDriven
+        ),
+        "not configured · under development · not yet verified"
     );
 }
 

@@ -894,8 +894,21 @@ is created first.
     "configured": ["telegram", "whatsapp"],
     "count": 2,
     "channels": [
-      { "key": "telegram", "label": "Telegram", "maturity": "supported", "configured": true },
-      { "key": "irc", "label": "IRC", "maturity": "under_development", "configured": false }
+      {
+        "key": "telegram", "label": "Telegram",
+        "support": "supported", "maturity": "supported",
+        "verification": "driven", "configured": true
+      },
+      {
+        "key": "discord", "label": "Discord",
+        "support": "supported", "maturity": "supported",
+        "verification": "not_driven", "configured": false
+      },
+      {
+        "key": "irc", "label": "IRC",
+        "support": "under_development", "maturity": "under_development",
+        "verification": "not_driven", "configured": false
+      }
     ]
   }
   ```
@@ -903,9 +916,18 @@ is created first.
   about, in the runtime's own order, whether configured or not. It is derived
   from `CHANNEL_CATALOG` (`src/channels/mod.rs`), which is also what the factory
   builds from, so a channel cannot exist in one and not the other.
-  `maturity` is `"supported"` or `"under_development"`; the two tiers are
-  defined, with the promotion checklist, in
-  [`channels.md` §0](channels.md#0-maturity-tiers).
+
+  **Two axes, not one.** `support` is `"supported"` or `"under_development"` and
+  says what the project undertakes; it is the owner's decision. `verification` is
+  `"driven"` or `"not_driven"` and says whether anyone has driven a round trip
+  against the real platform. They move independently, and the Discord row above
+  is the combination that made the split necessary: committed to, never driven.
+  Both are defined in [`channels.md` §0](channels.md#0-two-axes-support-and-verification).
+
+  `maturity` is a **deprecated alias for `support`**, kept so a client written
+  against the field the previous release published keeps working. Both are read
+  from the same catalog column, so they cannot disagree, and a test asserts that.
+  New clients should read `support`.
 
   `configured` and `count` are unchanged and mean exactly what they meant: the
   keys whose config section is present, and how many. They are the same set as

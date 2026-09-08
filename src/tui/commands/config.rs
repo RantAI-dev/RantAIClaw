@@ -203,7 +203,11 @@ impl CommandHandler for DoctorCommand {
 
         // Channels probe — read live auto_start_state.
         let mut channels = InfoSection::new("Channels");
-        let configured_count = ctx.channels_summary.iter().filter(|(_, c, _)| *c).count();
+        let configured_count = ctx
+            .channels_summary
+            .iter()
+            .filter(|(_, c, _, _)| *c)
+            .count();
         channels = match crate::channels::auto_start_state::snapshot() {
             crate::channels::auto_start_state::AutoStartState::NotDispatched => {
                 if configured_count == 0 {
@@ -232,12 +236,12 @@ impl CommandHandler for DoctorCommand {
                     "failed — see /channels for the error",
                 ),
         };
-        for (name, configured, maturity) in &ctx.channels_summary {
+        for (name, configured, support, verification) in &ctx.channels_summary {
             if *configured {
                 channels = channels.status_with(
                     StatusKind::Ok,
                     name.clone(),
-                    crate::channels::channel_roster_note(true, *maturity),
+                    crate::channels::channel_roster_note(true, *support, *verification),
                 );
             }
         }
@@ -364,21 +368,25 @@ pub struct ChannelsCommand;
 fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
     use crate::channels::auto_start_state::{snapshot, AutoStartState};
 
-    let rows: Vec<(String, bool, crate::channels::ChannelMaturity)> = ctx.channels_summary.clone();
-    let configured_count = rows.iter().filter(|(_, c, _)| *c).count();
-    // Split by tier rather than one flat list: the tier is the whole point of
-    // this section for an operator deciding what to turn on next, and a bare
-    // name says nothing about whether anyone has driven it.
-    let unconfigured_by_tier = |want: crate::channels::ChannelMaturity| -> Vec<String> {
+    let rows: Vec<(
+        String,
+        bool,
+        crate::channels::ChannelSupport,
+        crate::channels::ChannelVerification,
+    )> = ctx.channels_summary.clone();
+    let configured_count = rows.iter().filter(|(_, c, _, _)| *c).count();
+    // Split by support tier rather than one flat list: for an operator deciding
+    // what to turn on next, what the project commits to is the first question.
+    // Whether anyone has driven it is the second, and it rides on each row.
+    let unconfigured_by_tier = |want: crate::channels::ChannelSupport| -> Vec<String> {
         rows.iter()
-            .filter(|(_, c, m)| !*c && *m == want)
-            .map(|(n, _, _)| n.clone())
+            .filter(|(_, c, support, _)| !*c && *support == want)
+            .map(|(n, _, _, _)| n.clone())
             .collect()
     };
-    let not_configured_supported =
-        unconfigured_by_tier(crate::channels::ChannelMaturity::Supported);
+    let not_configured_supported = unconfigured_by_tier(crate::channels::ChannelSupport::Supported);
     let not_configured_under_development =
-        unconfigured_by_tier(crate::channels::ChannelMaturity::UnderDevelopment);
+        unconfigured_by_tier(crate::channels::ChannelSupport::UnderDevelopment);
 
     // Auto-start state — drives the per-channel status icon + the footer
     // diagnostic. Mirrors the v0.6.6 logic but renders into typed rows.
@@ -492,12 +500,16 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
             AutoStartState::Failed { .. } => StatusKind::Fail,
             AutoStartState::NotDispatched => StatusKind::Info,
         };
-        for (name, configured, maturity) in &rows {
+        for (name, configured, support, verification) in &rows {
             if *configured {
                 sec = sec.status_with(
                     kind,
                     name.clone(),
-                    format!("{polling_label} · {}", maturity.label()),
+                    format!(
+                        "{polling_label} · {} · {}",
+                        support.label(),
+                        verification.label()
+                    ),
                 );
             }
         }
@@ -519,7 +531,7 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
         panel = panel.section(
             InfoSection::new(format!(
                 "Not configured · {}",
-                crate::channels::ChannelMaturity::UnderDevelopment.label()
+                crate::channels::ChannelSupport::UnderDevelopment.label()
             ))
             .inline_list(not_configured_under_development),
         );

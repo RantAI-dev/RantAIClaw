@@ -4,11 +4,13 @@
 > binaries carry no Matrix support: it needs a source build with
 > `cargo build --features channel-matrix`, and that build needs **rustc 1.93 or
 > newer** — `matrix-sdk` declares it, while the rest of RantaiClaw builds on
-> 1.91. The channel ships labelled **under development** — it builds and its
-> tests run in CI (`Channel Matrix (build + test)`), but it has not been driven
-> live against a real homeserver as part of a release, which is what the
-> supported tier requires. Everything below assumes a binary built with that
-> feature.
+> 1.91. Matrix is **under development** on the support axis and **not yet
+> verified** on the verification axis, for two separate reasons: the owner did
+> not name it in the supported tier, and nobody has driven it against a real
+> homeserver. Neither implies the other. Discord is supported and undriven, and
+> a driven channel is not thereby committed to. Matrix builds and its tests run
+> in CI (`Channel Matrix (build + test)`). Everything below assumes a binary
+> built with that feature.
 
 This guide explains how to run RantaiClaw reliably in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
 
@@ -34,14 +36,14 @@ checked is worse than no sentence.
 
 - **No RantaiClaw release or test run has ever completed a message round trip
   against a real homeserver.** That is what keeps Matrix outside the supported
-  tier ([channels.md §0](channels.md#0-maturity-tiers)), and it means §3's
+  tier ([channels.md §0](channels.md#0-two-axes-support-and-verification)), and it means §3's
   validation flow is a procedure nobody here has executed end to end.
 - The E2EE key-sharing, device-trust and key-backup behaviour in §4.D is
   client-side and homeserver-side behaviour. RantaiClaw delegates all of it to
   `matrix-sdk`; none of it is exercised by a test in this repository.
 
 If you run the §3 flow against a real homeserver, the promotion checklist in
-[channels.md §0](channels.md#how-a-channel-is-promoted) is what turns that into
+[channels.md §0](channels.md#how-a-channel-becomes-verified) is what turns that into
 a tier change — including writing down what broke.
 
 It focuses on the common failure mode reported by users:

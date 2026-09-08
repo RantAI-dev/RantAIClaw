@@ -26,6 +26,18 @@ Run one agent across many transports simultaneously. Each channel is independent
 
 ## Channel matrix
 
+The **Status** column below describes the implementation: whether the code is
+finished and exercised. It is not the same thing as the two labels the runtime
+publishes for each channel, and it never was.
+
+Those two live in `CHANNEL_CATALOG` and are defined in
+[channels.md §0](../reference/channels.md#0-two-axes-support-and-verification):
+**support** is what the project undertakes (four channels, the owner's
+2026-09-04 decision), and **verification** is whether anyone has driven a round
+trip against the real platform (one channel, Telegram). A row reading "Stable"
+here can still be `not yet verified` there, and for Discord, Slack and WhatsApp
+Cloud it is.
+
 | Channel | Status | Feature | Doctor probe |
 |---|---|---|---|
 | Telegram | Stable | default | `getMe` |
@@ -57,7 +69,7 @@ unverified rather than current._
 | Hot-add via gateway API | Stable |
 | Doctor probes | Stable (added v0.5.2) |
 | WhatsApp Web QR (Unicode block) | Stable (added v0.5.2) |
-| Matrix E2EE | Under development — builds and unit-tests in CI since the `matrix-sdk` 0.18 pin; not live-verified against a homeserver, so outside the supported tier |
+| Matrix E2EE | Under development on both axes — builds and unit-tests in CI since the `matrix-sdk` 0.18 pin, and not driven against a homeserver |
 | Mattermost maturation | Implemented · needs validation |
 | Nextcloud Talk | Implemented · needs validation |
 

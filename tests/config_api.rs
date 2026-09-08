@@ -325,7 +325,7 @@ async fn get_channels_returns_200() {
 /// every field, the tier vocabulary, and that the pre-existing `configured` and
 /// `count` fields still mean what they meant.
 #[tokio::test]
-async fn get_channels_publishes_the_catalog_with_maturity() {
+async fn get_channels_publishes_the_catalog_with_both_axes() {
     let workspace = tempfile::tempdir().expect("tempdir creation should succeed");
     let base_url = spawn_test_gateway(test_config(workspace.path())).await;
 
@@ -349,23 +349,60 @@ async fn get_channels_publishes_the_catalog_with_maturity() {
     );
 
     let mut supported = 0;
+    let mut driven = 0;
     for entry in channels {
-        for field in ["key", "label", "maturity", "configured"] {
+        for field in [
+            "key",
+            "label",
+            "support",
+            "maturity",
+            "verification",
+            "configured",
+        ] {
             assert!(
                 entry.get(field).is_some(),
                 "a channel entry is missing `{field}`: {entry}"
             );
         }
-        match entry["maturity"].as_str() {
+        match entry["support"].as_str() {
             Some("supported") => supported += 1,
             Some("under_development") => {}
-            other => panic!("unknown maturity {other:?} in {entry}"),
+            other => panic!("unknown support value {other:?} in {entry}"),
         }
+        match entry["verification"].as_str() {
+            Some("driven") => driven += 1,
+            Some("not_driven") => {}
+            other => panic!("unknown verification value {other:?} in {entry}"),
+        }
+        assert_eq!(
+            entry["maturity"], entry["support"],
+            "`maturity` is the deprecated alias for `support`; they must never \
+             diverge on the wire: {entry}"
+        );
         assert!(entry["configured"].is_boolean(), "in {entry}");
     }
+    // Counted separately, because they are separate facts. One assertion over
+    // both would pass while a channel moved from one axis to the other.
     assert_eq!(
         supported, 4,
-        "the supported tier is a promise to operators, not a refactor: {body}"
+        "the support axis is a product commitment, not a refactor: {body}"
+    );
+    assert_eq!(
+        driven, 1,
+        "the verification axis moves only when a round trip was run: {body}"
+    );
+
+    // The combination the split exists for: committed to, never driven. If this
+    // set is empty, check whether somebody drove them or somebody demoted them.
+    let committed_undriven: Vec<&str> = channels
+        .iter()
+        .filter(|e| e["support"] == "supported" && e["verification"] == "not_driven")
+        .map(|e| e["key"].as_str().expect("key is a string"))
+        .collect();
+    assert_eq!(
+        committed_undriven,
+        vec!["discord", "slack", "whatsapp"],
+        "supported-but-undriven is a legitimate state and must survive: {body}"
     );
 
     // The compatibility half: the old fields still mean what they meant.
