@@ -9,8 +9,31 @@
 #
 # Thresholds:
 #   >35MB  — hard error (safeguard)
-#   >30MB  — warning (advisory)
-#   >5MB   — warning (target)
+#   >30MB  — warning (advisory: this target is close to the cap)
+#    5MB   — the aspiration, reported but NOT warned on. See below.
+#
+# Why 5MB stopped being a warning
+# -------------------------------
+# It fired on every target of every release — six warnings, six releases in a
+# row, none of them actionable — and a warning that always fires is training,
+# not information. The number is kept as the stated aspiration because deleting
+# it would erase the goal along with the noise; it is printed, not raised.
+#
+# Measured from the published v0.30.0-alpha artefacts on 2026-09-08, by
+# downloading all six and reading the extracted binary:
+#
+#   x86_64-unknown-linux-gnu       36,159,376 B   34.48 MiB   ← 540,784 B under the cap
+#   x86_64-apple-darwin            30,118,616 B   28.72 MiB
+#   x86_64-pc-windows-msvc         29,429,760 B   28.07 MiB
+#   aarch64-unknown-linux-gnu      28,295,856 B   26.99 MiB
+#   armv7-unknown-linux-gnueabihf  26,862,132 B   25.62 MiB
+#   aarch64-apple-darwin           21,476,752 B   20.48 MiB
+#
+# So the 30MB advisory fires on exactly ONE of the six, which makes it a signal
+# rather than wolf-crying: x86_64-linux has **0.52 MiB of headroom** to the hard
+# cap. Anyone raising the floor again should start from that number, and should
+# know it is one target's problem and not the platform's — the same build is
+# 14 MiB clear of the cap on aarch64-darwin.
 #
 # Floor history:
 #   v0.6.39 → rig-core multi-provider adapter became default streaming
@@ -62,7 +85,9 @@ if [ "$SIZE" -gt 36700160 ]; then
 elif [ "$SIZE" -gt 31457280 ]; then
   echo "::warning::Binary exceeds 30MB advisory target (${SIZE_MB}MB)"
 elif [ "$SIZE" -gt 5242880 ]; then
-  echo "::warning::Binary exceeds 5MB target (${SIZE_MB}MB)"
+  # Reported, not warned. See the threshold notes at the top: this fired on
+  # every target of every release and taught readers to skip the size step.
+  echo "Above the 5MB aspiration (${SIZE_MB}MB); under the 30MB advisory."
 else
   echo "Binary size within target."
 fi
