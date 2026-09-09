@@ -14,10 +14,27 @@
 //! different — [`ChatRelayApprovalBackend`] posts those into the originating
 //! chat and is wired.
 //!
-//! [`try_handle_reply`] is a stateless parser called by the channel
-//! dispatch loop before each inbound message is forwarded to the
-//! agent. It recognises text-channel approval replies in formats
-//! natural over chat:
+//! Two relays, two reply vocabularies, and they are not the same. Layer A
+//! decides one pending tool call; Layer B widens the shell allowlist. Mixing
+//! them up is easy from the outside, so both are written out here.
+//!
+//! **Layer A — [`try_handle_tool_reply`]**, one decision per pending request:
+//!
+//!    - `approve <tool>` / `deny <tool>` — that tool's pending call
+//!    - `approve <handle>` — the one request named by its short id, which is
+//!      the only form that works when several calls to one tool are queued in
+//!      one chat
+//!    - `reject` is accepted for `deny`, `approved` for `approve`
+//!    - the verb is case-insensitive, and a leading `/` is optional
+//!    - **no `--persist`**: a tool approval answers one request, and a trailing
+//!      token makes the whole reply fall through to the agent as ordinary chat
+//!
+//! The prompt omits the leading `/` on channels whose platform intercepts it
+//! (see [`reply_verb_prefix`]).
+//!
+//! **Layer B — [`try_handle_reply`]** is a stateless parser called by the
+//! channel dispatch loop before each inbound message is forwarded to the
+//! agent. It recognises shell-allowlist replies in formats natural over chat:
 //!
 //!    - `/allow brew` / `/allow brew --persist`
 //!    - `/deny brew`
@@ -299,6 +316,23 @@ pub(crate) fn auto_deny_line(timeout: Option<std::time::Duration>) -> String {
     }
 }
 
+/// Leading character for the reply forms the prompt prints.
+///
+/// Slack treats every message starting with `/` as a slash command and answers
+/// "/approve is not a valid command" without ever delivering it, so a prompt
+/// telling a Slack owner to type `/approve` names a reply that cannot arrive.
+/// The parser has always accepted the slash-less form (see [`parse_tool_reply`],
+/// which strips an optional leading `/`), so this only changes what is printed.
+///
+/// An explicit list, not a guess: a channel is added here after its platform is
+/// shown to intercept the prefix.
+fn reply_verb_prefix(channel_name: &str) -> &'static str {
+    match channel_name {
+        "slack" => "",
+        _ => "/",
+    }
+}
+
 /// Format a tool-approval request for chat.
 ///
 /// `handle` is the short request id. A tool name is not a unique thing to
@@ -309,7 +343,9 @@ pub fn format_tool_approval_message(
     args_summary: &str,
     handle: &str,
     timeout: Option<std::time::Duration>,
+    channel_name: &str,
 ) -> String {
+    let verb = reply_verb_prefix(channel_name);
     let detail = if args_summary.trim().is_empty() {
         String::new()
     } else {
@@ -319,9 +355,9 @@ pub fn format_tool_approval_message(
         "🔧 The agent wants to run the `{tool_name}` tool{detail}.\n\
          Request `{handle}`.\n\
          Reply with one of:\n\
-         • `/approve {tool_name}` — allow this call\n\
-         • `/approve {handle}` — answer this exact request\n\
-         • `/deny {tool_name}` — reject it\n\
+         • `{verb}approve {tool_name}` — allow this call\n\
+         • `{verb}approve {handle}` — answer this exact request\n\
+         • `{verb}deny {tool_name}` — reject it\n\
          {}",
         auto_deny_line(timeout)
     )
@@ -378,6 +414,7 @@ impl ApprovalBackend for ChatRelayApprovalBackend {
             &summary,
             &handle,
             self.relay.timeout(),
+            &self.channel_name,
         );
         let msg = SendMessage::new(body, &self.recipient).in_thread(self.thread_ts.clone());
         if let Err(e) = self.channel.send(&msg).await {
@@ -474,7 +511,11 @@ fn parse_tool_reply(text: &str) -> Option<ParsedToolReply> {
     if tokens.next().is_some() {
         return None;
     }
-    let verb = match head {
+    // Lowercased for the same reason `parse_reply` does it: a phone keyboard
+    // capitalises the first word, and `Approve shell` used to match nothing here
+    // while its sibling parser accepted it — one file, two parsers, one of them
+    // taught.
+    let verb = match head.to_ascii_lowercase().as_str() {
         "approve" | "approved" => ToolReplyVerb::Approve,
         "deny" | "reject" => ToolReplyVerb::Deny,
         _ => return None,
@@ -1069,6 +1110,38 @@ mod tests {
 
     /// A basename is not a unique thing to answer. Two pending requests can
     /// share one; the handle names exactly which.
+    /// Slack eats any message starting with `/`, so a prompt printing
+    /// `/approve` names a reply the platform will never deliver. Verified live:
+    /// Slack answered "/approve is not a valid command" and the tool auto-denied.
+    #[test]
+    fn slack_prompt_omits_the_slash_every_other_channel_keeps() {
+        let slack = format_tool_approval_message("shell", "rm x", "abc123", None, "slack");
+        assert!(
+            !slack.contains("/approve") && !slack.contains("/deny"),
+            "slack prompt must not print a leading slash: {slack}"
+        );
+        assert!(slack.contains("`approve shell`"), "{slack}");
+        assert!(slack.contains("`approve abc123`"), "{slack}");
+
+        let tg = format_tool_approval_message("shell", "rm x", "abc123", None, "telegram");
+        assert!(tg.contains("`/approve shell`"), "{tg}");
+        assert!(tg.contains("`/deny shell`"), "{tg}");
+    }
+
+    /// `parse_reply` lowercases multi-character verbs on purpose — a phone
+    /// keyboard capitalises the first word. `parse_tool_reply` did not, so the
+    /// same typing worked for the shell allowlist and silently became chat for a
+    /// tool approval.
+    #[test]
+    fn tool_reply_verb_is_case_insensitive_like_its_sibling() {
+        for text in ["Approve shell", "APPROVE shell", "Deny shell"] {
+            assert!(
+                parse_tool_reply(text).is_some(),
+                "capitalised verb must parse: {text}"
+            );
+        }
+    }
+
     /// The case the handle form exists for, and the one its sibling test never
     /// covered: two requests for one tool in ONE chat. `reply_naming_the_request_
     /// handle_resolves_that_one` puts them in different chats, so `reply_target`
