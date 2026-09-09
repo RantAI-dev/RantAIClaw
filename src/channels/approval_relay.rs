@@ -513,15 +513,20 @@ pub fn try_handle_tool_reply(
             .iter()
             .find(|r| PendingApprovals::handle_for(r.id) == parsed.tool.to_ascii_lowercase())
         {
+            // Resolve by the handle itself. Mapping it back to a basename and
+            // re-resolving by name reintroduced exactly the guess this branch
+            // exists to avoid: with two requests queued for one tool in one
+            // chat, the name lookup found both, returned `None`, and the queue
+            // could not be answered by name OR by handle until auto-deny.
             let basename = req.basename.clone();
-            return Some(resolve_tool(
+            let handle = PendingApprovals::handle_for(req.id);
+            return Some(resolve_handle(
                 relay,
+                &handle,
                 &basename,
                 parsed.verb,
                 sender,
                 owners,
-                &req.channel.clone(),
-                &req.reply_target.clone(),
             ));
         }
         // Exact tool basename match keeps the original behavior.
@@ -590,6 +595,40 @@ pub fn try_handle_tool_reply(
 
 /// Resolve a single tool request (already known to be pending) honoring the
 /// owner gate for approvals.
+/// Resolve one request named by its handle. Unlike [`resolve_tool`] this never
+/// searches by name, so a queue holding several requests for the same tool in
+/// one chat stays answerable — that is the whole reason the prompt offers the
+/// handle form alongside the tool name.
+///
+/// `basename` is display-only: the acknowledgement names the tool because that
+/// is what the operator recognises, while resolution goes through the id.
+fn resolve_handle(
+    relay: &PendingApprovals,
+    handle: &str,
+    basename: &str,
+    verb: ToolReplyVerb,
+    sender: &str,
+    owners: &[String],
+) -> String {
+    match verb {
+        ToolReplyVerb::Approve => {
+            if !can_approve(owners, sender) {
+                return format!(
+                    "You're not authorized to approve `{basename}`. Ask an owner to reply `/approve {basename}`."
+                );
+            }
+            match relay.resolve_by_handle(handle, Decision::Once) {
+                Some(_) => format!("✅ Approved `{basename}` — the agent will run it now."),
+                None => format!("Request `{handle}` is no longer pending."),
+            }
+        }
+        ToolReplyVerb::Deny => match relay.resolve_by_handle(handle, Decision::Deny) {
+            Some(_) => format!("🚫 Denied `{basename}`. The tool call will fail."),
+            None => format!("Request `{handle}` is no longer pending."),
+        },
+    }
+}
+
 fn resolve_tool(
     relay: &PendingApprovals,
     tool: &str,
@@ -1030,6 +1069,63 @@ mod tests {
 
     /// A basename is not a unique thing to answer. Two pending requests can
     /// share one; the handle names exactly which.
+    /// The case the handle form exists for, and the one its sibling test never
+    /// covered: two requests for one tool in ONE chat. `reply_naming_the_request_
+    /// handle_resolves_that_one` puts them in different chats, so `reply_target`
+    /// scoping already disambiguates and the handle contributes nothing — it
+    /// passed while the queue was unanswerable in the field.
+    #[tokio::test]
+    async fn handle_resolves_one_of_two_same_tool_requests_in_one_chat() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let id_a = uuid::Uuid::new_v4();
+        let id_b = uuid::Uuid::new_v4();
+        let (r1, r2) = (relay.clone(), relay.clone());
+        let ta = tokio::spawn(async move {
+            r1.request_decision_in(id_a, "shell", "rm a.txt", "slack", "chat-1")
+                .await
+        });
+        let tb = tokio::spawn(async move {
+            r2.request_decision_in(id_b, "shell", "rm b.txt", "slack", "chat-1")
+                .await
+        });
+        await_pending(&relay, 2).await;
+
+        let owners = vec!["owner1".to_string()];
+
+        // By name it is genuinely ambiguous, and must stay refused.
+        let by_name = try_handle_tool_reply(
+            "approve shell",
+            &relay,
+            "owner1",
+            &owners,
+            "slack",
+            "chat-1",
+        )
+        .expect("a recognised reply");
+        assert!(
+            by_name.contains("more than one"),
+            "name form must stay ambiguous: {by_name}"
+        );
+
+        // By handle it must resolve exactly the named one.
+        let handle = PendingApprovals::handle_for(id_b);
+        let ack = try_handle_tool_reply(
+            &format!("approve {handle}"),
+            &relay,
+            "owner1",
+            &owners,
+            "slack",
+            "chat-1",
+        )
+        .expect("handle names a request");
+        assert!(ack.contains("Approved"), "{ack}");
+        assert_eq!(tb.await.unwrap(), Decision::Once, "exactly the named one");
+        assert_eq!(relay.list().len(), 1, "the other is untouched");
+
+        relay.resolve_by_handle(&PendingApprovals::handle_for(id_a), Decision::Deny);
+        let _ = ta.await;
+    }
+
     #[tokio::test]
     async fn reply_naming_the_request_handle_resolves_that_one() {
         let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
