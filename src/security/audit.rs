@@ -23,6 +23,22 @@ pub enum AuditEventType {
     SecurityEvent,
 }
 
+/// Whether a human approved a call, or whether nobody was ever asked.
+///
+/// A single `approved: bool` wrote "the owner answered yes" and "policy let it
+/// run without asking" as the same byte, so the trail could not prove that
+/// anyone had approved anything. Three states is the fewest that can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalOutcome {
+    /// A human was asked and answered yes.
+    Granted,
+    /// Nobody was asked: the active policy let the call run unprompted.
+    NotRequired,
+    /// The call was refused, so the tool did not run.
+    Denied,
+}
+
 /// Actor information (who performed the action)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Actor {
@@ -36,7 +52,8 @@ pub struct Actor {
 pub struct Action {
     pub command: Option<String>,
     pub risk_level: Option<String>,
-    pub approved: bool,
+    /// What let this call run — a human, the policy, or nobody.
+    pub approval: ApprovalOutcome,
     pub allowed: bool,
 }
 
@@ -107,13 +124,13 @@ impl AuditEvent {
         mut self,
         command: String,
         risk_level: String,
-        approved: bool,
+        approval: ApprovalOutcome,
         allowed: bool,
     ) -> Self {
         self.action = Some(Action {
             command: Some(command),
             risk_level: Some(risk_level),
-            approved,
+            approval,
             allowed,
         });
         self
@@ -156,7 +173,7 @@ pub struct CommandExecutionLog<'a> {
     pub channel: &'a str,
     pub command: &'a str,
     pub risk_level: &'a str,
-    pub approved: bool,
+    pub approval: ApprovalOutcome,
     pub allowed: bool,
     pub success: bool,
     pub duration_ms: u64,
@@ -169,7 +186,7 @@ pub struct ToolCallRecord {
     pub channel: String,
     pub tool: String,
     pub risk_level: String,
-    pub approved: bool,
+    pub approval: ApprovalOutcome,
     pub allowed: bool,
     pub success: bool,
     pub duration_ms: u64,
@@ -206,7 +223,7 @@ pub fn record_tool_call(record: ToolCallRecord) {
             channel: &record.channel,
             command: &record.tool,
             risk_level: &record.risk_level,
-            approved: record.approved,
+            approval: record.approval,
             allowed: record.allowed,
             success: record.success,
             duration_ms: record.duration_ms,
@@ -303,7 +320,7 @@ impl AuditLogger {
             .with_action(
                 entry.command.to_string(),
                 entry.risk_level.to_string(),
-                entry.approved,
+                entry.approval,
                 entry.allowed,
             )
             .with_result(entry.success, None, entry.duration_ms, None);
@@ -318,7 +335,7 @@ impl AuditLogger {
         channel: &str,
         command: &str,
         risk_level: &str,
-        approved: bool,
+        approval: ApprovalOutcome,
         allowed: bool,
         success: bool,
         duration_ms: u64,
@@ -327,7 +344,7 @@ impl AuditLogger {
             channel,
             command,
             risk_level,
-            approved,
+            approval,
             allowed,
             success,
             duration_ms,
@@ -391,7 +408,7 @@ mod tests {
         let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
             "ls -la".to_string(),
             "low".to_string(),
-            false,
+            ApprovalOutcome::Granted,
             true,
         );
 
@@ -399,13 +416,35 @@ mod tests {
         let action = event.action.as_ref().unwrap();
         assert_eq!(action.command, Some("ls -la".to_string()));
         assert_eq!(action.risk_level, Some("low".to_string()));
+        assert_eq!(action.approval, ApprovalOutcome::Granted);
+    }
+
+    /// The three names are the on-disk contract: anything parsing `audit.log`
+    /// reads these strings, and the whole point of the field is that a reader
+    /// can tell a human's yes from a policy that never asked.
+    #[test]
+    fn the_three_approval_outcomes_serialize_under_distinct_names() {
+        let names: Vec<String> = [
+            ApprovalOutcome::Granted,
+            ApprovalOutcome::NotRequired,
+            ApprovalOutcome::Denied,
+        ]
+        .iter()
+        .map(|o| serde_json::to_string(o).expect("serialize"))
+        .collect();
+        assert_eq!(names, vec!["\"granted\"", "\"not_required\"", "\"denied\""]);
     }
 
     #[test]
     fn audit_event_serializes_to_json() {
         let event = AuditEvent::new(AuditEventType::CommandExecution)
             .with_actor("telegram".to_string(), None, None)
-            .with_action("ls".to_string(), "low".to_string(), false, true)
+            .with_action(
+                "ls".to_string(),
+                "low".to_string(),
+                ApprovalOutcome::Denied,
+                true,
+            )
             .with_result(true, Some(0), 15, None);
 
         let json = serde_json::to_string(&event);
@@ -457,7 +496,7 @@ mod tests {
             channel: "cli",
             command,
             risk_level: "executed",
-            approved: true,
+            approval: ApprovalOutcome::Granted,
             allowed: true,
             success: true,
             duration_ms: 1,
@@ -549,7 +588,7 @@ mod tests {
             channel: "cli".into(),
             tool: "shell".into(),
             risk_level: "executed".into(),
-            approved: true,
+            approval: ApprovalOutcome::NotRequired,
             allowed: true,
             success: true,
             duration_ms: 1,
@@ -569,7 +608,12 @@ mod tests {
         let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
         let event = AuditEvent::new(AuditEventType::CommandExecution)
             .with_actor("cli".to_string(), None, None)
-            .with_action("ls".to_string(), "low".to_string(), false, true);
+            .with_action(
+                "ls".to_string(),
+                "low".to_string(),
+                ApprovalOutcome::Denied,
+                true,
+            );
 
         logger.log(&event)?;
 
@@ -598,7 +642,7 @@ mod tests {
             channel: "telegram",
             command: "echo test",
             risk_level: "low",
-            approved: false,
+            approval: ApprovalOutcome::NotRequired,
             allowed: true,
             success: true,
             duration_ms: 42,
@@ -611,6 +655,7 @@ mod tests {
         let action = parsed.action.unwrap();
         assert_eq!(action.command, Some("echo test".to_string()));
         assert_eq!(action.risk_level, Some("low".to_string()));
+        assert_eq!(action.approval, ApprovalOutcome::NotRequired);
         assert!(action.allowed);
 
         let result = parsed.result.unwrap();

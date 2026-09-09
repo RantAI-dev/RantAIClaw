@@ -450,7 +450,14 @@ fn audit_config_change(cfg: &crate::config::Config, change_summary: &str) {
 fn config_change_event(change_summary: &str) -> crate::security::AuditEvent {
     crate::security::AuditEvent::new(crate::security::AuditEventType::ConfigChange)
         .with_actor("web-console".to_string(), None, None)
-        .with_action(change_summary.to_string(), "config".to_string(), true, true)
+        .with_action(
+            change_summary.to_string(),
+            "config".to_string(),
+            // The console principal is paired, not prompted: no approval dialog
+            // stands between a paired caller and a config write.
+            crate::security::ApprovalOutcome::NotRequired,
+            true,
+        )
 }
 
 /// If a provider switch left the active provider without a usable credential,

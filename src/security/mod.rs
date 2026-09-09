@@ -28,7 +28,9 @@ pub mod runtime_overlay;
 pub mod secrets;
 
 #[allow(unused_imports)]
-pub use audit::{record_tool_call, AuditEvent, AuditEventType, AuditLogger, ToolCallRecord};
+pub use audit::{
+    record_tool_call, ApprovalOutcome, AuditEvent, AuditEventType, AuditLogger, ToolCallRecord,
+};
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 #[allow(unused_imports)]
