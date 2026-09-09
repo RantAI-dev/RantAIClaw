@@ -240,9 +240,9 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 When running `rantaiclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
 
 - `/models` — show available providers and current selection
-- `/models <provider>` — switch provider for the current sender session
+- `/models <provider>` — switch provider for the current conversation. In a group that applies to everyone in it
 - `/model` — show current model and cached model IDs (if available)
-- `/model <model-id>` — switch model for the current sender session
+- `/model <model-id>` — switch model for the current conversation. In a group that applies to everyone in it
 
 Notes:
 
