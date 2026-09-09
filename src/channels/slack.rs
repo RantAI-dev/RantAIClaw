@@ -20,6 +20,21 @@ pub struct SlackChannel {
 /// <https://docs.slack.dev/changelog/2018-truncating-really-long-messages/>
 const SLACK_MAX_MESSAGE_LENGTH: usize = 4000;
 
+/// What an operator loses by leaving `app_token` unset, in one sentence.
+///
+/// Three surfaces have to say this and must not drift apart: the runtime
+/// warning in `channels::factory`, the TUI provisioner prompt, and the
+/// first-run wizard prompt. Two of the three used to say nothing at all, and
+/// `doctor` sent operators to a config key no setup path could write, so the
+/// wording is shared rather than copied.
+pub const NO_APP_TOKEN_CONSEQUENCE: &str =
+    "Without it the bot polls one conversation: it will not see direct messages, and it will \
+     not see replies inside a thread — including replies to the approval prompt it posts there.";
+
+/// The shape of a Slack app-level token. Checked for a warning only; `doctor`
+/// decides whether a token actually works.
+pub const APP_TOKEN_PREFIX: &str = "xapp-";
+
 /// What the poll loop should do with one inbound Slack message.
 ///
 /// Extracted so the allowlist gate is reachable from a test. It used to sit
