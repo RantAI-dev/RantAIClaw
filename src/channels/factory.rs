@@ -396,10 +396,10 @@ pub(crate) fn warn_unused_channel_config(config: &Config) {
     if let Some(ref sl) = config.channels_config.slack {
         if sl.app_token.as_deref().is_none_or(|t| t.trim().is_empty()) {
             tracing::warn!(
-                "Slack: no `app_token`, so this channel polls one conversation. It will not see \
-                 direct messages, and it will not see replies inside a thread — including replies \
-                 to the approval prompt it posts there. Set [channels_config.slack].app_token \
-                 (an `xapp-` token with `connections:write`) for Socket Mode."
+                "Slack: no `app_token`. {} Set [channels_config.slack].app_token (an `{}` token \
+                 with `connections:write`) for Socket Mode.",
+                crate::channels::slack::NO_APP_TOKEN_CONSEQUENCE,
+                crate::channels::slack::APP_TOKEN_PREFIX,
             );
         }
     }

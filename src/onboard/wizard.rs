@@ -3958,9 +3958,30 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     }
                 }
 
-                // No app-token prompt: Socket Mode is not implemented, so the
-                // token would be a real credential collected for nothing.
-                let app_token = String::new();
+                // App-level token, optional. Skipping it is valid and yields
+                // polling, which is what every install got before this prompt
+                // existed — but the operator now gets told what that costs.
+                println!();
+                print_bullet(crate::channels::slack::NO_APP_TOKEN_CONSEQUENCE);
+                print_bullet(
+                    "To enable it: Slack app -> Basic Information -> App-Level Tokens -> generate one with `connections:write`.",
+                );
+
+                let app_token: String = Password::new()
+                    .with_prompt("  App-level token (xapp-..., Enter to skip)")
+                    .allow_empty_password(true)
+                    .interact()?;
+
+                let app_token =
+                    crate::onboard::provision::channels::slack::app_token_from_answer(&app_token);
+                if let Some(ref t) = app_token {
+                    if !crate::onboard::provision::channels::slack::looks_like_app_token(t) {
+                        println!(
+                            "  {} That does not look like an app-level token (they start 'xapp-'). Saving it anyway — run `doctor` to check it.",
+                            style("⚠").yellow().bold()
+                        );
+                    }
+                }
 
                 let channel: String = Input::new()
                     .with_prompt("  Default channel ID (optional, Enter to skip)")
@@ -3999,11 +4020,7 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
 
                 config.slack = Some(SlackConfig {
                     bot_token: token,
-                    app_token: if app_token.is_empty() {
-                        None
-                    } else {
-                        Some(app_token)
-                    },
+                    app_token,
                     channel_id: if channel.is_empty() {
                         None
                     } else {

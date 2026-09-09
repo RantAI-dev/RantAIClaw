@@ -256,12 +256,17 @@ fn assert_aborted(
 /// Port 1 is reserved and closed, so the proxy connect is refused instantly:
 /// no DNS, no eight-second timeout, and the probe reaches the provisioner as
 /// the inconclusive result a happy-path smoke run wants.
-struct OfflineProbes {
+///
+/// `pub(crate)` because the per-provisioner tests need the same guarantee. A
+/// second copy of this would be a second thing to get subtly wrong, and the
+/// failure it prevents is invisible on the runner that happens to agree with
+/// the test's answer script.
+pub(crate) struct OfflineProbes {
     prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
 impl OfflineProbes {
-    fn engage() -> Self {
+    pub(crate) fn engage() -> Self {
         let mut prev = Vec::new();
         for key in ["HTTPS_PROXY", "HTTP_PROXY"] {
             prev.push((key, std::env::var_os(key)));
@@ -573,7 +578,8 @@ mod slack {
                 // prefix, and this repo's fixtures have been rejected at push
                 // time for looking real. The provisioner does not check shape.
                 ProvisionResponse::Text("placeholder-slack-bot-token".into()), // bot token
-                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text(String::new()), // app token (optional) -> skip
+                ProvisionResponse::Selection(vec![0]),  // probe inconclusive -> save anyway
                 ProvisionResponse::Text(String::new()), // default channel (optional)
                 ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
             ],

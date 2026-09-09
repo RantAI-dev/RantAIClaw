@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`doctor` told operators to set a Slack `app_token`, and no supported setup path could write
+  one.** Both paths hardcoded it. `provision/channels/slack.rs` bound
+  `let app_token: Option<String> = None` and `wizard.rs` bound `let app_token = String::new()`,
+  each under a comment claiming Socket Mode was not implemented, which stopped being true when
+  #778 landed it. So every operator who set Slack up through an official path got polling, and
+  the diagnostic then sent them to a config key only hand-editing `config.toml` could produce.
+  Both paths now offer an optional app-token prompt that names the token shape (`xapp-`) and the
+  scope it needs (`connections:write`), takes the value as a secret, and says what skipping costs
+  in the same words the runtime warning uses, which is now a shared constant rather than a third
+  copy to drift. Empty stays valid and still means polling. The token's shape is only warned
+  about, never enforced: `apps.connections.open` is the real check and it opens a live socket, so
+  setup must not call it to validate a string, and `doctor` keeps that verdict.
 - **`always_ask` was silently discarded under `Full` autonomy.** `needs_approval` returned early on
   `Full`, nine lines above the check it was supposed to reach, so the list was never read: an
   operator who wrote "run by yourself, except for the dangerous things" had the second half of
