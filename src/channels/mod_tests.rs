@@ -97,42 +97,43 @@ fn thread_replies_opt_out_disables_threading() {
 #[test]
 fn every_channel_listen_path_calls_its_allowlist_gate() {
     // (channel, source, fn that receives messages, gate call in it,
-    //  fn `listen()` must delegate to — empty when the gate is in listen)
-    let wiring: &[(&str, &str, &str, &str, &str)] = &[
+    //  call chain from `listen()` down to that fn — empty when the gate is
+    //  in listen itself, one entry per hop when listen delegates)
+    let wiring: &[(&str, &str, &str, &str, &[&str])] = &[
         (
             "dingtalk",
             include_str!("dingtalk.rs"),
             "fn listen(",
             "self.is_user_allowed(",
-            "",
+            &[],
         ),
         (
             "discord",
             include_str!("discord.rs"),
             "fn classify_inbound(",
             "self.is_user_allowed(",
-            "self.classify_inbound(",
+            &["self.classify_inbound("],
         ),
         (
             "imessage",
             include_str!("imessage.rs"),
             "fn listen(",
             "self.is_contact_allowed(",
-            "",
+            &[],
         ),
         (
             "irc",
             include_str!("irc.rs"),
             "fn run_session(",
             "self.is_user_allowed(",
-            "self.run_session(",
+            &["self.run_session("],
         ),
         (
             "lark (websocket)",
             include_str!("lark.rs"),
             "fn listen_ws(",
             "self.is_user_allowed(",
-            "self.listen_ws(",
+            &["self.listen_ws("],
         ),
         (
             // The webhook half gates inside `parse_event_payload`, which the
@@ -141,21 +142,21 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
             include_str!("lark.rs"),
             "fn parse_event_payload(",
             "self.is_user_allowed(",
-            "",
+            &[],
         ),
         (
             "matrix",
             include_str!("matrix.rs"),
             "fn listen(",
             "MatrixChannel::is_sender_allowed(",
-            "",
+            &[],
         ),
         (
             "mattermost",
             include_str!("mattermost.rs"),
             "fn listen(",
             "self.is_user_allowed(",
-            "",
+            &[],
         ),
         // QQ gates twice — once per message shape — so both are named.
         // One entry, not two: the C2C and group events used to be separate
@@ -168,39 +169,58 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
             include_str!("qq.rs"),
             "fn listen(",
             "self.is_user_allowed(&routed.sender)",
-            "Self::classify_inbound(",
+            &["Self::classify_inbound("],
         ),
         (
             "signal",
             include_str!("signal.rs"),
             "fn process_envelope(",
             "self.is_sender_allowed(",
-            "self.process_envelope(",
+            &["self.process_envelope("],
         ),
+        // Slack has two transports and `listen` picks between them, so both
+        // routes down to the gate are pinned. `.handle_inbound(` is written
+        // without a receiver because rustfmt puts `self` on its own line in
+        // the polling arm.
         (
-            "slack",
+            "slack (socket mode)",
             include_str!("slack.rs"),
             "fn classify_inbound(",
             "self.is_user_allowed(",
-            "self.classify_inbound(",
+            &[
+                "self.listen_socket_mode(",
+                ".handle_inbound(",
+                "self.classify_inbound(",
+            ],
+        ),
+        (
+            "slack (polling)",
+            include_str!("slack.rs"),
+            "fn classify_inbound(",
+            "self.is_user_allowed(",
+            &[
+                "self.listen_polling(",
+                ".handle_inbound(",
+                "self.classify_inbound(",
+            ],
         ),
         (
             "telegram",
             include_str!("telegram.rs"),
             "fn parse_update_message(",
             "self.is_any_user_allowed(",
-            "self.parse_update_message(",
+            &["self.parse_update_message("],
         ),
         (
             "whatsapp_web",
             include_str!("whatsapp_web.rs"),
             "fn listen(",
             "Self::allow_inbound(",
-            "",
+            &[],
         ),
     ];
 
-    for (channel, src, receiver, gate, delegate) in wiring {
+    for (channel, src, receiver, gate, hops) in wiring {
         let production = production_half(src);
         let body = fn_body(production, receiver)
             .unwrap_or_else(|| panic!("{channel}: `{receiver}` not found in production code"));
@@ -209,16 +229,28 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
             "{channel}: `{receiver}` no longer calls `{gate}` — an inbound \
                  message can reach the agent without passing the allowlist"
         );
-        if !delegate.is_empty() {
-            let listen = fn_body(production, "fn listen(")
-                .unwrap_or_else(|| panic!("{channel}: no `listen` in production code"));
+        let mut caller = "fn listen(".to_string();
+        for hop in *hops {
+            let caller_body = fn_body(production, &caller)
+                .unwrap_or_else(|| panic!("{channel}: `{caller}` not found in production code"));
             assert!(
-                listen.contains(delegate),
-                "{channel}: `listen()` no longer reaches `{delegate}`, so the \
-                     gate asserted above is on a dead path"
+                caller_body.contains(hop),
+                "{channel}: `{caller}` no longer reaches `{hop}`, so the gate \
+                     asserted above is on a dead path"
             );
+            caller = format!("fn {}(", callee_name(hop));
         }
     }
+}
+
+/// The function a hop call names: `self.handle_inbound(` is `handle_inbound`.
+/// Receivers vary (`self.`, `Self::`, or nothing when rustfmt broke the line)
+/// so all three are stripped.
+fn callee_name(hop: &str) -> &str {
+    hop.trim_start_matches("self.")
+        .trim_start_matches("Self::")
+        .trim_start_matches('.')
+        .trim_end_matches('(')
 }
 
 /// Everything before the test module. Cutting at the first `#[cfg(test)]`
