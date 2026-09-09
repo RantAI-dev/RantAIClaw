@@ -751,6 +751,7 @@ Examples:
 
 - `[channels_config.telegram]`
 - `[channels_config.discord]`
+- `[channels_config.slack]`
 - `[channels_config.whatsapp]`
 - `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
@@ -768,6 +769,33 @@ Notes:
 - While `rantaiclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels.md).
+
+### `[channels_config.slack]`
+
+Slack bot integration. Two receive transports live under one table, and which one
+runs is decided by whether `app_token` is set.
+
+| Key | Required | Purpose |
+|---|---|---|
+| `bot_token` | Yes | Bot token (`xoxb-`) used for every Web API call |
+| `app_token` | Optional | App-level token (`xapp-`, scope `connections:write`). Present and non-blank selects Socket Mode |
+| `channel_id` | See below | Conversation ID (e.g. `C1234567890`) |
+| `allowed_users` | Recommended | Allowed Slack member IDs (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- `channel_id` is **required for polling and optional under Socket Mode**, which
+  is the asymmetry most likely to confuse. Polling reads one
+  `conversations.history` page and has nowhere to read from without it, so
+  `listen` fails immediately; Socket Mode receives every conversation the bot is
+  in and treats `channel_id` as an optional filter.
+- With **no** `app_token`, the channel polls: it will not see direct messages and
+  will not see replies inside a thread, including replies to the approval prompt
+  it posts there. `doctor` reports this rather than leaving it to be found.
+- With **neither** `app_token` nor `channel_id`, Slack cannot listen at all.
+- Both setup paths prompt for `app_token` as an optional field; leaving it empty
+  is valid and yields polling.
+- See [Channels reference §4.3](channels.md#43-slack) for the transport detail.
 
 ### `[channels_config.whatsapp]`
 

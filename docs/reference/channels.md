@@ -198,7 +198,7 @@ that anything was run. As of 2026-09-08:
 |---|---|---|
 | Telegram | yes | 2026-07, re-driven 2026-09-08 (see the row above) |
 | Discord | **no** | never |
-| Slack | **no** | never |
+| Slack | **no** | driven before #778 landed, so void as evidence — re-drive owed |
 | WhatsApp Cloud | **no** | never |
 
 Three of the four have no credential in any profile or environment on the
@@ -335,7 +335,7 @@ If `[channels_config.matrix]` or `[channels_config.lark]` is present but the cor
 | CLI | local stdin/stdout | No | n/a — local |
 | Telegram | polling | No | n/a — the agent calls out |
 | Discord | gateway/websocket | No | n/a — the agent calls out |
-| Slack | polling (`conversations.history`) | No | n/a — the agent calls out |
+| Slack | Socket Mode (websocket) with `app_token`, else polling (`conversations.history`) | No | n/a — the agent calls out |
 | Mattermost | polling | No | n/a — the agent calls out |
 | Matrix | sync API (supports E2EE) | No | n/a — the agent calls out |
 | Signal | signal-cli HTTP bridge | No (local bridge endpoint) | n/a — local bridge |
@@ -465,21 +465,43 @@ mention_only = false
 ```toml
 [channels_config.slack]
 bot_token = "xoxb-..."
-app_token = "xapp-..."             # accepted, ignored — setup no longer asks
-channel_id = "C1234567890"         # optional
+app_token = "xapp-..."             # optional; selects Socket Mode. Needs `connections:write`.
+                                   # Without it the channel polls one conversation: no DMs,
+                                   # and no replies inside a thread.
+channel_id = "C1234567890"         # required for polling, optional filter under Socket Mode
 allowed_users = ["*"]
 ```
 
 Slack notes:
 
-- The channel **polls** `conversations.history` every 3 seconds
-  (`src/channels/slack.rs:257`, `:267`); it is not an Events API subscriber and
-  needs no public inbound port. Expect up to a few seconds of reply latency, and
-  budget the poll against Slack's Web API rate limits when several channels run.
-- `app_token` exists in the config schema for a Socket Mode implementation that
-  does not exist yet. Setting it changes nothing; the channel now logs
-  `Slack: \`app_token\` is set but ignored` at startup so it is not a silent
-  no-op, and neither setup path asks for it any more.
+- **Two receive transports, chosen by `app_token`.** `SlackChannel::listen` calls
+  `listen_socket_mode` when `app_token` is set and non-blank, and `listen_polling`
+  otherwise. This is a documented split, not a silent fallback: the two differ in
+  what they can see. (Function names rather than line numbers on purpose — the
+  line numbers this file used to cite went stale after one refactor.)
+- **Socket Mode** holds one outbound WebSocket carrying events for every
+  conversation the bot is in: channels, threads and DMs alike. `channel_id` stops
+  being a requirement here and becomes what the schema always called it, an
+  optional filter. No public inbound port either way.
+- **Polling** reads one `conversations.history` page every 3 seconds. It
+  **requires** `channel_id` — `listen_polling` returns `Err` without one — and it
+  cannot see direct messages, nor replies inside a thread. That last one includes
+  replies to the approval prompt this channel itself posts into a thread, so an
+  operator on polling can be asked to approve a tool call in a place where their
+  answer is never read. Budget the poll against Slack's Web API rate limits when
+  several channels run.
+- `doctor` reports the gap rather than leaving it to be discovered. With
+  `app_token` it says nothing; with only `channel_id` it names polling as the
+  narrower transport; with neither it says Slack cannot listen at all. See
+  `slack_listen_gap` in `src/doctor/checks/channels.rs`.
+- Both setup paths ask for `app_token` as an optional prompt. Skipping it is
+  valid and yields polling.
+- **Slack shows no "working" indicator** while the agent thinks, and this is a
+  decision rather than an oversight. Slack does have an API for it,
+  `agents.sessions.setStatus`, but using it requires the app to be declared as an
+  agent, adds the `assistant:write` scope, and needs a reinstall. Draft streaming
+  gives the same signal with no app change, so the status API was skipped on
+  2026-09-09. Recorded here so the next reader does not re-audit it.
 
 ### 4.4 Mattermost
 
