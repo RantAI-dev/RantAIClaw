@@ -38,6 +38,14 @@ pub(crate) enum SlackInbound {
     Deliver(ChannelMessage),
 }
 
+/// What the listener should do after one inbound message.
+enum InboundOutcome {
+    /// Keep listening.
+    Continue,
+    /// The agent-side receiver is gone; stop cleanly.
+    ReceiverGone,
+}
+
 impl SlackChannel {
     /// Classify one message from a `conversations.history` page.
     pub(crate) fn classify_inbound(
@@ -83,6 +91,73 @@ impl SlackChannel {
                 .as_secs(),
             thread_ts: Self::inbound_thread_ts(msg, ts),
         })
+    }
+
+    /// Handle one inbound message: classify it, deliver it, or let an
+    /// unauthorized sender self-onboard with a pairing code.
+    ///
+    /// Extracted from the polling loop so a second transport can reuse it
+    /// verbatim rather than growing a second copy of the allowlist and pairing
+    /// rules — `factory.rs` already records what happens when two paths for one
+    /// channel drift.
+    async fn handle_inbound(
+        &self,
+        msg: &serde_json::Value,
+        bot_user_id: &str,
+        last_ts: &mut String,
+        channel_id: &str,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> InboundOutcome {
+        // The decision — including the allowlist gate — lives in
+        // `classify_inbound` so a test can reach it. Everything below needs the
+        // network, which is why it stays here.
+        let (user, text, ts) = match self.classify_inbound(msg, bot_user_id, last_ts, channel_id) {
+            SlackInbound::Own | SlackInbound::EmptyOrSeen => return InboundOutcome::Continue,
+            SlackInbound::Deliver(channel_msg) => {
+                *last_ts = channel_msg
+                    .id
+                    .rsplit('_')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if tx.send(channel_msg).await.is_err() {
+                    return InboundOutcome::ReceiverGone;
+                }
+                return InboundOutcome::Continue;
+            }
+            SlackInbound::Unauthorized { user, text, ts } => (user, text, ts),
+        };
+        let (user, text, ts) = (user.as_str(), text.as_str(), ts.as_str());
+
+        // Before rejecting, let a not-yet-allowed user self-onboard with a
+        // `/bind`/`/claim <code>` minted via `rantaiclaw channels pair`. On
+        // success the sender lands in `allowed_users` (and, for an owner
+        // `/claim`, `approval_owners`).
+        if !text.is_empty() && ts > last_ts.as_str() {
+            if let Some(root) = crate::channels::pairing::profile_root("slack") {
+                let identities = vec![user.to_string()];
+                if let Some(reply) = crate::channels::pairing::try_handle_pairing(
+                    text,
+                    "slack",
+                    crate::channels::pairing::AllowlistField::AllowedUsers,
+                    &identities,
+                    &root,
+                )
+                .await
+                {
+                    // Advance the cursor so this command isn't re-processed,
+                    // mirror into the runtime allowlist, and reply in-channel.
+                    *last_ts = ts.to_string();
+                    self.add_allowed_identity_runtime(user);
+                    let reply_msg = SendMessage::new(reply, channel_id.to_string())
+                        .in_thread(Self::inbound_thread_ts(msg, ts));
+                    let _ = self.send(&reply_msg).await;
+                    return InboundOutcome::Continue;
+                }
+            }
+        }
+        tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+        InboundOutcome::Continue
     }
 
     /// POST one already-split chunk.
@@ -311,63 +386,12 @@ impl Channel for SlackChannel {
             if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                 // Messages come newest-first, reverse to process oldest first
                 for msg in messages.iter().rev() {
-                    // The decision — including the allowlist gate — lives in
-                    // `classify_inbound` so a test can reach it. Everything the
-                    // arms below do needs the network, which is why it stays
-                    // here.
-                    let (user, text, ts) = match self.classify_inbound(
-                        msg,
-                        &bot_user_id,
-                        last_ts.as_str(),
-                        &channel_id,
-                    ) {
-                        SlackInbound::Own | SlackInbound::EmptyOrSeen => continue,
-                        SlackInbound::Deliver(channel_msg) => {
-                            last_ts = channel_msg
-                                .id
-                                .rsplit('_')
-                                .next()
-                                .unwrap_or_default()
-                                .to_string();
-                            if tx.send(channel_msg).await.is_err() {
-                                return Ok(());
-                            }
-                            continue;
-                        }
-                        SlackInbound::Unauthorized { user, text, ts } => (user, text, ts),
-                    };
-                    let (user, text, ts) = (user.as_str(), text.as_str(), ts.as_str());
-
+                    match self
+                        .handle_inbound(msg, &bot_user_id, &mut last_ts, &channel_id, &tx)
+                        .await
                     {
-                        // Before rejecting, let a not-yet-allowed user self-onboard
-                        // with a `/bind`/`/claim <code>` minted via
-                        // `rantaiclaw channels pair`. On success the sender lands in
-                        // `allowed_users` (and, for an owner `/claim`, `approval_owners`).
-                        if !text.is_empty() && ts > last_ts.as_str() {
-                            if let Some(root) = crate::channels::pairing::profile_root("slack") {
-                                let identities = vec![user.to_string()];
-                                if let Some(reply) = crate::channels::pairing::try_handle_pairing(
-                                    text,
-                                    "slack",
-                                    crate::channels::pairing::AllowlistField::AllowedUsers,
-                                    &identities,
-                                    &root,
-                                )
-                                .await
-                                {
-                                    // Advance the cursor so this command isn't
-                                    // re-processed on the next poll, mirror into the
-                                    // runtime allowlist, and reply in-channel.
-                                    last_ts = ts.to_string();
-                                    self.add_allowed_identity_runtime(user);
-                                    let reply_msg = SendMessage::new(reply, channel_id.clone())
-                                        .in_thread(Self::inbound_thread_ts(msg, ts));
-                                    let _ = self.send(&reply_msg).await;
-                                    continue;
-                                }
-                            }
-                        }
-                        tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                        InboundOutcome::Continue => {}
+                        InboundOutcome::ReceiverGone => return Ok(()),
                     }
                 }
             }
