@@ -124,6 +124,31 @@ pub(crate) fn build_providers_help_response(current: &ChannelRouteSelection) -> 
     response
 }
 
+/// The reply to a successful `/models <provider>`.
+///
+/// The scope in this sentence is not decoration. Route overrides are keyed by
+/// `conversation_history_key`, so the switch follows the conversation and not
+/// the person, which `channels/dispatch.rs` documents as a deliberate choice.
+/// The old wording said "for this sender session", and there is no such thing:
+/// in a group one member typed `/model`, the model changed for everybody, and
+/// the bot then told them the change was theirs alone.
+fn provider_switched_message(provider: &str, model: &str) -> String {
+    format!(
+        "Provider switched to `{provider}` for this conversation. In a group chat that applies \
+         to everyone here. Current model is `{model}`.\nUse `/model <model-id>` to set a \
+         provider-compatible model."
+    )
+}
+
+/// The reply to a successful `/model <model-id>`. Same scope, same reason as
+/// [`provider_switched_message`].
+fn model_switched_message(model: &str, provider: &str) -> String {
+    format!(
+        "Model switched to `{model}` for provider `{provider}` in this conversation. In a group \
+         chat that applies to everyone here."
+    )
+}
+
 pub(crate) async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -153,10 +178,7 @@ pub(crate) async fn handle_runtime_command_if_needed(
                                 history::clear_sender_history(ctx, &sender_key);
                             }
 
-                            format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                            current.model
-                        )
+                            provider_switched_message(&provider_name, &current.model)
                         }
                         Err(err) => {
                             let safe_err = providers::sanitize_api_error(&err.to_string());
@@ -183,10 +205,7 @@ pub(crate) async fn handle_runtime_command_if_needed(
                 routing::set_route_selection(ctx, &sender_key, current.clone());
                 history::clear_sender_history(ctx, &sender_key);
 
-                format!(
-                    "Model switched to `{model}` for provider `{}` in this sender session.",
-                    current.provider
-                )
+                model_switched_message(&model, &current.provider)
             }
         }
     };
@@ -202,4 +221,67 @@ pub(crate) async fn handle_runtime_command_if_needed(
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both replies used to say the switch was "for this sender session". No
+    /// such scope exists: route overrides are keyed by
+    /// `dispatch::conversation_history_key`, so in a group one member's
+    /// `/model` moves the model for everyone and the bot then described the
+    /// change as that member's own.
+    #[test]
+    fn a_switch_reply_names_the_conversation_and_never_a_sender_session() {
+        // Assembled at runtime so this test does not match itself.
+        let stale = format!("{} session", "sender");
+        for reply in [
+            provider_switched_message("openai", "gpt-5"),
+            model_switched_message("gpt-5", "openai"),
+        ] {
+            assert!(
+                !reply.contains(stale.as_str()),
+                "the reply claims a scope that does not exist: {reply}"
+            );
+            assert!(
+                reply.contains("this conversation"),
+                "the reply must say what the switch actually applies to: {reply}"
+            );
+            assert!(
+                reply.contains("everyone here"),
+                "a group member must be told the switch is not theirs alone: {reply}"
+            );
+        }
+    }
+
+    /// The replies still have to carry the values they are given, so the
+    /// scope-wording assertions above cannot be satisfied by a constant.
+    #[test]
+    fn a_switch_reply_carries_the_provider_and_model_it_was_given() {
+        let provider = provider_switched_message("anthropic", "claude-opus-5");
+        assert!(provider.contains("`anthropic`") && provider.contains("`claude-opus-5`"));
+
+        let model = model_switched_message("claude-opus-5", "anthropic");
+        assert!(model.contains("`claude-opus-5`") && model.contains("`anthropic`"));
+    }
+
+    /// Guards the file rather than the two functions: a third command added
+    /// tomorrow must not reintroduce the phrase in a reply. Doc comments are
+    /// skipped so the note explaining the old wording does not trip this.
+    #[test]
+    fn no_reply_string_in_this_file_claims_a_sender_session() {
+        let stale = format!("{} session", "sender");
+        for (n, line) in include_str!("commands.rs").lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains(stale.as_str()),
+                "line {} reintroduces the phrase: {line}",
+                n + 1
+            );
+        }
+    }
 }
