@@ -137,19 +137,28 @@ impl ApprovalManager {
     pub fn needs_approval(&self, tool_name: &str) -> bool {
         let autonomy = self.effective_autonomy();
 
-        // Full autonomy never prompts.
-        if autonomy == AutonomyLevel::Full {
-            return false;
-        }
-
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
+        // Checked before `always_ask` because a tool that never runs needs no
+        // approval: prompting there asks the operator to authorise something
+        // the policy is going to refuse anyway.
         if autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
 
-        // always_ask overrides everything.
+        // always_ask overrides everything below, `Full` included. The `Full`
+        // branch used to sit above this one and return early, so the list was
+        // never read under `Full`: an operator who wrote `always_ask = ["ssh"]`
+        // and set `Full` got no prompt, and nothing told them the rule had been
+        // dropped. Accepting a policy and discarding it silently is the
+        // "never silently broaden permissions" failure in CLAUDE.md §3.5, and
+        // the default list is not empty — it ships `["ssh", "pty"]`.
         if self.forces_prompt(tool_name) {
             return true;
+        }
+
+        // Full autonomy never prompts, except for the `always_ask` list above.
+        if autonomy == AutonomyLevel::Full {
+            return false;
         }
 
         // auto_approve skips the prompt.
@@ -675,10 +684,59 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_never_prompts() {
+    fn full_autonomy_does_not_prompt_for_tools_outside_always_ask() {
+        // Renamed from `full_autonomy_never_prompts`: "never" stopped being
+        // true once `always_ask` was honoured here. None of these three is on
+        // the default list, so the assertions themselves are unchanged.
         let mgr = ApprovalManager::from_config(&full_config());
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("file_write"));
+        assert!(!mgr.needs_approval("anything"));
+    }
+
+    /// The defect: `Full` returned early, so the list was never read. An
+    /// operator who writes "run by yourself, except for the dangerous things"
+    /// had the second half of that sentence silently discarded.
+    #[test]
+    fn full_autonomy_still_prompts_for_an_always_ask_tool() {
+        let config = AutonomyConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec!["shell".into()],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&config);
+        assert!(
+            mgr.needs_approval("shell"),
+            "a tool the operator put on always_ask must prompt even under Full"
+        );
+        assert!(
+            !mgr.needs_approval("file_write"),
+            "Full still runs everything the operator did not list"
+        );
+    }
+
+    /// The list ships non-empty (`default_always_ask` is `["ssh", "pty"]`), so
+    /// this is not a corner reachable only by hand-editing config: every
+    /// deployment that raises autonomy to `Full` without emptying the list gets
+    /// a prompt for the two remote-install tools, which is what the default was
+    /// written to guarantee.
+    #[test]
+    fn full_autonomy_prompts_for_the_default_always_ask_tools() {
+        let mgr = ApprovalManager::from_config(&full_config());
+        assert!(mgr.needs_approval("ssh"));
+        assert!(mgr.needs_approval("pty"));
+    }
+
+    #[test]
+    fn full_autonomy_with_an_empty_always_ask_prompts_for_nothing() {
+        let config = AutonomyConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec![],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&config);
+        assert!(!mgr.needs_approval("shell"));
+        assert!(!mgr.needs_approval("ssh"));
         assert!(!mgr.needs_approval("anything"));
     }
 
@@ -690,6 +748,22 @@ mod tests {
         };
         let mgr = ApprovalManager::from_config(&config);
         assert!(!mgr.needs_approval("shell"));
+    }
+
+    /// `always_ask` moved above `Full` but deliberately stayed below
+    /// `ReadOnly`. Under ReadOnly the tool does not run at all, so there is
+    /// nothing to approve, and a prompt would ask the operator to authorise
+    /// something the policy refuses either way.
+    #[test]
+    fn readonly_ignores_always_ask() {
+        let config = AutonomyConfig {
+            level: AutonomyLevel::ReadOnly,
+            always_ask: vec!["shell".into(), "ssh".into()],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&config);
+        assert!(!mgr.needs_approval("shell"));
+        assert!(!mgr.needs_approval("ssh"));
     }
 
     // ── session allowlist ────────────────────────────────────
