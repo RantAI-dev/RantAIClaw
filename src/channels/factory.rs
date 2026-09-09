@@ -120,18 +120,21 @@ pub(crate) fn build_configured_channels(
     }
 
     if let Some(ref sl) = config.channels_config.slack {
-        // The "`app_token` is set but ignored" note is an operator-facing,
+        // The "no `app_token`" note is an operator-facing,
         // one-time warning — emitted from `warn_unused_channel_config` on the
         // startup/doctor paths, NOT here, so the cron delivery path (which builds
         // channels on every scheduled run) does not re-log it as a recurring fault.
         channels.push((
             "slack",
             "Slack",
-            Arc::new(SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            )),
+            Arc::new(
+                SlackChannel::new(
+                    sl.bot_token.clone(),
+                    sl.channel_id.clone(),
+                    sl.allowed_users.clone(),
+                )
+                .with_app_token(sl.app_token.clone()),
+            ),
         ));
     }
 
@@ -363,11 +366,14 @@ pub(crate) fn build_one(config: &Config, key: &str) -> Option<Arc<dyn Channel>> 
             ) as Arc<dyn Channel>
         }),
         "slack" => config.channels_config.slack.as_ref().map(|sl| {
-            Arc::new(SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            )) as Arc<dyn Channel>
+            Arc::new(
+                SlackChannel::new(
+                    sl.bot_token.clone(),
+                    sl.channel_id.clone(),
+                    sl.allowed_users.clone(),
+                )
+                .with_app_token(sl.app_token.clone()),
+            ) as Arc<dyn Channel>
         }),
         "mattermost" => config.channels_config.mattermost.as_ref().map(|mm| {
             Arc::new(MattermostChannel::new(
@@ -388,14 +394,12 @@ pub(crate) fn build_one(config: &Config, key: &str) -> Option<Arc<dyn Channel>> 
 /// from cron delivery, which must not re-log on every scheduled run.
 pub(crate) fn warn_unused_channel_config(config: &Config) {
     if let Some(ref sl) = config.channels_config.slack {
-        if sl
-            .app_token
-            .as_deref()
-            .is_some_and(|t| !t.trim().is_empty())
-        {
+        if sl.app_token.as_deref().is_none_or(|t| t.trim().is_empty()) {
             tracing::warn!(
-                "Slack: `app_token` is set but ignored — this build polls conversations.history \
-                 and does not implement Socket Mode. Remove the key, or leave it for when it does."
+                "Slack: no `app_token`, so this channel polls one conversation. It will not see \
+                 direct messages, and it will not see replies inside a thread — including replies \
+                 to the approval prompt it posts there. Set [channels_config.slack].app_token \
+                 (an `xapp-` token with `connections:write`) for Socket Mode."
             );
         }
     }

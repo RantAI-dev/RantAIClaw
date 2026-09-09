@@ -2993,9 +2993,20 @@ pub struct DiscordConfig {
 pub struct SlackConfig {
     /// Slack bot OAuth token (xoxb-...).
     pub bot_token: String,
-    /// Slack app-level token for Socket Mode (xapp-...).
+    /// Slack app-level token for Socket Mode (`xapp-...`, scope
+    /// `connections:write`).
+    ///
+    /// With it the channel opens one WebSocket and receives events for every
+    /// conversation the bot is in — channels, threads and direct messages.
+    /// Without it the channel falls back to polling a single
+    /// `conversations.history` page, which sees neither DMs nor thread replies.
     pub app_token: Option<String>,
-    /// Optional channel ID to restrict the bot to a single channel.
+    /// Channel ID.
+    ///
+    /// Under Socket Mode this is an optional filter: leave it empty to accept
+    /// every conversation. Under the polling fallback it is **required** — that
+    /// transport has exactly one conversation to read, and `listen` fails
+    /// without it.
     pub channel_id: Option<String>,
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
