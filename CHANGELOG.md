@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The audit log wrote `approved: true` as a constant, so it could not prove that anyone had
+  approved anything.** Two sites in `agent/loop_.rs` filled the field with a literal, which meant
+  a `Full`-autonomy run that never raised a prompt and an owner tapping "approve" produced
+  byte-identical records. A log that always says `true` stores no information, and it is worse
+  than no log because it looks like evidence. The boolean is now a three-state
+  `ApprovalOutcome`: `granted` when a human answered a prompt, `not_required` when policy let the
+  call run unprompted, and `denied` when it was refused. Only the branch that actually consults a
+  human may name `granted`; every other record takes the outcome the caller tracked. **The audit
+  line format changes**: `action.approved` (boolean) is replaced by `action.approval` (one of
+  `"granted"`, `"not_required"`, `"denied"`), so anything parsing `audit.log` needs updating.
+  A source-reading test pins the class, refusing any second site that writes `granted` and any
+  refusal path that pushes a result without auditing it, so the third site cannot be added
+  tomorrow with the old constant.
 - **The runbook told the maintainer to find the previous release with `git describe
   --tags --abbrev=0`, and at `8dcefe0~1` that answers `v0.29.0-alpha`.** It walks ancestry, so
   it steps straight over `v0.30.0-alpha`, which the 2026-09-07 trailer-strip force-push

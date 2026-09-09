@@ -1230,6 +1230,11 @@ pub(crate) async fn execute_one_tool_structured(
     // because this is the one funnel both batch paths (parallel fast-path and
     // serial gated loop) go through.
     channel_name: &str,
+    // What let this call through: a human answering a prompt, or a policy that
+    // never asked. Only the caller knows, so only the caller may say. This
+    // funnel used to write the constant `true` for both, which is why the trail
+    // could not prove that anybody had approved anything.
+    approval_outcome: crate::security::ApprovalOutcome,
 ) -> Result<ToolExecutionResult> {
     let id = Uuid::new_v4().to_string();
 
@@ -1254,7 +1259,7 @@ pub(crate) async fn execute_one_tool_structured(
             channel: channel_name.to_string(),
             tool: call.name.clone(),
             risk_level: "unknown_tool".into(),
-            approved: true,
+            approval: approval_outcome,
             allowed: true,
             success: false,
             duration_ms: 0,
@@ -1335,9 +1340,9 @@ pub(crate) async fn execute_one_tool_structured(
         channel: channel_name.to_string(),
         tool: call.name.clone(),
         // The gate ran before this funnel: reaching it means the call was
-        // allowed, and either needed no approval or was granted one.
+        // allowed. Which of the two ways it got here is what the caller passes.
         risk_level: "executed".into(),
-        approved: true,
+        approval: approval_outcome,
         allowed: true,
         success,
         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1397,6 +1402,10 @@ pub(crate) async fn execute_tool_calls_collecting(
                 cancellation_token,
                 events,
                 channel_name,
+                // This path raises no prompt at all, so nobody approved
+                // anything here — whatever the policy allowed, it allowed
+                // silently.
+                crate::security::ApprovalOutcome::NotRequired,
             )
         });
         return futures_util::future::try_join_all(futures).await;
@@ -1404,6 +1413,11 @@ pub(crate) async fn execute_tool_calls_collecting(
 
     let mut results = Vec::with_capacity(calls.len());
     for call in calls {
+        // What the audit line will say about this call. It starts as "nobody
+        // was asked", and only the approval branch below — the one place a
+        // human is actually consulted — may raise it to `Granted`.
+        let mut approval_outcome = crate::security::ApprovalOutcome::NotRequired;
+
         // Role ceiling (guests): deny disallowed tools / out-of-allowlist shell
         // commands outright — a hard ceiling, never escalated to an owner.
         if let Some(gate) = guest_gate {
@@ -1429,7 +1443,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                     channel: channel_name.to_string(),
                     tool: call.name.clone(),
                     risk_level: "guest_ceiling".into(),
-                    approved: false,
+                    approval: crate::security::ApprovalOutcome::Denied,
                     allowed: false,
                     success: false,
                     duration_ms: 0,
@@ -1470,7 +1484,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                     channel: channel_name.to_string(),
                     tool: call.name.clone(),
                     risk_level: "foreign_cron_delivery".into(),
-                    approved: false,
+                    approval: crate::security::ApprovalOutcome::Denied,
                     allowed: false,
                     success: false,
                     duration_ms: 0,
@@ -1553,7 +1567,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                         channel: channel_name.to_string(),
                         tool: call.name.clone(),
                         risk_level: "requires_approval".into(),
-                        approved: false,
+                        approval: crate::security::ApprovalOutcome::Denied,
                         allowed: true,
                         success: false,
                         duration_ms: 0,
@@ -1566,6 +1580,8 @@ pub(crate) async fn execute_tool_calls_collecting(
                     });
                     continue;
                 }
+                // Past the denial branch: a human was asked and said yes.
+                approval_outcome = crate::security::ApprovalOutcome::Granted;
             }
         }
 
@@ -1581,6 +1597,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 cancellation_token,
                 events,
                 channel_name,
+                approval_outcome,
             )
             .await?,
         );
@@ -3972,7 +3989,7 @@ mod tests {
         // whole, and carry the right verdict.
         let denial = records
             .iter()
-            .find(|r| r["action"]["approved"] == false)
+            .find(|r| r["action"]["approval"] == "denied")
             .unwrap_or_else(|| panic!("no denial record: {text}"));
         assert_eq!(denial["actor"]["channel"], "telegram");
         assert_eq!(denial["action"]["command"], "do_thing");
@@ -3980,8 +3997,8 @@ mod tests {
 
         let run = records
             .iter()
-            .find(|r| r["action"]["approved"] == true)
-            .unwrap_or_else(|| panic!("no executed record: {text}"));
+            .find(|r| r["action"]["approval"] == "granted")
+            .unwrap_or_else(|| panic!("no granted record: {text}"));
         assert_eq!(run["action"]["command"], "do_thing");
         assert_eq!(run["result"]["success"], true);
 
@@ -3990,6 +4007,118 @@ mod tests {
         assert!(
             !text.contains("arguments"),
             "tool arguments must not be audited: {text}"
+        );
+    }
+
+    /// The third state, and the one a boolean could never hold: the tool ran,
+    /// nobody was asked, and the record must not read as an approval. Before
+    /// this, a `Full`-autonomy run and an owner tapping "approve" produced
+    /// byte-identical audit lines, so the trail could not prove that any human
+    /// had approved anything.
+    #[tokio::test]
+    async fn a_call_that_raised_no_prompt_is_audited_as_not_required() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+
+        // Full autonomy: `needs_approval` is false, so no backend is consulted
+        // and no human ever sees a prompt.
+        let mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        });
+        assert!(
+            !mgr.needs_approval("do_thing"),
+            "this test needs a manager that never prompts"
+        );
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("batch completes");
+        assert!(results[0].success, "the unprompted call must run");
+
+        let text = audit_log_after_writes(&log_path, 1).await;
+        let record: serde_json::Value = serde_json::from_str(text.trim())
+            .unwrap_or_else(|e| panic!("bad record ({e}): {text}"));
+        assert_eq!(
+            record["action"]["approval"], "not_required",
+            "nobody was asked, so the trail must not read as an approval: {text}"
+        );
+    }
+
+    /// Only the branch that actually asked a human may claim one answered.
+    ///
+    /// The defect was two `approved: true` literals in this file — one on the
+    /// unknown-tool path, one on the executed path — and fixing exactly those
+    /// two leaves the third site to be written tomorrow with the same constant.
+    /// So the class, not the sites: nothing outside the approval branch may
+    /// name `Granted` at all, because nothing else is in a position to know.
+    /// Sibling of `every_channel_listen_path_calls_its_allowlist_gate`, which
+    /// caught a real regression by binding a class this way.
+    #[test]
+    fn only_the_branch_that_asked_a_human_may_record_a_granted_approval() {
+        let src = include_str!("loop_.rs");
+        // Assembled at runtime so these assertions do not match themselves.
+        let granted = format!("ApprovalOutcome::{}", "Granted");
+        let stale = format!("{}: true", "approved");
+        let test_module = format!("\n#[cfg({})]\nmod tests {{", "test");
+        let runtime = src
+            .split_once(test_module.as_str())
+            .map_or(src, |(before, _)| before);
+        assert!(
+            runtime.len() < src.len(),
+            "the test module marker moved; update this guard"
+        );
+
+        assert!(
+            !runtime.contains(stale.as_str()),
+            "the audit path still writes the boolean that cannot tell a human's \
+             yes from a policy that never asked"
+        );
+
+        let sites: Vec<usize> = runtime
+            .match_indices(granted.as_str())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "exactly one place may record a human approval: the branch that \
+             asked for one. Found {} — every other site is guessing.",
+            sites.len()
+        );
+
+        let line = runtime[..sites[0]]
+            .rsplit_once('\n')
+            .map_or("", |(_, last)| last);
+        assert!(
+            line.trim_start().starts_with("approval_outcome ="),
+            "the one granted approval must be the caller's tracked outcome, not \
+             a value written straight into a record (found: {line:?}). If the \
+             variable was renamed, update this guard."
         );
     }
 
@@ -4022,6 +4151,13 @@ mod tests {
 
     #[tokio::test]
     async fn injected_backend_overrides_non_cli_auto_deny() {
+        // This test drives the executor, and the executor appends to the
+        // audit log under the ambient `HOME`. Without its own home it writes
+        // into whichever tempdir another test is holding, which is how a
+        // stray `guest_ceiling` record turned up in the audit test's log.
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
         // A non-CLI surface with an approval manager that gates `do_thing`.
         let mgr = supervised_manager();
         assert!(mgr.needs_approval("do_thing"));
@@ -4111,6 +4247,13 @@ mod tests {
 
     #[tokio::test]
     async fn approval_wait_aborts_on_cancellation() {
+        // This test drives the executor, and the executor appends to the
+        // audit log under the ambient `HOME`. Without its own home it writes
+        // into whichever tempdir another test is holding, which is how a
+        // stray `guest_ceiling` record turned up in the audit test's log.
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
         // A gated tool whose approval never resolves must abort promptly when the
         // turn's cancellation token fires — not hang until the backend deadline.
         let mgr = supervised_manager();
@@ -4160,6 +4303,13 @@ mod tests {
 
     #[tokio::test]
     async fn guest_gate_denies_disallowed_tool_in_executor() {
+        // This test drives the executor, and the executor appends to the
+        // audit log under the ambient `HOME`. Without its own home it writes
+        // into whichever tempdir another test is holding, which is how a
+        // stray `guest_ceiling` record turned up in the audit test's log.
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
         // A guest gate that does NOT permit `do_thing` → the executor denies it
         // (hard ceiling) and the tool never runs.
         let call = ParsedToolCall {
