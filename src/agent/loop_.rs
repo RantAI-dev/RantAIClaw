@@ -102,6 +102,33 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
+/// What the model is told when a tool call was refused for want of approval.
+///
+/// One sentence, outcome first. Extracted so a test can pin its shape: the
+/// regression it guards is not a crash but a model reading a long denial as
+/// success.
+fn denied_tool_message(tool_name: &str) -> String {
+    format!("The `{tool_name}` tool did NOT run and nothing was changed: the operator did not approve it.")
+}
+
+/// Tell the operator how to enable in-chat approval — once per process, on the
+/// log, never inside a tool result.
+///
+/// This advice used to ride along inside the denial the model reads. The model
+/// cannot edit `config.toml`, so it was never for the model; what it did do was
+/// bury the one fact that mattered, that the call had not run.
+fn hint_denied_tool_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            target: "approval",
+            "a tool call was denied because no approval reached it. Enable in-chat approval with \
+             [channels_config].approval_owners, set [channels_config].autonomous_tools = true, or \
+             raise autonomy with `rantaiclaw autonomy <preset>`"
+        );
+    });
+}
+
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
     tools_registry
         .iter()
@@ -1512,14 +1539,15 @@ pub(crate) async fn execute_tool_calls_collecting(
                     let msg = if channel_name == "cli" {
                         "Denied by user.".to_string()
                     } else {
-                        format!(
-                            "Tool '{}' denied: requires approval, but none was granted. \
-                             An operator can enable in-chat approval via \
-                             [channels_config].approval_owners (then reply `/approve`), \
-                             set [channels_config].autonomous_tools = true, or raise autonomy \
-                             with `rantaiclaw autonomy full` (trusted/sandboxed only).",
-                            call.name
-                        )
+                        // Read by the MODEL. It used to open with three
+                        // sentences of operator configuration advice behind a
+                        // single word, `denied`. A model summarised that as
+                        // success and told the owner a file had been deleted
+                        // that was still on disk. Say the outcome first, say it
+                        // flatly, and keep advice the model cannot act on out of
+                        // its context entirely.
+                        hint_denied_tool_once();
+                        denied_tool_message(&call.name)
                     };
                     crate::security::record_tool_call(crate::security::ToolCallRecord {
                         channel: channel_name.to_string(),
@@ -3080,6 +3108,32 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The denial the model reads must state the outcome, not bury it.
+    ///
+    /// Live evidence for why: two `rm` calls were denied (audit recorded
+    /// `approved=false, success=false`), the file survived, and the bot told the
+    /// owner "File uji.txt telah saya hapuskan menggunakan perintah rm". The old
+    /// string opened with `denied` and then spent three sentences explaining how
+    /// an operator could switch approval ON, which is advice the model cannot
+    /// act on and is not what it needed to hear.
+    #[test]
+    fn denial_states_the_outcome_and_carries_no_operator_config_advice() {
+        let msg = denied_tool_message("shell");
+        assert!(msg.contains("did NOT run"), "{msg}");
+        assert!(msg.contains("nothing was changed"), "{msg}");
+        for leak in [
+            "autonomous_tools",
+            "approval_owners",
+            "rantaiclaw autonomy",
+            "trusted/sandboxed",
+        ] {
+            assert!(
+                !msg.contains(leak),
+                "operator configuration advice must not reach the model: found {leak:?} in {msg}"
+            );
+        }
+    }
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::VecDeque;
@@ -4002,7 +4056,15 @@ mod tests {
             "auto-deny must not run the tool"
         );
         assert!(!results[0].success);
-        assert!(results[0].output.contains("denied") || results[0].output.contains("approval"));
+        // Tightened alongside the message change: the old check accepted any
+        // output mentioning "denied" or "approval", which the long advice-first
+        // string satisfied while a model still read it as success. What the
+        // caller must actually be told is that the call did not happen.
+        assert!(
+            results[0].output.contains("did NOT run"),
+            "the caller must be told the tool did not run: {}",
+            results[0].output
+        );
 
         // Injected always-yes backend ⇒ the same gated call runs.
         let ran2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
