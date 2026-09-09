@@ -6,6 +6,10 @@ use std::sync::{Arc, RwLock};
 pub struct SlackChannel {
     bot_token: String,
     channel_id: Option<String>,
+    /// App-level token (`xapp-`). Present means Socket Mode; absent means the
+    /// polling transport. The schema has documented this key as Socket Mode
+    /// since before anything read it.
+    app_token: Option<String>,
     /// `Arc<RwLock<..>>` so a successful `/bind`/`/claim` can append the sender
     /// at runtime (immediate access without a channel restart).
     allowed_users: Arc<RwLock<Vec<String>>>,
@@ -36,6 +40,14 @@ pub(crate) enum SlackInbound {
     /// Empty text, or older than the cursor.
     EmptyOrSeen,
     Deliver(ChannelMessage),
+}
+
+/// What the listener should do after one inbound message.
+enum InboundOutcome {
+    /// Keep listening.
+    Continue,
+    /// The agent-side receiver is gone; stop cleanly.
+    ReceiverGone,
 }
 
 impl SlackChannel {
@@ -83,6 +95,73 @@ impl SlackChannel {
                 .as_secs(),
             thread_ts: Self::inbound_thread_ts(msg, ts),
         })
+    }
+
+    /// Handle one inbound message: classify it, deliver it, or let an
+    /// unauthorized sender self-onboard with a pairing code.
+    ///
+    /// Extracted from the polling loop so a second transport can reuse it
+    /// verbatim rather than growing a second copy of the allowlist and pairing
+    /// rules — `factory.rs` already records what happens when two paths for one
+    /// channel drift.
+    async fn handle_inbound(
+        &self,
+        msg: &serde_json::Value,
+        bot_user_id: &str,
+        last_ts: &mut String,
+        channel_id: &str,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> InboundOutcome {
+        // The decision — including the allowlist gate — lives in
+        // `classify_inbound` so a test can reach it. Everything below needs the
+        // network, which is why it stays here.
+        let (user, text, ts) = match self.classify_inbound(msg, bot_user_id, last_ts, channel_id) {
+            SlackInbound::Own | SlackInbound::EmptyOrSeen => return InboundOutcome::Continue,
+            SlackInbound::Deliver(channel_msg) => {
+                *last_ts = channel_msg
+                    .id
+                    .rsplit('_')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if tx.send(channel_msg).await.is_err() {
+                    return InboundOutcome::ReceiverGone;
+                }
+                return InboundOutcome::Continue;
+            }
+            SlackInbound::Unauthorized { user, text, ts } => (user, text, ts),
+        };
+        let (user, text, ts) = (user.as_str(), text.as_str(), ts.as_str());
+
+        // Before rejecting, let a not-yet-allowed user self-onboard with a
+        // `/bind`/`/claim <code>` minted via `rantaiclaw channels pair`. On
+        // success the sender lands in `allowed_users` (and, for an owner
+        // `/claim`, `approval_owners`).
+        if !text.is_empty() && ts > last_ts.as_str() {
+            if let Some(root) = crate::channels::pairing::profile_root("slack") {
+                let identities = vec![user.to_string()];
+                if let Some(reply) = crate::channels::pairing::try_handle_pairing(
+                    text,
+                    "slack",
+                    crate::channels::pairing::AllowlistField::AllowedUsers,
+                    &identities,
+                    &root,
+                )
+                .await
+                {
+                    // Advance the cursor so this command isn't re-processed,
+                    // mirror into the runtime allowlist, and reply in-channel.
+                    *last_ts = ts.to_string();
+                    self.add_allowed_identity_runtime(user);
+                    let reply_msg = SendMessage::new(reply, channel_id.to_string())
+                        .in_thread(Self::inbound_thread_ts(msg, ts));
+                    let _ = self.send(&reply_msg).await;
+                    return InboundOutcome::Continue;
+                }
+            }
+        }
+        tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+        InboundOutcome::Continue
     }
 
     /// POST one already-split chunk.
@@ -139,8 +218,19 @@ impl SlackChannel {
         Self {
             bot_token,
             channel_id,
+            app_token: None,
             allowed_users: Arc::new(RwLock::new(allowed_users)),
         }
+    }
+
+    /// Supply the app-level token, which selects Socket Mode.
+    ///
+    /// A separate builder rather than a fourth constructor argument: every
+    /// existing caller keeps compiling, and the factory opts in explicitly.
+    #[must_use]
+    pub fn with_app_token(mut self, app_token: Option<String>) -> Self {
+        self.app_token = app_token.filter(|t| !t.trim().is_empty());
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -238,6 +328,167 @@ impl Channel for SlackChannel {
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
+        // Socket Mode when the operator supplied an app token, polling
+        // otherwise. Not a silent fallback: the two differ in what they can
+        // see, and `channels.md` says which is which. Polling reads one
+        // `conversations.history` page, so it cannot see DMs and cannot see
+        // replies inside a thread — including replies to the approval prompt
+        // this channel posts into a thread.
+        if self
+            .app_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+        {
+            return self.listen_socket_mode(tx, cancel).await;
+        }
+        self.listen_polling(tx, cancel).await
+    }
+}
+
+impl SlackChannel {
+    /// Socket Mode: one outbound WebSocket carrying events for every
+    /// conversation the bot is in — channels, threads and DMs alike.
+    ///
+    /// `channel_id` stops being a requirement here and becomes what the schema
+    /// always called it: an optional filter.
+    async fn listen_socket_mode(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let app_token = self
+            .app_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Slack app_token required for Socket Mode"))?;
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/apps.connections.open")
+            .bearer_auth(&app_token)
+            .send()
+            .await?;
+        // A dead app token must reach the supervisor as `Err` so its backoff
+        // rises, not be retried at the connect rate forever.
+        if crate::channels::fault::is_fatal_auth_status(resp.status()) {
+            anyhow::bail!(
+                "Slack Socket Mode authentication failed ({}); check the app_token",
+                resp.status()
+            );
+        }
+        let body: serde_json::Value = resp.json().await?;
+        if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            let err = body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if crate::channels::fault::slack_error_is_fatal(err) {
+                anyhow::bail!("Slack apps.connections.open failed ({err}); check the app_token");
+            }
+            anyhow::bail!("Slack apps.connections.open returned ok=false ({err})");
+        }
+        let url = body
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open returned no url"))?;
+
+        let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+        let (mut write, mut read) = ws.split();
+        let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
+        tracing::info!("Slack channel listening over Socket Mode...");
+
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::info!("Slack channel shutting down");
+                    let _ = write.send(Message::Close(None)).await;
+                    return Ok(());
+                }
+                frame = read.next() => {
+                    let text = match frame {
+                        Some(Ok(Message::Text(t))) => t.to_string(),
+                        Some(Ok(Message::Close(_))) | None => return Ok(()),
+                        Some(Ok(_)) => continue,
+                        Some(Err(e)) => return Err(e.into()),
+                    };
+                    let env: serde_json::Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("Slack Socket Mode: unparseable frame: {e}");
+                            continue;
+                        }
+                    };
+                    // Acknowledge first. Slack redelivers anything unacked
+                    // within three seconds, and handling can outlast that.
+                    if let Some(id) = env.get("envelope_id").and_then(serde_json::Value::as_str) {
+                        let ack = serde_json::json!({ "envelope_id": id });
+                        if write.send(Message::Text(ack.to_string().into())).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    if let Some(msg) = Self::socket_event_message(&env, self.channel_id.as_deref()) {
+                        let channel_id = msg
+                            .get("channel")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        // Socket Mode delivers each event once and the ack above
+                        // is the dedup, so the polling cursor has no job here —
+                        // and a shared cursor would drop events from a second
+                        // conversation whose timestamps run behind the first.
+                        let mut cursor = String::new();
+                        if matches!(
+                            self.handle_inbound(&msg, &bot_user_id, &mut cursor, &channel_id, &tx)
+                                .await,
+                            InboundOutcome::ReceiverGone
+                        ) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The inner `event` of a Socket Mode envelope, when it is a user message
+    /// this channel should consider.
+    ///
+    /// Returns the event with `channel` intact so the caller can route the
+    /// reply; `classify_inbound` reads `user`, `text`, `ts` and `thread_ts` from
+    /// the same object, which is why the shape is passed through rather than
+    /// rebuilt.
+    pub(crate) fn socket_event_message(
+        envelope: &serde_json::Value,
+        only_channel: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        if envelope.get("type").and_then(serde_json::Value::as_str) != Some("events_api") {
+            return None;
+        }
+        let event = envelope.get("payload")?.get("event")?;
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            return None;
+        }
+        // Edits, deletions and joins arrive as `message` with a subtype. None of
+        // them is someone talking to the bot.
+        if event.get("subtype").is_some() {
+            return None;
+        }
+        if let Some(want) = only_channel.filter(|c| !c.trim().is_empty()) {
+            if event.get("channel").and_then(serde_json::Value::as_str) != Some(want) {
+                return None;
+            }
+        }
+        Some(event.clone())
+    }
+
+    /// The original transport: one `conversations.history` page per tick.
+    async fn listen_polling(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
         let channel_id = self
             .channel_id
             .clone()
@@ -311,63 +562,12 @@ impl Channel for SlackChannel {
             if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                 // Messages come newest-first, reverse to process oldest first
                 for msg in messages.iter().rev() {
-                    // The decision — including the allowlist gate — lives in
-                    // `classify_inbound` so a test can reach it. Everything the
-                    // arms below do needs the network, which is why it stays
-                    // here.
-                    let (user, text, ts) = match self.classify_inbound(
-                        msg,
-                        &bot_user_id,
-                        last_ts.as_str(),
-                        &channel_id,
-                    ) {
-                        SlackInbound::Own | SlackInbound::EmptyOrSeen => continue,
-                        SlackInbound::Deliver(channel_msg) => {
-                            last_ts = channel_msg
-                                .id
-                                .rsplit('_')
-                                .next()
-                                .unwrap_or_default()
-                                .to_string();
-                            if tx.send(channel_msg).await.is_err() {
-                                return Ok(());
-                            }
-                            continue;
-                        }
-                        SlackInbound::Unauthorized { user, text, ts } => (user, text, ts),
-                    };
-                    let (user, text, ts) = (user.as_str(), text.as_str(), ts.as_str());
-
+                    match self
+                        .handle_inbound(msg, &bot_user_id, &mut last_ts, &channel_id, &tx)
+                        .await
                     {
-                        // Before rejecting, let a not-yet-allowed user self-onboard
-                        // with a `/bind`/`/claim <code>` minted via
-                        // `rantaiclaw channels pair`. On success the sender lands in
-                        // `allowed_users` (and, for an owner `/claim`, `approval_owners`).
-                        if !text.is_empty() && ts > last_ts.as_str() {
-                            if let Some(root) = crate::channels::pairing::profile_root("slack") {
-                                let identities = vec![user.to_string()];
-                                if let Some(reply) = crate::channels::pairing::try_handle_pairing(
-                                    text,
-                                    "slack",
-                                    crate::channels::pairing::AllowlistField::AllowedUsers,
-                                    &identities,
-                                    &root,
-                                )
-                                .await
-                                {
-                                    // Advance the cursor so this command isn't
-                                    // re-processed on the next poll, mirror into the
-                                    // runtime allowlist, and reply in-channel.
-                                    last_ts = ts.to_string();
-                                    self.add_allowed_identity_runtime(user);
-                                    let reply_msg = SendMessage::new(reply, channel_id.clone())
-                                        .in_thread(Self::inbound_thread_ts(msg, ts));
-                                    let _ = self.send(&reply_msg).await;
-                                    continue;
-                                }
-                            }
-                        }
-                        tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                        InboundOutcome::Continue => {}
+                        InboundOutcome::ReceiverGone => return Ok(()),
                     }
                 }
             }
@@ -527,6 +727,87 @@ mod tests {
     }
 
     use super::*;
+
+    fn envelope(event: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": { "event": event }
+        })
+    }
+
+    /// The gap Socket Mode exists to close. Polling reads one
+    /// `conversations.history` page, so a DM never arrived at all — the owner
+    /// sent one and the bot stayed silent.
+    #[test]
+    fn socket_mode_accepts_a_direct_message() {
+        let env = envelope(serde_json::json!({
+            "type": "message", "user": "U1", "text": "hai",
+            "ts": "1.1", "channel": "D0PRIVATE"
+        }));
+        let got = SlackChannel::socket_event_message(&env, None).expect("a DM is a message");
+        assert_eq!(got.get("channel").unwrap(), "D0PRIVATE");
+        assert_eq!(got.get("text").unwrap(), "hai");
+    }
+
+    /// The other half: the approval prompt is posted into a thread, and a reply
+    /// typed there was invisible to the polling transport, so every gated tool
+    /// call auto-denied.
+    #[test]
+    fn socket_mode_accepts_a_reply_inside_a_thread() {
+        let env = envelope(serde_json::json!({
+            "type": "message", "user": "U1", "text": "approve shell",
+            "ts": "2.2", "thread_ts": "1.1", "channel": "C0CHAN"
+        }));
+        let got = SlackChannel::socket_event_message(&env, None).expect("a thread reply arrives");
+        assert_eq!(got.get("thread_ts").unwrap(), "1.1");
+    }
+
+    #[test]
+    fn socket_mode_filters_by_channel_id_when_one_is_configured() {
+        let env = envelope(serde_json::json!({
+            "type": "message", "user": "U1", "text": "hai",
+            "ts": "1.1", "channel": "C0OTHER"
+        }));
+        assert!(SlackChannel::socket_event_message(&env, Some("C0WANTED")).is_none());
+        assert!(SlackChannel::socket_event_message(&env, Some("C0OTHER")).is_some());
+        // Blank is not a filter: under Socket Mode the key is optional.
+        assert!(SlackChannel::socket_event_message(&env, Some("   ")).is_some());
+    }
+
+    #[test]
+    fn socket_mode_ignores_what_is_not_someone_talking() {
+        // Edits, deletions and joins all arrive as `message` with a subtype.
+        let edited = envelope(serde_json::json!({
+            "type": "message", "subtype": "message_changed",
+            "user": "U1", "text": "hai", "ts": "1.1", "channel": "C0"
+        }));
+        assert!(SlackChannel::socket_event_message(&edited, None).is_none());
+
+        let reaction = envelope(serde_json::json!({
+            "type": "reaction_added", "user": "U1", "ts": "1.1", "channel": "C0"
+        }));
+        assert!(SlackChannel::socket_event_message(&reaction, None).is_none());
+
+        let hello = serde_json::json!({ "type": "hello" });
+        assert!(SlackChannel::socket_event_message(&hello, None).is_none());
+    }
+
+    /// An event still classifies through the same allowlist the polling
+    /// transport used — one gate, not two.
+    #[test]
+    fn socket_mode_events_go_through_the_same_allowlist() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U_ALLOWED".into()]);
+        let env = envelope(serde_json::json!({
+            "type": "message", "user": "U_DENIED", "text": "hai",
+            "ts": "1.1", "channel": "C0"
+        }));
+        let event = SlackChannel::socket_event_message(&env, None).unwrap();
+        assert!(matches!(
+            ch.classify_inbound(&event, "UBOT", "", "C0"),
+            SlackInbound::Unauthorized { .. }
+        ));
+    }
 
     #[test]
     fn slack_render_target_is_lightmarkup_slack() {

@@ -110,6 +110,37 @@ fn summarize(name: &'static str, category: &'static str, summary: &ChannelSummar
     }
 }
 
+/// Why a configured Slack channel still cannot receive anything.
+///
+/// A valid `bot_token` was the only thing checked here, and `auth.test` answers
+/// for it happily — so doctor reported Slack healthy while `listen` failed on
+/// the first tick. Listening needs one of two keys, and which one depends on the
+/// transport:
+///
+/// * `app_token` selects Socket Mode, which sees every conversation.
+/// * `channel_id` is **required** by the polling fallback, which reads exactly
+///   one `conversations.history` page.
+///
+/// With neither, `SlackChannel::listen` returns `Err` immediately.
+pub(crate) fn slack_listen_gap(c: &crate::config::SlackConfig) -> Option<&'static str> {
+    let has_app = c.app_token.as_deref().is_some_and(|t| !t.trim().is_empty());
+    let has_channel = c
+        .channel_id
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    match (has_app, has_channel) {
+        (true, _) => None,
+        (false, true) => Some(
+            "slack: polling transport (no app_token) — it will not see direct messages or replies \
+             inside a thread, including replies to its own approval prompt",
+        ),
+        (false, false) => Some(
+            "slack: cannot listen — set app_token for Socket Mode, or channel_id for the polling \
+             fallback. Without one of them `listen` fails immediately",
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelSummary {
     pub severity: Severity,
@@ -171,6 +202,14 @@ pub fn inspect_channels(config: &crate::config::Config) -> ChannelSummary {
             message: format!("channels with missing credentials: {}", missing.join(", ")),
         };
     }
+    // A credential that authenticates is not the same as a channel that can
+    // receive. Slack has a second requirement and doctor used to be blind to it.
+    if let Some(gap) = cc.slack.as_ref().and_then(slack_listen_gap) {
+        return ChannelSummary {
+            severity: Severity::Warn,
+            message: gap.to_string(),
+        };
+    }
     ChannelSummary {
         severity: Severity::Ok,
         message: format!(
@@ -214,6 +253,12 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
         match probe_slack(&client, &c.bot_token).await {
             Ok(team) => ok.push(format!("slack ({team})")),
             Err(e) => bad.push(format!("slack: {e}")),
+        }
+        // `auth.test` answers for the token, not for the ability to receive.
+        // Reporting healthy on a channel whose `listen` fails on the first tick
+        // is the failure this line exists to stop.
+        if let Some(gap) = slack_listen_gap(c) {
+            warn.push(gap.to_string());
         }
     }
     if let Some(c) = cc.whatsapp.as_ref() {
@@ -407,6 +452,39 @@ fn probe_whatsapp_web(path: &str) -> ProbeWebResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slack_cfg(app: Option<&str>, chan: Option<&str>) -> crate::config::SlackConfig {
+        crate::config::SlackConfig {
+            bot_token: "xoxb-valid".into(),
+            app_token: app.map(str::to_string),
+            channel_id: chan.map(str::to_string),
+            allowed_users: vec!["U1".into()],
+        }
+    }
+
+    /// Doctor reported Slack healthy on a config whose `listen` fails on the
+    /// first tick, because `auth.test` answers for the token and nothing asked
+    /// whether the channel could receive.
+    #[test]
+    fn slack_with_a_valid_token_but_no_way_to_listen_is_not_healthy() {
+        let gap = slack_listen_gap(&slack_cfg(None, None)).expect("neither key is a real gap");
+        assert!(gap.contains("cannot listen"), "{gap}");
+    }
+
+    #[test]
+    fn slack_polling_is_reported_as_the_narrower_transport() {
+        let gap = slack_listen_gap(&slack_cfg(None, Some("C0"))).expect("polling has limits");
+        assert!(gap.contains("direct messages"), "{gap}");
+        assert!(gap.contains("thread"), "{gap}");
+    }
+
+    #[test]
+    fn slack_with_socket_mode_has_no_gap() {
+        assert!(slack_listen_gap(&slack_cfg(Some("xapp-1"), None)).is_none());
+        assert!(slack_listen_gap(&slack_cfg(Some("xapp-1"), Some("C0"))).is_none());
+        // Whitespace is not a token.
+        assert!(slack_listen_gap(&slack_cfg(Some("   "), None)).is_some());
+    }
     use crate::config::Config;
 
     fn telegram_with_token(token: &str) -> crate::config::TelegramConfig {

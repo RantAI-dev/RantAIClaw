@@ -3025,7 +3025,7 @@ expression: pretty
           }
         },
         "app_token": {
-          "description": "Slack app-level token for Socket Mode (xapp-...).",
+          "description": "Slack app-level token for Socket Mode (`xapp-...`, scope\n`connections:write`).\n\nWith it the channel opens one WebSocket and receives events for every\nconversation the bot is in — channels, threads and direct messages.\nWithout it the channel falls back to polling a single\n`conversations.history` page, which sees neither DMs nor thread replies.",
           "type": [
             "string",
             "null"
@@ -3036,7 +3036,7 @@ expression: pretty
           "type": "string"
         },
         "channel_id": {
-          "description": "Optional channel ID to restrict the bot to a single channel.",
+          "description": "Channel ID.\n\nUnder Socket Mode this is an optional filter: leave it empty to accept\nevery conversation. Under the polling fallback it is **required** — that\ntransport has exactly one conversation to read, and `listen` fails\nwithout it.",
           "type": [
             "string",
             "null"
