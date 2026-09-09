@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`always_ask` was silently discarded under `Full` autonomy.** `needs_approval` returned early on
+  `Full`, nine lines above the check it was supposed to reach, so the list was never read: an
+  operator who wrote "run by yourself, except for the dangerous things" had the second half of
+  that sentence dropped without a word. The default list is not empty either. It ships
+  `["ssh", "pty"]`, the two remote-install tools whose whole point is to prompt even after a
+  session "Always", so any deployment that raised autonomy to `Full` lost that guarantee. The
+  `always_ask` check now sits above the `Full` branch. It stays *below* the `ReadOnly` branch,
+  because under ReadOnly the tool does not run at all and a prompt would ask the operator to
+  authorise something the policy refuses anyway. The change can only add prompts, never remove
+  them: the sole altered outcome is `Full` plus a listed tool, which went from "runs silently" to
+  "asks". **Operators running unattended `ssh` or `pty` under `Full` must now empty `always_ask`**,
+  because a non-interactive surface answers its own prompt with a denial.
 - **The audit log wrote `approved: true` as a constant, so it could not prove that anyone had
   approved anything.** Two sites in `agent/loop_.rs` filled the field with a literal, which meant
   a `Full`-autonomy run that never raised a prompt and an owner tapping "approve" produced
