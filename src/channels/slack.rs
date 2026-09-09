@@ -243,6 +243,16 @@ impl SlackChannel {
     /// A separate builder rather than a fourth constructor argument: every
     /// existing caller keeps compiling, and the factory opts in explicitly.
     #[must_use]
+    /// The app-level token this channel was built with, if any.
+    ///
+    /// Read-only, and it exists so a test can prove the token survived
+    /// construction. Presence here is what decides Socket Mode over polling in
+    /// [`Self::listen`], and #778 had to wire it through two separate
+    /// constructors by hand.
+    pub(crate) fn app_token(&self) -> Option<&str> {
+        self.app_token.as_deref()
+    }
+
     pub fn with_app_token(mut self, app_token: Option<String>) -> Self {
         self.app_token = app_token.filter(|t| !t.trim().is_empty());
         self

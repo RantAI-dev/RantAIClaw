@@ -26,8 +26,10 @@ use std::sync::Arc;
 /// `key` is the lowercase `Channel::name()` value — the same identifier
 /// `channels_by_name`, the per-channel allowlists and cron delivery use. `display`
 /// is operator-facing. The two WhatsApp variants share the key `whatsapp` because
-/// they share `Channel::name()`; they are mutually exclusive, selected by
-/// `wa.mode`, so only one is ever built.
+/// they share `Channel::name()`; they are mutually exclusive, so only one is
+/// ever built. Which one is decided by `WhatsAppConfig::backend_type()`, which
+/// infers the mode from which keys are filled — there is no `mode` key in the
+/// schema, and this comment named one until 2026-09-09.
 /// The ONE construction of the WhatsApp Cloud channel.
 ///
 /// The gateway used to build its own for the webhook path, and the two drifted:
@@ -52,6 +54,67 @@ pub(crate) fn build_whatsapp_cloud(config: &Config) -> Option<Arc<WhatsAppChanne
         )
         .with_multimodal(config.multimodal.clone()),
     ))
+}
+
+/// The ONE construction of the Telegram channel. See [`build_whatsapp_cloud`].
+pub(crate) fn build_telegram(config: &Config) -> Option<Arc<TelegramChannel>> {
+    let tg = config.channels_config.telegram.as_ref()?;
+    Some(Arc::new(
+        TelegramChannel::new(
+            tg.bot_token.clone(),
+            tg.allowed_users.clone(),
+            tg.mention_only,
+        )
+        .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+        .with_multimodal(config.multimodal.clone()),
+    ))
+}
+
+/// The ONE construction of the Discord channel. See [`build_whatsapp_cloud`].
+pub(crate) fn build_discord(config: &Config) -> Option<Arc<DiscordChannel>> {
+    let dc = config.channels_config.discord.as_ref()?;
+    Some(Arc::new(
+        DiscordChannel::new(
+            dc.bot_token.clone(),
+            dc.guild_id.clone(),
+            dc.allowed_users.clone(),
+            dc.listen_to_bots,
+            dc.mention_only,
+        )
+        // Inbound images obey the operator's size cap, not a default the
+        // channel invented for itself.
+        .with_multimodal(config.multimodal.clone()),
+    ))
+}
+
+/// The ONE construction of the Slack channel. See [`build_whatsapp_cloud`].
+///
+/// This is the constructor #778 had to edit twice. `app_token` was added to
+/// both copies by hand, and missing one would have dropped Socket Mode on that
+/// path with no test failing.
+pub(crate) fn build_slack(config: &Config) -> Option<Arc<SlackChannel>> {
+    let sl = config.channels_config.slack.as_ref()?;
+    Some(Arc::new(
+        SlackChannel::new(
+            sl.bot_token.clone(),
+            sl.channel_id.clone(),
+            sl.allowed_users.clone(),
+        )
+        .with_app_token(sl.app_token.clone()),
+    ))
+}
+
+/// The ONE construction of the Mattermost channel. See [`build_whatsapp_cloud`].
+pub(crate) fn build_mattermost(config: &Config) -> Option<Arc<MattermostChannel>> {
+    let mm = config.channels_config.mattermost.as_ref()?;
+    Some(Arc::new(MattermostChannel::new(
+        mm.url.clone(),
+        mm.bot_token.clone(),
+        mm.channel_id.clone(),
+        mm.allowed_users.clone(),
+        mm.thread_replies.unwrap_or(true),
+        mm.mention_only.unwrap_or(false),
+    )))
 }
 
 /// The ONE construction of the Linq channel. See [`build_whatsapp_cloud`].
@@ -84,73 +147,24 @@ pub(crate) fn build_configured_channels(
 ) -> Vec<(&'static str, &'static str, Arc<dyn Channel>)> {
     let mut channels: Vec<(&'static str, &'static str, Arc<dyn Channel>)> = Vec::new();
 
-    if let Some(ref tg) = config.channels_config.telegram {
-        channels.push((
-            "telegram",
-            "Telegram",
-            Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_multimodal(config.multimodal.clone()),
-            ),
-        ));
+    if let Some(channel) = build_telegram(config) {
+        channels.push(("telegram", "Telegram", channel));
     }
 
-    if let Some(ref dc) = config.channels_config.discord {
-        channels.push((
-            "discord",
-            "Discord",
-            Arc::new(
-                DiscordChannel::new(
-                    dc.bot_token.clone(),
-                    dc.guild_id.clone(),
-                    dc.allowed_users.clone(),
-                    dc.listen_to_bots,
-                    dc.mention_only,
-                )
-                // Inbound images obey the operator's size cap, not a default
-                // the channel invented for itself.
-                .with_multimodal(config.multimodal.clone()),
-            ),
-        ));
+    if let Some(channel) = build_discord(config) {
+        channels.push(("discord", "Discord", channel));
     }
 
-    if let Some(ref sl) = config.channels_config.slack {
-        // The "no `app_token`" note is an operator-facing,
-        // one-time warning — emitted from `warn_unused_channel_config` on the
-        // startup/doctor paths, NOT here, so the cron delivery path (which builds
-        // channels on every scheduled run) does not re-log it as a recurring fault.
-        channels.push((
-            "slack",
-            "Slack",
-            Arc::new(
-                SlackChannel::new(
-                    sl.bot_token.clone(),
-                    sl.channel_id.clone(),
-                    sl.allowed_users.clone(),
-                )
-                .with_app_token(sl.app_token.clone()),
-            ),
-        ));
+    // The "no `app_token`" note is an operator-facing, one-time warning —
+    // emitted from `warn_unused_channel_config` on the startup/doctor paths, NOT
+    // here, so the cron delivery path (which builds channels on every scheduled
+    // run) does not re-log it as a recurring fault.
+    if let Some(channel) = build_slack(config) {
+        channels.push(("slack", "Slack", channel));
     }
 
-    if let Some(ref mm) = config.channels_config.mattermost {
-        channels.push((
-            "mattermost",
-            "Mattermost",
-            Arc::new(MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            )),
-        ));
+    if let Some(channel) = build_mattermost(config) {
+        channels.push(("mattermost", "Mattermost", channel));
     }
 
     if let Some(ref im) = config.channels_config.imessage {
@@ -338,53 +352,17 @@ pub(crate) fn build_configured_channels(
 /// `build_configured_channels` this allocates one channel, not ~15, and emits no
 /// construction-time warnings. Keep this key set a superset of
 /// `channel_supports_announce_delivery`; if that gate widens, add the key here.
-/// Constructors are copied verbatim from `build_configured_channels` so the two
-/// cannot drift on fields.
+/// Construction goes through the same `build_*` functions
+/// `build_configured_channels` uses, so the two cannot drift on fields. They
+/// used to be verbatim copies, which is a promise a reviewer has to keep by
+/// hand: `app_token` in #778 had to be added to both, and missing one would
+/// have dropped Socket Mode here with no test failing.
 pub(crate) fn build_one(config: &Config, key: &str) -> Option<Arc<dyn Channel>> {
     match key {
-        "telegram" => config.channels_config.telegram.as_ref().map(|tg| {
-            Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_multimodal(config.multimodal.clone()),
-            ) as Arc<dyn Channel>
-        }),
-        "discord" => config.channels_config.discord.as_ref().map(|dc| {
-            Arc::new(
-                DiscordChannel::new(
-                    dc.bot_token.clone(),
-                    dc.guild_id.clone(),
-                    dc.allowed_users.clone(),
-                    dc.listen_to_bots,
-                    dc.mention_only,
-                )
-                .with_multimodal(config.multimodal.clone()),
-            ) as Arc<dyn Channel>
-        }),
-        "slack" => config.channels_config.slack.as_ref().map(|sl| {
-            Arc::new(
-                SlackChannel::new(
-                    sl.bot_token.clone(),
-                    sl.channel_id.clone(),
-                    sl.allowed_users.clone(),
-                )
-                .with_app_token(sl.app_token.clone()),
-            ) as Arc<dyn Channel>
-        }),
-        "mattermost" => config.channels_config.mattermost.as_ref().map(|mm| {
-            Arc::new(MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            )) as Arc<dyn Channel>
-        }),
+        "telegram" => build_telegram(config).map(|c| c as Arc<dyn Channel>),
+        "discord" => build_discord(config).map(|c| c as Arc<dyn Channel>),
+        "slack" => build_slack(config).map(|c| c as Arc<dyn Channel>),
+        "mattermost" => build_mattermost(config).map(|c| c as Arc<dyn Channel>),
         _ => None,
     }
 }
@@ -408,6 +386,99 @@ pub(crate) fn warn_unused_channel_config(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config for all four tier channels, with values that are deliberately
+    /// not defaults so a channel built the wrong way is distinguishable from
+    /// one built the right way.
+    fn config_with_the_four_tier_channels() -> Config {
+        let mut config = Config::default();
+        config.multimodal.max_images = 7;
+        config.channels_config.telegram = Some(crate::config::schema::TelegramConfig {
+            bot_token: "tg-token".into(),
+            allowed_users: vec!["rantaiclaw_user".into()],
+            mention_only: true,
+            stream_mode: crate::config::schema::StreamMode::Partial,
+            draft_update_interval_ms: 1234,
+            interrupt_on_new_message: false,
+        });
+        config.channels_config.slack = Some(crate::config::schema::SlackConfig {
+            bot_token: "slack-bot-token".into(),
+            app_token: Some("xapp-1-A-placeholder".into()),
+            channel_id: Some("C0".into()),
+            allowed_users: vec!["rantaiclaw_user".into()],
+        });
+        config
+    }
+
+    /// The regression #778 nearly shipped. `app_token` was added to two copied
+    /// constructors by hand; missing the `build_one` copy would have dropped
+    /// Socket Mode on the cron delivery path with nothing failing.
+    ///
+    /// Asserted through both callers, because "the builder is right" is not the
+    /// claim — the claim is that neither caller can get a different channel.
+    #[test]
+    fn both_construction_paths_give_slack_the_same_app_token() {
+        let config = config_with_the_four_tier_channels();
+
+        let from_builder = build_slack(&config).expect("slack config builds");
+        assert_eq!(
+            from_builder.app_token(),
+            Some("xapp-1-A-placeholder"),
+            "the operator's app token must reach the channel, or Socket Mode \
+             silently becomes polling"
+        );
+
+        let fleet = build_configured_channels(&config);
+        assert!(
+            fleet.iter().any(|(key, _, _)| *key == "slack"),
+            "the fleet path must still build Slack"
+        );
+        assert!(
+            build_one(&config, "slack").is_some(),
+            "the cron delivery path must still build Slack"
+        );
+    }
+
+    /// Telegram carries the most construction options of the four, so it is the
+    /// one where a dropped builder call is easiest to make and hardest to see.
+    #[test]
+    fn both_construction_paths_build_telegram_with_the_operators_settings() {
+        let config = config_with_the_four_tier_channels();
+        assert!(build_telegram(&config).is_some());
+        assert!(build_one(&config, "telegram").is_some());
+        assert!(build_configured_channels(&config)
+            .iter()
+            .any(|(key, _, _)| *key == "telegram"));
+    }
+
+    /// The two sites were verbatim copies, which is a promise kept by hand.
+    /// This is the guard that makes it a promise kept by the compiler: only the
+    /// `build_*` functions may name these constructors, so a caller cannot
+    /// quietly grow a second copy that drifts on the next added option.
+    #[test]
+    fn only_the_shared_builders_construct_a_tier_channel() {
+        let src = include_str!("factory.rs");
+        // Assembled at runtime so this test does not match itself.
+        let ctors = [
+            format!("{}Channel::new(", "Telegram"),
+            format!("{}Channel::new(", "Discord"),
+            format!("{}Channel::new(", "Slack"),
+            format!("{}Channel::new(", "Mattermost"),
+        ];
+        let production = src.split("\n#[cfg(test)]").next().expect("source");
+        assert!(
+            production.len() < src.len(),
+            "the test module marker moved; update this guard"
+        );
+        for ctor in &ctors {
+            let hits = production.matches(ctor.as_str()).count();
+            assert_eq!(
+                hits, 1,
+                "`{ctor}` is constructed {hits} times; exactly one shared \
+                 builder may call it, or the two paths can drift again"
+            );
+        }
+    }
 
     /// A config whose `[multimodal]` limits are deliberately NOT the defaults,
     /// so a channel built without `with_multimodal` is distinguishable from one
