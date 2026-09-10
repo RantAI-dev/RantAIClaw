@@ -5762,6 +5762,11 @@ fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
             include_str!("discord.rs"),
             "async fn send_attachment(",
         ),
+        (
+            "whatsapp (web)",
+            include_str!("whatsapp_web.rs"),
+            "async fn send_attachment(",
+        ),
     ];
 
     for (channel, src, sender) in wiring {

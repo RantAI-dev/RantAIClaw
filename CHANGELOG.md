@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WhatsApp Web can send attachments now**, which leaves Slack as the only tier channel that
+  cannot. The same five markers every delivering channel uses, the same shared parsing, and the
+  same workspace confinement: a reply is influenced by whoever is chatting, so a local path is read
+  only from inside the workspace. Each marker kind builds its own message type rather than being
+  flattened to one, because the recipient's client renders on that and the upload is encrypted
+  under a bucket chosen by the same kind — a video uploaded as an image is undecryptable on the
+  other end, and nothing on the sending side sees it fail. `[VOICE:…]` sets `ptt`, which is the
+  only thing distinguishing a voice note from an audio file. A URL is sent as text for WhatsApp to
+  preview instead of being re-uploaded.
 - **Slack's inbound-image support needed a scope nobody was told to grant.** The first-run wizard
   listed `chat:write, channels:history`, and `url_private` (the only way to fetch an upload) is
   authenticated behind `files:read`. So the feature that shipped could not work on a workspace set
