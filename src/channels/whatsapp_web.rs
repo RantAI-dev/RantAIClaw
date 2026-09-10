@@ -3,7 +3,12 @@
 //! This channel provides direct WhatsApp Web integration with:
 //! - QR code and pair code linking
 //! - End-to-end encryption via Signal Protocol
-//! - Full Baileys parity (groups, media, presence, reactions, editing/deletion)
+//! - Groups, presence, reactions, editing and deletion
+//! - Inbound images, downloaded through the shared `media` budget gate
+//!
+//! The `wa-rs` library it wraps advertises full Baileys parity. This module
+//! used to repeat that claim as its own, which was wrong: until 2026-09-10 it
+//! had no media path at all, and outbound media is still missing.
 //!
 //! # Feature Flag
 //!
@@ -61,6 +66,8 @@ pub struct WhatsAppWebChannel {
     /// Allowed phone numbers (E.164 format) or "*" for all. Behind a lock so an
     /// in-chat `/bind`/`/claim` can extend it at runtime without a restart.
     allowed_numbers: Arc<RwLock<Vec<String>>>,
+    /// `[multimodal]` defaults; the factory overrides it with the operator's.
+    multimodal: crate::config::MultimodalConfig,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -126,9 +133,61 @@ impl WhatsAppWebChannel {
             pair_phone,
             pair_code,
             allowed_numbers: Arc::new(RwLock::new(allowed_numbers)),
+            multimodal: crate::config::MultimodalConfig::default(),
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Apply the operator's `[multimodal]` limits to inbound images.
+    #[must_use]
+    pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
+        self.multimodal = multimodal;
+        self
+    }
+
+    /// Is there anything here to answer?
+    ///
+    /// Extracted from the `listen()` closure so a test can reach it — no test
+    /// enters that closure, which is the same structural hole
+    /// `every_channel_listen_path_calls_its_allowlist_gate` exists for. Keying
+    /// this on text alone dropped an image sent with no caption.
+    pub(crate) fn has_deliverable_content(text: &str, has_image: bool) -> bool {
+        !text.trim().is_empty() || has_image
+    }
+
+    /// Turn downloaded image bytes into the marker the agent sees.
+    ///
+    /// Separated from the download so the part that carries the risk — the
+    /// budget, the size cap and the byte sniffing — is reachable from a test
+    /// without the `whatsapp-web` feature, a linked session or a live socket.
+    /// The library call around it is a single `client.download(..)`.
+    ///
+    /// `charge` is explicit here because the bytes arrive from a library call
+    /// rather than a URL, so `fetch_image_bytes` (which charges internally) is
+    /// not on this path. Charged *before* the bytes are examined, matching
+    /// every other channel.
+    pub(crate) fn image_marker_from_bytes(
+        bytes: &[u8],
+        claimed: Option<&str>,
+        multimodal: &crate::config::MultimodalConfig,
+        sender: &str,
+    ) -> String {
+        use crate::channels::media::{ImageBytes, MediaOutcome};
+
+        let sender_key = format!("whatsapp:{sender}");
+        if let Err(note) = crate::channels::media::charge(&sender_key) {
+            return MediaOutcome::Rejected(note).to_marker();
+        }
+        let cap = crate::channels::media::max_bytes(multimodal);
+        match crate::channels::media::accept_image_bytes(bytes, claimed, cap) {
+            ImageBytes::Ok { mime, bytes } => {
+                use base64::Engine as _;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                MediaOutcome::Image(format!("data:{mime};base64,{encoded}")).to_marker()
+            }
+            ImageBytes::Rejected(note) => MediaOutcome::Rejected(note).to_marker(),
         }
     }
 
@@ -625,6 +684,7 @@ impl Channel for WhatsAppWebChannel {
         // Build the bot
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
+        let multimodal = self.multimodal.clone();
         // Last time each chat was told a message was dropped, so a saturated
         // queue produces one apology per chat rather than one per message.
         let drop_notices: Arc<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
@@ -648,6 +708,7 @@ impl Channel for WhatsAppWebChannel {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
                 let drop_notices = Arc::clone(&drop_notices);
+                let multimodal = multimodal.clone();
                 let session_ended_inner = session_ended.clone();
                 let session_end_inner = Arc::clone(&session_end_reason);
                 async move {
@@ -724,12 +785,49 @@ impl Channel for WhatsAppWebChannel {
 
                             if is_allowed {
                                 let trimmed = text.trim();
-                                if trimmed.is_empty() {
+                                // An image sent with no caption has empty text
+                                // and is still a message. Keying "is there
+                                // anything here" on text alone dropped it.
+                                let image = msg.image_message.as_deref();
+                                if !Self::has_deliverable_content(trimmed, image.is_some()) {
                                     tracing::debug!(
                                         "WhatsApp Web: ignoring empty or non-text message from {}",
                                         normalized
                                     );
                                     return;
+                                }
+
+                                // Download through the library, then apply the
+                                // shared policy. `client.download` is the whole
+                                // of the wa-rs side: `ImageMessage` already
+                                // implements `Downloadable`.
+                                let mut content = trimmed.to_string();
+                                if let Some(img) = image {
+                                    let claimed = img.mimetype.clone();
+                                    let marker = match client.download(img).await {
+                                        Ok(bytes) => Self::image_marker_from_bytes(
+                                            &bytes,
+                                            claimed.as_deref(),
+                                            &multimodal,
+                                            &normalized,
+                                        ),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "WhatsApp Web: an inbound image could not be \
+                                                 downloaded: {e}"
+                                            );
+                                            crate::channels::media::MediaOutcome::Rejected(
+                                                "Attachment unavailable: the image could not be \
+                                                 downloaded"
+                                                    .into(),
+                                            )
+                                            .to_marker()
+                                        }
+                                    };
+                                    if !content.is_empty() {
+                                        content.push('\n');
+                                    }
+                                    content.push_str(&marker);
                                 }
 
                                 // Reply on the chat WhatsApp actually delivers to:
@@ -747,7 +845,7 @@ impl Channel for WhatsAppWebChannel {
                                     channel: "whatsapp".to_string(),
                                     sender: normalized.clone(),
                                     reply_target,
-                                    content: trimmed.to_string(),
+                                    content: content.clone(),
                                     // The message's own timestamp, checked —
                                     // `Utc::now()` stamped the moment we
                                     // happened to process it.
@@ -1270,6 +1368,140 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
         }
         yield PairEvent::Failed("channel closed".into());
     })
+}
+
+/// Inbound-image policy, reachable without a linked session or a live socket.
+///
+/// Gated on the feature like the module's other tests, which is fine because
+/// `whatsapp-web` is a default feature: these run in an ordinary
+/// `cargo test --lib`.
+#[cfg(all(test, feature = "whatsapp-web"))]
+mod media_tests {
+    use super::*;
+
+    /// A 1x1 PNG. Small, real bytes, so the sniffer has something to read.
+    fn png() -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+            .expect("fixture decodes")
+    }
+
+    fn caps(max_mb: usize) -> crate::config::MultimodalConfig {
+        let mut m = crate::config::MultimodalConfig::default();
+        m.max_image_size_mb = max_mb;
+        m
+    }
+
+    /// The happy path. Until 2026-09-10 this channel had no media path at all,
+    /// so an image sent to it simply vanished.
+    #[test]
+    fn an_inbound_image_becomes_an_image_marker() {
+        let marker = WhatsAppWebChannel::image_marker_from_bytes(
+            &png(),
+            Some("image/png"),
+            &caps(8),
+            "15550000001",
+        );
+        assert!(
+            marker.contains("IMAGE:") && marker.contains("data:image/png;base64,"),
+            "an accepted image must reach the agent as a marker: {marker}"
+        );
+    }
+
+    /// Over the operator's cap becomes a visible note, not a silent drop and
+    /// not a truncated image.
+    #[test]
+    fn an_image_over_the_operators_cap_is_refused_with_a_note() {
+        let big = vec![0x89u8; 2 * 1024 * 1024];
+        let marker = WhatsAppWebChannel::image_marker_from_bytes(
+            &big,
+            Some("image/png"),
+            &caps(1),
+            "15550000002",
+        );
+        assert!(
+            marker.contains("too large"),
+            "the refusal must say why: {marker}"
+        );
+        assert!(
+            !marker.contains("base64"),
+            "nothing may be forwarded when the cap is exceeded: {marker}"
+        );
+    }
+
+    /// The claimed type is checked against the bytes rather than trusted.
+    #[test]
+    fn a_non_image_file_is_refused_with_a_reason() {
+        let marker = WhatsAppWebChannel::image_marker_from_bytes(
+            b"%PDF-1.7 not an image at all",
+            Some("application/pdf"),
+            &caps(8),
+            "15550000003",
+        );
+        assert!(
+            marker.contains("rejected") || marker.contains("unsupported"),
+            "a non-image must be refused with a reason: {marker}"
+        );
+        assert!(!marker.contains("base64"), "{marker}");
+    }
+
+    /// Empty bytes are a failed download, not an empty image.
+    #[test]
+    fn an_empty_download_is_reported_rather_than_forwarded() {
+        let marker = WhatsAppWebChannel::image_marker_from_bytes(
+            &[],
+            Some("image/png"),
+            &caps(8),
+            "15550000004",
+        );
+        assert!(!marker.contains("base64"), "{marker}");
+        assert!(
+            marker.contains("unavailable") || marker.contains("rejected"),
+            "{marker}"
+        );
+    }
+
+    /// An image with no caption is still a message. This is what dropped it.
+    #[test]
+    fn an_image_with_no_caption_is_still_something_to_answer() {
+        assert!(
+            WhatsAppWebChannel::has_deliverable_content("", true),
+            "an image with no caption must be delivered"
+        );
+        assert!(WhatsAppWebChannel::has_deliverable_content(
+            "look at this",
+            true
+        ));
+        assert!(WhatsAppWebChannel::has_deliverable_content(
+            "just words",
+            false
+        ));
+        assert!(
+            !WhatsAppWebChannel::has_deliverable_content("   ", false),
+            "whitespace with no image is still nothing"
+        );
+    }
+
+    /// The budget is charged per channel-qualified sender, and charged before
+    /// the bytes are examined, so a stream of images cannot outspend the
+    /// allowance by failing a later check.
+    #[test]
+    fn a_sender_over_their_budget_does_not_get_the_image_forwarded() {
+        let sender = format!("15559{}", std::process::id() % 100_000);
+        let key = format!("whatsapp:{sender}");
+        while crate::channels::media::charge(&key).is_ok() {}
+        let marker = WhatsAppWebChannel::image_marker_from_bytes(
+            &png(),
+            Some("image/png"),
+            &caps(8),
+            &sender,
+        );
+        assert!(
+            !marker.contains("base64"),
+            "a sender over budget must not get their image forwarded: {marker}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "whatsapp-web"))]
