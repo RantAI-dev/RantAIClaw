@@ -342,10 +342,19 @@ async fn get_channels_publishes_the_catalog_with_both_axes() {
     let channels = body["channels"]
         .as_array()
         .unwrap_or_else(|| panic!("`channels` must be an array, got: {body}"));
+    // Pinned, like the counts in `mod_tests.rs` and `check_channel_maturity.sh`:
+    // `CHANNEL_CATALOG` is the source and this number moves with it. 17 since
+    // schema v32 split WhatsApp Cloud API and WhatsApp Web onto their own rows.
     assert_eq!(
         channels.len(),
-        16,
+        17,
         "every catalog channel must be published, got: {body}"
+    );
+    assert!(
+        channels
+            .iter()
+            .any(|c| c["key"] == "whatsapp_web" && c["label"] == "WhatsApp Web"),
+        "the split gave WhatsApp Web its own row; the API must publish it: {body}"
     );
 
     let mut supported = 0;
@@ -384,7 +393,7 @@ async fn get_channels_publishes_the_catalog_with_both_axes() {
     // Counted separately, because they are separate facts. One assertion over
     // both would pass while a channel moved from one axis to the other.
     assert_eq!(
-        supported, 4,
+        supported, 5,
         "the support axis is a product commitment, not a refactor: {body}"
     );
     assert_eq!(
@@ -401,7 +410,7 @@ async fn get_channels_publishes_the_catalog_with_both_axes() {
         .collect();
     assert_eq!(
         committed_undriven,
-        vec!["discord", "slack", "whatsapp"],
+        vec!["discord", "slack", "whatsapp", "whatsapp_web"],
         "supported-but-undriven is a legitimate state and must survive: {body}"
     );
 
