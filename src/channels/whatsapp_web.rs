@@ -1240,7 +1240,7 @@ impl Channel for WhatsAppWebChannel {
         self.client.lock().is_some() && self.bot_handle.lock().is_some()
     }
 
-    async fn start_typing(&self, recipient: &str) -> Result<()> {
+    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
@@ -1340,7 +1340,7 @@ impl Channel for WhatsAppWebChannel {
         false
     }
 
-    async fn start_typing(&self, _recipient: &str) -> Result<()> {
+    async fn start_typing(&self, _recipient: &str, _thread_ts: Option<&str>) -> Result<()> {
         anyhow::bail!(
             "WhatsApp Web channel requires the 'whatsapp-web' feature. \
             Enable with: cargo build --features whatsapp-web"

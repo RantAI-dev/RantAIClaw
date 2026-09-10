@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Slack showed nothing at all while the agent worked**, which on an eighteen-second turn reads as
+  a bot that never got the message. It was the only tier channel with no `start_typing` override, so
+  it fell through to the no-op default while Telegram, Discord and WhatsApp Web all showed
+  something. Slack has no bot-drivable typing indicator, and both other routes were closed —
+  `agents.sessions.setStatus` needs an app reinstall, draft streaming needs a config key only
+  Telegram has — so it now posts a short "working…" message and deletes it when the answer is
+  ready. `chat:write` already covers both, so no new scope and no reinstall. The notice goes in the
+  same thread as the reply, is removed on every exit path including a turn that errored or was
+  cancelled, and is deleted before the answer is posted so the two never race. `start_typing` gained
+  the reply's thread so a channel that shows progress by posting can put it where the answer goes;
+  every other implementation ignores it.
 - **Slack can send attachments now, which closes outbound media across all four tier channels.**
   It was the last one that could not, and the blocker was the `files:write` scope rather than
   missing code; the owner granted it on 2026-09-10. The upload is the three-call flow that replaced

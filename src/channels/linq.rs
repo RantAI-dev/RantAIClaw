@@ -521,7 +521,7 @@ impl Channel for LinqChannel {
             .unwrap_or(false)
     }
 
-    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
         let url = format!("{LINQ_API_BASE}/chats/{}/typing", encode_chat_id(recipient));
 
         let resp = self

@@ -367,7 +367,7 @@ impl Channel for MattermostChannel {
             .unwrap_or(false)
     }
 
-    async fn start_typing(&self, recipient: &str) -> Result<()> {
+    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> Result<()> {
         // Cancel any existing typing loop before starting a new one.
         self.stop_typing(recipient).await?;
 

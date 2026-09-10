@@ -265,7 +265,7 @@ async fn channel_health_check_default_returns_true() {
 #[tokio::test]
 async fn channel_typing_defaults_succeed() {
     let channel = CapturingChannel::new();
-    assert!(channel.start_typing("target").await.is_ok());
+    assert!(channel.start_typing("target", None).await.is_ok());
     assert!(channel.stop_typing("target").await.is_ok());
 }
 

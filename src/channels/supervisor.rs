@@ -316,6 +316,7 @@ pub(crate) fn log_worker_join_result(result: Result<(), tokio::task::JoinError>)
 pub(crate) fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
+    thread_ts: Option<String>,
     cancellation_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let stop_signal = cancellation_token;
@@ -328,7 +329,8 @@ pub(crate) fn spawn_scoped_typing_task(
             tokio::select! {
                 () = stop_signal.cancelled() => break,
                 _ = interval.tick() => {
-                    if let Err(e) = channel.start_typing(&recipient).await {
+                    if let Err(e) = channel.start_typing(&recipient, thread_ts.as_deref()).await
+                    {
                         tracing::debug!("Failed to start typing on {}: {e}", channel.name());
                     }
                 }

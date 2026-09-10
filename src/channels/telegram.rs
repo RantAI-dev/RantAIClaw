@@ -2392,7 +2392,7 @@ Ensure only one `rantaiclaw` process is using this bot token."
     /// earlier and spawned another. The runtime cadence (4s) is inside
     /// Telegram's ~5s indicator expiry, so the inner loop was redundant as
     /// well as self-defeating.
-    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
         self.stop_typing(recipient).await?;
 
         let client = self.http_client();
@@ -2706,7 +2706,7 @@ mod tests {
             );
         }
 
-        let _ = ch.start_typing("123").await;
+        let _ = ch.start_typing("123", None).await;
 
         let guard = ch.typing_handles.lock();
         assert!(guard.contains_key("123"));
