@@ -801,7 +801,7 @@ impl Channel for TelegramRecordingChannel {
         Ok(())
     }
 
-    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+    async fn start_typing(&self, _recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -832,7 +832,7 @@ impl Channel for RecordingChannel {
         Ok(())
     }
 
-    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+    async fn start_typing(&self, _recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
         self.start_typing_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -5807,6 +5807,65 @@ fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
             body.contains(confine.as_str()),
             "{channel}: `{sender}` uploads a local path without confining it to \
              the workspace — a reply could exfiltrate the config"
+        );
+    }
+}
+
+/// Every tier channel must show that it heard you, and must clean that up.
+///
+/// Slack had no `start_typing` override at all and fell through to the no-op
+/// default in `traits.rs`, so an eighteen-second turn looked like a bot that
+/// never got the message. A class guard rather than a per-channel test because
+/// the failure is an *absent* override: nothing fails when a channel quietly
+/// stops implementing it, which is exactly how Slack sat silent while the other
+/// three did not.
+///
+/// Checked by reading the source: `start_typing` needs a live API to drive, and
+/// the thing that must hold is that each channel overrides it and pairs it with
+/// a `stop_typing`.
+#[test]
+fn every_tier_channel_shows_and_clears_a_working_signal() {
+    // Assembled at runtime so this test does not match itself.
+    let start = format!("async fn start_{}(", "typing");
+    let stop = format!("async fn stop_{}(", "typing");
+    // Per channel, the call in `stop_typing` that actually ends the signal.
+    // Asserting the method merely *exists* is not enough: a `stop_typing` whose
+    // body was emptied still satisfies that, and an emptied one is precisely
+    // how a "working…" placeholder outlives its turn.
+    let wiring: &[(&str, &str, &str)] = &[
+        ("telegram", include_str!("telegram.rs"), "remove("),
+        ("discord", include_str!("discord.rs"), "remove("),
+        ("slack", include_str!("slack.rs"), "take_working_notice("),
+        (
+            "whatsapp (web)",
+            include_str!("whatsapp_web.rs"),
+            "send_paused(",
+        ),
+    ];
+
+    for (channel, src, clears) in wiring {
+        let production = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            production.contains(start.as_str()),
+            "{channel}: no `start_typing` override, so it falls through to the \
+             no-op default and shows nothing while the agent works"
+        );
+
+        let at = production.find(stop.as_str()).unwrap_or_else(|| {
+            panic!("{channel}: overrides `start_typing` without a `stop_typing`")
+        });
+        // Slice to the end of `stop_typing`. Every one of these is an
+        // `async fn`, so a marker of `"\n    fn "` would run to end-of-file and
+        // match anything — the shape that made an earlier guard vacuous.
+        let body = &production[at..];
+        let end = body[1..]
+            .find("\n    async fn ")
+            .or_else(|| body[1..].find("\n    fn "))
+            .map_or(body.len(), |i| i + 1);
+        assert!(
+            body[..end].contains(clears),
+            "{channel}: `stop_typing` no longer calls `{clears}`, so whatever \
+             it shows can outlive the turn"
         );
     }
 }

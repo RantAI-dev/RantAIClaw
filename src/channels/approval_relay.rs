@@ -1748,7 +1748,11 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        async fn start_typing(
+            &self,
+            _recipient: &str,
+            _thread_ts: Option<&str>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {

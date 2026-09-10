@@ -612,14 +612,24 @@ Slack notes:
   `slack_listen_gap` in `src/doctor/checks/channels.rs`.
 - Both setup paths ask for `app_token` as an optional prompt. Skipping it is
   valid and yields polling.
-- **Slack shows no "working" indicator** while the agent thinks. Slack does have
-  an API for it, `agents.sessions.setStatus`, but using it requires the app to be
-  declared as an agent, adds the `assistant:write` scope, and needs a reinstall,
-  so it was skipped on 2026-09-09. The reason recorded at the time — that draft
-  streaming would give the same signal for free — **did not survive contact**:
-  draft streaming is gated on a per-channel `stream_mode` that only Telegram has
-  (see [Draft streaming](#draft-streaming) below). So Slack has neither today,
-  and closing that gap means choosing one of the two, not waiting for the other.
+- **Slack shows a short "working…" message** while the agent thinks, posted when
+  the turn starts and deleted when the answer is ready. Slack has no typing
+  indicator a bot can drive, and the two other routes were both closed:
+  `agents.sessions.setStatus` needs the app declared as an agent plus a
+  reinstall, and draft streaming needs a per-channel `stream_mode` only Telegram
+  has (see [Draft streaming](#draft-streaming)). A placeholder needs neither —
+  `chat:write` already covers posting and deleting the bot's own message.
+  - It goes in the **same thread** as the reply, so a threaded conversation does
+    not put a notice in the main channel where everyone else sees it.
+  - It is removed on **every** exit path. The runtime cancels the typing task
+    and awaits it before it looks at the turn's result, so a turn that errored,
+    timed out or was cancelled still cleans up. A stuck "working…" is a lie that
+    persists, and this is the shape that cannot leave one behind.
+  - The placeholder is deleted **before** the answer is posted, so the two never
+    race and nothing edits a message into something else.
+  - **Not yet measured:** whether posting and quickly deleting leaves a push
+    notification behind on mobile, which can differ between a channel post, a
+    thread reply and a DM. That is a drive question; the code cannot answer it.
 
 ### 4.4 Mattermost
 

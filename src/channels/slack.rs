@@ -1,5 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use std::sync::{Arc, RwLock};
 
 /// Slack channel — polls conversations.history via Web API
@@ -15,6 +16,10 @@ pub struct SlackChannel {
     /// `Arc<RwLock<..>>` so a successful `/bind`/`/claim` can append the sender
     /// at runtime (immediate access without a channel restart).
     allowed_users: Arc<RwLock<Vec<String>>>,
+    /// The "working…" placeholder currently posted for each conversation,
+    /// keyed by recipient so two concurrent chats cannot delete each other's.
+    /// Value is the Slack `ts` needed to remove it.
+    working_notices: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 /// Slack's own guidance for `chat.postMessage`: "For best results, limit the
@@ -331,6 +336,26 @@ impl SlackChannel {
         Some((url.to_string(), id.to_string()))
     }
 
+    /// Delete one of the bot's own messages. Covered by `chat:write`; no new
+    /// scope and no app reinstall.
+    async fn delete_message(&self, channel: &str, ts: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.delete")
+            .bearer_auth(&self.bot_token)
+            .json(&serde_json::json!({ "channel": channel, "ts": ts }))
+            .send()
+            .await?;
+        let text = resp.text().await.unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if !Self::api_response_is_ok(&parsed) {
+            // A placeholder that outlives its turn is the failure this plan is
+            // about, so say so rather than swallowing it.
+            tracing::warn!("Slack could not remove its working notice: {text}");
+        }
+        Ok(())
+    }
+
     async fn post_chunk(&self, message: &SendMessage, chunk: &str) -> anyhow::Result<()> {
         let mut body = serde_json::json!({
             "channel": message.recipient,
@@ -387,7 +412,53 @@ impl SlackChannel {
             channel_id,
             app_token: None,
             allowed_users: Arc::new(RwLock::new(allowed_users)),
+            working_notices: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// What the placeholder says. Short and unmistakably transient.
+    pub(crate) const WORKING_NOTICE: &'static str = "_working on it…_";
+
+    /// The `chat.postMessage` body for the placeholder.
+    ///
+    /// Extracted so the threading is reachable from a test: posting needs a
+    /// live workspace, and a placeholder that lands in the main channel while
+    /// the conversation is in a thread is noise for everyone else in it.
+    pub(crate) fn working_notice_body(
+        recipient: &str,
+        thread_ts: Option<&str>,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "channel": recipient,
+            "text": Self::WORKING_NOTICE,
+        });
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
+        body
+    }
+
+    /// Has a placeholder already been posted for this conversation?
+    ///
+    /// `start_typing` is driven on a 4-second refresh
+    /// (`supervisor::spawn_scoped_typing_task`), which is right for a platform
+    /// typing indicator that expires and wrong for a message. Posting one per
+    /// tick would fill the chat, so the second and later calls must be no-ops.
+    pub(crate) fn has_working_notice(&self, recipient: &str) -> bool {
+        self.working_notices.lock().contains_key(recipient)
+    }
+
+    /// Record the placeholder posted for `recipient`, returning any previous
+    /// one so it can be cleaned up rather than orphaned.
+    pub(crate) fn remember_working_notice(&self, recipient: &str, ts: String) -> Option<String> {
+        self.working_notices
+            .lock()
+            .insert(recipient.to_string(), ts)
+    }
+
+    /// Take this conversation's placeholder, leaving every other one alone.
+    pub(crate) fn take_working_notice(&self, recipient: &str) -> Option<String> {
+        self.working_notices.lock().remove(recipient)
     }
 
     /// Apply the operator's `[multimodal]` limits to inbound images.
@@ -569,6 +640,58 @@ impl Channel for SlackChannel {
         }
 
         self.send_text(&message.content, message).await
+    }
+
+    /// Slack has no typing indicator a bot can drive, so "working" is shown by
+    /// posting a short placeholder and deleting it when the answer is ready.
+    ///
+    /// Shape chosen deliberately over editing the placeholder into the answer:
+    /// the runtime already tears this down on **every** exit path
+    /// (`dispatch.rs` cancels the token and awaits the task before it matches
+    /// on the turn's result), so a failed, errored or cancelled turn cleans up
+    /// for free. Editing would need `send` to own the handle as well, giving
+    /// one resource two owners.
+    ///
+    /// Idempotent: the runtime calls this every 4 seconds.
+    async fn start_typing(&self, recipient: &str, thread_ts: Option<&str>) -> anyhow::Result<()> {
+        if self.has_working_notice(recipient) {
+            return Ok(());
+        }
+
+        let body = Self::working_notice_body(recipient, thread_ts);
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+        let text = resp.text().await.unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if !Self::api_response_is_ok(&parsed) {
+            // Not an error worth failing the turn over: the answer still comes.
+            tracing::debug!("Slack working notice not posted: {text}");
+            return Ok(());
+        }
+        if let Some(ts) = parsed.get("ts").and_then(|t| t.as_str()) {
+            if let Some(stale) = self.remember_working_notice(recipient, ts.to_string()) {
+                // Should not happen while `has_working_notice` guards the post,
+                // but an orphaned notice is exactly the lie this plan exists to
+                // avoid, so remove it rather than leak it.
+                let _ = self.delete_message(recipient, &stale).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove this conversation's placeholder. Runs on every exit path,
+    /// including a turn that errored or was cancelled.
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let Some(ts) = self.take_working_notice(recipient) else {
+            return Ok(());
+        };
+        self.delete_message(recipient, &ts).await
     }
 
     /// Slack can deliver attachments, so the model is told the marker syntax.
@@ -884,6 +1007,102 @@ impl SlackChannel {
             return false;
         };
         Self::api_response_is_ok(&body)
+    }
+}
+
+#[cfg(test)]
+mod working_notice_tests {
+    use super::*;
+
+    fn channel() -> SlackChannel {
+        SlackChannel::new("xoxb-test".into(), Some("C_CHAN".into()), vec!["*".into()])
+    }
+
+    /// Two conversations must not clear each other's placeholder. Mirrors
+    /// `start_typing_replaces_that_recipients_handle_only` in `telegram.rs`.
+    #[test]
+    fn a_notice_is_kept_per_recipient() {
+        let ch = channel();
+        ch.remember_working_notice("C_ONE", "111.1".into());
+        ch.remember_working_notice("C_TWO", "222.2".into());
+
+        assert_eq!(ch.take_working_notice("C_ONE").as_deref(), Some("111.1"));
+        assert!(
+            ch.has_working_notice("C_TWO"),
+            "taking one conversation's notice must leave the other alone"
+        );
+        assert_eq!(ch.take_working_notice("C_TWO").as_deref(), Some("222.2"));
+    }
+
+    /// The runtime calls `start_typing` every four seconds. Without this the
+    /// chat fills with placeholders instead of showing one.
+    #[test]
+    fn a_second_start_does_not_post_a_second_notice() {
+        let ch = channel();
+        assert!(!ch.has_working_notice("C_ONE"), "nothing posted yet");
+        ch.remember_working_notice("C_ONE", "111.1".into());
+        assert!(
+            ch.has_working_notice("C_ONE"),
+            "a refresh tick must find the existing notice and do nothing"
+        );
+    }
+
+    /// Taking a notice that was never posted is not an error: `stop_typing`
+    /// runs on every exit path, including turns where the post failed.
+    #[test]
+    fn stopping_without_a_notice_is_harmless() {
+        assert!(channel().take_working_notice("C_NONE").is_none());
+    }
+
+    /// A notice is removed exactly once, so a second `stop_typing` cannot
+    /// delete a message that a later turn has since posted.
+    #[test]
+    fn a_notice_is_taken_only_once() {
+        let ch = channel();
+        ch.remember_working_notice("C_ONE", "111.1".into());
+        assert_eq!(ch.take_working_notice("C_ONE").as_deref(), Some("111.1"));
+        assert_eq!(
+            ch.take_working_notice("C_ONE"),
+            None,
+            "the second stop must find nothing left to delete"
+        );
+    }
+
+    /// The placeholder goes where the answer goes. In a thread, a notice
+    /// posted to the main channel is noise for everyone else in it.
+    #[test]
+    fn a_notice_follows_the_reply_into_its_thread() {
+        let threaded = SlackChannel::working_notice_body("C_CHAN", Some("1700000001.000100"));
+        assert_eq!(
+            threaded.get("thread_ts").and_then(|t| t.as_str()),
+            Some("1700000001.000100"),
+            "a threaded reply must get a threaded notice: {threaded}"
+        );
+        assert_eq!(
+            threaded.get("channel").and_then(|c| c.as_str()),
+            Some("C_CHAN")
+        );
+
+        // A channel-level turn carries no thread, and must not invent one.
+        let plain = SlackChannel::working_notice_body("C_CHAN", None);
+        assert!(
+            plain.get("thread_ts").is_none(),
+            "a channel reply must not be forced into a thread: {plain}"
+        );
+    }
+
+    /// The text has to read as transient. A placeholder that looks like an
+    /// answer is worse than silence.
+    #[test]
+    fn the_notice_reads_as_temporary() {
+        assert!(SlackChannel::WORKING_NOTICE
+            .to_lowercase()
+            .contains("working"));
+        assert!(
+            SlackChannel::WORKING_NOTICE.len() < 40,
+            "the placeholder must be short: {}",
+            SlackChannel::WORKING_NOTICE
+        );
     }
 }
 

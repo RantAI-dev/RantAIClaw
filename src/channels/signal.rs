@@ -657,7 +657,7 @@ impl Channel for SignalChannel {
         resp.status().is_success()
     }
 
-    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
         let Some(target) = Self::parse_recipient_target(recipient) else {
             // A typing indicator is cosmetic; refusing quietly is right, and
             // `send` reports the same target with a full error.

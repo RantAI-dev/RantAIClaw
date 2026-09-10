@@ -794,7 +794,7 @@ impl DiscordChannel {
             .unwrap_or(false)
     }
 
-    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
         self.stop_typing(recipient).await?;
 
         let client = self.http_client();
@@ -1342,7 +1342,7 @@ mod tests {
     #[tokio::test]
     async fn start_typing_sets_handle() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
-        let _ = ch.start_typing("123456").await;
+        let _ = ch.start_typing("123456", None).await;
         let guard = ch.typing_handles.lock();
         assert!(guard.contains_key("123456"));
     }
@@ -1350,7 +1350,7 @@ mod tests {
     #[tokio::test]
     async fn stop_typing_clears_handle() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
-        let _ = ch.start_typing("123456").await;
+        let _ = ch.start_typing("123456", None).await;
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handles.lock();
         assert!(!guard.contains_key("123456"));
@@ -1366,8 +1366,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_typing_handles_are_independent() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
-        let _ = ch.start_typing("111").await;
-        let _ = ch.start_typing("222").await;
+        let _ = ch.start_typing("111", None).await;
+        let _ = ch.start_typing("222", None).await;
         {
             let guard = ch.typing_handles.lock();
             assert_eq!(guard.len(), 2);

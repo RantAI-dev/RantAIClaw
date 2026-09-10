@@ -508,6 +508,9 @@ pub(crate) async fn process_channel_message(
         (Some(channel), Some(token)) => Some(supervisor::spawn_scoped_typing_task(
             Arc::clone(channel),
             msg.reply_target.clone(),
+            // The thread the reply will land in, so a channel that shows
+            // progress by posting can put it where the answer goes.
+            msg.thread_ts.clone(),
             token.clone(),
         )),
         _ => None,

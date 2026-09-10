@@ -160,7 +160,11 @@ pub trait Channel: Send + Sync {
 
     /// Signal that the bot is processing a response (e.g. "typing" indicator).
     /// Implementations should repeat the indicator as needed for their platform.
-    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+    /// `thread_ts` is the thread the reply will land in, so a channel that
+    /// shows progress by posting a message can put it where the answer goes.
+    /// A placeholder in the main channel while the conversation is in a thread
+    /// is noise for everyone else in that channel.
+    async fn start_typing(&self, _recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -279,7 +283,7 @@ mod tests {
         let channel = DummyChannel;
 
         assert!(channel.health_check().await);
-        assert!(channel.start_typing("bob").await.is_ok());
+        assert!(channel.start_typing("bob", None).await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
         assert!(channel
             .send(&SendMessage::new("hello", "bob"))
