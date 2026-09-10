@@ -197,6 +197,140 @@ impl SlackChannel {
     }
 
     /// POST one already-split chunk.
+    /// Upload one attachment and share it into the conversation.
+    ///
+    /// Three calls, because `files.upload` is retired: reserve an upload URL,
+    /// `POST` the bytes to it, then complete the upload naming the channel. All
+    /// of it is covered by `files:write`; nothing here needs a scope beyond the
+    /// one the operator granted.
+    ///
+    /// A remote URL is posted as text instead. Slack unfurls it, the file is
+    /// already public, and re-uploading it would spend bandwidth to gain
+    /// nothing — the same choice Discord and WhatsApp Web make.
+    async fn send_attachment(
+        &self,
+        message: &SendMessage,
+        attachment: &crate::channels::media::OutboundAttachment,
+    ) -> anyhow::Result<()> {
+        let target = attachment.target.trim();
+
+        if crate::channels::media::is_http_url(target) {
+            return self.post_chunk(message, target).await;
+        }
+
+        let path = std::path::Path::new(target);
+        if !path.exists() {
+            anyhow::bail!("Slack attachment path not found: {target}");
+        }
+        let (_config_path, workspace_dir) = {
+            use anyhow::Context as _;
+            crate::config::Config::resolve_active_paths()
+                .await
+                .context("cannot resolve workspace to validate attachment path")?
+        };
+        if !crate::channels::media::path_within_workspace(path, &workspace_dir) {
+            anyhow::bail!(
+                "Slack attachment path is outside the workspace and was blocked: {target}"
+            );
+        }
+
+        let bytes = {
+            use anyhow::Context as _;
+            tokio::fs::read(path)
+                .await
+                .with_context(|| format!("cannot read attachment: {target}"))?
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+
+        // 1. Reserve an upload URL. `length` is required and must match what we
+        //    actually send, so it comes from the bytes rather than metadata.
+        let reserve = self
+            .http_client()
+            .get("https://slack.com/api/files.getUploadURLExternal")
+            .bearer_auth(&self.bot_token)
+            .query(&[
+                ("filename", file_name.as_str()),
+                ("length", &bytes.len().to_string()),
+            ])
+            .send()
+            .await?;
+        let reserve_body = reserve.text().await.unwrap_or_default();
+        let reserve_json: serde_json::Value =
+            serde_json::from_str(&reserve_body).unwrap_or_default();
+        if !Self::api_response_is_ok(&reserve_json) {
+            let err = reserve_json
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack files.getUploadURLExternal failed: {err}");
+        }
+        let (upload_url, file_id) = Self::upload_ticket(&reserve_json)
+            .ok_or_else(|| anyhow::anyhow!("Slack returned no upload URL or file id"))?;
+
+        // 2. `POST` the bytes. **No credential is attached here**, which is the
+        //    whole reason this needs no host pin: the URL came back from an
+        //    authenticated call to `slack.com`, and the worst case is sending
+        //    the file to Slack's own storage. That is the opposite of the
+        //    inbound path, where `url_private` arrives in an event payload and
+        //    *does* carry the bot token, so `is_slack_file_host` gates it.
+        //    Pinning a host here would instead break uploads the day Slack
+        //    moves external storage off `files.slack.com`.
+        let put = self
+            .http_client()
+            .post(&upload_url)
+            .body(bytes)
+            .send()
+            .await?;
+        if !put.status().is_success() {
+            let status = put.status();
+            anyhow::bail!("Slack file upload failed ({status})");
+        }
+
+        // 3. Complete, which is what actually posts it into the conversation.
+        let mut complete = serde_json::json!({
+            "files": [{ "id": file_id, "title": file_name }],
+            "channel_id": message.recipient,
+        });
+        if let Some(ref ts) = message.thread_ts {
+            complete["thread_ts"] = serde_json::json!(ts);
+        }
+        let done = self
+            .http_client()
+            .post("https://slack.com/api/files.completeUploadExternal")
+            .bearer_auth(&self.bot_token)
+            .json(&complete)
+            .send()
+            .await?;
+        let done_body = done.text().await.unwrap_or_default();
+        let done_json: serde_json::Value = serde_json::from_str(&done_body).unwrap_or_default();
+        if !Self::api_response_is_ok(&done_json) {
+            let err = done_json
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack files.completeUploadExternal failed: {err}");
+        }
+        Ok(())
+    }
+
+    /// Pull the upload URL and file id out of a `getUploadURLExternal` reply.
+    ///
+    /// Separated so the parsing is reachable from a test: the call around it
+    /// needs a workspace and a live token, and a missing field here is the
+    /// difference between an upload and a confusing failure two calls later.
+    pub(crate) fn upload_ticket(reply: &serde_json::Value) -> Option<(String, String)> {
+        let url = reply.get("upload_url").and_then(|u| u.as_str())?;
+        let id = reply.get("file_id").and_then(|i| i.as_str())?;
+        if url.trim().is_empty() || id.trim().is_empty() {
+            return None;
+        }
+        Some((url.to_string(), id.to_string()))
+    }
+
     async fn post_chunk(&self, message: &SendMessage, chunk: &str) -> anyhow::Result<()> {
         let mut body = serde_json::json!({
             "channel": message.recipient,
@@ -420,10 +554,46 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Attachments first: the markers must come out of the text before it is
+        // rendered, or they reach the reader as literal `[IMAGE:…]`.
+        let (text, attachments) =
+            crate::channels::media::parse_attachment_markers(&message.content);
+        if !attachments.is_empty() {
+            if !text.is_empty() {
+                self.send_text(&text, message).await?;
+            }
+            for attachment in &attachments {
+                self.send_attachment(message, attachment).await?;
+            }
+            return Ok(());
+        }
+
+        self.send_text(&message.content, message).await
+    }
+
+    /// Slack can deliver attachments, so the model is told the marker syntax.
+    /// Telling a channel that cannot leaks `[IMAGE:…]` to the reader as literal
+    /// text, which is why this is per-channel rather than a default.
+    fn delivery_instructions(&self) -> Option<&'static str> {
+        static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        Some(TEXT.get_or_init(|| crate::channels::media::delivery_instructions_for("Slack")))
+    }
+
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        self.listen_inner(tx, cancel).await
+    }
+}
+
+impl SlackChannel {
+    async fn send_text(&self, content: &str, message: &SendMessage) -> anyhow::Result<()> {
         // Render per-platform, then split without cutting a fenced block. The
         // whole reply used to go out in one request, so anything past Slack's
         // limit failed the entire send and the user got nothing at all.
-        let blocks = crate::channels::format::render(&message.content, &self.render_target());
+        let blocks = crate::channels::format::render(content, &self.render_target());
         let chunks = crate::channels::format::split_non_empty(&blocks, SLACK_MAX_MESSAGE_LENGTH);
 
         for (index, chunk) in chunks.iter().enumerate() {
@@ -436,7 +606,7 @@ impl Channel for SlackChannel {
         Ok(())
     }
 
-    async fn listen(
+    async fn listen_inner(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         cancel: tokio_util::sync::CancellationToken,
@@ -718,6 +888,132 @@ impl SlackChannel {
 }
 
 #[cfg(test)]
+mod outbound_media_tests {
+    use super::*;
+    use crate::channels::media::{parse_attachment_markers, AttachmentKind};
+
+    fn channel() -> SlackChannel {
+        SlackChannel::new("xoxb-test".into(), Some("C_CHAN".into()), vec!["*".into()])
+    }
+
+    /// Slack was the last tier channel that could not deliver an attachment,
+    /// and the model was never told the syntax because of it.
+    #[test]
+    fn slack_tells_the_model_the_marker_syntax() {
+        let text = channel()
+            .delivery_instructions()
+            .expect("slack can deliver attachments");
+        assert!(text.contains("Slack"), "{text}");
+        for marker in ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"] {
+            assert!(text.contains(marker), "missing {marker}: {text}");
+        }
+    }
+
+    /// One vocabulary across every delivering channel: a reply written on one
+    /// must not leak literal markers on another.
+    #[test]
+    fn slack_and_discord_teach_the_same_markers() {
+        let slack = channel().delivery_instructions().expect("slack");
+        let discord = crate::channels::discord::DiscordChannel::new(
+            "t".into(),
+            None,
+            vec!["*".into()],
+            false,
+            false,
+        )
+        .delivery_instructions()
+        .expect("discord");
+        let strip = |s: &str| {
+            s.replace("Slack", "<platform>")
+                .replace("Discord", "<platform>")
+        };
+        assert_eq!(
+            strip(slack),
+            strip(discord),
+            "the marker vocabulary must not fork per channel"
+        );
+    }
+
+    /// A marker becomes an upload and leaves the text clean, so the reader
+    /// never sees `[IMAGE:…]`.
+    #[test]
+    fn a_marker_is_split_off_and_the_text_stays_clean() {
+        let (text, attachments) =
+            parse_attachment_markers("here is the chart [IMAGE:/w/chart.png] enjoy");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, AttachmentKind::Image);
+        assert_eq!(attachments[0].target, "/w/chart.png");
+        assert!(
+            !text.contains("[IMAGE:"),
+            "the marker must not reach the reader: {text}"
+        );
+    }
+
+    /// The reserve call answers with the URL to `POST` to and the id to
+    /// complete with. A missing field here is the difference between an upload
+    /// and a confusing failure two calls later.
+    #[test]
+    fn an_upload_ticket_needs_both_the_url_and_the_file_id() {
+        let good = serde_json::json!({
+            "ok": true,
+            "upload_url": "https://files.slack.com/upload/v1/ABC",
+            "file_id": "F123"
+        });
+        assert_eq!(
+            SlackChannel::upload_ticket(&good),
+            Some((
+                "https://files.slack.com/upload/v1/ABC".to_string(),
+                "F123".to_string()
+            ))
+        );
+
+        for missing in [
+            serde_json::json!({ "ok": true, "file_id": "F123" }),
+            serde_json::json!({ "ok": true, "upload_url": "https://x/y" }),
+            serde_json::json!({ "ok": true, "upload_url": "", "file_id": "F123" }),
+            serde_json::json!({ "ok": true, "upload_url": "https://x/y", "file_id": "  " }),
+            serde_json::json!({ "ok": false, "error": "invalid_auth" }),
+        ] {
+            assert_eq!(
+                SlackChannel::upload_ticket(&missing),
+                None,
+                "an incomplete ticket must not be used: {missing}"
+            );
+        }
+    }
+
+    /// The confinement that stops a reply exfiltrating host files. A prompt
+    /// injection naming the config would otherwise upload provider keys and the
+    /// bot token into the channel.
+    #[test]
+    fn an_attachment_outside_the_workspace_is_refused() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+
+        let inside = workspace.path().join("ok.txt");
+        std::fs::write(&inside, b"fine").expect("write");
+        let secret = outside.path().join("config.toml");
+        std::fs::write(&secret, b"api_key = 'x'").expect("write");
+
+        assert!(crate::channels::media::path_within_workspace(
+            &inside,
+            workspace.path()
+        ));
+        assert!(
+            !crate::channels::media::path_within_workspace(&secret, workspace.path()),
+            "a file outside the workspace must be blocked"
+        );
+        assert!(
+            !crate::channels::media::path_within_workspace(
+                &workspace.path().join("..").join("config.toml"),
+                workspace.path()
+            ),
+            "a traversal must be blocked"
+        );
+    }
+}
+
+#[cfg(test)]
 mod media_tests {
     use super::*;
 
@@ -924,17 +1220,42 @@ mod tests {
     fn slack_send_routes_through_the_splitter() {
         let src = include_str!("slack.rs");
         let production = src.split("#[cfg(test)]").next().expect("source");
+
+        // One hop since outbound attachments split `send`: the text half moved
+        // to `send_text`, and the splitter moved with it. Follow the hop rather
+        // than dropping the assertion — a `send` that reaches neither is the
+        // regression this exists for.
         let send_body = production
             .split("async fn send(")
             .nth(1)
             .expect("send exists");
-        let split_at = send_body
-            .find("format::split_non_empty(")
-            .expect("send must route through format::split_non_empty");
         let next_fn = send_body.find("\n    async fn ").unwrap_or(send_body.len());
+        let send_only = &send_body[..next_fn];
         assert!(
-            split_at < next_fn,
-            "the split call must be inside send(), not a later function"
+            send_only.contains("self.send_text("),
+            "send() must delegate its text to send_text()"
+        );
+        // Mentioning `send_text` is not the same as routing through it: the
+        // attachment branch names it too, so a `send` that posted the plain
+        // path directly still satisfied the line above. Only `send_text` and
+        // `send_attachment` may reach the API from here.
+        let chunk_call = format!("self.post_{}(", "chunk");
+        assert!(
+            !send_only.contains(chunk_call.as_str()),
+            "send() must not post directly; the splitter lives behind send_text()"
+        );
+
+        let text_body = production
+            .split("async fn send_text(")
+            .nth(1)
+            .expect("send_text exists");
+        let split_at = text_body
+            .find("format::split_non_empty(")
+            .expect("send_text must route through format::split_non_empty");
+        let text_next = text_body.find("\n    async fn ").unwrap_or(text_body.len());
+        assert!(
+            split_at < text_next,
+            "the split call must be inside send_text(), not a later function"
         );
     }
 
