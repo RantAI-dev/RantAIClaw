@@ -252,6 +252,39 @@ Notes:
 - Model cache previews come from `rantaiclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
+## Outbound Media Markers
+
+A channel that can deliver attachments tells the model the marker syntax through
+`Channel::delivery_instructions()`. The model then writes one marker per
+attachment and the channel splits them out of the reply before sending:
+
+```text
+Here is the chart. [IMAGE:/workspace/chart.png]
+```
+
+`[IMAGE:…]`, `[DOCUMENT:…]`, `[VIDEO:…]`, `[AUDIO:…]` and `[VOICE:…]` all take a
+local path or an `http(s)` URL. One vocabulary for every channel, built by
+`media::delivery_instructions_for`, so a reply written on one channel does not
+leak literal markers on another.
+
+**Telegram and Discord can deliver attachments.** Every other channel returns
+`None` and is never told the syntax, because telling a channel that cannot
+deliver them leaks `[IMAGE:…]` to the reader as literal text.
+
+Rules that apply wherever a marker names a **local path**:
+
+- The file must exist and must resolve **inside the workspace**. Both sides are
+  canonicalised, so `../` cannot walk out, and an unresolvable path fails closed.
+- This is not tidiness. A reply is influenced by whoever is chatting, so a prompt
+  injection naming `~/.rantaiclaw/config.toml` would otherwise post provider keys
+  and the bot token into the chat. `media::path_within_workspace` is the one
+  implementation, and a class test fails if any channel's upload path stops
+  calling it.
+- An `http(s)` URL is passed to the platform instead of being re-uploaded.
+
+The per-sender media budget in `media.rs` is **inbound only**. Nothing counts
+outbound attachments today.
+
 ## Inbound Image Marker Protocol
 
 RantaiClaw supports multimodal input through inline message markers:

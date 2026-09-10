@@ -577,3 +577,136 @@ mod tests {
         );
     }
 }
+
+// ── Outbound attachments ────────────────────────────────────────────────────
+//
+// The marker vocabulary the model emits when it wants a file delivered, and the
+// rules for turning one into something safe to upload. Lifted out of
+// `telegram.rs` on 2026-09-10, when Discord became the second channel to need
+// it: the parsing and the workspace confinement were never Telegram-specific,
+// and a second copy of the confinement check is the last thing this should grow.
+
+/// What kind of attachment a marker asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+    Voice,
+}
+
+impl AttachmentKind {
+    /// Parse the marker tag. Aliases are accepted because the model writes what
+    /// it was told plus what it guesses.
+    #[must_use]
+    pub fn from_marker(marker: &str) -> Option<Self> {
+        match marker.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            "VOICE" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+}
+
+/// One attachment the model asked for: a kind and a path or URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachment {
+    pub kind: AttachmentKind,
+    pub target: String,
+}
+
+/// Is this target a remote URL rather than a local path?
+#[must_use]
+pub fn is_http_url(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
+/// Split a reply into the text a human reads and the attachments to upload.
+///
+/// A bracketed run that is not a valid marker is left in the text verbatim, so
+/// a model writing `[see attached]` does not lose it.
+#[must_use]
+pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some(open_rel) = message[cursor..].find('[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let open = cursor + open_rel;
+        cleaned.push_str(&message[cursor..open]);
+
+        let Some(close_rel) = message[open..].find(']') else {
+            cleaned.push_str(&message[open..]);
+            break;
+        };
+
+        let close = open + close_rel;
+        let marker = &message[open + 1..close];
+
+        let parsed = marker.split_once(':').and_then(|(kind, target)| {
+            let kind = AttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(OutboundAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[open..=close]);
+        }
+
+        cursor = close + 1;
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
+/// Is this local path inside the workspace?
+///
+/// A reply is influenced by whoever is chatting, and a prompt injection that
+/// names `~/.rantaiclaw/config.toml` would otherwise exfiltrate provider keys
+/// and bot tokens straight into the chat. Canonicalised on both sides so
+/// `../` cannot walk out, and **fails closed** when the path cannot be
+/// resolved. Mirrors the `file_*` tool sandbox.
+#[must_use]
+pub fn path_within_workspace(target: &std::path::Path, workspace: &std::path::Path) -> bool {
+    let Ok(canonical_target) = target.canonicalize() else {
+        return false;
+    };
+    let workspace_root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    canonical_target.starts_with(&workspace_root)
+}
+
+/// The marker syntax, phrased for one platform.
+///
+/// Kept as a builder rather than a per-channel constant so the vocabulary
+/// cannot drift into per-channel dialects — the model has to be told the same
+/// five markers everywhere, or a reply written for one channel leaks literal
+/// text on another.
+#[must_use]
+pub fn delivery_instructions_for(platform: &str) -> String {
+    format!(
+        "When responding on {platform}, include media markers for files or URLs that should be \
+         sent as attachments. Use one marker per attachment with this exact syntax: \
+         [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], \
+         [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside \
+         markers and never wrap markers in code fences."
+    )
+}
