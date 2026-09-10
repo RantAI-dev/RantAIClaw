@@ -41,37 +41,14 @@ fn decorate_continuation(chunk: &str, index: usize, total: usize) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TelegramAttachmentKind {
-    Image,
-    Document,
-    Video,
-    Audio,
-    Voice,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TelegramAttachment {
-    kind: TelegramAttachmentKind,
-    target: String,
-}
-
-impl TelegramAttachmentKind {
-    fn from_marker(marker: &str) -> Option<Self> {
-        match marker.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
-            _ => None,
-        }
-    }
-}
-
-fn is_http_url(target: &str) -> bool {
-    target.starts_with("http://") || target.starts_with("https://")
-}
+/// The shared marker vocabulary, aliased so this file reads unchanged.
+/// Lifted to `channels::media` when Discord became the second channel to
+/// deliver attachments; a second copy of the workspace check is the last thing
+/// this should grow.
+use crate::channels::media::{
+    is_http_url, parse_attachment_markers, AttachmentKind as TelegramAttachmentKind,
+    OutboundAttachment as TelegramAttachment,
+};
 
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
     let normalized = target
@@ -111,15 +88,6 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
 ///
 /// Fails closed: an unresolvable target (missing file, canonicalize error) is
 /// not sendable.
-fn attachment_path_within_workspace(target: &Path, workspace: &Path) -> bool {
-    let Ok(canonical_target) = target.canonicalize() else {
-        return false;
-    };
-    let workspace_root = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    canonical_target.starts_with(&workspace_root)
-}
 
 fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let trimmed = message.trim();
@@ -266,56 +234,13 @@ fn strip_tool_call_tags(message: &str) -> String {
     result.trim().to_string()
 }
 
-fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0;
-
-    while cursor < message.len() {
-        let Some(open_rel) = message[cursor..].find('[') else {
-            cleaned.push_str(&message[cursor..]);
-            break;
-        };
-
-        let open = cursor + open_rel;
-        cleaned.push_str(&message[cursor..open]);
-
-        let Some(close_rel) = message[open..].find(']') else {
-            cleaned.push_str(&message[open..]);
-            break;
-        };
-
-        let close = open + close_rel;
-        let marker = &message[open + 1..close];
-
-        let parsed = marker.split_once(':').and_then(|(kind, target)| {
-            let kind = TelegramAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(TelegramAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[open..=close]);
-        }
-
-        cursor = close + 1;
-    }
-
-    (cleaned.trim().to_string(), attachments)
-}
-
 /// Media-marker syntax, appended to the system prompt on this channel only.
 /// Telegram is the one channel that can actually deliver an attachment; telling
 /// the model otherwise elsewhere leaks markers as literal text.
-pub(crate) const TELEGRAM_DELIVERY_INSTRUCTIONS: &str = "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.";
+pub(crate) fn telegram_delivery_instructions() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| crate::channels::media::delivery_instructions_for("Telegram"))
+}
 
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
@@ -1547,7 +1472,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let (_config_path, workspace_dir) = Config::resolve_active_paths()
             .await
             .context("cannot resolve workspace to validate attachment path")?;
-        if !attachment_path_within_workspace(path, &workspace_dir) {
+        if !crate::channels::media::path_within_workspace(path, &workspace_dir) {
             anyhow::bail!(
                 "Telegram attachment path is outside the workspace and was blocked: {target}"
             );
@@ -1971,7 +1896,7 @@ impl Channel for TelegramChannel {
     }
 
     fn delivery_instructions(&self) -> Option<&'static str> {
-        Some(TELEGRAM_DELIVERY_INSTRUCTIONS)
+        Some(telegram_delivery_instructions())
     }
 
     fn render_target(&self) -> crate::channels::format::RenderTarget {
@@ -3049,7 +2974,10 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let file = workspace.path().join("report.pdf");
         std::fs::write(&file, b"data").unwrap();
-        assert!(attachment_path_within_workspace(&file, workspace.path()));
+        assert!(crate::channels::media::path_within_workspace(
+            &file,
+            workspace.path()
+        ));
     }
 
     #[test]
@@ -3060,7 +2988,10 @@ mod tests {
         std::fs::write(&secret, b"bot_token = \"secret\"").unwrap();
         // A reply containing [DOCUMENT:<secret>] must not read a file living
         // outside the workspace and upload it to the chat.
-        assert!(!attachment_path_within_workspace(&secret, workspace.path()));
+        assert!(!crate::channels::media::path_within_workspace(
+            &secret,
+            workspace.path()
+        ));
     }
 
     #[test]
@@ -3074,7 +3005,10 @@ mod tests {
         {
             std::os::unix::fs::symlink(&secret, &link).unwrap();
             // canonicalize resolves the symlink to its out-of-workspace target.
-            assert!(!attachment_path_within_workspace(&link, workspace.path()));
+            assert!(!crate::channels::media::path_within_workspace(
+                &link,
+                workspace.path()
+            ));
         }
     }
 
@@ -3082,7 +3016,7 @@ mod tests {
     fn attachment_path_within_workspace_fails_closed_on_missing_file() {
         let workspace = tempfile::tempdir().unwrap();
         let missing = workspace.path().join("does-not-exist");
-        assert!(!attachment_path_within_workspace(
+        assert!(!crate::channels::media::path_within_workspace(
             &missing,
             workspace.path()
         ));

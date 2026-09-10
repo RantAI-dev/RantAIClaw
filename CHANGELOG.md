@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Discord can now send attachments, which only Telegram could.**
+  `delivery_instructions()` was overridden by `telegram.rs` alone; the other fifteen channels took
+  the `None` default, so the model was never told how to ask for an attachment and never tried.
+  Outbound media was a Telegram feature by accident of who had been wired. Discord now advertises
+  the same five markers and uploads a local file multipart, or passes an `http(s)` URL through for
+  the platform to unfurl. The marker parsing, the URL test and the workspace confinement moved out
+  of `telegram.rs` into `channels::media` so there is one vocabulary and, more importantly, **one**
+  copy of the confinement check: a reply is influenced by whoever is chatting, and a prompt
+  injection naming the config file would otherwise post provider keys and the bot token into the
+  chat. A class test now fails if any channel's upload path stops calling it — added because
+  deleting that call from Discord's sender left every direct test of the helper green. Slack still
+  returns `None` and is still not told the syntax, which is the honest answer until its upload path
+  exists.
 - **WhatsApp Web could not see an image either, and its module header said otherwise.** The
   channel had no media path at all: `download`, `upload` and `ImageMessage` appeared nowhere in
   `whatsapp_web.rs`, and the only "media" mention was a comment on the HTTP client handed to the

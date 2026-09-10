@@ -377,9 +377,46 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Attachments first: the markers must come out of the text before it is
+        // rendered, or they reach the reader as literal `[IMAGE:…]`.
+        let (text, attachments) =
+            crate::channels::media::parse_attachment_markers(&message.content);
+        if !attachments.is_empty() {
+            if !text.is_empty() {
+                self.send_text(&text, message).await?;
+            }
+            for attachment in &attachments {
+                self.send_attachment(&message.recipient, attachment).await?;
+            }
+            return Ok(());
+        }
+
+        self.send_text(&message.content, message).await
+    }
+
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        self.listen_inner(tx, cancel).await
+    }
+
+    /// Discord can deliver attachments, so the model is told the marker syntax.
+    /// Telling a channel that cannot deliver them leaks `[IMAGE:…]` to the
+    /// reader as literal text, which is why this is per-channel and not a
+    /// default.
+    fn delivery_instructions(&self) -> Option<&'static str> {
+        static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        Some(TEXT.get_or_init(|| crate::channels::media::delivery_instructions_for("Discord")))
+    }
+}
+
+impl DiscordChannel {
+    async fn send_text(&self, content: &str, message: &SendMessage) -> anyhow::Result<()> {
         // Render per-platform, then split without cutting a code fence — replaces
         // the naive char-count splitter that could cut a fenced block in half.
-        let blocks = crate::channels::format::render(&message.content, &self.render_target());
+        let blocks = crate::channels::format::render(content, &self.render_target());
         let chunks = crate::channels::format::split_non_empty(&blocks, DISCORD_MAX_MESSAGE_LENGTH);
 
         for (i, chunk) in chunks.iter().enumerate() {
@@ -416,8 +453,92 @@ impl Channel for DiscordChannel {
         Ok(())
     }
 
+    /// Upload one attachment as a Discord message attachment.
+    ///
+    /// A remote URL is passed through as text: Discord unfurls it and the file
+    /// is already public, so re-uploading it would spend bandwidth to gain
+    /// nothing. A local path is uploaded multipart, and only from inside the
+    /// workspace — a reply is influenced by whoever is chatting, so a prompt
+    /// injection naming the config would otherwise post the bot token into the
+    /// channel. Same rule the Telegram path has always applied, now the same
+    /// code.
+    async fn send_attachment(
+        &self,
+        recipient: &str,
+        attachment: &crate::channels::media::OutboundAttachment,
+    ) -> anyhow::Result<()> {
+        let target = attachment.target.trim();
+        let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+
+        if crate::channels::media::is_http_url(target) {
+            let body = serde_json::json!({ "content": target });
+            let resp = self
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .json(&body)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                anyhow::bail!("Discord attachment link failed ({status})");
+            }
+            return Ok(());
+        }
+
+        let path = std::path::Path::new(target);
+        if !path.exists() {
+            anyhow::bail!("Discord attachment path not found: {target}");
+        }
+        let (_config_path, workspace_dir) = {
+            use anyhow::Context as _;
+            crate::config::Config::resolve_active_paths()
+                .await
+                .context("cannot resolve workspace to validate attachment path")?
+        };
+        if !crate::channels::media::path_within_workspace(path, &workspace_dir) {
+            anyhow::bail!(
+                "Discord attachment path is outside the workspace and was blocked: {target}"
+            );
+        }
+
+        let bytes = {
+            use anyhow::Context as _;
+            tokio::fs::read(path)
+                .await
+                .with_context(|| format!("cannot read attachment: {target}"))?
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", serde_json::json!({}).to_string())
+            .part("files[0]", part);
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .multipart(form)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord attachment upload failed ({status}): {err}");
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
-    async fn listen(
+    async fn listen_inner(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         cancel: tokio_util::sync::CancellationToken,
@@ -704,6 +825,122 @@ impl Channel for DiscordChannel {
             handle.abort();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod outbound_media_tests {
+    use super::*;
+    use crate::channels::media::{parse_attachment_markers, AttachmentKind};
+
+    fn channel() -> DiscordChannel {
+        DiscordChannel::new("token".into(), None, vec!["*".into()], false, false)
+    }
+
+    /// Discord can deliver attachments, so the model has to be told the syntax.
+    /// Until now `delivery_instructions()` was overridden by Telegram alone, so
+    /// the model was never told and never tried.
+    #[test]
+    fn discord_tells_the_model_the_marker_syntax() {
+        let text = channel()
+            .delivery_instructions()
+            .expect("discord can deliver attachments");
+        assert!(text.contains("Discord"), "{text}");
+        for marker in ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"] {
+            assert!(text.contains(marker), "missing {marker}: {text}");
+        }
+    }
+
+    /// One vocabulary, not a per-channel dialect: a reply written on one
+    /// channel must not leak literal markers on another.
+    #[test]
+    fn discord_and_telegram_teach_the_same_markers() {
+        let discord = channel().delivery_instructions().expect("discord");
+        let telegram = crate::channels::telegram::telegram_delivery_instructions();
+        let strip = |s: &str| {
+            s.replace("Discord", "<platform>")
+                .replace("Telegram", "<platform>")
+        };
+        assert_eq!(
+            strip(discord),
+            strip(telegram),
+            "the marker vocabulary must not fork per channel"
+        );
+    }
+
+    /// A marker becomes an attachment and leaves the text clean, so the reader
+    /// never sees `[IMAGE:…]`.
+    #[test]
+    fn a_marker_is_split_off_and_the_text_stays_clean() {
+        let (text, attachments) =
+            parse_attachment_markers("here is the chart [IMAGE:/w/chart.png] enjoy");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, AttachmentKind::Image);
+        assert_eq!(attachments[0].target, "/w/chart.png");
+        assert!(
+            !text.contains("[IMAGE:"),
+            "the marker must not reach the reader: {text}"
+        );
+        assert!(text.contains("here is the chart"), "{text}");
+    }
+
+    /// No markers means no uploads, and the text is untouched.
+    #[test]
+    fn plain_text_produces_no_attachments() {
+        let (text, attachments) = parse_attachment_markers("just a normal reply");
+        assert!(attachments.is_empty());
+        assert_eq!(text, "just a normal reply");
+    }
+
+    /// Bracketed text that is not a marker stays in the message rather than
+    /// vanishing.
+    #[test]
+    fn a_bracketed_non_marker_is_left_alone() {
+        let (text, attachments) = parse_attachment_markers("see [the attached] file");
+        assert!(attachments.is_empty());
+        assert!(text.contains("[the attached]"), "{text}");
+    }
+
+    /// The confinement that stops a reply exfiltrating host files. A prompt
+    /// injection naming the config would otherwise post provider keys and the
+    /// bot token into the channel.
+    #[test]
+    fn an_attachment_outside_the_workspace_is_refused() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+
+        let inside_file = workspace.path().join("ok.txt");
+        std::fs::write(&inside_file, b"fine").expect("write");
+        let outside_file = outside.path().join("secret.toml");
+        std::fs::write(&outside_file, b"api_key = 'x'").expect("write");
+
+        assert!(
+            crate::channels::media::path_within_workspace(&inside_file, workspace.path()),
+            "a file in the workspace is allowed"
+        );
+        assert!(
+            !crate::channels::media::path_within_workspace(&outside_file, workspace.path()),
+            "a file outside the workspace must be blocked"
+        );
+        // `../` cannot walk out either, because both sides are canonicalised.
+        let traversal = workspace
+            .path()
+            .join("..")
+            .join(outside_file.file_name().expect("name"));
+        assert!(
+            !crate::channels::media::path_within_workspace(&traversal, workspace.path()),
+            "a traversal must be blocked"
+        );
+    }
+
+    /// A path that does not resolve fails closed rather than open.
+    #[test]
+    fn a_path_that_cannot_be_resolved_is_refused() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(!crate::channels::media::path_within_workspace(
+            &workspace.path().join("does-not-exist"),
+            workspace.path()
+        ));
     }
 }
 

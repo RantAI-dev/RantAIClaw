@@ -22,11 +22,27 @@ fn delivery_instructions_default_is_none() {
         "a channel that cannot deliver media must not claim it can"
     );
 
+    // Discord gained this in the outbound-media work; Slack has not, so its
+    // `None` above is the honest answer rather than an oversight.
+    let discord = crate::channels::discord::DiscordChannel::new(
+        "t".into(),
+        None,
+        vec!["*".into()],
+        false,
+        false,
+    );
+    assert!(
+        discord
+            .delivery_instructions()
+            .is_some_and(|t| t.contains("[IMAGE:")),
+        "Discord can deliver attachments and must say so"
+    );
+
     let telegram =
         crate::channels::telegram::TelegramChannel::new("t".into(), vec!["*".into()], false);
     let instructions = telegram
         .delivery_instructions()
-        .expect("Telegram is the channel that can deliver media");
+        .expect("Telegram can deliver media");
     assert!(instructions.contains("[IMAGE:"));
 
     // Behaviour-preserving: the prompt is assembled exactly as the central
@@ -112,7 +128,9 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
             include_str!("discord.rs"),
             "fn classify_inbound(",
             "self.is_user_allowed(",
-            &["self.classify_inbound("],
+            // Two hops since outbound attachments split `send`: `listen` now
+            // delegates to `listen_inner`, which is where the gate is reached.
+            &["self.listen_inner(", "self.classify_inbound("],
         ),
         (
             "imessage",
@@ -734,7 +752,7 @@ impl Channel for TelegramRecordingChannel {
     // impl now, not from a `match` on its name, so a stub that claims the
     // name must also claim the capability.
     fn delivery_instructions(&self) -> Option<&'static str> {
-        Some(crate::channels::telegram::TELEGRAM_DELIVERY_INSTRUCTIONS)
+        Some(crate::channels::telegram::telegram_delivery_instructions())
     }
 
     fn name(&self) -> &str {
@@ -5714,6 +5732,52 @@ fn every_tier_channel_with_inbound_media_charges_the_shared_budget() {
             gates.iter().any(|g| body.contains(g.as_str())),
             "{channel}: `{collector}` downloads inbound media without going \
              through the shared budget gate"
+        );
+    }
+}
+
+/// Every channel that uploads a local file must confine it to the workspace.
+///
+/// A reply is influenced by whoever is chatting, so a prompt injection naming
+/// `~/.rantaiclaw/config.toml` would post provider keys and the bot token into
+/// the chat. Telegram has always checked; Discord is the second channel to
+/// upload, and a third will come.
+///
+/// This is a class guard because testing `path_within_workspace` directly does
+/// **not** catch the failure that matters: deleting the *call* from a send path
+/// leaves every such test green. Verified by mutation — that is how this guard
+/// came to exist.
+#[test]
+fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
+    // Assembled at runtime so this test does not match itself.
+    let confine = format!("media::path_within_{}(", "workspace");
+    let wiring: &[(&str, &str, &str)] = &[
+        (
+            "telegram",
+            include_str!("telegram.rs"),
+            "async fn send_attachment(",
+        ),
+        (
+            "discord",
+            include_str!("discord.rs"),
+            "async fn send_attachment(",
+        ),
+    ];
+
+    for (channel, src, sender) in wiring {
+        let at = src.find(sender).unwrap_or_else(|| {
+            panic!("{channel}: `{sender}` is gone — the upload path moved, update this guard")
+        });
+        let body = &src[at..];
+        let end = body[1..]
+            .find("\n    async fn ")
+            .or_else(|| body[1..].find("\n    fn "))
+            .map_or(body.len(), |i| i + 1);
+        let body = &body[..end];
+        assert!(
+            body.contains(confine.as_str()),
+            "{channel}: `{sender}` uploads a local path without confining it to \
+             the workspace — a reply could exfiltrate the config"
         );
     }
 }
