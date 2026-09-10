@@ -237,7 +237,7 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 
 ## In-Chat Runtime Model Switching (Telegram / Discord)
 
-When running `rantaiclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
+When running `rantaiclaw channel start` (or daemon mode), Telegram and Discord support runtime switching, scoped to the conversation:
 
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current conversation. In a group that applies to everyone in it
@@ -246,7 +246,7 @@ When running `rantaiclaw channel start` (or daemon mode), Telegram and Discord n
 
 Notes:
 
-- Switching clears only that sender's in-memory conversation history to avoid cross-model context contamination.
+- Switching clears that conversation's history to avoid cross-model context contamination, in memory and in the persisted store. In a group that clears the history everyone there shares.
 - Model cache previews come from `rantaiclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
