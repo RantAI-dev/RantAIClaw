@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The reason recorded for skipping Slack's "working" indicator turned out to be wrong.** The
+  2026-09-09 note said `agents.sessions.setStatus` could be skipped because draft streaming would
+  give the same signal without an app change. Draft streaming is gated on `stream_mode`, and that
+  key exists exactly once in the schema, on `TelegramConfig` — so Slack has neither, and the note
+  pointed at a substitute that does not exist. The channels reference now says which channels
+  stream drafts, that the blocker is a per-channel config key rather than platform support, and
+  what a WhatsApp Web implementation would cost: the throttle default is one edit per second and a
+  turn may run to `message_timeout_secs` = 600 scaling 4× with depth, so 600 to 2,400 edits for one
+  reply, against a platform that marks every edit "Edited" and only allows them for 15 minutes.
 - **WhatsApp Web can send attachments now**, which leaves Slack as the only tier channel that
   cannot. The same five markers every delivering channel uses, the same shared parsing, and the
   same workspace confinement: a reply is influenced by whoever is chatting, so a local path is read
