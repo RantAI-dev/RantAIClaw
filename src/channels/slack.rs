@@ -5,6 +5,8 @@ use std::sync::{Arc, RwLock};
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
     bot_token: String,
+    /// `[multimodal]` defaults; the factory overrides it with the operator's.
+    multimodal: crate::config::MultimodalConfig,
     channel_id: Option<String>,
     /// App-level token (`xapp-`). Present means Socket Mode; absent means the
     /// polling transport. The schema has documented this key as Socket Mode
@@ -93,7 +95,13 @@ impl SlackChannel {
             };
         }
 
-        if text.is_empty() || ts <= last_ts {
+        // A photo posted with no caption has empty `text` and is still a
+        // message. Only treat it as empty when it carries no files either.
+        let has_files = msg
+            .get("files")
+            .and_then(|f| f.as_array())
+            .is_some_and(|f| !f.is_empty());
+        if (text.is_empty() && !has_files) || ts <= last_ts {
             return SlackInbound::EmptyOrSeen;
         }
 
@@ -132,13 +140,22 @@ impl SlackChannel {
         // network, which is why it stays here.
         let (user, text, ts) = match self.classify_inbound(msg, bot_user_id, last_ts, channel_id) {
             SlackInbound::Own | SlackInbound::EmptyOrSeen => return InboundOutcome::Continue,
-            SlackInbound::Deliver(channel_msg) => {
+            SlackInbound::Deliver(mut channel_msg) => {
                 *last_ts = channel_msg
                     .id
                     .rsplit('_')
                     .next()
                     .unwrap_or_default()
                     .to_string();
+                // Downloads need the network, which is why they happen here and
+                // not in `classify_inbound`.
+                let markers = self.file_markers(msg, &channel_msg.sender).await;
+                if !markers.is_empty() {
+                    if !channel_msg.content.is_empty() {
+                        channel_msg.content.push('\n');
+                    }
+                    channel_msg.content.push_str(&markers.join("\n"));
+                }
                 if tx.send(channel_msg).await.is_err() {
                     return InboundOutcome::ReceiverGone;
                 }
@@ -232,10 +249,81 @@ impl SlackChannel {
     pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
         Self {
             bot_token,
+            multimodal: crate::config::MultimodalConfig::default(),
             channel_id,
             app_token: None,
             allowed_users: Arc::new(RwLock::new(allowed_users)),
         }
+    }
+
+    /// Apply the operator's `[multimodal]` limits to inbound images.
+    #[must_use]
+    pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
+        self.multimodal = multimodal;
+        self
+    }
+
+    /// Slack hosts uploaded files behind `url_private`, which needs the bot
+    /// token. That makes this different from Discord, whose CDN links are
+    /// pre-authorised and which therefore sends no credential at all.
+    ///
+    /// The URL comes out of the event payload, so the host is attacker-chosen
+    /// in the sense that matters: a crafted event naming an external host would
+    /// walk the bot token straight off the workspace. The token goes only to
+    /// hosts Slack actually serves files from.
+    fn is_slack_file_host(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if parsed.scheme() != "https" {
+            return false;
+        }
+        parsed
+            .host_str()
+            .is_some_and(|h| h == "slack.com" || h.ends_with(".slack.com"))
+    }
+
+    /// One marker per inbound file: an `[IMAGE:…]` for anything that survives
+    /// the shared policy, a visible note for anything that does not. Never
+    /// silent — a user who sent a screenshot and got no answer cannot tell a
+    /// policy rejection from a bug.
+    async fn file_markers(&self, message: &serde_json::Value, sender: &str) -> Vec<String> {
+        let Some(files) = message.get("files").and_then(|f| f.as_array()) else {
+            return Vec::new();
+        };
+        let (max_images, _) = self.multimodal.effective_limits();
+        let cap = crate::channels::media::max_bytes(&self.multimodal);
+        let client = self.http_client();
+        let sender_key = format!("slack:{sender}");
+
+        let mut markers = Vec::new();
+        for file in files.iter().take(max_images) {
+            let Some(url) = file.get("url_private").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            if !Self::is_slack_file_host(url) {
+                tracing::warn!("Slack: refusing to send the bot token to a non-Slack file host");
+                markers.push(
+                    crate::channels::media::MediaOutcome::Rejected(
+                        "Attachment rejected: the file is not hosted by Slack".into(),
+                    )
+                    .to_marker(),
+                );
+                continue;
+            }
+            let claimed = file.get("mimetype").and_then(|c| c.as_str());
+            let outcome = crate::channels::media::fetch_image(
+                &client,
+                url,
+                Some(&self.bot_token),
+                claimed,
+                cap,
+                &sender_key,
+            )
+            .await;
+            markers.push(outcome.to_marker());
+        }
+        markers
     }
 
     /// Supply the app-level token, which selects Socket Mode.
@@ -496,8 +584,14 @@ impl SlackChannel {
             return None;
         }
         // Edits, deletions and joins arrive as `message` with a subtype. None of
-        // them is someone talking to the bot.
-        if event.get("subtype").is_some() {
+        // them is someone talking to the bot — except `file_share`, which is
+        // how Slack delivers a message that carries an upload. Dropping every
+        // subtype meant a photo with a caption was discarded whole, so the bot
+        // did not merely miss the image, it never answered at all.
+        if !matches!(
+            event.get("subtype").and_then(serde_json::Value::as_str),
+            None | Some("file_share")
+        ) {
             return None;
         }
         if let Some(want) = only_channel.filter(|c| !c.trim().is_empty()) {
@@ -620,6 +714,143 @@ impl SlackChannel {
             return false;
         };
         Self::api_response_is_ok(&body)
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+
+    fn channel() -> SlackChannel {
+        SlackChannel::new("xoxb-test".into(), Some("C_CHAN".into()), vec!["*".into()])
+    }
+
+    /// Slack delivers an upload as `message` with `subtype: "file_share"`.
+    /// Dropping every subtype meant a captioned screenshot was discarded whole,
+    /// so the bot did not answer at all — a worse symptom than the missing
+    /// image this plan set out to fix.
+    #[test]
+    fn a_file_share_event_is_a_message_and_the_other_subtypes_are_not() {
+        let envelope = |subtype: serde_json::Value| {
+            serde_json::json!({
+                "type": "events_api",
+                "payload": { "event": {
+                    "type": "message", "subtype": subtype,
+                    "channel": "C_CHAN", "user": "U1", "text": "look",
+                    "ts": "1700000001.000100"
+                }}
+            })
+        };
+        assert!(
+            SlackChannel::socket_event_message(&envelope(serde_json::json!("file_share")), None)
+                .is_some(),
+            "an upload must reach the agent"
+        );
+        for ignored in ["message_changed", "message_deleted", "channel_join"] {
+            assert!(
+                SlackChannel::socket_event_message(&envelope(serde_json::json!(ignored)), None)
+                    .is_none(),
+                "{ignored} is not someone talking to the bot"
+            );
+        }
+    }
+
+    /// A photo posted with no caption has empty `text`. Keying "is this a
+    /// message" on text alone dropped it.
+    #[test]
+    fn an_upload_with_no_caption_is_still_delivered() {
+        let ch = channel();
+        let msg = serde_json::json!({
+            "user": "U1", "text": "", "ts": "1700000001.000100",
+            "files": [{ "url_private": "https://files.slack.com/f/x.png", "mimetype": "image/png" }]
+        });
+        assert!(
+            matches!(
+                ch.classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+                SlackInbound::Deliver(_)
+            ),
+            "an image with no caption is still a message"
+        );
+
+        // Still empty when there is genuinely nothing.
+        let bare = serde_json::json!({ "user": "U1", "text": "", "ts": "1700000001.000100" });
+        assert!(matches!(
+            ch.classify_inbound(&bare, "U_BOT", "", "C_CHAN"),
+            SlackInbound::EmptyOrSeen
+        ));
+    }
+
+    /// The bot token is a workspace credential and the file URL comes out of
+    /// the event payload. A crafted event naming an external host would walk
+    /// the token off the workspace, so the host is checked before the token is
+    /// attached. Discord has no equivalent because its CDN links carry no
+    /// credential at all.
+    #[test]
+    fn the_bot_token_only_goes_to_slack_file_hosts() {
+        for good in [
+            "https://files.slack.com/files-pri/T1-F1/x.png",
+            "https://slack.com/files-pri/x.png",
+        ] {
+            assert!(SlackChannel::is_slack_file_host(good), "{good}");
+        }
+        for bad in [
+            "https://files.slack.com.evil.test/x.png",
+            "https://evil.test/x.png",
+            "http://files.slack.com/x.png",
+            "https://notslack.com/x.png",
+            "not a url",
+        ] {
+            assert!(
+                !SlackChannel::is_slack_file_host(bad),
+                "the token must not be sent to {bad}"
+            );
+        }
+    }
+
+    /// A file on a host Slack does not serve becomes a visible note rather than
+    /// silence, and no token is sent to fetch it.
+    #[tokio::test]
+    async fn a_file_on_a_foreign_host_is_refused_with_a_note() {
+        let ch = channel();
+        let msg = serde_json::json!({
+            "files": [{ "url_private": "https://evil.test/x.png", "mimetype": "image/png" }]
+        });
+        let markers = ch.file_markers(&msg, "U1").await;
+        assert_eq!(markers.len(), 1, "the refusal must be visible: {markers:?}");
+        assert!(
+            markers[0].contains("not hosted by Slack"),
+            "the note must say why: {markers:?}"
+        );
+    }
+
+    /// The operator's `[multimodal]` cap decides how many images are fetched,
+    /// not a number this channel invented.
+    #[tokio::test]
+    async fn no_more_files_are_fetched_than_the_operator_allows() {
+        let mut multimodal = crate::config::MultimodalConfig::default();
+        multimodal.max_images = 1;
+        let ch = channel().with_multimodal(multimodal);
+        let msg = serde_json::json!({
+            "files": [
+                { "url_private": "https://evil.test/a.png", "mimetype": "image/png" },
+                { "url_private": "https://evil.test/b.png", "mimetype": "image/png" }
+            ]
+        });
+        let markers = ch.file_markers(&msg, "U1").await;
+        assert_eq!(
+            markers.len(),
+            1,
+            "the second file is over the cap: {markers:?}"
+        );
+    }
+
+    /// No `files` array at all must produce nothing, not an empty marker that
+    /// would read to the model as a failed attachment.
+    #[tokio::test]
+    async fn a_message_without_files_produces_no_markers() {
+        let ch = channel();
+        let msg = serde_json::json!({ "text": "just words" });
+        assert!(ch.file_markers(&msg, "U1").await.is_empty());
     }
 }
 

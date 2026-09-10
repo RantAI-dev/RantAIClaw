@@ -5643,3 +5643,72 @@ done
         "the MCP server's tool must be in the channel registry (issue #283); got {names:?}"
     );
 }
+
+/// Every tier channel that can receive an image must charge the shared media
+/// budget on its inbound path.
+///
+/// Modelled on `every_channel_listen_path_calls_its_allowlist_gate`, which
+/// caught a real regression on 2026-09-09. Without a class-level rule the sixth
+/// channel is born tomorrow with no gate, which is how Slack and WhatsApp Web
+/// reached the supported tier with zero occurrences of `media::` between them:
+/// one big image would otherwise spend nothing from a budget the other channels
+/// all pay into.
+///
+/// `media::fetch_image` and `fetch_image_bytes` both call `charge` internally,
+/// so naming either counts — what must not happen is a channel downloading
+/// bytes into the model's context without passing through this module at all.
+#[test]
+fn every_tier_channel_with_inbound_media_charges_the_shared_budget() {
+    // Assembled at runtime so this test does not match itself. These are the
+    // entry points that actually spend the budget — `fetch_image` and
+    // `fetch_image_bytes` call `charge` internally. Matching the module path
+    // instead is not enough: `media::MediaOutcome` satisfies it while the
+    // download goes ungated, which is exactly how the first version of this
+    // guard passed under the mutation it exists to catch.
+    let gates = [
+        format!("media::{}(", "fetch_image"),
+        format!("media::{}(", "fetch_image_bytes"),
+        format!("media::{}(", "charge"),
+    ];
+    let wiring: &[(&str, &str, &str)] = &[
+        (
+            "telegram",
+            include_str!("telegram.rs"),
+            "fn resolve_photo_marker",
+        ),
+        (
+            "discord",
+            include_str!("discord.rs"),
+            "fn attachment_markers",
+        ),
+        ("slack", include_str!("slack.rs"), "fn file_markers"),
+        (
+            "whatsapp (cloud)",
+            include_str!("whatsapp.rs"),
+            "fn resolve_media",
+        ),
+    ];
+
+    for (channel, src, collector) in wiring {
+        let at = src.find(collector).unwrap_or_else(|| {
+            panic!("{channel}: `{collector}` is gone — the inbound media path moved, update this guard")
+        });
+        // The gate must be inside the collector, not merely somewhere in the
+        // file: a `use` line or a test would satisfy a whole-file search.
+        // Slice to the end of this function. Collectors are `async fn`, so a
+        // marker of `"\n    fn "` never matches and the body runs to EOF,
+        // letting an unrelated call elsewhere in the file satisfy the check.
+        let body = &src[at..];
+        let end = body[1..]
+            .find("\n    async fn ")
+            .or_else(|| body[1..].find("\n    fn "))
+            .or_else(|| body[1..].find("\n    pub "))
+            .map_or(body.len(), |i| i + 1);
+        let body = &body[..end];
+        assert!(
+            gates.iter().any(|g| body.contains(g.as_str())),
+            "{channel}: `{collector}` downloads inbound media without going \
+             through the shared budget gate"
+        );
+    }
+}

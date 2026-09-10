@@ -267,13 +267,21 @@ Operational notes:
 - Marker parsing applies to user-role messages before provider calls.
 - Provider capability is enforced at runtime: if the selected provider does not support vision, the request fails with a structured capability error (`capability=vision`).
 - Linq webhook `media` parts with `image/*` MIME type are automatically converted to this marker format.
-- **Discord, Telegram, WhatsApp Cloud, Linq and Email accept inbound images.** An
+- **Discord, Telegram, Slack, WhatsApp Cloud, Linq and Email accept inbound images.** An
   attachment is fetched, its type is sniffed from the bytes (the sender's claimed
   MIME is only an early filter), and it is embedded as a `data:` URI — nothing is
   written to disk. Over the `[multimodal].max_image_size_mb` cap, an unsupported
   type, or a failed fetch produces a **visible note** in the message rather than
   silence. Full rules:
   [inbound media policy](../security/inbound-media-policy.md).
+- **Slack sends its bot token to fetch an upload**, because `url_private` is
+  authenticated. The URL comes out of the event payload, so the token goes only
+  to `slack.com` and its subdomains over HTTPS; a file named on any other host
+  becomes a visible note and no credential is sent. Discord needs no equivalent
+  because its CDN links are pre-authorised and carry no token.
+- **WhatsApp Web does not yet accept inbound images.** The channel has no media
+  path at all; the module header's "Full Baileys parity (… media …)" describes
+  the `wa-rs` library, not this integration.
 - **Inbound images are budgeted per sender**: 20 images per 10 minutes, counted
   per channel-qualified sender and charged *before* the download. Past it, the
   attachment becomes a note naming the wait. Not a config key — the constants
