@@ -86,3 +86,183 @@ fn migrate_is_idempotent_post_stamp() {
         "re-running migrate on a stamped config must be a no-op"
     );
 }
+
+// ── v32: WhatsApp Web gets its own table ────────────────────────────────────
+//
+// These three carry the risk of the v32 bump. The owner's own config is the
+// first case — `session_path` set, no `phone_number_id` — so this migration
+// runs on a real machine on first launch after the upgrade.
+
+/// Build a v31 config whose `[channels_config.whatsapp]` holds `keys`.
+fn v31_with_whatsapp(keys: &str) -> toml::Value {
+    let toml_src = format!(
+        "schema_version = 31\n\n[channels_config.whatsapp]\n{keys}\n",
+        keys = keys
+    );
+    toml::from_str(&toml_src).expect("fixture parses")
+}
+
+fn table<'a>(v: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+    let mut cur = v;
+    for seg in path {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// Case 1, the owner's own config: Web keys only.
+///
+/// The Web keys move to the new table and the Cloud table goes away entirely,
+/// rather than being left behind empty — an empty `[channels_config.whatsapp]`
+/// would make `channel_is_configured("whatsapp")` answer yes for a transport
+/// that cannot run.
+#[test]
+fn v32_moves_a_web_only_config_into_its_own_table() {
+    let mut v = v31_with_whatsapp(
+        "session_path = \"/home/rantaiclaw_user/.rantaiclaw/wa.db\"\n\
+         pair_phone = \"15551234567\"\n\
+         allowed_numbers = [\"+15550000001\"]",
+    );
+    migrate(&mut v).expect("migrate runs");
+
+    let web = table(&v, &["channels_config", "whatsapp_web"]).expect("web table created");
+    assert_eq!(
+        web.get("session_path").and_then(toml::Value::as_str),
+        Some("/home/rantaiclaw_user/.rantaiclaw/wa.db"),
+        "the session path must survive the move"
+    );
+    assert_eq!(
+        web.get("pair_phone").and_then(toml::Value::as_str),
+        Some("15551234567")
+    );
+    assert_eq!(
+        web.get("allowed_numbers")
+            .and_then(toml::Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "the allowlist must follow the transport that reads it"
+    );
+    assert!(
+        table(&v, &["channels_config", "whatsapp"]).is_none(),
+        "an empty Cloud table must not be left behind: {v:?}"
+    );
+
+    let cfg: Result<Config, _> = v.try_into();
+    assert!(cfg.is_ok(), "migrated config must load: {:?}", cfg.err());
+}
+
+/// Case 2: both transports in the old table. Nothing the operator wrote is
+/// dropped — both tables exist afterwards, each with its own keys.
+#[test]
+fn v32_splits_a_dual_transport_config_into_both_tables() {
+    let mut v = v31_with_whatsapp(
+        "access_token = \"cloud-token\"\n\
+         phone_number_id = \"1234567890\"\n\
+         verify_token = \"verify\"\n\
+         session_path = \"/var/lib/rantaiclaw/wa.db\"\n\
+         pair_code = \"ABCD1234\"\n\
+         allowed_numbers = [\"*\"]",
+    );
+    migrate(&mut v).expect("migrate runs");
+
+    let cloud = table(&v, &["channels_config", "whatsapp"]).expect("cloud table kept");
+    assert_eq!(
+        cloud.get("access_token").and_then(toml::Value::as_str),
+        Some("cloud-token")
+    );
+    assert_eq!(
+        cloud.get("phone_number_id").and_then(toml::Value::as_str),
+        Some("1234567890")
+    );
+    assert!(
+        cloud.get("session_path").is_none() && cloud.get("pair_code").is_none(),
+        "Web keys must not be left in the Cloud table: {cloud:?}"
+    );
+
+    let web = table(&v, &["channels_config", "whatsapp_web"]).expect("web table created");
+    assert_eq!(
+        web.get("session_path").and_then(toml::Value::as_str),
+        Some("/var/lib/rantaiclaw/wa.db")
+    );
+    assert_eq!(
+        web.get("pair_code").and_then(toml::Value::as_str),
+        Some("ABCD1234")
+    );
+    assert_eq!(
+        web.get("allowed_numbers")
+            .and_then(toml::Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "allowed_numbers is copied, not moved: both transports read it"
+    );
+    assert_eq!(
+        cloud
+            .get("allowed_numbers")
+            .and_then(toml::Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "the Cloud table must keep the allowlist it already had"
+    );
+
+    let cfg: Result<Config, _> = v.try_into();
+    assert!(cfg.is_ok(), "migrated config must load: {:?}", cfg.err());
+}
+
+/// Case 3: Cloud only. Nothing moves and no Web table appears — a v32 config
+/// that invented an empty `[channels_config.whatsapp_web]` would report a
+/// channel the operator never asked for.
+#[test]
+fn v32_leaves_a_cloud_only_config_alone() {
+    let mut v = v31_with_whatsapp(
+        "access_token = \"cloud-token\"\n\
+         phone_number_id = \"1234567890\"\n\
+         verify_token = \"verify\"\n\
+         allowed_numbers = [\"+15550000001\"]",
+    );
+    migrate(&mut v).expect("migrate runs");
+
+    let cloud = table(&v, &["channels_config", "whatsapp"]).expect("cloud table kept");
+    assert_eq!(
+        cloud.get("access_token").and_then(toml::Value::as_str),
+        Some("cloud-token")
+    );
+    assert!(
+        table(&v, &["channels_config", "whatsapp_web"]).is_none(),
+        "no Web table may be invented for a Cloud-only operator: {v:?}"
+    );
+
+    let cfg: Result<Config, _> = v.try_into();
+    assert!(cfg.is_ok(), "migrated config must load: {:?}", cfg.err());
+}
+
+/// The version the migration chain claims to reach. If this drifts from
+/// `CURRENT_VERSION` the three cases above are testing a migration nobody runs.
+#[test]
+fn v32_is_the_current_version() {
+    assert_eq!(CURRENT_VERSION, 32);
+    let mut v = v31_with_whatsapp("session_path = \"/tmp/wa.db\"");
+    migrate(&mut v).expect("migrate runs");
+    assert_eq!(
+        v.get(SCHEMA_VERSION_KEY).and_then(toml::Value::as_integer),
+        Some(32),
+        "the migrated config must be stamped with the version it reached"
+    );
+}
+
+/// A v31 Web config that never listed an allowlist must land fail-closed.
+///
+/// The migration copies `allowed_numbers` when it exists; when it does not, the
+/// new table must default to deny-all rather than inheriting anything wider.
+#[test]
+fn v32_leaves_a_web_config_without_an_allowlist_denying_everyone() {
+    let mut v = v31_with_whatsapp("session_path = \"/tmp/wa.db\"");
+    migrate(&mut v).expect("migrate runs");
+
+    let cfg: Config = v.try_into().expect("migrated config loads");
+    let web = cfg.channels_config.whatsapp_web.expect("web table created");
+    assert!(
+        web.allowed_numbers.is_empty(),
+        "an absent allowlist must stay empty, not become a wildcard: {:?}",
+        web.allowed_numbers
+    );
+}

@@ -2809,8 +2809,10 @@ pub struct ChannelsConfig {
     pub matrix: Option<MatrixConfig>,
     /// Signal channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub signal: Option<SignalConfig>,
-    /// WhatsApp channel configuration (Cloud API or Web mode). Support: **supported**. Verification: **not yet verified**.
+    /// WhatsApp Cloud API channel configuration. Support: **supported**. Verification: **not yet verified**.
     pub whatsapp: Option<WhatsAppConfig>,
+    /// WhatsApp Web channel configuration. Support: **supported**. Verification: **not yet verified**.
+    pub whatsapp_web: Option<WhatsAppWebConfig>,
     /// Linq Partner API channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub linq: Option<LinqConfig>,
     /// Nextcloud Talk bot channel configuration. Support: **under development**. Verification: **not yet verified**.
@@ -2913,6 +2915,7 @@ impl Default for ChannelsConfig {
             matrix: None,
             signal: None,
             whatsapp: None,
+            whatsapp_web: None,
             linq: None,
             nextcloud_talk: None,
             email: None,
@@ -3091,36 +3094,46 @@ pub struct SignalConfig {
     pub ignore_stories: bool,
 }
 
-/// WhatsApp channel configuration (Cloud API or Web mode).
+/// WhatsApp Cloud API channel configuration.
 ///
-/// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
+/// Web mode moved to [`WhatsAppWebConfig`] in schema v32. Before that both
+/// transports shared this table and the mode was inferred from which keys
+/// happened to be filled, which meant the product guessed at something the
+/// operator was never asked to state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WhatsAppConfig {
-    /// Access token from Meta Business Suite (Cloud API mode)
+    /// Access token from Meta Business Suite
     #[serde(default)]
     pub access_token: Option<String>,
-    /// Phone number ID from Meta Business API (Cloud API mode)
+    /// Phone number ID from Meta Business API
     #[serde(default)]
     pub phone_number_id: Option<String>,
     /// Webhook verify token (you define this, Meta sends it back for verification)
-    /// Only used in Cloud API mode
     #[serde(default)]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
     /// Can also be set via `RANTAICLAW_WHATSAPP_APP_SECRET` environment variable
-    /// Only used in Cloud API mode
     #[serde(default)]
     pub app_secret: Option<String>,
-    /// Session database path for WhatsApp Web client (Web mode)
-    /// When set, enables native WhatsApp Web mode with wa-rs
+    /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
-    pub session_path: Option<String>,
-    /// Phone number for pair code linking (Web mode, optional)
+    pub allowed_numbers: Vec<String>,
+}
+
+/// WhatsApp Web channel configuration (native client, QR or pair-code linking).
+///
+/// Split out of [`WhatsAppConfig`] in schema v32. Writing this table is how an
+/// operator selects Web mode; there is no mode key and nothing is inferred.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WhatsAppWebConfig {
+    /// Session database path for the WhatsApp Web client
+    pub session_path: String,
+    /// Phone number for pair code linking (optional)
     /// Format: country code + number (e.g., "15551234567")
     /// If not set, QR code pairing will be used
     #[serde(default)]
     pub pair_phone: Option<String>,
-    /// Custom pair code for linking (Web mode, optional)
+    /// Custom pair code for linking (optional)
     /// Leave empty to let WhatsApp generate one
     #[serde(default)]
     pub pair_code: Option<String>,
@@ -3163,32 +3176,12 @@ pub struct NextcloudTalkConfig {
 impl WhatsAppConfig {
     /// Detect which backend to use based on config fields.
     /// Returns "cloud" if phone_number_id is set, "web" if session_path is set.
-    pub fn backend_type(&self) -> &'static str {
-        if self.phone_number_id.is_some() {
-            "cloud"
-        } else if self.session_path.is_some() {
-            "web"
-        } else {
-            // Default to Cloud API for backward compatibility
-            "cloud"
-        }
-    }
-
-    /// Check if this is a valid Cloud API config
+    /// Is this Cloud API table usable?
+    ///
+    /// Unchanged by the v32 split: the webhook path has nothing to talk to
+    /// without all three.
     pub fn is_cloud_config(&self) -> bool {
         self.phone_number_id.is_some() && self.access_token.is_some() && self.verify_token.is_some()
-    }
-
-    /// Check if this is a valid Web config
-    pub fn is_web_config(&self) -> bool {
-        self.session_path.is_some()
-    }
-
-    /// Returns true when both Cloud and Web selectors are present.
-    ///
-    /// Runtime currently prefers Cloud mode in this case for backward compatibility.
-    pub fn is_ambiguous_config(&self) -> bool {
-        self.phone_number_id.is_some() && self.session_path.is_some()
     }
 }
 
@@ -5496,6 +5489,7 @@ default_temperature = 0.7
                 matrix: None,
                 signal: None,
                 whatsapp: None,
+                whatsapp_web: None,
                 linq: None,
                 nextcloud_talk: None,
                 email: None,
@@ -6277,6 +6271,7 @@ allowed_users = ["@ops:matrix.org"]
             }),
             signal: None,
             whatsapp: None,
+            whatsapp_web: None,
             linq: None,
             nextcloud_talk: None,
             email: None,
@@ -6384,9 +6379,6 @@ channel_id = "C123"
             phone_number_id: Some("123456789".into()),
             verify_token: Some("my-verify-token".into()),
             app_secret: None,
-            session_path: None,
-            pair_phone: None,
-            pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
         };
         let json = serde_json::to_string(&wc).unwrap();
@@ -6404,9 +6396,6 @@ channel_id = "C123"
             phone_number_id: Some("12345".into()),
             verify_token: Some("verify".into()),
             app_secret: Some("secret123".into()),
-            session_path: None,
-            pair_phone: None,
-            pair_code: None,
             allowed_numbers: vec!["+1".into()],
         };
         let toml_str = toml::to_string(&wc).unwrap();
@@ -6429,9 +6418,6 @@ channel_id = "C123"
             phone_number_id: Some("123".into()),
             verify_token: Some("ver".into()),
             app_secret: None,
-            session_path: None,
-            pair_phone: None,
-            pair_code: None,
             allowed_numbers: vec!["*".into()],
         };
         let toml_str = toml::to_string(&wc).unwrap();
@@ -6439,36 +6425,56 @@ channel_id = "C123"
         assert_eq!(parsed.allowed_numbers, vec!["*"]);
     }
 
+    /// Replaces the two `backend_type` tests deleted in schema v32.
+    ///
+    /// The mode used to be inferred from which keys happened to be filled, and
+    /// those tests pinned the guess: Cloud won when both were present, Web won
+    /// when only `session_path` was. There is nothing left to infer. The table
+    /// an operator writes is the declaration, so what is worth pinning now is
+    /// that the two tables carry disjoint keys and neither can express the
+    /// other's transport.
     #[test]
-    async fn whatsapp_config_backend_type_cloud_precedence_when_ambiguous() {
-        let wc = WhatsAppConfig {
+    async fn the_two_whatsapp_tables_are_disjoint_and_neither_infers_a_mode() {
+        let cloud_toml = toml::to_string(&WhatsAppConfig {
             access_token: Some("tok".into()),
             phone_number_id: Some("123".into()),
             verify_token: Some("ver".into()),
             app_secret: None,
-            session_path: Some("~/.rantaiclaw/state/whatsapp-web/session.db".into()),
-            pair_phone: None,
-            pair_code: None,
             allowed_numbers: vec!["+1".into()],
-        };
-        assert!(wc.is_ambiguous_config());
-        assert_eq!(wc.backend_type(), "cloud");
-    }
+        })
+        .expect("cloud serialises");
+        for web_key in ["session_path", "pair_phone", "pair_code"] {
+            assert!(
+                !cloud_toml.contains(web_key),
+                "the Cloud table must not carry `{web_key}`: {cloud_toml}"
+            );
+        }
 
-    #[test]
-    async fn whatsapp_config_backend_type_web() {
-        let wc = WhatsAppConfig {
-            access_token: None,
-            phone_number_id: None,
-            verify_token: None,
-            app_secret: None,
-            session_path: Some("~/.rantaiclaw/state/whatsapp-web/session.db".into()),
+        let web_toml = toml::to_string(&WhatsAppWebConfig {
+            session_path: "~/.rantaiclaw/state/whatsapp-web/session.db".into(),
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec![],
-        };
-        assert!(!wc.is_ambiguous_config());
-        assert_eq!(wc.backend_type(), "web");
+        })
+        .expect("web serialises");
+        for cloud_key in [
+            "access_token",
+            "phone_number_id",
+            "verify_token",
+            "app_secret",
+        ] {
+            assert!(
+                !web_toml.contains(cloud_key),
+                "the Web table must not carry `{cloud_key}`: {web_toml}"
+            );
+        }
+
+        // `session_path` is required, so a Web table cannot be written empty.
+        let empty: Result<WhatsAppWebConfig, _> = toml::from_str("allowed_numbers = []");
+        assert!(
+            empty.is_err(),
+            "a Web table with no session_path must not deserialise"
+        );
     }
 
     #[test]
@@ -6488,11 +6494,9 @@ channel_id = "C123"
                 phone_number_id: Some("123".into()),
                 verify_token: Some("ver".into()),
                 app_secret: None,
-                session_path: None,
-                pair_phone: None,
-                pair_code: None,
                 allowed_numbers: vec!["+1".into()],
             }),
+            whatsapp_web: None,
             linq: None,
             nextcloud_talk: None,
             email: None,

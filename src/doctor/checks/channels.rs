@@ -36,7 +36,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// "no channels configured". `probed_keys_cover_the_supported_tier` pins that
 /// this list keeps up with promotions — a channel promoted to `Supported`
 /// without a probe would claim the tier with no ongoing evidence behind it.
-const PROBED_KEYS: [&str; 4] = ["telegram", "discord", "slack", "whatsapp"];
+const PROBED_KEYS: [&str; 5] = ["telegram", "discord", "slack", "whatsapp", "whatsapp_web"];
 
 /// Configured channels this check does not probe, with their tier.
 ///
@@ -170,24 +170,20 @@ pub fn inspect_channels(config: &crate::config::Config) -> ChannelSummary {
     check_token!("discord", cc.discord, bot_token);
     check_token!("slack", cc.slack, bot_token);
 
+    // One credential per table since the v32 split. They used to share a table
+    // and either one satisfied the other's report, so a Cloud operator with a
+    // stale session path read as configured.
     if let Some(c) = cc.whatsapp.as_ref() {
-        // WhatsApp's "credential" depends on which mode is in use.
-        let cloud_ok = c
-            .access_token
+        if c.access_token
             .as_deref()
-            .map(|t| !t.trim().is_empty())
-            .unwrap_or(false);
-        let web_ok = c
-            .session_path
-            .as_deref()
-            .map(|p| !p.trim().is_empty())
-            .unwrap_or(false);
-        if cloud_ok || web_ok {
+            .is_some_and(|t| !t.trim().is_empty())
+        {
             configured.push("whatsapp");
         } else {
             missing.push("whatsapp");
         }
     }
+    check_token!("whatsapp_web", cc.whatsapp_web, session_path);
 
     let n_total = configured.len() + missing.len();
     if n_total == 0 {
@@ -267,12 +263,6 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
             (c.access_token.as_deref(), c.phone_number_id.as_deref()),
             (Some(token), Some(phone_id)) if !token.trim().is_empty() && !phone_id.trim().is_empty()
         );
-        // Web path: usable when a non-empty session DB path is configured.
-        let web_usable = c
-            .session_path
-            .as_deref()
-            .is_some_and(|p| !p.trim().is_empty());
-
         if cloud_usable {
             // Safe to unwrap the pair — `cloud_usable` proved both are present.
             let token = c.access_token.as_deref().unwrap_or_default();
@@ -281,10 +271,21 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
                 Ok(()) => ok.push("whatsapp (cloud-api)".to_string()),
                 Err(e) => bad.push(format!("whatsapp cloud: {e}")),
             }
+        } else {
+            // A configured table that cannot run is broken, not absent — the
+            // offline `inspect_channels` already fails it, so the online probe
+            // must too. They used to disagree, and it read as "no channels
+            // configured" when it was the only channel.
+            bad.push(
+                "whatsapp: incomplete credentials — set access_token + phone_number_id".to_string(),
+            );
         }
-        if web_usable {
-            let path = c.session_path.as_deref().unwrap_or_default();
-            match probe_whatsapp_web(path) {
+    }
+    if let Some(c) = cc.whatsapp_web.as_ref() {
+        if c.session_path.trim().is_empty() {
+            bad.push("whatsapp_web: incomplete credentials — set session_path".to_string());
+        } else {
+            match probe_whatsapp_web(&c.session_path) {
                 ProbeWebResult::Ok => ok.push("whatsapp (web)".to_string()),
                 ProbeWebResult::SessionMissing => {
                     warn.push(
@@ -293,17 +294,6 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
                 }
                 ProbeWebResult::SessionPathBad(e) => bad.push(format!("whatsapp web session: {e}")),
             }
-        }
-        // A configured WhatsApp block with neither a usable cloud pair nor a
-        // session path is broken, not absent — the offline `inspect_channels`
-        // already fails it, so the online probe must too (they used to disagree,
-        // and it read as "no channels configured" when it was the only channel).
-        if !cloud_usable && !web_usable {
-            bad.push(
-                "whatsapp: incomplete credentials — set access_token + phone_number_id (cloud) \
-                 or session_path (web)"
-                    .to_string(),
-            );
         }
     }
 
@@ -590,24 +580,23 @@ mod tests {
         assert!(s.message.contains("telegram"));
     }
 
+    /// A session path used to satisfy the *Cloud* table's credential report,
+    /// because both transports shared one table and either key counted. Since
+    /// v32 it satisfies its own table and nothing else.
     #[test]
-    fn whatsapp_with_session_path_counts_as_configured() {
+    fn whatsapp_web_with_a_session_path_counts_as_configured() {
         let mut cfg = Config::default();
-        cfg.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
-            access_token: None,
-            phone_number_id: None,
-            verify_token: None,
-            app_secret: None,
-            session_path: Some("~/.rantaiclaw/state/whatsapp-web/session.db".into()),
+        cfg.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+            session_path: "~/.rantaiclaw/state/whatsapp-web/session.db".into(),
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["*".into()],
         });
         let s = inspect_channels(&cfg);
-        // No telegram/discord/slack — so wa is the only one. Marked OK
+        // No telegram/discord/slack — so wa web is the only one. Marked OK
         // (config-only) because session_path is set.
         assert_eq!(s.severity, Severity::Ok);
-        assert!(s.message.contains("whatsapp"));
+        assert!(s.message.contains("whatsapp_web"), "{}", s.message);
     }
 
     #[test]
@@ -618,9 +607,6 @@ mod tests {
             phone_number_id: None,
             verify_token: None,
             app_secret: None,
-            session_path: None,
-            pair_phone: None,
-            pair_code: None,
             allowed_numbers: vec!["*".into()],
         });
         let s = inspect_channels(&cfg);
@@ -640,9 +626,6 @@ mod tests {
             phone_number_id: None,
             verify_token: None,
             app_secret: None,
-            session_path: None,
-            pair_phone: None,
-            pair_code: None,
             allowed_numbers: vec!["*".into()],
         });
         let s = probe_channels(&cfg).await;

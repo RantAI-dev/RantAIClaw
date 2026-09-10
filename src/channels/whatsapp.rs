@@ -1810,9 +1810,6 @@ mod tests {
                 phone_number_id: None,
                 verify_token: None,
                 app_secret: None,
-                session_path: None,
-                pair_phone: None,
-                pair_code: None,
                 allowed_numbers: vec![],
             });
             seed.save().await.unwrap();

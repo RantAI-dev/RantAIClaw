@@ -402,7 +402,7 @@ pub(crate) struct ChannelRuntimeContext {
 /// `scripts/ci/check_channel_maturity.sh` instead of trusted.
 ///
 /// Rows stay on one line: that gate parses them.
-pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerification); 16] = [
+pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerification); 17] = [
     (
         "telegram",
         "Telegram",
@@ -457,7 +457,13 @@ pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerificat
     ),
     (
         "whatsapp",
-        "WhatsApp",
+        "WhatsApp Cloud API",
+        ChannelSupport::Supported,
+        ChannelVerification::NotDriven,
+    ),
+    (
+        "whatsapp_web",
+        "WhatsApp Web",
         ChannelSupport::Supported,
         ChannelVerification::NotDriven,
     ),
@@ -657,6 +663,7 @@ pub(crate) fn channel_is_configured(key: &str, config: &Config) -> bool {
         "matrix" => cfg!(feature = "channel-matrix") && c.matrix.is_some(),
         "signal" => c.signal.is_some(),
         "whatsapp" => c.whatsapp.is_some(),
+        "whatsapp_web" => c.whatsapp_web.is_some(),
         "linq" => c.linq.is_some(),
         "nextcloud_talk" => c.nextcloud_talk.is_some(),
         "email" => c.email.is_some(),
@@ -713,12 +720,16 @@ pub(crate) fn channel_has_credentials(key: &str, config: &Config) -> bool {
             .signal
             .as_ref()
             .is_some_and(|s| filled(&s.http_url) && filled(&s.account)),
-        // Either transport counts: the Cloud API uses an access token, the
-        // web client a linked session.
-        "whatsapp" => c.whatsapp.as_ref().is_some_and(|w| {
-            w.access_token.as_deref().is_some_and(filled)
-                || w.session_path.as_deref().is_some_and(filled)
-        }),
+        // One transport per key since the v32 split: the Cloud API uses an
+        // access token, and the web client a linked session in its own table.
+        "whatsapp" => c
+            .whatsapp
+            .as_ref()
+            .is_some_and(|w| w.access_token.as_deref().is_some_and(filled)),
+        "whatsapp_web" => c
+            .whatsapp_web
+            .as_ref()
+            .is_some_and(|w| filled(&w.session_path)),
         "linq" => c.linq.as_ref().is_some_and(|l| filled(&l.api_token)),
         "nextcloud_talk" => c
             .nextcloud_talk

@@ -111,6 +111,7 @@ probing three channels the owner committed to.
 | `matrix` | under development | not yet verified |
 | `signal` | under development | not yet verified |
 | `whatsapp` | supported | not yet verified |
+| `whatsapp_web` | supported | not yet verified |
 | `linq` | under development | not yet verified |
 | `nextcloud_talk` | under development | not yet verified |
 | `email` | under development | not yet verified |
@@ -128,7 +129,7 @@ by a default, and it can never become verified while that stays true.
 
 ## 0.1 Build and test evidence, per channel
 
-**Sixteen channels are wired. One has been driven against a real platform.**
+**Seventeen channels are wired. One has been driven against a real platform.**
 
 That count is the length of `CHANNEL_CATALOG`, and
 `scripts/ci/check_channel_maturity.sh` fails the build if this sentence and the
@@ -199,6 +200,7 @@ that anything was run. As of 2026-09-08:
 | Telegram | yes | 2026-07, re-driven 2026-09-08 (see the row above) |
 | Discord | **no** | never |
 | Slack | **no** | driven before #778 landed, so void as evidence — re-drive owed |
+| WhatsApp Web | **no** | never |
 | WhatsApp Cloud | **no** | never |
 
 Three of the four have no credential in any profile or environment on the

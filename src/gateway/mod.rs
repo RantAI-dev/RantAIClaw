@@ -2655,9 +2655,6 @@ mod tests {
             phone_number_id: Some("p".into()),
             verify_token: Some("v".into()),
             app_secret: None,
-            session_path: None,
-            pair_phone: None,
-            pair_code: None,
             allowed_numbers: vec![],
         });
 

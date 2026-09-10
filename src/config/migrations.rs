@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 31;
+pub const CURRENT_VERSION: u32 = 32;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -426,6 +426,10 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v31(raw);
     }
 
+    if from < 32 {
+        migrate_v32(raw);
+    }
+
     // Future migrations (v32, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
@@ -450,6 +454,82 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
 /// `[cost.prices]` is **not** re-created here. It is optional, empty by default,
 /// and used only for reporting; a migration that invented entries would be
 /// inventing prices.
+/// v32: give WhatsApp Web its own table.
+///
+/// Both transports used to share `[channels_config.whatsapp]`, and which one
+/// ran was inferred from which keys happened to be filled. After this the
+/// table an operator writes *is* the declaration, so nothing is guessed.
+///
+/// Moves only the four Web keys. `allowed_numbers` is **copied**, not moved,
+/// because both transports read it and a Cloud-only operator who also had a
+/// session path must not lose their allowlist. Everything else stays put.
+///
+/// A config carrying both transports gets both tables. Nothing an operator
+/// wrote is dropped: which one the runtime builds is a separate question, and
+/// `factory::build_configured_channels` answers it exactly as it did before.
+///
+/// This runs on real machines on first launch after the upgrade, so it is
+/// deliberately narrow.
+fn migrate_v32(raw: &mut Value) {
+    const WEB_KEYS: [&str; 3] = ["session_path", "pair_phone", "pair_code"];
+
+    let Some(root) = raw.as_table_mut() else {
+        return;
+    };
+    let Some(channels) = root
+        .get_mut("channels_config")
+        .and_then(Value::as_table_mut)
+    else {
+        return;
+    };
+    let Some(whatsapp) = channels.get_mut("whatsapp").and_then(Value::as_table_mut) else {
+        return;
+    };
+
+    // No session path means no Web mode to move, whatever else is present.
+    let has_session = whatsapp
+        .get("session_path")
+        .and_then(Value::as_str)
+        .is_some_and(|p| !p.trim().is_empty());
+    if !has_session {
+        // Still drop the stragglers: a `pair_phone` with no `session_path`
+        // configured nothing before and would configure nothing now, and
+        // leaving it behind makes the Cloud table read as half a Web one.
+        for key in WEB_KEYS {
+            whatsapp.remove(key);
+        }
+        return;
+    }
+
+    let mut web = toml::map::Map::new();
+    for key in WEB_KEYS {
+        if let Some(value) = whatsapp.remove(key) {
+            web.insert(key.to_string(), value);
+        }
+    }
+    if let Some(allowed) = whatsapp.get("allowed_numbers") {
+        web.insert("allowed_numbers".to_string(), allowed.clone());
+    }
+
+    // An operator with only Web keys is left with an empty Cloud table, which
+    // would deserialise into a `WhatsAppConfig` that configures nothing and
+    // makes `channel_is_configured("whatsapp")` answer yes to a channel that
+    // cannot run. Remove it.
+    let cloud_is_empty = [
+        "access_token",
+        "phone_number_id",
+        "verify_token",
+        "app_secret",
+    ]
+    .iter()
+    .all(|k| whatsapp.get(*k).is_none());
+    if cloud_is_empty {
+        channels.remove("whatsapp");
+    }
+
+    channels.insert("whatsapp_web".to_string(), Value::Table(web));
+}
+
 fn migrate_v31(raw: &mut Value) {
     let Some(root) = raw.as_table_mut() else {
         return;

@@ -460,6 +460,14 @@ mod tests {
     /// serve them.
     #[tokio::test]
     async fn the_tasks_api_is_off_on_a_default_config() {
+        // Takes the same lock and home its sibling below takes. Without them
+        // this runs against whatever `HOME` another test is holding, and the
+        // router it builds is not the one a fresh install would get. Same flake
+        // class as the audit-log tests fixed in #779.
+        let _lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(tmp.path());
+
         let config = crate::config::Config::default();
         assert!(
             !config.tasks.api_enabled,

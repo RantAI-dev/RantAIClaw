@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WhatsApp Web now has its own config table, and the transport is no longer guessed.**
+  `[channels_config.whatsapp]` carried both transports, and `WhatsAppConfig::backend_type()`
+  decided which one ran by looking at which keys happened to be filled: `phone_number_id` meant
+  Cloud, `session_path` meant Web, neither meant Cloud anyway. The mode was never something the
+  operator stated. Web keys move to `[channels_config.whatsapp_web]`, and writing that table *is*
+  the declaration. `backend_type`, `is_web_config` and `is_ambiguous_config` are deleted.
+  **Config schema 31 → 32**, with an automatic migration: `session_path`, `pair_phone` and
+  `pair_code` move, `allowed_numbers` is copied so both transports keep the allowlist they had,
+  and a `[channels_config.whatsapp]` left with no Cloud keys is removed rather than kept as an
+  empty table reporting a channel that cannot run. **Downgrading is a manual edit** — see
+  "Schema version and downgrades" in the config reference. The two transports stay mutually
+  exclusive at runtime, Cloud first, because both return `"whatsapp"` from `Channel::name()` and
+  `channels_by_name` is keyed by that name; an unusable Cloud table no longer shadows a working
+  Web one, which the old `phone_number_id` check happened to allow. `whatsapp_web` also gets its
+  own catalog row, its own `doctor` probe key, and its own section in the config reference.
+- **`check_channel_maturity.sh` failed silently on the two cases most likely to hit it.** A
+  catalog key with no matching `ChannelsConfig` field aborted the whole script under
+  `set -euo pipefail` with an empty exit 1, no message; and a key the row regex could not read
+  (`[a-z_]+`, so any hyphen) was skipped without a word, in a gate whose own header says it is
+  fail-closed. Both now print what is wrong and which key caused it. Found by hitting the first
+  one while splitting the WhatsApp row.
 - **`doctor` told operators to set a Slack `app_token`, and no supported setup path could write
   one.** Both paths hardcoded it. `provision/channels/slack.rs` bound
   `let app_token: Option<String> = None` and `wizard.rs` bound `let app_token = String::new()`,
