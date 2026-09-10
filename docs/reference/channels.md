@@ -252,6 +252,50 @@ Notes:
 - Model cache previews come from `rantaiclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
+## Draft streaming
+
+A long reply can arrive all at once when the turn finishes, or grow in place while
+the agent writes. The second is what makes a channel feel responsive, and it is
+one feature rather than a maturity difference.
+
+**Telegram is the only channel that streams drafts.** `supports_draft_updates()`
+and the four methods behind it (`send_draft`, `update_draft`, `finalize_draft`,
+`cancel_draft`) are implemented only in `telegram.rs`; every other channel takes
+the `false` default from `channels/traits.rs` and replies once.
+
+The blocker is configuration, not platform support. Discord and Slack both edit
+messages perfectly well. What gates the feature is `stream_mode`, and that key
+exists exactly once in the schema — on `TelegramConfig`. Turning streaming on for
+another channel means giving it its own `stream_mode` and
+`draft_update_interval_ms`, which are new config keys, so it needs a schema
+version bump and belongs in a change that carries one.
+
+Shipping it without the gate is not the shortcut it looks like: `update_draft` is
+called on **every** streamed delta (`dispatch.rs:495`), and the per-recipient
+throttle inside the channel is the only thing turning that into one edit per
+`draft_update_interval_ms`. A channel with no setting has no off switch and no
+configurable cadence.
+
+### Why WhatsApp Web is a separate question
+
+Even after a schema bump, WhatsApp Web should be measured before it is wired.
+`wa-rs` does expose `Client::edit_message`, so the API is there. The cost is what
+the numbers say:
+
+- The throttle default is one edit per second (`draft_update_interval_ms` =
+  `1000`).
+- A channel turn may run to `message_timeout_secs` = `600`, and that scales up to
+  4× with tool depth, so **600 edits for a default-length turn and up to 2,400 at
+  the ceiling** — for a single reply.
+- WhatsApp marks an edited message "Edited" on the recipient's screen and allows
+  edits only within 15 minutes of sending, which is shorter than that scaled
+  ceiling.
+
+Telegram absorbs this because an edit there is quiet. On WhatsApp the same
+cadence rewrites a message hundreds of times in a conversation the recipient is
+watching. If it is ever built, it wants a much longer interval than the Telegram
+default, chosen deliberately rather than inherited.
+
 ## Outbound Media Markers
 
 A channel that can deliver attachments tells the model the marker syntax through
@@ -561,12 +605,14 @@ Slack notes:
   `slack_listen_gap` in `src/doctor/checks/channels.rs`.
 - Both setup paths ask for `app_token` as an optional prompt. Skipping it is
   valid and yields polling.
-- **Slack shows no "working" indicator** while the agent thinks, and this is a
-  decision rather than an oversight. Slack does have an API for it,
-  `agents.sessions.setStatus`, but using it requires the app to be declared as an
-  agent, adds the `assistant:write` scope, and needs a reinstall. Draft streaming
-  gives the same signal with no app change, so the status API was skipped on
-  2026-09-09. Recorded here so the next reader does not re-audit it.
+- **Slack shows no "working" indicator** while the agent thinks. Slack does have
+  an API for it, `agents.sessions.setStatus`, but using it requires the app to be
+  declared as an agent, adds the `assistant:write` scope, and needs a reinstall,
+  so it was skipped on 2026-09-09. The reason recorded at the time — that draft
+  streaming would give the same signal for free — **did not survive contact**:
+  draft streaming is gated on a per-channel `stream_mode` that only Telegram has
+  (see [Draft streaming](#draft-streaming) below). So Slack has neither today,
+  and closing that gap means choosing one of the two, not waiting for the other.
 
 ### 4.4 Mattermost
 
