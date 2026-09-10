@@ -147,6 +147,166 @@ impl WhatsAppWebChannel {
         self
     }
 
+    /// Upload one attachment and send it as a media message.
+    ///
+    /// A remote URL is sent as text: WhatsApp previews links, and re-uploading
+    /// someone else's public file would spend bandwidth to gain nothing. A
+    /// local path is read, uploaded through `wa-rs`, and only from inside the
+    /// workspace — a reply is influenced by whoever is chatting, so a prompt
+    /// injection naming the config would otherwise post the session and
+    /// provider keys into the chat. Same rule and same function as Telegram and
+    /// Discord.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_attachment(
+        &self,
+        client: &wa_rs::Client,
+        to: wa_rs_binary::jid::Jid,
+        attachment: &crate::channels::media::OutboundAttachment,
+    ) -> Result<()> {
+        let target = attachment.target.trim();
+
+        if crate::channels::media::is_http_url(target) {
+            // Boxed: `send_message` builds a ~34 KB future and clippy's
+            // `large_futures` is denied on changed lines. Same treatment the
+            // pairing call in `listen` already gets.
+            Box::pin(client.send_message(
+                to,
+                wa_rs_proto::whatsapp::Message {
+                    conversation: Some(target.to_string()),
+                    ..Default::default()
+                },
+            ))
+            .await?;
+            return Ok(());
+        }
+
+        let path = std::path::Path::new(target);
+        if !path.exists() {
+            anyhow::bail!("WhatsApp attachment path not found: {target}");
+        }
+        let (_config_path, workspace_dir) = {
+            use anyhow::Context as _;
+            crate::config::Config::resolve_active_paths()
+                .await
+                .context("cannot resolve workspace to validate attachment path")?
+        };
+        if !crate::channels::media::path_within_workspace(path, &workspace_dir) {
+            anyhow::bail!(
+                "WhatsApp attachment path is outside the workspace and was blocked: {target}"
+            );
+        }
+
+        let bytes = {
+            use anyhow::Context as _;
+            tokio::fs::read(path)
+                .await
+                .with_context(|| format!("cannot read attachment: {target}"))?
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        // Sniffed from the bytes, not guessed from the extension: the recipient
+        // renders on what we declare here.
+        let mimetype = crate::channels::media::sniff_image_mime(&bytes)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        let upload = {
+            use anyhow::Context as _;
+            client
+                .upload(bytes, Self::media_type_for(attachment.kind))
+                .await
+                .with_context(|| format!("WhatsApp upload failed for {file_name}"))?
+        };
+
+        let outgoing =
+            Self::outgoing_media_message(attachment.kind, &upload, &mimetype, &file_name);
+        Box::pin(client.send_message(to, outgoing)).await?;
+        Ok(())
+    }
+
+    /// Which wa-rs media bucket a marker kind uploads into.
+    ///
+    /// Pure so the mapping is testable: an upload encrypted under the wrong
+    /// `MediaType` produces a file the recipient's client cannot open, and that
+    /// failure is invisible from this side.
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn media_type_for(
+        kind: crate::channels::media::AttachmentKind,
+    ) -> wa_rs_core::download::MediaType {
+        use crate::channels::media::AttachmentKind;
+        use wa_rs_core::download::MediaType;
+        match kind {
+            AttachmentKind::Image => MediaType::Image,
+            AttachmentKind::Video => MediaType::Video,
+            // Voice notes ride the audio bucket; `ptt` on the message is what
+            // makes WhatsApp render one as a voice note rather than a file.
+            AttachmentKind::Audio | AttachmentKind::Voice => MediaType::Audio,
+            AttachmentKind::Document => MediaType::Document,
+        }
+    }
+
+    /// Build the outgoing message for an upload that already succeeded.
+    ///
+    /// Separated from the upload so the part that is easy to get wrong — which
+    /// of the six fields each message type carries, and whether `ptt` is set —
+    /// is reachable from a test. The client call around it is two lines.
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn outgoing_media_message(
+        kind: crate::channels::media::AttachmentKind,
+        upload: &wa_rs::upload::UploadResponse,
+        mimetype: &str,
+        file_name: &str,
+    ) -> wa_rs_proto::whatsapp::Message {
+        use crate::channels::media::AttachmentKind;
+        use wa_rs_proto::whatsapp::{message, Message};
+
+        // Every media message carries the same six values the upload returned.
+        macro_rules! common {
+            ($t:expr) => {{
+                let mut m = $t;
+                m.url = Some(upload.url.clone());
+                m.direct_path = Some(upload.direct_path.clone());
+                m.media_key = Some(upload.media_key.clone());
+                m.file_enc_sha256 = Some(upload.file_enc_sha256.clone());
+                m.file_sha256 = Some(upload.file_sha256.clone());
+                m.file_length = Some(upload.file_length);
+                m.mimetype = Some(mimetype.to_string());
+                m
+            }};
+        }
+
+        match kind {
+            AttachmentKind::Image => Message {
+                image_message: Some(Box::new(common!(message::ImageMessage::default()))),
+                ..Default::default()
+            },
+            AttachmentKind::Video => Message {
+                video_message: Some(Box::new(common!(message::VideoMessage::default()))),
+                ..Default::default()
+            },
+            AttachmentKind::Audio | AttachmentKind::Voice => {
+                let mut audio = common!(message::AudioMessage::default());
+                audio.ptt = Some(kind == AttachmentKind::Voice);
+                Message {
+                    audio_message: Some(Box::new(audio)),
+                    ..Default::default()
+                }
+            }
+            AttachmentKind::Document => {
+                let mut doc = common!(message::DocumentMessage::default());
+                // Without a name the recipient sees an untitled blob.
+                doc.file_name = Some(file_name.to_string());
+                Message {
+                    document_message: Some(Box::new(doc)),
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
     /// Is there anything here to answer?
     ///
     /// Extracted from the `listen()` closure so a test can reach it — no test
@@ -578,6 +738,14 @@ impl Channel for WhatsAppWebChannel {
         }
     }
 
+    /// WhatsApp Web can deliver attachments, so the model is told the syntax.
+    /// Telling a channel that cannot leaks `[IMAGE:…]` to the reader as literal
+    /// text, which is why this is per-channel and not a default.
+    fn delivery_instructions(&self) -> Option<&'static str> {
+        static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        Some(TEXT.get_or_init(|| crate::channels::media::delivery_instructions_for("WhatsApp")))
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
@@ -599,6 +767,30 @@ impl Channel for WhatsAppWebChannel {
         }
 
         let to = self.recipient_to_jid(&message.recipient)?;
+
+        // Attachments come out of the text before rendering, or the markers
+        // reach the reader as literal `[IMAGE:…]`.
+        let (text, attachments) =
+            crate::channels::media::parse_attachment_markers(&message.content);
+        if !attachments.is_empty() {
+            if !text.is_empty() {
+                let rendered =
+                    crate::channels::format::render_to_string(&text, &self.render_target());
+                Box::pin(client.send_message(
+                    to.clone(),
+                    wa_rs_proto::whatsapp::Message {
+                        conversation: Some(rendered),
+                        ..Default::default()
+                    },
+                ))
+                .await?;
+            }
+            for attachment in &attachments {
+                Box::pin(self.send_attachment(&client, to.clone(), attachment)).await?;
+            }
+            return Ok(());
+        }
+
         // `rendered`, not `outgoing`: `outgoing` is the wa-rs Message struct.
         let rendered =
             crate::channels::format::render_to_string(&message.content, &self.render_target());
@@ -1481,6 +1673,178 @@ mod media_tests {
             !WhatsAppWebChannel::has_deliverable_content("   ", false),
             "whitespace with no image is still nothing"
         );
+    }
+
+    fn upload(len: u64) -> wa_rs::upload::UploadResponse {
+        wa_rs::upload::UploadResponse {
+            url: "https://mmg.whatsapp.net/x".into(),
+            direct_path: "/v/x".into(),
+            media_key: vec![1, 2, 3],
+            file_enc_sha256: vec![4, 5, 6],
+            file_sha256: vec![7, 8, 9],
+            file_length: len,
+        }
+    }
+
+    /// Every media message must carry all six values the upload returned. Drop
+    /// one and the recipient's client cannot decrypt the file, which looks like
+    /// a broken attachment rather than a bug on this side.
+    #[test]
+    fn every_media_message_carries_the_whole_upload() {
+        use crate::channels::media::AttachmentKind;
+        let up = upload(4096);
+
+        for kind in [
+            AttachmentKind::Image,
+            AttachmentKind::Video,
+            AttachmentKind::Audio,
+            AttachmentKind::Voice,
+            AttachmentKind::Document,
+        ] {
+            let m = WhatsAppWebChannel::outgoing_media_message(kind, &up, "image/png", "f.png");
+            // Read the six back out of whichever variant was built.
+            let got = m
+                .image_message
+                .as_ref()
+                .map(|i| (&i.url, &i.direct_path, &i.media_key, &i.file_length))
+                .or_else(|| {
+                    m.video_message
+                        .as_ref()
+                        .map(|v| (&v.url, &v.direct_path, &v.media_key, &v.file_length))
+                })
+                .or_else(|| {
+                    m.audio_message
+                        .as_ref()
+                        .map(|a| (&a.url, &a.direct_path, &a.media_key, &a.file_length))
+                })
+                .or_else(|| {
+                    m.document_message
+                        .as_ref()
+                        .map(|d| (&d.url, &d.direct_path, &d.media_key, &d.file_length))
+                })
+                .unwrap_or_else(|| panic!("{kind:?} built no media message"));
+
+            assert_eq!(
+                got.0.as_deref(),
+                Some("https://mmg.whatsapp.net/x"),
+                "{kind:?}"
+            );
+            assert_eq!(got.1.as_deref(), Some("/v/x"), "{kind:?}");
+            assert_eq!(got.2.as_deref(), Some(&[1u8, 2, 3][..]), "{kind:?}");
+            assert_eq!(*got.3, Some(4096), "{kind:?}");
+        }
+    }
+
+    /// Each marker kind builds its own message type. Sending a video as an
+    /// image is not a cosmetic difference: the recipient's client renders on
+    /// this.
+    #[test]
+    fn each_kind_builds_its_own_message_type() {
+        use crate::channels::media::AttachmentKind;
+        let up = upload(1);
+
+        let img = WhatsAppWebChannel::outgoing_media_message(
+            AttachmentKind::Image,
+            &up,
+            "image/png",
+            "f.png",
+        );
+        assert!(img.image_message.is_some() && img.document_message.is_none());
+
+        let vid = WhatsAppWebChannel::outgoing_media_message(
+            AttachmentKind::Video,
+            &up,
+            "video/mp4",
+            "f.mp4",
+        );
+        assert!(vid.video_message.is_some() && vid.image_message.is_none());
+
+        let doc = WhatsAppWebChannel::outgoing_media_message(
+            AttachmentKind::Document,
+            &up,
+            "application/pdf",
+            "report.pdf",
+        );
+        let doc_msg = doc.document_message.as_ref().expect("document");
+        assert_eq!(
+            doc_msg.file_name.as_deref(),
+            Some("report.pdf"),
+            "a document with no name shows as an untitled blob"
+        );
+    }
+
+    /// `ptt` is the only thing separating a voice note from an audio file, and
+    /// both ride the same upload bucket.
+    #[test]
+    fn a_voice_note_is_flagged_ptt_and_an_audio_file_is_not() {
+        use crate::channels::media::AttachmentKind;
+        let up = upload(1);
+
+        let voice = WhatsAppWebChannel::outgoing_media_message(
+            AttachmentKind::Voice,
+            &up,
+            "audio/ogg",
+            "v.ogg",
+        );
+        assert_eq!(
+            voice.audio_message.as_ref().expect("audio").ptt,
+            Some(true),
+            "a voice marker must render as a voice note"
+        );
+
+        let audio = WhatsAppWebChannel::outgoing_media_message(
+            AttachmentKind::Audio,
+            &up,
+            "audio/mpeg",
+            "a.mp3",
+        );
+        assert_eq!(
+            audio.audio_message.as_ref().expect("audio").ptt,
+            Some(false)
+        );
+    }
+
+    /// The upload bucket decides the encryption keys. Encrypt under the wrong
+    /// one and the file is undecryptable, invisibly from this side.
+    #[test]
+    fn each_kind_uploads_into_its_own_media_bucket() {
+        use crate::channels::media::AttachmentKind;
+        use wa_rs_core::download::MediaType;
+        assert_eq!(
+            WhatsAppWebChannel::media_type_for(AttachmentKind::Image),
+            MediaType::Image
+        );
+        assert_eq!(
+            WhatsAppWebChannel::media_type_for(AttachmentKind::Video),
+            MediaType::Video
+        );
+        assert_eq!(
+            WhatsAppWebChannel::media_type_for(AttachmentKind::Document),
+            MediaType::Document
+        );
+        // Both voice forms share the audio bucket; `ptt` differentiates them.
+        assert_eq!(
+            WhatsAppWebChannel::media_type_for(AttachmentKind::Audio),
+            MediaType::Audio
+        );
+        assert_eq!(
+            WhatsAppWebChannel::media_type_for(AttachmentKind::Voice),
+            MediaType::Audio
+        );
+    }
+
+    /// WhatsApp Web can deliver attachments now, so the model is told how to
+    /// ask, in the same vocabulary every other delivering channel uses.
+    #[test]
+    fn whatsapp_web_tells_the_model_the_marker_syntax() {
+        let ch = WhatsAppWebChannel::new("/tmp/wa.db".into(), None, None, vec!["*".into()]);
+        let text = ch
+            .delivery_instructions()
+            .expect("whatsapp web can deliver attachments");
+        assert!(text.contains("WhatsApp"), "{text}");
+        for marker in ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"] {
+            assert!(text.contains(marker), "missing {marker}: {text}");
+        }
     }
 
     /// The budget is charged per channel-qualified sender, and charged before

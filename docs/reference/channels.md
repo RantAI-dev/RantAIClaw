@@ -267,9 +267,9 @@ local path or an `http(s)` URL. One vocabulary for every channel, built by
 `media::delivery_instructions_for`, so a reply written on one channel does not
 leak literal markers on another.
 
-**Telegram and Discord can deliver attachments.** Every other channel returns
-`None` and is never told the syntax, because telling a channel that cannot
-deliver them leaks `[IMAGE:…]` to the reader as literal text.
+**Telegram, Discord and WhatsApp Web can deliver attachments.** Every other
+channel returns `None` and is never told the syntax, because telling a channel
+that cannot deliver them leaks `[IMAGE:…]` to the reader as literal text.
 
 **Slack cannot, and the blocker is a scope rather than code.** Uploading needs
 `files:write`, which is not among the scopes this project asks operators to
@@ -291,8 +291,15 @@ Rules that apply wherever a marker names a **local path**:
   calling it.
 - An `http(s)` URL is passed to the platform instead of being re-uploaded.
 
+WhatsApp Web builds a different message type per marker kind, because the
+recipient's client renders on that: `[VIDEO:…]` is a video message, not an image
+one, and `[VOICE:…]` is an audio message with `ptt` set, which is the only thing
+separating a voice note from an audio file. The upload bucket follows the kind
+too — encrypting under the wrong one produces a file the recipient cannot open,
+and nothing on the sending side sees that fail.
+
 The per-sender media budget in `media.rs` is **inbound only**. Nothing counts
-outbound attachments today.
+outbound attachments today, on any channel.
 
 ## Inbound Image Marker Protocol
 
