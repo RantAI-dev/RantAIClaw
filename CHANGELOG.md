@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Slack dropped a message that carried a photo, and could not see an image in one that got
+  through.** Two separate faults. `socket_event_message` returned `None` for every message with a
+  subtype, and Slack delivers an upload as `subtype: "file_share"`, so a captioned screenshot over
+  Socket Mode was discarded whole and the bot never answered. On the polling path a photo with no
+  caption has empty `text` and was treated as an empty message. Slack now accepts `file_share`
+  (and only that subtype), treats a message carrying files as a message, and fetches each upload
+  through the same `media.rs` budget gate every other channel pays into. Because `url_private` is
+  authenticated, this is the one channel that must send its bot token to fetch an attachment, and
+  the URL comes from the event payload: the token goes only to `slack.com` and its subdomains over
+  HTTPS, and a file named on any other host becomes a visible note with no credential sent. Slack
+  also had no `[multimodal]` caps at all and used struct defaults; the factory now passes the
+  operator's. A class test reads each tier channel's inbound collector and fails if one downloads
+  media without charging the shared budget.
 - **WhatsApp Web now has its own config table, and the transport is no longer guessed.**
   `[channels_config.whatsapp]` carried both transports, and `WhatsAppConfig::backend_type()`
   decided which one ran by looking at which keys happened to be filled: `phone_number_id` meant

@@ -100,7 +100,10 @@ pub(crate) fn build_slack(config: &Config) -> Option<Arc<SlackChannel>> {
             sl.channel_id.clone(),
             sl.allowed_users.clone(),
         )
-        .with_app_token(sl.app_token.clone()),
+        .with_app_token(sl.app_token.clone())
+        // Inbound images obey the operator's caps, not a default the channel
+        // invented for itself.
+        .with_multimodal(config.multimodal.clone()),
     ))
 }
 
