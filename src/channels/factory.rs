@@ -122,7 +122,12 @@ pub(crate) fn build_mattermost(config: &Config) -> Option<Arc<MattermostChannel>
 /// Returns `None` on a build without the `whatsapp-web` feature, which is the
 /// same answer as "not configured" to every caller and keeps the feature gate
 /// out of the call sites.
-pub(crate) fn build_whatsapp_web(config: &Config) -> Option<Arc<super::WhatsAppWebChannel>> {
+///
+/// Returns `Arc<dyn Channel>` rather than the concrete type because
+/// `WhatsAppWebChannel` does not exist at all without the `whatsapp-web`
+/// feature — naming it in the signature fails every `--no-default-features`
+/// build, so the type appears only inside the gated block.
+pub(crate) fn build_whatsapp_web(config: &Config) -> Option<Arc<dyn Channel>> {
     let web = config.channels_config.whatsapp_web.as_ref()?;
     if web.session_path.trim().is_empty() {
         tracing::warn!("WhatsApp Web configured but session_path is empty");
@@ -144,7 +149,7 @@ pub(crate) fn build_whatsapp_web(config: &Config) -> Option<Arc<super::WhatsAppW
             web.pair_phone.clone(),
             web.pair_code.clone(),
             web.allowed_numbers.clone(),
-        )))
+        )) as Arc<dyn Channel>)
     }
 }
 
