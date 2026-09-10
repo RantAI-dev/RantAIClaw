@@ -12,18 +12,35 @@
 fn delivery_instructions_default_is_none() {
     use crate::channels::traits::Channel;
 
+    // Mattermost has no upload path, so it still takes the default and must
+    // not claim otherwise. Slack held this position until it gained one.
+    let mattermost = crate::channels::mattermost::MattermostChannel::new(
+        "https://mm.example.com".into(),
+        "t".into(),
+        Some("c".into()),
+        vec!["*".into()],
+        true,
+        false,
+    );
+    assert!(
+        mattermost.delivery_instructions().is_none(),
+        "a channel that cannot deliver media must not claim it can"
+    );
+
+    // Slack gained an upload path alongside this change; the pin moved with it
+    // rather than ahead of it.
     let slack = crate::channels::slack::SlackChannel::new(
         "xoxb-placeholder".into(),
         None,
         vec!["*".into()],
     );
     assert!(
-        slack.delivery_instructions().is_none(),
-        "a channel that cannot deliver media must not claim it can"
+        slack
+            .delivery_instructions()
+            .is_some_and(|t| t.contains("[IMAGE:")),
+        "Slack can deliver attachments now and must say so"
     );
 
-    // Discord gained this in the outbound-media work; Slack has not, so its
-    // `None` above is the honest answer rather than an oversight.
     let discord = crate::channels::discord::DiscordChannel::new(
         "t".into(),
         None,
@@ -206,6 +223,7 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
             "fn classify_inbound(",
             "self.is_user_allowed(",
             &[
+                "self.listen_inner(",
                 "self.listen_socket_mode(",
                 ".handle_inbound(",
                 "self.classify_inbound(",
@@ -217,6 +235,7 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
             "fn classify_inbound(",
             "self.is_user_allowed(",
             &[
+                "self.listen_inner(",
                 "self.listen_polling(",
                 ".handle_inbound(",
                 "self.classify_inbound(",
@@ -5765,6 +5784,11 @@ fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
         (
             "whatsapp (web)",
             include_str!("whatsapp_web.rs"),
+            "async fn send_attachment(",
+        ),
+        (
+            "slack",
+            include_str!("slack.rs"),
             "async fn send_attachment(",
         ),
     ];

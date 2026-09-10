@@ -311,18 +311,25 @@ local path or an `http(s)` URL. One vocabulary for every channel, built by
 `media::delivery_instructions_for`, so a reply written on one channel does not
 leak literal markers on another.
 
-**Telegram, Discord and WhatsApp Web can deliver attachments.** Every other
-channel returns `None` and is never told the syntax, because telling a channel
-that cannot deliver them leaks `[IMAGE:…]` to the reader as literal text.
+**All four tier channels can deliver attachments**: Telegram, Discord, Slack and
+WhatsApp Web. Every other channel returns `None` and is never told the syntax,
+because telling a channel that cannot deliver them leaks `[IMAGE:…]` to the
+reader as literal text.
 
-**Slack cannot, and the blocker is a scope rather than code.** Uploading needs
-`files:write`, which is not among the scopes this project asks operators to
-grant, so turning it on means editing the app's scopes and reinstalling it into
-the workspace. That is the operator's decision to make, not something a release
-should do on their behalf, so `delivery_instructions()` stays `None` for Slack
-until the scope is granted deliberately. The upload itself is the modern
-three-call flow (`files.getUploadURLExternal`, a `PUT` of the bytes to the URL it
-returns, then `files.completeUploadExternal`); `files.upload` is retired.
+**Slack needs the `files:write` scope**, granted on the owner's decision of
+2026-09-10. A workspace whose app predates that has to add the scope and
+reinstall; no migration can grant it. The upload is the modern three-call flow —
+`files.getUploadURLExternal` to reserve a URL, a `POST` of the bytes to it, then
+`files.completeUploadExternal` naming the channel, which is what actually shares
+the file. `files.upload` is retired.
+
+Only the first and third calls carry the bot token, and both go to the hardcoded
+`slack.com` API host. The bytes `POST` deliberately carries **no** credential,
+which is why it needs no host check: the URL came back from an authenticated
+call, and pinning a host there would break uploads the day Slack moves external
+storage off `files.slack.com`. That is the opposite of the *inbound* path, where
+`url_private` arrives inside an event payload and does carry the token, so the
+host is pinned there.
 
 Rules that apply wherever a marker names a **local path**:
 

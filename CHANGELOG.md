@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Slack can send attachments now, which closes outbound media across all four tier channels.**
+  It was the last one that could not, and the blocker was the `files:write` scope rather than
+  missing code; the owner granted it on 2026-09-10. The upload is the three-call flow that replaced
+  the retired `files.upload`: reserve a URL, `POST` the bytes, complete the upload naming the
+  channel. Only the first and third calls carry the bot token and both go to the hardcoded
+  `slack.com` host; the bytes `POST` carries no credential, which is why it needs no host pin,
+  unlike the inbound path where `url_private` arrives in an event payload and does carry the token.
+  Local paths are confined to the workspace by the same shared check every other uploading channel
+  uses, and Slack is now in the class guard that fails if any upload path stops calling it. A reply
+  goes to the same thread as the answer. The pin holding Slack's `delivery_instructions()` at `None`
+  moved in this change rather than ahead of it, and now sits on Mattermost, which still has no
+  upload path.
 - **The reason recorded for skipping Slack's "working" indicator turned out to be wrong.** The
   2026-09-09 note said `agents.sessions.setStatus` could be skipped because draft streaming would
   give the same signal without an app change. Draft streaming is gated on `stream_mode`, and that
