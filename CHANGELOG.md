@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WhatsApp Web could not see an image either, and its module header said otherwise.** The
+  channel had no media path at all: `download`, `upload` and `ImageMessage` appeared nowhere in
+  `whatsapp_web.rs`, and the only "media" mention was a comment on the HTTP client handed to the
+  `wa-rs` bot builder. Meanwhile the module header advertised "Full Baileys parity (groups, media,
+  presence, reactions, editing/deletion)", which describes the library rather than this
+  integration. Inbound images now download through `wa-rs` (`ImageMessage` already implements its
+  `Downloadable` trait) and pass through the same per-sender budget, size cap and byte sniffing as
+  every other channel, with rejections becoming a visible note. An image sent with no caption is
+  no longer dropped as an empty message. The header now says what this module actually does, and
+  says outbound media is still missing.
 - **Slack dropped a message that carried a photo, and could not see an image in one that got
   through.** Two separate faults. `socket_event_message` returned `None` for every message with a
   subtype, and Slack delivers an upload as `subtype: "file_share"`, so a captioned screenshot over

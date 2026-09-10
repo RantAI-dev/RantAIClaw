@@ -147,12 +147,17 @@ pub(crate) fn build_whatsapp_web(config: &Config) -> Option<Arc<dyn Channel>> {
     }
     #[cfg(feature = "whatsapp-web")]
     {
-        Some(Arc::new(super::WhatsAppWebChannel::new(
-            web.session_path.clone(),
-            web.pair_phone.clone(),
-            web.pair_code.clone(),
-            web.allowed_numbers.clone(),
-        )) as Arc<dyn Channel>)
+        Some(Arc::new(
+            super::WhatsAppWebChannel::new(
+                web.session_path.clone(),
+                web.pair_phone.clone(),
+                web.pair_code.clone(),
+                web.allowed_numbers.clone(),
+            )
+            // Inbound images obey the operator's caps, not a default the
+            // channel invented for itself.
+            .with_multimodal(config.multimodal.clone()),
+        ) as Arc<dyn Channel>)
     }
 }
 

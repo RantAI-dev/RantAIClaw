@@ -5687,6 +5687,11 @@ fn every_tier_channel_with_inbound_media_charges_the_shared_budget() {
             include_str!("whatsapp.rs"),
             "fn resolve_media",
         ),
+        (
+            "whatsapp (web)",
+            include_str!("whatsapp_web.rs"),
+            "fn image_marker_from_bytes",
+        ),
     ];
 
     for (channel, src, collector) in wiring {
