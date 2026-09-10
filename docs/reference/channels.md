@@ -271,6 +271,15 @@ leak literal markers on another.
 `None` and is never told the syntax, because telling a channel that cannot
 deliver them leaks `[IMAGE:…]` to the reader as literal text.
 
+**Slack cannot, and the blocker is a scope rather than code.** Uploading needs
+`files:write`, which is not among the scopes this project asks operators to
+grant, so turning it on means editing the app's scopes and reinstalling it into
+the workspace. That is the operator's decision to make, not something a release
+should do on their behalf, so `delivery_instructions()` stays `None` for Slack
+until the scope is granted deliberately. The upload itself is the modern
+three-call flow (`files.getUploadURLExternal`, a `PUT` of the bytes to the URL it
+returns, then `files.completeUploadExternal`); `files.upload` is retired.
+
 Rules that apply wherever a marker names a **local path**:
 
 - The file must exist and must resolve **inside the workspace**. Both sides are
@@ -307,6 +316,11 @@ Operational notes:
   type, or a failed fetch produces a **visible note** in the message rather than
   silence. Full rules:
   [inbound media policy](../security/inbound-media-policy.md).
+- **Slack needs the `files:read` scope to see an upload at all.** `url_private` is
+  authenticated, so without that scope the fetch is refused and the attachment
+  becomes a note rather than an image. It is not in the scopes the first-run
+  wizard used to list, so a workspace set up before 2026-09-10 has to add it and
+  reinstall the app.
 - **Slack sends its bot token to fetch an upload**, because `url_private` is
   authenticated. The URL comes out of the event payload, so the token goes only
   to `slack.com` and its subdomains over HTTPS; a file named on any other host

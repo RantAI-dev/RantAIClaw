@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Slack's inbound-image support needed a scope nobody was told to grant.** The first-run wizard
+  listed `chat:write, channels:history`, and `url_private` (the only way to fetch an upload) is
+  authenticated behind `files:read`. So the feature that shipped could not work on a workspace set
+  up by following our own instructions: the image arrived as a note saying the fetch failed. The
+  wizard now lists `files:read` and says what it buys. A workspace configured before this has to
+  add the scope and reinstall the app.
+- **Slack outbound attachments are blocked on a scope decision, not on code**, and the docs now say
+  so rather than leaving it looking unimplemented. Uploading needs `files:write`, which means
+  editing the app's scopes and reinstalling it into the workspace. That is the operator's call, so
+  `delivery_instructions()` stays `None` for Slack until it is made deliberately; telling the model
+  otherwise would leak `[IMAGE:…]` to readers as literal text.
 - **Discord can now send attachments, which only Telegram could.**
   `delivery_instructions()` was overridden by `telegram.rs` alone; the other fifteen channels took
   the `None` default, so the model was never told how to ask for an attachment and never tried.

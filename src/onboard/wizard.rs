@@ -3898,7 +3898,10 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     style("— talk to RantaiClaw from Slack").dim()
                 );
                 print_bullet("1. Go to https://api.slack.com/apps → Create New App");
-                print_bullet("2. Add Bot Token Scopes: chat:write, channels:history");
+                print_bullet("2. Add Bot Token Scopes: chat:write, channels:history, files:read");
+                print_bullet(
+                    "   files:read is what lets the bot open an image you send it. Without it an upload arrives as a note saying the fetch failed.",
+                );
                 print_bullet("3. Install to workspace and copy the Bot Token");
                 println!();
 
