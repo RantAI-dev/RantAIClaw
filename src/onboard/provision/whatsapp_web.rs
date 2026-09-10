@@ -10,7 +10,7 @@ use super::traits::{
     Severity, TuiProvisioner,
 };
 use crate::channels::whatsapp_web::{pair_once, PairEvent, PairOptions};
-use crate::config::schema::WhatsAppConfig;
+use crate::config::schema::WhatsAppWebConfig;
 use crate::config::Config;
 use crate::profile::Profile;
 use anyhow::Result;
@@ -218,13 +218,12 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
         .await?;
 
         // ── 5. Write config and save ───────────────────────────────
-        let existing = config.channels_config.whatsapp.clone();
-        config.channels_config.whatsapp = Some(WhatsAppConfig {
-            access_token: existing.as_ref().and_then(|c| c.access_token.clone()),
-            phone_number_id: existing.as_ref().and_then(|c| c.phone_number_id.clone()),
-            verify_token: existing.as_ref().and_then(|c| c.verify_token.clone()),
-            app_secret: existing.as_ref().and_then(|c| c.app_secret.clone()),
-            session_path: Some(session_path.to_string_lossy().into_owned()),
+        // Its own table since schema v32. The Cloud table is not read and not
+        // written here: setting up Web mode must not disturb Cloud keys, and
+        // it no longer has to reach across to preserve them.
+        let existing = config.channels_config.whatsapp_web.clone();
+        config.channels_config.whatsapp_web = Some(WhatsAppWebConfig {
+            session_path: session_path.to_string_lossy().into_owned(),
             pair_phone: pair_phone.clone(),
             pair_code: existing.as_ref().and_then(|c| c.pair_code.clone()),
             allowed_numbers: allowed_numbers.clone(),

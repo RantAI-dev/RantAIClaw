@@ -753,6 +753,7 @@ Examples:
 - `[channels_config.discord]`
 - `[channels_config.slack]`
 - `[channels_config.whatsapp]`
+- `[channels_config.whatsapp_web]`
 - `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
 
@@ -799,9 +800,8 @@ Notes:
 
 ### `[channels_config.whatsapp]`
 
-WhatsApp supports two backends under one config table.
-
-Cloud API mode (Meta webhook):
+WhatsApp Cloud API (Meta webhook). Web mode moved to
+[`[channels_config.whatsapp_web]`](#channels_configwhatsapp_web) in schema **v32**.
 
 | Key | Required | Purpose |
 |---|---|---|
@@ -811,19 +811,39 @@ Cloud API mode (Meta webhook):
 | `app_secret` | Optional | Enables webhook signature verification (`X-Hub-Signature-256`) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
 
-WhatsApp Web mode (native client):
+Notes:
+
+- Webhook endpoint is `POST /whatsapp`.
+- `session_path`, `pair_phone` and `pair_code` are no longer read here. A v31
+  config carrying them is migrated automatically on first launch.
+
+### `[channels_config.whatsapp_web]`
+
+WhatsApp Web (native client, QR or pair-code linking). Split out of
+`[channels_config.whatsapp]` in schema **v32**; before that both transports
+shared one table and the mode was inferred from which keys happened to be
+filled.
 
 | Key | Required | Purpose |
 |---|---|---|
-| `session_path` | Yes | Persistent SQLite session path |
-| `pair_phone` | Optional | Pair-code flow phone number (digits only) |
+| `session_path` | Yes | Persistent SQLite session path for the linked device |
+| `pair_phone` | Optional | Pair-code flow phone number (digits only). Omit for QR pairing |
 | `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
 
 Notes:
 
-- WhatsApp Web is compiled into the default binary since v0.6.49-alpha (no build flag required).
-- If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
+- **Writing this table is how you select Web mode.** There is no mode key and
+  nothing is inferred.
+- Compiled into the default binary since v0.6.49-alpha; a build without the
+  `whatsapp-web` feature logs that it cannot run this table rather than pretending.
+- If **both** this table and `[channels_config.whatsapp]` are present, the Cloud
+  API transport runs and this one is skipped, with a warning naming both tables.
+  The two are mutually exclusive at runtime because they share
+  `Channel::name() == "whatsapp"`. Remove one table to choose deliberately.
+- Upgrading from v31 moves `session_path`, `pair_phone` and `pair_code` here
+  automatically and copies `allowed_numbers`. See [Schema version and downgrades](#schema-version-and-downgrades)
+  for what a downgrade needs.
 
 ### `[channels_config.nextcloud_talk]`
 
@@ -841,6 +861,37 @@ Notes:
 - Webhook endpoint is `POST /nextcloud-talk`.
 - `RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
 - See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for setup and troubleshooting.
+
+## Schema version and downgrades
+
+`config.toml` carries a `schema_version` line. On launch the binary runs any
+migrations between that number and the version it was built for, then rewrites
+the file with the new number. Running a **newer** config on an **older** binary
+is refused rather than half-understood.
+
+Migrations only move forward. There is no automatic downgrade, so reverting to a
+binary older than your config's `schema_version` needs a manual edit.
+
+### v32: WhatsApp Web moved to its own table
+
+Upgrading rewrites a v31 WhatsApp section:
+
+- `session_path`, `pair_phone` and `pair_code` move from
+  `[channels_config.whatsapp]` into `[channels_config.whatsapp_web]`.
+- `allowed_numbers` is **copied**, not moved, so both transports keep the
+  allowlist they had.
+- A `[channels_config.whatsapp]` left with no Cloud keys is removed, rather than
+  kept as an empty table that would report a channel that cannot run.
+
+**To go back to a v31 binary**, undo it by hand before launching the old binary:
+
+1. Move `session_path`, `pair_phone` and `pair_code` from
+   `[channels_config.whatsapp_web]` back into `[channels_config.whatsapp]`,
+   recreating that table if the upgrade removed it.
+2. Delete the `[channels_config.whatsapp_web]` table.
+3. Set `schema_version = 31`.
+
+Keeping a copy of `config.toml` before a major upgrade is cheaper than step 1.
 
 ## `[hardware]`
 

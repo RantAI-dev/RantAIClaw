@@ -5438,8 +5438,8 @@ async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() 
 /// fails here and in `scripts/ci/check_channel_maturity.sh`: the gate checks the
 /// static surfaces, this checks the value the runtime renders.
 #[test]
-fn catalog_declares_sixteen_channels_and_four_supported() {
-    assert_eq!(CHANNEL_CATALOG.len(), 16);
+fn catalog_declares_seventeen_channels_and_five_supported() {
+    assert_eq!(CHANNEL_CATALOG.len(), 17);
 
     let supported: Vec<&str> = CHANNEL_CATALOG
         .iter()
@@ -5449,7 +5449,7 @@ fn catalog_declares_sixteen_channels_and_four_supported() {
 
     assert_eq!(
         supported,
-        vec!["telegram", "discord", "slack", "whatsapp"],
+        vec!["telegram", "discord", "slack", "whatsapp", "whatsapp_web"],
         "the supported tier changed — that is a promise to operators, not a refactor"
     );
 }
@@ -5495,7 +5495,7 @@ fn committed_but_undriven_is_a_legitimate_state() {
 
     assert_eq!(
         committed_undriven,
-        vec!["discord", "slack", "whatsapp"],
+        vec!["discord", "slack", "whatsapp", "whatsapp_web"],
         "the committed-but-undriven set changed; demoting one of these discards \
          an owner decision to make a label look tidy"
     );

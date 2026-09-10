@@ -234,9 +234,9 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
                 Some(verify_token.trim().to_string())
             },
             app_secret,
-            session_path: existing.as_ref().and_then(|c| c.session_path.clone()),
-            pair_phone: existing.as_ref().and_then(|c| c.pair_phone.clone()),
-            pair_code: existing.as_ref().and_then(|c| c.pair_code.clone()),
+            // Web keys moved to `[channels_config.whatsapp_web]` in schema v32,
+            // so this Cloud provisioner no longer carries them forward. The
+            // operator's Web table is a separate section and is left untouched.
             allowed_numbers,
         });
 

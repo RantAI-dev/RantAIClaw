@@ -56,6 +56,21 @@ catalog_block="$(awk '/^pub\(crate\) const CHANNEL_CATALOG/,/^\];/' "$CATALOG_SR
 rows="$(grep -oE '\( *"[a-z_]+", *"[^"]+", *ChannelSupport::[A-Za-z]+, *ChannelVerification::[A-Za-z]+,? *\)' <<<"$catalog_block" \
   | tr -s ' ' || true)"
 
+# A key this regex cannot read is a row this gate cannot check, and it used to
+# be skipped in silence — a hyphenated key like `whatsapp-web` simply vanished
+# from a gate whose own header says it is fail-closed. Count the rows the
+# catalog actually opens and refuse a mismatch before comparing anything.
+opened="$(grep -oE '\( *"[^"]+", *"[^"]+", *ChannelSupport::' <<<"$catalog_block" | wc -l | tr -d ' ')"
+matched="$(grep -c . <<<"$rows" || true)"
+if [ "$opened" != "$matched" ]; then
+  echo "ERROR: $CATALOG_SRC has $opened catalog row(s) but only $matched parsed."
+  echo "       A row this gate cannot read is a row it cannot check. Keys must match"
+  echo "       [a-z_]+ — a hyphen is the usual cause. Rows seen but not parsed:"
+  grep -oE '\( *"[^"]+", *"[^"]+", *ChannelSupport::' <<<"$catalog_block" \
+    | grep -oE '"[^"]+"' | head -40
+  exit 1
+fi
+
 if [ -z "$rows" ]; then
   echo "ERROR: could not parse CHANNEL_CATALOG out of $CATALOG_SRC."
   echo "       Expected rows shaped"
@@ -117,7 +132,18 @@ while IFS= read -r row; do
     fail=1
   fi
 
-  doc_line="$(grep -B1 "^    pub $key:" <<<"$schema_block" | head -1)"
+  # `|| true` because a miss here used to abort the entire script under
+  # `set -euo pipefail` with an empty exit 1 — no message, nothing to act on.
+  # A catalog key with no matching struct field is a real finding, so say it.
+  doc_line="$(grep -B1 "^    pub $key:" <<<"$schema_block" | head -1 || true)"
+  if [ -z "$doc_line" ]; then
+    echo "ERROR: $SCHEMA has no \`ChannelsConfig.$key\` field for catalog key '$key'."
+    echo "       Every catalog key needs a config field of the same name, whose doc"
+    echo "       comment carries both labels. Adding one is a schema change: bump"
+    echo "       CURRENT_VERSION and write the migration."
+    fail=1
+    continue
+  fi
   if ! grep -qF "Support: **$support**. Verification: **$verification**." <<<"$doc_line"; then
     echo "ERROR: $SCHEMA is stale for ChannelsConfig.$key."
     echo "       The catalog says '$support' / '$verification'; its doc comment reads:"
@@ -132,9 +158,11 @@ done <<<"$rows"
 # combined assertion would pass while a channel moved from one axis to the
 # other, which is the exact confusion this split removed.
 #
-# Four supported is the owner's 2026-09-04 product commitment.
-if [ "$supported" -ne 4 ]; then
-  echo "ERROR: $supported channels are marked Supported; the recorded decision is 4."
+# Five supported: the owner's 2026-09-04 commitment of four, plus WhatsApp Web,
+# split onto its own row and its own config table in schema v32 after the owner
+# recorded it Supported on 2026-09-09.
+if [ "$supported" -ne 5 ]; then
+  echo "ERROR: $supported channels are marked Supported; the recorded decision is 5."
   echo "       The support axis is the OWNER's call, not a checklist outcome. If"
   echo "       the owner moved it, update this number and say which channel."
   fail=1

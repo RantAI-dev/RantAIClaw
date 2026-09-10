@@ -1770,12 +1770,12 @@ mod tests {
 
         {
             let mut seed = crate::config::Config::load_or_init().await.unwrap();
-            seed.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
-                access_token: None,
-                phone_number_id: None,
-                verify_token: None,
-                app_secret: None,
-                session_path: Some("/tmp/wa.db".into()),
+            // Its own table since schema v32. This is also the test that proves
+            // a `/claim` from WhatsApp Web still reaches an allowlist: the
+            // channel reports `name() == "whatsapp"`, so the pairing arm has to
+            // fall through to the Web table when there is no Cloud one.
+            seed.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+                session_path: "/tmp/wa.db".into(),
                 pair_phone: None,
                 pair_code: None,
                 allowed_numbers: vec![],
@@ -1809,11 +1809,15 @@ mod tests {
 
         // Config persisted.
         let config = crate::config::Config::load_or_init().await.unwrap();
+        // The Web table, not the Cloud one. `Channel::name()` is still
+        // `"whatsapp"` for both transports, so `apply_pairing` matches the
+        // `"whatsapp"` arm and has to fall through to `whatsapp_web` when no
+        // Cloud table exists. If that fallback is dropped this unwrap panics.
         let numbers = &config
             .channels_config
-            .whatsapp
+            .whatsapp_web
             .as_ref()
-            .unwrap()
+            .expect("the Web table must still exist after a /claim")
             .allowed_numbers;
         assert!(
             numbers.contains(&"+9999999999".to_string()),

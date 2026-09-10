@@ -178,7 +178,16 @@ pub fn apply_pairing(
         "qq" => cc.qq.as_mut().map(|c| &mut c.allowed_users),
         "nextcloud_talk" => cc.nextcloud_talk.as_mut().map(|c| &mut c.allowed_users),
         "signal" => cc.signal.as_mut().map(|c| &mut c.allowed_from),
-        "whatsapp" => cc.whatsapp.as_mut().map(|c| &mut c.allowed_numbers),
+        // Both WhatsApp transports answer to `Channel::name() == "whatsapp"`,
+        // so a `/bind` from WhatsApp Web arrives under this arm and has to
+        // reach the Web table. Cloud first, matching the factory.
+        "whatsapp" => {
+            if cc.whatsapp.is_some() {
+                cc.whatsapp.as_mut().map(|c| &mut c.allowed_numbers)
+            } else {
+                cc.whatsapp_web.as_mut().map(|c| &mut c.allowed_numbers)
+            }
+        }
         "linq" => cc.linq.as_mut().map(|c| &mut c.allowed_senders),
         "imessage" => cc.imessage.as_mut().map(|c| &mut c.allowed_contacts),
         _ => None,

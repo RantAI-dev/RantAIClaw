@@ -85,7 +85,17 @@ pub(crate) fn channel_allowlists(
         cc.nextcloud_talk.as_ref().map(|c| &c.allowed_users),
     );
     put("signal", cc.signal.as_ref().map(|c| &c.allowed_from));
-    put("whatsapp", cc.whatsapp.as_ref().map(|c| &c.allowed_numbers));
+    // One runtime name, two tables since the v32 split: both WhatsApp channel
+    // types return `"whatsapp"` from `Channel::name()`, so an inbound Web
+    // message arrives keyed `"whatsapp"` and must still find its allowlist.
+    // Cloud first, matching which transport the factory actually builds.
+    put(
+        "whatsapp",
+        cc.whatsapp
+            .as_ref()
+            .map(|c| &c.allowed_numbers)
+            .or_else(|| cc.whatsapp_web.as_ref().map(|c| &c.allowed_numbers)),
+    );
     put("linq", cc.linq.as_ref().map(|c| &c.allowed_senders));
     put(
         "imessage",

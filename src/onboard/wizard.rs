@@ -1,5 +1,6 @@
 use crate::config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
+    WhatsAppWebConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -4282,12 +4283,10 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                         users_str.split(',').map(|s| s.trim().to_string()).collect()
                     };
 
-                    config.whatsapp = Some(WhatsAppConfig {
-                        access_token: None,
-                        phone_number_id: None,
-                        verify_token: None,
-                        app_secret: None,
-                        session_path: Some(session_path.trim().to_string()),
+                    // Its own table since schema v32, so choosing Web mode no
+                    // longer writes a WhatsApp table full of empty Cloud keys.
+                    config.whatsapp_web = Some(WhatsAppWebConfig {
+                        session_path: session_path.trim().to_string(),
                         pair_phone: (!pair_phone.trim().is_empty())
                             .then(|| pair_phone.trim().to_string()),
                         pair_code: (!pair_code.trim().is_empty())
@@ -4408,9 +4407,6 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     phone_number_id: Some(phone_number_id.trim().to_string()),
                     verify_token: Some(verify_token.trim().to_string()),
                     app_secret: None, // Can be set via RANTAICLAW_WHATSAPP_APP_SECRET env var
-                    session_path: None,
-                    pair_phone: None,
-                    pair_code: None,
                     allowed_numbers,
                 });
             }

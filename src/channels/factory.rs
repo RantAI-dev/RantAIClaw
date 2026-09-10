@@ -117,6 +117,37 @@ pub(crate) fn build_mattermost(config: &Config) -> Option<Arc<MattermostChannel>
     )))
 }
 
+/// The ONE construction of the WhatsApp Web channel. See [`build_whatsapp_cloud`].
+///
+/// Returns `None` on a build without the `whatsapp-web` feature, which is the
+/// same answer as "not configured" to every caller and keeps the feature gate
+/// out of the call sites.
+pub(crate) fn build_whatsapp_web(config: &Config) -> Option<Arc<super::WhatsAppWebChannel>> {
+    let web = config.channels_config.whatsapp_web.as_ref()?;
+    if web.session_path.trim().is_empty() {
+        tracing::warn!("WhatsApp Web configured but session_path is empty");
+        return None;
+    }
+    #[cfg(not(feature = "whatsapp-web"))]
+    {
+        let _ = web;
+        tracing::warn!(
+            "WhatsApp Web is configured but this build lacks the 'whatsapp-web' feature. \
+             Rebuild with: cargo build --features whatsapp-web"
+        );
+        None
+    }
+    #[cfg(feature = "whatsapp-web")]
+    {
+        Some(Arc::new(super::WhatsAppWebChannel::new(
+            web.session_path.clone(),
+            web.pair_phone.clone(),
+            web.pair_code.clone(),
+            web.allowed_numbers.clone(),
+        )))
+    }
+}
+
 /// The ONE construction of the Linq channel. See [`build_whatsapp_cloud`].
 pub(crate) fn build_linq(config: &Config) -> Option<Arc<LinqChannel>> {
     let lq = config.channels_config.linq.as_ref()?;
@@ -213,47 +244,40 @@ pub(crate) fn build_configured_channels(
         ));
     }
 
-    if let Some(ref wa) = config.channels_config.whatsapp {
-        if wa.is_ambiguous_config() {
+    // Cloud API and Web are still mutually exclusive at runtime, and Cloud
+    // still wins, exactly as before the v32 table split. They are not two
+    // independent channels: both `WhatsAppChannel` and `WhatsAppWebChannel`
+    // return `"whatsapp"` from `Channel::name()`, and `channels_by_name` is
+    // keyed by that name, so building both would put two channels under one
+    // key and let one silently shadow the other. Giving Web its own runtime
+    // name would move the pairing surface and re-key conversation history,
+    // which is a behaviour change and not part of a config split.
+    //
+    // What the split did change is that the choice is no longer inferred from
+    // which keys happen to be filled. It is which table the operator wrote.
+    if config.channels_config.whatsapp.is_some() && config.channels_config.whatsapp_web.is_some() {
+        tracing::warn!(
+            "WhatsApp: both [channels_config.whatsapp] and [channels_config.whatsapp_web] are \
+             configured. Running the Cloud API transport; remove one table to choose \
+             deliberately."
+        );
+    }
+    if let Some(channel) = build_whatsapp_cloud(config) {
+        channels.push(("whatsapp", "WhatsApp Cloud API", channel));
+    } else {
+        // A Cloud table that cannot run must not shadow a Web table that can.
+        // Before the split the mode was chosen by `phone_number_id` alone, so a
+        // half-filled Cloud section with a good session path still ran Web;
+        // keying the choice on mere presence would have silently taken that
+        // away.
+        if config.channels_config.whatsapp.is_some() {
             tracing::warn!(
-                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+                "WhatsApp Cloud API configured but missing required fields (phone_number_id, \
+                 access_token, verify_token)"
             );
         }
-        // Runtime negotiation: detect backend type from config
-        match wa.backend_type() {
-            "cloud" => {
-                // Cloud API mode: requires phone_number_id, access_token, verify_token
-                if let Some(channel) = build_whatsapp_cloud(config) {
-                    channels.push(("whatsapp", "WhatsApp", channel));
-                } else {
-                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
-                }
-            }
-            "web" => {
-                // Web mode: requires session_path
-                #[cfg(feature = "whatsapp-web")]
-                if wa.is_web_config() {
-                    channels.push((
-                        "whatsapp",
-                        "WhatsApp",
-                        Arc::new(super::WhatsAppWebChannel::new(
-                            wa.session_path.clone().unwrap_or_default(),
-                            wa.pair_phone.clone(),
-                            wa.pair_code.clone(),
-                            wa.allowed_numbers.clone(),
-                        )),
-                    ));
-                } else {
-                    tracing::warn!("WhatsApp Web configured but session_path not set");
-                }
-                #[cfg(not(feature = "whatsapp-web"))]
-                {
-                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
-                }
-            }
-            _ => {
-                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
-            }
+        if let Some(channel) = build_whatsapp_web(config) {
+            channels.push(("whatsapp_web", "WhatsApp Web", channel));
         }
     }
 
@@ -455,6 +479,74 @@ mod tests {
     /// This is the guard that makes it a promise kept by the compiler: only the
     /// `build_*` functions may name these constructors, so a caller cannot
     /// quietly grow a second copy that drifts on the next added option.
+    /// The v32 split must not let a half-filled Cloud table shadow a working
+    /// Web one. Before the split the transport was chosen by `phone_number_id`
+    /// alone, so this config ran Web; choosing on table *presence* would have
+    /// silently stopped it.
+    #[test]
+    fn an_unusable_cloud_table_does_not_shadow_a_working_web_table() {
+        let mut config = Config::default();
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            // No `phone_number_id`, so `is_cloud_config()` is false.
+            access_token: Some("t".into()),
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            allowed_numbers: vec![],
+        });
+        config.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+            session_path: "/tmp/rantaiclaw-wa.db".into(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["+15550000001".into()],
+        });
+
+        let built: Vec<&str> = build_configured_channels(&config)
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+        assert!(
+            !built.contains(&"whatsapp"),
+            "an incomplete Cloud table must not be built: {built:?}"
+        );
+        #[cfg(feature = "whatsapp-web")]
+        assert!(
+            built.contains(&"whatsapp_web"),
+            "the usable Web table must still run: {built:?}"
+        );
+    }
+
+    /// Both usable: Cloud wins, and only one is built. They share
+    /// `Channel::name() == "whatsapp"`, so building both would put two channels
+    /// under one key in `channels_by_name` and let one shadow the other.
+    #[test]
+    fn cloud_wins_when_both_tables_are_usable_and_only_one_is_built() {
+        let mut config = Config::default();
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("t".into()),
+            phone_number_id: Some("p".into()),
+            verify_token: Some("v".into()),
+            app_secret: None,
+            allowed_numbers: vec![],
+        });
+        config.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+            session_path: "/tmp/rantaiclaw-wa.db".into(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        });
+
+        let built: Vec<&str> = build_configured_channels(&config)
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+        assert!(built.contains(&"whatsapp"), "Cloud must win: {built:?}");
+        assert!(
+            !built.contains(&"whatsapp_web"),
+            "only one WhatsApp transport may run: {built:?}"
+        );
+    }
+
     #[test]
     fn only_the_shared_builders_construct_a_tier_channel() {
         let src = include_str!("factory.rs");
@@ -491,9 +583,6 @@ mod tests {
             phone_number_id: Some("p".into()),
             verify_token: Some("v".into()),
             app_secret: None,
-            session_path: None,
-            pair_phone: None,
-            pair_code: None,
             allowed_numbers: vec![],
         });
         config
