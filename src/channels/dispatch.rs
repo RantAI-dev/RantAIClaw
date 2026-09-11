@@ -6,7 +6,6 @@
 //! items are `pub(crate)`.
 
 use super::traits;
-use super::truncate_with_ellipsis;
 use super::{
     approval_relay, channel_message_timeout_budget_secs, commands, conversation, history, prompt,
     routing, sanitize, supervisor, ChannelRuntimeContext, AUTOSAVE_MIN_MESSAGE_CHARS,
@@ -296,12 +295,14 @@ pub(crate) async fn process_channel_message(
     // — "[telegram] from <sender>: ..." — printed straight into the local
     // chat surface). Tracing routes to the log file in TUI
     // mode and to whatever subscriber daemon mode installs — operator
-    // can `RUST_LOG=info` + tail the log file.
+    // can `RUST_LOG=info` + tail the log file. It carries the message's id and
+    // length, never its text: the journal is not the conversation (plan 352).
     tracing::info!(
         channel = %msg.channel,
         sender = %msg.sender,
-        "channel message received: {}",
-        truncate_with_ellipsis(&msg.content, 80)
+        message_id = %msg.id,
+        chars = msg.content.chars().count(),
+        "channel message received"
     );
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
@@ -654,9 +655,11 @@ pub(crate) async fn process_channel_message(
             // time, and the gate counts a moved line as a changed one.
             let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(
+                channel = %msg.channel,
+                message_id = %msg.id,
                 ms = elapsed_ms,
-                "channel reply: {}",
-                truncate_with_ellipsis(&delivered_response, 80)
+                chars = delivered_response.chars().count(),
+                "channel reply"
             );
 
             // Deliver FIRST, record after. The append used to run before the
