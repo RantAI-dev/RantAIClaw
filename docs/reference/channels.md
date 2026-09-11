@@ -237,20 +237,29 @@ cli = true
 
 Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).
 
-## In-Chat Runtime Model Switching (Telegram / Discord)
+## In-Chat Runtime Model Switching
 
-When running `rantaiclaw channel start` (or daemon mode), Telegram and Discord support runtime switching, scoped to the conversation:
+When running `rantaiclaw channel start` (or daemon mode), the four tier channels (Telegram, Discord, Slack and WhatsApp Web) support runtime switching, scoped to the conversation:
 
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current conversation. In a group that applies to everyone in it
 - `/model` — show current model and cached model IDs (if available)
 - `/model <model-id>` — switch model for the current conversation. In a group that applies to everyone in it
 
+**Slack takes the same commands without the slash:** `models`, `models <provider>`, `model` and
+`model <model-id>`. Slack's client treats a message that starts with `/` as one of its own slash
+commands and never delivers it, which is also why approval replies on Slack are bare verbs. A bare
+verb can also start an ordinary sentence, so Slack treats the message as a command only when it is
+the verb alone or the verb and one more word; `model apa yang kamu pakai?` goes to the model. The
+runtime's replies on Slack name the commands without the slash too.
+
 Notes:
 
-- Switching clears that conversation's history to avoid cross-model context contamination, in memory and in the persisted store. In a group that clears the history everyone there shares.
+- Switching clears that conversation's history to avoid cross-model context contamination, in memory and in the persisted store. In a group that clears the history everyone there shares. On Slack the conversation is the thread.
 - Model cache previews come from `rantaiclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
+- WhatsApp Cloud registers under the same channel name as WhatsApp Web, so it answers the slash form as well.
+- Other channels do not answer these commands; the text reaches the model as ordinary chat.
 
 ## Draft streaming
 
