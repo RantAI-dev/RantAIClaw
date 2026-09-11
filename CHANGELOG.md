@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/model` and `/models` now work on Slack and WhatsApp Web, not only on Telegram and Discord.**
+  On the other two tier channels the command went to the model, which answered as a chatbot and
+  switched nothing. WhatsApp Web takes the slash form. Slack takes `model` and `models` without the
+  slash, because its client never delivers a message that starts with `/`, and only when the message
+  is the verb alone or the verb and one more word, so a sentence such as "model apa yang kamu
+  pakai?" still reaches the model. The approval prompt and the runtime commands now read one rule
+  for that prefix, and the runtime replies use it too, so a Slack reply names `model <model-id>`
+  instead of a slash command that cannot arrive. WhatsApp Cloud registers under WhatsApp Web's
+  channel name and answers the slash form as well.
+
 ### Fixed
 
 - **Telegram and Discord forgot the conversation after every message, and `/model` never stuck

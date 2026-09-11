@@ -4022,6 +4022,217 @@ async fn a_telegram_dm_carries_the_previous_exchange_into_the_next_message() {
     assert!(calls[1][2].1.contains("response-1"), "{:?}", calls[1]);
 }
 
+/// The thread every Slack message from [`tier_message`] replies inside.
+const SLACK_THREAD_ROOT: &str = "1700000000.000100";
+
+/// A message with `text` in one conversation on a tier channel, built by that
+/// channel's own inbound parser. `id` keeps consecutive messages distinct.
+fn tier_message(channel: &str, id: u32, text: &str) -> traits::ChannelMessage {
+    match channel {
+        "telegram" => telegram_dm(i64::from(id), text),
+        "discord" => {
+            let discord = crate::channels::discord::DiscordChannel::new(
+                "t".into(),
+                None,
+                vec!["*".into()],
+                false,
+                false,
+            );
+            let payload = serde_json::json!({
+                "id": format!("MSG_{id}"),
+                "channel_id": "C_CHAN",
+                "content": text,
+                "author": { "id": "U_OK", "username": "rantaiclaw_user" },
+            });
+            match discord.classify_inbound(&payload, "U_BOT") {
+                crate::channels::discord::DiscordInbound::Deliver(msg) => msg,
+                other => panic!("the message must be delivered: {other:?}"),
+            }
+        }
+        "slack" => {
+            let slack = crate::channels::slack::SlackChannel::new(
+                "xoxb-placeholder".into(),
+                None,
+                vec!["*".into()],
+            );
+            let payload = serde_json::json!({
+                "user": "U1",
+                "text": text,
+                "ts": format!("1700000{id:03}.000200"),
+                "thread_ts": SLACK_THREAD_ROOT,
+            });
+            match slack.classify_inbound(&payload, "U_BOT", "", "C_CHAN") {
+                crate::channels::slack::SlackInbound::Deliver(msg) => msg,
+                other => panic!("the message must be delivered: {other:?}"),
+            }
+        }
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp" => crate::channels::whatsapp_web::WhatsAppWebChannel::inbound_channel_message(
+            &format!("3EB0{id}"),
+            "+15550001111".into(),
+            "15550001111@s.whatsapp.net".into(),
+            text.into(),
+            1_700_000_000,
+        ),
+        other => panic!("not a tier channel with a parser here: {other}"),
+    }
+}
+
+/// The command forms a reply tells the user to type: every backticked span
+/// whose verb is `model` or `models`, with its placeholders filled in.
+fn named_commands(reply: &str) -> Vec<String> {
+    reply
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| {
+            matches!(
+                span.trim_start_matches('/').split_whitespace().next(),
+                Some("model" | "models")
+            )
+        })
+        .map(|span| span.replace("<model-id>", "x").replace("<provider>", "x"))
+        .collect()
+}
+
+/// Runtime commands answer on every tier channel, and every command a reply
+/// tells the user to type is one their channel accepts.
+///
+/// `/model` used to work on Telegram and Discord only; on WhatsApp Web and
+/// Slack it went to the model, which answered as a chatbot. The replies also
+/// named `/model` everywhere, and Slack cannot send a leading slash, so a reply
+/// there would teach a command that never arrives. Messages come from each
+/// channel's own parser.
+#[tokio::test]
+async fn every_command_a_runtime_reply_names_is_one_its_channel_accepts() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = tempfile::TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let mut channels = vec![("telegram", "/"), ("discord", "/"), ("slack", "")];
+    if cfg!(feature = "whatsapp-web") {
+        channels.push(("whatsapp", "/"));
+    }
+    for (channel_name, prefix) in channels {
+        let channel_impl = Arc::new(AddressRecordingChannel::named(channel_name));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let ctx = dispatch_ctx(
+            vec![channel],
+            provider_impl.clone(),
+            routing::RuntimeConfigSlot::default(),
+        );
+
+        let commands = ["model", "models", "models no-such-provider", "model x"];
+        for (id, command) in (1u32..).zip(commands) {
+            process_channel_message(
+                Arc::clone(&ctx),
+                tier_message(channel_name, id, &format!("{prefix}{command}")),
+                CancellationToken::new(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            provider_impl.call_count.load(Ordering::SeqCst),
+            0,
+            "{channel_name}: a runtime command reached the model"
+        );
+        let sent = channel_impl.sent.lock().await;
+        assert_eq!(
+            sent.len(),
+            commands.len(),
+            "{channel_name}: one runtime reply per command: {sent:?}"
+        );
+        for reply in sent.iter() {
+            for form in named_commands(&reply.content) {
+                assert!(
+                    commands::parse_runtime_command(channel_name, &form).is_some(),
+                    "{channel_name}: the reply names `{form}`, which this channel does not accept: {}",
+                    reply.content
+                );
+            }
+        }
+    }
+}
+
+/// Slack takes `models` without the slash it cannot send, answers inside the
+/// thread the command came from, and leaves a sentence that starts with the
+/// same word to the model.
+#[tokio::test]
+async fn slack_answers_a_bare_command_in_its_thread_and_leaves_sentences_to_the_model() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = tempfile::TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("slack"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let provider_impl = Arc::new(ModelCaptureProvider::default());
+    let ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    process_channel_message(
+        Arc::clone(&ctx),
+        tier_message("slack", 1, "models"),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        provider_impl.call_count.load(Ordering::SeqCst),
+        0,
+        "a bare `models` is a runtime command on Slack"
+    );
+    {
+        let sent = channel_impl.sent.lock().await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].content.contains("Current provider"),
+            "{}",
+            sent[0].content
+        );
+        assert_eq!(
+            sent[0].thread_ts.as_deref(),
+            Some(SLACK_THREAD_ROOT),
+            "the reply stays in the thread the command came from"
+        );
+    }
+
+    process_channel_message(
+        ctx,
+        tier_message("slack", 2, "model apa yang kamu pakai?"),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        provider_impl.call_count.load(Ordering::SeqCst),
+        1,
+        "a sentence that starts with `model` is chat, not a command"
+    );
+}
+
+/// Approval prompts and runtime commands spell their verbs with one prefix
+/// rule. With two copies, one learns that Slack cannot send a leading slash and
+/// the other does not, which is how a Slack owner was once told to type
+/// `/approve`, a message that never arrives.
+#[test]
+fn approval_prompts_and_runtime_commands_share_one_prefix_rule() {
+    let approvals = production_half(include_str!("approval_relay.rs"));
+    let runtime_commands = production_half(include_str!("commands.rs"));
+    assert!(
+        approvals.contains("commands::command_prefix("),
+        "the approval prompt must print the prefix the runtime commands parse"
+    );
+    let copies = approvals.matches("\"slack\" => \"\"").count()
+        + runtime_commands.matches("\"slack\" => \"\"").count();
+    assert_eq!(
+        copies, 1,
+        "the Slack exception to the slash prefix must be written once"
+    );
+}
+
 /// A role the normalizer does not expect is dropped from the rebuilt turn
 /// list. Nothing writes one today; this pins that the loss is reported rather
 /// than silent, since it would be permanent after the next compaction.

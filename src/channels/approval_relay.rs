@@ -30,7 +30,7 @@
 //!      token makes the whole reply fall through to the agent as ordinary chat
 //!
 //! The prompt omits the leading `/` on channels whose platform intercepts it
-//! (see [`reply_verb_prefix`]).
+//! (see [`command_prefix`](super::commands::command_prefix)).
 //!
 //! **Layer B — [`try_handle_reply`]** is a stateless parser called by the
 //! channel dispatch loop before each inbound message is forwarded to the
@@ -318,23 +318,6 @@ pub(crate) fn auto_deny_line(timeout: Option<std::time::Duration>) -> String {
     }
 }
 
-/// Leading character for the reply forms the prompt prints.
-///
-/// Slack treats every message starting with `/` as a slash command and answers
-/// "/approve is not a valid command" without ever delivering it, so a prompt
-/// telling a Slack owner to type `/approve` names a reply that cannot arrive.
-/// The parser has always accepted the slash-less form (see [`parse_tool_reply`],
-/// which strips an optional leading `/`), so this only changes what is printed.
-///
-/// An explicit list, not a guess: a channel is added here after its platform is
-/// shown to intercept the prefix.
-fn reply_verb_prefix(channel_name: &str) -> &'static str {
-    match channel_name {
-        "slack" => "",
-        _ => "/",
-    }
-}
-
 /// Format a tool-approval request for chat.
 ///
 /// `handle` is the short request id. A tool name is not a unique thing to
@@ -347,7 +330,7 @@ pub fn format_tool_approval_message(
     timeout: Option<std::time::Duration>,
     channel_name: &str,
 ) -> String {
-    let verb = reply_verb_prefix(channel_name);
+    let verb = super::commands::command_prefix(channel_name);
     let detail = if args_summary.trim().is_empty() {
         String::new()
     } else {
