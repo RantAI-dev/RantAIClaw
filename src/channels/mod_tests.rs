@@ -293,11 +293,20 @@ fn callee_name(hop: &str) -> &str {
 /// Everything before the test module. Cutting at the first `#[cfg(test)]`
 /// would be wrong twice over: telegram has a `#[cfg(test)]` helper among
 /// its production methods, and whatsapp_web gates its test module on a
-/// feature as well.
+/// feature as well. A `mod tests;` line only declares a file: `format/mod.rs`
+/// has one near its top, and cutting there left the rest of it unread.
 fn production_half(src: &str) -> &str {
     let cut = ["\n#[cfg(test)]\nmod ", "\n#[cfg(all(test"]
         .iter()
-        .filter_map(|marker| src.find(marker))
+        .flat_map(|marker| src.match_indices(marker))
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            let item = src[at..]
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with("#["));
+            !item.is_some_and(|line| line.starts_with("mod ") && line.ends_with(';'))
+        })
         .min()
         .unwrap_or(src.len());
     &src[..cut]
@@ -320,6 +329,440 @@ fn fn_body<'a>(production: &'a str, header: &str) -> Option<&'a str> {
     .min()
     .unwrap_or(after.len());
     Some(&after[..end])
+}
+
+/// Plan 352 (D4): no log or print call carries message or reply text, at any
+/// level. The journal from the 2026-09-11 drive held owners' messages, the head
+/// of a base64 photo and an owner-granting pairing code, written by three INFO
+/// lines in shared code, while the one guard (`no_message_body_is_logged_at_info`)
+/// read a channel module that was already clean.
+///
+/// Reads every file under `src/channels`, and `src/gateway/mod.rs`, from disk,
+/// so a module added later is scanned without editing a list. In the production
+/// half of each, every `print!`/`println!`/`eprint!`/`eprintln!` and every
+/// tracing macro, with or without the `tracing::` prefix, is read to its closing
+/// delimiter with comments and literals masked. A call fails when its arguments,
+/// or a `{name}` capture inside one of its literals, name a text binding
+/// ([`is_text_binding`]) or `truncate_with_ellipsis`. Taking a binding's length
+/// or reading one of its fields (`msg.sender`) passes.
+///
+/// It matches names, not types: text copied into a binding with another name
+/// passes unseen. Hits that are not message text are listed in `CLASSIFIED` with
+/// the reason, and each entry must match exactly one call, so none goes stale.
+#[test]
+fn no_log_or_print_call_carries_message_or_reply_text() {
+    // (file under src/, a fragment of the call, why it is not message text)
+    const CLASSIFIED: &[(&str, &str, &str)] = &[
+        (
+            "channels/email_channel.rs",
+            "IDLE response:",
+            "the IMAP server's IDLE status, not mail",
+        ),
+        (
+            "channels/lark.rs",
+            "Lark: add reaction failed for",
+            "Lark's HTTP error body",
+        ),
+        (
+            "channels/lark.rs",
+            "Lark: add reaction returned code=",
+            "Lark's API error message",
+        ),
+        (
+            "channels/linq.rs",
+            "Linq create chat failed:",
+            "Linq's HTTP error body",
+        ),
+        (
+            "channels/linq.rs",
+            "Linq send failed:",
+            "Linq's HTTP error body",
+        ),
+        (
+            "channels/nextcloud_talk.rs",
+            "Nextcloud Talk send failed:",
+            "Nextcloud's HTTP error body",
+        ),
+        (
+            "channels/signal.rs",
+            "Signal SSE returned",
+            "signal-cli's HTTP error body",
+        ),
+        (
+            "channels/slack.rs",
+            "Slack could not remove its working notice:",
+            "Slack's chat.delete response",
+        ),
+        (
+            "channels/slack.rs",
+            "Slack working notice not posted:",
+            "Slack's chat.postMessage response",
+        ),
+        (
+            "channels/telegram.rs",
+            "Telegram deleteMessage failed",
+            "the Bot API's HTTP error body",
+        ),
+        (
+            "channels/whatsapp.rs",
+            "WhatsApp send failed:",
+            "the Cloud API's HTTP error body",
+        ),
+    ];
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = vec![src_root.join("gateway").join("mod.rs")];
+    let mut dirs = vec![src_root.join("channels")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if name.ends_with(".rs") && name != "mod_tests.rs" && name != "tests.rs" {
+                // `mod_tests.rs` and `format/tests.rs` are whole test modules.
+                files.push(path);
+            }
+        }
+    }
+
+    let mut calls_per_file = std::collections::BTreeMap::new();
+    let mut unclassified = Vec::new();
+    let mut matched = vec![0_usize; CLASSIFIED.len()];
+    for path in files {
+        let file = path
+            .strip_prefix(&src_root)
+            .expect("a file under src")
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let src = std::fs::read_to_string(&path).expect("read a source file");
+        let production = production_half(&src);
+        let (code, literals) = mask_comments_and_literals(production);
+        let calls = log_calls(&code);
+        calls_per_file.insert(file.clone(), calls.len());
+        for (at, args) in calls {
+            let mut named = printed_text_bindings(&String::from_utf8_lossy(&code[args.clone()]));
+            for literal in literals
+                .iter()
+                .filter(|literal| args.start <= literal.start && literal.end <= args.end)
+            {
+                named.extend(
+                    inline_captures(&production[literal.clone()])
+                        .into_iter()
+                        .filter(|name| is_text_binding(name))
+                        .map(|name| format!("{{{name}}}")),
+                );
+            }
+            if named.is_empty() {
+                continue;
+            }
+            let call = &production[at..(args.end + 1).min(production.len())];
+            match CLASSIFIED
+                .iter()
+                .position(|(f, fragment, _)| file == *f && call.contains(fragment))
+            {
+                Some(entry) => matched[entry] += 1,
+                None => unclassified.push(format!(
+                    "{file}:{} names {named:?}: {}",
+                    production[..at].matches('\n').count() + 1,
+                    call.split_whitespace().collect::<Vec<_>>().join(" ")
+                )),
+            }
+        }
+    }
+
+    // The scan must be reading what it claims to: the dispatch core, the
+    // gateway's webhook hand-off, and a module that imports the bare macros.
+    for file in [
+        "channels/dispatch.rs",
+        "gateway/mod.rs",
+        "channels/email_channel.rs",
+    ] {
+        assert!(
+            calls_per_file.get(file).is_some_and(|&calls| calls > 0),
+            "found no log calls in {file}, so the scan is not reading it"
+        );
+    }
+    let stale: Vec<String> = CLASSIFIED
+        .iter()
+        .zip(&matched)
+        .filter(|(_, calls)| **calls != 1)
+        .map(|((file, fragment, _), calls)| {
+            format!("{file}: `{fragment}` is classified but matched {calls} calls, not 1")
+        })
+        .collect();
+    assert!(
+        unclassified.is_empty() && stale.is_empty(),
+        "log or print calls that name message or reply text; log an id and a length \
+         instead, or classify a value that is not message text:\n{}\n{}",
+        unclassified.join("\n"),
+        stale.join("\n")
+    );
+}
+
+/// Names that hold message or reply text in the scanned code: the inbound text
+/// each channel binds (`text`, `content`, `body`, `caption`), the dispatch
+/// core's `msg` (a `ChannelMessage`, whose `Debug` prints its content), the
+/// model's `response` and `reply`, and derived names such as
+/// `delivered_response` and `display_text`.
+fn is_text_binding(name: &str) -> bool {
+    matches!(
+        name,
+        "text"
+            | "content"
+            | "body"
+            | "caption"
+            | "msg"
+            | "message"
+            | "response"
+            | "reply"
+            | "prompt"
+            | "transcript"
+    ) || [
+        "_text",
+        "_body",
+        "_content",
+        "_caption",
+        "_response",
+        "_reply",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+}
+
+fn is_identifier(token: &str) -> bool {
+    token.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+}
+
+/// The text bindings that a call's masked arguments print. A binding followed
+/// by `.len()`, `.is_empty()` or `.chars().count()` is only measured, one
+/// followed by a field (`msg.sender`) is judged by that field's own name, and
+/// one followed by `=` is a tracing field's key.
+fn printed_text_bindings(args: &str) -> Vec<String> {
+    let tokens = rust_tokens(args);
+    let mut printed = Vec::new();
+    for (index, &token) in tokens.iter().enumerate() {
+        let after = &tokens[index + 1..];
+        let measured = after.starts_with(&[".", "len", "(", ")"])
+            || after.starts_with(&[".", "is_empty", "(", ")"])
+            || after.starts_with(&[".", "chars", "(", ")", ".", "count", "(", ")"]);
+        let field = after.first() == Some(&".")
+            && after.get(1).is_some_and(|name| is_identifier(name))
+            && !matches!(after.get(2), Some(&"(" | &":"));
+        let key = after.first() == Some(&"=") && after.get(1) != Some(&"=");
+        if token == "truncate_with_ellipsis"
+            || (is_text_binding(token) && !measured && !field && !key)
+        {
+            printed.push(token.to_string());
+        }
+    }
+    printed
+}
+
+/// Identifiers and numbers as whole tokens; every other character that is not
+/// whitespace is a token of its own.
+fn rust_tokens(code: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = code;
+    while let Some(first) = rest.chars().next() {
+        let len = if first.is_ascii_alphanumeric() || first == '_' {
+            rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len())
+        } else {
+            first.len_utf8()
+        };
+        let (token, tail) = rest.split_at(len);
+        if !first.is_whitespace() {
+            tokens.push(token);
+        }
+        rest = tail;
+    }
+    tokens
+}
+
+/// The names a format string captures inline: `{text}` and `{text:?}`, but not
+/// `{}`, `{0}` or an escaped `{{`.
+fn inline_captures(literal: &str) -> Vec<&str> {
+    let mut captures = Vec::new();
+    let mut rest = literal;
+    while let Some(open) = rest.find('{') {
+        rest = &rest[open + 1..];
+        if let Some(escaped) = rest.strip_prefix('{') {
+            rest = escaped;
+            continue;
+        }
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if is_identifier(&rest[..end]) && matches!(rest[end..].chars().next(), Some('}' | ':')) {
+            captures.push(&rest[..end]);
+        }
+    }
+    captures
+}
+
+/// Every log or print macro call in masked source: the offset of the macro's
+/// name, and the byte range of its arguments (the closing delimiter sits at the
+/// range's end).
+fn log_calls(code: &[u8]) -> Vec<(usize, std::ops::Range<usize>)> {
+    const MACROS: &[&str] = &[
+        "print", "println", "eprint", "eprintln", "trace", "debug", "info", "warn", "error",
+        "event",
+    ];
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut calls = Vec::new();
+    let mut i = 0;
+    while i < code.len() {
+        if !is_ident(code[i]) || (i > 0 && is_ident(code[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < code.len() && is_ident(code[i]) {
+            i += 1;
+        }
+        if code.get(i) != Some(&b'!') || !MACROS.iter().any(|m| m.as_bytes() == &code[start..i]) {
+            continue;
+        }
+        let mut open = i + 1;
+        while code.get(open).is_some_and(u8::is_ascii_whitespace) {
+            open += 1;
+        }
+        if !matches!(code.get(open), Some(b'(' | b'[' | b'{')) {
+            continue;
+        }
+        let mut depth = 0_usize;
+        let mut close = open;
+        while close < code.len() {
+            match code[close] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            close += 1;
+        }
+        calls.push((start, open + 1..close));
+        i = close;
+    }
+    calls
+}
+
+/// `src` with comments and the contents of string and char literals blanked
+/// to spaces (newlines kept, so offsets and line numbers still line up), and
+/// the byte range of each string literal's contents. Nested block comments,
+/// raw strings and a quote inside a char literal are handled; a lifetime has
+/// no closing quote and is left alone.
+fn mask_comments_and_literals(src: &str) -> (Vec<u8>, Vec<std::ops::Range<usize>>) {
+    fn blank(code: &mut [u8], range: std::ops::Range<usize>) {
+        for byte in &mut code[range] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    let bytes = src.as_bytes();
+    let mut code = bytes.to_vec();
+    let mut literals = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"//") {
+            let end = rest
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(bytes.len(), |n| i + n);
+            blank(&mut code, i..end);
+            i = end;
+        } else if rest.starts_with(b"/*") {
+            let mut depth = 0_usize;
+            let mut end = i;
+            while end < bytes.len() {
+                if bytes[end..].starts_with(b"/*") {
+                    depth += 1;
+                    end += 2;
+                } else if bytes[end..].starts_with(b"*/") {
+                    depth -= 1;
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    end += 1;
+                }
+            }
+            let end = end.min(bytes.len());
+            blank(&mut code, i..end);
+            i = end;
+        } else if let Some(hashes) = raw_string_hashes(bytes, i) {
+            let start = i + hashes + 2;
+            let closing: Vec<u8> = std::iter::once(b'"')
+                .chain(std::iter::repeat_n(b'#', hashes))
+                .collect();
+            let end = (start..bytes.len())
+                .find(|&j| bytes[j..].starts_with(&closing))
+                .unwrap_or(bytes.len());
+            blank(&mut code, start..end);
+            literals.push(start..end);
+            i = end + closing.len();
+        } else if bytes[i] == b'"' {
+            let mut end = i + 1;
+            while end < bytes.len() && bytes[end] != b'"' {
+                end += if bytes[end] == b'\\' { 2 } else { 1 };
+            }
+            let end = end.min(bytes.len());
+            blank(&mut code, i + 1..end);
+            literals.push(i + 1..end);
+            i = end + 1;
+        } else if bytes[i] == b'\'' {
+            let close = if bytes.get(i + 1) == Some(&b'\\') {
+                (i + 3..bytes.len()).find(|&j| bytes[j] == b'\'')
+            } else {
+                src.get(i + 1..)
+                    .and_then(|tail| tail.chars().next())
+                    .map(|c| i + 1 + c.len_utf8())
+                    .filter(|&j| bytes.get(j) == Some(&b'\''))
+            };
+            match close {
+                Some(close) => {
+                    blank(&mut code, i + 1..close);
+                    i = close + 1;
+                }
+                None => i += 1,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    (code, literals)
+}
+
+/// At the `r` of a raw string (`r"…"`, `r#"…"#`, `br"…"`), how many `#` it
+/// uses; `None` anywhere else, including a raw identifier such as `r#type`.
+fn raw_string_hashes(bytes: &[u8], at: usize) -> Option<usize> {
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let starts_a_token = match at.checked_sub(1).map(|before| bytes[before]) {
+        None => true,
+        Some(b'b') => at < 2 || !is_ident(bytes[at - 2]),
+        Some(before) => !is_ident(before),
+    };
+    if bytes[at] != b'r' || !starts_a_token {
+        return None;
+    }
+    let hashes = bytes[at + 1..]
+        .iter()
+        .take_while(|&&byte| byte == b'#')
+        .count();
+    (bytes.get(at + 1 + hashes) == Some(&b'"')).then_some(hashes)
 }
 
 use super::*;

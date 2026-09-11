@@ -294,17 +294,37 @@ pub async fn validate_bot_token(bot_token: &str) -> anyhow::Result<String> {
         .context("bot username missing from getMe response")
 }
 
+/// The banner `TelegramChannel::new` prints for its startup pairing code, or
+/// `None` when stdout is not a terminal.
+///
+/// The code grants approval-owner rights through `/claim`, and a managed
+/// daemon's stdout is the journal. WhatsApp Web keeps its pair code out of the
+/// journal the same way (`qr_terminal::render_pair_code`).
+fn startup_pairing_banner(code: &str, stdout_is_terminal: bool) -> Option<String> {
+    stdout_is_terminal.then(|| {
+        format!(
+            "  🔐 Telegram pairing required. One-time code: {code}\n     \
+             DM the bot `{TELEGRAM_BIND_COMMAND} {code}` to let yourself chat,\n     \
+             or `{TELEGRAM_CLAIM_COMMAND} {code}` to also become an approval owner (can /approve tools)."
+        )
+    })
+}
+
 impl TelegramChannel {
     pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
         let pairing = if normalized_allowed.is_empty() {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
-                println!("  🔐 Telegram pairing required. One-time code: {code}");
-                println!("     DM the bot `{TELEGRAM_BIND_COMMAND} {code}` to let yourself chat,");
-                println!(
-                    "     or `{TELEGRAM_CLAIM_COMMAND} {code}` to also become an approval owner (can /approve tools)."
-                );
+                match startup_pairing_banner(&code, super::qr_terminal::stdout_is_interactive()) {
+                    Some(banner) => println!("{banner}"),
+                    None => tracing::info!(
+                        "Telegram pairing required, but stdout is not a terminal, so the \
+                         one-time code is not printed (it would be written to the journal). \
+                         Mint a code with `rantaiclaw channel pair --channel telegram`, then \
+                         DM the bot `/bind <code>` to chat or `/claim <code>` to also approve tools."
+                    ),
+                }
             }
             Some(guard)
         } else {
@@ -2438,6 +2458,45 @@ Ensure only one `rantaiclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The startup pairing code grants approval-owner rights through `/claim`,
+    /// and a managed daemon's stdout is the journal, so only a terminal gets it.
+    #[test]
+    fn startup_pairing_banner_is_only_for_a_terminal() {
+        let code = "314159";
+        assert_eq!(
+            startup_pairing_banner(code, false),
+            None,
+            "a stdout that is not a terminal must not receive the code"
+        );
+        let banner = startup_pairing_banner(code, true).expect("a terminal gets the banner");
+        for expected in ["One-time code: 314159", "/bind 314159", "/claim 314159"] {
+            assert!(banner.contains(expected), "missing `{expected}`: {banner}");
+        }
+    }
+
+    /// `new` must ask whether stdout is a terminal rather than pass a constant.
+    /// No test can see `println!` reach the process's real stdout, so this pins
+    /// the call by source, as the allowlist wiring guard in `mod_tests.rs` does;
+    /// the banner's own decision is tested above.
+    #[test]
+    fn new_asks_the_terminal_before_printing_the_pairing_code() {
+        let src = include_str!("telegram.rs");
+        let production = &src[..src.find("\n#[cfg(test)]\nmod tests").expect("test module")];
+        let new: String = production
+            .split("pub fn new(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    pub fn ").next())
+            .expect("TelegramChannel::new")
+            .split_whitespace()
+            .collect();
+        assert!(
+            new.contains(
+                "startup_pairing_banner(&code,super::qr_terminal::stdout_is_interactive())"
+            ),
+            "`new` must print the pairing code only when stdout is a terminal"
+        );
+    }
 
     /// A reqwest error's `Display` appends the request URL, which embeds
     /// `/bot<token>/<method>`. `scrub_token` must remove the token literal from

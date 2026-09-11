@@ -77,6 +77,14 @@ If gateway pairing is required, include `Authorization: Bearer <token>`.
 
 ## Logs and Diagnostics
 
+Channel logs identify a message by channel, sender, message id and length in characters, never by
+its text, at any log level: `channel message received` and `channel reply` carry `message_id` and
+`chars`, and the gateway logs the same fields when it receives a webhook message. Journals written by
+0.31.0-alpha and earlier may still hold the start of each message and reply, including a pairing
+code a user typed; upgrading does not rewrite them. A daemon started with Telegram's
+`allowed_users` empty no longer writes its one-time pairing code to the journal. Mint a code with
+`rantaiclaw channel pair --channel telegram` and DM the bot `/claim <code>`.
+
 ### macOS / Windows (service wrapper logs)
 
 - `~/.rantaiclaw/logs/daemon.stdout.log`

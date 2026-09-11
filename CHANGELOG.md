@@ -215,6 +215,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publish passes through. It fails before a single artefact is built. Seen to refuse and seen
   to accept, in both places.
 
+### Security
+
+- **Channel logs no longer carry message or reply text, and Telegram's startup pairing code no
+  longer reaches the journal.** Two INFO lines in the dispatch core wrote the first 80 characters
+  of every inbound message and of every reply on every channel, and the gateway wrote the first 50
+  of every webhook message (WhatsApp Cloud, Linq, Nextcloud Talk). A drive found owners' messages,
+  the head of a base64 photo, and an owner-granting pairing code typed as `claim <code>` without
+  the slash, all in the journal. Those lines now log the message id and its length in characters.
+  Telegram printed a one-time pairing code with `println!` whenever `allowed_users` was empty, and
+  a managed daemon's stdout is the journal. It now prints the code only to a terminal, and
+  otherwise logs that a code comes from `rantaiclaw channel pair --channel telegram`, which a
+  running Telegram channel accepts without a restart. A test reads every log and print call in the
+  channel modules and the gateway's webhook hand-off, at every level, bare macros and inline format
+  arguments included, and fails when one names message text. **Journals written by 0.31.0-alpha
+  and earlier may still hold message text and Telegram pairing codes**; upgrading does not rewrite
+  them.
+
 ## [0.31.0-alpha] — 2026-09-08
 
 Two waves in one tag. Wave 3 landed on `main` on 2026-09-07 and was never cut, so

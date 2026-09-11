@@ -25,7 +25,6 @@ use crate::security::SecurityPolicy;
 use crate::skills;
 use crate::tools;
 use crate::tools::traits::Tool;
-use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
@@ -2075,10 +2074,12 @@ async fn enqueue_inbound(
         }
         let platform_id = msg.id.clone();
 
+        // Id and length only: the text reaches the agent, not the journal.
         tracing::info!(
-            "{channel} message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
+            sender = %msg.sender,
+            message_id = %msg.id,
+            chars = msg.content.chars().count(),
+            "{channel}: webhook message received"
         );
 
         match state.channel_bus.try_send(msg).await {

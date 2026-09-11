@@ -23,6 +23,13 @@ fn stderr_is_interactive() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// Whether a pairing secret may be written to stdout, for the same reason as
+/// [`stderr_is_interactive`]: a managed daemon's stdout is the journal too.
+/// Telegram prints its startup pairing code there.
+pub(crate) fn stdout_is_interactive() -> bool {
+    std::io::stdout().is_terminal()
+}
+
 /// Print a framed QR for `payload` to stderr, with `header` above it and a
 /// reminder line below. `payload` is the raw text the phone will decode —
 /// for WhatsApp Web that's the `Event::PairingQrCode { code }` value.
