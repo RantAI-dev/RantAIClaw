@@ -9,15 +9,15 @@ use super::traits;
 use super::{
     approval_relay, channel_message_timeout_budget_secs, commands, conversation, history, prompt,
     routing, sanitize, supervisor, ChannelRuntimeContext, AUTOSAVE_MIN_MESSAGE_CHARS,
-    FAILED_TURN_MARKER, IN_FLIGHT_COMPLETION_WAIT_TIMEOUT, MEMORY_CONTEXT_ENTRY_MAX_CHARS,
-    MEMORY_CONTEXT_MAX_CHARS, MEMORY_CONTEXT_MAX_ENTRIES, TIMED_OUT_TURN_MARKER,
-    UNDELIVERED_TURN_MARKER,
+    CHANNEL_DRAIN_DEADLINE, CHANNEL_NOTICE_SEND_TIMEOUT, FAILED_TURN_MARKER,
+    IN_FLIGHT_COMPLETION_WAIT_TIMEOUT, MEMORY_CONTEXT_ENTRY_MAX_CHARS, MEMORY_CONTEXT_MAX_CHARS,
+    MEMORY_CONTEXT_MAX_ENTRIES, RESTART_NOTICE, TIMED_OUT_TURN_MARKER, UNDELIVERED_TURN_MARKER,
 };
 use crate::agent::loop_::run_tool_call_loop;
 use crate::memory::Memory;
 use crate::providers::{self, ChatMessage};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -280,13 +280,24 @@ pub(crate) fn clean_delivered_reply(text: &str) -> String {
     }
 }
 
+/// How a turn ended, as far as the dispatch loop needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnEnd {
+    /// The turn reached something the user sees: a reply, an error message, a
+    /// runtime command's answer.
+    Finished,
+    /// The turn was cancelled before the model answered, so the user got
+    /// nothing from it.
+    Cancelled,
+}
+
 pub(crate) async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
     cancellation_token: CancellationToken,
-) {
+) -> TurnEnd {
     if cancellation_token.is_cancelled() {
-        return;
+        return TurnEnd::Cancelled;
     }
 
     // Pre-v0.6.7 used `println!` here, which leaks into the TUI's
@@ -311,7 +322,7 @@ pub(crate) async fn process_channel_message(
     }
     if commands::handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await
     {
-        return;
+        return TurnEnd::Finished;
     }
 
     let history_key = conversation_history_key(&msg);
@@ -329,7 +340,7 @@ pub(crate) async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel.send(&msg.reply(message)).await;
             }
-            return;
+            return TurnEnd::Finished;
         }
     };
     // Conversation scope for layered memory: one scope per chat/thread, the same
@@ -610,12 +621,15 @@ pub(crate) async fn process_channel_message(
         supervisor::log_worker_join_result(handle.await);
     }
 
+    let cancelled = matches!(llm_result, LlmExecutionResult::Cancelled);
     match llm_result {
         LlmExecutionResult::Cancelled => {
+            // A newer message from the same sender, or a shutdown's drain
+            // deadline. The dispatch loop knows which, and answers for the second.
             tracing::info!(
                 channel = %msg.channel,
                 sender = %msg.sender,
-                "Cancelled in-flight channel request due to newer message"
+                "Cancelled an in-flight channel request"
             );
             if let (Some(channel), Some(draft_id)) =
                 (target_channel.as_ref(), draft_message_id.as_deref())
@@ -711,7 +725,7 @@ pub(crate) async fn process_channel_message(
                 tracing::info!(
                     channel = %msg.channel,
                     sender = %msg.sender,
-                    "Cancelled in-flight channel request due to newer message"
+                    "Cancelled an in-flight channel request"
                 );
                 if let (Some(channel), Some(draft_id)) =
                     (target_channel.as_ref(), draft_message_id.as_deref())
@@ -720,7 +734,7 @@ pub(crate) async fn process_channel_message(
                         tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
                     }
                 }
-                return;
+                return TurnEnd::Cancelled;
             }
 
             if is_context_window_overflow_error(&e) {
@@ -747,7 +761,7 @@ pub(crate) async fn process_channel_message(
                         let _ = channel.send(&msg.reply(error_text)).await;
                     }
                 }
-                return;
+                return TurnEnd::Finished;
             }
 
             tracing::error!(
@@ -817,6 +831,96 @@ pub(crate) async fn process_channel_message(
             }
         }
     }
+
+    if cancelled {
+        TurnEnd::Cancelled
+    } else {
+        TurnEnd::Finished
+    }
+}
+
+/// Clear a message's thread and quote when its channel has threaded replies
+/// turned off.
+///
+/// One place decides whether replies thread. Channels fill `thread_ts` and
+/// `reply_anchor` unconditionally; clearing both here — before the message
+/// reaches the agent, the approval relay, or history — means a channel added
+/// later cannot forget to honour the switch. Both, because Slack and Mattermost
+/// thread through the first while Telegram and Discord quote through the
+/// second, and every reply is built from these two fields by
+/// `ChannelMessage::reply`.
+fn apply_thread_setting(ctx: &ChannelRuntimeContext, msg: &mut traits::ChannelMessage) {
+    if !routing::thread_replies_enabled(ctx, &msg.channel) {
+        msg.thread_ts = None;
+        msg.reply_anchor = None;
+    }
+}
+
+/// The conversations a shutdown has already told to resend, so each gets one
+/// line however many of its messages were stopped (plan 353, decision D3).
+type NotifiedConversations = Arc<std::sync::Mutex<HashSet<String>>>;
+
+/// The line that tells a conversation shutdown stopped its message before it
+/// was answered. Taken from the message before its turn consumes it: the
+/// conversation it belongs to, the channel to send on, the id to log, and the
+/// outbound message addressed to the same chat and thread.
+struct RestartNotice {
+    conversation: String,
+    channel: String,
+    message_id: String,
+    outbound: traits::SendMessage,
+    notified: NotifiedConversations,
+}
+
+impl RestartNotice {
+    fn for_message(msg: &traits::ChannelMessage, notified: &NotifiedConversations) -> Self {
+        Self {
+            conversation: conversation_history_key(msg),
+            channel: msg.channel.clone(),
+            message_id: msg.id.clone(),
+            outbound: msg.reply(RESTART_NOTICE),
+            notified: Arc::clone(notified),
+        }
+    }
+
+    /// Sends nothing when the conversation was already told. Bounded by
+    /// `CHANNEL_NOTICE_SEND_TIMEOUT`, so a platform that does not answer cannot
+    /// use up the drain the other notices need. Logs the message id, never the
+    /// text.
+    async fn send(&self, ctx: &ChannelRuntimeContext) {
+        let first_for_conversation = self
+            .notified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.conversation.clone());
+        if !first_for_conversation {
+            return;
+        }
+        let Some(target) = ctx.channels_by_name.get(&self.channel) else {
+            return;
+        };
+        let (channel, message_id) = (self.channel.as_str(), self.message_id.as_str());
+        match tokio::time::timeout(CHANNEL_NOTICE_SEND_TIMEOUT, target.send(&self.outbound)).await {
+            Ok(Ok(())) => tracing::info!(channel, message_id, "sent a restart notice"),
+            Ok(Err(e)) => {
+                tracing::warn!(channel, message_id, "could not send a restart notice: {e}");
+            }
+            Err(_) => tracing::warn!(channel, message_id, "a restart notice timed out"),
+        }
+    }
+
+    /// Send the notice for a message that will never start, on the loop's join
+    /// set so the drain waits for it.
+    fn spawn_for(
+        workers: &mut tokio::task::JoinSet<()>,
+        ctx: &Arc<ChannelRuntimeContext>,
+        msg: &traits::ChannelMessage,
+        notified: &NotifiedConversations,
+    ) {
+        let notice = Self::for_message(msg, notified);
+        let ctx = Arc::clone(ctx);
+        workers.spawn(async move { notice.send(&ctx).await });
+    }
 }
 
 pub(crate) async fn run_message_dispatch_loop(
@@ -838,21 +942,17 @@ pub(crate) async fn run_message_dispatch_loop(
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
+    // Cancelled once running turns have had `CHANNEL_DRAIN_DEADLINE` after
+    // shutdown; each worker still running then stops its turn and says so.
+    let stop_running_turns = CancellationToken::new();
+    let notified: NotifiedConversations = Arc::default();
+
     while let Some(mut msg) = tokio::select! {
+        biased;
         () = shutdown.cancelled() => None,
         m = rx.recv() => m,
     } {
-        // One place decides whether replies thread. Channels fill `thread_ts`
-        // and `reply_anchor` unconditionally; clearing both here — before the
-        // message reaches the agent, the approval relay, or history — means a
-        // channel added later cannot forget to honour the switch. Both, because
-        // Slack and Mattermost thread through the first while Telegram and
-        // Discord quote through the second, and every reply is built from these
-        // two fields by `ChannelMessage::reply`.
-        if !routing::thread_replies_enabled(ctx.as_ref(), &msg.channel) {
-            msg.thread_ts = None;
-            msg.reply_anchor = None;
-        }
+        apply_thread_setting(ctx.as_ref(), &mut msg);
         // Intercept approval replies before the message reaches the agent.
         // Try the whole-tool relay first (`/approve X`, `/deny X` — Layer A),
         // then the shell allowlist relay (`/allow X`, `y X`, … — Layer B). Both
@@ -911,14 +1011,25 @@ pub(crate) async fn run_message_dispatch_loop(
             continue;
         }
 
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
+        // A message waiting for a free worker when shutdown begins never
+        // starts. Its conversation is told, rather than left without an answer.
+        let permit = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                RestartNotice::spawn_for(&mut workers, &ctx, &msg, &notified);
+                break;
+            }
+            permit = Arc::clone(&semaphore).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
         };
 
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
+        let stop_running_turns = stop_running_turns.clone();
+        let notified = Arc::clone(&notified);
         workers.spawn(async move {
             let _permit = permit;
             let interrupt_enabled =
@@ -974,7 +1085,24 @@ pub(crate) async fn run_message_dispatch_loop(
                 }
             }
 
-            process_channel_message(worker_ctx, msg, cancellation_token).await;
+            // Built before the turn takes the message, in case shutdown stops it.
+            let notice = RestartNotice::for_message(&msg, &notified);
+            let notice_ctx = Arc::clone(&worker_ctx);
+
+            let turn = process_channel_message(worker_ctx, msg, cancellation_token.clone());
+            tokio::pin!(turn);
+            let end = tokio::select! {
+                end = &mut turn => end,
+                () = stop_running_turns.cancelled() => {
+                    cancellation_token.cancel();
+                    turn.await
+                }
+            };
+            // Answer only for a turn the drain stopped. One a newer message
+            // interrupted is followed by that message's own turn.
+            if end == TurnEnd::Cancelled && stop_running_turns.is_cancelled() {
+                notice.send(&notice_ctx).await;
+            }
 
             if interrupt_enabled {
                 let mut active = in_flight.lock().await;
@@ -992,7 +1120,31 @@ pub(crate) async fn run_message_dispatch_loop(
         }
     }
 
-    while let Some(result) = workers.join_next().await {
-        supervisor::log_worker_join_result(result);
+    if !shutdown.is_cancelled() {
+        // Every sender is gone, so nothing more can arrive: let turns finish.
+        while let Some(result) = workers.join_next().await {
+            supervisor::log_worker_join_result(result);
+        }
+        return;
+    }
+
+    // Shutdown. A message still queued never starts; tell its conversation.
+    rx.close();
+    while let Ok(mut msg) = rx.try_recv() {
+        apply_thread_setting(ctx.as_ref(), &mut msg);
+        RestartNotice::spawn_for(&mut workers, &ctx, &msg, &notified);
+    }
+
+    // Turns still running get until the drain deadline, then stop and say so.
+    let deadline = tokio::time::sleep(CHANNEL_DRAIN_DEADLINE);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            joined = workers.join_next() => match joined {
+                Some(result) => supervisor::log_worker_join_result(result),
+                None => break,
+            },
+            () = &mut deadline, if !stop_running_turns.is_cancelled() => stop_running_turns.cancel(),
+        }
     }
 }

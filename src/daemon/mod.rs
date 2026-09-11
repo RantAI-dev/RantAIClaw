@@ -11,15 +11,18 @@ use tokio_util::sync::CancellationToken;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
-/// How long to let the gateway finish in-flight HTTP requests after a shutdown
-/// signal before it is force-aborted. Well under systemd's `TimeoutStopSec=30`
-/// so the whole stop (drain + `stop_all`) stays inside the unit's window.
-const GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// How long to let channels drain in-flight replies and commit long-poll offsets
-/// after a shutdown signal before they are force-aborted. Kept with the gateway
-/// drain inside systemd's `TimeoutStopSec=30` window.
-const CHANNELS_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long the gateway and channels together get to finish in-flight work
+/// after a shutdown signal before what is left is force-aborted: HTTP requests,
+/// replies, long-poll offsets.
+///
+/// One deadline for both, measured from the start of the drain. It used to be
+/// eight seconds each in turn, and the gateway normally exits at once, so its
+/// unused eight seconds were lost and channels were cut off eight seconds after
+/// SIGTERM. It is the channel runtime's own stop timeout, sixteen seconds, well
+/// under systemd's `TimeoutStopSec=30`, so `services::stop_all` still fits after
+/// it. The runtime ends its turns before this (`CHANNEL_DRAIN_DEADLINE`, checked
+/// at compile time against the same value) so their notices go out first.
+const DRAIN_TIMEOUT: Duration = crate::channels::CHANNEL_RUNTIME_STOP_TIMEOUT;
 
 /// Consecutive `EADDRINUSE` binds the gateway tolerates before the port conflict
 /// is treated as fatal. A few retries cover a fast restart where the old process
@@ -273,10 +276,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 }
 
 /// Drain and tear down all daemon components after `shutdown` has been cancelled.
-/// The gateway and channels get bounded drain windows (they have in-flight state
-/// — HTTP requests, long-poll offsets); the rest are aborted directly. Shared by
-/// the fatal-exit, early-shutdown, and normal-stop paths so teardown stays
-/// identical.
+/// The gateway and channels share one bounded drain window (they have in-flight
+/// state — HTTP requests, replies, long-poll offsets); the rest are aborted
+/// directly. Shared by the fatal-exit, early-shutdown, and normal-stop paths so
+/// teardown stays identical.
 async fn drain_and_cleanup(
     mut gateway_handle: JoinHandle<()>,
     channels_handle: Option<JoinHandle<()>>,
@@ -284,8 +287,12 @@ async fn drain_and_cleanup(
     services: &[Box<dyn crate::services::Service>],
     active_profile: &str,
 ) {
+    // One deadline for both drains, so the time the gateway does not use is
+    // left to channels instead of lost.
+    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+
     // Gateway: bounded drain, then force.
-    if tokio::time::timeout(GATEWAY_DRAIN_TIMEOUT, &mut gateway_handle)
+    if tokio::time::timeout_at(deadline, &mut gateway_handle)
         .await
         .is_err()
     {
@@ -293,10 +300,10 @@ async fn drain_and_cleanup(
         let _ = gateway_handle.await;
     }
 
-    // Channels: bounded drain window (cancellation makes them return cleanly)
-    // before falling back to abort.
+    // Channels: what is left of the same deadline (cancellation makes them
+    // return cleanly) before falling back to abort.
     if let Some(mut channels_handle) = channels_handle {
-        if tokio::time::timeout(CHANNELS_DRAIN_TIMEOUT, &mut channels_handle)
+        if tokio::time::timeout_at(deadline, &mut channels_handle)
             .await
             .is_err()
         {
@@ -667,6 +674,52 @@ fn has_supervised_channels(config: &Config) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Plan 353: the gateway and channels share one drain deadline instead of
+    /// eight seconds each in turn. The gateway normally exits at once, and its
+    /// unused eight seconds were lost, so channels were aborted eight seconds
+    /// after SIGTERM with replies still on their way.
+    #[tokio::test(start_paused = true)]
+    async fn channels_get_the_drain_time_the_gateway_did_not_use() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+
+        let gateway = tokio::spawn(async {});
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let channels = tokio::spawn({
+            let finished = std::sync::Arc::clone(&finished);
+            async move {
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        drain_and_cleanup(gateway, Some(channels), Vec::new(), &[], "drain-test").await;
+
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "channels that needed 12 s were aborted before they finished"
+        );
+    }
+
+    /// The shared deadline still ends the drain at 16 s in total, today's
+    /// eight plus eight, so the unit's `TimeoutStopSec=30` keeps its room for
+    /// `services::stop_all` after it.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_ends_sixteen_seconds_after_it_starts_at_the_latest() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+
+        let gateway = tokio::spawn(tokio::time::sleep(Duration::from_secs(5)));
+        let channels = tokio::spawn(tokio::time::sleep(Duration::from_secs(60)));
+
+        let started = tokio::time::Instant::now();
+        drain_and_cleanup(gateway, Some(channels), Vec::new(), &[], "drain-test").await;
+
+        assert_eq!(started.elapsed(), Duration::from_secs(16));
+    }
 
     /// One registry per process is a wiring fact with no behavioural test that
     /// can see it from outside: each component builds fine on its own, and the

@@ -163,9 +163,12 @@ pub trait Channel: Send + Sync {
     /// **Cancellation.** Implementations SHOULD return promptly once `cancel`
     /// is triggered, and SHOULD complete any teardown the platform expects
     /// first — IRC `QUIT`, IMAP `LOGOUT`, a WebSocket close frame, an HTTP
-    /// server's graceful shutdown. The supervisor also drops the future, but
-    /// that is a backstop for channels with nothing to tear down, not the
-    /// contract: a dropped future sends nothing and frees no port.
+    /// server's graceful shutdown. The exception is a connection the channel
+    /// also sends through (WhatsApp Web): it stops forwarding when `cancel`
+    /// fires but stays open, so replies still go out while dispatch drains, and
+    /// is torn down in [`close`](Self::close). The supervisor also drops the
+    /// future, but that is a backstop for channels with nothing to tear down,
+    /// not the contract: a dropped future sends nothing and frees no port.
     async fn listen(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
@@ -188,6 +191,15 @@ pub trait Channel: Send + Sync {
     async fn health_check(&self) -> bool {
         true
     }
+
+    /// Release what `listen` kept open so replies could still be sent.
+    ///
+    /// The channel runtime calls this once per channel after its dispatch loop
+    /// has returned, when every reply and restart notice of a shutdown has gone
+    /// out. Most channels send over HTTP and have nothing to release. WhatsApp
+    /// Web sends through the connection it listens on, so a cancelled `listen`
+    /// only stops forwarding, and the connection is closed here.
+    async fn close(&self) {}
 
     /// Signal that the bot is processing a response (e.g. "typing" indicator).
     /// Implementations should repeat the indicator as needed for their platform.

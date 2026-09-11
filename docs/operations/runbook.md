@@ -96,6 +96,19 @@ code a user typed; upgrading does not rewrite them. A daemon started with Telegr
 journalctl --user -u rantaiclaw.service -f
 ```
 
+## Stopping and Restarting
+
+`rantaiclaw service stop` and `rantaiclaw service restart` send SIGTERM, and the daemon drains
+before it exits:
+
+- The gateway and channels share one 16-second window to finish in-flight work.
+- A reply still being written 12 seconds in is stopped, and its conversation gets one message in its
+  own thread saying the bot is restarting and the message should be sent again. A message that was
+  queued, or waiting for a free worker, gets the same message. The journal records each one as
+  `sent a restart notice` with its `channel` and `message_id`.
+- Nothing is replayed after the restart, so a turn that already ran tools does not run again.
+- Auto-managed services stop after channels, inside the unit's `TimeoutStopSec=30`.
+
 ## Incident Triage Flow (Fast Path)
 
 1. Snapshot system state:

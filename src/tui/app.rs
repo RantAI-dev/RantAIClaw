@@ -2354,10 +2354,17 @@ impl TuiApp {
                 // old and new listeners don't fight over the same backend
                 // (Telegram getUpdates returns 409 to a second concurrent
                 // poller). Cancel + bounded await guarantees the old long-poll
-                // has released first.
+                // has released first. The bound covers the runtime's own drain:
+                // a WhatsApp Web connection stays open until dispatch has sent
+                // its restart notices, and two connections on one session
+                // conflict.
                 if let Some(prev) = prev {
                     prev.shutdown.cancel();
-                    let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
+                    let _ = tokio::time::timeout(
+                        crate::channels::CHANNEL_RUNTIME_STOP_TIMEOUT,
+                        prev.handle,
+                    )
+                    .await;
                 }
                 crate::channels::auto_start_state::mark_starting();
                 match crate::channels::start_channels_with_cancellation(cfg, task_token, None, None)

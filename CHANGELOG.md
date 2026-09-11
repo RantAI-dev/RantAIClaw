@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A restart no longer cuts off a reply in silence.** A `rantaiclaw service restart` during a reply
+  aborted the turn eight seconds after SIGTERM: the daemon gave the gateway and channels eight
+  seconds each in turn, the gateway normally exits at once, and its unused time was lost. Drives on
+  Discord and WhatsApp Web lost both the message and the reply, and nothing told the user. The two
+  drains now share one 16-second deadline. A turn still running 12 seconds into the drain is
+  stopped, and its conversation gets one line in its own thread saying the bot is restarting and the
+  message should be sent again. A message that was queued, or waiting for a free worker, gets the
+  same line instead of being dropped. Nothing is replayed after the restart, so a turn that ran
+  tools never runs twice, and Slack's working notice is removed on the way out. WhatsApp Web stops
+  forwarding new messages as soon as shutdown begins but keeps its connection until those lines have
+  gone out, and the TUI now waits up to 16 seconds for the old channel runtime to close before it
+  starts a new one.
 - **Telegram and Discord forgot the conversation after every message, and `/model` never stuck
   there.** Since 2026-08-14 both channels put the id of the prompting message in `thread_ts` so the
   reply would quote it, and `thread_ts` is part of the conversation key. Every message therefore

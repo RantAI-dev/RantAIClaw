@@ -4165,10 +4165,12 @@ fn dispatch_ctx(
 }
 
 /// Records each `SendMessage` whole, so a test can read where a reply was
-/// addressed as well as what it said.
+/// addressed as well as what it said, and counts `stop_typing`, which is what
+/// removes Slack's working notice.
 struct AddressRecordingChannel {
     name: &'static str,
     sent: tokio::sync::Mutex<Vec<SendMessage>>,
+    stop_typing_calls: AtomicUsize,
 }
 
 impl AddressRecordingChannel {
@@ -4176,6 +4178,7 @@ impl AddressRecordingChannel {
         Self {
             name,
             sent: tokio::sync::Mutex::new(Vec::new()),
+            stop_typing_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -4198,6 +4201,326 @@ impl Channel for AddressRecordingChannel {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+// ── shutdown drain (plan 353) ────────────────────────────
+
+/// A message in its own chat and thread, quoting its own id, so each notice a
+/// drain sends can be traced to the message it answers.
+fn drain_message(chat: &str) -> traits::ChannelMessage {
+    traits::ChannelMessage {
+        id: format!("msg-{chat}"),
+        sender: "rantaiclaw_user".into(),
+        reply_target: chat.into(),
+        content: "write something long".into(),
+        channel: "test-channel".into(),
+        timestamp: 1,
+        thread_ts: Some(format!("thread-{chat}")),
+        reply_anchor: Some(format!("anchor-{chat}")),
+        sender_aliases: Vec::new(),
+    }
+}
+
+/// Plan 353 (D3): a turn still running when the drain deadline passes is not
+/// cut off in silence. Its conversation gets exactly one notice to send the
+/// message again, in the same thread and quoting the same message, and the
+/// typing indicator is stopped on the way out. The loop returns inside the
+/// daemon's 16-second drain, with a sender still open as the gateway holds one.
+#[tokio::test(start_paused = true)]
+async fn a_turn_still_running_at_the_drain_deadline_gets_one_restart_notice() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(SlowProvider {
+            delay: Duration::from_secs(600),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let shutdown = CancellationToken::new();
+    let dispatch = tokio::spawn(run_message_dispatch_loop(rx, ctx, 4, shutdown.clone()));
+
+    tx.send(drain_message("chat-1")).await.expect("queued");
+    // Let the turn start and park in the provider.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(16), dispatch)
+        .await
+        .expect("the dispatch loop must return inside the 16-second drain")
+        .expect("the dispatch loop must not panic");
+
+    let sent = channel_impl.sent.lock().await;
+    assert_eq!(sent.len(), 1, "exactly one message: {sent:?}");
+    assert_eq!(sent[0].content, RESTART_NOTICE);
+    assert_eq!(sent[0].recipient, "chat-1");
+    assert_eq!(sent[0].thread_ts.as_deref(), Some("thread-chat-1"));
+    assert_eq!(sent[0].reply_anchor.as_deref(), Some("anchor-chat-1"));
+    assert_eq!(channel_impl.stop_typing_calls.load(Ordering::SeqCst), 1);
+    drop(tx);
+}
+
+/// Plan 353 (D3): a message that has not started when the token fires is never
+/// dropped in silence. One waiting for a free worker and one still in the queue
+/// each get the notice, and the running turn gets its own at the deadline.
+#[tokio::test(start_paused = true)]
+async fn messages_not_started_when_the_token_fires_get_the_restart_notice() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(SlowProvider {
+            delay: Duration::from_secs(600),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let shutdown = CancellationToken::new();
+    // One worker: chat-1 runs, chat-2 waits for the worker, chat-3 stays queued.
+    let dispatch = tokio::spawn(run_message_dispatch_loop(rx, ctx, 1, shutdown.clone()));
+
+    let chats = ["chat-1", "chat-2", "chat-3"];
+    for chat in chats {
+        tx.send(drain_message(chat)).await.expect("queued");
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(16), dispatch)
+        .await
+        .expect("the dispatch loop must return inside the 16-second drain")
+        .expect("the dispatch loop must not panic");
+
+    let sent = channel_impl.sent.lock().await;
+    let mut mismatches = Vec::new();
+    for chat in chats {
+        let answers: Vec<&SendMessage> = sent.iter().filter(|m| m.recipient == chat).collect();
+        let thread = format!("thread-{chat}");
+        let told_to_resend = answers.len() == 1
+            && answers[0].content == RESTART_NOTICE
+            && answers[0].thread_ts.as_deref() == Some(thread.as_str());
+        if !told_to_resend {
+            mismatches.push(format!("{chat}: {answers:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "every conversation must get one notice to resend:\n{}",
+        mismatches.join("\n")
+    );
+    drop(tx);
+}
+
+/// Records, in order, each message sent and the runtime's `close`, so a test
+/// can see which came first.
+struct OrderRecordingChannel {
+    events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait::async_trait]
+impl Channel for OrderRecordingChannel {
+    fn name(&self) -> &str {
+        "test-channel"
+    }
+
+    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push("send");
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        cancel.cancelled().await;
+        Ok(())
+    }
+
+    async fn close(&self) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push("close");
+    }
+}
+
+/// Plan 353: the runtime closes its channels only after the dispatch loop has
+/// returned, so a channel that sends through its listener's connection
+/// (WhatsApp Web) can still deliver the notice for a turn the drain stopped.
+#[tokio::test(start_paused = true)]
+async fn the_runtime_closes_channels_only_after_dispatch_has_finished() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let channel: Arc<dyn Channel> = Arc::new(OrderRecordingChannel {
+        events: Arc::clone(&events),
+    });
+    let ctx = dispatch_ctx(
+        vec![Arc::clone(&channel)],
+        Arc::new(SlowProvider {
+            delay: Duration::from_secs(600),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(drain_message("chat-1")).await.expect("queued");
+    let runtime = ChannelRuntime {
+        ctx,
+        channels: vec![channel],
+        tx,
+        rx,
+        max_in_flight_messages: 4,
+        initial_backoff_secs: 1,
+        max_backoff_secs: 1,
+    };
+    let shutdown = CancellationToken::new();
+    let running = tokio::spawn(run_channel_runtime(runtime, shutdown.clone(), None));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(16), running)
+        .await
+        .expect("the runtime must stop inside the 16-second drain")
+        .expect("the runtime must not panic")
+        .expect("the runtime must stop cleanly");
+
+    let events = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        events,
+        ["send", "close"],
+        "the restart notice must go out before the channel is closed"
+    );
+}
+
+/// A slow provider that counts the turns that reached it.
+struct CallCountingProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for CallCountingProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        Ok(format!("echo: {message}"))
+    }
+}
+
+/// Plan 353: once the shutdown token has fired, the loop starts nothing new.
+/// Both of its waits used to pick at random between the fired token and a
+/// ready message or free worker, so a queued message could still start a turn
+/// after shutdown began. The choice is random, so the case runs many rounds.
+#[tokio::test(start_paused = true)]
+async fn a_message_queued_when_the_token_fires_never_starts_a_turn() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    for round in 0..64 {
+        let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider = Arc::new(CallCountingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let ctx = dispatch_ctx(
+            vec![channel],
+            provider.clone(),
+            routing::RuntimeConfigSlot::default(),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(drain_message("chat-1")).await.expect("queued");
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        tokio::time::timeout(
+            Duration::from_secs(16),
+            run_message_dispatch_loop(rx, ctx, 4, shutdown),
+        )
+        .await
+        .expect("the dispatch loop must return inside the 16-second drain");
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "round {round}: a turn started after the token"
+        );
+        let sent = channel_impl.sent.lock().await;
+        assert_eq!(sent.len(), 1, "round {round}: {sent:?}");
+        assert_eq!(sent[0].content, RESTART_NOTICE, "round {round}");
+        drop(tx);
+    }
+}
+
+/// Plan 353 (D3): each conversation gets one notice, however many of its
+/// messages the drain stopped. A running turn, a message waiting for a worker
+/// and a queued message in the same chat get a single line between them.
+#[tokio::test(start_paused = true)]
+async fn a_conversation_gets_one_restart_notice_however_many_messages_it_had() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(SlowProvider {
+            delay: Duration::from_secs(600),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let shutdown = CancellationToken::new();
+    // One worker: chat-1's first message runs, its second waits for the worker,
+    // and its third and chat-2's message stay queued.
+    let dispatch = tokio::spawn(run_message_dispatch_loop(rx, ctx, 1, shutdown.clone()));
+    for chat in ["chat-1", "chat-1", "chat-1", "chat-2"] {
+        tx.send(drain_message(chat)).await.expect("queued");
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(16), dispatch)
+        .await
+        .expect("the dispatch loop must return inside the 16-second drain")
+        .expect("the dispatch loop must not panic");
+
+    let sent = channel_impl.sent.lock().await;
+    let notices = |chat: &str| {
+        sent.iter()
+            .filter(|m| m.recipient == chat && m.content == RESTART_NOTICE)
+            .count()
+    };
+    assert_eq!(
+        (notices("chat-1"), notices("chat-2")),
+        (1, 1),
+        "one notice per conversation: {sent:?}"
+    );
+    assert_eq!(sent.len(), 2, "nothing but the two notices: {sent:?}");
+    drop(tx);
 }
 
 /// A reply inside a Slack thread, as Slack's own classifier builds it.

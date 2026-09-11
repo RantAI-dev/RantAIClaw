@@ -76,6 +76,18 @@ pub struct WhatsAppWebChannel {
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
 }
 
+/// What became of an inbound message offered to the dispatch queue.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug)]
+enum InboundForward {
+    Queued,
+    /// The queue refused it: full, or closed because the runtime is stopping.
+    /// The message is dropped here; only the reason is kept.
+    Refused(tokio::sync::mpsc::error::TrySendError<()>),
+    /// Shutdown has begun, so it was not offered to the queue at all.
+    StoppedListening,
+}
+
 /// How long before the same chat may be told again that a message was dropped.
 ///
 /// The queue saturates in bursts, so without this a user who sent five messages
@@ -145,6 +157,45 @@ impl WhatsAppWebChannel {
     pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
         self.multimodal = multimodal;
         self
+    }
+
+    /// Offer one inbound message to the dispatch queue, unless shutdown has begun.
+    ///
+    /// Once `listen`'s token is cancelled the connection stays up only so replies
+    /// and restart notices still reach WhatsApp while dispatch drains, and
+    /// nothing new may enter the queue it is draining (plan 353).
+    fn forward_inbound(
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        listening: &tokio_util::sync::CancellationToken,
+        inbound: ChannelMessage,
+    ) -> InboundForward {
+        if listening.is_cancelled() {
+            return InboundForward::StoppedListening;
+        }
+        match tx.try_send(inbound) {
+            Ok(()) => InboundForward::Queued,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                InboundForward::Refused(tokio::sync::mpsc::error::TrySendError::Full(()))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                InboundForward::Refused(tokio::sync::mpsc::error::TrySendError::Closed(()))
+            }
+        }
+    }
+
+    /// What the sender is told when their message did not reach dispatch: that
+    /// the agent is busy when the queue is full, and that the bot is restarting
+    /// once shutdown has begun (plan 353). Nothing when it was queued, or when
+    /// the queue is already closed and the connection is closing with it.
+    fn inbound_notice(outcome: &InboundForward) -> Option<&'static str> {
+        match outcome {
+            InboundForward::Refused(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                Some(DROP_NOTICE)
+            }
+            InboundForward::StoppedListening => Some(super::RESTART_NOTICE),
+            InboundForward::Queued
+            | InboundForward::Refused(tokio::sync::mpsc::error::TrySendError::Closed(())) => None,
+        }
     }
 
     /// Upload one attachment and send it as a media message.
@@ -906,6 +957,9 @@ impl Channel for WhatsAppWebChannel {
 
         // Build the bot
         let tx_clone = tx.clone();
+        // The event handler watches the same token as `listen` below, so once
+        // shutdown begins it forwards nothing new.
+        let listening = cancel.clone();
         let allowed_numbers = self.allowed_numbers.clone();
         let multimodal = self.multimodal.clone();
         // Last time each chat was told a message was dropped, so a saturated
@@ -929,6 +983,7 @@ impl Channel for WhatsAppWebChannel {
             .with_http_client(http_client)
             .on_event(move |event, client| {
                 let tx_inner = tx_clone.clone();
+                let listening = listening.clone();
                 let allowed_numbers = allowed_numbers.clone();
                 let drop_notices = Arc::clone(&drop_notices);
                 let multimodal = multimodal.clone();
@@ -1070,32 +1125,30 @@ impl Channel for WhatsAppWebChannel {
                                 // `try_send`, not `send`: a busy agent must not
                                 // park the wa-rs protocol loop, which also
                                 // carries acks and retries.
-                                if let Err(e) = tx_inner.try_send(inbound) {
+                                let outcome =
+                                    Self::forward_inbound(&tx_inner, &listening, inbound);
+                                if let InboundForward::Refused(e) = &outcome {
                                     tracing::warn!(
                                         "WhatsApp Web: dropping an inbound message, the agent \
                                          queue is not accepting it: {e}"
                                     );
-                                    // Tell the sender. A dropped message was
-                                    // silent to them: no reply, no reason, and
-                                    // nothing to distinguish a busy agent from
-                                    // a broken bot. The notice goes out through
-                                    // wa-rs, not the agent queue, so it cannot
-                                    // re-enter this path.
-                                    //
-                                    // Only on `Full`. `Closed` means the runtime
-                                    // is shutting down — there is nothing to try
-                                    // again with, and the send would race the
-                                    // teardown.
-                                    let chat = chat_jid.to_string();
-                                    if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_))
-                                        && Self::claim_drop_notice(
-                                            &drop_notices,
-                                            &chat,
-                                            std::time::Instant::now(),
-                                        )
-                                    {
+                                }
+                                // Tell the sender. A message that did not reach
+                                // dispatch was silent to them: no reply, no
+                                // reason, and nothing to distinguish a busy agent
+                                // from a broken bot, or from one restarting. The
+                                // notice goes out through wa-rs, not the agent
+                                // queue, so it cannot re-enter this path; once
+                                // per chat per cooldown.
+                                let chat = chat_jid.to_string();
+                                if let Some(line) = Self::inbound_notice(&outcome) {
+                                    if Self::claim_drop_notice(
+                                        &drop_notices,
+                                        &chat,
+                                        std::time::Instant::now(),
+                                    ) {
                                         let notice = wa_rs_proto::whatsapp::Message {
-                                            conversation: Some(DROP_NOTICE.to_string()),
+                                            conversation: Some(line.to_string()),
                                             ..Default::default()
                                         };
                                         if let Err(e) =
@@ -1207,23 +1260,25 @@ impl Channel for WhatsAppWebChannel {
         // `Ok(())` independently of the app's shutdown token, which the
         // supervisor read as an unexpected exit and restarted — the passed
         // token already covers shutdown.
-        select! {
-            () = cancel.cancelled() => {
-                tracing::info!("WhatsApp Web channel shutting down");
-            }
-            () = session_ended_outer.cancelled() => {
-                tracing::warn!("WhatsApp Web session ended");
-            }
+        let stopped_listening = select! {
+            () = cancel.cancelled() => true,
+            () = session_ended_outer.cancelled() => false,
+        };
+        if stopped_listening {
+            // Shutdown. The event handler watches the same token and forwards
+            // nothing new, and the connection stays up so replies and restart
+            // notices still reach WhatsApp while dispatch drains. The runtime
+            // calls `close` once dispatch has returned (plan 353).
+            tracing::info!(
+                "WhatsApp Web stopped listening; its connection stays open until dispatch finishes"
+            );
+            return Ok(());
         }
+        tracing::warn!("WhatsApp Web session ended");
 
         // Clear both before returning, so `health_check` can report false and a
         // restart does not find a stale client.
-        *self.client.lock() = None;
-        let handle = self.bot_handle.lock().take();
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
-        }
+        self.close().await;
 
         // `Err` on a fault, per the trait contract: the supervisor escalates its
         // backoff instead of reconnecting at a fixed rate. Note the limit — the
@@ -1259,6 +1314,18 @@ impl Channel for WhatsAppWebChannel {
     /// object is still around. The supervisor now runs this on its heartbeat.
     async fn health_check(&self) -> bool {
         self.client.lock().is_some() && self.bot_handle.lock().is_some()
+    }
+
+    /// Close the connection `listen` left open for replies: stop the bot task
+    /// and forget the client. Called by the runtime once dispatch has returned,
+    /// and by `listen` itself when the session ends.
+    async fn close(&self) {
+        *self.client.lock() = None;
+        let handle = self.bot_handle.lock().take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> Result<()> {
@@ -1892,6 +1959,153 @@ mod media_tests {
 #[cfg(all(test, feature = "whatsapp-web"))]
 mod tests {
     use super::*;
+
+    // ── shutdown drain (plan 353) ───────────────────────────
+
+    /// Once `listen`'s token is cancelled, an inbound message is not offered to
+    /// the dispatch queue, which is draining; before that it is. The wa-rs event
+    /// loop cannot run without a WhatsApp connection, so the message arm's use
+    /// of this function is pinned by source.
+    #[test]
+    fn inbound_is_forwarded_only_while_listening() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listening = tokio_util::sync::CancellationToken::new();
+        let inbound = || ChannelMessage {
+            id: "whatsapp_1".into(),
+            content: "hello".into(),
+            channel: "whatsapp".into(),
+            ..ChannelMessage::default()
+        };
+
+        assert!(matches!(
+            WhatsAppWebChannel::forward_inbound(&tx, &listening, inbound()),
+            InboundForward::Queued
+        ));
+        assert!(
+            rx.try_recv().is_ok(),
+            "a message before the token is queued"
+        );
+
+        listening.cancel();
+        assert!(matches!(
+            WhatsAppWebChannel::forward_inbound(&tx, &listening, inbound()),
+            InboundForward::StoppedListening
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may enter the queue after the token"
+        );
+
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let handler = production
+            .split("Event::Message(msg, info)")
+            .nth(1)
+            .expect("the message arm exists");
+        assert!(
+            handler.contains("Self::forward_inbound(") && !handler.contains("tx_inner.try_send("),
+            "the message arm must forward through `forward_inbound`"
+        );
+    }
+
+    /// Plan 353: a cancelled `listen` leaves the connection up so replies and
+    /// restart notices can still be sent while dispatch drains, and `close` tears
+    /// it down afterwards. Pinned by source for the reason above: the cancel arm
+    /// returns before the teardown, which only a session that ended reaches.
+    #[test]
+    fn a_cancelled_listen_leaves_the_connection_for_close() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let listen = production
+            .split("async fn listen(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn apply_allowed_senders(").next())
+            .expect("listen exists");
+        let cancel_arm = listen
+            .find("() = cancel.cancelled() =>")
+            .expect("listen waits on its token");
+        let after_cancel = &listen[cancel_arm..];
+        let returns = after_cancel
+            .find("return Ok(());")
+            .expect("the cancel path returns on its own");
+        let before_return = &after_cancel[..returns];
+        for teardown in ["client.lock() = None", ".abort()", ".close()"] {
+            assert!(
+                !before_return.contains(teardown),
+                "on cancel, listen must not tear the connection down (`{teardown}`) before it returns"
+            );
+        }
+        assert!(
+            after_cancel[returns..].contains("self.close().await"),
+            "a session that ended must still tear the connection down"
+        );
+    }
+
+    /// Plan 353 (D3): a message that did not reach dispatch is not left without
+    /// a word. A full queue gets the busy notice and, once shutdown has begun,
+    /// the restart notice. The message arm sends whatever this returns, pinned by
+    /// source because the wa-rs event loop cannot run in a test.
+    #[test]
+    fn a_message_not_taken_tells_the_sender_why() {
+        use tokio::sync::mpsc::error::TrySendError;
+        let cases = [
+            (InboundForward::Queued, None),
+            (
+                InboundForward::Refused(TrySendError::Full(())),
+                Some(DROP_NOTICE),
+            ),
+            (InboundForward::Refused(TrySendError::Closed(())), None),
+            (
+                InboundForward::StoppedListening,
+                Some(crate::channels::RESTART_NOTICE),
+            ),
+        ];
+        let mismatches: Vec<String> = cases
+            .iter()
+            .filter(|(outcome, expected)| WhatsAppWebChannel::inbound_notice(outcome) != *expected)
+            .map(|(outcome, expected)| format!("{outcome:?}: expected {expected:?}"))
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let handler = production
+            .split("Event::Message(msg, info)")
+            .nth(1)
+            .expect("the message arm exists");
+        assert!(
+            handler.contains("Self::inbound_notice(&outcome)"),
+            "the message arm must send what `inbound_notice` returns"
+        );
+    }
+
+    /// Plan 353: `close`, which the runtime calls once dispatch has finished,
+    /// stops the bot task `listen` left running and leaves no client behind.
+    #[tokio::test(start_paused = true)]
+    async fn close_stops_the_bot_that_listen_left_running() {
+        let ch =
+            WhatsAppWebChannel::new("/tmp/wa-close-test.db".into(), None, None, vec!["*".into()]);
+        let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+        let bot = tokio::spawn(async move {
+            let _alive = alive;
+            std::future::pending::<()>().await;
+        });
+        *ch.bot_handle.lock() = Some(bot);
+
+        ch.close().await;
+
+        assert!(
+            ch.bot_handle.lock().is_none(),
+            "the bot handle must be taken"
+        );
+        assert!(ch.client.lock().is_none(), "no client may be left behind");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stopped)
+                .await
+                .is_ok(),
+            "the bot task must be stopped"
+        );
+    }
 
     /// A dropped inbound message used to be silent to the sender: the log said
     /// so, they got no reply and no reason, and a busy agent looked exactly like

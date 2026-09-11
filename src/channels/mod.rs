@@ -159,6 +159,40 @@ const UNDELIVERED_TURN_MARKER: &str = "(the previous reply was not delivered)";
 const TIMED_OUT_TURN_MARKER: &str = "(the previous attempt timed out)";
 const FAILED_TURN_MARKER: &str = "(the previous attempt failed)";
 
+/// What a conversation is told when a restart stops its turn before the
+/// answer, or stops a message before its turn began (plan 353, decision D3).
+/// Nothing is replayed after the restart, so the user decides whether to send
+/// the message again; a turn that ran tools is never run a second time.
+const RESTART_NOTICE: &str =
+    "I'm restarting and could not answer your last message. Please send it again in a minute.";
+
+/// How long turns still running when shutdown begins may go on before they are
+/// stopped and their conversations told to resend.
+///
+/// Measured from when the dispatch loop sees the shutdown token, and shorter
+/// than the daemon's sixteen-second drain (`daemon::DRAIN_TIMEOUT`) by enough
+/// for those notices to be sent: a turn that the daemon aborts instead sends
+/// nothing and leaves Slack's working notice posted.
+const CHANNEL_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Bound on sending one restart notice, so a platform that does not answer
+/// cannot use up the drain that the other conversations' notices need.
+const CHANNEL_NOTICE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the channel runtime may take to stop once its shutdown token fires:
+/// the drain deadline, its notices, and closing the channels after it. The
+/// daemon's drain (`daemon::DRAIN_TIMEOUT`) is this value, and the TUI waits
+/// this long on a restart so an old WhatsApp Web connection is closed before
+/// the new runtime's listener opens another.
+pub(crate) const CHANNEL_RUNTIME_STOP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(16);
+
+const _: () = assert!(
+    CHANNEL_DRAIN_DEADLINE.as_secs() + CHANNEL_NOTICE_SEND_TIMEOUT.as_secs()
+        < CHANNEL_RUNTIME_STOP_TIMEOUT.as_secs(),
+    "the drain deadline and one notice must fit inside the runtime's stop timeout"
+);
+
 /// Backstop for waiting on a previous in-flight turn to signal completion.
 ///
 /// `supervisor::CompletionGuard` releases the signal even on a panic, so this should never
@@ -1397,6 +1431,12 @@ pub(crate) async fn run_channel_runtime(
 
     if let Some(ref bus) = bus {
         bus.clear().await;
+    }
+
+    // Dispatch has returned, so every reply and restart notice has gone out.
+    // Only now may a channel close what `listen` kept open for sending.
+    for ch in &channels {
+        ch.close().await;
     }
 
     for h in handles {
