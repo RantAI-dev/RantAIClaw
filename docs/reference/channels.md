@@ -1170,3 +1170,11 @@ If a specific channel task crashes or exits, the channel supervisor in `channels
 - `Channel message worker crashed:`
 
 These messages indicate automatic restart behavior is active, and you should inspect preceding logs for root cause.
+
+### 7.4 Shutdown drain keywords
+
+When the daemon stops, the dispatch loop drains before the process exits:
+
+- `Cancelled an in-flight channel request`: a turn was stopped, by a newer message from the same sender or by the drain deadline 12 seconds into shutdown
+- `sent a restart notice` / `could not send a restart notice:` / `a restart notice timed out`: a conversation was told to send its message again, logged with `channel` and `message_id`
+- `WhatsApp Web stopped listening; its connection stays open until dispatch finishes`: WhatsApp Web forwards nothing new and keeps its connection only for the replies and notices still going out
