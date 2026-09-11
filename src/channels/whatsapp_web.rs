@@ -599,6 +599,37 @@ impl WhatsAppWebChannel {
         })
     }
 
+    /// The `ChannelMessage` for one inbound message.
+    ///
+    /// Out of the event handler so the conversation key a message produces can
+    /// be checked: the handler only runs behind a live wa-rs client, which no
+    /// test has. WhatsApp has no platform thread and quotes nothing, so a chat
+    /// is one conversation and both thread fields stay empty.
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn inbound_channel_message(
+        platform_id: &str,
+        sender: String,
+        reply_target: String,
+        content: String,
+        message_ts: i64,
+    ) -> ChannelMessage {
+        ChannelMessage {
+            sender_aliases: Vec::new(),
+            // The platform id, not a fresh UUID: a redelivery has to be
+            // recognisable.
+            id: Self::inbound_message_id(platform_id),
+            channel: "whatsapp".to_string(),
+            sender,
+            reply_target,
+            content,
+            // The message's own timestamp, checked. `Utc::now()` stamped the
+            // moment we happened to process it.
+            timestamp: Self::inbound_timestamp(message_ts),
+            thread_ts: None,
+            reply_anchor: None,
+        }
+    }
+
     /// Whether an inbound sender may reach the agent.
     ///
     /// An unmapped LID used to be admitted whenever the allowlist was
@@ -1029,23 +1060,13 @@ impl Channel for WhatsAppWebChannel {
                                 // this target, so it follows the reply.
                                 let reply_target =
                                     Self::resolve_reply_target(&client, &chat_jid).await;
-                                let inbound = ChannelMessage {
-                                    sender_aliases: Vec::new(),
-                                    // The platform id, not a fresh UUID: a
-                                    // redelivery has to be recognisable.
-                                    id: Self::inbound_message_id(&info.id),
-                                    channel: "whatsapp".to_string(),
-                                    sender: normalized.clone(),
+                                let inbound = Self::inbound_channel_message(
+                                    &info.id,
+                                    normalized.clone(),
                                     reply_target,
-                                    content: content.clone(),
-                                    // The message's own timestamp, checked —
-                                    // `Utc::now()` stamped the moment we
-                                    // happened to process it.
-                                    timestamp: Self::inbound_timestamp(
-                                        info.timestamp.timestamp(),
-                                    ),
-                                    thread_ts: None,
-                                };
+                                    content.clone(),
+                                    info.timestamp.timestamp(),
+                                );
                                 // `try_send`, not `send`: a busy agent must not
                                 // park the wa-rs protocol loop, which also
                                 // carries acks and retries.

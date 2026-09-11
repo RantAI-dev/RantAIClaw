@@ -10,9 +10,16 @@ pub struct ChannelMessage {
     pub content: String,
     pub channel: String,
     pub timestamp: u64,
-    /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
-    /// When set, replies should be posted as threaded responses.
+    /// The platform thread this message belongs to: a Slack parent `ts`, a
+    /// Mattermost `root_id`. Part of the conversation key, so every message in
+    /// one thread is one conversation. Not the message a reply quotes; that is
+    /// [`reply_anchor`](Self::reply_anchor).
     pub thread_ts: Option<String>,
+    /// The message a reply should quote: a Telegram message id, a Discord
+    /// message id. It differs on every message, so it is never part of the
+    /// conversation key. Telegram and Discord once carried it in `thread_ts`,
+    /// which made every message on those channels a conversation of its own.
+    pub reply_anchor: Option<String>,
     /// Additional identity forms for `sender` when a channel resolves one user
     /// to more than one (e.g. Telegram exposes both a numeric id and a
     /// username, but `sender` can only be one). The owner gate checks these
@@ -30,6 +37,19 @@ impl ChannelMessage {
     pub fn sender_identities(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.sender.as_str()).chain(self.sender_aliases.iter().map(String::as_str))
     }
+
+    /// The outbound message that answers this one: to the same chat, in the
+    /// same thread, quoting this message.
+    ///
+    /// The runtime builds its replies here so the address fields are copied in
+    /// one place. Copying them at each call site is how one site ends up
+    /// threading a reply while another forgets to quote.
+    #[must_use]
+    pub fn reply(&self, content: impl Into<String>) -> SendMessage {
+        SendMessage::new(content, &self.reply_target)
+            .in_thread(self.thread_ts.clone())
+            .replying_to(self.reply_anchor.clone())
+    }
 }
 
 /// Message to send through a channel
@@ -38,8 +58,11 @@ pub struct SendMessage {
     pub content: String,
     pub recipient: String,
     pub subject: Option<String>,
-    /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
+    /// The platform thread to post into (e.g. a Slack parent `ts`, a
+    /// Mattermost `root_id`).
     pub thread_ts: Option<String>,
+    /// The message to quote (e.g. a Telegram or Discord message id).
+    pub reply_anchor: Option<String>,
 }
 
 impl SendMessage {
@@ -50,6 +73,7 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            reply_anchor: None,
         }
     }
 
@@ -64,12 +88,19 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: Some(subject.into()),
             thread_ts: None,
+            reply_anchor: None,
         }
     }
 
-    /// Set the thread identifier for threaded replies.
+    /// Set the platform thread to post into.
     pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
         self.thread_ts = thread_ts;
+        self
+    }
+
+    /// Set the message this one quotes.
+    pub fn replying_to(mut self, reply_anchor: Option<String>) -> Self {
+        self.reply_anchor = reply_anchor;
         self
     }
 }
@@ -239,6 +270,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                reply_anchor: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -267,6 +299,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            reply_anchor: None,
         };
 
         let cloned = message.clone();
@@ -276,6 +309,26 @@ mod tests {
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");
         assert_eq!(cloned.timestamp, 999);
+    }
+
+    /// A reply goes to the chat the message came from, into its thread, quoting
+    /// it. All three are checked because losing any one is silent: the reply
+    /// still arrives, just in the wrong place or without the quote.
+    #[test]
+    fn a_reply_keeps_the_chat_the_thread_and_the_quote() {
+        let inbound = ChannelMessage {
+            reply_target: "chat-1".into(),
+            thread_ts: Some("thread-1".into()),
+            reply_anchor: Some("383".into()),
+            ..ChannelMessage::default()
+        };
+
+        let reply = inbound.reply("answer");
+
+        assert_eq!(reply.content, "answer");
+        assert_eq!(reply.recipient, "chat-1");
+        assert_eq!(reply.thread_ts.as_deref(), Some("thread-1"));
+        assert_eq!(reply.reply_anchor.as_deref(), Some("383"));
     }
 
     #[tokio::test]

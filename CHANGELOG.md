@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Telegram and Discord forgot the conversation after every message, and `/model` never stuck
+  there.** Since 2026-08-14 both channels put the id of the prompting message in `thread_ts` so the
+  reply would quote it, and `thread_ts` is part of the conversation key. Every message therefore
+  started a conversation of its own: the bot kept no history past one exchange, conversation-scoped
+  memory never accumulated, and a `/model` switch was stored under the key of the `/model` message
+  itself, so the bot answered "switched" and the next message ran on the old model. The quoted
+  message now travels in its own field, `reply_anchor`, which is never part of the key, and
+  `thread_ts` again means a platform thread (Slack, Mattermost). Replies still quote the prompting
+  message, and `thread_replies = false` still turns quoting off. Three things change for operators.
+  A chat on Telegram or Discord is one conversation again, so a `/model` switch there clears that
+  chat's history, as the channels reference already says. Conversation-scoped memory now
+  accumulates per chat; core memories, which the model saves with `memory_store`, were never scoped
+  to a conversation and behave as before. History stored under the old per-message keys is no
+  longer read and is removed by the 30-day retention prune at the next startup after it ages out.
+  No config change and no migration.
 - **Slack showed nothing at all while the agent worked**, which on an eighteen-second turn reads as
   a bot that never got the message. It was the only tier channel with no `start_typing` override, so
   it fell through to the no-op default while Telegram, Discord and WhatsApp Web all showed

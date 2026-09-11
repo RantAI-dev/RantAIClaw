@@ -1058,7 +1058,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
     }
 
-    fn parse_update_message(
+    pub(crate) fn parse_update_message(
         &self,
         update: &serde_json::Value,
     ) -> Option<(ChannelMessage, Option<String>)> {
@@ -1180,10 +1180,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                // The reply ANCHOR, not the forum topic. The topic is a
-                // destination and stays in `reply_target` (`chat_id:thread_id`)
-                // — carrying it in both fields would let the two disagree.
-                thread_ts: if message_id == 0 {
+                // No platform thread. A forum topic is a destination and stays
+                // in `reply_target` (`chat_id:thread_id`), which already makes
+                // each topic its own conversation.
+                thread_ts: None,
+                // The prompting message, so the reply quotes it. Not
+                // `thread_ts`: that field is part of the conversation key, and
+                // an id that changes on every message made every message a
+                // conversation of its own.
+                reply_anchor: if message_id == 0 {
                     None
                 } else {
                     Some(message_id.to_string())
@@ -2177,7 +2182,7 @@ impl Channel for TelegramChannel {
                     &text_without_markers,
                     chat_id,
                     thread_id,
-                    message.thread_ts.as_deref(),
+                    message.reply_anchor.as_deref(),
                 )
                 .await?;
             }
@@ -2195,8 +2200,13 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        self.send_text_chunks(&content, chat_id, thread_id, message.thread_ts.as_deref())
-            .await
+        self.send_text_chunks(
+            &content,
+            chat_id,
+            thread_id,
+            message.reply_anchor.as_deref(),
+        )
+        .await
     }
 
     async fn listen(
@@ -3287,8 +3297,10 @@ mod tests {
     }
 
     /// A forum topic is a DESTINATION and stays in `reply_target`; the reply
-    /// anchor is the prompting message and lives in `thread_ts`. Carrying the
-    /// topic in both is the failure this asserts against — they could disagree.
+    /// anchor is the prompting message and lives in `reply_anchor`. Neither
+    /// goes in `thread_ts`, which is part of the conversation key: the topic is
+    /// already keyed through `reply_target`, and the anchor changes on every
+    /// message.
     #[test]
     fn telegram_forum_topic_and_reply_anchor_are_different_fields() {
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
@@ -3308,9 +3320,31 @@ mod tests {
             .expect("the message parses");
         assert_eq!(msg.reply_target, "-100200300:789", "topic = destination");
         assert_eq!(
-            msg.thread_ts.as_deref(),
+            msg.reply_anchor.as_deref(),
             Some("4242"),
             "anchor = the message"
+        );
+        assert_eq!(msg.thread_ts, None, "Telegram has no platform thread");
+    }
+
+    /// A thread is not a quote. The sender reads the anchor from
+    /// `reply_anchor`, so a message carrying only `thread_ts` must not come out
+    /// as a reply to that id.
+    #[tokio::test]
+    async fn telegram_quotes_only_the_reply_anchor_never_the_thread() {
+        let (base, captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
+
+        ch.send(&SendMessage::new("reply", "-100200300").in_thread(Some("4242".to_string())))
+            .await
+            .expect("the local Bot API accepts it");
+
+        let (_, body) = only_request(&captured);
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert!(
+            json.get("reply_parameters").is_none(),
+            "a thread id must not be sent as a quote: {json}"
         );
     }
 
@@ -3399,7 +3433,7 @@ mod tests {
 
         ch.send(
             &SendMessage::new("threaded reply", "-100200300:789")
-                .in_thread(Some("4242".to_string())),
+                .replying_to(Some("4242".to_string())),
         )
         .await
         .expect("the local Bot API accepts it");

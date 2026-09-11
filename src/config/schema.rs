@@ -2851,9 +2851,10 @@ pub struct ChannelsConfig {
     /// to turn it off without turning off the channel. A per-channel key of the
     /// same name (currently `[channels_config.mattermost]`) overrides this.
     ///
-    /// Enforced once, in the inbound dispatch loop, which clears the message's
-    /// thread anchor before the agent sees it — channels do not read this flag,
-    /// so a channel added later cannot forget to honour it.
+    /// Enforced once, in the inbound dispatch loop, which clears both the
+    /// message's thread (`thread_ts`) and the message its reply would quote
+    /// (`reply_anchor`) before the agent sees it. Channels do not read this
+    /// flag, so a channel added later cannot forget to honour it.
     #[serde(default = "default_thread_replies")]
     pub thread_replies: bool,
     /// Sender ids authorized to **approve** tool calls over a channel (the

@@ -997,7 +997,7 @@ expression: pretty
           "default": null
         },
         "thread_replies": {
-          "description": "Reply in-thread where the platform supports it (default `true`).\n\nThreading changes **where** a reply appears, so an operator must be able\nto turn it off without turning off the channel. A per-channel key of the\nsame name (currently `[channels_config.mattermost]`) overrides this.\n\nEnforced once, in the inbound dispatch loop, which clears the message's\nthread anchor before the agent sees it — channels do not read this flag,\nso a channel added later cannot forget to honour it.",
+          "description": "Reply in-thread where the platform supports it (default `true`).\n\nThreading changes **where** a reply appears, so an operator must be able\nto turn it off without turning off the channel. A per-channel key of the\nsame name (currently `[channels_config.mattermost]`) overrides this.\n\nEnforced once, in the inbound dispatch loop, which clears both the\nmessage's thread (`thread_ts`) and the message its reply would quote\n(`reply_anchor`) before the agent sees it. Channels do not read this\nflag, so a channel added later cannot forget to honour it.",
           "type": "boolean",
           "default": true
         },

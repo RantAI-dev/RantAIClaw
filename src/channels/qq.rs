@@ -546,6 +546,7 @@ impl Channel for QQChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        reply_anchor: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
