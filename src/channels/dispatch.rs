@@ -5,7 +5,7 @@
 //! tests stayed in `mod_tests.rs` with the fixtures they share, so the moved
 //! items are `pub(crate)`.
 
-use super::traits::{self, SendMessage};
+use super::traits;
 use super::truncate_with_ellipsis;
 use super::{
     approval_relay, channel_message_timeout_budget_secs, commands, conversation, history, prompt,
@@ -37,11 +37,20 @@ pub(crate) fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 /// public group, and persisted to `brain.db` so it survived restarts.
 ///
 /// `reply_target` is the chat id on every channel that has one (Telegram
-/// `chat_id[:thread_id]`, Discord/Slack `channel_id`), and it is stable per
-/// conversation — checked against Telegram, Discord, Slack and Matrix before
-/// this was adopted. Matrix sets `reply_target` to the sender, but a Matrix
-/// channel is pinned to one configured room, so there is only ever one
+/// `chat_id[:thread_id]`, Discord/Slack `channel_id`). `thread_ts` narrows it to
+/// a platform thread where the platform has one (Slack, Mattermost) and is empty
+/// on Telegram and Discord. Matrix sets `reply_target` to the sender, but a
+/// Matrix channel is pinned to one configured room, so there is only ever one
 /// conversation there and nothing merges.
+///
+/// Nothing that changes from one message to the next may enter this key.
+/// Telegram and Discord once carried the id of the prompting message in
+/// `thread_ts` so replies would quote it, and every message became a
+/// conversation of its own: no history past one exchange, and a `/model` choice
+/// no later message read. The quote now travels in `reply_anchor`, which this
+/// function does not read, and
+/// `every_tier_channel_keeps_one_conversation_across_consecutive_messages`
+/// checks the key through each tier channel's own parser.
 ///
 /// Route overrides use this same value, so a `/model` pin follows the
 /// conversation rather than following the person into every chat they are in.
@@ -317,12 +326,7 @@ pub(crate) async fn process_channel_message(
                 route.provider
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(
-                        &SendMessage::new(message, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await;
+                let _ = channel.send(&msg.reply(message)).await;
             }
             return;
         }
@@ -460,12 +464,7 @@ pub(crate) async fn process_channel_message(
 
     let draft_message_id = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
-            match channel
-                .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                )
-                .await
-            {
+            match channel.send_draft(&msg.reply("...")).await {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::debug!("Failed to send draft on {}: {e}", channel.name());
@@ -540,9 +539,7 @@ pub(crate) async fn process_channel_message(
             approval_relay::ChatRelayApprovalBackend::new(
                 Arc::clone(&ctx.tool_approvals),
                 Arc::clone(chan),
-                msg.reply_target.clone(),
-                msg.thread_ts.clone(),
-                msg.channel.clone(),
+                &msg,
             )
         })
     } else {
@@ -675,23 +672,11 @@ pub(crate) async fn process_channel_message(
                         Ok(()) => true,
                         Err(e) => {
                             tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                            channel
-                                .send(
-                                    &SendMessage::new(&delivered_response, &msg.reply_target)
-                                        .in_thread(msg.thread_ts.clone()),
-                                )
-                                .await
-                                .is_ok()
+                            channel.send(&msg.reply(&delivered_response)).await.is_ok()
                         }
                     }
                 } else {
-                    match channel
-                        .send(
-                            &SendMessage::new(&delivered_response, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await
-                    {
+                    match channel.send(&msg.reply(&delivered_response)).await {
                         Ok(()) => true,
                         Err(e) => {
                             tracing::error!(channel = %channel.name(), "failed to reply: {e}");
@@ -756,12 +741,7 @@ pub(crate) async fn process_channel_message(
                             .finalize_draft(&msg.reply_target, draft_id, error_text)
                             .await;
                     } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(error_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        let _ = channel.send(&msg.reply(error_text)).await;
                     }
                 }
                 return;
@@ -798,12 +778,7 @@ pub(crate) async fn process_channel_message(
                         .finalize_draft(&msg.reply_target, draft_id, &reply)
                         .await;
                 } else {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new(reply, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
+                    let _ = channel.send(&msg.reply(reply)).await;
                 }
             }
         }
@@ -834,12 +809,7 @@ pub(crate) async fn process_channel_message(
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
                         .await;
                 } else {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
+                    let _ = channel.send(&msg.reply(error_text)).await;
                 }
             }
         }
@@ -870,12 +840,15 @@ pub(crate) async fn run_message_dispatch_loop(
         m = rx.recv() => m,
     } {
         // One place decides whether replies thread. Channels fill `thread_ts`
-        // unconditionally; clearing it here — before the message reaches the
-        // agent, the approval relay, or history — means a channel added later
-        // cannot forget to honour the switch, and the ten dispatch sites that
-        // copy `thread_ts` onto the outbound message need no change.
+        // and `reply_anchor` unconditionally; clearing both here — before the
+        // message reaches the agent, the approval relay, or history — means a
+        // channel added later cannot forget to honour the switch. Both, because
+        // Slack and Mattermost thread through the first while Telegram and
+        // Discord quote through the second, and every reply is built from these
+        // two fields by `ChannelMessage::reply`.
         if !routing::thread_replies_enabled(ctx.as_ref(), &msg.channel) {
             msg.thread_ts = None;
+            msg.reply_anchor = None;
         }
         // Intercept approval replies before the message reaches the agent.
         // Try the whole-tool relay first (`/approve X`, `/deny X` — Layer A),
@@ -922,8 +895,7 @@ pub(crate) async fn run_message_dispatch_loop(
         });
         if let Some(reply) = approval_reply {
             if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
-                let ack = traits::SendMessage::new(reply, msg.reply_target.clone())
-                    .in_thread(msg.thread_ts.clone());
+                let ack = msg.reply(reply);
                 if let Err(e) = channel.send(&ack).await {
                     tracing::warn!(
                         target: "approval_relay",

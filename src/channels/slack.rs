@@ -122,6 +122,7 @@ impl SlackChannel {
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: Self::inbound_thread_ts(msg, ts),
+            reply_anchor: None,
         })
     }
 

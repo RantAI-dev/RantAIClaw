@@ -56,7 +56,9 @@ use crate::approval::{
     can_approve, summarize_args, ApprovalBackend, ApprovalManager, ApprovalRequest,
     ApprovalResponse,
 };
-use crate::channels::traits::{Channel, SendMessage};
+use crate::channels::traits::Channel;
+#[cfg(test)]
+use crate::channels::traits::SendMessage;
 use crate::security::{Decision, PendingApprovals, PendingRequest, SecurityPolicy};
 
 /// Try to interpret `text` as an approval reply. On success returns a
@@ -374,28 +376,28 @@ pub struct ChatRelayApprovalBackend {
     relay: Arc<PendingApprovals>,
     /// Channel used to post the approval prompt back to the originating chat.
     channel: Arc<dyn Channel>,
-    /// Reply target (chat id / room) the prompt is delivered to.
-    recipient: String,
-    /// Optional thread id so the prompt threads with the conversation.
-    thread_ts: Option<String>,
-    /// Channel name, recorded on the pending request for display/audit.
-    channel_name: String,
+    /// The message whose turn asked for the tool, with its content dropped.
+    /// The prompt is built from it by [`ChannelMessage::reply`], so it lands in
+    /// the same chat and thread as the answer and quotes the same message, and
+    /// its channel name is what the pending request records.
+    ///
+    /// [`ChannelMessage::reply`]: super::traits::ChannelMessage::reply
+    origin: super::traits::ChannelMessage,
 }
 
 impl ChatRelayApprovalBackend {
     pub fn new(
         relay: Arc<PendingApprovals>,
         channel: Arc<dyn Channel>,
-        recipient: impl Into<String>,
-        thread_ts: Option<String>,
-        channel_name: impl Into<String>,
+        origin: &super::traits::ChannelMessage,
     ) -> Self {
         Self {
             relay,
             channel,
-            recipient: recipient.into(),
-            thread_ts,
-            channel_name: channel_name.into(),
+            origin: super::traits::ChannelMessage {
+                content: String::new(),
+                ..origin.clone()
+            },
         }
     }
 }
@@ -414,14 +416,14 @@ impl ApprovalBackend for ChatRelayApprovalBackend {
             &summary,
             &handle,
             self.relay.timeout(),
-            &self.channel_name,
+            &self.origin.channel,
         );
-        let msg = SendMessage::new(body, &self.recipient).in_thread(self.thread_ts.clone());
+        let msg = self.origin.reply(body);
         if let Err(e) = self.channel.send(&msg).await {
             // Can't ask the owner → fail closed (deny). Do not run the tool.
             tracing::warn!(
                 target: "approval_relay",
-                channel = %self.channel_name,
+                channel = %self.origin.channel,
                 tool = %request.tool_name,
                 error = %e,
                 "failed to post tool-approval prompt; denying"
@@ -437,11 +439,11 @@ impl ApprovalBackend for ChatRelayApprovalBackend {
                 request_id,
                 request.tool_name.clone(),
                 summary,
-                self.channel_name.clone(),
+                self.origin.channel.clone(),
                 // The chat this request can be answered from. Without it, a bare
                 // `ok` typed in ANY chat resolved it — the prompt goes to the
                 // triggering chat, which a guest chooses.
-                self.recipient.clone(),
+                self.origin.reply_target.clone(),
             )
             .await
         {
@@ -1729,7 +1731,7 @@ mod tests {
     /// Minimal channel that records what was posted, for backend tests.
     #[derive(Default)]
     struct CapturingChannel {
-        posted: tokio::sync::Mutex<Vec<String>>,
+        posted: tokio::sync::Mutex<Vec<SendMessage>>,
     }
 
     #[async_trait::async_trait]
@@ -1738,7 +1740,7 @@ mod tests {
             "telegram"
         }
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-            self.posted.lock().await.push(message.content.clone());
+            self.posted.lock().await.push(message.clone());
             Ok(())
         }
         async fn listen(
@@ -1768,13 +1770,12 @@ mod tests {
     async fn chat_relay_backend_posts_prompt_and_yields_yes_on_owner_approval() {
         let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
         let channel: Arc<dyn Channel> = Arc::new(CapturingChannel::default());
-        let backend = ChatRelayApprovalBackend::new(
-            relay.clone(),
-            channel.clone(),
-            "chat-1",
-            None,
-            "telegram",
-        );
+        let origin = crate::channels::traits::ChannelMessage {
+            reply_target: "chat-1".into(),
+            channel: "telegram".into(),
+            ..Default::default()
+        };
+        let backend = ChatRelayApprovalBackend::new(relay.clone(), channel.clone(), &origin);
         let mgr = test_manager();
         let request = ApprovalRequest {
             tool_name: "web_search".into(),
@@ -1806,13 +1807,12 @@ mod tests {
     async fn chat_relay_backend_denies_on_timeout() {
         let relay = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
         let channel: Arc<dyn Channel> = Arc::new(CapturingChannel::default());
-        let backend = ChatRelayApprovalBackend::new(
-            relay.clone(),
-            channel.clone(),
-            "chat-1",
-            None,
-            "telegram",
-        );
+        let origin = crate::channels::traits::ChannelMessage {
+            reply_target: "chat-1".into(),
+            channel: "telegram".into(),
+            ..Default::default()
+        };
+        let backend = ChatRelayApprovalBackend::new(relay.clone(), channel.clone(), &origin);
         let mgr = test_manager();
         let request = ApprovalRequest {
             tool_name: "shell".into(),
@@ -1820,5 +1820,37 @@ mod tests {
         };
         // No owner replies → the registry deadline fires → deny.
         assert_eq!(backend.decide(&mgr, &request).await, ApprovalResponse::No);
+    }
+
+    /// The approval prompt lands where the answer will: in the conversation's
+    /// thread, quoting the message that asked. The backend is built from that
+    /// message, so a caller has no thread or anchor argument to swap or drop;
+    /// this pins that `decide` carries both onto the prompt.
+    #[tokio::test]
+    async fn chat_relay_backend_prompt_threads_and_quotes_like_the_answer() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
+        let capturing = Arc::new(CapturingChannel::default());
+        let channel: Arc<dyn Channel> = capturing.clone();
+        let origin = crate::channels::traits::ChannelMessage {
+            reply_target: "chat-1".into(),
+            channel: "telegram".into(),
+            thread_ts: Some("thread-1".into()),
+            reply_anchor: Some("383".into()),
+            ..Default::default()
+        };
+        let backend = ChatRelayApprovalBackend::new(relay, channel, &origin);
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({ "command": "ls" }),
+        };
+
+        // Nobody answers, so the deadline denies. Only the posted prompt matters.
+        let _ = backend.decide(&test_manager(), &request).await;
+
+        let posted = capturing.posted.lock().await;
+        assert_eq!(posted.len(), 1, "{posted:?}");
+        assert_eq!(posted[0].recipient, "chat-1");
+        assert_eq!(posted[0].thread_ts.as_deref(), Some("thread-1"));
+        assert_eq!(posted[0].reply_anchor.as_deref(), Some("383"));
     }
 }

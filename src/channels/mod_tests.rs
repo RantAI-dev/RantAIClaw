@@ -1241,6 +1241,7 @@ async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -1311,6 +1312,7 @@ async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_repl
             channel: "test-channel".to_string(),
             timestamp: 3,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -1381,6 +1383,7 @@ async fn process_channel_message_executes_tool_calls_with_alias_tags() {
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -1460,6 +1463,7 @@ async fn process_channel_message_handles_models_command_without_llm_call() {
             channel: "telegram".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -1561,6 +1565,7 @@ async fn process_channel_message_uses_route_override_provider_and_model() {
             channel: "telegram".to_string(),
             timestamp: 2,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -1643,6 +1648,7 @@ async fn process_channel_message_prefers_cached_default_provider_instance() {
             channel: "telegram".to_string(),
             timestamp: 3,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -1754,6 +1760,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
             channel: "telegram".to_string(),
             timestamp: 4,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -2745,6 +2752,7 @@ async fn process_channel_message_respects_configured_max_tool_iterations_above_d
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -2825,6 +2833,7 @@ async fn process_channel_message_reports_configured_max_tool_iterations_limit() 
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -3088,6 +3097,7 @@ async fn channel_error_replies_are_sanitized_before_delivery() {
         channel: "test-channel".to_string(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     })
     .await
     .unwrap();
@@ -3398,6 +3408,7 @@ fn dm_and_group_history_do_not_merge() {
         channel: "telegram".into(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     });
     let group = conversation_history_key(&traits::ChannelMessage {
         sender_aliases: Vec::new(),
@@ -3408,6 +3419,7 @@ fn dm_and_group_history_do_not_merge() {
         channel: "telegram".into(),
         timestamp: 2,
         thread_ts: None,
+        reply_anchor: None,
     });
 
     assert_ne!(
@@ -3429,6 +3441,7 @@ fn threads_resolve_to_their_own_conversation() {
         channel: "discord".into(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     };
     let parent = conversation_history_key(&base);
     let threaded = conversation_history_key(&traits::ChannelMessage {
@@ -3453,6 +3466,7 @@ fn route_override_key_follows_the_conversation_not_the_person() {
         channel: "telegram".into(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     });
     let chat_b = conversation_history_key(&traits::ChannelMessage {
         sender_aliases: Vec::new(),
@@ -3463,12 +3477,549 @@ fn route_override_key_follows_the_conversation_not_the_person() {
         channel: "telegram".into(),
         timestamp: 2,
         thread_ts: None,
+        reply_anchor: None,
     });
 
     assert_ne!(
         chat_a, chat_b,
         "a /model pin must not follow the sender into another chat"
     );
+}
+
+/// One Telegram update, as the Bot API delivers it: a message in `chat`,
+/// optionally inside a forum topic.
+fn telegram_update(message_id: i64, chat: i64, topic: Option<i64>) -> serde_json::Value {
+    let mut message = serde_json::json!({
+        "message_id": message_id,
+        "text": "hi",
+        "from": { "id": 555 },
+        "chat": { "id": chat },
+    });
+    if let Some(topic) = topic {
+        message["message_thread_id"] = serde_json::json!(topic);
+    }
+    serde_json::json!({ "update_id": message_id, "message": message })
+}
+
+/// The conversation key Telegram's own parser produces for `update`.
+fn telegram_key(update: &serde_json::Value) -> String {
+    let channel =
+        crate::channels::telegram::TelegramChannel::new("t".into(), vec!["*".into()], false);
+    let (msg, _) = channel
+        .parse_update_message(update)
+        .expect("the update parses");
+    conversation_history_key(&msg)
+}
+
+/// The conversation key Discord's own classifier produces for a message.
+fn discord_key(message_id: &str, channel_id: &str) -> String {
+    let channel = crate::channels::discord::DiscordChannel::new(
+        "t".into(),
+        None,
+        vec!["*".into()],
+        false,
+        false,
+    );
+    let payload = serde_json::json!({
+        "id": message_id,
+        "channel_id": channel_id,
+        "content": "hi",
+        "author": { "id": "U_OK", "username": "rantaiclaw_user" },
+    });
+    match channel.classify_inbound(&payload, "U_BOT") {
+        crate::channels::discord::DiscordInbound::Deliver(msg) => conversation_history_key(&msg),
+        other => panic!("the message must be delivered: {other:?}"),
+    }
+}
+
+/// The conversation key Slack's own classifier produces for a message.
+fn slack_key(message: &serde_json::Value) -> String {
+    let channel = crate::channels::slack::SlackChannel::new(
+        "xoxb-placeholder".into(),
+        None,
+        vec!["*".into()],
+    );
+    match channel.classify_inbound(message, "U_BOT", "", "C_CHAN") {
+        crate::channels::slack::SlackInbound::Deliver(msg) => conversation_history_key(&msg),
+        other => panic!("the message must be delivered: {other:?}"),
+    }
+}
+
+/// Two consecutive messages in one chat are one conversation on every tier
+/// channel, checked through each channel's own inbound parser.
+///
+/// #480 keyed history by chat and verified it on Telegram and Discord. Two
+/// days later #506 set their inbound `thread_ts` to the prompting message id so
+/// replies would quote it, and from then on every message was its own
+/// conversation: no history past one exchange, and a `/model` stored under a
+/// key no later message read. The break was in the parsers, so a hand-built
+/// `ChannelMessage` cannot catch it and none is used here.
+#[test]
+fn every_tier_channel_keeps_one_conversation_across_consecutive_messages() {
+    assert_eq!(
+        telegram_key(&telegram_update(10, 555, None)),
+        telegram_key(&telegram_update(12, 555, None)),
+        "Telegram DM"
+    );
+    assert_eq!(
+        telegram_key(&telegram_update(20, -100_200_300, None)),
+        telegram_key(&telegram_update(21, -100_200_300, None)),
+        "Telegram group"
+    );
+    assert_eq!(
+        telegram_key(&telegram_update(30, -100_200_300, Some(7))),
+        telegram_key(&telegram_update(31, -100_200_300, Some(7))),
+        "Telegram forum topic"
+    );
+
+    assert_eq!(
+        discord_key("MSG_1", "C_CHAN"),
+        discord_key("MSG_2", "C_CHAN"),
+        "Discord channel"
+    );
+
+    let root = serde_json::json!({ "user": "U1", "text": "hi", "ts": "1700000001.000100" });
+    let reply = serde_json::json!({
+        "user": "U1", "text": "and then", "ts": "1700000002.000100",
+        "thread_ts": "1700000001.000100"
+    });
+    assert_eq!(slack_key(&root), slack_key(&reply), "Slack thread");
+
+    #[cfg(feature = "whatsapp-web")]
+    {
+        use crate::channels::whatsapp_web::WhatsAppWebChannel;
+        let chat = "15550001111@s.whatsapp.net";
+        let first = WhatsAppWebChannel::inbound_channel_message(
+            "3EB0A1",
+            "+15550001111".into(),
+            chat.into(),
+            "hi".into(),
+            1_700_000_000,
+        );
+        let next = WhatsAppWebChannel::inbound_channel_message(
+            "3EB0A2",
+            "+15550001111".into(),
+            chat.into(),
+            "and then".into(),
+            1_700_000_005,
+        );
+        assert_eq!(
+            conversation_history_key(&first),
+            conversation_history_key(&next),
+            "WhatsApp Web chat"
+        );
+    }
+}
+
+/// The other half: what is a separate conversation stays separate, so keeping
+/// consecutive messages together cannot degrade into one key per channel.
+#[test]
+fn separate_conversations_keep_separate_keys_on_every_tier_channel() {
+    assert_ne!(
+        telegram_key(&telegram_update(30, -100_200_300, Some(7))),
+        telegram_key(&telegram_update(31, -100_200_300, Some(8))),
+        "two forum topics"
+    );
+    assert_ne!(
+        telegram_key(&telegram_update(10, 555, None)),
+        telegram_key(&telegram_update(11, -100_200_300, None)),
+        "a DM and a group"
+    );
+    // A Discord thread is a channel of its own.
+    assert_ne!(
+        discord_key("MSG_1", "C_CHAN"),
+        discord_key("MSG_2", "C_THREAD"),
+        "a Discord thread and its parent channel"
+    );
+    // Each top-level Slack message starts its own thread, by design.
+    let first = serde_json::json!({ "user": "U1", "text": "hi", "ts": "1700000001.000100" });
+    let second = serde_json::json!({ "user": "U1", "text": "hi again", "ts": "1700000003.000100" });
+    assert_ne!(
+        slack_key(&first),
+        slack_key(&second),
+        "two top-level Slack messages"
+    );
+}
+
+/// F-22 as it was found: in one Telegram DM, message 383 asked for three
+/// colours and 385 asked which one was second. History held them under keys
+/// ending `:383` and `:385`, two conversations of two turns each, so the bot
+/// could not see its own previous answer.
+#[test]
+fn a_telegram_dm_is_one_conversation_from_message_383_to_385() {
+    let first = telegram_key(&telegram_update(383, 555, None));
+    let next = telegram_key(&telegram_update(385, 555, None));
+    assert_eq!(first, next);
+    assert_eq!(
+        first, "telegram:555",
+        "the key is the chat, with no per-message suffix"
+    );
+}
+
+/// A message in the Telegram DM `555`, as the real parser builds it.
+fn telegram_dm(message_id: i64, text: &str) -> traits::ChannelMessage {
+    let mut update = telegram_update(message_id, 555, None);
+    update["message"]["text"] = serde_json::json!(text);
+    let channel =
+        crate::channels::telegram::TelegramChannel::new("t".into(), vec!["*".into()], false);
+    channel
+        .parse_update_message(&update)
+        .expect("the update parses")
+        .0
+}
+
+/// A context for dispatch tests driven by a real channel parser: the given
+/// channels, one provider cached as the default, nothing persisted.
+fn dispatch_ctx(
+    channels: Vec<Arc<dyn Channel>>,
+    provider: Arc<dyn Provider>,
+    runtime_config: routing::RuntimeConfigSlot,
+) -> Arc<ChannelRuntimeContext> {
+    let channels_by_name: HashMap<String, Arc<dyn Channel>> = channels
+        .into_iter()
+        .map(|channel| (channel.name().to_string(), channel))
+        .collect();
+    let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+    provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+    Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(runtime_config)),
+        channels_by_name: Arc::new(channels_by_name),
+        provider,
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("default-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(Vec::new()),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(
+            Vec::<String>::new(),
+            &[],
+            &[],
+        )),
+    })
+}
+
+/// Records each `SendMessage` whole, so a test can read where a reply was
+/// addressed as well as what it said.
+struct AddressRecordingChannel {
+    name: &'static str,
+    sent: tokio::sync::Mutex<Vec<SendMessage>>,
+}
+
+impl AddressRecordingChannel {
+    fn named(name: &'static str) -> Self {
+        Self {
+            name,
+            sent: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Channel for AddressRecordingChannel {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.sent.lock().await.push(message.clone());
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        _cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A reply inside a Slack thread, as Slack's own classifier builds it.
+fn slack_thread_reply() -> traits::ChannelMessage {
+    let channel = crate::channels::slack::SlackChannel::new(
+        "xoxb-placeholder".into(),
+        None,
+        vec!["*".into()],
+    );
+    let message = serde_json::json!({
+        "user": "U1", "text": "and then", "ts": "1700000002.000100",
+        "thread_ts": "1700000001.000100"
+    });
+    match channel.classify_inbound(&message, "U_BOT", "", "C_CHAN") {
+        crate::channels::slack::SlackInbound::Deliver(msg) => msg,
+        other => panic!("the message must be delivered: {other:?}"),
+    }
+}
+
+/// Replies on Telegram still quote the message they answer, the model's
+/// answer and a runtime command's reply alike, now that the quote no longer
+/// travels in `thread_ts`.
+#[tokio::test]
+async fn telegram_replies_quote_the_message_they_answer() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = tempfile::TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("telegram"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(ModelCaptureProvider::default()),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    for (message_id, text) in [(383, "/model"), (385, "hello")] {
+        process_channel_message(
+            Arc::clone(&ctx),
+            telegram_dm(message_id, text),
+            CancellationToken::new(),
+        )
+        .await;
+    }
+
+    let sent = channel_impl.sent.lock().await;
+    let anchors: Vec<Option<&str>> = sent.iter().map(|m| m.reply_anchor.as_deref()).collect();
+    assert_eq!(
+        anchors,
+        [Some("383"), Some("385")],
+        "each reply must quote the message it answers: {sent:?}"
+    );
+    assert!(
+        sent.iter().all(|m| m.thread_ts.is_none()),
+        "Telegram has no platform thread: {sent:?}"
+    );
+}
+
+/// With `thread_replies = false` a reply neither quotes nor threads.
+///
+/// The switch cleared one field while there was one. With two, clearing only
+/// `thread_ts` leaves Telegram and Discord quoting with threading off, and
+/// clearing only the anchor leaves Slack answering inside the thread. Both
+/// channels go through the dispatch loop, which is where the switch lives.
+#[tokio::test]
+async fn threading_off_clears_both_the_thread_and_the_quote() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = tempfile::TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let telegram_impl = Arc::new(AddressRecordingChannel::named("telegram"));
+    let slack_impl = Arc::new(AddressRecordingChannel::named("slack"));
+    let telegram: Arc<dyn Channel> = telegram_impl.clone();
+    let slack: Arc<dyn Channel> = slack_impl.clone();
+    let threading_off = routing::RuntimeConfigSlot {
+        state: Some(routing::RuntimeConfigState {
+            defaults: ChannelRuntimeDefaults {
+                default_provider: "test-provider".to_string(),
+                model: "default-model".to_string(),
+                temperature: 0.0,
+                api_key: None,
+                api_url: None,
+                reliability: crate::config::ReliabilityConfig::default(),
+                approval_owners: Arc::new(Vec::new()),
+                guest_gate: Arc::new(crate::approval::GuestGate::new(
+                    Vec::<String>::new(),
+                    &[],
+                    &[],
+                )),
+                allowed_commands: Arc::new(Vec::new()),
+                autonomy_level: crate::security::AutonomyLevel::Supervised,
+                autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
+                allowlists: Arc::new(HashMap::new()),
+                message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+                max_tool_iterations: 5,
+                auto_save_memory: false,
+                min_relevance_score: 0.0,
+                autonomous_tools: false,
+                mention_only: Arc::new(HashMap::new()),
+                thread_replies: Arc::new(HashMap::from([
+                    ("telegram".to_string(), false),
+                    ("slack".to_string(), false),
+                ])),
+            },
+            last_applied_stamp: None,
+            last_reload_error: None,
+        }),
+        ..routing::RuntimeConfigSlot::default()
+    };
+    let ctx = dispatch_ctx(
+        vec![telegram, slack],
+        Arc::new(ModelCaptureProvider::default()),
+        threading_off,
+    );
+
+    // The inputs carry both fields, so an empty result is the switch at work
+    // and not a parser that never set them.
+    let telegram_message = telegram_dm(383, "hello");
+    let slack_message = slack_thread_reply();
+    assert!(telegram_message.reply_anchor.is_some());
+    assert!(slack_message.thread_ts.is_some());
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(2);
+    tx.send(telegram_message).await.unwrap();
+    tx.send(slack_message).await.unwrap();
+    drop(tx);
+    run_message_dispatch_loop(rx, ctx, 1, CancellationToken::new()).await;
+
+    let telegram_sent = telegram_impl.sent.lock().await;
+    assert_eq!(telegram_sent.len(), 1, "{telegram_sent:?}");
+    assert_eq!(
+        telegram_sent[0].reply_anchor, None,
+        "with threading off a Telegram reply must not quote"
+    );
+    let slack_sent = slack_impl.sent.lock().await;
+    assert_eq!(slack_sent.len(), 1, "{slack_sent:?}");
+    assert_eq!(
+        slack_sent[0].thread_ts, None,
+        "with threading off a Slack reply must not go into the thread"
+    );
+}
+
+/// Every reply dispatch and the runtime commands send is built by
+/// `ChannelMessage::reply`, which copies the chat, the thread and the quote
+/// together. A site that builds its own `SendMessage` can copy one field and
+/// forget another, and nothing fails: the reply still arrives, unquoted or
+/// outside its thread. The behaviour tests above cover the answer and the
+/// command reply; this covers the error, timeout and approval paths beside
+/// them.
+#[test]
+fn dispatch_and_commands_build_every_reply_through_channel_message_reply() {
+    for (file, source) in [
+        ("dispatch.rs", include_str!("dispatch.rs")),
+        ("commands.rs", include_str!("commands.rs")),
+    ] {
+        let production = production_half(source);
+        for (n, line) in production.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains("SendMessage::new(") && !line.contains("SendMessage {"),
+                "{file}:{} builds a reply by hand instead of through `reply`: {line}",
+                n + 1
+            );
+        }
+    }
+}
+
+/// `/model` in a Telegram DM, then an ordinary message: that message runs on
+/// the model the DM switched to, and the next `/model` says so.
+///
+/// On 2026-09-11 the switch answered "Model switched" and the next `/model`
+/// still showed the old model. The choice was stored under the key of the
+/// `/model` message itself, which no later message reads.
+#[tokio::test]
+async fn a_model_switch_in_a_telegram_dm_reaches_the_next_message() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = tempfile::TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(TelegramRecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let provider_impl = Arc::new(ModelCaptureProvider::default());
+    let ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    for (message_id, text) in [
+        (383, "/model switched-model"),
+        (385, "hello"),
+        (387, "/model"),
+    ] {
+        process_channel_message(
+            Arc::clone(&ctx),
+            telegram_dm(message_id, text),
+            CancellationToken::new(),
+        )
+        .await;
+    }
+
+    assert_eq!(
+        provider_impl
+            .models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_slice(),
+        &["switched-model".to_string()],
+        "the ordinary message must run on the model this DM switched to"
+    );
+    let sent = channel_impl.sent_messages.lock().await;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(
+        sent[2].contains("Current model: `switched-model`"),
+        "the next /model must report the switch: {}",
+        sent[2]
+    );
+}
+
+/// The next message in a Telegram DM sees the bot's own previous answer.
+///
+/// The drive of 2026-09-11 asked for three colours, then which one was second,
+/// and got "I have not mentioned any colours". Each message had its own key,
+/// so history never held more than the exchange in progress.
+#[tokio::test]
+async fn a_telegram_dm_carries_the_previous_exchange_into_the_next_message() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = tempfile::TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+    let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
+    let ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    process_channel_message(
+        Arc::clone(&ctx),
+        telegram_dm(383, "name three colours"),
+        CancellationToken::new(),
+    )
+    .await;
+    process_channel_message(
+        ctx,
+        telegram_dm(385, "which colour was second?"),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2);
+    let roles: Vec<&str> = calls[1].iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "user"],
+        "the second message must see the first exchange"
+    );
+    assert!(calls[1][2].1.contains("response-1"), "{:?}", calls[1]);
 }
 
 /// A role the normalizer does not expect is dropped from the rebuilt turn
@@ -3555,6 +4106,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         channel: "test-channel".to_string(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     })
     .await
     .unwrap();
@@ -3567,6 +4119,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         channel: "test-channel".to_string(),
         timestamp: 2,
         thread_ts: None,
+        reply_anchor: None,
     })
     .await
     .unwrap();
@@ -3648,6 +4201,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
             channel: "telegram".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         })
         .await
         .unwrap();
@@ -3661,6 +4215,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
             channel: "telegram".to_string(),
             timestamp: 2,
             thread_ts: None,
+            reply_anchor: None,
         })
         .await
         .unwrap();
@@ -3752,6 +4307,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
             channel: "telegram".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         })
         .await
         .unwrap();
@@ -3765,6 +4321,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
             channel: "telegram".to_string(),
             timestamp: 2,
             thread_ts: None,
+            reply_anchor: None,
         })
         .await
         .unwrap();
@@ -3838,6 +4395,7 @@ async fn process_channel_message_cancels_scoped_typing_task() {
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -4217,6 +4775,7 @@ fn conversation_memory_key_uses_message_id() {
         channel: "slack".into(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     };
 
     assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -4233,6 +4792,7 @@ fn conversation_memory_key_is_unique_per_message() {
         channel: "slack".into(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     };
     let msg2 = traits::ChannelMessage {
         sender_aliases: Vec::new(),
@@ -4243,6 +4803,7 @@ fn conversation_memory_key_is_unique_per_message() {
         channel: "slack".into(),
         timestamp: 2,
         thread_ts: None,
+        reply_anchor: None,
     };
 
     assert_ne!(
@@ -4265,6 +4826,7 @@ async fn autosave_keys_preserve_multiple_conversation_facts() {
         channel: "slack".into(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     };
     let msg2 = traits::ChannelMessage {
         sender_aliases: Vec::new(),
@@ -4275,6 +4837,7 @@ async fn autosave_keys_preserve_multiple_conversation_facts() {
         channel: "slack".into(),
         timestamp: 2,
         thread_ts: None,
+        reply_anchor: None,
     };
 
     mem.store(
@@ -4392,6 +4955,7 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -4408,6 +4972,7 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -4489,6 +5054,7 @@ async fn process_channel_message_enriches_current_turn_without_persisting_contex
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -4585,6 +5151,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
             channel: "telegram".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -4695,6 +5262,7 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
             channel: "telegram".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_anchor: None,
         },
         CancellationToken::new(),
     )
@@ -5332,6 +5900,7 @@ fn memory_scope_does_not_merge_a_dm_into_a_group() {
         channel: "telegram".into(),
         timestamp: 1,
         thread_ts: None,
+        reply_anchor: None,
     };
     let group = traits::ChannelMessage {
         reply_target: "-1009999".into(),
@@ -5374,6 +5943,7 @@ async fn the_bus_reports_closed_before_a_runtime_publishes_and_after_it_clears()
         channel: "nextcloud_talk".into(),
         timestamp: 0,
         thread_ts: None,
+        reply_anchor: None,
         sender_aliases: Vec::new(),
     };
 

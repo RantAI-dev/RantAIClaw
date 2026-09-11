@@ -696,6 +696,7 @@ impl Channel for MatrixChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: None,
+                    reply_anchor: None,
                 };
 
                 let _ = tx.send(msg).await;

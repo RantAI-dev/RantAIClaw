@@ -957,22 +957,25 @@ allowed_contacts = ["*"]
 ## 4a. Threading
 
 Where the platform supports it, a reply attaches to the message that prompted
-it. Two fields, two meanings — they are not interchangeable:
+it. Three fields carry three different things, and they are not interchangeable:
 
-- **`reply_target`** — *where* the message goes (a channel, a chat, a Telegram
-  forum topic as `chat_id:thread_id`).
-- **`thread_ts`** — *what* it attaches to once there (a Slack parent `ts`, a
-  Discord `message_reference`, a Mattermost `root_id`, a Telegram
-  `reply_to_message_id`).
+- **`reply_target`**: *where* the message goes. A channel, a chat, a Telegram
+  forum topic as `chat_id:thread_id`, or a Discord thread, which is a channel.
+- **`thread_ts`**: the platform *thread* the message belongs to, a Slack parent
+  `ts` or a Mattermost `root_id`. It is part of the conversation key, so every
+  message in one thread shares history, memory scope and a `/model` choice.
+- **`reply_anchor`**: the message a reply *quotes*, a Telegram
+  `reply_parameters` or a Discord `message_reference`. It is different on every
+  message, so it is never part of the conversation key.
 
-| Channel | Threads today | Mechanism |
-|---|---|---|
-| Slack | yes | parent `ts` |
-| Discord | yes | `message_reference` on the prompting message |
-| Telegram | yes | `reply_parameters` (text sends; attachments are not anchored) |
-| Mattermost | yes | `root_id` |
-| Nextcloud Talk, QQ, Email, Lark, Matrix, Signal | not yet | see [the design note](../project/2026-08-14-threading-design.md) for each platform's mechanism and cost |
-| DingTalk, Linq, IRC, iMessage | no platform primitive | replies land in the conversation |
+| Channel | Threads today | Mechanism | Field |
+|---|---|---|---|
+| Slack | yes | parent `ts` | `thread_ts` |
+| Discord | yes | `message_reference` on the prompting message | `reply_anchor` |
+| Telegram | yes | `reply_parameters` (text sends; attachments are not anchored) | `reply_anchor` |
+| Mattermost | yes | `root_id` | `thread_ts` |
+| Nextcloud Talk, QQ, Email, Lark, Matrix, Signal | not yet | see [the design note](../project/2026-08-14-threading-design.md) for each platform's mechanism and cost | none yet |
+| DingTalk, Linq, IRC, iMessage | no platform primitive | replies land in the conversation | none |
 
 Turn it off without turning off the channel:
 
@@ -984,8 +987,11 @@ thread_replies = true          # shared default
 thread_replies = false         # per-channel override, wins where set
 ```
 
-The switch is enforced once, centrally: the dispatch loop clears the reply
-anchor before the agent sees it, so every channel honours it identically.
+The switch is enforced once, centrally. The dispatch loop clears both
+`thread_ts` and `reply_anchor` before the agent sees the message, so every
+channel honours it identically. With threading off, Telegram and Discord replies
+stop quoting, and a Slack or Mattermost channel becomes one conversation instead
+of one per thread.
 
 ---
 

@@ -129,12 +129,14 @@ impl DiscordChannel {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            // Discord threads are channels, so `channel_id` above already
+            // routes into a thread and makes it its own conversation.
+            thread_ts: None,
             // The prompting message, so the reply carries a
-            // `message_reference` back to it. Discord threads are
-            // channels, so `recipient` already routes into a thread;
-            // what was missing is the reply anchor that makes a busy
-            // channel readable.
-            thread_ts: if message_id.is_empty() {
+            // `message_reference` back to it. Not `thread_ts`: that field is
+            // part of the conversation key, and an id that changes on every
+            // message made every message a conversation of its own.
+            reply_anchor: if message_id.is_empty() {
                 None
             } else {
                 Some(message_id.to_string())
@@ -413,25 +415,35 @@ impl Channel for DiscordChannel {
 }
 
 impl DiscordChannel {
-    async fn send_text(&self, content: &str, message: &SendMessage) -> anyhow::Result<()> {
+    /// The `POST /channels/{id}/messages` bodies for a text send, one per chunk.
+    ///
+    /// Separate from the send loop so a test can see what a reply quotes: the
+    /// loop posts to `discord.com`, which no test reaches.
+    fn text_bodies(&self, content: &str, message: &SendMessage) -> Vec<serde_json::Value> {
         // Render per-platform, then split without cutting a code fence — replaces
         // the naive char-count splitter that could cut a fenced block in half.
         let blocks = crate::channels::format::render(content, &self.render_target());
-        let chunks = crate::channels::format::split_non_empty(&blocks, DISCORD_MAX_MESSAGE_LENGTH);
+        crate::channels::format::split_non_empty(&blocks, DISCORD_MAX_MESSAGE_LENGTH)
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| Self::message_body(chunk, message.reply_anchor.as_deref(), i == 0))
+            .collect()
+    }
 
-        for (i, chunk) in chunks.iter().enumerate() {
+    async fn send_text(&self, content: &str, message: &SendMessage) -> anyhow::Result<()> {
+        let chunks = self.text_bodies(content, message);
+
+        for (i, body) in chunks.iter().enumerate() {
             let url = format!(
                 "https://discord.com/api/v10/channels/{}/messages",
                 message.recipient
             );
 
-            let body = Self::message_body(chunk, message.thread_ts.as_deref(), i == 0);
-
             let resp = self
                 .http_client()
                 .post(&url)
                 .header("Authorization", format!("Bot {}", self.bot_token))
-                .json(&body)
+                .json(body)
                 .send()
                 .await?;
 
@@ -946,13 +958,13 @@ mod outbound_media_tests {
 
 #[cfg(test)]
 mod tests {
-    /// The reply anchor is what makes a busy channel readable, and it is
-    /// carried by `thread_ts` — the typed field — not by packing it into the
-    /// recipient.
-    /// The inbound capture is inside `listen()`'s socket loop, which no test
-    /// enters — setting `thread_ts: None` there passed every test in this file.
-    /// This is a source-position assertion and says so: it proves the anchor is
-    /// read from the payload, not that the loop runs.
+    // The reply anchor is what makes a busy channel readable. It is carried by
+    // `reply_anchor`, the typed field: not packed into the recipient, and not in
+    // `thread_ts`, which is part of the conversation key. It used to be captured
+    // inside `listen()`'s socket loop, which no test enters; `classify_inbound`
+    // builds it now, and `discord_inbound_thread_anchor_is_the_prompting_message`
+    // checks it.
+
     /// A screenshot on Discord was dropped without acknowledgement. The fetch
     /// lives inside `listen()`'s socket loop, so this drives the piece that can
     /// be reached — the per-attachment decision — through the shared policy.
@@ -1084,13 +1096,39 @@ mod tests {
         let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
         match ch.classify_inbound(&inbound("U_OK", "hi", None), "U_BOT") {
             DiscordInbound::Deliver(msg) => {
-                // The reply anchor is the inbound message id, not the channel.
-                assert_eq!(msg.thread_ts.as_deref(), Some("MSG_1"));
+                // The reply anchor is the inbound message id, not the channel,
+                // and it is not a thread: a Discord thread is a channel.
+                assert_eq!(msg.reply_anchor.as_deref(), Some("MSG_1"));
+                assert_eq!(msg.thread_ts, None);
                 assert_eq!(msg.id, "discord_MSG_1");
                 assert_eq!(msg.reply_target, "C_CHAN");
             }
             other => panic!("expected delivery: {other:?}"),
         }
+    }
+
+    /// What a Discord send posts quotes the `reply_anchor`, and never takes a
+    /// `thread_ts` for a quote.
+    #[test]
+    fn discord_send_quotes_the_reply_anchor_and_not_the_thread() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
+
+        let quoted = ch.text_bodies(
+            "hi",
+            &SendMessage::new("hi", "C_CHAN").replying_to(Some("msg-42".into())),
+        );
+        assert_eq!(quoted.len(), 1);
+        assert_eq!(quoted[0]["message_reference"]["message_id"], "msg-42");
+
+        let threaded = ch.text_bodies(
+            "hi",
+            &SendMessage::new("hi", "C_CHAN").in_thread(Some("msg-42".into())),
+        );
+        assert!(
+            threaded[0].get("message_reference").is_none(),
+            "a thread id must not be sent as a quote: {}",
+            threaded[0]
+        );
     }
 
     #[test]

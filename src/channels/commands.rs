@@ -4,7 +4,7 @@
 //! tests stayed with the dispatch fixtures they share, so the moved items are
 //! `pub(crate)`.
 
-use super::traits::{self, Channel, SendMessage};
+use super::traits::{self, Channel};
 use super::{history, routing, ChannelRouteSelection, ChannelRuntimeContext};
 use crate::providers;
 use std::fmt::Write as _;
@@ -210,10 +210,7 @@ pub(crate) async fn handle_runtime_command_if_needed(
         }
     };
 
-    if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-        .await
-    {
+    if let Err(err) = channel.send(&msg.reply(response)).await {
         tracing::warn!(
             "Failed to send runtime command response on {}: {err}",
             channel.name()
