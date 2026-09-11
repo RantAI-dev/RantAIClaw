@@ -4079,7 +4079,7 @@ fn tier_message(channel: &str, id: u32, text: &str) -> traits::ChannelMessage {
 }
 
 /// The command forms a reply tells the user to type: every backticked span
-/// whose verb is `model` or `models`, with its placeholders filled in.
+/// whose verb is a runtime command, with its placeholders filled in.
 fn named_commands(reply: &str) -> Vec<String> {
     reply
         .split('`')
@@ -4088,11 +4088,234 @@ fn named_commands(reply: &str) -> Vec<String> {
         .filter(|span| {
             matches!(
                 span.trim_start_matches('/').split_whitespace().next(),
-                Some("model" | "models")
+                Some("model" | "models" | "new" | "clear" | "help" | "start")
             )
         })
         .map(|span| span.replace("<model-id>", "x").replace("<provider>", "x"))
         .collect()
+}
+
+/// What a user sees after sending one message.
+#[derive(Debug, PartialEq)]
+enum TurnOutcome {
+    /// The message reached the model.
+    Model,
+    /// Nothing was sent back and the model was not called.
+    Silent,
+    /// The runtime's `/model` reply.
+    ModelReply,
+    /// The runtime cleared the conversation and said what it kept.
+    Reset,
+    /// The runtime said the command does not exist and listed the ones that do.
+    CommandList,
+    /// The runtime's welcome with the command list.
+    Welcome,
+    /// A reply none of the above describes.
+    Other(String),
+}
+
+/// Classify the turn that `text` produced, from the model calls and replies
+/// it added. The markers are what plan 351 requires each reply to say: every
+/// list names `/new` and `/clear`, a reset names the command that removes
+/// long-term memory, and an unknown-command reply names the command sent.
+fn classify_turn(text: &str, model_calls: usize, replies: &[SendMessage]) -> TurnOutcome {
+    if model_calls > 0 {
+        return TurnOutcome::Model;
+    }
+    let Some(reply) = replies.first() else {
+        return TurnOutcome::Silent;
+    };
+    let reply = reply.content.as_str();
+    let sent_verb = text.split_whitespace().next().unwrap_or("");
+    let sent_verb = sent_verb.split('@').next().unwrap_or(sent_verb);
+    if reply.contains("Current model") {
+        TurnOutcome::ModelReply
+    } else if reply.contains("rantaiclaw memory clear") {
+        TurnOutcome::Reset
+    } else if reply.contains(&format!("`{sent_verb}`")) && reply.contains("`/new`") {
+        TurnOutcome::CommandList
+    } else if reply.contains("`/new`") && reply.contains("`/clear`") {
+        TurnOutcome::Welcome
+    } else {
+        TurnOutcome::Other(reply.to_string())
+    }
+}
+
+/// Every slash command gets a runtime answer on the slash channels: a welcome
+/// for `/start` and `/help`, a reset for `/new` and `/clear`, the command list
+/// for one that does not exist, and silence for a command addressed to another
+/// bot. Approval replies and pairing codes are left alone, because they are
+/// consumed before a message reaches the runtime commands and the runtime must
+/// never claim them. Slack cannot send a leading slash, so none of this applies
+/// there. Messages come from each channel's own parser.
+///
+/// `/clear` used to reach the model, which answered "session cleared" while the
+/// conversation kept every turn.
+#[tokio::test]
+async fn every_slash_command_gets_the_runtime_answer_its_channel_owes() {
+    use TurnOutcome::{CommandList, Model, ModelReply, Reset, Silent, Welcome};
+
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = tempfile::TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let inputs = [
+        "/start",
+        "/start@rantaiclaw_bot",
+        "/help",
+        "/new",
+        "/clear",
+        "/model",
+        "/foo",
+        "/foo@otherbot",
+        "/approve x",
+        "/claim CODE",
+        "hello there",
+    ];
+    let slash = [
+        Welcome,
+        Welcome,
+        Welcome,
+        Reset,
+        Reset,
+        ModelReply,
+        CommandList,
+        Silent,
+        Model,
+        Model,
+        Model,
+    ];
+    let slack = [
+        Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model,
+    ];
+    let mut table = vec![
+        ("telegram", slash.as_slice()),
+        ("discord", slash.as_slice()),
+    ];
+    if cfg!(feature = "whatsapp-web") {
+        table.push(("whatsapp", slash.as_slice()));
+    }
+    table.push(("slack", slack.as_slice()));
+
+    let mut mismatches = Vec::new();
+    for (channel_name, expected) in table {
+        let channel_impl = Arc::new(AddressRecordingChannel::named(channel_name));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let ctx = dispatch_ctx(
+            vec![channel],
+            provider_impl.clone(),
+            routing::RuntimeConfigSlot::default(),
+        );
+
+        for ((id, text), want) in (1u32..).zip(inputs).zip(expected) {
+            let calls_before = provider_impl.call_count.load(Ordering::SeqCst);
+            let sent_before = channel_impl.sent.lock().await.len();
+            process_channel_message(
+                Arc::clone(&ctx),
+                tier_message(channel_name, id, text),
+                CancellationToken::new(),
+            )
+            .await;
+            let calls = provider_impl.call_count.load(Ordering::SeqCst) - calls_before;
+            let replies = channel_impl.sent.lock().await[sent_before..].to_vec();
+
+            let got = classify_turn(text, calls, &replies);
+            if &got != want {
+                mismatches.push(format!(
+                    "{channel_name} {text:?}: got {got:?}, want {want:?}"
+                ));
+            }
+            if calls == 0 {
+                for reply in &replies {
+                    for form in named_commands(&reply.content) {
+                        if commands::parse_runtime_command(channel_name, &form).is_none() {
+                            mismatches.push(format!(
+                                "{channel_name} {text:?}: the reply names `{form}`, which this channel does not accept"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "runtime command mismatches:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// `/new` clears the conversation it is sent in and leaves every other one
+/// alone, and the next message there starts without the old turns.
+#[tokio::test]
+async fn new_clears_only_the_conversation_it_is_sent_in() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = tempfile::TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel: Arc<dyn Channel> = Arc::new(AddressRecordingChannel::named("telegram"));
+    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+    let ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    let group_message = |message_id: i64, text: &str| {
+        let mut update = telegram_update(message_id, -100_200_300, None);
+        update["message"]["text"] = serde_json::json!(text);
+        crate::channels::telegram::TelegramChannel::new("t".into(), vec!["*".into()], false)
+            .parse_update_message(&update)
+            .expect("the update parses")
+            .0
+    };
+    let dm_key = conversation_history_key(&telegram_dm(1, "x"));
+    let group_key = conversation_history_key(&group_message(2, "x"));
+    assert_ne!(dm_key, group_key, "the fixture needs two conversations");
+
+    for msg in [
+        telegram_dm(1, "remember the colour blue"),
+        group_message(2, "remember the colour red"),
+        telegram_dm(3, "/new"),
+    ] {
+        process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+    }
+
+    {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            histories.get(&dm_key).is_none_or(Vec::is_empty),
+            "the DM's history must be gone: {:?}",
+            histories.get(&dm_key)
+        );
+        assert_eq!(
+            histories.get(&group_key).map(Vec::len),
+            Some(2),
+            "the group keeps its own turns"
+        );
+    }
+
+    process_channel_message(
+        Arc::clone(&ctx),
+        telegram_dm(4, "which colour?"),
+        CancellationToken::new(),
+    )
+    .await;
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let last = calls.last().expect("the model was called");
+    let roles: Vec<&str> = last.iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        ["system", "user"],
+        "after /new the DM starts without the old turns: {last:?}"
+    );
 }
 
 /// Runtime commands answer on every tier channel, and every command a reply
