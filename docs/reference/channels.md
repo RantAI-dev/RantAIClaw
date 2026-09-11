@@ -261,6 +261,48 @@ Notes:
 - WhatsApp Cloud registers under the same channel name as WhatsApp Web, so it answers the slash form as well.
 - Other channels do not answer these commands; the text reaches the model as ordinary chat.
 
+Telegram, Discord and WhatsApp Web answer three more kinds of slash command:
+
+- `/new` or `/clear` clears this conversation's history. Long-term memory stays; see
+  [Clearing a Conversation](#clearing-a-conversation).
+- `/start` or `/help` returns a short welcome with the command list. Telegram sends `/start` by
+  itself when someone first opens a bot, and the group form `/start@<botname>` works too.
+- Any other `/command` is answered by the runtime with the command list instead of reaching the
+  model, which used to invent a result. In a Telegram group, an unknown command carrying an
+  `@<name>` gets no reply at all, since it may be addressed to another bot; the runtime only knows
+  its own bot name when `mention_only` is on, so this applies to its own name as well.
+
+Approval replies (`/approve`, `/deny`) and pairing (`/bind`, `/claim`) are handled before any of
+these and behave as before. Slack has no reset command: a new top-level message already starts a new
+conversation.
+
+## Clearing a Conversation
+
+A conversation keeps its history, in memory and in `brain.db`, so the bot can follow what was said
+earlier. To start fresh:
+
+| Channel | How |
+|---|---|
+| Telegram, Discord, WhatsApp Web | send `/new` or `/clear` |
+| Slack | start a new top-level message instead of replying inside the thread. With threading on, the default, each top-level message is already its own conversation. With `thread_replies = false` a Slack channel is one conversation, and no chat command resets it |
+
+A `/model` or `/models <provider>` switch also clears that conversation's history, as the section
+above describes. A reset keeps the model chosen with `/model`.
+
+### What a reset does not clear
+
+`/new` and `/clear` remove the conversation's history and nothing else. Long-term memory stays:
+facts the model saved with `memory_store`, such as a name, remain available in every conversation.
+To see and remove those, run on the host:
+
+- `rantaiclaw memory list` shows stored entries; `--category core|daily|conversation` narrows it.
+- `rantaiclaw memory clear --key <key>` removes entries whose key starts with `<key>`. It is a
+  prefix match, so list first.
+- `rantaiclaw memory clear --category <core|daily|conversation>` removes a whole category.
+
+Editing `brain.db` by hand does not reach a running daemon, which loads conversation history into
+memory when it starts. Use `/new`, or restart the daemon after a manual edit.
+
 ## Draft streaming
 
 A long reply can arrive all at once when the turn finishes, or grow in place while

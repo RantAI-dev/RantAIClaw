@@ -477,6 +477,18 @@ fn parse_bare_verb(text: &str) -> Option<BareVerb> {
     }
 }
 
+/// Whether `text` is a reply the approval relays consume: a bare verb, a
+/// whole-tool reply, or a shell allowlist reply.
+///
+/// The runtime commands ask this rather than keeping their own copy of these
+/// verbs, so an approval reply is never answered as an unknown command even if
+/// it reaches them first.
+pub(crate) fn is_approval_reply(text: &str) -> bool {
+    parse_bare_verb(text).is_some()
+        || parse_tool_reply(text).is_some()
+        || parse_reply(text).is_some()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedToolReply {
     verb: ToolReplyVerb,

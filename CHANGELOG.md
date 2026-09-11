@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An unknown slash command is answered by the runtime, and a conversation can be reset from
+  chat.** On Telegram, Discord and WhatsApp Web an unknown `/command` used to reach the model, which
+  invented a result: `/clear` was answered "session cleared" while the conversation still held
+  every turn. The runtime now answers with the commands that exist on that channel. `/new`, with
+  `/clear` as an alias, clears the conversation's history in memory and in `brain.db`, and the reply
+  says that long-term memory is kept and names `rantaiclaw memory clear` as the way to remove it.
+  `/start`, which Telegram sends when someone first opens a bot, and `/help` get a short welcome with
+  the same list. An unknown command carrying an `@<name>` in a Telegram group gets no reply, since
+  it may be addressed to another bot. Approval replies and pairing codes are handled before any of
+  this and behave as before. Slack needs no reset command, because a new top-level message already
+  starts a new conversation. The channels reference has a new section on clearing a conversation,
+  including what a reset does not clear.
 - **`/model` and `/models` now work on Slack and WhatsApp Web, not only on Telegram and Discord.**
   On the other two tier channels the command went to the model, which answered as a chatbot and
   switched nothing. WhatsApp Web takes the slash form. Slack takes `model` and `models` without the

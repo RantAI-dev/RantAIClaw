@@ -1,4 +1,5 @@
-//! In-chat runtime commands: `/model`, `/provider`, `/models`, `/providers`.
+//! In-chat runtime commands: `/model`, `/models`, `/new` and `/clear`, `/start`
+//! and `/help`, and the answer to a slash command that does not exist.
 //!
 //! Moved out of `mod.rs` verbatim (plan 121, row 6). No behaviour change; the
 //! tests stayed with the dispatch fixtures they share, so the moved items are
@@ -17,6 +18,15 @@ pub(crate) enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    /// `/start` or `/help`: a welcome with the command list.
+    Welcome,
+    /// `/new` or `/clear`: clear this conversation's history.
+    Reset,
+    /// A slash command the runtime does not know, as it was typed.
+    UnknownCommand(String),
+    /// An unknown command carrying `@<name>`. In a Telegram group it may be
+    /// meant for another bot, and the runtime cannot tell, so it says nothing.
+    AddressedElsewhere,
 }
 
 /// The prefix a command verb carries on `channel_name`, for runtime commands
@@ -48,6 +58,13 @@ pub(crate) fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord" | "slack" | "whatsapp")
 }
 
+/// Whether `name` has the shape of a command name: ASCII letters, digits and
+/// underscores, 1 to 32 of them, as Telegram defines one. A path such as
+/// `/etc/hosts` also starts with a slash and is not a command.
+fn is_command_name(name: &str) -> bool {
+    (1..=32).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub(crate) fn parse_runtime_command(
     channel_name: &str,
     content: &str,
@@ -60,7 +77,11 @@ pub(crate) fn parse_runtime_command(
     let mut parts = content.split_whitespace();
     let command_token = parts.next()?;
     let verb = command_token.strip_prefix(prefix)?;
-    let base_command = verb.split('@').next().unwrap_or(verb).to_ascii_lowercase();
+    let (base, addressed_to) = match verb.split_once('@') {
+        Some((base, name)) => (base, Some(name)),
+        None => (verb, None),
+    };
+    let base_command = base.to_ascii_lowercase();
     let arguments: Vec<&str> = parts.collect();
 
     // Without a prefix the verb also starts ordinary sentences ("model apa yang
@@ -83,7 +104,25 @@ pub(crate) fn parse_runtime_command(
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
-        _ => None,
+        // Everything below is a slash command. On a channel without a prefix
+        // these words are ordinary chat, and a new top-level message already
+        // starts a new conversation there.
+        _ if prefix.is_empty() => None,
+        "start" | "help" => Some(ChannelRuntimeCommand::Welcome),
+        "new" | "clear" => Some(ChannelRuntimeCommand::Reset),
+        // Approval replies and pairing codes are consumed before a message
+        // reaches the runtime commands. Claiming one here would break that
+        // order, so the stages that own them are asked, not copied.
+        _ if super::approval_relay::is_approval_reply(content)
+            || super::pairing::parse_pairing_command(content).is_some() =>
+        {
+            None
+        }
+        _ if !is_command_name(&base_command) => None,
+        _ if addressed_to.is_some() => Some(ChannelRuntimeCommand::AddressedElsewhere),
+        _ => Some(ChannelRuntimeCommand::UnknownCommand(format!(
+            "{prefix}{base}"
+        ))),
     }
 }
 
@@ -177,6 +216,44 @@ fn model_switched_message(model: &str, provider: &str) -> String {
     )
 }
 
+/// The runtime commands a slash channel answers, one line each. Every reply
+/// that lists commands uses this, so a new command is listed everywhere or
+/// nowhere.
+fn command_list(prefix: &str) -> String {
+    format!(
+        "- `{prefix}model` shows the model; `{prefix}model <model-id>` switches it for this conversation.\n\
+         - `{prefix}models` lists providers; `{prefix}models <provider>` switches the provider.\n\
+         - `{prefix}new` or `{prefix}clear` clears this conversation's history. Long-term memory stays.\n"
+    )
+}
+
+/// The reply to `/start`, which Telegram sends when someone first opens the
+/// bot, and to `/help`.
+fn welcome_message(prefix: &str) -> String {
+    format!(
+        "Hi. Send a message and I will answer it. Commands:\n{}",
+        command_list(prefix)
+    )
+}
+
+/// The reply to a slash command that does not exist. It used to reach the
+/// model, which invented a result: `/clear` was answered "session cleared"
+/// while the conversation kept every turn.
+fn unknown_command_message(command: &str, prefix: &str) -> String {
+    format!(
+        "`{command}` is not a command here, so nothing ran. Commands:\n{}",
+        command_list(prefix)
+    )
+}
+
+/// The reply to `/new` and `/clear`: what was cleared, what was kept, and how
+/// to remove the rest.
+const RESET_MESSAGE: &str =
+    "Cleared this conversation's history. The model chosen here stays, and \
+     so does long-term memory: facts the bot saved with its memory tools remain available in every \
+     conversation. To remove those, the operator runs `rantaiclaw memory list` and then \
+     `rantaiclaw memory clear --key <key>` on the host.";
+
 pub(crate) async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -238,6 +315,15 @@ pub(crate) async fn handle_runtime_command_if_needed(
                 model_switched_message(&model, &current.provider)
             }
         }
+        ChannelRuntimeCommand::Welcome => welcome_message(prefix),
+        ChannelRuntimeCommand::Reset => {
+            // This conversation's key only: another chat, topic or thread
+            // keeps its history.
+            history::clear_sender_history(ctx, &sender_key);
+            RESET_MESSAGE.to_string()
+        }
+        ChannelRuntimeCommand::UnknownCommand(command) => unknown_command_message(&command, prefix),
+        ChannelRuntimeCommand::AddressedElsewhere => return true,
     };
 
     if let Err(err) = channel.send(&msg.reply(response)).await {
@@ -375,5 +461,18 @@ mod tests {
             "grammar mismatches:\n{}",
             mismatches.join("\n")
         );
+    }
+
+    /// A message that starts with a path also starts with a slash. It is not a
+    /// command, and it must still reach the model rather than be answered with
+    /// the command list.
+    #[test]
+    fn a_path_that_starts_with_a_slash_is_not_a_command() {
+        for text in [
+            "/etc/hosts",
+            "/home/rantaiclaw_user/notes.txt please read it",
+        ] {
+            assert_eq!(parse_runtime_command("telegram", text), None, "{text}");
+        }
     }
 }
