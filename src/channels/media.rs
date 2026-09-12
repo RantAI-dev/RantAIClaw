@@ -576,6 +576,128 @@ mod tests {
             "got: {outcome:?}"
         );
     }
+
+    // ── Outbound attachment paths (plan 354) ────────────────
+
+    /// A workspace holding one file, and that file's absolute path.
+    fn workspace_with_file(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let file = workspace.join(name);
+        std::fs::write(&file, b"halo").expect("write file");
+        file
+    }
+
+    /// The only form that worked before plan 354.
+    #[test]
+    fn an_absolute_path_inside_the_workspace_resolves() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = workspace_with_file(dir.path(), "catatan.txt");
+        let workspace = dir.path().join("workspace");
+
+        let resolved = resolve_attachment_path("Slack", file.to_str().expect("utf-8"), &workspace)
+            .expect("an absolute path inside the workspace is allowed");
+
+        assert_eq!(
+            resolved.canonicalize().expect("canonical"),
+            file.canonicalize().expect("canonical")
+        );
+    }
+
+    /// The form Telegram failed on at 06:38:48: a bare file name, which must
+    /// resolve against the workspace and not the daemon's working directory.
+    #[test]
+    fn a_bare_name_resolves_against_the_workspace() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = workspace_with_file(dir.path(), "catatan.txt");
+        let workspace = dir.path().join("workspace");
+
+        let resolved = resolve_attachment_path("Telegram", "catatan.txt", &workspace)
+            .expect("a bare name resolves against the workspace");
+
+        assert_eq!(
+            resolved.canonicalize().expect("canonical"),
+            file.canonicalize().expect("canonical")
+        );
+    }
+
+    /// The form Slack failed on at 06:45:29. `$HOME` is a tempdir here: the
+    /// developer's own home is never read.
+    #[tokio::test]
+    async fn a_tilde_path_resolves_against_home() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let _home_guard = crate::test_env::HomeGuard::set(home.path());
+
+        let profile = home.path().join(".rantaiclaw/profiles/default");
+        let file = workspace_with_file(&profile, "catatan.txt");
+        let workspace = profile.join("workspace");
+
+        let resolved = resolve_attachment_path(
+            "Slack",
+            "~/.rantaiclaw/profiles/default/workspace/catatan.txt",
+            &workspace,
+        )
+        .expect("a ~ path resolves against HOME");
+
+        assert_eq!(
+            resolved.canonicalize().expect("canonical"),
+            file.canonicalize().expect("canonical")
+        );
+    }
+
+    /// Accepting more path forms must not widen what is allowed: a relative path
+    /// that climbs out of the workspace is still refused.
+    #[test]
+    fn a_relative_path_that_climbs_out_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        workspace_with_file(dir.path(), "catatan.txt");
+        let workspace = dir.path().join("workspace");
+        std::fs::write(dir.path().join("config.toml"), b"secret").expect("write outside file");
+
+        let refused = resolve_attachment_path("Discord", "../config.toml", &workspace)
+            .expect_err("a path climbing out of the workspace must be refused");
+
+        assert!(
+            refused.to_string().contains("outside the workspace"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_outside_the_workspace_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        workspace_with_file(dir.path(), "catatan.txt");
+        let workspace = dir.path().join("workspace");
+        let secret = dir.path().join("config.toml");
+        std::fs::write(&secret, b"secret").expect("write outside file");
+
+        let refused =
+            resolve_attachment_path("WhatsApp", secret.to_str().expect("utf-8"), &workspace)
+                .expect_err("an absolute path outside the workspace must be refused");
+
+        assert!(
+            refused.to_string().contains("outside the workspace"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_refused_naming_what_the_model_wrote() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        let refused = resolve_attachment_path("Telegram", "test123.txt", &workspace)
+            .expect_err("a missing file must be refused");
+
+        assert!(
+            refused
+                .to_string()
+                .contains("attachment path not found: test123.txt"),
+            "{refused}"
+        );
+    }
 }
 
 // ── Outbound attachments ────────────────────────────────────────────────────
@@ -692,6 +814,78 @@ pub fn path_within_workspace(target: &std::path::Path, workspace: &std::path::Pa
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
     canonical_target.starts_with(&workspace_root)
+}
+
+/// Where a marker's target points on this machine, before it is checked.
+///
+/// A leading `~/` expands against `$HOME`, a relative path joins the workspace
+/// root, and an absolute path is taken as written. `~user` is **not** expanded:
+/// it stays literal and is then refused by the checks in
+/// [`resolve_attachment_path`], which is the safe direction.
+fn expand_attachment_path(target: &str, workspace: &std::path::Path) -> std::path::PathBuf {
+    if let Some(rest) = target.strip_prefix("~/") {
+        return crate::profile::paths::home_dir().join(rest);
+    }
+    let path = std::path::Path::new(target);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    workspace.join(path)
+}
+
+/// Turn a marker's target into a local file to upload, or refuse it.
+///
+/// The model writes whichever path form it likes, and one afternoon produced all
+/// three: a bare name, a `~/` path, and the absolute workspace path. Only the
+/// last worked, because every channel checked the string as written and a
+/// relative path resolves against the daemon's working directory rather than the
+/// workspace where `file_write` puts everything.
+///
+/// The file must then exist and [`path_within_workspace`] must pass. That check
+/// canonicalises and fails closed, and it is the reason a prompt injection
+/// naming `config.toml` cannot post provider keys into a chat. Expanding `~` or
+/// joining the workspace changes **which** file is named, never whether it is
+/// allowed. Errors name the target the model wrote, so the journal still shows
+/// the model's own mistake.
+///
+/// # Errors
+///
+/// When the resolved file does not exist, or lies outside `workspace`.
+pub fn resolve_attachment_path(
+    channel: &str,
+    target: &str,
+    workspace: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let resolved = expand_attachment_path(target, workspace);
+    if !resolved.exists() {
+        anyhow::bail!("{channel} attachment path not found: {target}");
+    }
+    if !path_within_workspace(&resolved, workspace) {
+        anyhow::bail!(
+            "{channel} attachment path is outside the workspace and was blocked: {target}"
+        );
+    }
+    Ok(resolved)
+}
+
+/// [`resolve_attachment_path`] against the active workspace.
+///
+/// Every channel's `send_attachment` calls this, so the path forms, the
+/// existence check and the confinement check live in one place. Four copies is
+/// how they drifted: all four accepted only the absolute form.
+///
+/// # Errors
+///
+/// When the active workspace cannot be resolved, or the target is refused.
+pub async fn resolve_attachment_path_in_workspace(
+    channel: &str,
+    target: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context as _;
+    let (_config_path, workspace_dir) = crate::config::Config::resolve_active_paths()
+        .await
+        .context("cannot resolve workspace to validate attachment path")?;
+    resolve_attachment_path(channel, target, &workspace_dir)
 }
 
 /// The marker syntax, phrased for one platform.

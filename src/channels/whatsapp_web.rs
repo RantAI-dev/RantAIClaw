@@ -231,25 +231,16 @@ impl WhatsAppWebChannel {
             return Ok(());
         }
 
-        let path = std::path::Path::new(target);
-        if !path.exists() {
-            anyhow::bail!("WhatsApp attachment path not found: {target}");
-        }
-        let (_config_path, workspace_dir) = {
-            use anyhow::Context as _;
-            crate::config::Config::resolve_active_paths()
-                .await
-                .context("cannot resolve workspace to validate attachment path")?
-        };
-        if !crate::channels::media::path_within_workspace(path, &workspace_dir) {
-            anyhow::bail!(
-                "WhatsApp attachment path is outside the workspace and was blocked: {target}"
-            );
-        }
+        // One resolver for every channel: it expands `~`, resolves a relative
+        // path against the workspace rather than the daemon's working directory,
+        // checks the file exists, and fails closed outside the workspace — a
+        // reply a guest can influence must not post the config into the chat.
+        let path = crate::channels::media::resolve_attachment_path_in_workspace("WhatsApp", target)
+            .await?;
 
         let bytes = {
             use anyhow::Context as _;
-            tokio::fs::read(path)
+            tokio::fs::read(&path)
                 .await
                 .with_context(|| format!("cannot read attachment: {target}"))?
         };
