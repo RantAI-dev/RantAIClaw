@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An attachment that could not be delivered is now said out loud, and the runtime's own bookkeeping
+  never reaches the chat.** Every channel sends the reply text first and each attachment after,
+  aborting on the first failure, and `send` returns one result, so a half-delivered reply looked
+  exactly like one that never left: the journal recorded `failed to reply`, history recorded "the
+  previous reply was not delivered", and the person waiting in the chat was told nothing. Observed
+  three ways on 2026-09-12: the text landed without the file four times; a reply that was only a
+  marker produced complete silence twice; and once a model read the history note back to the user as
+  its answer, a 38-character reply that was exactly `(the previous reply was not delivered)`. Now a
+  failed delivery sends one line to that conversation, in its own thread, naming the file that did
+  not arrive, and it never claims the answer was lost when the text went through. History keeps the
+  text the person actually read plus a note that the attachment did not arrive, so the model's next
+  turn works from the truth, while the blanket marker stays for a reply that never left. All four
+  internal history notes are stripped from outgoing replies, so a model that parrots its history
+  cannot deliver the runtime's bookkeeping to a user.
 - **An attachment the model named with a bare file name or a `~/` path is now delivered.** Every
   channel checked the marker's path exactly as the model wrote it, so a relative path resolved
   against the daemon's working directory instead of the workspace where `file_write` puts files, and
