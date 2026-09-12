@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A marker the model wrote as an example is no longer sent as an attachment.** Asked for a file
+  that did not exist, the model explained what it would do and wrote the marker syntax inside
+  backticks as an illustration. The parser took the illustration for a request, tried to attach a
+  file literally called `...`, and the reader saw the example with its insides eaten, followed by a
+  notice saying the attachment could not be delivered. A marker inside inline code or a fenced block
+  is now left exactly as written, since the instruction tells the model never to wrap a real marker
+  in a fence, and so is a placeholder target such as `...` or `<path-or-url>`, which is the form the
+  instruction itself prints. Both rules reach an unclosed marker too, so an unclosed example stays in
+  the text instead of being reported as a broken delivery. A real marker outside code is untouched.
 - **A reset says what it did not clear, and how long a model choice lasts.** `/new` and `/clear`
   clear the conversation's history while the chat app goes on showing every earlier message, and the
   reply said nothing about that, so the person reading it could not tell what had happened. It now

@@ -389,6 +389,14 @@ nothing is lost. Workspace confinement is unchanged and is still decided by
 `media::resolve_attachment_path_in_workspace` on the send path, which fails
 closed.
 
+A marker the model wrote as an example is not a request. One inside inline code
+or a fenced block is left exactly as written, because the instruction tells the
+model never to wrap a real marker in a code fence, so anything in there is
+illustration. So is a placeholder target: `[DOCUMENT:...]`, and anything wrapped
+in angle brackets such as the `<path-or-url>` the instruction itself prints. Both
+rules reach an unclosed marker too, so an unclosed example stays in the text and
+is not reported as a broken delivery. A real marker outside code is untouched.
+
 When an attachment cannot be delivered, the conversation gets one line naming the
 file, in the same thread as the reply. The text of a reply is sent before its
 attachments on every channel, so that line says the attachment did not arrive
