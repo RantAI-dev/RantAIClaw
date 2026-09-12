@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A reset says what it did not clear, and how long a model choice lasts.** `/new` and `/clear`
+  clear the conversation's history while the chat app goes on showing every earlier message, and the
+  reply said nothing about that, so the person reading it could not tell what had happened. It now
+  ends with a line in the channel's own name: Telegram and WhatsApp Web point at the chat's own menu,
+  Discord says the messages stay because a DM has no clear-chat, and a channel whose behaviour nobody
+  has checked gets the unchanged reply rather than an invented instruction. No hint quotes a menu
+  label. The same reply now also says the model chosen with `/model` lasts until the daemon restarts,
+  which is what actually happens: route overrides are held in memory and never written to disk. Slack
+  is unchanged and still has no reset command, because a new top-level message already starts a new
+  conversation there.
 - **The model is told how to attach a file, and a broken marker is no longer silent.** The
   instruction named the five markers and nothing else: not that a marker needs no tool call and no
   approval, not which path form works, not that the file must already exist. Asked for the same file

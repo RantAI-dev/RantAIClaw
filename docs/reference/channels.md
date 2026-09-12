@@ -287,7 +287,15 @@ earlier. To start fresh:
 | Slack | start a new top-level message instead of replying inside the thread. With threading on, the default, each top-level message is already its own conversation. With `thread_replies = false` a Slack channel is one conversation, and no chat command resets it |
 
 A `/model` or `/models <provider>` switch also clears that conversation's history, as the section
-above describes. A reset keeps the model chosen with `/model`.
+above describes. A reset keeps the model chosen with `/model`, and that choice lasts until the daemon
+restarts: route overrides are held in memory and never written to disk, so a restart returns every
+conversation to the configured model.
+
+**A reset does not change what the chat app shows.** Telegram, Discord and WhatsApp Web still display
+every earlier message, and the reply now says so in each app's own name: Telegram and WhatsApp point
+at the chat's own menu, while Discord says the messages stay, because a DM has no clear-chat. A
+channel whose behaviour has not been checked gets the reply unchanged rather than an invented
+instruction, and no hint quotes a menu label.
 
 ### What a reset does not clear
 

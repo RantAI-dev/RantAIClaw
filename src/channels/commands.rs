@@ -58,6 +58,40 @@ pub(crate) fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord" | "slack" | "whatsapp")
 }
 
+/// What a reset does **not** reach: the messages the chat app itself still
+/// shows.
+///
+/// `/new` clears the conversation on our side and the app goes on displaying
+/// every earlier message, so the reply left out the one thing the reader is
+/// looking at. Each hint names its own channel, the way each module already
+/// names itself to the model in `delivery_instructions_for`, and claims only
+/// what that platform actually offers: Telegram and WhatsApp have a per-chat
+/// clear, a Discord DM does not. A channel nobody has checked gets `None`,
+/// because saying nothing beats inventing an app's behaviour.
+///
+/// No hint names a menu item. A label nobody verified is the kind of small lie
+/// this effort keeps finding; a drive can confirm the real wording, and then the
+/// docs may name it.
+pub(crate) fn manual_clear_hint(channel_name: &str) -> Option<&'static str> {
+    match channel_name {
+        "telegram" => Some(
+            "Telegram still shows the earlier messages. Clearing them is done in Telegram, from \
+             this chat's menu.",
+        ),
+        // One arm for both WhatsApp types: they share `Channel::name()`.
+        "whatsapp" => Some(
+            "WhatsApp still shows the earlier messages. Clearing them is done in WhatsApp, from \
+             this chat's menu.",
+        ),
+        // No clear-chat in a DM, so Telegram's wording would be a promise
+        // Discord cannot keep.
+        "discord" => {
+            Some("Discord still shows the earlier messages, and the bot cannot remove them.")
+        }
+        _ => None,
+    }
+}
+
 /// Whether `name` has the shape of a command name: ASCII letters, digits and
 /// underscores, 1 to 32 of them, as Telegram defines one. A path such as
 /// `/etc/hosts` also starts with a slash and is not a command.
@@ -249,10 +283,19 @@ fn unknown_command_message(command: &str, prefix: &str) -> String {
 /// The reply to `/new` and `/clear`: what was cleared, what was kept, and how
 /// to remove the rest.
 const RESET_MESSAGE: &str =
-    "Cleared this conversation's history. The model chosen here stays, and \
-     so does long-term memory: facts the bot saved with its memory tools remain available in every \
-     conversation. To remove those, the operator runs `rantaiclaw memory list` and then \
+    "Cleared this conversation's history. The model chosen here stays until the daemon restarts. \
+     Long-term memory stays too: facts the bot saved with its memory tools remain available in \
+     every conversation. To remove those, the operator runs `rantaiclaw memory list` and then \
      `rantaiclaw memory clear --key <key>` on the host.";
+
+/// [`RESET_MESSAGE`], plus what the chat app still shows when we know the
+/// answer for this channel.
+fn reset_message(channel_name: &str) -> String {
+    match manual_clear_hint(channel_name) {
+        Some(hint) => format!("{RESET_MESSAGE} {hint}"),
+        None => RESET_MESSAGE.to_string(),
+    }
+}
 
 pub(crate) async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
@@ -320,7 +363,7 @@ pub(crate) async fn handle_runtime_command_if_needed(
             // This conversation's key only: another chat, topic or thread
             // keeps its history.
             history::clear_sender_history(ctx, &sender_key);
-            RESET_MESSAGE.to_string()
+            reset_message(&msg.channel)
         }
         ChannelRuntimeCommand::UnknownCommand(command) => unknown_command_message(&command, prefix),
         ChannelRuntimeCommand::AddressedElsewhere => return true,
@@ -460,6 +503,128 @@ mod tests {
             mismatches.is_empty(),
             "grammar mismatches:\n{}",
             mismatches.join("\n")
+        );
+    }
+
+    /// F-30: `route_overrides` is built empty on every runtime start
+    /// (`mod.rs:1293`) and is never written to disk, so a restart returns every
+    /// conversation to the configured model. The reply promised "The model
+    /// chosen here stays", which is true of a reset and false of a restart, and
+    /// a reader could not tell the difference from the sentence.
+    #[test]
+    fn the_reset_reply_says_how_long_a_model_choice_lasts() {
+        assert!(
+            RESET_MESSAGE.to_lowercase().contains("restart"),
+            "the reply must say the choice dies with the daemon: {RESET_MESSAGE}"
+        );
+    }
+
+    /// DECIDED 2026-09-12: Slack stays as it is. With threading on, the default,
+    /// a new top-level message is already a new conversation, so the command was
+    /// never wired there. Pinned so the decision cannot be undone by accident:
+    /// the bare-verb arm at `:110` has to keep stopping these before `:112`.
+    #[test]
+    fn slack_never_answers_new_or_clear() {
+        for input in ["new", "clear", "/new", "/clear"] {
+            assert_eq!(
+                parse_runtime_command("slack", input),
+                None,
+                "Slack must not answer {input:?}"
+            );
+        }
+    }
+
+    /// The owner read `/new` in a live chat and could not tell what it had done,
+    /// because the app still showed everything. One test per channel, so a
+    /// mutation that breaks one hint cannot hide behind another's assertion.
+    #[test]
+    fn telegram_reset_reply_points_at_the_chat_menu() {
+        let reply = reset_message("telegram");
+        assert!(
+            reply.starts_with(RESET_MESSAGE),
+            "the hint is added to the reply, never in place of it: {reply}"
+        );
+        assert!(
+            reply.contains("Telegram still shows the earlier messages"),
+            "{reply}"
+        );
+        assert!(reply.contains("this chat's menu"), "{reply}");
+    }
+
+    /// Both WhatsApp types share `Channel::name()`, so one arm covers them.
+    #[test]
+    fn whatsapp_reset_reply_points_at_the_chat_menu() {
+        let reply = reset_message("whatsapp");
+        assert!(reply.starts_with(RESET_MESSAGE), "{reply}");
+        assert!(
+            reply.contains("WhatsApp still shows the earlier messages"),
+            "{reply}"
+        );
+        assert!(reply.contains("this chat's menu"), "{reply}");
+    }
+
+    /// A Discord DM has no clear-chat, so Telegram's wording would be a promise
+    /// the bot cannot keep.
+    #[test]
+    fn discord_reset_reply_says_the_messages_stay() {
+        let reply = reset_message("discord");
+        assert!(reply.starts_with(RESET_MESSAGE), "{reply}");
+        assert!(
+            reply.contains("Discord still shows the earlier messages")
+                && reply.contains("cannot remove them"),
+            "{reply}"
+        );
+        assert!(
+            !reply.contains("menu"),
+            "a DM has no chat menu, so the reply must not point at one: {reply}"
+        );
+    }
+
+    /// Saying nothing beats inventing an app's behaviour, so a channel nobody
+    /// has checked gets today's message byte for byte.
+    #[test]
+    fn a_channel_without_a_hint_gets_the_unchanged_reply() {
+        for channel in ["mattermost", "irc", "signal", "slack"] {
+            assert_eq!(
+                reset_message(channel),
+                RESET_MESSAGE,
+                "{channel} must get the unchanged reply"
+            );
+        }
+    }
+
+    /// The honesty guard. A hint may name the app and say where the control
+    /// lives; it may not quote a label nobody has verified. Asserted as a closed
+    /// list of spellings plus the quote characters that would wrap one, rather
+    /// than as a pattern: three hints are short enough for a reviewer to read,
+    /// and a fourth channel's hint has to pass here before it ships.
+    ///
+    /// The ASCII apostrophe is deliberately absent. English writes a possessive
+    /// with it, and forbidding it flagged "this chat's menu" on the first run:
+    /// the guard is about a quoted label, not about punctuation.
+    #[test]
+    fn no_hint_quotes_a_menu_label() {
+        let forbidden = [
+            "Delete Chat",
+            "Delete chat",
+            "Clear Chat",
+            "Clear chat",
+            "\"",
+            "\u{201C}",
+            "\u{201D}",
+        ];
+        for channel in ["telegram", "whatsapp", "discord"] {
+            let hint = manual_clear_hint(channel).expect("this channel has a hint");
+            for label in forbidden {
+                assert!(
+                    !hint.contains(label),
+                    "{channel}'s hint quotes a label nobody verified: {hint}"
+                );
+            }
+        }
+        assert!(
+            manual_clear_hint("mattermost").is_none() && manual_clear_hint("slack").is_none(),
+            "a channel nobody checked must get no hint at all"
         );
     }
 
