@@ -1230,3 +1230,11 @@ When the daemon stops, the dispatch loop drains before the process exits:
 - `Cancelled an in-flight channel request`: a turn was stopped, by a newer message from the same sender or by the drain deadline 12 seconds into shutdown
 - `sent a restart notice` / `could not send a restart notice:` / `a restart notice timed out`: a conversation was told to send its message again, logged with `channel` and `message_id`
 - `WhatsApp Web stopped listening; its connection stays open until dispatch finishes`: WhatsApp Web forwards nothing new and keeps its connection only for the replies and notices still going out
+
+A turn the drain stops is also recorded in its conversation's history as interrupted and never
+answered. The inbound message is written to history before the model is called, so without that note
+the request sits there unanswered and the model answers it on a later turn, in reply to something
+else entirely. Nothing is replayed: the note only closes the turn in the transcript. It is stripped
+from every outgoing reply, like the runtime's other internal notes, so nobody reads it. A turn
+interrupted by a newer message from the same sender is unchanged and keeps its context, because that
+sender is still here and the context is theirs.

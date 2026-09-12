@@ -166,6 +166,19 @@ const FAILED_TURN_MARKER: &str = "(the previous attempt failed)";
 /// next turn would then answer a question the user had already been answered.
 const UNDELIVERED_ATTACHMENT_NOTE: &str = "(the attachment was not delivered)";
 
+/// Recorded in history when a restart stopped a turn before it was answered
+/// (plan 359, finding F-31).
+///
+/// The user turn is written before the model is called, so an interrupted
+/// request otherwise sits in history with no assistant turn after it. The
+/// conversation is told to send it again, and the model then answers the old
+/// request on the next turn: on 2026-09-12 a greeting on Telegram was answered
+/// with the 1500-word story from the turn the restart had stopped. D3 chose that
+/// nothing is replayed. The runtime replays nothing, and this stops the model
+/// replaying it in the runtime's place.
+const INTERRUPTED_TURN_MARKER: &str =
+    "(the previous request was interrupted by a restart and never answered)";
+
 /// What a conversation is told when a restart stops its turn before the
 /// answer, or stops a message before its turn began (plan 353, decision D3).
 /// Nothing is replayed after the restart, so the user decides whether to send

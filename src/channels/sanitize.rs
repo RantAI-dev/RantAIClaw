@@ -25,13 +25,15 @@ pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>])
 /// model knows its last turn did not land. On 2026-09-12 a model read one back as
 /// its answer: WhatsApp received exactly `(the previous reply was not delivered)`,
 /// 38 characters, as the bot's reply to a request. Bookkeeping the model may
-/// repeat must never reach a person. All four notes, not just that one: they are
-/// one family, and a model that parrots one parrots the others.
+/// repeat must never reach a person. Every note in this family, not just that
+/// one: a model that parrots one parrots the others, so the list below and the
+/// family in `mod.rs` are meant to be read together.
 fn strip_internal_history_notes(message: &str) -> String {
     let mut cleaned = message.to_string();
     for note in [
         super::UNDELIVERED_TURN_MARKER,
         super::UNDELIVERED_ATTACHMENT_NOTE,
+        super::INTERRUPTED_TURN_MARKER,
         super::TIMED_OUT_TURN_MARKER,
         super::FAILED_TURN_MARKER,
     ] {
