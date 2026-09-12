@@ -234,12 +234,12 @@ fn strip_tool_call_tags(message: &str) -> String {
     result.trim().to_string()
 }
 
-/// Media-marker syntax, appended to the system prompt on this channel only.
-/// Telegram is the one channel that can actually deliver an attachment; telling
-/// the model otherwise elsewhere leaks markers as literal text.
-pub(crate) fn telegram_delivery_instructions() -> &'static str {
-    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TEXT.get_or_init(|| crate::channels::media::delivery_instructions_for("Telegram"))
+/// How to attach a file, appended to the system prompt on this channel.
+///
+/// No longer cached: the text names the workspace path (plan 356), so it is
+/// built per turn rather than once per process.
+pub(crate) fn telegram_delivery_instructions(workspace: &std::path::Path) -> String {
+    crate::channels::media::delivery_instructions_for("Telegram", workspace)
 }
 
 /// Telegram channel — long-polls the Bot API for updates
@@ -1911,8 +1911,8 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
-    fn delivery_instructions(&self) -> Option<&'static str> {
-        Some(telegram_delivery_instructions())
+    fn delivery_instructions(&self, workspace: &std::path::Path) -> Option<String> {
+        Some(telegram_delivery_instructions(workspace))
     }
 
     fn render_target(&self) -> crate::channels::format::RenderTarget {

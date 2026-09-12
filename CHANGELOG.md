@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The model is told how to attach a file, and a broken marker is no longer silent.** The
+  instruction named the five markers and nothing else: not that a marker needs no tool call and no
+  approval, not which path form works, not that the file must already exist. Asked for the same file
+  on 2026-09-12, WhatsApp attached it while Telegram answered that it does not support sending
+  attachments and emitted no marker at all, and Slack guessed a `~/` path and then an absolute one.
+  The instruction now states those promises and names the workspace path, which is why
+  `Channel::delivery_instructions` takes the workspace. Separately, a marker that opened and never
+  closed was copied into the reply verbatim with nothing logged at any level, so a Slack reader saw
+  `[DOCUMENT:/abs/path` as text on 2026-09-11. The closing bracket is now looked for on the marker's
+  own line, an unclosed known kind is logged at WARN naming the kind and the target, and where the
+  rest of the line is an absolute path to a file that exists the attachment is delivered anyway.
+  Workspace confinement is unchanged and still decided on the send path.
 - **An attachment that could not be delivered is now said out loud, and the runtime's own bookkeeping
   never reaches the chat.** Every channel sends the reply text first and each attachment after,
   aborting on the first failure, and `send` returns one result, so a half-delivered reply looked

@@ -130,7 +130,11 @@ pub trait Channel: Send + Sync {
     ///
     /// Was a central `match` on the channel name in `mod.rs`, which meant a new
     /// channel's media support was declared in a file its author never opened.
-    fn delivery_instructions(&self) -> Option<&'static str> {
+    ///
+    /// Takes the workspace because the instruction states the one path form that
+    /// works, and that sentence cannot be written without the path (plan 356).
+    /// A `&'static str` cannot carry runtime data, hence the `String`.
+    fn delivery_instructions(&self, _workspace: &std::path::Path) -> Option<String> {
         None
     }
 

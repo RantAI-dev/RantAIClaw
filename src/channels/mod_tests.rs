@@ -12,6 +12,10 @@
 fn delivery_instructions_default_is_none() {
     use crate::channels::traits::Channel;
 
+    // The instruction names the workspace path, so asking for it needs one. Any
+    // path does: the text is built from it and nothing is read off disk.
+    let workspace = std::path::Path::new("/ws/rantaiclaw");
+
     // Mattermost has no upload path, so it still takes the default and must
     // not claim otherwise. Slack held this position until it gained one.
     let mattermost = crate::channels::mattermost::MattermostChannel::new(
@@ -23,7 +27,7 @@ fn delivery_instructions_default_is_none() {
         false,
     );
     assert!(
-        mattermost.delivery_instructions().is_none(),
+        mattermost.delivery_instructions(workspace).is_none(),
         "a channel that cannot deliver media must not claim it can"
     );
 
@@ -36,7 +40,7 @@ fn delivery_instructions_default_is_none() {
     );
     assert!(
         slack
-            .delivery_instructions()
+            .delivery_instructions(workspace)
             .is_some_and(|t| t.contains("[IMAGE:")),
         "Slack can deliver attachments now and must say so"
     );
@@ -50,7 +54,7 @@ fn delivery_instructions_default_is_none() {
     );
     assert!(
         discord
-            .delivery_instructions()
+            .delivery_instructions(workspace)
             .is_some_and(|t| t.contains("[IMAGE:")),
         "Discord can deliver attachments and must say so"
     );
@@ -58,14 +62,19 @@ fn delivery_instructions_default_is_none() {
     let telegram =
         crate::channels::telegram::TelegramChannel::new("t".into(), vec!["*".into()], false);
     let instructions = telegram
-        .delivery_instructions()
+        .delivery_instructions(workspace)
         .expect("Telegram can deliver media");
     assert!(instructions.contains("[IMAGE:"));
 
     // Behaviour-preserving: the prompt is assembled exactly as the central
     // `match` assembled it.
-    let with =
-        prompt::build_channel_system_prompt("BASE", "telegram", "1", false, Some(instructions));
+    let with = prompt::build_channel_system_prompt(
+        "BASE",
+        "telegram",
+        "1",
+        false,
+        Some(instructions.as_str()),
+    );
     assert!(with.starts_with("BASE\n\n"));
     assert!(with.contains("[DOCUMENT:"));
     let without = prompt::build_channel_system_prompt("BASE", "irc", "#room", false, None);
@@ -1213,8 +1222,10 @@ impl Channel for TelegramRecordingChannel {
     // Mirrors the real channel: the instructions come from the channel
     // impl now, not from a `match` on its name, so a stub that claims the
     // name must also claim the capability.
-    fn delivery_instructions(&self) -> Option<&'static str> {
-        Some(crate::channels::telegram::telegram_delivery_instructions())
+    fn delivery_instructions(&self, workspace: &std::path::Path) -> Option<String> {
+        Some(crate::channels::telegram::telegram_delivery_instructions(
+            workspace,
+        ))
     }
 
     fn name(&self) -> &str {
@@ -6695,10 +6706,11 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
         .map(|(role, _)| role.as_str())
         .collect::<Vec<_>>();
     assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+    // Pinned as a promise, not a sentence: the instruction is addressed to this
+    // platform and carries the marker vocabulary. Plan 356 rewrote the wording,
+    // and a test that greps one sentence fails for a change it should not judge.
     assert!(
-        calls[0][0]
-            .1
-            .contains("When responding on Telegram, include media markers"),
+        calls[0][0].1.contains("When responding on Telegram") && calls[0][0].1.contains("[IMAGE:"),
         "telegram delivery instruction should live in the system prompt"
     );
     assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));

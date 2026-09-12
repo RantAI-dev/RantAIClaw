@@ -682,6 +682,165 @@ mod tests {
         );
     }
 
+    /// Plan 356: the instruction has to carry the promises, not just the
+    /// syntax. Pinned as promises so the wording can be rewritten freely: the
+    /// workspace path is named, no tool and no approval are needed, the file
+    /// must exist first, and all five markers are still listed.
+    #[test]
+    fn the_instruction_tells_the_model_what_actually_works() {
+        let text = delivery_instructions_for("Telegram", std::path::Path::new("/ws/rantaiclaw"));
+        let lowered = text.to_lowercase();
+
+        assert!(
+            text.contains("/ws/rantaiclaw"),
+            "the one path form that works is unusable unless the workspace is named: {text}"
+        );
+        assert!(
+            lowered.contains("no tool call") && lowered.contains("no approval"),
+            "Telegram refused on 2026-09-12 because nothing said a marker is enough: {text}"
+        );
+        assert!(
+            lowered.contains("absolute"),
+            "Slack guessed `~/…` without this: {text}"
+        );
+        assert!(
+            lowered.contains("exist"),
+            "a marker for a file not yet written cannot be delivered: {text}"
+        );
+        for marker in ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"] {
+            assert!(text.contains(marker), "missing {marker}: {text}");
+        }
+    }
+
+    /// Plan 356, finding F-13: a Slack reply ended `[DOCUMENT:/abs/path` with no
+    /// bracket, and the reader saw the raw marker. When the file is really
+    /// there, the person gets the file the model meant.
+    #[test]
+    fn an_unclosed_marker_naming_a_real_file_still_delivers_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = dir.path().join("catatan.txt");
+        std::fs::write(&file, b"isi").expect("write the file");
+
+        let reply = format!("ini berkasnya [DOCUMENT:{}", file.display());
+        let (text, attachments) = parse_attachment_markers(&reply);
+
+        assert_eq!(attachments.len(), 1, "{attachments:?}");
+        assert_eq!(attachments[0].kind, AttachmentKind::Document);
+        assert_eq!(attachments[0].target, file.display().to_string());
+        assert!(
+            !text.contains("[DOCUMENT:"),
+            "the raw marker must not reach the reader: {text}"
+        );
+    }
+
+    /// The other half: nothing is lost when the fragment names no file. The text
+    /// stays exactly as it was, and plan 355's notice explains the rest.
+    #[test]
+    fn an_unclosed_marker_naming_nothing_stays_in_the_text() {
+        let (text, attachments) =
+            parse_attachment_markers("ini berkasnya [DOCUMENT:bukan berkas apa pun");
+
+        assert!(attachments.is_empty(), "{attachments:?}");
+        assert!(
+            text.contains("[DOCUMENT:bukan berkas apa pun"),
+            "the text must survive untouched: {text}"
+        );
+    }
+
+    /// A `]` on a later line belongs to a later thought. Before the line scope
+    /// it closed this marker and swallowed everything in between.
+    #[test]
+    fn a_bracket_on_a_later_line_does_not_close_an_unclosed_marker() {
+        let (text, attachments) =
+            parse_attachment_markers("lihat [DOCUMENT:/tidak/ada\nlalu [catatan] berikutnya");
+
+        assert!(attachments.is_empty(), "{attachments:?}");
+        assert!(
+            text.contains("[DOCUMENT:/tidak/ada") && text.contains("[catatan]"),
+            "both lines must survive: {text}"
+        );
+    }
+
+    /// Line scoping must not cost a well-formed marker that follows other text
+    /// on the same line, which is where markers normally sit.
+    #[test]
+    fn a_closed_marker_after_trailing_text_on_the_same_line_is_still_parsed() {
+        let (text, attachments) = parse_attachment_markers(
+            "catatan [lihat lampiran] ini dia [IMAGE:/w/chart.png] selesai",
+        );
+
+        assert_eq!(attachments.len(), 1, "{attachments:?}");
+        assert_eq!(attachments[0].target, "/w/chart.png");
+        assert!(
+            text.contains("[lihat lampiran]") && !text.contains("[IMAGE:"),
+            "the non-marker stays and the marker goes: {text}"
+        );
+    }
+
+    /// Collect the WARN lines emitted while `run` executes.
+    ///
+    /// The first log capture in this crate, and it earns its keep: the whole
+    /// point of plan 356's second half is that a broken marker leaves a trace,
+    /// and a trace is only observable through a subscriber. Thread-local, so
+    /// parallel tests cannot see each other's events.
+    fn warnings_from(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("lock the log buffer")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Buffer {
+            type Writer = Self;
+
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().expect("lock the log buffer").clone();
+        String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
+    /// Finding F-13: the 2026-09-11 Slack reply was invisible because nothing
+    /// was logged at any level. A marker that cannot be recovered must still be
+    /// reported, naming the kind and the target so the path can be checked.
+    #[test]
+    fn an_unclosed_marker_that_cannot_be_delivered_is_still_reported() {
+        let logged = warnings_from(|| {
+            let (_text, attachments) =
+                parse_attachment_markers("ini berkasnya [DOCUMENT:/tidak/ada/catatan.txt");
+            assert!(attachments.is_empty(), "{attachments:?}");
+        });
+
+        assert!(
+            logged.contains("unclosed attachment marker"),
+            "silence is what made this invisible: {logged:?}"
+        );
+        assert!(
+            logged.contains("/tidak/ada/catatan.txt") && logged.contains("Document"),
+            "the report has to name the kind and the target: {logged:?}"
+        );
+    }
+
     #[test]
     fn a_missing_file_is_refused_naming_what_the_model_wrote() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -751,6 +910,13 @@ pub fn is_http_url(target: &str) -> bool {
 ///
 /// A bracketed run that is not a valid marker is left in the text verbatim, so
 /// a model writing `[see attached]` does not lose it.
+///
+/// An unclosed marker is not left silent. On 2026-09-11 a Slack reply ended
+/// `[DOCUMENT:/abs/path` with no `]`: the reader saw the raw marker, `send`
+/// returned `Ok`, and no line was logged at any level. Now the closing bracket
+/// is looked for on the marker's own line only, and a known kind that opens
+/// without one is reported and, where the fragment names a file that exists,
+/// delivered anyway. See [`recover_unclosed_marker`].
 #[must_use]
 pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachment>) {
     let mut cleaned = String::with_capacity(message.len());
@@ -766,9 +932,22 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachmen
         let open = cursor + open_rel;
         cleaned.push_str(&message[cursor..open]);
 
-        let Some(close_rel) = message[open..].find(']') else {
-            cleaned.push_str(&message[open..]);
-            break;
+        // The closing bracket has to be on this marker's line. A `]` further
+        // down the reply closes a different thought, and accepting it as this
+        // marker's swallows every line in between.
+        let line_end = message[open..]
+            .find('\n')
+            .map_or(message.len(), |idx| open + idx);
+        let Some(close_rel) = message[open..line_end].find(']') else {
+            let fragment = &message[open..line_end];
+            match recover_unclosed_marker(fragment) {
+                Some(attachment) => attachments.push(attachment),
+                None => cleaned.push_str(fragment),
+            }
+            // The newline itself is still ahead of the cursor, so the next pass
+            // copies it and the reply keeps its shape.
+            cursor = line_end;
+            continue;
         };
 
         let close = open + close_rel;
@@ -796,6 +975,36 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachmen
     }
 
     (cleaned.trim().to_string(), attachments)
+}
+
+/// What to do with `[DOCUMENT:/abs/path` when no `]` follows on its line.
+///
+/// Returns the attachment when the fragment names a file that is already there,
+/// so the person gets the file the model meant instead of a raw marker. Either
+/// way a WARN names the kind and the target: the path is not message text, and
+/// silence is what made the 2026-09-11 case invisible.
+///
+/// Confinement is not decided here. The send path calls
+/// [`resolve_attachment_path_in_workspace`], which fails closed, so this can
+/// only ever propose a candidate — keeping the workspace boundary in one place
+/// rather than copying it into the parser. A URL is left alone: only a path can
+/// resolve.
+fn recover_unclosed_marker(fragment: &str) -> Option<OutboundAttachment> {
+    let (kind, target) = fragment.trim_start_matches('[').split_once(':')?;
+    let kind = AttachmentKind::from_marker(kind)?;
+    let target = target.trim();
+    let resolvable = !target.is_empty()
+        && !is_http_url(target)
+        && std::path::Path::new(target).is_absolute()
+        && std::path::Path::new(target).exists();
+    tracing::warn!(
+        "unclosed attachment marker in a reply: kind={kind:?}, target={target}, \
+         delivered_anyway={resolvable}"
+    );
+    resolvable.then(|| OutboundAttachment {
+        kind,
+        target: target.to_string(),
+    })
 }
 
 /// Is this local path inside the workspace?
@@ -888,19 +1097,35 @@ pub async fn resolve_attachment_path_in_workspace(
     resolve_attachment_path(channel, target, &workspace_dir)
 }
 
-/// The marker syntax, phrased for one platform.
+/// What the model is told about attaching files, phrased for one platform.
 ///
 /// Kept as a builder rather than a per-channel constant so the vocabulary
 /// cannot drift into per-channel dialects — the model has to be told the same
 /// five markers everywhere, or a reply written for one channel leaks literal
 /// text on another.
+///
+/// Syntax alone was not enough. On 2026-09-12 the same request produced a file
+/// on WhatsApp and, on Telegram, "bot ini saat ini tidak mendukung pengiriman
+/// file sebagai lampiran" with no marker at all: the model disbelieved a
+/// capability it had been given, because nothing told it that a marker needs no
+/// tool and no approval. Slack, told the same thing, guessed `~/…` and then an
+/// absolute path. So the text states the promises the runtime actually keeps,
+/// and `workspace` is a parameter because the one path form that works cannot
+/// be named without it.
 #[must_use]
-pub fn delivery_instructions_for(platform: &str) -> String {
+pub fn delivery_instructions_for(platform: &str, workspace: &std::path::Path) -> String {
+    let workspace = workspace.display();
     format!(
-        "When responding on {platform}, include media markers for files or URLs that should be \
-         sent as attachments. Use one marker per attachment with this exact syntax: \
+        "When responding on {platform}, you can attach a file yourself: put a media marker in \
+         your reply and the runtime uploads the file for you. This needs no tool call and no \
+         approval. Use one marker per attachment, with this exact syntax: \
          [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], \
-         [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside \
-         markers and never wrap markers in code fences."
+         [AUDIO:<path-or-url>], or [VOICE:<path-or-url>].\n\n\
+         A local path must be absolute and inside this workspace: {workspace}. A path outside \
+         the workspace is refused and the file is not sent, so do not guess a home-relative or \
+         bare name.\n\n\
+         The file has to exist before the marker is sent. Write it first, then attach it.\n\n\
+         Keep normal user-facing text outside markers, put the markers at the end of the reply, \
+         and never wrap a marker in code fences."
     )
 }
