@@ -10,9 +10,9 @@ use super::{
     approval_relay, channel_message_timeout_budget_secs, commands, conversation, history, media,
     prompt, routing, sanitize, supervisor, ChannelRuntimeContext, AUTOSAVE_MIN_MESSAGE_CHARS,
     CHANNEL_DRAIN_DEADLINE, CHANNEL_NOTICE_SEND_TIMEOUT, FAILED_TURN_MARKER,
-    IN_FLIGHT_COMPLETION_WAIT_TIMEOUT, MEMORY_CONTEXT_ENTRY_MAX_CHARS, MEMORY_CONTEXT_MAX_CHARS,
-    MEMORY_CONTEXT_MAX_ENTRIES, RESTART_NOTICE, TIMED_OUT_TURN_MARKER, UNDELIVERED_ATTACHMENT_NOTE,
-    UNDELIVERED_TURN_MARKER,
+    INTERRUPTED_TURN_MARKER, IN_FLIGHT_COMPLETION_WAIT_TIMEOUT, MEMORY_CONTEXT_ENTRY_MAX_CHARS,
+    MEMORY_CONTEXT_MAX_CHARS, MEMORY_CONTEXT_MAX_ENTRIES, RESTART_NOTICE, TIMED_OUT_TURN_MARKER,
+    UNDELIVERED_ATTACHMENT_NOTE, UNDELIVERED_TURN_MARKER,
 };
 use crate::agent::loop_::run_tool_call_loop;
 use crate::memory::Memory;
@@ -425,8 +425,14 @@ pub(crate) enum TurnEnd {
     /// runtime command's answer.
     Finished,
     /// The turn was cancelled before the model answered, so the user got
-    /// nothing from it.
+    /// nothing from it. Its request is in history with no assistant turn after
+    /// it, which is what [`RestartNotice::record_interruption`] closes.
     Cancelled,
+    /// The drain reached this turn before its first poll, so nothing was
+    /// recorded for it: no history key, no user turn. The conversation is still
+    /// told to send the message again, but there is no dangling request to
+    /// close, and writing a note here would answer a request that is not there.
+    NotStarted,
 }
 
 pub(crate) async fn process_channel_message(
@@ -435,7 +441,7 @@ pub(crate) async fn process_channel_message(
     cancellation_token: CancellationToken,
 ) -> TurnEnd {
     if cancellation_token.is_cancelled() {
-        return TurnEnd::Cancelled;
+        return TurnEnd::NotStarted;
     }
 
     // Pre-v0.6.7 used `println!` here, which leaks into the TUI's
@@ -1034,6 +1040,21 @@ impl RestartNotice {
         }
     }
 
+    /// Record in history that this request was stopped and never answered.
+    ///
+    /// Per stopped turn, not per conversation: [`Self::send`] deliberately
+    /// speaks once however many of a conversation's messages were stopped
+    /// (D3), while each stopped request left its own user turn behind. A user
+    /// turn with no assistant turn after it is the one the model answers later,
+    /// at a moment nobody chose.
+    fn record_interruption(&self, ctx: &ChannelRuntimeContext) {
+        history::append_sender_turn(
+            ctx,
+            &self.conversation,
+            ChatMessage::assistant(INTERRUPTED_TURN_MARKER),
+        );
+    }
+
     /// Sends nothing when the conversation was already told. Bounded by
     /// `CHANNEL_NOTICE_SEND_TIMEOUT`, so a platform that does not answer cannot
     /// use up the drain the other notices need. Logs the message id, never the
@@ -1251,7 +1272,15 @@ pub(crate) async fn run_message_dispatch_loop(
             };
             // Answer only for a turn the drain stopped. One a newer message
             // interrupted is followed by that message's own turn.
-            if end == TurnEnd::Cancelled && stop_running_turns.is_cancelled() {
+            if stop_running_turns.is_cancelled()
+                && matches!(end, TurnEnd::Cancelled | TurnEnd::NotStarted)
+            {
+                // Only a turn that began left a request behind to close. One the
+                // drain reached before its first poll wrote no history key and no
+                // user turn, so a note there would close a request nobody made.
+                if end == TurnEnd::Cancelled {
+                    notice.record_interruption(&notice_ctx);
+                }
                 notice.send(&notice_ctx).await;
             }
 

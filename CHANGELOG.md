@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A turn stopped by a restart is recorded as stopped, so it is not answered later out of nowhere.**
+  The inbound message is written to history before the model is called, so a turn the shutdown drain
+  stops left an unanswered request behind. The conversation is told to send it again, and on the next
+  turn the model answered the old request instead: on 2026-09-12 a greeting on Telegram received the
+  1500-word story from the turn a restart had stopped, and a user who follows the notice and resends
+  could be answered twice. History now records that the request was interrupted and never answered,
+  on the restart path only, so a turn interrupted by a newer message from the same sender keeps its
+  context exactly as before. The note is stripped from outgoing replies along with the runtime's
+  other internal notes, so nobody reads it, and nothing is replayed.
 - **A marker the model wrote as an example is no longer sent as an attachment.** Asked for a file
   that did not exist, the model explained what it would do and wrote the marker syntax inside
   backticks as an illustration. The parser took the illustration for a request, tried to attach a

@@ -4280,6 +4280,142 @@ async fn a_turn_still_running_at_the_drain_deadline_gets_one_restart_notice() {
     drop(tx);
 }
 
+/// Plan 359 (F-31): the user turn is written before the model is called, so a
+/// turn the drain stops leaves an unanswered request in history. On 2026-09-12
+/// the owner sent an unrelated "halo" afterwards and received the 1500-word
+/// story from the stopped turn. History must end with the request and a note
+/// saying it was never answered.
+#[tokio::test(start_paused = true)]
+async fn a_turn_stopped_by_the_drain_is_recorded_as_interrupted() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(SlowProvider {
+            delay: Duration::from_secs(600),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+    // Kept so history can be read after the loop takes the context.
+    let history_ctx = Arc::clone(&ctx);
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let shutdown = CancellationToken::new();
+    let dispatch = tokio::spawn(run_message_dispatch_loop(rx, ctx, 4, shutdown.clone()));
+
+    tx.send(drain_message("chat-1")).await.expect("queued");
+    // Let the turn start and park in the provider.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(16), dispatch)
+        .await
+        .expect("the dispatch loop must return inside the 16-second drain")
+        .expect("the dispatch loop must not panic");
+
+    {
+        let sent = channel_impl.sent.lock().await;
+        assert_eq!(sent.len(), 1, "the conversation is told once: {sent:?}");
+        assert_eq!(sent[0].content, RESTART_NOTICE);
+    }
+
+    let key = dispatch::conversation_history_key(&drain_message("chat-1"));
+    let histories = history_ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let turns = histories
+        .get(&key)
+        .expect("the stopped request is in history");
+
+    assert_eq!(turns.len(), 2, "{turns:?}");
+    assert_eq!(turns[0].role, "user");
+    assert_eq!(turns[0].content, "write something long");
+    assert_eq!(turns[1].role, "assistant");
+    assert_eq!(
+        turns[1].content, INTERRUPTED_TURN_MARKER,
+        "the request must not be left dangling: {turns:?}"
+    );
+    drop(tx);
+}
+
+/// Effort rule 2: a test of a helper never tests that anything calls it. The
+/// unit test proves the sanitizer removes the marker; this proves the reply path
+/// runs the sanitizer, which is the half that would have let a parroted marker
+/// through.
+#[tokio::test]
+async fn the_interruption_marker_never_reaches_the_chat() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(FixedReplyProvider {
+            reply: format!("Here you go. {INTERRUPTED_TURN_MARKER}"),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    process_channel_message(
+        Arc::clone(&ctx),
+        drain_message("chat-1"),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let sent = channel_impl.sent.lock().await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        !sent[0].content.contains(INTERRUPTED_TURN_MARKER),
+        "the marker must never reach a reader: {sent:?}"
+    );
+    assert!(
+        sent[0].content.contains("Here you go."),
+        "the rest of the reply must survive: {sent:?}"
+    );
+}
+
+/// The premise the guard rests on: a turn the drain reaches before its first
+/// poll records nothing, so there is no request for a note to close. Without
+/// this, `record_interruption` would write an assistant turn into a conversation
+/// that never had a user turn written for it.
+#[tokio::test]
+async fn a_turn_the_drain_reached_before_it_began_records_nothing() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(SlowProvider {
+            delay: Duration::from_secs(600),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    let token = CancellationToken::new();
+    token.cancel();
+    let end = process_channel_message(Arc::clone(&ctx), drain_message("chat-1"), token).await;
+
+    assert_eq!(end, TurnEnd::NotStarted);
+    let key = dispatch::conversation_history_key(&drain_message("chat-1"));
+    let histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(
+        histories.get(&key).is_none_or(Vec::is_empty),
+        "nothing may be recorded for a turn that never began: {histories:?}"
+    );
+}
+
 /// Plan 353 (D3): a message that has not started when the token fires is never
 /// dropped in silence. One waiting for a free worker and one still in the queue
 /// each get the notice, and the running turn gets its own at the deadline.
@@ -4750,6 +4886,7 @@ fn the_runtimes_own_history_notes_never_reach_the_chat() {
     for note in [
         UNDELIVERED_TURN_MARKER,
         UNDELIVERED_ATTACHMENT_NOTE,
+        INTERRUPTED_TURN_MARKER,
         TIMED_OUT_TURN_MARKER,
         FAILED_TURN_MARKER,
     ] {
@@ -5678,6 +5815,13 @@ async fn message_dispatch_processes_messages_in_parallel() {
 
 #[tokio::test]
 async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_context() {
+    // Effort rule 3 (F-6): this drives the dispatch loop and touches history, so
+    // it must not write into the developer's real profile. Time is deliberately
+    // not paused: the two messages are ordered by a real delay below.
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
     let channel_impl = Arc::new(TelegramRecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -5782,6 +5926,14 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
     assert!(
         !second_call.iter().any(|(role, _)| role == "assistant"),
         "cancelled turn should not persist an assistant response"
+    );
+    // Plan 359 writes an interruption note on the restart path only. This path
+    // is the other one: the sender is still here and their context is theirs.
+    assert!(
+        !second_call
+            .iter()
+            .any(|(_, content)| content.contains(INTERRUPTED_TURN_MARKER)),
+        "a newer message from the same sender is not a restart: {second_call:?}"
     );
 }
 
