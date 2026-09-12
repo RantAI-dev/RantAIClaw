@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The model can no longer pass off the runtime's tool summary as its own.** `[Used tools: …]` is
+  built by the runtime from the tools that actually ran and added to the history entry, never to the
+  delivered reply, so a label inside a reply is one the model typed. On 2026-09-12 two Telegram
+  replies carried one with no tool call in the turn at all, and the second sat above an invented
+  config file, which is what made a fabrication read like a tool's output: an operator reading it
+  would have believed a security posture the host does not have. Every such label is now stripped on
+  the way to a person, wherever in the reply it sits, rather than only when it led the first line,
+  and each one is logged at WARN with a count and no message text. History still records the
+  runtime's own summary, and a reply that was nothing but a label still gets the ordinary
+  empty-reply answer. The wider problem, a model stating things it did not do, is model quality and
+  is not something the runtime can fix.
 - **A turn stopped by a restart is recorded as stopped, so it is not answered later out of nowhere.**
   The inbound message is written to history before the model is called, so a turn the shutdown drain
   stops left an unanswered request behind. The conversation is told to send it again, and on the next
