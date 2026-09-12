@@ -397,12 +397,14 @@ async fn get_channels_publishes_the_catalog_with_both_axes() {
         "the support axis is a product commitment, not a refactor: {body}"
     );
     assert_eq!(
-        driven, 1,
+        driven, 4,
         "the verification axis moves only when a round trip was run: {body}"
     );
 
-    // The combination the split exists for: committed to, never driven. If this
-    // set is empty, check whether somebody drove them or somebody demoted them.
+    // The combination the split exists for: committed to, never driven. Three
+    // channels left this set on 2026-09-12, the only way a row may leave it:
+    // somebody drove them. If it is ever empty, check whether somebody drove the
+    // last one or somebody demoted it.
     let committed_undriven: Vec<&str> = channels
         .iter()
         .filter(|e| e["support"] == "supported" && e["verification"] == "not_driven")
@@ -410,7 +412,7 @@ async fn get_channels_publishes_the_catalog_with_both_axes() {
         .collect();
     assert_eq!(
         committed_undriven,
-        vec!["discord", "slack", "whatsapp", "whatsapp_web"],
+        vec!["whatsapp"],
         "supported-but-undriven is a legitimate state and must survive: {body}"
     );
 
