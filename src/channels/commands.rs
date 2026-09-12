@@ -24,8 +24,10 @@ pub(crate) enum ChannelRuntimeCommand {
     Reset,
     /// A slash command the runtime does not know, as it was typed.
     UnknownCommand(String),
-    /// An unknown command carrying `@<name>`. In a Telegram group it may be
-    /// meant for another bot, and the runtime cannot tell, so it says nothing.
+    /// A command carrying `@<name>` where the name is not this bot's, or where
+    /// this bot never learned its own name. Any verb, known or not: in a group
+    /// holding several bots, `/new@otherbot` is not ours to answer, and a bot
+    /// that cannot tell stays quiet rather than answering for someone else.
     AddressedElsewhere,
 }
 
@@ -102,6 +104,7 @@ fn is_command_name(name: &str) -> bool {
 pub(crate) fn parse_runtime_command(
     channel_name: &str,
     content: &str,
+    bot_username: Option<&str>,
 ) -> Option<ChannelRuntimeCommand> {
     if !supports_runtime_model_switch(channel_name) {
         return None;
@@ -117,6 +120,15 @@ pub(crate) fn parse_runtime_command(
     };
     let base_command = base.to_ascii_lowercase();
     let arguments: Vec<&str> = parts.collect();
+    // The approval and pairing stages match on the whole message and know
+    // nothing about `@name`, so they are asked about the form with the name
+    // taken out. Without this, `/approve@thisbot shell` missed their guard, then
+    // passed the addressing arm because the name WAS ours, and was answered with
+    // a command list instead of reaching the stage that owns it.
+    let without_name = match addressed_to {
+        Some(name) => std::borrow::Cow::Owned(content.replacen(&format!("@{name}"), "", 1)),
+        None => std::borrow::Cow::Borrowed(content),
+    };
 
     // Without a prefix the verb also starts ordinary sentences ("model apa yang
     // kamu pakai?"), so a bare-verb channel takes the verb alone or the verb and
@@ -126,6 +138,31 @@ pub(crate) fn parse_runtime_command(
     }
 
     match base_command.as_str() {
+        // Approval replies and pairing codes are consumed before a message
+        // reaches the runtime commands. Claiming one here would break that
+        // order, so the stages that own them are asked, not copied. This arm
+        // stays first: addressing must not steal a message another stage owns.
+        _ if super::approval_relay::is_approval_reply(&without_name)
+            || super::pairing::parse_pairing_command(&without_name).is_some() =>
+        {
+            None
+        }
+        // Addressing is settled before any verb is matched. `/new@otherbot` used
+        // to reach the `"new" | "clear"` arm below and clear THIS bot's
+        // conversation for the whole group (F-23). A command carrying a name
+        // runs only when the name is ours, and a bot that cannot learn its own
+        // name answers none of them: staying quiet beats answering for someone
+        // else.
+        // Anything this channel would treat as a command, carrying a name that is
+        // not ours, is not ours to answer. The test is whether the token is a
+        // command HERE, not whether the channel uses a prefix: gating on the
+        // prefix left bare `model@otherbot` on Slack running this bot's own
+        // `model`, which is F-23 with a different spelling.
+        _ if addressed_to.is_some_and(|name| !addressed_to_this_bot(name, bot_username))
+            && is_command_on_this_channel(&base_command, prefix) =>
+        {
+            Some(ChannelRuntimeCommand::AddressedElsewhere)
+        }
         "models" => Some(match arguments.first() {
             Some(provider) => ChannelRuntimeCommand::SetProvider(provider.trim().to_string()),
             None => ChannelRuntimeCommand::ShowProviders,
@@ -144,20 +181,38 @@ pub(crate) fn parse_runtime_command(
         _ if prefix.is_empty() => None,
         "start" | "help" => Some(ChannelRuntimeCommand::Welcome),
         "new" | "clear" => Some(ChannelRuntimeCommand::Reset),
-        // Approval replies and pairing codes are consumed before a message
-        // reaches the runtime commands. Claiming one here would break that
-        // order, so the stages that own them are asked, not copied.
-        _ if super::approval_relay::is_approval_reply(content)
-            || super::pairing::parse_pairing_command(content).is_some() =>
-        {
-            None
-        }
         _ if !is_command_name(&base_command) => None,
-        _ if addressed_to.is_some() => Some(ChannelRuntimeCommand::AddressedElsewhere),
         _ => Some(ChannelRuntimeCommand::UnknownCommand(format!(
             "{prefix}{base}"
         ))),
     }
+}
+
+/// Whether `@name` on a command names this bot.
+///
+/// Case-insensitive, because Telegram renders a username however the sender
+/// typed it. `None` for the bot's own name means it never learned it, and then
+/// no addressed command is ours: the safe direction.
+/// Would this channel act on this verb at all?
+///
+/// `model` and `models` are answered everywhere, including the bare-verb
+/// channels. The slash verbs and the unknown-command reply exist only where a
+/// prefix does: on a bare-verb channel a leading slash is ordinary text, so
+/// `/foo@otherbot` there is chat and must reach the model untouched.
+fn is_command_on_this_channel(base_command: &str, prefix: &str) -> bool {
+    match base_command {
+        "model" | "models" => true,
+        _ if prefix.is_empty() => false,
+        _ => is_command_name(base_command),
+    }
+}
+
+/// Neither side carries an `@`: `verb.split_once('@')` hands back the part after
+/// the separator, and [`traits::Channel::bot_username`] documents the bot's own
+/// name as being without one. Trimming here would have been defence against
+/// input both contracts already exclude.
+fn addressed_to_this_bot(addressed_to: &str, bot_username: Option<&str>) -> bool {
+    bot_username.is_some_and(|own| own.eq_ignore_ascii_case(addressed_to))
 }
 
 pub(crate) fn build_models_help_response(
@@ -302,7 +357,21 @@ pub(crate) async fn handle_runtime_command_if_needed(
     msg: &traits::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> bool {
-    let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
+    // Asked before parsing, because whether this is a command at all depends on
+    // whose name it carries — but only when it carries one. Telegram caches the
+    // answer, yet the trait promises no implementer will, and the first call is
+    // a network round trip either way: ordinary chat must not pay for it.
+    let carries_a_name = msg
+        .content
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| token.contains('@'));
+    let bot_username = match target_channel.filter(|_| carries_a_name) {
+        Some(channel) => channel.bot_username().await,
+        None => None,
+    };
+    let Some(command) = parse_runtime_command(&msg.channel, &msg.content, bot_username.as_deref())
+    else {
         return false;
     };
 
@@ -441,6 +510,143 @@ mod tests {
         }
     }
 
+    /// F-23, the red-first test: a known command carrying someone else's name
+    /// must never be executed. Before this change all six verbs ran, because the
+    /// verb arms were matched long before anything looked at the name.
+    #[test]
+    fn a_known_command_addressed_to_another_bot_is_not_executed() {
+        let mut executed = Vec::new();
+
+        for verb in ["new", "clear", "start", "help", "model", "models"] {
+            let addressed_elsewhere = format!("/{verb}@otherbot");
+            if !matches!(
+                parse_runtime_command("telegram", &addressed_elsewhere, Some("rantaiclaw_bot")),
+                None | Some(ChannelRuntimeCommand::AddressedElsewhere)
+            ) {
+                executed.push(addressed_elsewhere);
+            }
+        }
+
+        assert!(
+            executed.is_empty(),
+            "these ran for a bot that is not us: {executed:?}"
+        );
+    }
+
+    /// The other half, which the refusal test cannot show: a command addressed
+    /// to THIS bot still runs, and the name match ignores case because Telegram
+    /// renders a username however the sender typed it. Without this, a mutation
+    /// making `addressed_to_this_bot` always false would pass everything else.
+    #[test]
+    fn a_known_command_addressed_to_this_bot_still_runs() {
+        let mut refused = Vec::new();
+
+        for (verb, want) in [
+            ("new", ChannelRuntimeCommand::Reset),
+            ("clear", ChannelRuntimeCommand::Reset),
+            ("start", ChannelRuntimeCommand::Welcome),
+            ("help", ChannelRuntimeCommand::Welcome),
+        ] {
+            for name in ["rantaiclaw_bot", "RantaiClaw_Bot"] {
+                let addressed_here = format!("/{verb}@{name}");
+                let got =
+                    parse_runtime_command("telegram", &addressed_here, Some("rantaiclaw_bot"));
+                if got.as_ref() != Some(&want) {
+                    refused.push(format!("{addressed_here}: got {got:?}, want {want:?}"));
+                }
+            }
+        }
+
+        assert!(
+            refused.is_empty(),
+            "a command addressed to this bot must run: {refused:?}"
+        );
+    }
+
+    /// The safe direction, and the one a mutation would quietly reverse: a bot
+    /// that never learned its own name answers no addressed command at all.
+    /// Answering one meant for another bot is worse than staying quiet, so an
+    /// unknown name must refuse rather than match.
+    #[test]
+    fn a_bot_that_does_not_know_its_name_answers_no_addressed_command() {
+        let mut ran = Vec::new();
+
+        for verb in ["new", "clear", "start", "help", "model", "models"] {
+            let addressed = format!("/{verb}@anyone");
+            if parse_runtime_command("telegram", &addressed, None)
+                != Some(ChannelRuntimeCommand::AddressedElsewhere)
+            {
+                ran.push(addressed);
+            }
+        }
+
+        assert!(
+            ran.is_empty(),
+            "with no name known, nothing addressed may run: {ran:?}"
+        );
+    }
+
+    /// The hole the spec review found, and the one my own Slack test missed
+    /// because every input I tried began with a slash. A bare verb is a command
+    /// on Slack, so carrying someone else's name must refuse it there too.
+    #[test]
+    fn a_bare_verb_addressed_to_another_bot_is_refused_on_slack() {
+        for input in ["model@otherbot", "models@otherbot"] {
+            assert_eq!(
+                parse_runtime_command("slack", input, Some("rantaiclaw_bot")),
+                Some(ChannelRuntimeCommand::AddressedElsewhere),
+                "{input:?} would have run this bot's own command"
+            );
+        }
+    }
+
+    /// An approval reply addressed to this bot belongs to the approval stage, not
+    /// to the runtime commands. It used to miss the guard, because
+    /// `is_approval_reply` never splits `@`, and end up answered with a command
+    /// list.
+    #[test]
+    fn an_approval_reply_addressed_to_this_bot_is_left_to_the_approval_stage() {
+        for input in [
+            "/approve@rantaiclaw_bot shell",
+            "/deny@rantaiclaw_bot shell",
+            "/claim@rantaiclaw_bot CODE",
+        ] {
+            assert_eq!(
+                parse_runtime_command("telegram", input, Some("rantaiclaw_bot")),
+                None,
+                "{input:?} is owned by another stage and must pass through"
+            );
+        }
+    }
+
+    /// The plan lists `model` among the verbs to cover with a matching name, and
+    /// it is the only one that carries an argument.
+    #[test]
+    fn a_model_switch_addressed_to_this_bot_still_runs() {
+        assert_eq!(
+            parse_runtime_command(
+                "telegram",
+                "/model@rantaiclaw_bot gpt-5",
+                Some("rantaiclaw_bot")
+            ),
+            Some(ChannelRuntimeCommand::SetModel("gpt-5".to_string()))
+        );
+    }
+
+    /// A bare-verb channel has no `@` convention, so a token that merely looks
+    /// like an addressed command there is ordinary chat. This is the row that
+    /// caught the regression: the rule used to silence `/foo@otherbot` on Slack.
+    #[test]
+    fn an_addressed_looking_token_on_a_bare_verb_channel_reaches_the_model() {
+        for input in ["/foo@otherbot", "/start@rantaiclaw_bot", "/new@otherbot"] {
+            assert_eq!(
+                parse_runtime_command("slack", input, Some("rantaiclaw_bot")),
+                None,
+                "Slack has no slash commands, so {input:?} is chat"
+            );
+        }
+    }
+
     /// The command grammar on each tier channel, as data. Slack cannot send a
     /// leading slash, so it takes the bare verb; the other tier channels take
     /// the slash form and treat a bare `model` as chat. On a bare-verb channel
@@ -493,7 +699,7 @@ mod tests {
         let mut mismatches = Vec::new();
         for (channel, expected) in table {
             for (input, want) in inputs.iter().zip(expected.iter()) {
-                let got = parse_runtime_command(channel, input);
+                let got = parse_runtime_command(channel, input, None);
                 if &got != want {
                     mismatches.push(format!("{channel} {input:?}: got {got:?}, want {want:?}"));
                 }
@@ -527,7 +733,7 @@ mod tests {
     fn slack_never_answers_new_or_clear() {
         for input in ["new", "clear", "/new", "/clear"] {
             assert_eq!(
-                parse_runtime_command("slack", input),
+                parse_runtime_command("slack", input, None),
                 None,
                 "Slack must not answer {input:?}"
             );
@@ -637,7 +843,11 @@ mod tests {
             "/etc/hosts",
             "/home/rantaiclaw_user/notes.txt please read it",
         ] {
-            assert_eq!(parse_runtime_command("telegram", text), None, "{text}");
+            assert_eq!(
+                parse_runtime_command("telegram", text, None),
+                None,
+                "{text}"
+            );
         }
     }
 }

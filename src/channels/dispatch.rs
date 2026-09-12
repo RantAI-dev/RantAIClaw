@@ -261,6 +261,23 @@ pub(crate) fn extract_tool_context_summary(history: &[ChatMessage], start_index:
 pub(crate) const CHANNEL_EMPTY_REPLY_FALLBACK: &str =
     "I worked on that but don't have a final answer to show — want me to try again?";
 
+/// What a conversation is told when its provider cannot be built.
+///
+/// The command is spelled with the prefix this channel can actually deliver.
+/// Slack's prefix is empty, so the hardcoded `/models` this replaces named a
+/// command Slack never receives (F-23's smaller sibling). `command_prefix`
+/// exists for exactly this.
+pub(crate) fn provider_init_failure_message(
+    provider: &str,
+    safe_err: &str,
+    prefix: &str,
+) -> String {
+    format!(
+        "⚠️ Failed to initialize provider `{provider}`. Please run `{prefix}models` to choose \
+         another provider.\nDetails: {safe_err}"
+    )
+}
+
 /// Make a reply safe to deliver to a human: strip a leading internal
 /// `[Used tools: …]` annotation (that belongs in history, not the chat) and
 /// substitute a graceful message when nothing meaningful remains. The tool
@@ -477,9 +494,10 @@ pub(crate) async fn process_channel_message(
         Ok(provider) => provider,
         Err(err) => {
             let safe_err = providers::sanitize_api_error(&err.to_string());
-            let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
-                route.provider
+            let message = provider_init_failure_message(
+                &route.provider,
+                &safe_err,
+                commands::command_prefix(&msg.channel),
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel.send(&msg.reply(message)).await;

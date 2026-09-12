@@ -138,6 +138,20 @@ pub trait Channel: Send + Sync {
         None
     }
 
+    /// This bot's own username on the platform, without the `@`.
+    ///
+    /// Used to decide whether `/new@somebot` is addressed to us. Defaults to
+    /// `None`, which is the safe side twice over: a platform with no `@`
+    /// convention never produces an addressed command in the first place, and a
+    /// bot that cannot learn its own name answers no addressed command at all.
+    /// Answering one meant for another bot is worse than staying quiet (F-23).
+    ///
+    /// Async because the name comes from the platform's API on Telegram, where
+    /// it is fetched once and cached.
+    async fn bot_username(&self) -> Option<String> {
+        None
+    }
+
     /// Replace this channel's runtime sender allowlist.
     ///
     /// Called by the channels runtime when `config.toml` changes, so an allowlist

@@ -16,9 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/clear` as an alias, clears the conversation's history in memory and in `brain.db`, and the reply
   says that long-term memory is kept and names `rantaiclaw memory clear` as the way to remove it.
   `/start`, which Telegram sends when someone first opens a bot, and `/help` get a short welcome with
-  the same list. An unknown command carrying an `@<name>` in a Telegram group gets no reply, since
-  it may be addressed to another bot. Approval replies and pairing codes are handled before any of
-  this and behave as before. Slack needs no reset command, because a new top-level message already
+  the same list. A command carrying an `@<name>` in a Telegram group is handled by the rule described
+  under Fixed below, which replaced this entry's narrower one. Approval replies and pairing codes are
+  handled before any of this and behave as before. Slack needs no reset command, because a new top-level message already
   starts a new conversation. The channels reference has a new section on clearing a conversation,
   including what a reset does not clear.
 - **`/model` and `/models` now work on Slack and WhatsApp Web, not only on Telegram and Discord.**
@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A slash command addressed to another bot no longer runs here.** `parse_runtime_command` split
+  `@<name>` off the verb and then matched the verb first, so `model`, `models`, `start`, `help`, `new`
+  and `clear` were all answered before anything looked at who the command was for; only an unknown
+  command ever consulted the name. In a Telegram group that meant `/new@otherbot` cleared this bot's
+  conversation for everyone in the room, and `/model@otherbot` switched this bot's model. Addressing
+  is now settled before any verb is matched, though still after the approval and pairing guard, which
+  deliberately declines so the stage that owns those messages can consume them. A command carrying a
+  name runs only when the name is this bot's, compared case-insensitively, and a bot that cannot learn
+  its own name answers no addressed command at all. `Channel::bot_username` is a new defaulted trait
+  method returning `None`, so channels with no `@` convention are unaffected, and Telegram answers it
+  from the cache it already keeps. Separately, the provider-failure message now spells its command
+  with the channel's own prefix, so Slack reads `models` rather than a slash form it can never
+  deliver.
 - **The model can no longer pass off the runtime's tool summary as its own.** `[Used tools: …]` is
   built by the runtime from the tools that actually ran and added to the history entry, never to the
   delivered reply, so a label inside a reply is one the model typed. On 2026-09-12 two Telegram
