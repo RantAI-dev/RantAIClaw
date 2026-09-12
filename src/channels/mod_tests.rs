@@ -7040,6 +7040,84 @@ fn extract_tool_context_summary_respects_start_index() {
     assert_eq!(summary, "[Used tools: fresh_tool]");
 }
 
+/// F-24, Telegram 2026-09-12. Two replies reached the chat carrying
+/// `[Used tools: shell]` at 06:38:11 and `[Used tools: file_read]` at 12:20:14,
+/// and the audit holds no tool call in either turn: the model typed them. The
+/// runtime builds its own summary from the tools that actually ran and adds it
+/// to the history entry, never to the delivered reply, so a label inside a reply
+/// is by definition forged. `clean_delivered_reply` only ever caught a leading
+/// one, and only its first line.
+#[test]
+fn a_forged_tool_summary_in_the_middle_is_stripped() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let out = sanitize::sanitize_channel_response(
+        "Here is the file.\n[Used tools: file_read]\nLet me know if you need more.",
+        &tools,
+    );
+
+    assert!(!out.contains("[Used tools:"), "{out}");
+    assert!(out.contains("Here is the file."), "{out}");
+    assert!(out.contains("Let me know if you need more."), "{out}");
+}
+
+#[test]
+fn a_forged_tool_summary_at_the_end_is_stripped() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let out = sanitize::sanitize_channel_response("All set.\n[Used tools: shell]", &tools);
+
+    assert!(!out.contains("[Used tools:"), "{out}");
+    assert!(out.contains("All set."), "{out}");
+}
+
+#[test]
+fn two_forged_tool_summaries_are_both_stripped() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let out = sanitize::sanitize_channel_response(
+        "[Used tools: shell]\nFirst.\n[Used tools: file_read]\nSecond.",
+        &tools,
+    );
+
+    assert!(!out.contains("[Used tools:"), "{out}");
+    assert!(out.contains("First.") && out.contains("Second."), "{out}");
+}
+
+/// The 12:20:14 shape: the label sat inside prose, above an invented config
+/// file, which is what made a fabrication read like a tool's output.
+#[test]
+fn a_forged_tool_summary_inside_a_paragraph_is_stripped() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let out = sanitize::sanitize_channel_response(
+        "I checked the file [Used tools: file_read] and it holds your settings.",
+        &tools,
+    );
+
+    assert!(!out.contains("[Used tools:"), "{out}");
+    assert!(out.contains("I checked the file"), "{out}");
+    assert!(out.contains("it holds your settings."), "{out}");
+}
+
+/// The leading case too, so the rule lives in one place rather than half here
+/// and half in `clean_delivered_reply`.
+#[test]
+fn a_leading_forged_tool_summary_is_stripped_by_the_sanitizer() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let out = sanitize::sanitize_channel_response("[Used tools: cron_list]\nAll set.", &tools);
+
+    assert!(!out.contains("[Used tools:"), "{out}");
+    assert!(out.contains("All set."), "{out}");
+}
+
+/// Plan 360 step 4: the empty-reply fallback stays, so a reply that was nothing
+/// but a forged label still says something rather than arriving as an empty
+/// bubble. Green before this change and after it, which is the point.
+#[test]
+fn a_reply_that_was_only_a_forged_label_still_says_something() {
+    assert_eq!(
+        clean_delivered_reply("[Used tools: cron_list, manage_permissions]"),
+        CHANNEL_EMPTY_REPLY_FALLBACK
+    );
+}
+
 #[test]
 fn clean_delivered_reply_strips_leading_tool_annotation() {
     let out = clean_delivered_reply("[Used tools: cron_list]\nAll set.");

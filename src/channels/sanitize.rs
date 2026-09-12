@@ -16,7 +16,65 @@ pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>])
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
     let without_tool_json = strip_isolated_tool_json_artifacts(response, &known_tool_names);
-    strip_internal_history_notes(&without_tool_json)
+    let (without_forged_summaries, forged) = strip_forged_tool_summaries(&without_tool_json);
+    if forged > 0 {
+        // The count, never the text. Every one of these is a forgery by
+        // definition, so how often the model does it is worth seeing.
+        tracing::warn!(
+            forged,
+            "stripped a tool summary the model wrote; the runtime never puts its own in a delivered reply"
+        );
+    }
+    strip_internal_history_notes(&without_forged_summaries)
+}
+
+/// Remove every `[Used tools: …]` label the model typed, and count them.
+///
+/// `[Used tools: …]` is the runtime's own vocabulary. It is built from the tools
+/// that actually ran and added to the **history** entry, never to the delivered
+/// reply, so a label inside a reply is by definition one the model wrote itself.
+///
+/// F-24, 2026-09-12: two Telegram replies carried one with no tool call in the
+/// turn at all, at 06:38:11 and 12:20:14. The second sat above an invented
+/// config file, which is what made a fabrication read like a tool's output. The
+/// runtime cannot make the model honest; it can stop repeating the claim.
+///
+/// Wherever the label sits, not just at the start. The journal no longer keeps
+/// message text (plan 352), so the exact shape that slipped past the old
+/// leading-only check is not recoverable, and a fix that depends on where the
+/// label sits would be guessing.
+fn strip_forged_tool_summaries(message: &str) -> (String, usize) {
+    const OPEN: &str = "[Used tools:";
+
+    let mut cleaned = String::with_capacity(message.len());
+    let mut rest = message;
+    let mut forged = 0;
+
+    while let Some(start) = rest.find(OPEN) {
+        cleaned.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        // Bounded by the line, like the attachment markers: a `]` further down
+        // the reply closes a different thought, and taking it would swallow
+        // every line in between.
+        let line_end = after_open.find('\n').unwrap_or(after_open.len());
+        rest = match after_open[..line_end].find(']') {
+            Some(close) => &after_open[close + 1..],
+            None => &after_open[line_end..],
+        };
+        forged += 1;
+    }
+    cleaned.push_str(rest);
+
+    // Only the blank run a stripped label can leave behind, the way
+    // `strip_isolated_tool_json_artifacts` already collapses its own. Spacing
+    // inside a line is left alone on purpose: the model's prose is not ours to
+    // reflow, and a global squeeze would edit replies that never carried a
+    // label at all.
+    let mut cleaned = cleaned;
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+    (cleaned.trim().to_string(), forged)
 }
 
 /// Remove the runtime's own history bookkeeping from an outgoing reply.

@@ -402,9 +402,20 @@ file, in the same thread as the reply. The text of a reply is sent before its
 attachments on every channel, so that line says the attachment did not arrive
 rather than that the answer was lost, and a reply that was only markers gets the
 same line instead of silence. History then keeps the text the person read plus
-`(the attachment was not delivered)`, and all four internal history notes are
+`(the attachment was not delivered)`, and all five internal history notes are
 stripped from outgoing replies, so a model that parrots its own history cannot
 deliver the runtime's bookkeeping to a reader.
+
+A `[Used tools: …]` label inside a reply is stripped as well, wherever in the
+reply it sits. That label is the runtime's own vocabulary: it is built from the
+tools that actually ran and added to the **history** entry, never to the
+delivered reply, so one that appears in a reply is a label the model typed. On
+2026-09-12 two Telegram replies carried one with no tool call in the turn at all,
+and the second sat above an invented config file, which is what made a
+fabrication read like a tool's output. The runtime cannot make the model honest,
+so it stops repeating the claim and logs a WARN carrying a count and no text, so
+an operator can see how often it happens. A reply that was nothing but a label
+still gets the ordinary empty-reply answer rather than an empty bubble.
 
 A local path goes through `media::resolve_attachment_path_in_workspace`, the same
 way on every channel: a leading `~/` expands against `$HOME`, a relative path is
