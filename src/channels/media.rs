@@ -777,6 +777,90 @@ mod tests {
         );
     }
 
+    /// F-29, Slack 2026-09-12 12:39:09 UTC. Asked for a file that did not
+    /// exist, the model explained what it would do and wrote the marker inside
+    /// backticks as an illustration. The parser took the illustration for a
+    /// request, the journal recorded `attachment path not found: ...` with the
+    /// literal three dots as the target, and the reader saw the example with its
+    /// insides eaten.
+    #[test]
+    fn a_marker_inside_an_inline_span_is_an_example_not_a_request() {
+        let (text, attachments) =
+            parse_attachment_markers("Tulis begini: `[DOCUMENT:/w/catatan.txt]` lalu kirim.");
+
+        assert!(attachments.is_empty(), "{attachments:?}");
+        assert!(
+            text.contains("`[DOCUMENT:/w/catatan.txt]`"),
+            "the example must survive whole, backticks included: {text}"
+        );
+    }
+
+    /// The instruction ends with "never wrap a marker in code fences", so a
+    /// marker inside a fenced block is by definition an example.
+    #[test]
+    fn a_marker_inside_a_fenced_block_is_an_example_not_a_request() {
+        let (text, attachments) = parse_attachment_markers(
+            "Contohnya:\n```\n[DOCUMENT:/w/catatan.txt]\n```\nBegitu caranya.",
+        );
+
+        assert!(attachments.is_empty(), "{attachments:?}");
+        assert!(
+            text.contains("[DOCUMENT:/w/catatan.txt]"),
+            "the fenced example must survive: {text}"
+        );
+    }
+
+    /// The exact shape seen live: three dots standing in for a path.
+    #[test]
+    fn a_three_dot_placeholder_is_not_a_path() {
+        let (text, attachments) =
+            parse_attachment_markers("Misalnya [DOCUMENT:...] di akhir balasan.");
+
+        assert!(attachments.is_empty(), "{attachments:?}");
+        assert!(text.contains("[DOCUMENT:...]"), "{text}");
+    }
+
+    /// `<path-or-url>` is the placeholder `delivery_instructions_for` prints, so
+    /// a model quoting the instruction back is quoting this.
+    #[test]
+    fn an_angle_bracket_placeholder_is_not_a_path() {
+        let (text, attachments) =
+            parse_attachment_markers("Sintaksnya [DOCUMENT:<path-or-url>] persis begitu.");
+
+        assert!(attachments.is_empty(), "{attachments:?}");
+        assert!(text.contains("[DOCUMENT:<path-or-url>]"), "{text}");
+    }
+
+    /// The control. Outside code, with a real path, nothing changes: this is the
+    /// case every delivery depends on, and the rules above must not cost it.
+    #[test]
+    fn a_real_marker_outside_code_still_attaches() {
+        let (text, attachments) = parse_attachment_markers("Ini dia [DOCUMENT:/w/catatan.txt]");
+
+        assert_eq!(attachments.len(), 1, "{attachments:?}");
+        assert_eq!(attachments[0].target, "/w/catatan.txt");
+        assert!(
+            !text.contains("[DOCUMENT:"),
+            "a real marker must not reach the reader: {text}"
+        );
+    }
+
+    /// Both rules at once, in the shape a reply actually takes: an explanation
+    /// carrying an example, and one real attachment at the end.
+    #[test]
+    fn an_explanation_with_one_real_marker_attaches_exactly_one_file() {
+        let (text, attachments) = parse_attachment_markers(
+            "Begini caranya:\n```\n[IMAGE:<path-or-url>]\n```\nDan ini berkasnya [DOCUMENT:/w/catatan.txt]",
+        );
+
+        assert_eq!(attachments.len(), 1, "{attachments:?}");
+        assert_eq!(attachments[0].target, "/w/catatan.txt");
+        assert!(
+            text.contains("[IMAGE:<path-or-url>]"),
+            "the example must survive beside the real one: {text}"
+        );
+    }
+
     /// Collect the WARN lines emitted while `run` executes.
     ///
     /// The first log capture in this crate, and it earns its keep: the whole
@@ -906,6 +990,58 @@ pub fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
+/// Whether a marker's target is a stand-in rather than a path.
+///
+/// F-29, Slack 2026-09-12: the model wrote `[DOCUMENT:...]` while explaining
+/// what it would do, and the parser tried to attach a file called `...`.
+/// `<path-or-url>` is the placeholder [`delivery_instructions_for`] itself
+/// prints, so a model quoting the instruction back quotes exactly this.
+fn is_placeholder_target(target: &str) -> bool {
+    target == "..." || (target.len() > 2 && target.starts_with('<') && target.ends_with('>'))
+}
+
+/// Whether the scan is currently inside inline code or a fenced block.
+///
+/// Not a Markdown parser, and it does not need to be. The scan already walks
+/// every byte between one marker and the next, so counting backtick runs in what
+/// it already walks answers the only question here: does the next `[` sit inside
+/// code? A run of three or more toggles a fenced block; a shorter run toggles an
+/// inline span, which a newline closes, the way CommonMark closes it.
+#[derive(Default)]
+struct CodeScanner {
+    in_fence: bool,
+    in_span: bool,
+}
+
+impl CodeScanner {
+    fn consume(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '`' => {
+                    let mut run = 1;
+                    while chars.peek() == Some(&'`') {
+                        chars.next();
+                        run += 1;
+                    }
+                    if run >= 3 {
+                        self.in_fence = !self.in_fence;
+                        self.in_span = false;
+                    } else if !self.in_fence {
+                        self.in_span = !self.in_span;
+                    }
+                }
+                '\n' => self.in_span = false,
+                _ => {}
+            }
+        }
+    }
+
+    fn in_code(&self) -> bool {
+        self.in_fence || self.in_span
+    }
+}
+
 /// Split a reply into the text a human reads and the attachments to upload.
 ///
 /// A bracketed run that is not a valid marker is left in the text verbatim, so
@@ -922,6 +1058,7 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachmen
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
     let mut cursor = 0;
+    let mut code = CodeScanner::default();
 
     while cursor < message.len() {
         let Some(open_rel) = message[cursor..].find('[') else {
@@ -931,6 +1068,17 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachmen
 
         let open = cursor + open_rel;
         cleaned.push_str(&message[cursor..open]);
+        code.consume(&message[cursor..open]);
+
+        // A marker inside code is an example, so the bracket is ordinary text
+        // and the scan reads on. Advancing by one character rather than past the
+        // whole marker is deliberate: the next pass then walks the marker body
+        // and the closing backtick, which is what closes the span.
+        if code.in_code() {
+            cleaned.push('[');
+            cursor = open + 1;
+            continue;
+        }
 
         // The closing bracket has to be on this marker's line. A `]` further
         // down the reply closes a different thought, and accepting it as this
@@ -956,7 +1104,7 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachmen
         let parsed = marker.split_once(':').and_then(|(kind, target)| {
             let kind = AttachmentKind::from_marker(kind)?;
             let target = target.trim();
-            if target.is_empty() {
+            if target.is_empty() || is_placeholder_target(target) {
                 return None;
             }
             Some(OutboundAttachment {
@@ -993,6 +1141,11 @@ fn recover_unclosed_marker(fragment: &str) -> Option<OutboundAttachment> {
     let (kind, target) = fragment.trim_start_matches('[').split_once(':')?;
     let kind = AttachmentKind::from_marker(kind)?;
     let target = target.trim();
+    // An example that happens to be unclosed is still an example. Warning about
+    // it would be noise, not the trace of a delivery that failed.
+    if is_placeholder_target(target) {
+        return None;
+    }
     let resolvable = !target.is_empty()
         && !is_http_url(target)
         && std::path::Path::new(target).is_absolute()
