@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of a slash command that cannot arrive. WhatsApp Cloud registers under WhatsApp Web's
   channel name and answers the slash form as well.
 
+### Changed
+
+- **The catalog says that Discord, Slack and WhatsApp Web have been driven.** It still read "not yet
+  verified" for three channels the owner drove himself on 2026-09-11 and 2026-09-12, against real
+  accounts on this host: commands answered, files delivered, and a delivery-failure notice produced on
+  purpose. The web console was not at fault, because it stopped keeping its own copy and reads
+  `/api/v1/channels`, so the stale fact sat in the runtime. `channel list`, `status`, the TUI panels and
+  `doctor` all render from the same array and move with it. WhatsApp Cloud stays "not yet verified":
+  nobody has driven it, and that combination of a support commitment without evidence is the state the
+  two axes exist to tell apart, so it keeps the middle state represented rather than leaving the axes to
+  collapse into one. Four static surfaces move with the catalog because a CI gate fails closed on them:
+  the per-key table in the channels reference, the `ChannelsConfig` doc comments, the JSON-schema
+  snapshot those comments reach verbatim, and the two tests that pin each axis. The evidence table now
+  carries dates instead of "never". No support value moved, no config key was added, and the schema
+  stays at 32, because only description text changed.
+
 ### Fixed
 
 - **A slash command addressed to another bot no longer runs here.** `parse_runtime_command` split

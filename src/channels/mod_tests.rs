@@ -7888,11 +7888,12 @@ fn catalog_declares_seventeen_channels_and_five_supported() {
 /// The verification axis, pinned separately from the one above.
 ///
 /// Separately on purpose. These are two different facts, and a single assertion
-/// covering both would pass while one of them silently moved. Telegram is the
-/// only channel anyone has driven (#770); the other three supported channels
-/// have no credential on any machine this project has run on.
+/// covering both would pass while one of them silently moved. Telegram was the
+/// only driven channel until 2026-09-12, when the owner drove Discord, Slack and
+/// WhatsApp Web against real accounts on this host. WhatsApp Cloud still has no
+/// credential anywhere this project has run.
 #[test]
-fn catalog_declares_exactly_one_driven_channel() {
+fn the_catalog_names_the_four_channels_that_were_driven() {
     let driven: Vec<&str> = CHANNEL_CATALOG
         .iter()
         .filter(|(_, _, _, verification)| *verification == ChannelVerification::Driven)
@@ -7901,7 +7902,7 @@ fn catalog_declares_exactly_one_driven_channel() {
 
     assert_eq!(
         driven,
-        vec!["telegram"],
+        vec!["telegram", "discord", "slack", "whatsapp_web"],
         "the driven set changed — that is evidence, and it moves only when a \
          round trip was actually run and written down"
     );
@@ -7910,10 +7911,12 @@ fn catalog_declares_exactly_one_driven_channel() {
 /// `Supported` + `NotDriven` is a state the catalog is allowed to be in.
 ///
 /// This test exists to stop a future contributor "fixing" the inconsistency by
-/// demoting Discord, Slack and WhatsApp. Those three carry the owner's
+/// demoting a channel nobody has driven yet. WhatsApp Cloud carries the owner's
 /// commitment and no evidence, and that combination is the honest answer, not a
-/// gap. If this assertion ever fails because the set became empty, check that
-/// somebody drove them rather than that somebody demoted them.
+/// gap. Three of its former companions left this set on 2026-09-12 the only way
+/// a row may leave it: somebody drove them. If this assertion ever fails because
+/// the set became empty, check that somebody drove the last one rather than that
+/// somebody demoted it.
 #[test]
 fn committed_but_undriven_is_a_legitimate_state() {
     let committed_undriven: Vec<&str> = CHANNEL_CATALOG
@@ -7926,9 +7929,10 @@ fn committed_but_undriven_is_a_legitimate_state() {
 
     assert_eq!(
         committed_undriven,
-        vec!["discord", "slack", "whatsapp", "whatsapp_web"],
-        "the committed-but-undriven set changed; demoting one of these discards \
-         an owner decision to make a label look tidy"
+        vec!["whatsapp"],
+        "the committed-but-undriven set changed; demoting the last one discards \
+         an owner decision to make a label look tidy, and emptying it would leave \
+         the middle state unrepresented"
     );
 }
 
