@@ -814,9 +814,10 @@ impl Channel for WhatsAppWebChannel {
     /// WhatsApp Web can deliver attachments, so the model is told the syntax.
     /// Telling a channel that cannot leaks `[IMAGE:…]` to the reader as literal
     /// text, which is why this is per-channel and not a default.
-    fn delivery_instructions(&self) -> Option<&'static str> {
-        static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        Some(TEXT.get_or_init(|| crate::channels::media::delivery_instructions_for("WhatsApp")))
+    fn delivery_instructions(&self, workspace: &std::path::Path) -> Option<String> {
+        Some(crate::channels::media::delivery_instructions_for(
+            "WhatsApp", workspace,
+        ))
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -1918,7 +1919,7 @@ mod media_tests {
     fn whatsapp_web_tells_the_model_the_marker_syntax() {
         let ch = WhatsAppWebChannel::new("/tmp/wa.db".into(), None, None, vec!["*".into()]);
         let text = ch
-            .delivery_instructions()
+            .delivery_instructions(std::path::Path::new("/ws/rantaiclaw"))
             .expect("whatsapp web can deliver attachments");
         assert!(text.contains("WhatsApp"), "{text}");
         for marker in ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"] {

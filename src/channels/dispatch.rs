@@ -587,17 +587,20 @@ pub(crate) async fn process_channel_message(
         &base_prompt,
         &crate::agent::prompt::render_persona_section(),
     );
+    // The channel declares its own media support. A channel that cannot deliver
+    // an attachment must not be told it can, or the model emits markers that
+    // reach the user as literal text. Bound here rather than inline because the
+    // text is owned now: it names the workspace path (plan 356).
+    let delivery_instructions = ctx
+        .channels_by_name
+        .get(&msg.channel)
+        .and_then(|channel| channel.delivery_instructions(ctx.workspace_dir.as_path()));
     let system_prompt = prompt::build_channel_system_prompt(
         &base_prompt,
         &msg.channel,
         &msg.reply_target,
         sender_is_owner,
-        // The channel declares its own media support. A channel that cannot
-        // deliver an attachment must not be told it can, or the model emits
-        // markers that reach the user as literal text.
-        ctx.channels_by_name
-            .get(&msg.channel)
-            .and_then(|channel| channel.delivery_instructions()),
+        delivery_instructions.as_deref(),
     );
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);

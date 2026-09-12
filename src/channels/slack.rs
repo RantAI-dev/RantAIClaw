@@ -689,9 +689,10 @@ impl Channel for SlackChannel {
     /// Slack can deliver attachments, so the model is told the marker syntax.
     /// Telling a channel that cannot leaks `[IMAGE:…]` to the reader as literal
     /// text, which is why this is per-channel rather than a default.
-    fn delivery_instructions(&self) -> Option<&'static str> {
-        static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        Some(TEXT.get_or_init(|| crate::channels::media::delivery_instructions_for("Slack")))
+    fn delivery_instructions(&self, workspace: &std::path::Path) -> Option<String> {
+        Some(crate::channels::media::delivery_instructions_for(
+            "Slack", workspace,
+        ))
     }
 
     async fn listen(
@@ -1112,7 +1113,7 @@ mod outbound_media_tests {
     #[test]
     fn slack_tells_the_model_the_marker_syntax() {
         let text = channel()
-            .delivery_instructions()
+            .delivery_instructions(std::path::Path::new("/ws/rantaiclaw"))
             .expect("slack can deliver attachments");
         assert!(text.contains("Slack"), "{text}");
         for marker in ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"] {
@@ -1124,7 +1125,8 @@ mod outbound_media_tests {
     /// must not leak literal markers on another.
     #[test]
     fn slack_and_discord_teach_the_same_markers() {
-        let slack = channel().delivery_instructions().expect("slack");
+        let workspace = std::path::Path::new("/ws/rantaiclaw");
+        let slack = channel().delivery_instructions(workspace).expect("slack");
         let discord = crate::channels::discord::DiscordChannel::new(
             "t".into(),
             None,
@@ -1132,15 +1134,15 @@ mod outbound_media_tests {
             false,
             false,
         )
-        .delivery_instructions()
+        .delivery_instructions(workspace)
         .expect("discord");
         let strip = |s: &str| {
             s.replace("Slack", "<platform>")
                 .replace("Discord", "<platform>")
         };
         assert_eq!(
-            strip(slack),
-            strip(discord),
+            strip(&slack),
+            strip(&discord),
             "the marker vocabulary must not fork per channel"
         );
     }

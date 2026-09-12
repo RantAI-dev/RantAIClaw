@@ -408,9 +408,10 @@ impl Channel for DiscordChannel {
     /// Telling a channel that cannot deliver them leaks `[IMAGE:…]` to the
     /// reader as literal text, which is why this is per-channel and not a
     /// default.
-    fn delivery_instructions(&self) -> Option<&'static str> {
-        static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        Some(TEXT.get_or_init(|| crate::channels::media::delivery_instructions_for("Discord")))
+    fn delivery_instructions(&self, workspace: &std::path::Path) -> Option<String> {
+        Some(crate::channels::media::delivery_instructions_for(
+            "Discord", workspace,
+        ))
     }
 }
 
@@ -846,7 +847,7 @@ mod outbound_media_tests {
     #[test]
     fn discord_tells_the_model_the_marker_syntax() {
         let text = channel()
-            .delivery_instructions()
+            .delivery_instructions(std::path::Path::new("/ws/rantaiclaw"))
             .expect("discord can deliver attachments");
         assert!(text.contains("Discord"), "{text}");
         for marker in ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"] {
@@ -858,15 +859,16 @@ mod outbound_media_tests {
     /// channel must not leak literal markers on another.
     #[test]
     fn discord_and_telegram_teach_the_same_markers() {
-        let discord = channel().delivery_instructions().expect("discord");
-        let telegram = crate::channels::telegram::telegram_delivery_instructions();
+        let workspace = std::path::Path::new("/ws/rantaiclaw");
+        let discord = channel().delivery_instructions(workspace).expect("discord");
+        let telegram = crate::channels::telegram::telegram_delivery_instructions(workspace);
         let strip = |s: &str| {
             s.replace("Discord", "<platform>")
                 .replace("Telegram", "<platform>")
         };
         assert_eq!(
-            strip(discord),
-            strip(telegram),
+            strip(&discord),
+            strip(&telegram),
             "the marker vocabulary must not fork per channel"
         );
     }

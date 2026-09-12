@@ -350,8 +350,8 @@ default, chosen deliberately rather than inherited.
 ## Outbound Media Markers
 
 A channel that can deliver attachments tells the model the marker syntax through
-`Channel::delivery_instructions()`. The model then writes one marker per
-attachment and the channel splits them out of the reply before sending:
+`Channel::delivery_instructions(workspace)`. The model then writes one marker
+per attachment and the channel splits them out of the reply before sending:
 
 ```text
 Here is the chart. [IMAGE:/workspace/chart.png]
@@ -361,6 +361,25 @@ Here is the chart. [IMAGE:/workspace/chart.png]
 local path or an `http(s)` URL. One vocabulary for every channel, built by
 `media::delivery_instructions_for`, so a reply written on one channel does not
 leak literal markers on another.
+
+The instruction says what the runtime actually does, not only the syntax. It
+states that attaching a file needs no tool call and no approval, that a local
+path must be absolute and inside the workspace and names that path, that the
+file has to exist before the marker is sent, and that markers go at the end of
+the reply and never inside code fences. Syntax alone was not enough: on
+2026-09-12 the same request produced a file on WhatsApp while Telegram answered
+that it could not send attachments at all and emitted no marker, and Slack
+guessed a `~/` path. Naming the workspace is why the method takes it.
+
+A marker that never closes is not silent either. The closing bracket is looked
+for on the marker's own line, so a `]` further down the reply no longer swallows
+every line in between. A known marker kind that opens without one is logged at
+WARN naming the kind and the target, and when the rest of the line is an
+absolute path to a file that exists it is delivered anyway, so the reader gets
+the file the model meant. Otherwise the text is left exactly as written and
+nothing is lost. Workspace confinement is unchanged and is still decided by
+`media::resolve_attachment_path_in_workspace` on the send path, which fails
+closed.
 
 When an attachment cannot be delivered, the conversation gets one line naming the
 file, in the same thread as the reply. The text of a reply is sent before its
