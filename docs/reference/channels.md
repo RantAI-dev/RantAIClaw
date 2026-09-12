@@ -362,6 +362,15 @@ local path or an `http(s)` URL. One vocabulary for every channel, built by
 `media::delivery_instructions_for`, so a reply written on one channel does not
 leak literal markers on another.
 
+When an attachment cannot be delivered, the conversation gets one line naming the
+file, in the same thread as the reply. The text of a reply is sent before its
+attachments on every channel, so that line says the attachment did not arrive
+rather than that the answer was lost, and a reply that was only markers gets the
+same line instead of silence. History then keeps the text the person read plus
+`(the attachment was not delivered)`, and all four internal history notes are
+stripped from outgoing replies, so a model that parrots its own history cannot
+deliver the runtime's bookkeeping to a reader.
+
 A local path goes through `media::resolve_attachment_path_in_workspace`, the same
 way on every channel: a leading `~/` expands against `$HOME`, a relative path is
 taken from the workspace root rather than the daemon's working directory, and an

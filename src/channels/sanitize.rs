@@ -1,8 +1,11 @@
-//! Reply sanitisation: strip tool-call JSON the model emitted as prose.
+//! Reply sanitisation: what must come out of a reply before a person reads it.
 //!
-//! Moved out of `mod.rs` verbatim (plan 121, row 2). No behaviour change — the
-//! functions and their tests are the same text, in a file whose one
-//! responsibility is naming what they do.
+//! Two kinds of text the reader should never see: tool-call JSON the model emitted
+//! as prose, and the runtime's own history bookkeeping, which a model can parrot
+//! back out of its context (plan 355).
+//!
+//! The tool-call half moved out of `mod.rs` verbatim in plan 121, row 2, and is
+//! still that same text.
 
 use crate::tools::Tool;
 use std::collections::HashSet;
@@ -12,7 +15,29 @@ pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>])
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+    let without_tool_json = strip_isolated_tool_json_artifacts(response, &known_tool_names);
+    strip_internal_history_notes(&without_tool_json)
+}
+
+/// Remove the runtime's own history bookkeeping from an outgoing reply.
+///
+/// `UNDELIVERED_TURN_MARKER` and its siblings are appended to history so the
+/// model knows its last turn did not land. On 2026-09-12 a model read one back as
+/// its answer: WhatsApp received exactly `(the previous reply was not delivered)`,
+/// 38 characters, as the bot's reply to a request. Bookkeeping the model may
+/// repeat must never reach a person. All four notes, not just that one: they are
+/// one family, and a model that parrots one parrots the others.
+fn strip_internal_history_notes(message: &str) -> String {
+    let mut cleaned = message.to_string();
+    for note in [
+        super::UNDELIVERED_TURN_MARKER,
+        super::UNDELIVERED_ATTACHMENT_NOTE,
+        super::TIMED_OUT_TURN_MARKER,
+        super::FAILED_TURN_MARKER,
+    ] {
+        cleaned = cleaned.replace(note, "");
+    }
+    cleaned.trim().to_string()
 }
 
 pub(crate) fn is_tool_call_payload(

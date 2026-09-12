@@ -4523,6 +4523,332 @@ async fn a_conversation_gets_one_restart_notice_however_many_messages_it_had() {
     drop(tx);
 }
 
+// ── a failed attachment is visible (plan 355) ───────────
+
+/// A channel that records every attempt and refuses the ones carrying an
+/// attachment marker. That is how all four tier channels fail: the text goes
+/// first, the upload after, and the upload is what breaks.
+#[derive(Default)]
+struct AttachmentFailingChannel {
+    attempts: tokio::sync::Mutex<Vec<SendMessage>>,
+}
+
+#[async_trait::async_trait]
+impl Channel for AttachmentFailingChannel {
+    fn name(&self) -> &str {
+        "test-channel"
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.attempts.lock().await.push(message.clone());
+        let (_text, attachments) =
+            crate::channels::media::parse_attachment_markers(&message.content);
+        if attachments.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("attachment path not found: {}", attachments[0].target);
+        }
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        _cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A provider that answers with one fixed reply, so a test can pin exactly what
+/// the channel was asked to deliver.
+struct FixedReplyProvider {
+    reply: String,
+}
+
+#[async_trait::async_trait]
+impl Provider for FixedReplyProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(self.reply.clone())
+    }
+}
+
+/// Plan 355 (F-16): the text landed, the attachment did not, and the chat was
+/// told nothing — observed four times on 2026-09-12. The conversation now gets
+/// one line naming the file, in its own thread, and history keeps what the
+/// person actually read rather than claiming the whole reply was lost.
+#[tokio::test]
+async fn a_failed_attachment_tells_the_conversation_and_history_keeps_what_was_read() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AttachmentFailingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(FixedReplyProvider {
+            reply: "Ini dia: [DOCUMENT:/tmp/catatan.txt]".to_string(),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    process_channel_message(
+        Arc::clone(&ctx),
+        drain_message("chat-1"),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let attempts = channel_impl.attempts.lock().await;
+    assert_eq!(
+        attempts.len(),
+        2,
+        "the reply, then one notice: {attempts:?}"
+    );
+    assert!(
+        attempts[0].content.contains("[DOCUMENT:"),
+        "the first attempt is the reply itself: {attempts:?}"
+    );
+    let notice = &attempts[1];
+    assert!(
+        notice.content.contains("catatan.txt"),
+        "the notice must name the file: {notice:?}"
+    );
+    assert!(
+        !notice.content.contains("[DOCUMENT:"),
+        "the notice must not carry a marker of its own: {notice:?}"
+    );
+    assert_eq!(notice.thread_ts.as_deref(), Some("thread-chat-1"));
+    assert_eq!(notice.reply_anchor.as_deref(), Some("anchor-chat-1"));
+    drop(attempts);
+
+    let key = conversation_history_key(&drain_message("chat-1"));
+    let histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let turns = histories.get(&key).expect("history for the conversation");
+    let last = turns.last().expect("an assistant turn");
+    assert_eq!(last.role, "assistant");
+    assert!(
+        last.content.contains("Ini dia:") && last.content.contains(UNDELIVERED_ATTACHMENT_NOTE),
+        "history keeps the text read plus the note: {last:?}"
+    );
+    assert!(
+        !last.content.contains(UNDELIVERED_TURN_MARKER),
+        "the blanket marker claims too much: {last:?}"
+    );
+}
+
+/// Control for the test above: a reply whose attachment goes through sends one
+/// message and records the reply itself, so the notice cannot be firing on
+/// success.
+#[tokio::test]
+async fn a_delivered_reply_gets_no_notice_and_no_note() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(FixedReplyProvider {
+            reply: "Ini dia: [DOCUMENT:/tmp/catatan.txt]".to_string(),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    process_channel_message(
+        Arc::clone(&ctx),
+        drain_message("chat-1"),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let sent = channel_impl.sent.lock().await;
+    assert_eq!(sent.len(), 1, "one send, no notice: {sent:?}");
+    drop(sent);
+
+    let key = conversation_history_key(&drain_message("chat-1"));
+    let histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let last = histories
+        .get(&key)
+        .and_then(|turns| turns.last())
+        .expect("an assistant turn");
+    assert!(
+        !last.content.contains(UNDELIVERED_ATTACHMENT_NOTE)
+            && !last.content.contains(UNDELIVERED_TURN_MARKER),
+        "a delivered reply records no note: {last:?}"
+    );
+}
+
+/// Plan 355 (F-26): a reply that was only a marker sent no text at all, so the
+/// chat showed nothing — no file, no message, no error. Telegram, 06:38:25 and
+/// 06:38:48 on 2026-09-12.
+#[tokio::test]
+async fn a_marker_only_reply_is_not_silence() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AttachmentFailingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(FixedReplyProvider {
+            reply: "[DOCUMENT:/tmp/catatan.txt]".to_string(),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    process_channel_message(
+        Arc::clone(&ctx),
+        drain_message("chat-1"),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let attempts = channel_impl.attempts.lock().await;
+    assert_eq!(
+        attempts.len(),
+        2,
+        "the reply, then one notice: {attempts:?}"
+    );
+    assert!(
+        attempts[1].content.contains("catatan.txt"),
+        "the notice must name the file: {attempts:?}"
+    );
+}
+
+/// Plan 355 (F-28): on 2026-09-12 a model read the runtime's own bookkeeping
+/// back to the user — WhatsApp received exactly `(the previous reply was not
+/// delivered)`, 38 characters. Bookkeeping the model may repeat never goes out.
+#[test]
+fn the_runtimes_own_history_notes_never_reach_the_chat() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    for note in [
+        UNDELIVERED_TURN_MARKER,
+        UNDELIVERED_ATTACHMENT_NOTE,
+        TIMED_OUT_TURN_MARKER,
+        FAILED_TURN_MARKER,
+    ] {
+        let out = sanitize::sanitize_channel_response(&format!("Here you go. {note}"), &tools);
+        assert!(!out.contains(note), "`{note}` survived: {out}");
+        assert!(out.contains("Here you go."), "{out}");
+    }
+}
+
+/// Plan 355 step 4, second clause: stripping the runtime's own note can empty a
+/// reply. What goes out is then the existing fallback rather than silence. The
+/// test pins the promise — something non-empty, and never the note itself —
+/// rather than the sentence, which names malformed tool output even though the
+/// cause here was a parroted note.
+#[tokio::test]
+async fn a_reply_that_was_only_an_internal_note_still_says_something() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(FixedReplyProvider {
+            reply: UNDELIVERED_TURN_MARKER.to_string(),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    process_channel_message(
+        Arc::clone(&ctx),
+        drain_message("chat-1"),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let sent = channel_impl.sent.lock().await;
+    assert_eq!(sent.len(), 1, "one reply, not silence: {sent:?}");
+    assert!(
+        !sent[0].content.contains(UNDELIVERED_TURN_MARKER),
+        "the note itself must never go out: {sent:?}"
+    );
+    assert!(
+        !sent[0].content.trim().is_empty(),
+        "an empty bubble is not an answer: {sent:?}"
+    );
+}
+
+/// The classifier reads what the person saw from the reply's shape. The
+/// end-to-end tests above prove dispatch calls it; this pins its decisions.
+#[test]
+fn a_failed_delivery_is_classified_by_what_the_person_saw() {
+    let half = DeliveryFailure::classify("Ini dia: [DOCUMENT:/tmp/catatan.txt]");
+    assert_eq!(
+        half,
+        DeliveryFailure::TextDelivered {
+            files: vec!["catatan.txt".to_string()],
+        }
+    );
+    assert!(half.notice().contains("catatan.txt"));
+
+    // History is what the next turn reasons from, so it keeps the text the person
+    // read and the model's own tool summary, without the markers.
+    let recorded = half.history_entry("[Used tools: shell]\nIni dia: [DOCUMENT:/tmp/catatan.txt]");
+    assert!(
+        recorded.contains("[Used tools: shell]")
+            && recorded.contains("Ini dia:")
+            && recorded.contains(UNDELIVERED_ATTACHMENT_NOTE),
+        "{recorded}"
+    );
+    assert!(!recorded.contains("[DOCUMENT:"), "{recorded}");
+
+    // A channel uploads in order and stops at the first failure, so with several
+    // markers the notice must not claim a file the person may have received.
+    let several = DeliveryFailure::classify(
+        "Dua berkas: [DOCUMENT:/tmp/a.txt] [IMAGE:https://example.com/chart.png]",
+    );
+    let notice = several.notice();
+    let lowered = notice.to_lowercase();
+    assert!(
+        lowered.contains("at least one")
+            && lowered.contains("a.txt")
+            && lowered.contains("chart.png"),
+        "{notice}"
+    );
+    assert!(
+        !notice.contains("I could not attach a.txt"),
+        "naming one file as failed is a claim this side cannot make: {notice}"
+    );
+
+    let marker_only = DeliveryFailure::classify("[DOCUMENT:/tmp/catatan.txt]");
+    assert_eq!(
+        marker_only,
+        DeliveryFailure::NothingSent {
+            files: vec!["catatan.txt".to_string()],
+        }
+    );
+    assert!(marker_only.notice().contains("catatan.txt"));
+    assert_eq!(
+        marker_only.history_entry("[DOCUMENT:/tmp/catatan.txt]"),
+        UNDELIVERED_TURN_MARKER
+    );
+
+    let plain = DeliveryFailure::classify("just text");
+    assert_eq!(plain, DeliveryFailure::NothingSent { files: Vec::new() });
+    assert!(!plain.notice().contains("attach"), "{}", plain.notice());
+    assert_eq!(plain.history_entry("just text"), UNDELIVERED_TURN_MARKER);
+}
+
 /// A reply inside a Slack thread, as Slack's own classifier builds it.
 fn slack_thread_reply() -> traits::ChannelMessage {
     let channel = crate::channels::slack::SlackChannel::new(

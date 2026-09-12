@@ -159,6 +159,13 @@ const UNDELIVERED_TURN_MARKER: &str = "(the previous reply was not delivered)";
 const TIMED_OUT_TURN_MARKER: &str = "(the previous attempt timed out)";
 const FAILED_TURN_MARKER: &str = "(the previous attempt failed)";
 
+/// Recorded in history, after the text the person actually read, when the text
+/// reached the chat and the attachment did not (plan 355).
+///
+/// `UNDELIVERED_TURN_MARKER` would claim the whole reply was lost, and the model's
+/// next turn would then answer a question the user had already been answered.
+const UNDELIVERED_ATTACHMENT_NOTE: &str = "(the attachment was not delivered)";
+
 /// What a conversation is told when a restart stops its turn before the
 /// answer, or stops a message before its turn began (plan 353, decision D3).
 /// Nothing is replayed after the restart, so the user decides whether to send

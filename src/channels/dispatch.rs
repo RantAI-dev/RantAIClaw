@@ -7,11 +7,12 @@
 
 use super::traits;
 use super::{
-    approval_relay, channel_message_timeout_budget_secs, commands, conversation, history, prompt,
-    routing, sanitize, supervisor, ChannelRuntimeContext, AUTOSAVE_MIN_MESSAGE_CHARS,
+    approval_relay, channel_message_timeout_budget_secs, commands, conversation, history, media,
+    prompt, routing, sanitize, supervisor, ChannelRuntimeContext, AUTOSAVE_MIN_MESSAGE_CHARS,
     CHANNEL_DRAIN_DEADLINE, CHANNEL_NOTICE_SEND_TIMEOUT, FAILED_TURN_MARKER,
     IN_FLIGHT_COMPLETION_WAIT_TIMEOUT, MEMORY_CONTEXT_ENTRY_MAX_CHARS, MEMORY_CONTEXT_MAX_CHARS,
-    MEMORY_CONTEXT_MAX_ENTRIES, RESTART_NOTICE, TIMED_OUT_TURN_MARKER, UNDELIVERED_TURN_MARKER,
+    MEMORY_CONTEXT_MAX_ENTRIES, RESTART_NOTICE, TIMED_OUT_TURN_MARKER, UNDELIVERED_ATTACHMENT_NOTE,
+    UNDELIVERED_TURN_MARKER,
 };
 use crate::agent::loop_::run_tool_call_loop;
 use crate::memory::Memory;
@@ -277,6 +278,143 @@ pub(crate) fn clean_delivered_reply(text: &str) -> String {
         CHANNEL_EMPTY_REPLY_FALLBACK.to_string()
     } else {
         s.to_string()
+    }
+}
+
+/// What a person saw when a reply could not be delivered (plan 355).
+///
+/// Every channel sends the text first and each attachment after, aborting on the
+/// first failure, so the shape of the reply says what reached the chat: text plus
+/// a marker means they read the text and never got the file, while a reply that
+/// was only markers means they saw nothing at all. `Channel::send` returns one
+/// `Result` and cannot say which, so this reads the reply dispatch just tried to
+/// send instead of changing the trait.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryFailure {
+    /// Nothing reached the chat: either there was no attachment to blame, or the
+    /// reply was only markers so no text was sent before the upload failed.
+    NothingSent { files: Vec<String> },
+    /// The text reached the chat; at least one of these attachments did not.
+    TextDelivered { files: Vec<String> },
+}
+
+impl DeliveryFailure {
+    /// Read the shape from the reply that was attempted.
+    pub(crate) fn classify(reply: &str) -> Self {
+        let (text, attachments) = media::parse_attachment_markers(reply);
+        let files: Vec<String> = attachments
+            .iter()
+            .map(|attachment| attachment_display_name(&attachment.target))
+            .collect();
+        if files.is_empty() || text.trim().is_empty() {
+            return Self::NothingSent { files };
+        }
+        Self::TextDelivered { files }
+    }
+
+    /// The one line the conversation is told. It never claims the answer was
+    /// lost when the text went through, because the text goes first everywhere.
+    pub(crate) fn notice(&self) -> String {
+        let (files, tail) = match self {
+            Self::NothingSent { files } if files.is_empty() => {
+                return "I could not deliver my last reply. Please ask again.".to_string();
+            }
+            Self::NothingSent { files } => (
+                files,
+                "There was nothing else in that reply, so please ask again.",
+            ),
+            Self::TextDelivered { files } => (files, "The message above is the rest of my reply."),
+        };
+        format!("{} {tail}", attachment_phrase(files))
+    }
+
+    /// What history records, given the reply this turn would have recorded.
+    ///
+    /// The model's next turn has to work from what the person actually read, so a
+    /// half-delivered reply keeps that text — the `[Used tools: …]` summary
+    /// included, since it is the model's own bookkeeping — with the markers
+    /// removed and a note added. The blanket marker stays for a reply that never
+    /// left.
+    pub(crate) fn history_entry(&self, recorded: &str) -> String {
+        match self {
+            Self::NothingSent { .. } => UNDELIVERED_TURN_MARKER.to_string(),
+            Self::TextDelivered { .. } => {
+                let (text, _) = media::parse_attachment_markers(recorded);
+                format!("{text}\n{UNDELIVERED_ATTACHMENT_NOTE}")
+            }
+        }
+    }
+}
+
+/// Which attachments to blame.
+///
+/// A channel uploads the markers in order and stops at the first failure, so with
+/// one marker the name is certain. With several, all that is true is that at least
+/// one of them did not arrive: naming them all as failed would claim a file the
+/// person may well have received.
+fn attachment_phrase(files: &[String]) -> String {
+    match files {
+        [only] => format!("I could not attach {only}."),
+        _ => format!(
+            "At least one attachment did not arrive ({}).",
+            human_list(files)
+        ),
+    }
+}
+
+/// The last segment of the target: the file name for a path, and the final
+/// segment of a URL. Falls back to the target as written when there is no segment
+/// to take.
+fn attachment_display_name(target: &str) -> String {
+    std::path::Path::new(target)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(target)
+        .to_string()
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn human_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Tell the conversation that delivery failed (plan 355).
+///
+/// Best-effort and bounded like the restart notice, so a platform that does not
+/// answer cannot hold the turn open, and logged by message id rather than text.
+async fn send_delivery_failure_notice(
+    channel: &dyn traits::Channel,
+    msg: &traits::ChannelMessage,
+    failure: &DeliveryFailure,
+) {
+    let outbound = msg.reply(failure.notice());
+    let (channel_name, message_id) = (channel.name(), msg.id.as_str());
+    match tokio::time::timeout(CHANNEL_NOTICE_SEND_TIMEOUT, channel.send(&outbound)).await {
+        Ok(Ok(())) => {
+            tracing::info!(
+                channel = channel_name,
+                message_id,
+                "told the conversation that delivery failed"
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                channel = channel_name,
+                message_id,
+                "could not send the delivery notice: {e}"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                channel = channel_name,
+                message_id,
+                "delivery notice timed out"
+            );
+        }
     }
 }
 
@@ -709,14 +847,24 @@ pub(crate) async fn process_channel_message(
                 true
             };
 
+            // A failed send is not silence (plan 355). The conversation is told
+            // what did not arrive, and history keeps what the person actually
+            // read: on every channel the text goes first and the attachment
+            // after, so a blanket "not delivered" would make the model answer a
+            // question the user had already been answered.
+            let recorded = if delivered {
+                history_response
+            } else {
+                let failure = DeliveryFailure::classify(&delivered_response);
+                if let Some(channel) = target_channel.as_ref() {
+                    send_delivery_failure_notice(channel.as_ref(), &msg, &failure).await;
+                }
+                failure.history_entry(&history_response)
+            };
             history::append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
-                if delivered {
-                    ChatMessage::assistant(&history_response)
-                } else {
-                    ChatMessage::assistant(UNDELIVERED_TURN_MARKER)
-                },
+                ChatMessage::assistant(recorded),
             );
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
