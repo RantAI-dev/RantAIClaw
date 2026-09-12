@@ -362,6 +362,14 @@ local path or an `http(s)` URL. One vocabulary for every channel, built by
 `media::delivery_instructions_for`, so a reply written on one channel does not
 leak literal markers on another.
 
+A local path goes through `media::resolve_attachment_path_in_workspace`, the same
+way on every channel: a leading `~/` expands against `$HOME`, a relative path is
+taken from the workspace root rather than the daemon's working directory, and an
+absolute path is used as written. The file must then exist and sit inside the
+workspace, or the attachment is refused and the error names the path the model
+wrote. Until 2026-09-12 each channel checked the string as written, so only the
+absolute form ever arrived.
+
 **All four tier channels can deliver attachments**: Telegram, Discord, Slack and
 WhatsApp Web. Every other channel returns `None` and is never told the syntax,
 because telling a channel that cannot deliver them leaks `[IMAGE:…]` to the

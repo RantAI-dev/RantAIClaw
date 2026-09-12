@@ -1484,33 +1484,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             };
         }
 
-        let path = Path::new(target);
-        if !path.exists() {
-            anyhow::bail!("Telegram attachment path not found: {target}");
-        }
-
         // Confine local attachments to the workspace: a reply (which a channel
         // guest can influence or prompt-inject) must not exfiltrate arbitrary
         // host files — the config with API keys/bot token, ssh keys — to the
-        // chat. Mirrors the file_* tool sandbox. Resolve the active workspace
-        // lazily here (attachments are infrequent) and fail closed.
-        let (_config_path, workspace_dir) = Config::resolve_active_paths()
-            .await
-            .context("cannot resolve workspace to validate attachment path")?;
-        if !crate::channels::media::path_within_workspace(path, &workspace_dir) {
-            anyhow::bail!(
-                "Telegram attachment path is outside the workspace and was blocked: {target}"
-            );
-        }
+        // chat. Mirrors the file_* tool sandbox. One resolver for every channel
+        // expands `~`, resolves a relative path against the workspace rather
+        // than the daemon's working directory, checks the file exists, and fails
+        // closed outside the workspace.
+        let path = crate::channels::media::resolve_attachment_path_in_workspace("Telegram", target)
+            .await?;
 
         match attachment.kind {
-            TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, path, None).await,
+            TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, &path, None).await,
             TelegramAttachmentKind::Document => {
-                self.send_document(chat_id, thread_id, path, None).await
+                self.send_document(chat_id, thread_id, &path, None).await
             }
-            TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, path, None).await,
+            TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, &path, None).await,
+            TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, &path, None).await,
+            TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, &path, None).await,
         }
     }
 

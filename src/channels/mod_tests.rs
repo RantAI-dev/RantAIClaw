@@ -7532,14 +7532,23 @@ fn every_tier_channel_with_inbound_media_charges_the_shared_budget() {
 /// the chat. Telegram has always checked; Discord is the second channel to
 /// upload, and a third will come.
 ///
-/// This is a class guard because testing `path_within_workspace` directly does
-/// **not** catch the failure that matters: deleting the *call* from a send path
-/// leaves every such test green. Verified by mutation — that is how this guard
-/// came to exist.
+/// This is a class guard because testing the resolver directly does **not**
+/// catch the failure that matters: deleting the *call* from a send path leaves
+/// every such test green. Verified by mutation — that is how this guard came to
+/// exist.
+///
+/// Since plan 354 the existence check, the path forms and the confinement check
+/// all live in `media::resolve_attachment_path_in_workspace`, so this guard pins
+/// two things per channel: that the sender goes through the resolver, and that it
+/// no longer builds a `Path` from the raw target. A sender doing its own
+/// `Path::new(target)` is how the four drifted into accepting only an absolute
+/// path. What the resolver then refuses is covered behaviourally by the unit
+/// tests in `media.rs`.
 #[test]
 fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
     // Assembled at runtime so this test does not match itself.
-    let confine = format!("media::path_within_{}(", "workspace");
+    let confine = format!("media::resolve_attachment_path_in_{}(", "workspace");
+    let raw_target = format!("Path::{}(target)", "new");
     let wiring: &[(&str, &str, &str)] = &[
         (
             "telegram",
@@ -7575,8 +7584,15 @@ fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
         let body = &body[..end];
         assert!(
             body.contains(confine.as_str()),
-            "{channel}: `{sender}` uploads a local path without confining it to \
-             the workspace — a reply could exfiltrate the config"
+            "{channel}: `{sender}` uploads a local path without going through the \
+             resolver, so it neither confines the path to the workspace nor \
+             accepts the path forms the model writes"
+        );
+        assert!(
+            !body.contains(raw_target.as_str()),
+            "{channel}: `{sender}` builds a path from the raw target again — a \
+             relative path then resolves against the daemon's working directory \
+             instead of the workspace"
         );
     }
 }

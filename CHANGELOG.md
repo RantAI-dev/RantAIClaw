@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An attachment the model named with a bare file name or a `~/` path is now delivered.** Every
+  channel checked the marker's path exactly as the model wrote it, so a relative path resolved
+  against the daemon's working directory instead of the workspace where `file_write` puts files, and
+  `~` was never expanded. In one afternoon the model produced all three forms: `test123.txt` on
+  Telegram and `~/.rantaiclaw/profiles/default/workspace/catatan.txt` on Slack both failed with
+  "attachment path not found", while the absolute form was delivered. Telegram, Discord, Slack and
+  WhatsApp Web now share one resolver: `~/` expands against `$HOME`, a relative path joins the
+  workspace root, an absolute path is taken as written, and the file must then exist and pass the
+  unchanged workspace confinement check. That check still refuses `../` and anything outside the
+  workspace, so a reply a guest can influence cannot post `config.toml` into a chat.
 - **A restart no longer cuts off a reply in silence.** A `rantaiclaw service restart` during a reply
   aborted the turn eight seconds after SIGTERM: the daemon gave the gateway and channels eight
   seconds each in turn, the gateway normally exits at once, and its unused time was lost. Drives on
