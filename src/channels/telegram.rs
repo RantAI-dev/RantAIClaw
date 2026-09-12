@@ -1915,6 +1915,14 @@ impl Channel for TelegramChannel {
         Some(telegram_delivery_instructions(workspace))
     }
 
+    /// One `getMe` per process: `get_bot_username` caches, and this is the
+    /// second reader of that cache. Fetched regardless of `mention_only` now,
+    /// because deciding whether `/new@name` is ours needs the name in every
+    /// group, not only in the groups where mentions are required.
+    async fn bot_username(&self) -> Option<String> {
+        self.get_bot_username().await
+    }
+
     fn render_target(&self) -> crate::channels::format::RenderTarget {
         crate::channels::format::RenderTarget::TelegramHtml
     }
@@ -2227,9 +2235,11 @@ impl Channel for TelegramChannel {
     ) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 
-        if self.mention_only {
-            let _ = self.get_bot_username().await;
-        }
+        // Whatever `mention_only` says. Deciding whether `/new@name` is ours
+        // needs the name in every group, and `get_bot_username` caches only a
+        // success: left to the command path, a failed `getMe` would be retried
+        // inline on every addressed message (plan 361).
+        let _ = self.get_bot_username().await;
 
         tracing::info!("Telegram channel listening for messages...");
 

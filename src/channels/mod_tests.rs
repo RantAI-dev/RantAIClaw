@@ -4180,6 +4180,10 @@ fn dispatch_ctx(
 /// removes Slack's working notice.
 struct AddressRecordingChannel {
     name: &'static str,
+    /// What this channel answers for `Channel::bot_username`. `None` is a bot
+    /// that never learned its own name, which must refuse every `@`-addressed
+    /// command on a slash channel (plan 361).
+    bot_username: Option<&'static str>,
     sent: tokio::sync::Mutex<Vec<SendMessage>>,
     stop_typing_calls: AtomicUsize,
 }
@@ -4188,8 +4192,16 @@ impl AddressRecordingChannel {
     fn named(name: &'static str) -> Self {
         Self {
             name,
+            bot_username: None,
             sent: tokio::sync::Mutex::new(Vec::new()),
             stop_typing_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn named_with_bot_username(name: &'static str, bot_username: &'static str) -> Self {
+        Self {
+            bot_username: Some(bot_username),
+            ..Self::named(name)
         }
     }
 }
@@ -4198,6 +4210,10 @@ impl AddressRecordingChannel {
 impl Channel for AddressRecordingChannel {
     fn name(&self) -> &str {
         self.name
+    }
+
+    async fn bot_username(&self) -> Option<String> {
+        self.bot_username.map(str::to_string)
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -4217,6 +4233,40 @@ impl Channel for AddressRecordingChannel {
         self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
+
+/// F-23's smaller sibling. The provider-failure message hardcoded `/models`,
+/// and Slack's prefix is empty, so on Slack it named a command that channel
+/// never delivers.
+///
+/// Fed back through the parser rather than compared as a string, because the
+/// question a reader would ask is not "does this text match a pattern" but "can
+/// this channel actually run what the message tells them to run". An earlier
+/// draft of this test rebuilt the sentence itself with `command_prefix`, which
+/// made it pass against the unfixed code: it was testing its own arithmetic.
+#[test]
+fn the_provider_failure_message_names_a_command_each_channel_can_run() {
+    let mut unusable = Vec::new();
+
+    for channel in ["telegram", "discord", "whatsapp", "slack"] {
+        let prefix = commands::command_prefix(channel);
+        let message = dispatch::provider_init_failure_message("openai", "boom", prefix);
+        let named = format!("{prefix}models");
+
+        if !message.contains(&format!("`{named}`")) {
+            unusable.push(format!(
+                "{channel}: message does not name `{named}`: {message}"
+            ));
+            continue;
+        }
+        if commands::parse_runtime_command(channel, &named, None).is_none() {
+            unusable.push(format!(
+                "{channel}: the message says to run `{named}`, which this channel does not accept"
+            ));
+        }
+    }
+
+    assert!(unusable.is_empty(), "{unusable:#?}");
 }
 
 // ── shutdown drain (plan 353) ────────────────────────────
@@ -5439,7 +5489,13 @@ async fn every_slash_command_gets_the_runtime_answer_its_channel_owes() {
 
     let mut mismatches = Vec::new();
     for (channel_name, expected) in table {
-        let channel_impl = Arc::new(AddressRecordingChannel::named(channel_name));
+        // Named, so `/start@rantaiclaw_bot` above is a command addressed to THIS
+        // bot and must still be answered. A nameless fixture refuses it, which
+        // is correct behaviour but proves only the refusal half of the rule.
+        let channel_impl = Arc::new(AddressRecordingChannel::named_with_bot_username(
+            channel_name,
+            "rantaiclaw_bot",
+        ));
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(ModelCaptureProvider::default());
         let ctx = dispatch_ctx(
@@ -5469,7 +5525,7 @@ async fn every_slash_command_gets_the_runtime_answer_its_channel_owes() {
             if calls == 0 {
                 for reply in &replies {
                     for form in named_commands(&reply.content) {
-                        if commands::parse_runtime_command(channel_name, &form).is_none() {
+                        if commands::parse_runtime_command(channel_name, &form, None).is_none() {
                             mismatches.push(format!(
                                 "{channel_name} {text:?}: the reply names `{form}`, which this channel does not accept"
                             ));
@@ -5610,7 +5666,7 @@ async fn every_command_a_runtime_reply_names_is_one_its_channel_accepts() {
         for reply in sent.iter() {
             for form in named_commands(&reply.content) {
                 assert!(
-                    commands::parse_runtime_command(channel_name, &form).is_some(),
+                    commands::parse_runtime_command(channel_name, &form, None).is_some(),
                     "{channel_name}: the reply names `{form}`, which this channel does not accept: {}",
                     reply.content
                 );

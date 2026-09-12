@@ -268,9 +268,14 @@ Telegram, Discord and WhatsApp Web answer three more kinds of slash command:
 - `/start` or `/help` returns a short welcome with the command list. Telegram sends `/start` by
   itself when someone first opens a bot, and the group form `/start@<botname>` works too.
 - Any other `/command` is answered by the runtime with the command list instead of reaching the
-  model, which used to invent a result. In a Telegram group, an unknown command carrying an
-  `@<name>` gets no reply at all, since it may be addressed to another bot; the runtime only knows
-  its own bot name when `mention_only` is on, so this applies to its own name as well.
+  model, which used to invent a result.
+- **A command carrying an `@<name>` runs only when the name is this bot's.** In a group holding
+  several bots, `/new@otherbot` used to clear this bot's conversation for the whole room, because the
+  verb was matched before anyone looked at the name. Now the name decides first, case-insensitively,
+  and a command addressed elsewhere gets no reply at all. A bot that cannot learn its own name
+  answers none of them: answering one meant for another bot is worse than staying quiet. The name is
+  fetched once per process on Telegram, whether or not `mention_only` is on, because the question
+  comes up in every group rather than only where mentions are required.
 
 Approval replies (`/approve`, `/deny`) and pairing (`/bind`, `/claim`) are handled before any of
 these and behave as before. Slack has no reset command: a new top-level message already starts a new
