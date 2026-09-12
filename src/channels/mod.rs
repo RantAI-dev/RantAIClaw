@@ -467,13 +467,13 @@ pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerificat
         "discord",
         "Discord",
         ChannelSupport::Supported,
-        ChannelVerification::NotDriven,
+        ChannelVerification::Driven,
     ),
     (
         "slack",
         "Slack",
         ChannelSupport::Supported,
-        ChannelVerification::NotDriven,
+        ChannelVerification::Driven,
     ),
     (
         "mattermost",
@@ -519,7 +519,7 @@ pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerificat
         "whatsapp_web",
         "WhatsApp Web",
         ChannelSupport::Supported,
-        ChannelVerification::NotDriven,
+        ChannelVerification::Driven,
     ),
     (
         "linq",

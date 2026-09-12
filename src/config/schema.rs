@@ -2795,9 +2795,9 @@ pub struct ChannelsConfig {
     pub cli: bool,
     /// Telegram bot channel configuration. Support: **supported**. Verification: **verified**.
     pub telegram: Option<TelegramConfig>,
-    /// Discord bot channel configuration. Support: **supported**. Verification: **not yet verified**.
+    /// Discord bot channel configuration. Support: **supported**. Verification: **verified**.
     pub discord: Option<DiscordConfig>,
-    /// Slack bot channel configuration. Support: **supported**. Verification: **not yet verified**.
+    /// Slack bot channel configuration. Support: **supported**. Verification: **verified**.
     pub slack: Option<SlackConfig>,
     /// Mattermost bot channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub mattermost: Option<MattermostConfig>,
@@ -2811,7 +2811,7 @@ pub struct ChannelsConfig {
     pub signal: Option<SignalConfig>,
     /// WhatsApp Cloud API channel configuration. Support: **supported**. Verification: **not yet verified**.
     pub whatsapp: Option<WhatsAppConfig>,
-    /// WhatsApp Web channel configuration. Support: **supported**. Verification: **not yet verified**.
+    /// WhatsApp Web channel configuration. Support: **supported**. Verification: **verified**.
     pub whatsapp_web: Option<WhatsAppWebConfig>,
     /// Linq Partner API channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub linq: Option<LinqConfig>,

@@ -818,7 +818,7 @@ expression: pretty
           "default": null
         },
         "discord": {
-          "description": "Discord bot channel configuration. Support: **supported**. Verification: **not yet verified**.",
+          "description": "Discord bot channel configuration. Support: **supported**. Verification: **verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/DiscordConfig"
@@ -973,7 +973,7 @@ expression: pretty
           "default": null
         },
         "slack": {
-          "description": "Slack bot channel configuration. Support: **supported**. Verification: **not yet verified**.",
+          "description": "Slack bot channel configuration. Support: **supported**. Verification: **verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/SlackConfig"
@@ -1026,7 +1026,7 @@ expression: pretty
           "default": null
         },
         "whatsapp_web": {
-          "description": "WhatsApp Web channel configuration. Support: **supported**. Verification: **not yet verified**.",
+          "description": "WhatsApp Web channel configuration. Support: **supported**. Verification: **verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/WhatsAppWebConfig"

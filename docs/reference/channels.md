@@ -53,11 +53,12 @@ fails the build when this table drifts from that catalog, on either axis.
 | **supported + not yet verified** | `supported · not yet verified` | **We commit to it and nobody has driven it yet. This is a legitimate state** |
 | under development + not yet verified | `under development · not yet verified` | Ships, outside what an alpha claims, and undriven |
 
-The middle state describes Discord, Slack and WhatsApp Cloud today. It is not an
-oversight and it is not something to tidy away. The owner committed to those
-three on 2026-09-04; nobody has driven them because no credential for them exists
-on any machine this project has run on. Both halves of that sentence are true at
-once, and the two labels say so.
+The middle state describes WhatsApp Cloud today. It is not an oversight and it is
+not something to tidy away. The owner committed to it on 2026-09-04; nobody has
+driven it because no credential for it exists on any machine this project has run
+on. Both halves of that sentence are true at once, and the two labels say so.
+Discord, Slack and WhatsApp Web sat here until 2026-09-12, and they left the only
+way a row may leave this state: somebody drove them.
 
 **Do not "fix" it by demoting them.** Moving a channel off the support axis
 discards an owner decision so that a label looks consistent, which is the
@@ -103,15 +104,15 @@ probing three channels the owner committed to.
 | Channel (catalog key) | Support | Verification |
 |---|---|---|
 | `telegram` | supported | verified |
-| `discord` | supported | not yet verified |
-| `slack` | supported | not yet verified |
+| `discord` | supported | verified |
+| `slack` | supported | verified |
 | `mattermost` | under development | not yet verified |
 | `webhook` | under development | not yet verified |
 | `imessage` | under development | not yet verified |
 | `matrix` | under development | not yet verified |
 | `signal` | under development | not yet verified |
 | `whatsapp` | supported | not yet verified |
-| `whatsapp_web` | supported | not yet verified |
+| `whatsapp_web` | supported | verified |
 | `linq` | under development | not yet verified |
 | `nextcloud_talk` | under development | not yet verified |
 | `email` | under development | not yet verified |
@@ -193,21 +194,21 @@ The README's channel table carries the same columns; the two are meant to agree.
 
 The supported tier is the owner's 2026-09-04 decision (§0). It is a statement of
 intent about what this project stands behind; it is **not**, by itself, a record
-that anything was run. As of 2026-09-08:
+that anything was run. As of 2026-09-12:
 
 | Supported channel | Credential available here | Driven |
 |---|---|---|
-| Telegram | yes | 2026-07, re-driven 2026-09-08 (see the row above) |
-| Discord | **no** | never |
-| Slack | **no** | driven before #778 landed, so void as evidence — re-drive owed |
-| WhatsApp Web | **no** | never |
+| Telegram | yes | 2026-07, re-driven 2026-09-08, and again on 2026-09-11 and 2026-09-12 |
+| Discord | yes | 2026-09-12, against a real bot: commands answered and a file delivered |
+| Slack | yes | 2026-09-12, against a real workspace: bare-verb commands, an upload, and a delivery-failure notice |
+| WhatsApp Web | yes | 2026-09-12, against a linked account: commands answered and files delivered both ways |
 | WhatsApp Cloud | **no** | never |
 
-Three of the four have no credential in any profile or environment on the
-machine this was checked from, so nobody can drive them without an account being
-provisioned first. They stay in the supported tier because the tier is the
-owner's call, not the executor's — but the gap between "supported" and "driven"
-is written down here rather than left for a reader to assume away.
+Four of the five now have a credential on the machine this was checked from, and
+the round trips are recorded with timestamps in the drive log rather than
+summarised here. WhatsApp Cloud has still never been driven, and it stays in the
+supported tier with no evidence: that combination is the owner's call to make and
+the honest answer to record, not a gap to tidy away.
 
 ### How a row becomes live-verified
 

@@ -168,9 +168,11 @@ if [ "$supported" -ne 5 ]; then
   fail=1
 fi
 
-# One driven is the evidence that exists. Telegram, #770.
-if [ "$driven" -ne 1 ]; then
-  echo "ERROR: $driven channels are marked Driven; the recorded evidence covers 1."
+# Four driven is the evidence that exists: Telegram (#770), and Discord, Slack and
+# WhatsApp Web, which the owner drove against real accounts on this host on
+# 2026-09-12, with the times and the per-channel results written down.
+if [ "$driven" -ne 4 ]; then
+  echo "ERROR: $driven channels are marked Driven; the recorded evidence covers 4."
   echo "       The verification axis moves only when a round trip was actually run"
   echo "       against a real account and written down. See $DOCS §0."
   fail=1
