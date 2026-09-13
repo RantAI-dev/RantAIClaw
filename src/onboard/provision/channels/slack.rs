@@ -6,7 +6,6 @@ use super::super::traits::{
 use crate::config::schema::SlackConfig;
 use crate::config::Config;
 use crate::onboard::provision::io::{recv_text, send};
-use crate::onboard::provision::validate::http::probe_post;
 use crate::onboard::provision::validate::verdict;
 use crate::onboard::provision::ProvisionerCategory;
 use crate::profile::Profile;
@@ -145,24 +144,10 @@ impl TuiProvisioner for SlackProvisioner {
         )
         .await?;
 
-        let probe = probe_post(
-            "https://slack.com/api/auth.test",
-            &[("Authorization", &format!("Bearer {}", bot_token.trim()))],
-            "",
-        )
-        .await;
-        // Slack answers 200 even when it rejects the token, so the status says
-        // nothing and `classify_status` cannot be used here — `ok` in the body
-        // is the only signal. Anything that is neither `ok:true` nor `ok:false`
-        // is an unrecognised response, not evidence against the token.
-        let verdict = match &probe {
-            Ok(r) if r.body.contains("\"ok\":true") => verdict::ProbeVerdict::Accepted,
-            Ok(r) if r.body.contains("\"ok\":false") => {
-                verdict::ProbeVerdict::Rejected(slack_error(&r.body))
-            }
-            Ok(_) => verdict::ProbeVerdict::Inconclusive("unrecognised response".into()),
-            Err(e) => verdict::ProbeVerdict::Inconclusive(format!("{e}")),
-        };
+        // The probe and its classification now live in `channels::slack`, so the
+        // console and this wizard ask Slack the same question and read the
+        // answer by the same rule.
+        let verdict = crate::channels::slack::validate_bot_token(bot_token.trim()).await;
         if !verdict::resolve(&events, &mut responses, verdict, "bot token")
             .await?
             .should_persist()
@@ -262,22 +247,6 @@ pub(crate) fn looks_like_app_token(token: &str) -> bool {
     token
         .trim()
         .starts_with(crate::channels::slack::APP_TOKEN_PREFIX)
-}
-
-/// Slack reports the reason in `error` alongside `"ok": false`. Surfacing it
-/// turns "may be invalid" into something the operator can act on —
-/// `invalid_auth` and `account_inactive` need different fixes.
-fn slack_error(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.as_str().map(|s| s.to_string()))
-        })
-        .map_or_else(
-            || "Slack rejected it".to_string(),
-            |e| format!("Slack returned `{e}`"),
-        )
 }
 
 #[cfg(test)]

@@ -6,7 +6,6 @@ use super::super::traits::{
 use crate::config::schema::DiscordConfig;
 use crate::config::Config;
 use crate::onboard::provision::io::{recv_selection, recv_text, send};
-use crate::onboard::provision::validate::http::probe_get;
 use crate::onboard::provision::validate::verdict;
 use crate::onboard::provision::ProvisionerCategory;
 use crate::profile::Profile;
@@ -99,15 +98,10 @@ impl TuiProvisioner for DiscordProvisioner {
         )
         .await?;
 
-        let probe = probe_get(
-            "https://discord.com/api/v10/users/@me",
-            &[("Authorization", &format!("Bot {}", bot_token.trim()))],
-        )
-        .await;
         if !verdict::resolve(
             &events,
             &mut responses,
-            verdict::classify_status(&probe),
+            crate::channels::discord::validate_bot_token(bot_token.trim()).await,
             "bot token",
         )
         .await?
