@@ -1,4 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::onboard::provision::validate::http::{probe_post, ProbeResult};
+use crate::onboard::provision::validate::verdict::ProbeVerdict;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::{Arc, RwLock};
@@ -600,10 +602,89 @@ impl SlackChannel {
     }
 }
 
+/// The endpoint both the console and the setup wizard probe to check a bot
+/// token. Named once so the two cannot drift onto different paths.
+pub(crate) const SLACK_AUTH_TEST_URL: &str = "https://slack.com/api/auth.test";
+
+/// Slack reports the reason in `error` alongside `"ok": false`. Surfacing it
+/// turns "may be invalid" into something the operator can act on:
+/// `invalid_auth` and `account_inactive` need different fixes.
+fn slack_error(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str().map(|s| s.to_string()))
+        })
+        .map_or_else(
+            || "Slack rejected it".to_string(),
+            |e| format!("Slack returned `{e}`"),
+        )
+}
+
+/// Classify an `auth.test` response.
+///
+/// Pure, so every branch is tested without a network. Slack answers HTTP 200
+/// even when it rejects the token, so the status says nothing and
+/// `verdict::classify_status` cannot be used here: `ok` in the body is the only
+/// signal. Anything that is neither `ok:true` nor `ok:false` is an unrecognised
+/// response, not evidence against the token, and a transport failure is not
+/// evidence either.
+pub(crate) fn classify_auth_test(probe: &anyhow::Result<ProbeResult>) -> ProbeVerdict {
+    match probe {
+        Ok(r) if r.body.contains("\"ok\":true") => ProbeVerdict::Accepted,
+        Ok(r) if r.body.contains("\"ok\":false") => ProbeVerdict::Rejected(slack_error(&r.body)),
+        Ok(_) => ProbeVerdict::Inconclusive("unrecognised response".into()),
+        Err(e) => ProbeVerdict::Inconclusive(format!("{e}")),
+    }
+}
+
+/// Validate a Slack bot token by calling `auth.test`, for callers outside the
+/// setup wizard.
+///
+/// The app-level token is deliberately not probed: `apps.connections.open` is
+/// the only real check and it opens a live socket, which setup must not do just
+/// to validate a string. `doctor` owns that verdict, exactly as the CLI wizard
+/// already decided.
+pub async fn validate_bot_token(bot_token: &str) -> ProbeVerdict {
+    let probe = probe_post(
+        SLACK_AUTH_TEST_URL,
+        &[("Authorization", &format!("Bearer {}", bot_token.trim()))],
+        "",
+    )
+    .await;
+    classify_auth_test(&probe)
+}
+
 #[async_trait]
 impl Channel for SlackChannel {
     fn name(&self) -> &str {
         "slack"
+    }
+
+    /// Replace the live allowlist from a reloaded config (F-33).
+    ///
+    /// Inside `impl Channel for` on purpose: the runtime holds channels as
+    /// `Arc<dyn Channel>` (`routing.rs:445-448`), so a copy in the plain `impl`
+    /// block would compile and never run, and the trait's no-op default would
+    /// keep the boot-time list until a restart.
+    ///
+    /// Stored exactly as configured, for the same reason as Discord's: the boot
+    /// path (`factory.rs:101`) and the reload path (`routing.rs:66-73`) both
+    /// carry the raw config list, and `is_user_allowed` compares entries
+    /// exactly.
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut users) = self.allowed_users.write() {
+            if users.as_slice() != allowed {
+                tracing::info!(
+                    target: "channels",
+                    channel = "slack",
+                    count = allowed.len(),
+                    "applied updated allowlist from config"
+                );
+                *users = allowed.to_vec();
+            }
+        }
     }
 
     fn render_target(&self) -> crate::channels::format::RenderTarget {
@@ -1581,6 +1662,84 @@ mod tests {
 
         let hello = serde_json::json!({ "type": "hello" });
         assert!(SlackChannel::socket_event_message(&hello, None).is_none());
+    }
+
+    /// F-33, through `Arc<dyn Channel>`, which is the only way a reloaded
+    /// allowlist ever reaches a channel (`routing.rs:445-448`). Slack holds its
+    /// list behind an `RwLock` but never overrode `apply_allowed_senders`, so
+    /// the trait's no-op default ran and a user removed from the config kept
+    /// talking to the bot until the daemon restarted.
+    #[test]
+    fn a_reloaded_allowlist_drops_a_user_without_a_restart() {
+        let ch = std::sync::Arc::new(SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec!["U_KEEP".into(), "U_DROP".into()],
+        ));
+        let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
+        assert!(ch.is_user_allowed("U_DROP"), "fixture: both start allowed");
+
+        as_the_runtime_holds_it.apply_allowed_senders(&["U_KEEP".to_string()]);
+
+        assert!(
+            !ch.is_user_allowed("U_DROP"),
+            "the removed user still reaches the bot, so the tightened list waits \
+             for a restart"
+        );
+        assert!(
+            ch.is_user_allowed("U_KEEP"),
+            "the rest of the reloaded list must survive"
+        );
+    }
+
+    fn slack_probe(body: &str) -> anyhow::Result<ProbeResult> {
+        Ok(ProbeResult {
+            status: 200,
+            body: body.to_string(),
+        })
+    }
+
+    #[test]
+    fn slack_auth_test_accepts_ok_true() {
+        assert_eq!(
+            classify_auth_test(&slack_probe(r#"{"ok":true,"team":"T1"}"#)),
+            ProbeVerdict::Accepted
+        );
+    }
+
+    /// The case the status cannot see. Slack answers **HTTP 200** with
+    /// `"ok":false` for a revoked or invalid token, so a status-only rule would
+    /// call it accepted and the console would store a credential Slack has
+    /// already refused.
+    #[test]
+    fn slack_auth_test_rejects_ok_false_and_names_the_reason() {
+        let verdict = classify_auth_test(&slack_probe(r#"{"ok":false,"error":"invalid_auth"}"#));
+        match verdict {
+            ProbeVerdict::Rejected(reason) => assert!(
+                reason.contains("invalid_auth"),
+                "the operator needs Slack's reason to act on it: {reason}"
+            ),
+            other => panic!("HTTP 200 with ok:false must be a rejection, got {other:?}"),
+        }
+    }
+
+    /// Neither `ok:true` nor `ok:false`: a changed API shape or a proxy's error
+    /// page. That says nothing about the token, so it must not be a rejection.
+    #[test]
+    fn slack_an_unrecognised_body_is_inconclusive() {
+        assert!(matches!(
+            classify_auth_test(&slack_probe("<html>gateway timeout</html>")),
+            ProbeVerdict::Inconclusive(_)
+        ));
+    }
+
+    #[test]
+    fn slack_a_transport_error_is_inconclusive() {
+        let offline: anyhow::Result<ProbeResult> = Err(anyhow::anyhow!("dns failure"));
+        assert!(
+            matches!(classify_auth_test(&offline), ProbeVerdict::Inconclusive(_)),
+            "an air-gapped host must not have its credential called invalid"
+        );
     }
 
     /// An event still classifies through the same allowlist the polling

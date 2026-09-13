@@ -1,5 +1,7 @@
 use super::fault;
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict::{classify_status, ProbeVerdict};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -8,6 +10,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+
+/// The endpoint both the console and the setup wizard probe to check a bot
+/// token. Named once so the two cannot drift onto different paths.
+pub(crate) const DISCORD_IDENTITY_URL: &str = "https://discord.com/api/v10/users/@me";
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -377,10 +383,55 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Validate a Discord bot token by calling `users/@me`, for callers outside the
+/// setup wizard.
+///
+/// Returns a [`ProbeVerdict`] rather than a bool or a `Result`, because the
+/// three outcomes are not interchangeable: a 401 is evidence the token is bad,
+/// while a DNS failure is evidence of nothing and must not stop an air-gapped
+/// install from saving a credential the operator knows is good.
+///
+/// Built on `validate::http::probe_get`, which times out in 8 seconds and keeps
+/// the credential-bearing URL out of the error it returns.
+pub async fn validate_bot_token(bot_token: &str) -> ProbeVerdict {
+    let probe = probe_get(
+        DISCORD_IDENTITY_URL,
+        &[("Authorization", &format!("Bot {}", bot_token.trim()))],
+    )
+    .await;
+    classify_status(&probe)
+}
+
 #[async_trait]
 impl Channel for DiscordChannel {
     fn name(&self) -> &str {
         "discord"
+    }
+
+    /// Replace the live allowlist from a reloaded config (F-33).
+    ///
+    /// Inside `impl Channel for` on purpose: the runtime holds channels as
+    /// `Arc<dyn Channel>` (`routing.rs:445-448`), so a copy in the plain `impl`
+    /// block would compile and never run, and the trait's no-op default would
+    /// keep the boot-time list until a restart.
+    ///
+    /// Stored exactly as configured. `channel_allowlists` clones the config list
+    /// unchanged and `build_discord` hands the same raw list to the constructor,
+    /// so normalising here would make a reloaded entry differ from the same
+    /// entry at boot. Telegram normalises because its identities carry a leading
+    /// `@`; Discord's are raw IDs that `is_user_allowed` compares exactly.
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut users) = self.allowed_users.write() {
+            if users.as_slice() != allowed {
+                tracing::info!(
+                    target: "channels",
+                    channel = "discord",
+                    count = allowed.len(),
+                    "applied updated allowlist from config"
+                );
+                *users = allowed.to_vec();
+            }
+        }
     }
 
     fn render_target(&self) -> crate::channels::format::RenderTarget {
@@ -1523,6 +1574,69 @@ mod tests {
                 .warned
                 .load(Ordering::Relaxed),
             "the next turn must be able to warn again"
+        );
+    }
+
+    /// F-33, through `Arc<dyn Channel>`, which is the only way a reloaded
+    /// allowlist ever reaches a channel (`routing.rs:445-448`). Discord holds
+    /// its list behind an `RwLock` but never overrode `apply_allowed_senders`,
+    /// so the trait's no-op default ran and a user removed from the config kept
+    /// talking to the bot until the daemon restarted.
+    #[test]
+    fn a_reloaded_allowlist_drops_a_user_without_a_restart() {
+        let ch = std::sync::Arc::new(DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["U_KEEP".into(), "U_DROP".into()],
+            false,
+            false,
+        ));
+        let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
+        assert!(ch.is_user_allowed("U_DROP"), "fixture: both start allowed");
+
+        as_the_runtime_holds_it.apply_allowed_senders(&["U_KEEP".to_string()]);
+
+        assert!(
+            !ch.is_user_allowed("U_DROP"),
+            "the removed user still reaches the bot, so the tightened list waits \
+             for a restart"
+        );
+        assert!(
+            ch.is_user_allowed("U_KEEP"),
+            "the rest of the reloaded list must survive"
+        );
+    }
+
+    fn discord_probe(
+        status: u16,
+    ) -> anyhow::Result<crate::onboard::provision::validate::http::ProbeResult> {
+        Ok(crate::onboard::provision::validate::http::ProbeResult {
+            status,
+            body: String::new(),
+        })
+    }
+
+    /// `users/@me` answers with the status alone, so Discord's rule is the
+    /// shared one: only the platform saying "no" is evidence against the token.
+    #[test]
+    fn discord_identity_probe_maps_each_outcome() {
+        assert_eq!(classify_status(&discord_probe(200)), ProbeVerdict::Accepted);
+        assert!(matches!(
+            classify_status(&discord_probe(401)),
+            ProbeVerdict::Rejected(_)
+        ));
+        assert!(
+            matches!(
+                classify_status(&discord_probe(500)),
+                ProbeVerdict::Inconclusive(_)
+            ),
+            "an outage is not evidence that the operator's token is bad"
+        );
+        let offline: anyhow::Result<crate::onboard::provision::validate::http::ProbeResult> =
+            Err(anyhow::anyhow!("dns failure"));
+        assert!(
+            matches!(classify_status(&offline), ProbeVerdict::Inconclusive(_)),
+            "an air-gapped host must not have its credential called invalid"
         );
     }
 

@@ -49,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Removing someone from Discord's or Slack's allowlist now takes effect without a restart.** When
+  `config.toml` changes, the runtime pushes each channel's allowlist into the live channel so a
+  tightened list does not wait, which is the whole point of applying it there. Both channels hold their
+  allowlist behind a lock, but neither overrode `Channel::apply_allowed_senders`, so the trait's no-op
+  default ran and both kept their boot-time list: a revoked user carried on talking to the bot until the
+  daemon was restarted. Both now take the change live, storing the list exactly as configured, because
+  the boot path and the reload path both carry the raw config entries and normalising on one side only
+  would make the same entry behave differently depending on which path wrote it. Telegram and WhatsApp
+  Web already did this. Separately, the credential checks for both channels are now callable outside the
+  setup wizard, and the wizard calls the same functions, so the console and the CLI ask the platform the
+  same question and read the answer by the same rule.
 - **Discord shows a typing indicator, and Discord and Slack can now report unhealthy.** The runtime
   holds every channel as `Arc<dyn Channel>`, so a call resolves against that channel's
   `impl Channel for` block. Four methods were written in a plain `impl` block instead, where the trait
