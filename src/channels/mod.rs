@@ -655,6 +655,13 @@ pub(crate) struct ChannelCatalogEntry {
     /// Whether anyone has driven it. New here.
     pub verification: ChannelVerification,
     pub configured: bool,
+    /// Whether the configured section actually carries the credential the
+    /// channel needs to start.
+    ///
+    /// Separate from `configured` on purpose: a section can exist with a blank
+    /// token, and "configured" alone reads as done. The console needs to tell
+    /// those apart to decide between "Connect" and "Edit".
+    pub has_credentials: bool,
 }
 
 /// The whole catalog, in catalog order, with each row's configured state.
@@ -668,6 +675,7 @@ pub(crate) fn channel_catalog_entries(config: &Config) -> Vec<ChannelCatalogEntr
             maturity: *support,
             verification: *verification,
             configured: channel_is_configured(key, config),
+            has_credentials: channel_has_credentials(key, config),
         })
         .collect()
 }
