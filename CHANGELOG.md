@@ -63,7 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method's text, which the wrong block satisfies; it now requires the definition to sit inside
   `impl Channel for`, and a new guard reads the trait's method names from `traits.rs` and fails when any
   channel defines one outside its trait impl, so the next method put in the wrong block fails the build
-  instead of going quiet. No config key, and the schema stays at 32.
+  instead of going quiet. One new consequence worth knowing: on a host with no network, Discord and
+  Slack now report unhealthy after three failed heartbeats, about 90 seconds, where they used to report
+  healthy forever. That is the probe working. No config key, and the schema stays at 32.
 - **A slash command addressed to another bot no longer runs here.** `parse_runtime_command` split
   `@<name>` off the verb and then matched the verb first, so `model`, `models`, `start`, `help`, `new`
   and `clear` were all answered before anything looked at who the command was for; only an unknown

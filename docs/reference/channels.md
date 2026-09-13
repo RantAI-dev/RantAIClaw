@@ -696,6 +696,18 @@ listen_to_bots = false
 mention_only = false
 ```
 
+- **Discord shows its native typing indicator** while the agent works, reposted every 8 seconds until
+  the turn ends, and cleared on every exit path. It had never appeared before 2026-09-13: the method was
+  written in a plain `impl DiscordChannel` block, and the runtime holds channels as `Arc<dyn Channel>`,
+  which resolves against `impl Channel for` and so ran the trait's no-op default instead. A class guard
+  in `src/channels/mod_tests.rs` now fails the build if any channel method is written where the runtime
+  cannot call it.
+- A typing request Discord refuses is logged once per turn at WARN with the HTTP status. The loop used to
+  discard every response, so a missing permission looked exactly like a working indicator.
+- `health_check` asks `users/@me` with the bot token, so a revoked token reports unhealthy in
+  `rantaiclaw status` and `doctor channels`. That probe was unreachable for the same reason as the
+  indicator and reported a constant `true`.
+
 ### 4.3 Slack
 
 ```toml

@@ -21,7 +21,21 @@ pub struct DiscordChannel {
     /// Size/type limits for inbound images. Defaults to the shipped
     /// `[multimodal]` defaults; the factory overrides it with the operator's.
     multimodal: crate::config::MultimodalConfig,
-    typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    typing_handles: Mutex<HashMap<String, TypingSignal>>,
+}
+
+/// One recipient's typing indicator: the task reposting it, and whether a
+/// refusal has already been logged for this turn.
+///
+/// The flag lives here rather than in the task because
+/// `supervisor::spawn_scoped_typing_task` calls `start_typing` every
+/// `CHANNEL_TYPING_REFRESH_INTERVAL_SECS` (4) seconds for the whole turn and
+/// calls `stop_typing` once at the end. A flag owned by the task would reset on
+/// every refresh, so one missing permission would WARN every four seconds, up to
+/// 75 times on a turn that runs to `CHANNEL_MESSAGE_TIMEOUT_SECS`.
+struct TypingSignal {
+    handle: tokio::task::JoinHandle<()>,
+    warned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What the gateway loop should do with one `MESSAGE_CREATE` payload.
@@ -428,20 +442,29 @@ impl Channel for DiscordChannel {
     }
 
     async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
-        self.stop_typing(recipient).await?;
+        // The previous task is aborted here rather than by calling
+        // `stop_typing`, which also drops the warn flag. The supervisor calls
+        // this every four seconds for the whole turn and calls `stop_typing`
+        // once at the end, so carrying the flag across a refresh is what makes
+        // one WARN per turn true rather than one per tick.
+        let warned = {
+            let mut guard = self.typing_handles.lock();
+            match guard.remove(recipient) {
+                Some(previous) => {
+                    previous.handle.abort();
+                    previous.warned
+                }
+                None => Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        };
 
         let client = self.http_client();
         let token = self.bot_token.clone();
         let channel_id = recipient.to_string();
+        let warned_in_task = Arc::clone(&warned);
 
         let handle = tokio::spawn(async move {
             let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
-            // One WARN per turn, not per tick. The loop reposts every 8 seconds,
-            // so a missing permission would otherwise write a line every 8
-            // seconds for the length of the turn. Each `start_typing` spawns a
-            // fresh task, so this flag is per turn by construction. The status
-            // only: no token, no message text.
-            let mut warned = false;
             loop {
                 match client
                     .post(&url)
@@ -450,18 +473,24 @@ impl Channel for DiscordChannel {
                     .await
                 {
                     Ok(ok) if ok.status().is_success() => {}
+                    // `swap` so whichever refresh sees the first refusal is the
+                    // one that logs, and the rest of the turn stays quiet. The
+                    // status only: the token travels in a header, and a typing
+                    // request carries no message text.
                     Ok(refused) => {
-                        if !warned {
-                            warned = true;
+                        if !warned_in_task.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             tracing::warn!(
                                 status = refused.status().as_u16(),
                                 "Discord refused the typing indicator; the turn runs without it"
                             );
                         }
                     }
+                    // The error's `Display` names the request URL, so this line
+                    // carries the channel id. Still no token, and no message
+                    // text: the only other channel that scrubs a transport error
+                    // is Telegram, whose URL embeds the token itself.
                     Err(err) => {
-                        if !warned {
-                            warned = true;
+                        if !warned_in_task.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             tracing::warn!(
                                 error = %err,
                                 "Discord typing request failed; the turn runs without it"
@@ -474,15 +503,15 @@ impl Channel for DiscordChannel {
         });
 
         let mut guard = self.typing_handles.lock();
-        guard.insert(recipient.to_string(), handle);
+        guard.insert(recipient.to_string(), TypingSignal { handle, warned });
 
         Ok(())
     }
 
     async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
         let mut guard = self.typing_handles.lock();
-        if let Some(handle) = guard.remove(recipient) {
-            handle.abort();
+        if let Some(signal) = guard.remove(recipient) {
+            signal.handle.abort();
         }
         Ok(())
     }
@@ -1451,6 +1480,49 @@ mod tests {
         assert!(
             ch.typing_handles.lock().is_empty(),
             "the indicator outlives the turn when `stop_typing` is unreachable"
+        );
+    }
+
+    /// The supervisor calls `start_typing` every four seconds for the whole turn
+    /// and `stop_typing` once at the end, so a flag owned by the spawned task
+    /// resets on every refresh and one refusal writes a WARN per tick. The flag
+    /// lives with the recipient's entry instead: a refresh carries it, and only
+    /// the turn's final `stop_typing` clears it.
+    #[tokio::test]
+    async fn a_refused_typing_warning_survives_a_refresh_and_resets_next_turn() {
+        use std::sync::atomic::Ordering;
+
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+
+        ch.start_typing("123456", None).await.unwrap();
+        ch.typing_handles
+            .lock()
+            .get("123456")
+            .expect("the first call registers the recipient")
+            .warned
+            .store(true, Ordering::Relaxed);
+
+        ch.start_typing("123456", None).await.unwrap();
+        assert!(
+            ch.typing_handles
+                .lock()
+                .get("123456")
+                .expect("a refresh keeps the recipient registered")
+                .warned
+                .load(Ordering::Relaxed),
+            "the refresh reset the flag, so one refusal would WARN every four seconds"
+        );
+
+        ch.stop_typing("123456").await.unwrap();
+        ch.start_typing("123456", None).await.unwrap();
+        assert!(
+            !ch.typing_handles
+                .lock()
+                .get("123456")
+                .expect("the next turn registers the recipient")
+                .warned
+                .load(Ordering::Relaxed),
+            "the next turn must be able to warn again"
         );
     }
 
