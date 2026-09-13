@@ -702,6 +702,29 @@ impl Channel for SlackChannel {
     ) -> anyhow::Result<()> {
         self.listen_inner(tx, cancel).await
     }
+
+    /// Slack answers `auth.test` with **HTTP 200 and `{"ok": false}`** for a
+    /// revoked or invalid token, so a status-only probe reported healthy for
+    /// exactly the condition it exists to catch. `send()` in this same file
+    /// already reads the `ok` field; this now does too.
+    async fn health_check(&self) -> bool {
+        let Ok(resp) = self
+            .http_client()
+            .get("https://slack.com/api/auth.test")
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if !resp.status().is_success() {
+            return false;
+        }
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            return false;
+        };
+        Self::api_response_is_ok(&body)
+    }
 }
 
 impl SlackChannel {
@@ -977,29 +1000,6 @@ impl SlackChannel {
                 }
             }
         }
-    }
-
-    /// Slack answers `auth.test` with **HTTP 200 and `{"ok": false}`** for a
-    /// revoked or invalid token, so a status-only probe reported healthy for
-    /// exactly the condition it exists to catch. `send()` in this same file
-    /// already reads the `ok` field; this now does too.
-    async fn health_check(&self) -> bool {
-        let Ok(resp) = self
-            .http_client()
-            .get("https://slack.com/api/auth.test")
-            .bearer_auth(&self.bot_token)
-            .send()
-            .await
-        else {
-            return false;
-        };
-        if !resp.status().is_success() {
-            return false;
-        }
-        let Ok(body) = resp.json::<serde_json::Value>().await else {
-            return false;
-        };
-        Self::api_response_is_ok(&body)
     }
 }
 

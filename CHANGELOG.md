@@ -49,6 +49,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Discord shows a typing indicator, and Discord and Slack can now report unhealthy.** The runtime
+  holds every channel as `Arc<dyn Channel>`, so a call resolves against that channel's
+  `impl Channel for` block. Four methods were written in a plain `impl` block instead, where the trait
+  object cannot see them: Discord's `start_typing`, `stop_typing` and `health_check`, and Slack's
+  `health_check`. The trait's defaults ran in their place, a no-op for typing and `true` for health. So
+  Discord had never shown "is typing..." since its first commit, and the supervisor's heartbeat and
+  `rantaiclaw doctor channels` reported Discord and Slack healthy whatever their tokens said, while the
+  careful probes written for them, Discord's `users/@me` and Slack's `auth.test` reading the `ok` field,
+  never ran at all. The four methods now sit in their trait impls with their bodies unchanged. A refused
+  Discord typing request is logged once per turn at WARN with the HTTP status only, where the loop used
+  to discard every response. The guard that was supposed to catch this searched the whole file for the
+  method's text, which the wrong block satisfies; it now requires the definition to sit inside
+  `impl Channel for`, and a new guard reads the trait's method names from `traits.rs` and fails when any
+  channel defines one outside its trait impl, so the next method put in the wrong block fails the build
+  instead of going quiet. No config key, and the schema stays at 32.
 - **A slash command addressed to another bot no longer runs here.** `parse_runtime_command` split
   `@<name>` off the verb and then matched the verb first, so `model`, `models`, `start`, `help`, `new`
   and `clear` were all answered before anything looked at who the command was for; only an unknown

@@ -413,6 +413,79 @@ impl Channel for DiscordChannel {
             "Discord", workspace,
         ))
     }
+
+    /// `users/@me` with the bot token. A revoked token answers 401, so this can
+    /// fail for the condition it exists to catch, which the trait's default
+    /// `true` could not.
+    async fn health_check(&self) -> bool {
+        self.http_client()
+            .get("https://discord.com/api/v10/users/@me")
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
+    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
+        self.stop_typing(recipient).await?;
+
+        let client = self.http_client();
+        let token = self.bot_token.clone();
+        let channel_id = recipient.to_string();
+
+        let handle = tokio::spawn(async move {
+            let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
+            // One WARN per turn, not per tick. The loop reposts every 8 seconds,
+            // so a missing permission would otherwise write a line every 8
+            // seconds for the length of the turn. Each `start_typing` spawns a
+            // fresh task, so this flag is per turn by construction. The status
+            // only: no token, no message text.
+            let mut warned = false;
+            loop {
+                match client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .send()
+                    .await
+                {
+                    Ok(ok) if ok.status().is_success() => {}
+                    Ok(refused) => {
+                        if !warned {
+                            warned = true;
+                            tracing::warn!(
+                                status = refused.status().as_u16(),
+                                "Discord refused the typing indicator; the turn runs without it"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if !warned {
+                            warned = true;
+                            tracing::warn!(
+                                error = %err,
+                                "Discord typing request failed; the turn runs without it"
+                            );
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            }
+        });
+
+        let mut guard = self.typing_handles.lock();
+        guard.insert(recipient.to_string(), handle);
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let mut guard = self.typing_handles.lock();
+        if let Some(handle) = guard.remove(recipient) {
+            handle.abort();
+        }
+        Ok(())
+    }
 }
 
 impl DiscordChannel {
@@ -785,49 +858,6 @@ impl DiscordChannel {
             }
         }
 
-        Ok(())
-    }
-
-    async fn health_check(&self) -> bool {
-        self.http_client()
-            .get("https://discord.com/api/v10/users/@me")
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-    }
-
-    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
-        self.stop_typing(recipient).await?;
-
-        let client = self.http_client();
-        let token = self.bot_token.clone();
-        let channel_id = recipient.to_string();
-
-        let handle = tokio::spawn(async move {
-            let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
-            loop {
-                let _ = client
-                    .post(&url)
-                    .header("Authorization", format!("Bot {token}"))
-                    .send()
-                    .await;
-                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-            }
-        });
-
-        let mut guard = self.typing_handles.lock();
-        guard.insert(recipient.to_string(), handle);
-
-        Ok(())
-    }
-
-    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
-        let mut guard = self.typing_handles.lock();
-        if let Some(handle) = guard.remove(recipient) {
-            handle.abort();
-        }
         Ok(())
     }
 }
@@ -1385,6 +1415,43 @@ mod tests {
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handles.lock();
         assert!(!guard.contains_key("123456"));
+    }
+
+    /// Through `Arc<dyn Channel>`, which is the only way the runtime ever calls
+    /// this. The three tests above call the methods on the concrete type, so they
+    /// resolve against whatever block holds them and cannot tell a reachable
+    /// method from an unreachable one. This one can: with `start_typing` in a
+    /// plain `impl DiscordChannel` block, the trait's no-op default runs and the
+    /// handle map stays empty, which is why Discord never showed typing (F-32).
+    #[tokio::test]
+    async fn typing_started_through_the_trait_object_is_registered_and_cleared() {
+        let ch = Arc::new(DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec![],
+            false,
+            false,
+        ));
+        let as_the_runtime_holds_it: Arc<dyn Channel> = ch.clone();
+
+        as_the_runtime_holds_it
+            .start_typing("123456", None)
+            .await
+            .expect("start_typing through the trait object");
+        assert!(
+            ch.typing_handles.lock().contains_key("123456"),
+            "nothing was registered, so the call reached the trait default \
+             instead of Discord's own method"
+        );
+
+        as_the_runtime_holds_it
+            .stop_typing("123456")
+            .await
+            .expect("stop_typing through the trait object");
+        assert!(
+            ch.typing_handles.lock().is_empty(),
+            "the indicator outlives the turn when `stop_typing` is unreachable"
+        );
     }
 
     #[tokio::test]

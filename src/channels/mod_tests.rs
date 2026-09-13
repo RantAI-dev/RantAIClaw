@@ -8225,6 +8225,219 @@ fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
     }
 }
 
+/// One indent level, `fn name(` or `async fn name(`, with any visibility. Used
+/// for both the trait's own declarations and a channel's definitions, so the two
+/// are read by the same rule. Nested `fn`s inside a body sit deeper and are not
+/// mistaken for methods.
+fn trait_method_name_on_line(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("    ")?;
+    if rest.starts_with(' ') {
+        return None;
+    }
+    let rest = rest.strip_prefix("pub(crate) ").unwrap_or(rest);
+    let rest = rest.strip_prefix("pub ").unwrap_or(rest);
+    let rest = rest.strip_prefix("async ").unwrap_or(rest);
+    let rest = rest.strip_prefix("fn ")?;
+    let name = &rest[..rest.find('(')?];
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        .then_some(name)
+}
+
+/// The method names `pub trait Channel` declares, read from `traits.rs`.
+///
+/// Read rather than listed so that a method added to the trait later is covered
+/// the day it is added. A hand list is the same failure as a hand-synced
+/// catalog: correct when written, silently short afterwards.
+fn channel_trait_method_names(traits_src: &str) -> std::collections::BTreeSet<&str> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut inside = false;
+    for line in traits_src.lines() {
+        if line.starts_with("pub trait Channel") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if line == "}" {
+            break;
+        }
+        if let Some(name) = trait_method_name_on_line(line) {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+/// `impl DiscordChannel {` -> `DiscordChannel`. Generics and `for` clauses are
+/// cut, so `impl<T> Foo<T> for Bar` yields `Foo`.
+fn impl_block_type(header: &str) -> &str {
+    let rest = header.trim_start_matches("impl ").trim_start();
+    let rest = match rest.find("> ") {
+        Some(at) if rest.starts_with('<') => &rest[at + 2..],
+        _ => rest,
+    };
+    rest.split([' ', '{', '<'])
+        .next()
+        .unwrap_or(rest)
+        .trim_end_matches(':')
+}
+
+/// Every `.rs` file under `src/channels`, the same walk the log guard uses.
+///
+/// `mod_tests.rs` and `format/tests.rs` are whole test modules: their fixtures
+/// implement `Channel` on purpose and their helpers are not runtime wiring.
+fn channel_source_files(src_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![src_root.join("channels")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if name.ends_with(".rs") && name != "mod_tests.rs" && name != "tests.rs" {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Is `needle` (a `fn` signature prefix) defined inside an `impl Channel for`
+/// block in this source?
+///
+/// The question the old check could not ask. `production.contains(needle)` is
+/// satisfied by a definition in a plain `impl T` block, which the runtime cannot
+/// reach through `Arc<dyn Channel>`.
+fn defines_inside_channel_impl(production: &str, needle: &str) -> bool {
+    let lines: Vec<&str> = production.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i].starts_with("impl ") {
+            i += 1;
+            continue;
+        }
+        let header = lines[i];
+        let mut end = i + 1;
+        while end < lines.len() && lines[end] != "}" {
+            end += 1;
+        }
+        if header.contains("Channel for")
+            && lines[i + 1..end]
+                .iter()
+                .any(|line| line.trim_start().starts_with(needle))
+        {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// A `Channel` method written in a plain `impl T` block is invisible to the
+/// runtime, which holds every channel as `Arc<dyn Channel>`: the call resolves
+/// against `impl Channel for T`, so the trait's DEFAULT runs and the method that
+/// was written never executes. Nothing fails. Nothing logs.
+///
+/// That is F-32. `DiscordChannel::start_typing` sat in `impl DiscordChannel`
+/// from the first commit, so Discord had never once shown a typing indicator,
+/// and `health_check` sat there too on Discord and Slack, so the supervisor's
+/// heartbeat ran the trait default `true` and a revoked token read healthy.
+///
+/// The trait's method names are read from `traits.rs`, so this covers a method
+/// added to the trait after this test was written.
+#[test]
+fn no_channel_defines_a_trait_method_outside_its_channel_impl() {
+    // Why this is not a channel: `RestartNotice` is the shutdown notice in
+    // `dispatch.rs`, a plain struct the dispatch loop calls directly. It
+    // implements no trait, so its own `send` is never reached through
+    // `dyn Channel` and cannot be shadowed by a default. Dropping it from this
+    // list must make this test fail, which is how we know the scan reads code.
+    const NOT_CHANNELS: &[&str] = &["RestartNotice"];
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let traits_src = std::fs::read_to_string(src_root.join("channels").join("traits.rs"))
+        .expect("read traits.rs");
+    let trait_methods = channel_trait_method_names(&traits_src);
+    // A control on the scan itself: an empty or tiny set would make every
+    // assertion below pass for the wrong reason.
+    for expected in [
+        "send",
+        "listen",
+        "health_check",
+        "start_typing",
+        "stop_typing",
+    ] {
+        assert!(
+            trait_methods.contains(expected),
+            "the trait scan missed `{expected}`, so it is not reading `pub trait Channel`"
+        );
+    }
+
+    let files = channel_source_files(&src_root);
+    assert!(
+        files.len() > 20,
+        "only {} channel source file(s) found; the walk is not reaching src/channels",
+        files.len()
+    );
+
+    let mut unreachable = Vec::new();
+    let mut impl_blocks = 0_usize;
+    for path in files {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let src = std::fs::read_to_string(&path).expect("read a channel source file");
+        let lines: Vec<&str> = production_half(&src).lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            if !lines[i].starts_with("impl ") {
+                i += 1;
+                continue;
+            }
+            let header = lines[i];
+            let mut end = i + 1;
+            while end < lines.len() && lines[end] != "}" {
+                end += 1;
+            }
+            impl_blocks += 1;
+            let ty = impl_block_type(header);
+            if !header.contains("Channel for") && !NOT_CHANNELS.contains(&ty) {
+                for (offset, line) in lines[i + 1..end].iter().enumerate() {
+                    if let Some(method) = trait_method_name_on_line(line) {
+                        if trait_methods.contains(method) {
+                            unreachable.push(format!(
+                                "{name}:{}: {ty}::{method} is a `Channel` method in a plain \
+                                 `impl {ty}` block, so `dyn Channel` runs the trait default",
+                                i + 2 + offset
+                            ));
+                        }
+                    }
+                }
+            }
+            i = end;
+        }
+    }
+    assert!(
+        impl_blocks > 40,
+        "only {impl_blocks} impl block(s) parsed; the block walk is broken"
+    );
+    assert!(
+        unreachable.is_empty(),
+        "these methods are written where the runtime cannot call them:\n  {}",
+        unreachable.join("\n  ")
+    );
+}
+
 /// Every tier channel must show that it heard you, and must clean that up.
 ///
 /// Slack had no `start_typing` override at all and fell through to the no-op
@@ -8235,8 +8448,11 @@ fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
 /// three did not.
 ///
 /// Checked by reading the source: `start_typing` needs a live API to drive, and
-/// the thing that must hold is that each channel overrides it and pairs it with
-/// a `stop_typing`.
+/// the thing that must hold is that each channel overrides it **inside its
+/// `impl Channel for` block** and pairs it with a `stop_typing`. This test used
+/// to ask only whether the text appeared anywhere in the file, which Discord
+/// satisfied for months with the method in a plain `impl DiscordChannel` block
+/// that the runtime could not reach (F-32).
 #[test]
 fn every_tier_channel_shows_and_clears_a_working_signal() {
     // Assembled at runtime so this test does not match itself.
@@ -8260,9 +8476,10 @@ fn every_tier_channel_shows_and_clears_a_working_signal() {
     for (channel, src, clears) in wiring {
         let production = src.split("\n#[cfg(test)]").next().unwrap_or(src);
         assert!(
-            production.contains(start.as_str()),
-            "{channel}: no `start_typing` override, so it falls through to the \
-             no-op default and shows nothing while the agent works"
+            defines_inside_channel_impl(production, start.as_str()),
+            "{channel}: no `start_typing` inside `impl Channel for`, so the \
+             runtime's `Arc<dyn Channel>` falls through to the no-op default and \
+             shows nothing while the agent works"
         );
 
         let at = production.find(stop.as_str()).unwrap_or_else(|| {
