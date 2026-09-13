@@ -1097,6 +1097,41 @@ the channel runtime**.
 - **DELETE response** `200`: `{ "disconnected": true, "channel": "telegram", "restarts_runtime": true }`
 - **Status codes**: `200`, `400`, `401`, `500`.
 
+### POST / DELETE /api/v1/channels/discord
+
+Connects, edits or disconnects a Discord channel. The bot token is validated against Discord before
+anything is written, and a token that is rejected — or that could not be checked at all — is refused
+rather than saved.
+
+- **POST request**: `{ "bot_token": "...", "allowed_users": ["..."], "guild_id": "..." }` — `bot_token`
+  may be omitted to edit the allowlist on an already connected channel; `guild_id` may be omitted to
+  leave the saved value alone.
+- **POST response** `200`: `{ "connected": true, "channel": "discord", "bot_username": null,
+  "allowed_users": 2, "warning": null, "restarts_runtime": false, "note": "..." }` — `allowed_users` is a
+  count, and `bot_username` is always `null` because the Discord check reports a verdict rather than an
+  identity.
+- **DELETE response** `200`: `{ "disconnected": true, "channel": "discord", "restarts_runtime": true }`
+- **Restarts**: only a changed credential or a changed `guild_id` restarts the channel runtime. An
+  allowlist-only edit applies live and must not restart, because the daemon hosts this gateway.
+- **Status codes**: `200`, `400`, `401`, `500`.
+
+### POST / DELETE /api/v1/channels/slack
+
+As for Discord, plus Socket Mode. The app-level token is shape-checked and refused when malformed; it is
+never probed, because the only real check opens a live socket and `doctor` owns that verdict.
+
+- **POST request**: `{ "bot_token": "xoxb-...", "app_token": "xapp-...", "allowed_users": ["..."],
+  "channel_id": "..." }` — every field except `allowed_users` may be omitted to leave the saved value
+  alone.
+- **POST response** `200`: `{ "connected": true, "channel": "slack", "bot_username": null,
+  "allowed_users": 2, "warning": "...", "restarts_runtime": false, "note": "..." }`
+- **`warning`**: set when Socket Mode is on and `channel_id` is also set, because the bot then ignores
+  direct messages and every conversation except that one.
+- **DELETE response** `200`: `{ "disconnected": true, "channel": "slack", "restarts_runtime": true }`
+- **Restarts**: a changed bot token, app token or `channel_id` restarts the runtime; an allowlist-only
+  edit does not.
+- **Status codes**: `200`, `400`, `401`, `500`.
+
 ## Cron
 
 ### GET /api/v1/cron
