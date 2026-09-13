@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Discord and Slack can be connected, edited and disconnected from the console.** Until now the
+  gateway could set up exactly one channel, Telegram, and the other two driven channels could only be
+  configured by hand in `config.toml`. `POST` and `DELETE /api/v1/channels/discord` and
+  `/api/v1/channels/slack` now exist, built on the Telegram handler's shape: the bot token is validated
+  against the platform before anything is written, an omitted token keeps the saved one so an allowlist
+  can be edited without re-entering the credential, and every option the request does not mention is
+  preserved. A credential that the platform rejects is refused, and so is one that could not be checked
+  at all, because the console has no way to ask "save it anyway?" the way the interactive setup does;
+  the two refusals say different things, so an operator on an offline host is not told their token is
+  bad. A Slack app-level token whose shape is wrong is refused here rather than saved with a warning,
+  and when Socket Mode is on with a `channel_id` filter the response carries the caveat that the bot
+  will then ignore direct messages, in the same `warning` field the console already reads. An
+  allowlist-only edit does not restart the runtime, which matters because the daemon hosts the gateway:
+  restarting would kill the request that made the edit. No response and no log line carries a token.
+  Separately, each entry in `GET /api/v1/channels` now reports `has_credentials` beside `configured`,
+  so a console can tell a section that exists from one that can actually start; the field is additive
+  and every existing field keeps its meaning.
 - **An unknown slash command is answered by the runtime, and a conversation can be reset from
   chat.** On Telegram, Discord and WhatsApp Web an unknown `/command` used to reach the model, which
   invented a result: `/clear` was answered "session cleared" while the conversation still held

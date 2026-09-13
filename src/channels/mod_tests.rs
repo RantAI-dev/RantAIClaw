@@ -7868,6 +7868,53 @@ async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() 
 /// when the owner moves it and not because a checklist passed. A fifth appearing
 /// fails here and in `scripts/ci/check_channel_maturity.sh`: the gate checks the
 /// static surfaces, this checks the value the runtime renders.
+/// `configured` says a section exists; `has_credentials` says it can actually
+/// start. The console needs both: a half-filled section is exactly what an
+/// operator has to be told about, and "configured" alone reads as done.
+///
+/// Here rather than inline in `mod.rs`: a `#[cfg(test)]` marker placed above
+/// `start_channels_with_cancellation` cuts the production half that
+/// `channels_module_public_surface_is_the_documented_ten` scans, and that guard
+/// then reports a public function as missing.
+#[test]
+fn has_credentials_separates_a_filled_section_from_an_empty_one() {
+    fn config_with(section: serde_json::Value) -> Config {
+        let mut cfg = Config::default();
+        cfg.channels_config = serde_json::from_value(section).expect("a channels section");
+        cfg
+    }
+
+    let filled = config_with(serde_json::json!({
+        "discord": { "bot_token": "a-token", "allowed_users": [] }
+    }));
+    let entry = channel_catalog_entries(&filled)
+        .into_iter()
+        .find(|e| e.key == "discord")
+        .expect("discord is in the catalog");
+    assert!(entry.configured);
+    assert!(entry.has_credentials);
+
+    let empty_token = config_with(serde_json::json!({
+        "discord": { "bot_token": "   ", "allowed_users": [] }
+    }));
+    let entry = channel_catalog_entries(&empty_token)
+        .into_iter()
+        .find(|e| e.key == "discord")
+        .expect("discord is in the catalog");
+    assert!(
+        !entry.has_credentials,
+        "a blank token is not a credential, however configured the section looks"
+    );
+
+    let absent = Config::default();
+    let entry = channel_catalog_entries(&absent)
+        .into_iter()
+        .find(|e| e.key == "slack")
+        .expect("slack is in the catalog");
+    assert!(!entry.configured);
+    assert!(!entry.has_credentials);
+}
+
 #[test]
 fn catalog_declares_seventeen_channels_and_five_supported() {
     assert_eq!(CHANNEL_CATALOG.len(), 17);

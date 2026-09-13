@@ -23,7 +23,7 @@ use serde_json::json;
 
 use super::AppState;
 use crate::config::api_url::{looks_like_api_key, validate_api_url};
-use crate::config::schema::{McpServerConfig, TelegramConfig};
+use crate::config::schema::{DiscordConfig, McpServerConfig, SlackConfig, TelegramConfig};
 use crate::security::AutonomyLevel;
 
 /// Build the `/api/v1/config*` router. Merged alongside `api_v1::router()` so
@@ -39,10 +39,21 @@ pub fn router() -> Router<AppState> {
             "/api/v1/config/mcp_servers/{name}",
             post(add_mcp_server).delete(remove_mcp_server),
         )
-        // Connect / update (allowlist) / disconnect a Telegram channel from the console.
+        // Connect / update (allowlist) / disconnect a channel from the console.
+        // One pair per channel rather than one polymorphic route: each carries a
+        // different body and a different credential check, and a `{channel}`
+        // segment would have to fan back out to exactly this anyway.
         .route(
             "/api/v1/channels/telegram",
             post(connect_telegram).delete(disconnect_telegram),
+        )
+        .route(
+            "/api/v1/channels/discord",
+            post(connect_discord).delete(disconnect_discord),
+        )
+        .route(
+            "/api/v1/channels/slack",
+            post(connect_slack).delete(disconnect_slack),
         );
     // Knowledge Base credential status/setter — only when the KB feature is built.
     #[cfg(feature = "kb")]
@@ -1053,6 +1064,386 @@ async fn disconnect_telegram(
     })))
 }
 
+// ── POST/DELETE /channels/discord and /channels/slack ───────────────────────
+
+#[derive(Deserialize)]
+struct DiscordConnectBody {
+    /// Bot token from the Discord developer portal. Validated live before
+    /// persisting. Optional: omit to edit `allowed_users` on an already
+    /// connected channel without re-entering it.
+    #[serde(default)]
+    bot_token: String,
+    /// Discord user ids allowed to talk to the bot. Empty = deny all.
+    #[serde(default)]
+    allowed_users: Vec<String>,
+    /// Optional guild filter. Absent leaves the saved value untouched.
+    #[serde(default)]
+    guild_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SlackConnectBody {
+    /// Bot token (`xoxb-…`). Validated live before persisting. Optional, as for
+    /// Discord.
+    #[serde(default)]
+    bot_token: String,
+    /// App-level token (`xapp-…`) that turns on Socket Mode. Absent leaves the
+    /// saved value untouched.
+    #[serde(default)]
+    app_token: Option<String>,
+    /// Slack user ids allowed to talk to the bot. Empty = deny all.
+    #[serde(default)]
+    allowed_users: Vec<String>,
+    /// Optional conversation filter. Absent leaves the saved value untouched.
+    #[serde(default)]
+    channel_id: Option<String>,
+}
+
+/// The Discord counterpart of [`plan_telegram_token`].
+///
+/// No shape check: a Discord bot token has no documented grammar, and the token
+/// never reaches a URL path (it travels in an `Authorization` header), so the
+/// reason Telegram's shape check exists does not apply. The live probe is the
+/// check.
+fn plan_discord_token(
+    existing: Option<&DiscordConfig>,
+    provided: &str,
+) -> Result<TokenPlan, ApiError> {
+    plan_channel_token(existing.is_some(), provided, "Discord")
+}
+
+/// The Slack counterpart. Same reasoning as Discord's: `xoxb-` is a convention,
+/// not a grammar, and the token travels in a header.
+fn plan_slack_token(existing: Option<&SlackConfig>, provided: &str) -> Result<TokenPlan, ApiError> {
+    plan_channel_token(existing.is_some(), provided, "Slack")
+}
+
+/// Shared by both planners: a supplied token is validated live, an omitted one
+/// keeps the saved credential, and an omitted one with nothing saved is refused
+/// rather than written as an empty credential.
+fn plan_channel_token(
+    has_existing: bool,
+    provided: &str,
+    channel: &str,
+) -> Result<TokenPlan, ApiError> {
+    let token = provided.trim();
+    if token.is_empty() {
+        return if has_existing {
+            Ok(TokenPlan::KeepExisting)
+        } else {
+            Err(err_400(format!(
+                "bot_token is required to connect a new {channel} channel"
+            )))
+        };
+    }
+    Ok(TokenPlan::Validate(token.to_string()))
+}
+
+/// Whether `token` looks like a Slack app-level token.
+///
+/// The console refuses a malformed one rather than warning, because it can ask
+/// again; the CLI wizard keeps warn-and-save, since abandoning a headless setup
+/// over a typo is worse there. Neither probes it: `apps.connections.open` is the
+/// only real check and it opens a live socket, so `doctor` owns that verdict.
+fn is_valid_slack_app_token(token: &str) -> bool {
+    let token = token.trim();
+    token.starts_with(crate::channels::slack::APP_TOKEN_PREFIX) && token.len() > 8
+}
+
+/// The caveat F-3 recorded on 2026-09-11: under Socket Mode, a `channel_id`
+/// filter drops direct messages, because a DM does not arrive on that channel.
+///
+/// Only when both are set. With no app token there is no Socket Mode, and with
+/// no channel filter nothing is dropped.
+fn socket_mode_dm_caveat(
+    app_token: Option<&str>,
+    channel_id: Option<&str>,
+) -> Option<&'static str> {
+    let filtering = channel_id.is_some_and(|c| !c.trim().is_empty());
+    let socket_mode = app_token.is_some_and(|t| !t.trim().is_empty());
+    (socket_mode && filtering).then_some(
+        "Socket Mode is on and channel_id is set: the bot will ignore direct messages and every \
+         conversation except that one. Clear channel_id to accept all of them.",
+    )
+}
+
+/// Build the `DiscordConfig` to persist from the existing one plus this
+/// request's changes, preserving every option the request does not mention.
+fn apply_discord_update(
+    existing: Option<DiscordConfig>,
+    new_token: Option<&str>,
+    allowed_users: Vec<String>,
+    guild_id: Option<&str>,
+) -> Result<DiscordConfig, ApiError> {
+    let mut dc = match existing {
+        Some(dc) => dc,
+        None => serde_json::from_value(json!({ "bot_token": "", "allowed_users": [] }))
+            .map_err(err_500)?,
+    };
+    if let Some(token) = new_token {
+        dc.bot_token = token.to_string();
+    }
+    dc.allowed_users = allowed_users;
+    if let Some(guild) = guild_id {
+        let guild = guild.trim();
+        dc.guild_id = (!guild.is_empty()).then(|| guild.to_string());
+    }
+    Ok(dc)
+}
+
+/// The Slack counterpart, which also enforces the app-token shape: a malformed
+/// one is a 400 here rather than a warning.
+fn apply_slack_update(
+    existing: Option<SlackConfig>,
+    new_token: Option<&str>,
+    allowed_users: Vec<String>,
+    app_token: Option<&str>,
+    channel_id: Option<&str>,
+) -> Result<SlackConfig, ApiError> {
+    let mut sc = match existing {
+        Some(sc) => sc,
+        None => serde_json::from_value(json!({ "bot_token": "", "allowed_users": [] }))
+            .map_err(err_500)?,
+    };
+    if let Some(token) = new_token {
+        sc.bot_token = token.to_string();
+    }
+    sc.allowed_users = allowed_users;
+    if let Some(app) = app_token {
+        let app = app.trim();
+        if app.is_empty() {
+            sc.app_token = None;
+        } else if is_valid_slack_app_token(app) {
+            sc.app_token = Some(app.to_string());
+        } else {
+            return Err(err_400(format!(
+                "app_token is not a Slack app-level token (expected `{}…`)",
+                crate::channels::slack::APP_TOKEN_PREFIX
+            )));
+        }
+    }
+    if let Some(channel) = channel_id {
+        let channel = channel.trim();
+        sc.channel_id = (!channel.is_empty()).then(|| channel.to_string());
+    }
+    Ok(sc)
+}
+
+/// The connect response for Discord. Carries no credential: the identity comes
+/// from the probe, and the allowlist is reported as a count.
+fn discord_connect_response(
+    bot_identity: Option<&str>,
+    allowed_users: usize,
+    warning: Option<&str>,
+    restarts_runtime: bool,
+) -> serde_json::Value {
+    json!({
+        "connected": true,
+        "channel": "discord",
+        "bot_username": bot_identity,
+        "allowed_users": allowed_users,
+        "warning": warning,
+        "restarts_runtime": restarts_runtime,
+        "note": runtime_restart_note(restarts_runtime),
+    })
+}
+
+/// The Slack counterpart, same shape so a console reads one thing.
+fn slack_connect_response(
+    bot_identity: Option<&str>,
+    allowed_users: usize,
+    warning: Option<&str>,
+    restarts_runtime: bool,
+) -> serde_json::Value {
+    json!({
+        "connected": true,
+        "channel": "slack",
+        "bot_username": bot_identity,
+        "allowed_users": allowed_users,
+        "warning": warning,
+        "restarts_runtime": restarts_runtime,
+        "note": runtime_restart_note(restarts_runtime),
+    })
+}
+
+/// Turn a probe verdict into either the identity to report or a 400.
+///
+/// Both `Rejected` and `Inconclusive` refuse. Rule 2 of this effort says a
+/// credential that cannot be validated is not stored, and the gateway already
+/// fails closed for Telegram. The two messages differ so an offline operator is
+/// not told their token is bad.
+fn refuse_unless_accepted(
+    verdict: crate::onboard::provision::validate::verdict::ProbeVerdict,
+    channel: &str,
+) -> Result<(), ApiError> {
+    use crate::onboard::provision::validate::verdict::ProbeVerdict;
+    match verdict {
+        ProbeVerdict::Accepted => Ok(()),
+        ProbeVerdict::Rejected(detail) => Err(err_400(format!(
+            "{channel} rejected the bot token: {detail}"
+        ))),
+        ProbeVerdict::Inconclusive(detail) => Err(err_400(format!(
+            "could not check the bot token with {channel} (it was not rejected, but nothing \
+             confirmed it either): {detail}"
+        ))),
+    }
+}
+
+/// The allowlist warning both channels share with Telegram.
+fn allowlist_warning(allowed_users: &[String], subject: &str) -> Option<String> {
+    if allowed_users.is_empty() {
+        Some(format!(
+            "allowed_users is empty — the bot will deny ALL senders until you add {subject} user ids."
+        ))
+    } else if allowed_users.iter().any(|u| u.trim() == "*") {
+        Some(format!(
+            "allowed_users contains \"*\" — the bot will respond to ANYONE. Use specific {subject} user ids unless this is intentional."
+        ))
+    } else {
+        None
+    }
+}
+
+async fn connect_discord(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DiscordConnectBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+
+    let existing = state.config.lock().channels_config.discord.clone();
+    let plan = plan_discord_token(existing.as_ref(), &body.bot_token)?;
+
+    let new_token = match plan {
+        TokenPlan::Validate(token) => {
+            let verdict = crate::channels::discord::validate_bot_token(&token).await;
+            refuse_unless_accepted(verdict, "Discord")?;
+            Some(token)
+        }
+        TokenPlan::KeepExisting => None,
+    };
+
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let dc = apply_discord_update(
+        cfg.channels_config.discord.clone(),
+        new_token.as_deref(),
+        body.allowed_users.clone(),
+        body.guild_id.as_deref(),
+    )?;
+    cfg.channels_config.discord = Some(dc);
+    persist_and_swap(&state, cfg, "channels.discord").await?;
+
+    // A guild filter lives inside the channel object, like `mention_only`, so a
+    // change to it cannot reach a running listener either.
+    let restarts_runtime = needs_runtime_restart(new_token.is_some()) || body.guild_id.is_some();
+    if restarts_runtime {
+        schedule_daemon_reload();
+    }
+
+    let warning = allowlist_warning(&body.allowed_users, "Discord");
+    Ok(Json(discord_connect_response(
+        None,
+        body.allowed_users.len(),
+        warning.as_deref(),
+        restarts_runtime,
+    )))
+}
+
+async fn disconnect_discord(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let was_configured = cfg.channels_config.discord.is_some();
+    cfg.channels_config.discord = None;
+    persist_and_swap(&state, cfg, "channels.discord").await?;
+    if was_configured {
+        schedule_daemon_reload();
+    }
+    Ok(Json(json!({
+        "disconnected": was_configured,
+        "channel": "discord",
+        "restarts_runtime": was_configured,
+    })))
+}
+
+async fn connect_slack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SlackConnectBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+
+    let existing = state.config.lock().channels_config.slack.clone();
+    let plan = plan_slack_token(existing.as_ref(), &body.bot_token)?;
+
+    let new_token = match plan {
+        TokenPlan::Validate(token) => {
+            let verdict = crate::channels::slack::validate_bot_token(&token).await;
+            refuse_unless_accepted(verdict, "Slack")?;
+            Some(token)
+        }
+        TokenPlan::KeepExisting => None,
+    };
+
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let sc = apply_slack_update(
+        cfg.channels_config.slack.clone(),
+        new_token.as_deref(),
+        body.allowed_users.clone(),
+        body.app_token.as_deref(),
+        body.channel_id.as_deref(),
+    )?;
+    let effective_app_token = sc.app_token.clone();
+    let effective_channel_id = sc.channel_id.clone();
+    cfg.channels_config.slack = Some(sc);
+    persist_and_swap(&state, cfg, "channels.slack").await?;
+
+    // The transport itself changes when the app token does, so that restarts for
+    // the same reason a new bot token does.
+    let restarts_runtime = needs_runtime_restart(new_token.is_some())
+        || body.app_token.is_some()
+        || body.channel_id.is_some();
+    if restarts_runtime {
+        schedule_daemon_reload();
+    }
+
+    // The DM caveat outranks the allowlist warning: it describes messages the
+    // operator will never see, which is the more surprising of the two.
+    let caveat = socket_mode_dm_caveat(
+        effective_app_token.as_deref(),
+        effective_channel_id.as_deref(),
+    )
+    .map(str::to_string)
+    .or_else(|| allowlist_warning(&body.allowed_users, "Slack"));
+    Ok(Json(slack_connect_response(
+        None,
+        body.allowed_users.len(),
+        caveat.as_deref(),
+        restarts_runtime,
+    )))
+}
+
+async fn disconnect_slack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let was_configured = cfg.channels_config.slack.is_some();
+    cfg.channels_config.slack = None;
+    persist_and_swap(&state, cfg, "channels.slack").await?;
+    if was_configured {
+        schedule_daemon_reload();
+    }
+    Ok(Json(json!({
+        "disconnected": was_configured,
+        "channel": "slack",
+        "restarts_runtime": was_configured,
+    })))
+}
+
 // ── GET/PUT /secrets ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1970,6 +2361,195 @@ mod tests {
         // No token and nothing configured yet → cannot connect.
         let err = plan_telegram_token(None, "").expect_err("must require a token");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    fn discord_config(token: &str) -> DiscordConfig {
+        serde_json::from_value(json!({
+            "bot_token": token,
+            "allowed_users": ["U_KEEP"],
+            "listen_to_bots": true,
+            "mention_only": true,
+            "guild_id": "G1",
+        }))
+        .expect("a Discord section")
+    }
+
+    fn slack_config(token: &str) -> SlackConfig {
+        serde_json::from_value(json!({
+            "bot_token": token,
+            "app_token": "xapp-1-AAA",
+            "channel_id": "C1",
+            "allowed_users": ["U_KEEP"],
+        }))
+        .expect("a Slack section")
+    }
+
+    /// The three cases the Telegram planner already distinguishes, per channel:
+    /// a new token is validated, an omitted token keeps the saved one so an
+    /// allowlist edit needs no re-entry, and an omitted token with nothing saved
+    /// is refused rather than written as an empty credential.
+    #[test]
+    fn discord_token_plan_covers_new_kept_and_missing() {
+        match plan_discord_token(None, "  discord-token  ").expect("a new token") {
+            TokenPlan::Validate(t) => assert_eq!(t, "discord-token", "the token is trimmed"),
+            TokenPlan::KeepExisting => panic!("a supplied token must be validated"),
+        }
+
+        let existing = discord_config("saved-token");
+        assert!(matches!(
+            plan_discord_token(Some(&existing), "").expect("keeps the saved token"),
+            TokenPlan::KeepExisting
+        ));
+
+        let err = plan_discord_token(None, "   ").expect_err("nothing saved, nothing supplied");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn slack_token_plan_covers_new_kept_and_missing() {
+        match plan_slack_token(None, " xoxb-abc ").expect("a new token") {
+            TokenPlan::Validate(t) => assert_eq!(t, "xoxb-abc"),
+            TokenPlan::KeepExisting => panic!("a supplied token must be validated"),
+        }
+
+        let existing = slack_config("xoxb-saved");
+        assert!(matches!(
+            plan_slack_token(Some(&existing), "").expect("keeps the saved token"),
+            TokenPlan::KeepExisting
+        ));
+
+        assert_eq!(
+            plan_slack_token(None, "").expect_err("nothing saved").0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// The half that is easy to lose: an allowlist-only edit must not clear the
+    /// options the request never mentions.
+    #[test]
+    fn a_discord_allowlist_edit_keeps_every_other_option() {
+        let updated = apply_discord_update(
+            Some(discord_config("saved-token")),
+            None,
+            vec!["U_NEW".into()],
+            None,
+        )
+        .expect("apply");
+
+        assert_eq!(updated.bot_token, "saved-token", "the saved token survives");
+        assert_eq!(updated.allowed_users, vec!["U_NEW".to_string()]);
+        assert!(updated.listen_to_bots, "listen_to_bots was cleared");
+        assert!(updated.mention_only, "mention_only was cleared");
+        assert_eq!(
+            updated.guild_id.as_deref(),
+            Some("G1"),
+            "an unmentioned guild_id was cleared"
+        );
+    }
+
+    #[test]
+    fn a_slack_allowlist_edit_keeps_every_other_option() {
+        let updated = apply_slack_update(
+            Some(slack_config("xoxb-saved")),
+            None,
+            vec!["U_NEW".into()],
+            None,
+            None,
+        )
+        .expect("apply");
+
+        assert_eq!(updated.bot_token, "xoxb-saved");
+        assert_eq!(updated.allowed_users, vec!["U_NEW".to_string()]);
+        assert_eq!(
+            updated.app_token.as_deref(),
+            Some("xapp-1-AAA"),
+            "an unmentioned app_token was cleared, silently turning off Socket Mode"
+        );
+        assert_eq!(updated.channel_id.as_deref(), Some("C1"));
+    }
+
+    /// The console refuses a malformed app token instead of warning: it can ask
+    /// again, which the CLI wizard cannot, so the CLI keeps warn-and-save.
+    #[test]
+    fn a_malformed_slack_app_token_is_refused() {
+        assert!(is_valid_slack_app_token("xapp-1-A0B1C2"));
+        assert!(!is_valid_slack_app_token("xoxb-not-an-app-token"));
+        assert!(!is_valid_slack_app_token("   "));
+
+        let err = apply_slack_update(None, Some("xoxb-abc"), vec![], Some("nope"), None)
+            .expect_err("a malformed app token is a 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// F-3 from the 2026-09-11 drive: under Socket Mode a `channel_id` filter
+    /// drops direct messages. Only when both are set, and in the field the
+    /// console already reads for Telegram.
+    #[test]
+    fn the_socket_mode_dm_caveat_appears_only_with_both_fields() {
+        assert!(socket_mode_dm_caveat(Some("xapp-1-A"), Some("C1")).is_some());
+        assert!(socket_mode_dm_caveat(Some("xapp-1-A"), None).is_none());
+        assert!(socket_mode_dm_caveat(None, Some("C1")).is_none());
+        assert!(socket_mode_dm_caveat(None, None).is_none());
+
+        let caveat = socket_mode_dm_caveat(Some("xapp-1-A"), Some("C1")).expect("a caveat");
+        assert!(
+            caveat.to_lowercase().contains("direct message"),
+            "the caveat must name what is dropped: {caveat}"
+        );
+    }
+
+    /// The one mistake that cannot be walked back once a console has logged the
+    /// response. Checked at any depth, not just the top level.
+    #[test]
+    fn no_connect_response_carries_the_token() {
+        let secret = "xoxb-super-secret-value";
+        for body in [
+            discord_connect_response(Some("BotName"), 2, None, true),
+            slack_connect_response(Some("TeamName"), 2, None, false),
+        ] {
+            let rendered = serde_json::to_string(&body).expect("serialise");
+            assert!(
+                !rendered.contains(secret),
+                "a token reached the response body: {rendered}"
+            );
+            assert!(
+                !rendered.contains("bot_token") && !rendered.contains("app_token"),
+                "the response names a credential field: {rendered}"
+            );
+        }
+    }
+
+    /// The console has no prompt, so it cannot ask "save it anyway?" the way the
+    /// CLI wizard does. Rule 2 of this effort refuses a credential that cannot be
+    /// validated, and the gateway already fails closed for Telegram, so both a
+    /// rejection and an inconclusive probe are a 400 here. The two messages
+    /// differ, so an operator on an offline host is not told their token is bad.
+    #[test]
+    fn only_an_accepted_probe_lets_a_token_be_saved() {
+        use crate::onboard::provision::validate::verdict::ProbeVerdict;
+
+        assert!(refuse_unless_accepted(ProbeVerdict::Accepted, "Discord").is_ok());
+
+        let rejected = refuse_unless_accepted(ProbeVerdict::Rejected("HTTP 401".into()), "Discord")
+            .expect_err("a rejected token must not be saved");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+
+        let inconclusive =
+            refuse_unless_accepted(ProbeVerdict::Inconclusive("dns failure".into()), "Slack")
+                .expect_err("an unchecked token must not be saved either");
+        assert_eq!(inconclusive.0, StatusCode::BAD_REQUEST);
+        let rendered = format!("{:?}", inconclusive.1).to_lowercase();
+        // A phrase, not the bare word: the message says "it was not rejected",
+        // which contains "rejected" while asserting the opposite. What must not
+        // appear is the rejection sentence itself.
+        assert!(
+            !rendered.contains("rejected the bot token"),
+            "an offline probe must not be reported as a rejection: {rendered}"
+        );
+        assert!(
+            rendered.contains("could not check"),
+            "an inconclusive probe must say the check could not be made: {rendered}"
+        );
     }
 
     #[test]
