@@ -21,7 +21,21 @@ pub struct DiscordChannel {
     /// Size/type limits for inbound images. Defaults to the shipped
     /// `[multimodal]` defaults; the factory overrides it with the operator's.
     multimodal: crate::config::MultimodalConfig,
-    typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    typing_handles: Mutex<HashMap<String, TypingSignal>>,
+}
+
+/// One recipient's typing indicator: the task reposting it, and whether a
+/// refusal has already been logged for this turn.
+///
+/// The flag lives here rather than in the task because
+/// `supervisor::spawn_scoped_typing_task` calls `start_typing` every
+/// `CHANNEL_TYPING_REFRESH_INTERVAL_SECS` (4) seconds for the whole turn and
+/// calls `stop_typing` once at the end. A flag owned by the task would reset on
+/// every refresh, so one missing permission would WARN every four seconds, up to
+/// 75 times on a turn that runs to `CHANNEL_MESSAGE_TIMEOUT_SECS`.
+struct TypingSignal {
+    handle: tokio::task::JoinHandle<()>,
+    warned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What the gateway loop should do with one `MESSAGE_CREATE` payload.
@@ -413,6 +427,94 @@ impl Channel for DiscordChannel {
             "Discord", workspace,
         ))
     }
+
+    /// `users/@me` with the bot token. A revoked token answers 401, so this can
+    /// fail for the condition it exists to catch, which the trait's default
+    /// `true` could not.
+    async fn health_check(&self) -> bool {
+        self.http_client()
+            .get("https://discord.com/api/v10/users/@me")
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
+    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
+        // The previous task is aborted here rather than by calling
+        // `stop_typing`, which also drops the warn flag. The supervisor calls
+        // this every four seconds for the whole turn and calls `stop_typing`
+        // once at the end, so carrying the flag across a refresh is what makes
+        // one WARN per turn true rather than one per tick.
+        let warned = {
+            let mut guard = self.typing_handles.lock();
+            match guard.remove(recipient) {
+                Some(previous) => {
+                    previous.handle.abort();
+                    previous.warned
+                }
+                None => Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        };
+
+        let client = self.http_client();
+        let token = self.bot_token.clone();
+        let channel_id = recipient.to_string();
+        let warned_in_task = Arc::clone(&warned);
+
+        let handle = tokio::spawn(async move {
+            let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
+            loop {
+                match client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .send()
+                    .await
+                {
+                    Ok(ok) if ok.status().is_success() => {}
+                    // `swap` so whichever refresh sees the first refusal is the
+                    // one that logs, and the rest of the turn stays quiet. The
+                    // status only: the token travels in a header, and a typing
+                    // request carries no message text.
+                    Ok(refused) => {
+                        if !warned_in_task.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::warn!(
+                                status = refused.status().as_u16(),
+                                "Discord refused the typing indicator; the turn runs without it"
+                            );
+                        }
+                    }
+                    // The error's `Display` names the request URL, so this line
+                    // carries the channel id. Still no token, and no message
+                    // text: the only other channel that scrubs a transport error
+                    // is Telegram, whose URL embeds the token itself.
+                    Err(err) => {
+                        if !warned_in_task.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::warn!(
+                                error = %err,
+                                "Discord typing request failed; the turn runs without it"
+                            );
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            }
+        });
+
+        let mut guard = self.typing_handles.lock();
+        guard.insert(recipient.to_string(), TypingSignal { handle, warned });
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let mut guard = self.typing_handles.lock();
+        if let Some(signal) = guard.remove(recipient) {
+            signal.handle.abort();
+        }
+        Ok(())
+    }
 }
 
 impl DiscordChannel {
@@ -785,49 +887,6 @@ impl DiscordChannel {
             }
         }
 
-        Ok(())
-    }
-
-    async fn health_check(&self) -> bool {
-        self.http_client()
-            .get("https://discord.com/api/v10/users/@me")
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-    }
-
-    async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
-        self.stop_typing(recipient).await?;
-
-        let client = self.http_client();
-        let token = self.bot_token.clone();
-        let channel_id = recipient.to_string();
-
-        let handle = tokio::spawn(async move {
-            let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
-            loop {
-                let _ = client
-                    .post(&url)
-                    .header("Authorization", format!("Bot {token}"))
-                    .send()
-                    .await;
-                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-            }
-        });
-
-        let mut guard = self.typing_handles.lock();
-        guard.insert(recipient.to_string(), handle);
-
-        Ok(())
-    }
-
-    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
-        let mut guard = self.typing_handles.lock();
-        if let Some(handle) = guard.remove(recipient) {
-            handle.abort();
-        }
         Ok(())
     }
 }
@@ -1385,6 +1444,86 @@ mod tests {
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handles.lock();
         assert!(!guard.contains_key("123456"));
+    }
+
+    /// Through `Arc<dyn Channel>`, which is the only way the runtime ever calls
+    /// this. The three tests above call the methods on the concrete type, so they
+    /// resolve against whatever block holds them and cannot tell a reachable
+    /// method from an unreachable one. This one can: with `start_typing` in a
+    /// plain `impl DiscordChannel` block, the trait's no-op default runs and the
+    /// handle map stays empty, which is why Discord never showed typing (F-32).
+    #[tokio::test]
+    async fn typing_started_through_the_trait_object_is_registered_and_cleared() {
+        let ch = Arc::new(DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec![],
+            false,
+            false,
+        ));
+        let as_the_runtime_holds_it: Arc<dyn Channel> = ch.clone();
+
+        as_the_runtime_holds_it
+            .start_typing("123456", None)
+            .await
+            .expect("start_typing through the trait object");
+        assert!(
+            ch.typing_handles.lock().contains_key("123456"),
+            "nothing was registered, so the call reached the trait default \
+             instead of Discord's own method"
+        );
+
+        as_the_runtime_holds_it
+            .stop_typing("123456")
+            .await
+            .expect("stop_typing through the trait object");
+        assert!(
+            ch.typing_handles.lock().is_empty(),
+            "the indicator outlives the turn when `stop_typing` is unreachable"
+        );
+    }
+
+    /// The supervisor calls `start_typing` every four seconds for the whole turn
+    /// and `stop_typing` once at the end, so a flag owned by the spawned task
+    /// resets on every refresh and one refusal writes a WARN per tick. The flag
+    /// lives with the recipient's entry instead: a refresh carries it, and only
+    /// the turn's final `stop_typing` clears it.
+    #[tokio::test]
+    async fn a_refused_typing_warning_survives_a_refresh_and_resets_next_turn() {
+        use std::sync::atomic::Ordering;
+
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+
+        ch.start_typing("123456", None).await.unwrap();
+        ch.typing_handles
+            .lock()
+            .get("123456")
+            .expect("the first call registers the recipient")
+            .warned
+            .store(true, Ordering::Relaxed);
+
+        ch.start_typing("123456", None).await.unwrap();
+        assert!(
+            ch.typing_handles
+                .lock()
+                .get("123456")
+                .expect("a refresh keeps the recipient registered")
+                .warned
+                .load(Ordering::Relaxed),
+            "the refresh reset the flag, so one refusal would WARN every four seconds"
+        );
+
+        ch.stop_typing("123456").await.unwrap();
+        ch.start_typing("123456", None).await.unwrap();
+        assert!(
+            !ch.typing_handles
+                .lock()
+                .get("123456")
+                .expect("the next turn registers the recipient")
+                .warned
+                .load(Ordering::Relaxed),
+            "the next turn must be able to warn again"
+        );
     }
 
     #[tokio::test]
