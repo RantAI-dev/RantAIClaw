@@ -914,6 +914,39 @@ fn needs_runtime_restart(token_changed: bool) -> bool {
     token_changed
 }
 
+/// Whether a Discord save needs the channels runtime restarted.
+///
+/// A credential change does, and so does a `guild_id` change, because the guild
+/// filter is passed into the channel object at construction and cannot be
+/// swapped in place.
+///
+/// What must NOT restart is a request that merely *carries* a field whose value
+/// is unchanged. The daemon hosts this gateway, so every restart kills the
+/// request that asked for it, and with no debounce a handful of no-op saves
+/// trips systemd's start limit and leaves the unit `failed`. Presence in the
+/// body is not a change; this compares against the config just loaded.
+fn discord_restart_needed(
+    token_changed: bool,
+    before: Option<&DiscordConfig>,
+    after: &DiscordConfig,
+) -> bool {
+    let guild_changed = before.and_then(|b| b.guild_id.clone()) != after.guild_id;
+    needs_runtime_restart(token_changed) || guild_changed
+}
+
+/// The Slack counterpart. The app token decides the transport itself (Socket
+/// Mode or polling) and `channel_id` is read at construction, so a change to
+/// either needs the listener rebuilt — but only a real change.
+fn slack_restart_needed(
+    token_changed: bool,
+    before: Option<&SlackConfig>,
+    after: &SlackConfig,
+) -> bool {
+    let app_token_changed = before.and_then(|b| b.app_token.clone()) != after.app_token;
+    let channel_changed = before.and_then(|b| b.channel_id.clone()) != after.channel_id;
+    needs_runtime_restart(token_changed) || app_token_changed || channel_changed
+}
+
 /// The operator-facing note for a save, derived from the same flag the response
 /// reports as `restarts_runtime`.
 ///
@@ -1324,18 +1357,19 @@ async fn connect_discord(
     };
 
     let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let previous = cfg.channels_config.discord.clone();
     let dc = apply_discord_update(
-        cfg.channels_config.discord.clone(),
+        previous.clone(),
         new_token.as_deref(),
         body.allowed_users.clone(),
         body.guild_id.as_deref(),
     )?;
+    // Decided against the freshly loaded config, before the new one replaces it,
+    // so resending an unchanged `guild_id` does not bounce the daemon.
+    let restarts_runtime = discord_restart_needed(new_token.is_some(), previous.as_ref(), &dc);
     cfg.channels_config.discord = Some(dc);
     persist_and_swap(&state, cfg, "channels.discord").await?;
 
-    // A guild filter lives inside the channel object, like `mention_only`, so a
-    // change to it cannot reach a running listener either.
-    let restarts_runtime = needs_runtime_restart(new_token.is_some()) || body.guild_id.is_some();
     if restarts_runtime {
         schedule_daemon_reload();
     }
@@ -1388,8 +1422,9 @@ async fn connect_slack(
     };
 
     let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let previous = cfg.channels_config.slack.clone();
     let sc = apply_slack_update(
-        cfg.channels_config.slack.clone(),
+        previous.clone(),
         new_token.as_deref(),
         body.allowed_users.clone(),
         body.app_token.as_deref(),
@@ -1397,14 +1432,12 @@ async fn connect_slack(
     )?;
     let effective_app_token = sc.app_token.clone();
     let effective_channel_id = sc.channel_id.clone();
+    // Same rule as Discord's: a real change to the transport or the filter, not
+    // the mere presence of the field in the body.
+    let restarts_runtime = slack_restart_needed(new_token.is_some(), previous.as_ref(), &sc);
     cfg.channels_config.slack = Some(sc);
     persist_and_swap(&state, cfg, "channels.slack").await?;
 
-    // The transport itself changes when the app token does, so that restarts for
-    // the same reason a new bot token does.
-    let restarts_runtime = needs_runtime_restart(new_token.is_some())
-        || body.app_token.is_some()
-        || body.channel_id.is_some();
     if restarts_runtime {
         schedule_daemon_reload();
     }
@@ -2549,6 +2582,52 @@ mod tests {
         assert!(
             rendered.contains("could not check"),
             "an inconclusive probe must say the check could not be made: {rendered}"
+        );
+    }
+
+    /// VULN-001 from the security review. Presence in the request is not a
+    /// change: a console that resends the saved `guild_id` or `channel_id` must
+    /// not bounce the daemon, because the daemon hosts this gateway and a
+    /// handful of no-op saves trips systemd's start limit and leaves the unit
+    /// `failed`, taking the endpoint down with it.
+    #[test]
+    fn resending_an_unchanged_option_does_not_restart_the_runtime() {
+        let before = discord_config("saved-token");
+        let unchanged =
+            apply_discord_update(Some(before.clone()), None, vec!["U_NEW".into()], Some("G1"))
+                .expect("apply");
+        assert!(
+            !discord_restart_needed(false, Some(&before), &unchanged),
+            "the same guild_id came back in the body, so nothing changed"
+        );
+
+        let moved =
+            apply_discord_update(Some(before.clone()), None, vec![], Some("G2")).expect("apply");
+        assert!(
+            discord_restart_needed(false, Some(&before), &moved),
+            "a different guild_id cannot reach a running channel"
+        );
+
+        let slack_before = slack_config("xoxb-saved");
+        let slack_unchanged = apply_slack_update(
+            Some(slack_before.clone()),
+            None,
+            vec![],
+            Some("xapp-1-AAA"),
+            Some("C1"),
+        )
+        .expect("apply");
+        assert!(
+            !slack_restart_needed(false, Some(&slack_before), &slack_unchanged),
+            "the same app token and channel came back, so nothing changed"
+        );
+
+        let slack_moved =
+            apply_slack_update(Some(slack_before.clone()), None, vec![], None, Some("C2"))
+                .expect("apply");
+        assert!(
+            slack_restart_needed(false, Some(&slack_before), &slack_moved),
+            "a different channel filter needs the listener rebuilt"
         );
     }
 
