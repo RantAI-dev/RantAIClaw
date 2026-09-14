@@ -1531,7 +1531,12 @@ struct WhatsAppWebConnectBody {
 /// Held only while a `pair` stream is open. The handler flips it on
 /// before yielding the SSE and clears it when the stream drops. A second
 /// concurrent `POST /pair` returns 409.
-pub(crate) type PairGuard = Arc<std::sync::atomic::AtomicBool>;
+///
+/// `pub` because `tests/kb/api_test.rs` builds an `AppState` literal and
+/// has to name the field's type; a `pub(crate)` alias is unreachable from
+/// an integration test. The alias only reveals an `Arc<AtomicBool>`, the
+/// same primitive the `pair` handler exchanges through it.
+pub type PairGuard = Arc<std::sync::atomic::AtomicBool>;
 
 async fn whatsapp_web_connect(
     State(state): State<AppState>,
