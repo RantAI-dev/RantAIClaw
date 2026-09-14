@@ -28,6 +28,7 @@ pub use admin::doctor_channels;
 #[allow(unused_imports)]
 pub(crate) use admin::{
     announce_daemon_reload, channel_roster, handle_command, reload_managed_daemon,
+    reload_managed_daemon_non_blocking, systemd_restart_args,
 };
 pub mod approval_relay;
 pub mod auto_start_state;
@@ -341,7 +342,6 @@ pub(crate) struct ChannelRuntimeDefaults {
 }
 
 pub(crate) const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "rantaiclaw.service"];
-pub(crate) const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "rantaiclaw.service"];
 pub(crate) const OPENRC_STATUS_ARGS: [&str; 2] = ["rantaiclaw", "status"];
 pub(crate) const OPENRC_RESTART_ARGS: [&str; 2] = ["rantaiclaw", "restart"];
 

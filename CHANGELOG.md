@@ -66,6 +66,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A channel change from the console no longer SIGKILLs the daemon on systemd.** Disconnecting or
+  reconnecting a channel asked systemd to restart this process, then waited for that restart job to
+  finish in `schedule_daemon_reload`. The job first stops the unit — systemd sends SIGTERM to this very
+  daemon — and the daemon could not exit because dropping the tokio runtime waits for blocking tasks,
+  including the one parked on `systemctl`. The pair sat there until `TimeoutStopSec=30` and systemd
+  SIGKILLed the daemon, which skipped everything plan 353 built into shutdown. The in-gateway reload
+  now uses a non-blocking entry point: `--no-block` on systemd so the job is queued and returns at once,
+  `kickstart -k` detached on launchd, and a detached spawn on OpenRC. The blocking form stays reachable
+  for the CLI, the TUI and the headless setup path, which live in their own processes and still need to
+  report the restart outcome. A source guard test under `src/channels/mod_tests.rs` keeps the blocking
+  form out of `src/gateway/`.
 - **Removing someone from Discord's or Slack's allowlist now takes effect without a restart.** When
   `config.toml` changes, the runtime pushes each channel's allowlist into the live channel so a
   tightened list does not wait, which is the whole point of applying it there. Both channels hold their
