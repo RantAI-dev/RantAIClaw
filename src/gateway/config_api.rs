@@ -17,15 +17,20 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::{
-        sse::{Event as SseEvent, KeepAlive, Sse},
-        IntoResponse, Json, Response,
-    },
+    response::Json,
     routing::{get, post, put},
     Router,
 };
+#[cfg(feature = "whatsapp-web")]
+use axum::{
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+};
 use serde::Deserialize;
 use serde_json::json;
+#[cfg(feature = "whatsapp-web")]
 use std::convert::Infallible;
 
 use super::AppState;
@@ -63,16 +68,21 @@ pub fn router() -> Router<AppState> {
             post(connect_slack).delete(disconnect_slack),
         )
         // Plan 367: WhatsApp Web can be linked and unlinked from the console.
-        // The pair endpoint streams an SSE of QR frames until the phone scans
-        // or the gateway's timeout fires.
+        // The connect/disconnect routes are always registered; allowlist-only
+        // edits apply live through the runtime's existing override. The pair
+        // route is gated behind the `whatsapp-web` feature because it shells
+        // out to the wa-rs pairing flow, which only compiles with the feature.
         .route(
             "/api/v1/channels/whatsapp_web",
             post(whatsapp_web_connect).delete(whatsapp_web_disconnect),
-        )
-        .route(
+        );
+    #[cfg(feature = "whatsapp-web")]
+    {
+        router = router.route(
             "/api/v1/channels/whatsapp_web/pair",
             post(whatsapp_web_pair),
         );
+    }
     // Knowledge Base credential status/setter — only when the KB feature is built.
     #[cfg(feature = "kb")]
     {
@@ -1618,6 +1628,7 @@ async fn whatsapp_web_disconnect(
     })))
 }
 
+#[cfg(feature = "whatsapp-web")]
 async fn whatsapp_web_pair(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1675,22 +1686,11 @@ async fn whatsapp_web_pair(
         .collect::<Vec<_>>();
 
     // Build the pair stream. `pair_once` is only available with the
-    // `whatsapp-web` feature; the route still exists without it so the
-    // console can branch on the response shape the way it does for the
-    // other setup routes.
-    #[cfg(feature = "whatsapp-web")]
+    // `whatsapp-web` feature, and the entire handler is gated behind it.
     let pair_stream = {
         use crate::channels::whatsapp_web::{pair_once, PairOptions};
         pair_once(PairOptions::new(session_path.clone()))
     };
-    #[cfg(not(feature = "whatsapp-web"))]
-    let pair_stream: std::pin::Pin<
-        Box<dyn Stream<Item = crate::channels::whatsapp_web::PairEvent> + Send>,
-    > = Box::pin(futures::stream::once(async {
-        crate::channels::whatsapp_web::PairEvent::Failed(
-            "whatsapp-web feature not enabled in this build".into(),
-        )
-    }));
 
     let state_for_stream = state.clone();
     let guard_for_drop = guard.clone();
@@ -1783,7 +1783,9 @@ impl Drop for PairDropGuard<'_> {
 /// Render a QR payload string into an SVG string using the `qrcode` crate's
 /// `svg` feature. The SVG is inline (no network call, no external assets)
 /// and the console renders it as an `<img src="data:image/svg+xml;...">`
-/// per plan 369 — never as `innerHTML`.
+/// per plan 369 — never as `innerHTML`. Only compiled with the
+/// `whatsapp-web` feature; the connect/disconnect routes that don't render
+/// a QR are available in every build.
 #[cfg(feature = "whatsapp-web")]
 fn render_qr_svg(payload: &str) -> String {
     use qrcode::render::svg;
@@ -1795,11 +1797,6 @@ fn render_qr_svg(payload: &str) -> String {
             .build(),
         Err(e) => format!("<!-- qr render failed: {e} -->"),
     }
-}
-
-#[cfg(not(feature = "whatsapp-web"))]
-fn render_qr_svg(_payload: &str) -> String {
-    String::new()
 }
 
 async fn persist_paired_session(
