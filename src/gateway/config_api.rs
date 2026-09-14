@@ -14,19 +14,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "whatsapp-web")]
+use axum::response::{
+    sse::{Event as SseEvent, KeepAlive, Sse},
+    IntoResponse, Response,
+};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post, put},
     Router,
-};
-#[cfg(feature = "whatsapp-web")]
-use axum::{
-    response::{
-        sse::{Event as SseEvent, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
 };
 use serde::Deserialize;
 use serde_json::json;
