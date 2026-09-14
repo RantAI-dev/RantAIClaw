@@ -10,7 +10,15 @@
 //! default) requests are accepted.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+#[cfg(feature = "whatsapp-web")]
+use axum::response::{
+    sse::{Event as SseEvent, KeepAlive, Sse},
+    IntoResponse, Response,
+};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -20,6 +28,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+#[cfg(feature = "whatsapp-web")]
+use std::convert::Infallible;
 
 use super::AppState;
 use crate::config::api_url::{looks_like_api_key, validate_api_url};
@@ -54,7 +64,23 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/channels/slack",
             post(connect_slack).delete(disconnect_slack),
+        )
+        // Plan 367: WhatsApp Web can be linked and unlinked from the console.
+        // The connect/disconnect routes are always registered; allowlist-only
+        // edits apply live through the runtime's existing override. The pair
+        // route is gated behind the `whatsapp-web` feature because it shells
+        // out to the wa-rs pairing flow, which only compiles with the feature.
+        .route(
+            "/api/v1/channels/whatsapp_web",
+            post(whatsapp_web_connect).delete(whatsapp_web_disconnect),
         );
+    #[cfg(feature = "whatsapp-web")]
+    {
+        router = router.route(
+            "/api/v1/channels/whatsapp_web/pair",
+            post(whatsapp_web_pair),
+        );
+    }
     // Knowledge Base credential status/setter — only when the KB feature is built.
     #[cfg(feature = "kb")]
     {
@@ -1483,6 +1509,314 @@ async fn disconnect_slack(
         "channel": "slack",
         "restarts_runtime": was_configured,
     })))
+}
+
+// ── POST/DELETE /channels/whatsapp_web + POST /channels/whatsapp_web/pair ────
+//
+// Plan 367. Three rules bound the surface:
+//   * Pair is refused while a `channels_config.whatsapp_web` section exists
+//     (D-3: two clients never hold one session).
+//   * The pair endpoint mints a fresh session file each call. The listener
+//     opens `WhatsAppWebConfig.session_path` exactly as written
+//     (`whatsapp_web.rs:923`), so a new pair never collides with an old
+//     session, and on `Connected` the gateway persists that new path.
+//   * The DELETE handler clears the section and schedules a reload. It
+//     moves no file: the runtime's `build_channel_runtime` set-aside step
+//     runs on the next start, before any channel listener can open
+//     anything (the listener-held SQLite descriptor that stopped the
+//     first version of this plan).
+
+#[derive(Deserialize)]
+struct WhatsAppWebConnectBody {
+    /// Phone numbers allowed to talk to the bot (E.164, or "*"). An empty
+    /// list denies everyone — the same convention Telegram and Discord
+    /// use, and the warning the response carries names it.
+    #[serde(default)]
+    allowed_numbers: Vec<String>,
+}
+
+/// Held only while a `pair` stream is open. The handler flips it on
+/// before yielding the SSE and clears it when the stream drops. A second
+/// concurrent `POST /pair` returns 409.
+///
+/// `pub` because `tests/kb/api_test.rs` builds an `AppState` literal and
+/// has to name the field's type; a `pub(crate)` alias is unreachable from
+/// an integration test. The alias only reveals an `Arc<AtomicBool>`, the
+/// same primitive the `pair` handler exchanges through it.
+pub type PairGuard = Arc<std::sync::atomic::AtomicBool>;
+
+async fn whatsapp_web_connect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WhatsAppWebConnectBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let previous = cfg.channels_config.whatsapp_web.clone();
+
+    // `whatsapp_web` is a live-allowlist channel like Telegram: the runtime
+    // pushes the new list through `Channel::apply_allowed_senders` on the
+    // next message (`whatsapp_web.rs:1291`), so editing it does NOT need
+    // a restart — the same rule plan 366 applied to Discord/Slack.
+    let normalised = body
+        .allowed_numbers
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+
+    let next = match previous {
+        Some(mut existing) => {
+            existing.allowed_numbers = normalised;
+            existing
+        }
+        None => {
+            // POST without a paired session yet — refuse, the operator
+            // must pair through `POST /pair` first. Same shape as the
+            // Telegram "token required" error.
+            return Err(err_400(
+                "whatsapp_web is not linked; pair first via POST /api/v1/channels/whatsapp_web/pair",
+            ));
+        }
+    };
+
+    cfg.channels_config.whatsapp_web = Some(next.clone());
+    persist_and_swap(&state, cfg, "channels.whatsapp_web").await?;
+
+    let warning = if next.allowed_numbers.is_empty() {
+        Some(
+            "allowed_numbers is empty — the bot will deny ALL senders until you add phone numbers."
+                .to_string(),
+        )
+    } else if next.allowed_numbers.iter().any(|n| n.trim() == "*") {
+        Some("allowed_numbers contains \"*\" — the bot will respond to ANY sender on WhatsApp Web. Use specific E.164 numbers unless this is intentional.".to_string())
+    } else {
+        None
+    };
+
+    // No restart — the runtime picks up the new allowlist on the next
+    // message via `apply_allowed_senders`.
+    Ok(Json(json!({
+        "connected": true,
+        "channel": "whatsapp_web",
+        "allowed_numbers": next.allowed_numbers.len(),
+        "warning": warning,
+        "restarts_runtime": false,
+        "note": "Saved. The running channel picks this up on its next message — no restart.",
+    })))
+}
+
+async fn whatsapp_web_disconnect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let was_configured = cfg.channels_config.whatsapp_web.is_some();
+    cfg.channels_config.whatsapp_web = None;
+    persist_and_swap(&state, cfg, "channels.whatsapp_web").await?;
+    if was_configured {
+        schedule_daemon_reload();
+    }
+    Ok(Json(json!({
+        "disconnected": was_configured,
+        "channel": "whatsapp_web",
+        "restarts_runtime": was_configured,
+        "note": runtime_restart_note(was_configured),
+    })))
+}
+
+#[cfg(feature = "whatsapp-web")]
+async fn whatsapp_web_pair(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WhatsAppWebConnectBody>,
+) -> Result<Response, ApiError> {
+    check_auth(&state, &headers)?;
+
+    // D-3: refuse while a WhatsApp Web section is configured. Two clients
+    // holding one session is the problem this guard closes.
+    {
+        let (_guard, cfg) = lock_and_load(&state).await?;
+        if cfg.channels_config.whatsapp_web.is_some() {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "already_linked",
+                    "detail": "WhatsApp Web is already linked. Disconnect first via DELETE /api/v1/channels/whatsapp_web, then pair again."
+                })),
+            ));
+        }
+    }
+
+    // A single in-flight pairing at a time. The guard is on `AppState` so
+    // every concurrent request sees the same flag; the SSE handler clears
+    // it on drop.
+    let guard = state.whatsapp_pair_guard.clone();
+    if guard
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "pairing_in_progress",
+                "detail": "Another pairing is already running. Cancel it or wait for it to finish."
+            })),
+        ));
+    }
+
+    // Mint a fresh session path under the workspace so the listener
+    // opens a brand new file (`whatsapp_web.rs:923` opens whatever
+    // `session_path` says, with no global state to clobber).
+    let workspace = state.config.lock().workspace_dir.clone();
+    let unix_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let session_path = workspace.join(format!("whatsapp-{unix_now}.db"));
+
+    let normalised = body
+        .allowed_numbers
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+
+    // Build the pair stream. `pair_once` is only available with the
+    // `whatsapp-web` feature, and the entire handler is gated behind it.
+    let pair_stream = {
+        use crate::channels::whatsapp_web::{pair_once, PairOptions};
+        pair_once(PairOptions::new(session_path.clone()))
+    };
+
+    let state_for_stream = state.clone();
+    let guard_for_drop = guard.clone();
+    let stream = async_stream::stream! {
+        let _drop_guard = PairDropGuard {
+            flag: &guard_for_drop,
+        };
+        let mut pin = Box::pin(pair_stream);
+        use futures::StreamExt;
+        while let Some(event) = pin.next().await {
+            // Map each PairEvent into an SSE frame. PairCode is dropped
+            // (D-2: QR only).
+            let frame = match event {
+                crate::channels::whatsapp_web::PairEvent::Qr(qr_payload) => {
+                    let svg = render_qr_svg(&qr_payload);
+                    json!({
+                        "type": "qr",
+                        "svg": svg,
+                    })
+                }
+                crate::channels::whatsapp_web::PairEvent::PairCode(_) => {
+                    // D-2: drop pair codes; the console never gets them.
+                    continue;
+                }
+                crate::channels::whatsapp_web::PairEvent::Connected => {
+                    // Persist the freshly-minted session and the allowed
+                    // numbers so the runtime picks them up after the
+                    // scheduled reload. `Box::pin` so the surrounding
+                    // async-stream future stays under the strict lint
+                    // size budget (clippy::large_futures).
+                    let persist_result = Box::pin(persist_paired_session(
+                        &state_for_stream,
+                        session_path.clone(),
+                        normalised.clone(),
+                    ))
+                    .await;
+                    let payload = match persist_result {
+                        Ok(()) => json!({
+                            "type": "connected",
+                            "session_path": session_path.display().to_string(),
+                        }),
+                        Err(err) => json!({
+                            "type": "failed",
+                            "reason": err,
+                        }),
+                    };
+                    payload
+                }
+                crate::channels::whatsapp_web::PairEvent::Timeout => json!({
+                    "type": "timeout",
+                }),
+                crate::channels::whatsapp_web::PairEvent::Failed(reason) => json!({
+                    "type": "failed",
+                    "reason": reason,
+                }),
+            };
+            yield Ok::<SseEvent, Infallible>(
+                SseEvent::default()
+                    .event(frame.get("type").and_then(|v| v.as_str()).unwrap_or("message"))
+                    .data(frame.to_string()),
+            );
+            // A terminal frame ends the stream; the drop guard clears
+            // the in-flight flag.
+            let terminal = matches!(
+                frame.get("type").and_then(|v| v.as_str()),
+                Some("connected" | "timeout" | "failed")
+            );
+            if terminal {
+                break;
+            }
+        }
+    };
+
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+/// RAII guard so the in-flight flag clears even if the stream is dropped
+/// mid-flight (browser closes the page, client disconnects).
+struct PairDropGuard<'a> {
+    flag: &'a AtomicBool,
+}
+impl Drop for PairDropGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Render a QR payload string into an SVG string using the `qrcode` crate's
+/// `svg` feature. The SVG is inline (no network call, no external assets)
+/// and the console renders it as an `<img src="data:image/svg+xml;...">`
+/// per plan 369 — never as `innerHTML`. Only compiled with the
+/// `whatsapp-web` feature; the connect/disconnect routes that don't render
+/// a QR are available in every build.
+#[cfg(feature = "whatsapp-web")]
+fn render_qr_svg(payload: &str) -> String {
+    use qrcode::render::svg;
+    use qrcode::{EcLevel, QrCode};
+    match QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M) {
+        Ok(code) => code
+            .render::<svg::Color<'_>>()
+            .min_dimensions(200, 200)
+            .build(),
+        Err(e) => format!("<!-- qr render failed: {e} -->"),
+    }
+}
+
+async fn persist_paired_session(
+    state: &AppState,
+    session_path: PathBuf,
+    allowed_numbers: Vec<String>,
+) -> Result<(), String> {
+    let (_guard, mut cfg) = lock_and_load(state)
+        .await
+        .map_err(|e| format!("could not lock config: {e:?}"))?;
+    let session_path_string = session_path.to_string_lossy().to_string();
+    let next = crate::config::WhatsAppWebConfig {
+        session_path: session_path_string,
+        pair_phone: None,
+        pair_code: None,
+        allowed_numbers,
+    };
+    cfg.channels_config.whatsapp_web = Some(next);
+    persist_and_swap(state, cfg, "channels.whatsapp_web")
+        .await
+        .map_err(|e| format!("could not persist config: {e:?}"))?;
+    Ok(())
 }
 
 // ── GET/PUT /secrets ─────────────────────────────────────────────────────────

@@ -153,6 +153,7 @@ fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
         idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
         whatsapp: None,
         whatsapp_app_secret: None,
+        whatsapp_pair_guard: rantaiclaw::gateway::config_api::PairGuard::default(),
         linq: None,
         linq_signing_secret: None,
         nextcloud_talk: None,

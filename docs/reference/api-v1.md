@@ -1132,6 +1132,52 @@ never probed, because the only real check opens a live socket and `doctor` owns 
   edit does not.
 - **Status codes**: `200`, `400`, `401`, `500`.
 
+### POST / DELETE /api/v1/channels/whatsapp_web
+
+Plan 367. Web-mode WhatsApp is linked by scanning a QR; the gateway mints a fresh session file per link
+(`whatsapp-<unix-seconds>.db` under the workspace) so two clients never hold one session (D-3). On
+`Connected`, the gateway persists `channels_config.whatsapp_web` with the new session path. `DELETE`
+clears the section and schedules the daemon reload; the session file itself is set aside on the next
+runtime start, before any listener opens it (plan 364 D-4).
+
+- **POST request** (after a successful pair): `{ "allowed_numbers": ["+15551234567", "*"] }`. Numbers
+  are normalised (trimmed, `+` ensured where missing) — the same rule the inbound gate uses
+  (`whatsapp_web.rs:513`), so the list you save matches the list the runtime checks. Pairing before
+  this endpoint returns `400`.
+- **POST response** `200`: `{ "connected": true, "channel": "whatsapp_web", "allowed_numbers": 1,
+  "warning": "...", "restarts_runtime": false, "note": "..." }`. An empty `allowed_numbers` produces
+  a `warning` saying the bot denies everyone; a list containing `"*"` produces a warning saying the
+  bot responds to any sender.
+- **DELETE response** `200`: `{ "disconnected": true, "channel": "whatsapp_web",
+  "restarts_runtime": true, "note": "..." }`. The `note` is the same one the other channels carry;
+  for an unmanaged daemon it tells the operator to restart `rantaiclaw daemon` themselves.
+- **Restarts**: never on a `POST` (allowlist-only edit, applied live through
+  `Channel::apply_allowed_senders` like Telegram/Discord/Slack); yes on `DELETE` if the section
+  existed.
+- **Status codes**: `200`, `400`, `401`, `500`.
+
+### POST /api/v1/channels/whatsapp_web/pair
+
+Plan 367. Server-Sent Events stream of `qr`, `connected`, `timeout`, `failed` events while the
+phone scans. The QR is rendered server-side as SVG (plan 364 D-2: QR only; no pair code is sent
+to the browser) and never logged. Refused while a `channels_config.whatsapp_web` section is already
+configured, and while another pairing is in flight.
+
+- **Request**: `{ "allowed_numbers": ["+15551234567"] }` — persisted on `Connected`. Empty list is
+  allowed at pair time so an operator can pair first and lock down later through `POST
+  /api/v1/channels/whatsapp_web`.
+- **Events**: each is a JSON object with a `type` and the relevant fields. Example QR frame:
+  `{"type":"qr","svg":"<svg ...>...</svg>"}`. Example terminal frames: `{"type":"connected",
+  "session_path":"/var/lib/rantaiclaw/workspace/whatsapp-1700000000.db"}`,
+  `{"type":"timeout"}`, `{"type":"failed","reason":"could not open storage"}`.
+- **PairCode events** are dropped — D-2 says QR only. The browser never receives a pair code.
+- **Status codes**: `200` (stream opened), `401` (no auth), `409` (`already_linked` /
+  `pairing_in_progress`), `500`. The stream itself ends with one of `connected`, `timeout`,
+  `failed`; closing the browser drops the pairing on the gateway side so the runtime stops trying.
+- **Restart**: a successful `connected` event triggers a scheduled daemon reload, just like the
+  other channel connect paths; the runtime picks up the freshly-persisted `session_path` on
+  `build_channel_runtime`.
+
 ## Cron
 
 ### GET /api/v1/cron
