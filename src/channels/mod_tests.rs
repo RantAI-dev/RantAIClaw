@@ -7625,16 +7625,103 @@ fn maybe_restart_daemon_systemd_args_regression() {
         SYSTEMD_STATUS_ARGS,
         ["--user", "is-active", "rantaiclaw.service"]
     );
-    assert_eq!(
-        SYSTEMD_RESTART_ARGS,
-        ["--user", "restart", "rantaiclaw.service"]
-    );
 }
 
 #[test]
 fn maybe_restart_daemon_openrc_args_regression() {
     assert_eq!(OPENRC_STATUS_ARGS, ["rantaiclaw", "status"]);
     assert_eq!(OPENRC_RESTART_ARGS, ["rantaiclaw", "restart"]);
+}
+
+/// Plan 370: the in-daemon reload must not block on the unit's stop timeout.
+/// `systemctl --no-block` queues the job and returns at once; without it the
+/// daemon's blocking `systemctl restart` waits for its own SIGTERM and gets
+/// SIGKILLed by `TimeoutStopSec`. Out-of-process callers (CLI, TUI, headless)
+/// keep the blocking form so they can still report success.
+#[test]
+fn systemd_restart_args_blocking_omits_no_block() {
+    assert_eq!(
+        systemd_restart_args(true),
+        ["--user", "restart", "rantaiclaw.service"],
+        "out-of-process callers must keep the blocking form so they can report whether the restart succeeded"
+    );
+}
+
+#[test]
+fn systemd_restart_args_non_blocking_includes_no_block() {
+    assert_eq!(
+        systemd_restart_args(false),
+        ["--user", "--no-block", "restart", "rantaiclaw.service"],
+        "in-daemon callers must use --no-block so the queued restart completes while the daemon is being torn down"
+    );
+}
+
+/// Plan 370: the gateway runs inside the daemon, so it cannot wait for its own
+/// restart job — that is the deadlock the plan closes. This source guard keeps
+/// the blocking `reload_managed_daemon` out of `src/gateway/`, leaving only
+/// `reload_managed_daemon_non_blocking`. The blocking form stays reachable
+/// from the CLI, the TUI and the headless setup path, which run in their own
+/// processes and must report the restart outcome.
+#[test]
+fn gateway_does_not_call_blocking_reload() {
+    use std::path::Path;
+
+    let gateway_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gateway");
+    assert!(
+        gateway_dir.is_dir(),
+        "src/gateway/ must exist at {}",
+        gateway_dir.display()
+    );
+
+    let mut stack = vec![gateway_dir];
+    let mut offenders: Vec<String> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => panic!("read_dir({}) failed: {e}", dir.display()),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => panic!("read_to_string({}) failed: {e}", path.display()),
+            };
+            for (lineno, raw) in content.lines().enumerate() {
+                let line = raw.trim_start();
+                if line.starts_with("//") {
+                    continue;
+                }
+                // The blocking entry point is `reload_managed_daemon`; the
+                // non-blocking one is `reload_managed_daemon_non_blocking`.
+                // A call that does not include the `_non_blocking` suffix and
+                // is not a definition is the kind of regression we are guarding
+                // against. The private `maybe_restart_managed_daemon_service`
+                // is blocked too: it is the function that shells out to
+                // systemctl/launchctl/rc-service, and the gateway must not
+                // reach it directly.
+                let has_blocking_call = (line.contains("reload_managed_daemon")
+                    && !line.contains("reload_managed_daemon_non_blocking"))
+                    || line.contains("maybe_restart_managed_daemon_service");
+                if has_blocking_call {
+                    offenders.push(format!("{}:{}: {}", path.display(), lineno + 1, line));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "src/gateway/ must not call the blocking daemon reload (plan 370). \
+         Use `reload_managed_daemon_non_blocking` from the gateway instead, \
+         and keep the blocking form for out-of-process callers. Offenders:\n  {}",
+        offenders.join("\n  ")
+    );
 }
 
 /// Plan 121's closing invariant: the module's public **function** surface is

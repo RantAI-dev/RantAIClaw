@@ -11,7 +11,7 @@
 use super::factory;
 use super::{
     channel_is_configured, CHANNEL_CATALOG, OPENRC_RESTART_ARGS, OPENRC_STATUS_ARGS,
-    SYSTEMD_RESTART_ARGS, SYSTEMD_STATUS_ARGS,
+    SYSTEMD_STATUS_ARGS,
 };
 use crate::config::Config;
 use anyhow::{Context, Result};
@@ -160,9 +160,11 @@ pub(crate) fn pair_channel(
 /// **Blocking**: `maybe_restart_managed_daemon_service` shells out to
 /// `launchctl`/`rc-service`/`systemctl` synchronously (a restart blocks up to
 /// the unit's stop timeout). Async callers must run this via
-/// `tokio::task::spawn_blocking`.
+/// `tokio::task::spawn_blocking`. CLI/TUI/headless callers live in their own
+/// process and can wait for the outcome; the in-daemon gateway uses
+/// `reload_managed_daemon_non_blocking` instead.
 pub(crate) fn announce_daemon_reload() {
-    match maybe_restart_managed_daemon_service() {
+    match maybe_restart_managed_daemon_service(true) {
         Ok(true) => {
             println!("🔄 Detected running managed daemon service; reloaded automatically.");
         }
@@ -185,8 +187,37 @@ pub(crate) fn announce_daemon_reload() {
 /// stdout. Returns `Ok(true)` if a managed service was restarted, `Ok(false)`
 /// when none is installed. Mirrors what [`announce_daemon_reload`] does for the
 /// CLI, minus the console output — callers log the outcome themselves.
+///
+/// **Blocking**: shells out to `launchctl`/`rc-service`/`systemctl` synchronously
+/// (a restart blocks up to the unit's stop timeout). Only safe for callers
+/// running in their own process — the CLI, the TUI, the headless setup path.
+/// For callers running **inside** the daemon (the gateway), the blocking call
+/// would deadlock against the daemon's own SIGTERM and get SIGKILLed; use
+/// [`reload_managed_daemon_non_blocking`] instead.
 pub(crate) fn reload_managed_daemon() -> Result<bool> {
-    maybe_restart_managed_daemon_service()
+    maybe_restart_managed_daemon_service(true)
+}
+
+/// Same as [`reload_managed_daemon`], but never waits for the restart job to
+/// finish. For callers that live in the same process as the daemon they are
+/// asking to be restarted — the gateway, reached via
+/// `gateway::config_api::schedule_daemon_reload`. On systemd it adds
+/// `--no-block` so `systemctl` queues the job and returns at once; on launchd
+/// it spawns the kickstart detached and returns without confirming the job
+/// re-listed (the operator is still the one to watch the journal); on OpenRC
+/// it spawns the restart detached for the same reason. The caller cannot tell
+/// whether the restart actually succeeded, so its log line says *requested*,
+/// not *reloaded*. Returns `Ok(true)` when the command was queued, `Ok(false)`
+/// when no managed service is installed.
+///
+/// **Risk note (OpenRC)**: `rc-service restart` has no non-blocking form, so
+/// the in-daemon variant detaches the command. The child becomes a child of
+/// init when this daemon exits, which is the path the change's `STOP`
+/// condition names as potentially unsafe. The project's service installer
+/// produces systemd on Linux, so OpenRC is not the shipping target; the
+/// blocking form stays correct for OpenRC under the CLI/TUI/headless paths.
+pub(crate) fn reload_managed_daemon_non_blocking() -> Result<bool> {
+    maybe_restart_managed_daemon_service(false)
 }
 
 /// Current uid for the launchd `gui/<uid>/<label>` domain target. `id -u` is
@@ -204,7 +235,19 @@ fn macos_launchctl_uid() -> String {
         .unwrap_or_else(|| "0".to_string())
 }
 
-pub(crate) fn maybe_restart_managed_daemon_service() -> Result<bool> {
+/// Build the `systemctl --user` arguments for a restart in one place so the
+/// in-daemon and out-of-process variants stay in sync. `blocking = false` adds
+/// `--no-block`, which queues the job and returns at once; that is what
+/// prevents the daemon from deadlocking against its own SIGTERM.
+pub(crate) fn systemd_restart_args(blocking: bool) -> &'static [&'static str] {
+    if blocking {
+        &["--user", "restart", "rantaiclaw.service"]
+    } else {
+        &["--user", "--no-block", "restart", "rantaiclaw.service"]
+    }
+}
+
+pub(crate) fn maybe_restart_managed_daemon_service(blocking: bool) -> Result<bool> {
     if cfg!(target_os = "macos") {
         let home = directories::UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
@@ -230,25 +273,35 @@ pub(crate) fn maybe_restart_managed_daemon_service() -> Result<bool> {
         // reported success while the old instance was still tearing down (or the
         // new one had already died), so the caller was told "reloaded" when the
         // daemon could be stale or dead. `kickstart -k` atomically kills and
-        // restarts the job in one call (mirrors `handoff::Launchd::restart`);
-        // then confirm the job is actually listed before claiming success.
+        // restarts the job in one call (mirrors `handoff::Launchd::restart`).
+        // For the blocking form we then confirm the job is actually listed
+        // before claiming success. The non-blocking form cannot do that — the
+        // caller is the very job being killed, so it returns `Ok(true)` as
+        // soon as `kickstart` is queued and leaves verification to the
+        // operator's journal.
         let target = format!("gui/{}/com.rantaiclaw.daemon", macos_launchctl_uid());
-        let kick = Command::new("launchctl")
-            .args(["kickstart", "-k", &target])
-            .output()
-            .context("Failed to kickstart launchd daemon service")?;
-        if !kick.status.success() {
-            let stderr = String::from_utf8_lossy(&kick.stderr);
-            anyhow::bail!("launchctl kickstart -k {target} failed: {}", stderr.trim());
-        }
-        let after = Command::new("launchctl")
-            .arg("list")
-            .output()
-            .context("Failed to query launchctl list after kickstart")?;
-        if !String::from_utf8_lossy(&after.stdout).contains("com.rantaiclaw.daemon") {
-            anyhow::bail!(
-                "launchctl kickstart reported success but com.rantaiclaw.daemon is not listed"
-            );
+        let mut cmd = Command::new("launchctl");
+        cmd.args(["kickstart", "-k", &target]);
+        if blocking {
+            let kick = cmd
+                .output()
+                .context("Failed to kickstart launchd daemon service")?;
+            if !kick.status.success() {
+                let stderr = String::from_utf8_lossy(&kick.stderr);
+                anyhow::bail!("launchctl kickstart -k {target} failed: {}", stderr.trim());
+            }
+            let after = Command::new("launchctl")
+                .arg("list")
+                .output()
+                .context("Failed to query launchctl list after kickstart")?;
+            if !String::from_utf8_lossy(&after.stdout).contains("com.rantaiclaw.daemon") {
+                anyhow::bail!(
+                    "launchctl kickstart reported success but com.rantaiclaw.daemon is not listed"
+                );
+            }
+        } else {
+            cmd.spawn()
+                .context("Failed to spawn launchctl kickstart (detached)")?;
         }
 
         return Ok(true);
@@ -262,13 +315,22 @@ pub(crate) fn maybe_restart_managed_daemon_service() -> Result<bool> {
             {
                 // rc-service exits 0 if running, non-zero otherwise
                 if status_output.status.success() {
-                    let restart_output = Command::new("rc-service")
-                        .args(OPENRC_RESTART_ARGS)
-                        .output()
-                        .context("Failed to restart OpenRC daemon service")?;
-                    if !restart_output.status.success() {
-                        let stderr = String::from_utf8_lossy(&restart_output.stderr);
-                        anyhow::bail!("rc-service restart failed: {}", stderr.trim());
+                    if blocking {
+                        let restart_output = Command::new("rc-service")
+                            .args(OPENRC_RESTART_ARGS)
+                            .output()
+                            .context("Failed to restart OpenRC daemon service")?;
+                        if !restart_output.status.success() {
+                            let stderr = String::from_utf8_lossy(&restart_output.stderr);
+                            anyhow::bail!("rc-service restart failed: {}", stderr.trim());
+                        }
+                    } else {
+                        // Detached: see the OpenRC risk note on
+                        // `reload_managed_daemon_non_blocking`.
+                        Command::new("rc-service")
+                            .args(OPENRC_RESTART_ARGS)
+                            .spawn()
+                            .context("Failed to spawn rc-service restart (detached)")?;
                     }
                     return Ok(true);
                 }
@@ -294,7 +356,7 @@ pub(crate) fn maybe_restart_managed_daemon_service() -> Result<bool> {
         }
 
         let restart_output = Command::new("systemctl")
-            .args(SYSTEMD_RESTART_ARGS)
+            .args(systemd_restart_args(blocking))
             .output()
             .context("Failed to restart systemd daemon service")?;
         if !restart_output.status.success() {

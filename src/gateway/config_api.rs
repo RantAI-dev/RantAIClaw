@@ -877,9 +877,17 @@ fn apply_telegram_update(
 fn schedule_daemon_reload() {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-        match tokio::task::spawn_blocking(crate::channels::reload_managed_daemon).await {
+        // Plan 370: the in-daemon variant. The blocking form would shell out
+        // to `systemctl restart` and wait for the unit's stop job, which
+        // sends SIGTERM to this very process; the runtime drop then waits for
+        // the spawned task and the whole thing deadlocks until
+        // `TimeoutStopSec` SIGKILLs the daemon. The non-blocking variant
+        // queues the job and returns at once, so the response can flush
+        // before the service manager replaces us.
+        match tokio::task::spawn_blocking(crate::channels::reload_managed_daemon_non_blocking).await
+        {
             Ok(Ok(true)) => {
-                tracing::info!(target: "gateway", "channel change: reloaded managed daemon service");
+                tracing::info!(target: "gateway", "channel change: requested managed daemon service restart");
             }
             Ok(Ok(false)) => tracing::info!(
                 target: "gateway",
