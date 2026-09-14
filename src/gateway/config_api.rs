@@ -24,7 +24,6 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
-use futures::Stream;
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -1719,12 +1718,14 @@ async fn whatsapp_web_pair(
                 crate::channels::whatsapp_web::PairEvent::Connected => {
                     // Persist the freshly-minted session and the allowed
                     // numbers so the runtime picks them up after the
-                    // scheduled reload.
-                    let persist_result = persist_paired_session(
+                    // scheduled reload. `Box::pin` so the surrounding
+                    // async-stream future stays under the strict lint
+                    // size budget (clippy::large_futures).
+                    let persist_result = Box::pin(persist_paired_session(
                         &state_for_stream,
                         session_path.clone(),
                         normalised.clone(),
-                    )
+                    ))
                     .await;
                     let payload = match persist_result {
                         Ok(()) => json!({
@@ -1755,7 +1756,7 @@ async fn whatsapp_web_pair(
             // the in-flight flag.
             let terminal = matches!(
                 frame.get("type").and_then(|v| v.as_str()),
-                Some("connected") | Some("timeout") | Some("failed")
+                Some("connected" | "timeout" | "failed")
             );
             if terminal {
                 break;
