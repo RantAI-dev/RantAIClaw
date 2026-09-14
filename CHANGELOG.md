@@ -70,13 +70,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconnecting a channel asked systemd to restart this process, then waited for that restart job to
   finish in `schedule_daemon_reload`. The job first stops the unit — systemd sends SIGTERM to this very
   daemon — and the daemon could not exit because dropping the tokio runtime waits for blocking tasks,
-  including the one parked on `systemctl`. The pair sat there until `TimeoutStopSec=30` and systemd
+  including the one parked on `systemctl`. The pair then sat there until `TimeoutStopSec=30` and systemd
   SIGKILLed the daemon, which skipped everything plan 353 built into shutdown. The in-gateway reload
   now uses a non-blocking entry point: `--no-block` on systemd so the job is queued and returns at once,
   `kickstart -k` detached on launchd, and a detached spawn on OpenRC. The blocking form stays reachable
   for the CLI, the TUI and the headless setup path, which live in their own processes and still need to
   report the restart outcome. A source guard test under `src/channels/mod_tests.rs` keeps the blocking
   form out of `src/gateway/`.
+- **WhatsApp Web can be linked and unlinked from the console.** Until now the gateway could only set
+  up Telegram, Discord and Slack on demand; WhatsApp Web could only be linked by scanning a QR in a
+  terminal. `POST` and `DELETE /api/v1/channels/whatsapp_web` now exist alongside the other channels,
+  and a `POST /api/v1/channels/whatsapp_web/pair` SSE stream relays the pairing QR (rendered server-side
+  as inline SVG, never logged) until the phone scans or the gateway's timeout fires. Each link mints a
+  fresh session file under the workspace (`whatsapp-<unix-seconds>.db`) so two clients never hold one
+  session (plan 364 D-3), and on `Connected` the gateway persists the new path. An allowlist-only edit
+  is applied live through `Channel::apply_allowed_senders` (`whatsapp_web.rs:1291`) and does not restart
+  the runtime; `DELETE` clears the section and schedules the reload. Pairing is refused with `409` while
+  a `channels_config.whatsapp_web` section already exists, and while another pairing is in flight — the
+  in-flight flag is on `AppState` and a `PairDropGuard` clears it when the SSE stream drops, so the
+  flag cannot leak if the browser closes the page mid-pair. The session files the loaded config no
+  longer references are set aside under `workspace/.unlinked/<unix-seconds>-<basename>` on the next
+  `build_channel_runtime`, before any channel listener can open them (plan 364 D-4, the part the first
+  version of this plan could not make safe — recorded in `plans/364` row 367). A pure function in
+  `channels/whatsapp_session.rs` does the move; nine regression tests pin the matrix (referenced vs
+  unreferenced, with vs without `-wal`/`-shm` companions, files outside the workspace, second-run
+  no-op). The `qrcode` crate's `svg` feature is enabled so the gateway can render the pairing QR inline
+  without a new dependency. No config key, schema stays at 32.
 - **Removing someone from Discord's or Slack's allowlist now takes effect without a restart.** When
   `config.toml` changes, the runtime pushes each channel's allowlist into the live channel so a
   tightened list does not wait, which is the whole point of applying it there. Both channels hold their

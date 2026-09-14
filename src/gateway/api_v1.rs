@@ -2581,6 +2581,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),

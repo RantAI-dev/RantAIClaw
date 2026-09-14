@@ -78,6 +78,7 @@ pub mod traits;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_http;
+pub mod whatsapp_session;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
@@ -1007,6 +1008,42 @@ pub(crate) async fn build_channel_runtime(
         policy_dir,
     ));
     admin::warn_on_risky_approval_owners(&config.channels_config.approval_owners);
+
+    // Plan 367: set aside WhatsApp Web session files the loaded config no
+    // longer references, BEFORE any channel listener can open one. The
+    // listener opens `WhatsAppWebConfig.session_path` as written
+    // (`whatsapp_web.rs:923`), so a fresh link gets a fresh file and an old
+    // file that the config no longer references is moved here, before any
+    // process holds a handle on it. This is the runtime-side counterpart to
+    // `DELETE /api/v1/channels/whatsapp_web` clearing the section. A restart
+    // with WhatsApp Web still configured moves nothing — the referenced
+    // session is on the keep list.
+    let referenced_session_bases: Vec<String> = config
+        .channels_config
+        .whatsapp_web
+        .as_ref()
+        .and_then(|w| {
+            whatsapp_session::session_base_name(
+                &config.workspace_dir,
+                &PathBuf::from(&w.session_path),
+            )
+        })
+        .into_iter()
+        .collect();
+    match whatsapp_session::set_aside_unreferenced_sessions(
+        &config.workspace_dir,
+        &referenced_session_bases,
+    ) {
+        Ok(report) if report.moved > 0 => tracing::info!(
+            moved = report.moved,
+            "set aside unreferenced WhatsApp Web session file(s) before channel start"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not set aside unreferenced WhatsApp Web session files; leaving in place"
+        ),
+    }
 
     // Bind an async-approval registry to the policy so shell tool
     // calls in Supervised mode can ask the user via chat reply when

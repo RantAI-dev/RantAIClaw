@@ -20,7 +20,7 @@ pub use schema::{
     SchedulerConfig, SecretsConfig, SecurityConfig, SkillApiKey, SkillEntryConfig, SkillsConfig,
     SkillsInstallConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, TasksConfig, TelegramConfig,
-    TunnelConfig, UiConfig, WebSearchConfig, WebhookConfig,
+    TunnelConfig, UiConfig, WebSearchConfig, WebhookConfig, WhatsAppWebConfig,
 };
 
 #[cfg(test)]

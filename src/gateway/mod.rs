@@ -512,6 +512,11 @@ pub struct AppState {
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    /// Plan 367: single in-flight flag for `POST /api/v1/channels/whatsapp_web/pair`.
+    /// The gateway refuses a second concurrent pair with 409. The handler clears
+    /// the flag when the SSE stream drops (success, timeout, failure, or the
+    /// browser closing the page).
+    pub whatsapp_pair_guard: crate::gateway::config_api::PairGuard,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Webhook trigger routes loaded from agent-runner config
@@ -815,6 +820,7 @@ pub fn build_gateway_router(
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
+        whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
         observer,
         webhook_routes,
         channel_bus,
@@ -3116,6 +3122,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -3168,6 +3175,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer,
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -3537,6 +3545,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -3779,6 +3788,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -3846,6 +3856,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -3925,6 +3936,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -3976,6 +3988,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -4032,6 +4045,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -4123,6 +4137,7 @@ mod tests {
                 vec!["*".into()],
             ))),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -4895,6 +4910,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -4953,6 +4969,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -5014,6 +5031,7 @@ mod tests {
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
@@ -5111,6 +5129,7 @@ mod tests {
             nextcloud_talk_webhook_secret: matches!(endpoint, Endpoint::NextcloudTalk)
                 .then(|| secret.map(Arc::<str>::from))
                 .flatten(),
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_bus: Arc::new(crate::channels::ChannelBus::default()),
