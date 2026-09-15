@@ -53,11 +53,14 @@ pub(crate) fn command_prefix(channel_name: &str) -> &'static str {
 }
 
 /// The channels that answer runtime commands: the four supported tier
-/// channels. WhatsApp Web registers as `whatsapp`, a name it shares with
-/// WhatsApp Cloud; the two are configured one at a time, so the name does not
-/// need to tell them apart.
+/// channels. WhatsApp appears under both runtime names, `"whatsapp"` for the
+/// Cloud API and `"whatsapp_web"` for WhatsApp Web, since either may be the
+/// one this host runs.
 pub(crate) fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "slack" | "whatsapp")
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "slack" | "whatsapp" | "whatsapp_web"
+    )
 }
 
 /// What a reset does **not** reach: the messages the chat app itself still
@@ -80,8 +83,8 @@ pub(crate) fn manual_clear_hint(channel_name: &str) -> Option<&'static str> {
             "Telegram still shows the earlier messages. Clearing them is done in Telegram, from \
              this chat's menu.",
         ),
-        // One arm for both WhatsApp types: they share `Channel::name()`.
-        "whatsapp" => Some(
+        // Same chat-menu UX for both WhatsApp transports.
+        "whatsapp" | "whatsapp_web" => Some(
             "WhatsApp still shows the earlier messages. Clearing them is done in WhatsApp, from \
              this chat's menu.",
         ),
@@ -692,6 +695,7 @@ mod tests {
             ("telegram", &slash),
             ("discord", &slash),
             ("whatsapp", &slash),
+            ("whatsapp_web", &slash),
             ("slack", &bare),
             ("mattermost", &not_a_tier_channel),
         ];
@@ -757,16 +761,19 @@ mod tests {
         assert!(reply.contains("this chat's menu"), "{reply}");
     }
 
-    /// Both WhatsApp types share `Channel::name()`, so one arm covers them.
+    /// Both WhatsApp transports give the same hint, under their two runtime
+    /// names.
     #[test]
     fn whatsapp_reset_reply_points_at_the_chat_menu() {
-        let reply = reset_message("whatsapp");
-        assert!(reply.starts_with(RESET_MESSAGE), "{reply}");
-        assert!(
-            reply.contains("WhatsApp still shows the earlier messages"),
-            "{reply}"
-        );
-        assert!(reply.contains("this chat's menu"), "{reply}");
+        for channel in ["whatsapp", "whatsapp_web"] {
+            let reply = reset_message(channel);
+            assert!(reply.starts_with(RESET_MESSAGE), "{channel}: {reply}");
+            assert!(
+                reply.contains("WhatsApp still shows the earlier messages"),
+                "{channel}: {reply}"
+            );
+            assert!(reply.contains("this chat's menu"), "{channel}: {reply}");
+        }
     }
 
     /// A Discord DM has no clear-chat, so Telegram's wording would be a promise
@@ -819,7 +826,7 @@ mod tests {
             "\u{201C}",
             "\u{201D}",
         ];
-        for channel in ["telegram", "whatsapp", "discord"] {
+        for channel in ["telegram", "whatsapp", "whatsapp_web", "discord"] {
             let hint = manual_clear_hint(channel).expect("this channel has a hint");
             for label in forbidden {
                 assert!(

@@ -3722,6 +3722,183 @@ fn every_configured_channel_is_built_by_the_factory() {
     }
 }
 
+/// D-5 (F-35). The supervisor names the health component and the per-channel
+/// lock after `Channel::name()`, while the console, the catalog and the config
+/// table all use the key the factory files the channel under. WhatsApp Web
+/// reported `"whatsapp"` under the key `whatsapp_web`, so the console looked up
+/// `channel:whatsapp_web`, found nothing, and never showed the channel running.
+///
+/// `name()` is called through the `Arc<dyn Channel>` the factory returns, the
+/// same object the supervisor holds. An inherent method that happens to return
+/// the right string does not satisfy this; only the trait method does.
+///
+/// Built twice because the two WhatsApp transports are never built together:
+/// once as `config_with_every_channel` writes it (Cloud), and once with the
+/// Cloud table swapped for a Web one.
+#[test]
+fn every_built_channel_reports_the_key_the_factory_files_it_under() {
+    let mut web_config = config_with_every_channel();
+    web_config.channels_config.whatsapp = None;
+    web_config.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+        // Never opened: the constructor only stores the path, `listen` opens it.
+        session_path: "/nonexistent/rantaiclaw-guard/whatsapp.db".into(),
+        pair_phone: None,
+        pair_code: None,
+        allowed_numbers: vec![],
+    });
+
+    let mut built = Vec::new();
+    let mut mismatches = Vec::new();
+    for config in [config_with_every_channel(), web_config] {
+        for (key, _, channel) in factory::build_configured_channels(&config) {
+            built.push(key);
+            if channel.name() != key {
+                mismatches.push(format!("`{key}` reports `{}`", channel.name()));
+            }
+        }
+    }
+
+    // Without these the guard could pass by never building the channel it is
+    // about.
+    assert!(
+        built.contains(&"whatsapp"),
+        "Cloud must be built: {built:?}"
+    );
+    #[cfg(feature = "whatsapp-web")]
+    assert!(
+        built.contains(&"whatsapp_web"),
+        "Web must be built: {built:?}"
+    );
+    assert!(
+        mismatches.is_empty(),
+        "a channel reports a runtime name that differs from its factory key, so its health \
+         component and lock are filed where the console never looks: {mismatches:?}"
+    );
+}
+
+/// D-5. Each WhatsApp transport's inbound messages arrive keyed by its own
+/// runtime name, so each has to find its own table and never borrow the other's.
+/// Before the rename both arrived as `"whatsapp"`, and that one key fell through
+/// from the Cloud table to the Web one.
+#[test]
+fn each_whatsapp_transport_finds_only_its_own_allowlist() {
+    use serde_json::json;
+    let mut cc = Config::default().channels_config;
+    cc.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+        session_path: "/nonexistent/rantaiclaw-guard/whatsapp.db".into(),
+        pair_phone: None,
+        pair_code: None,
+        allowed_numbers: vec!["+15550001111".into()],
+    });
+
+    let web_only = crate::channels::routing::channel_allowlists(&cc);
+    assert_eq!(
+        web_only.get("whatsapp_web"),
+        Some(&vec!["+15550001111".to_string()]),
+        "a Web message must find the Web table"
+    );
+    assert!(
+        !web_only.contains_key("whatsapp"),
+        "a Cloud-keyed message must not borrow the Web table: {web_only:?}"
+    );
+
+    cc.whatsapp = serde_json::from_value(json!({
+        "phone_number_id": "1", "access_token": "t", "verify_token": "v",
+        "allowed_numbers": ["+15550002222"]
+    }))
+    .expect("whatsapp");
+    let both = crate::channels::routing::channel_allowlists(&cc);
+    assert_eq!(
+        both.get("whatsapp"),
+        Some(&vec!["+15550002222".to_string()]),
+        "a Cloud message must find only the Cloud table"
+    );
+    assert_eq!(
+        both.get("whatsapp_web"),
+        Some(&vec!["+15550001111".to_string()]),
+        "a Web message must still find only the Web table"
+    );
+
+    // The key a live inbound Web message actually carries, rather than a string
+    // this test wrote down: a message built the way the listener builds it has
+    // to find the Web table under its own `channel`.
+    #[cfg(feature = "whatsapp-web")]
+    {
+        let inbound = crate::channels::whatsapp_web::WhatsAppWebChannel::inbound_channel_message(
+            "3EB0ALLOWLIST",
+            "+15550001111".into(),
+            "15550001111@s.whatsapp.net".into(),
+            "hello".into(),
+            0,
+        );
+        assert_eq!(
+            both.get(&inbound.channel),
+            Some(&vec!["+15550001111".to_string()]),
+            "an inbound Web message must find the Web table under the channel it carries"
+        );
+    }
+}
+
+/// D-5. WhatsApp Web answers pairing codes under `whatsapp_web`. On a host that
+/// runs Web, `channels pair --channel whatsapp` minted a code no listener would
+/// ever accept and printed it as though it would work. Where the Cloud API
+/// runs, the same command still mints.
+#[tokio::test]
+async fn channel_pair_refuses_whatsapp_only_where_whatsapp_web_is_what_runs() {
+    let _guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let mut web_only = Config::default();
+    web_only.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+        session_path: "/nonexistent/rantaiclaw-guard/whatsapp.db".into(),
+        pair_phone: None,
+        pair_code: None,
+        allowed_numbers: vec![],
+    });
+    let mut with_cloud = web_only.clone();
+    with_cloud.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+        access_token: Some("t".into()),
+        phone_number_id: Some("p".into()),
+        verify_token: Some("v".into()),
+        app_secret: None,
+        allowed_numbers: vec![],
+    });
+    let pair = || crate::ChannelCommands::Pair {
+        channel: "whatsapp".to_string(),
+        ttl: 15,
+        max_uses: None,
+        no_owner: true,
+    };
+
+    let refused = admin::handle_command(pair(), &web_only).await;
+    let store = admin::pairing_profile_root().map(|root| root.join("pairing_codes.json"));
+    let stored_after_refusal = store.as_ref().is_ok_and(|path| path.exists());
+    let minted = admin::handle_command(pair(), &with_cloud).await;
+    let stored_after_mint = store.as_ref().is_ok_and(|path| path.exists());
+
+    // Restored before asserting, so a failure here cannot leave HOME pointing
+    // at a deleted directory for every later test.
+    match prev_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let err = refused.expect_err("a code no listener accepts must be refused, not minted");
+    assert!(
+        err.to_string().contains("whatsapp_web"),
+        "the refusal must name the surface that works: {err}"
+    );
+    assert!(store.is_ok(), "the profile root must resolve");
+    assert!(!stored_after_refusal, "nothing may reach the pairing store");
+    assert!(
+        minted.is_ok(),
+        "the Cloud API is a listener for `whatsapp`: {minted:?}"
+    );
+    assert!(stored_after_mint, "the Cloud code must reach the store");
+}
+
 /// The roster is what `channel list` and `status` report. It used to be a
 /// separate hand-maintained list documented as the single source of truth,
 /// and it disagreed with what was actually constructed.
@@ -4248,7 +4425,7 @@ impl Channel for AddressRecordingChannel {
 fn the_provider_failure_message_names_a_command_each_channel_can_run() {
     let mut unusable = Vec::new();
 
-    for channel in ["telegram", "discord", "whatsapp", "slack"] {
+    for channel in ["telegram", "discord", "whatsapp", "whatsapp_web", "slack"] {
         let prefix = commands::command_prefix(channel);
         let message = dispatch::provider_init_failure_message("openai", "boom", prefix);
         let named = format!("{prefix}models");
@@ -5357,13 +5534,15 @@ fn tier_message(channel: &str, id: u32, text: &str) -> traits::ChannelMessage {
             }
         }
         #[cfg(feature = "whatsapp-web")]
-        "whatsapp" => crate::channels::whatsapp_web::WhatsAppWebChannel::inbound_channel_message(
-            &format!("3EB0{id}"),
-            "+15550001111".into(),
-            "15550001111@s.whatsapp.net".into(),
-            text.into(),
-            1_700_000_000,
-        ),
+        "whatsapp_web" => {
+            crate::channels::whatsapp_web::WhatsAppWebChannel::inbound_channel_message(
+                &format!("3EB0{id}"),
+                "+15550001111".into(),
+                "15550001111@s.whatsapp.net".into(),
+                text.into(),
+                1_700_000_000,
+            )
+        }
         other => panic!("not a tier channel with a parser here: {other}"),
     }
 }
@@ -5483,7 +5662,7 @@ async fn every_slash_command_gets_the_runtime_answer_its_channel_owes() {
         ("discord", slash.as_slice()),
     ];
     if cfg!(feature = "whatsapp-web") {
-        table.push(("whatsapp", slash.as_slice()));
+        table.push(("whatsapp_web", slash.as_slice()));
     }
     table.push(("slack", slack.as_slice()));
 
@@ -5630,7 +5809,7 @@ async fn every_command_a_runtime_reply_names_is_one_its_channel_accepts() {
 
     let mut channels = vec![("telegram", "/"), ("discord", "/"), ("slack", "")];
     if cfg!(feature = "whatsapp-web") {
-        channels.push(("whatsapp", "/"));
+        channels.push(("whatsapp_web", "/"));
     }
     for (channel_name, prefix) in channels {
         let channel_impl = Arc::new(AddressRecordingChannel::named(channel_name));

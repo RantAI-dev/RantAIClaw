@@ -289,6 +289,7 @@ pub fn all_tools_with_runtime(
         // SecurityPolicy gates it under ReadOnly.
         Arc::new(crate::tools::issue_pairing_code::IssuePairingCodeTool::new(
             security.clone(),
+            config.clone(),
         )),
         Arc::new(GitOperationsTool::new(
             security.clone(),

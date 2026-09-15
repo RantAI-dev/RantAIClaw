@@ -50,6 +50,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **WhatsApp Web reports its own name, `whatsapp_web`, and that moves state keyed by it.** The console's
+  Channels card never showed WhatsApp Web as running: the card, the catalog and the config table all
+  call the channel `whatsapp_web`, while the channel reported `whatsapp` from `Channel::name()`, so the
+  runtime filed its health component as `channel:whatsapp` where the console never looked. The channel
+  now reports `whatsapp_web` and the component is `channel:whatsapp_web`. This was chosen over renaming
+  the component alone, knowing what else is keyed by the runtime name, and each of these is intended:
+  - **Conversation history and memory start over for WhatsApp Web.** They are keyed `surface:chat`, so
+    rows saved as `whatsapp:<chat>` stay in the database, are not migrated and are not deleted, and no
+    longer load. The per-chat `/model` choice resets with them.
+  - **Pairing codes minted as `whatsapp` before the upgrade are not accepted by WhatsApp Web.** Mint
+    them as `whatsapp_web`. On a host whose configuration runs WhatsApp Web rather than the Cloud
+    API, asking for a `whatsapp` code from `rantaiclaw channels pair`,
+    from `/pair` in the TUI, or through the `issue_pairing_code` tool is now refused with a message
+    naming `whatsapp_web`, instead of minting a code no listener would accept.
+  - **The per-channel lock file and the observability `channel` label change with the name.**
+  - **WhatsApp Cloud API keeps `whatsapp`.** Only one WhatsApp transport runs at a time and Cloud still
+    wins when both tables are present, exactly as before.
+
 - **The catalog says that Discord, Slack and WhatsApp Web have been driven.** It still read "not yet
   verified" for three channels the owner drove himself on 2026-09-11 and 2026-09-12, against real
   accounts on this host: commands answered, files delivered, and a delivery-failure notice produced on

@@ -427,7 +427,7 @@ impl WhatsAppWebChannel {
 
     /// Try to handle `text` from `phone` (already normalized to `+E.164`) as a
     /// `/bind`/`/claim` against the shared pairing store at `root` (surface
-    /// `"whatsapp"`).
+    /// `"whatsapp_web"`, this channel's runtime name).
     ///
     /// Returns `Some(reply)` when the message WAS a live pairing command — the
     /// caller must then send the reply and NOT forward the message — and `None`
@@ -453,7 +453,8 @@ impl WhatsAppWebChannel {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        match pairing_store::contains(root, "whatsapp", &cmd.code, now) {
+        // WhatsApp Web owns its own pairing-store key.
+        match pairing_store::contains(root, "whatsapp_web", &cmd.code, now) {
             Ok(true) => {}
             Ok(false) => return None,
             Err(e) => {
@@ -464,7 +465,7 @@ impl WhatsAppWebChannel {
 
         let reply = try_handle_pairing(
             text,
-            "whatsapp",
+            "whatsapp_web",
             AllowlistField::AllowedNumbers,
             &[phone.to_string()],
             root,
@@ -660,7 +661,9 @@ impl WhatsAppWebChannel {
             // The platform id, not a fresh UUID: a redelivery has to be
             // recognisable.
             id: Self::inbound_message_id(platform_id),
-            channel: "whatsapp".to_string(),
+            // Matches `name()` so dispatch keys the message under
+            // `"whatsapp_web"` and finds the Web allowlist.
+            channel: "whatsapp_web".to_string(),
             sender,
             reply_target,
             content,
@@ -799,7 +802,12 @@ enum RecipientDecision {
 #[async_trait]
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
-        "whatsapp"
+        // The factory key, not Cloud's `"whatsapp"` (D-5). The supervisor
+        // names the health component and the channel lock after this, and
+        // the console, the catalog and the config table all look the channel
+        // up as `whatsapp_web`. The factory guard in `mod_tests.rs` holds the
+        // two together.
+        "whatsapp_web"
     }
 
     fn render_target(&self) -> crate::channels::format::RenderTarget {
@@ -1395,7 +1403,10 @@ impl WhatsAppWebChannel {
 #[async_trait]
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
-        "whatsapp"
+        // The factory key, as in the feature-gated branch. A build without the
+        // feature never constructs this stub (`build_whatsapp_web` returns
+        // `None`), so the name only has to agree, not to run.
+        "whatsapp_web"
     }
 
     async fn send(&self, _message: &SendMessage) -> Result<()> {
@@ -1965,7 +1976,7 @@ mod tests {
         let inbound = || ChannelMessage {
             id: "whatsapp_1".into(),
             content: "hello".into(),
-            channel: "whatsapp".into(),
+            channel: "whatsapp_web".into(),
             ..ChannelMessage::default()
         };
 
@@ -2577,11 +2588,11 @@ mod tests {
         assert!(reply.is_none());
     }
 
-    /// A store-minted "whatsapp" code is accepted on `/claim` via the extracted
+    /// A store-minted Web code is accepted on `/claim` via the extracted
     /// helper: the shared core lands the sender in `allowed_numbers` AND
     /// `approval_owners`, and `handle_pairing_for` extends the runtime allowlist.
     #[tokio::test]
-    async fn store_minted_whatsapp_code_claims_owner_and_extends_runtime() {
+    async fn store_minted_whatsapp_web_code_claims_owner_and_extends_runtime() {
         use crate::security::pairing_store;
 
         let _guard = crate::test_env::ENV_LOCK.lock().await;
@@ -2593,10 +2604,7 @@ mod tests {
 
         {
             let mut seed = crate::config::Config::load_or_init().await.unwrap();
-            // Its own table since schema v32. This is also the test that proves
-            // a `/claim` from WhatsApp Web still reaches an allowlist: the
-            // channel reports `name() == "whatsapp"`, so the pairing arm has to
-            // fall through to the Web table when there is no Cloud one.
+            // Its own table since schema v32.
             seed.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
                 session_path: "/tmp/wa.db".into(),
                 pair_phone: None,
@@ -2610,8 +2618,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let code = pairing_store::mint(root, "whatsapp", 3_600, None, true, now).unwrap();
-        assert!(pairing_store::contains(root, "whatsapp", &code, now + 1).unwrap());
+        let code = pairing_store::mint(root, "whatsapp_web", 3_600, None, true, now).unwrap();
+        assert!(pairing_store::contains(root, "whatsapp_web", &code, now + 1).unwrap());
 
         let allowed: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(vec![]));
         let reply = WhatsAppWebChannel::handle_pairing_for(
@@ -2632,10 +2640,7 @@ mod tests {
 
         // Config persisted.
         let config = crate::config::Config::load_or_init().await.unwrap();
-        // The Web table, not the Cloud one. `Channel::name()` is still
-        // `"whatsapp"` for both transports, so `apply_pairing` matches the
-        // `"whatsapp"` arm and has to fall through to `whatsapp_web` when no
-        // Cloud table exists. If that fallback is dropped this unwrap panics.
+        // The Web table, not the Cloud one.
         let numbers = &config
             .channels_config
             .whatsapp_web

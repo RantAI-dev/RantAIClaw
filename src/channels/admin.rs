@@ -504,6 +504,12 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             max_uses,
             no_owner,
         } => {
+            if let Some(refusal) = crate::security::pairing_store::whatsapp_surface_refusal(
+                &channel,
+                config.channels_config.running_whatsapp_surface(),
+            ) {
+                anyhow::bail!(refusal);
+            }
             pair_channel(&channel, ttl, max_uses, !no_owner)?;
             Ok(())
         }

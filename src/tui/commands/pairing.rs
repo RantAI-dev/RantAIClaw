@@ -3,7 +3,7 @@
 //! `issue_pairing_code` chat tool write to.
 //!
 //! - `/pair` — mint a Telegram code, valid 15 minutes, owner-capable.
-//! - `/pair <channel>` — mint for another surface (whatsapp, discord, …, gateway).
+//! - `/pair <channel>` — mint for another surface (whatsapp_web, discord, …, gateway).
 //! - `/pair <channel> --ttl <minutes>` — custom validity window.
 //! - `/pair <channel> --no-owner` — chat-only invite (`/claim` won't promote).
 //!
@@ -179,11 +179,16 @@ impl CommandHandler for PairCommand {
         "/pair [channel] [--ttl N] [--owner]"
     }
 
-    fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
+    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let parsed = match parse_args(args.trim()) {
             Ok(p) => p,
             Err(msg) => return Ok(CommandResult::Message(format!("✗ {msg}"))),
         };
+        if let Some(refusal) =
+            pairing_store::whatsapp_surface_refusal(&parsed.channel, ctx.running_whatsapp_surface)
+        {
+            return Ok(CommandResult::Message(format!("✗ {refusal}")));
+        }
         match mint_and_render(&parsed) {
             Ok((display, persisted)) => Ok(CommandResult::SensitiveMessage { display, persisted }),
             Err(e) => Ok(CommandResult::Message(format!(
@@ -316,5 +321,59 @@ mod tests {
             CommandResult::Message(m) => assert!(m.contains("--ttl"), "{m}"),
             other => panic!("expected Message, got {other:?}"),
         }
+    }
+
+    /// D-5. WhatsApp Web answers pairing codes under `whatsapp_web`. On a host
+    /// that runs Web, `/pair whatsapp` minted a code no listener accepts and
+    /// showed it as though it would work. Where the Cloud API runs, a
+    /// `whatsapp` code has a listener and still mints.
+    ///
+    /// The snapshot is set the way `reload_config` sets it, from
+    /// `running_whatsapp_surface`, because this command has no `Config`.
+    #[test]
+    fn pair_refuses_whatsapp_only_where_whatsapp_web_is_what_runs() {
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let mut web_only = crate::config::Config::default();
+        web_only.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+            session_path: "/nonexistent/rantaiclaw-test/whatsapp.db".into(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        });
+        let mut with_cloud = web_only.clone();
+        with_cloud.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("t".into()),
+            phone_number_id: Some("p".into()),
+            verify_token: Some("v".into()),
+            app_secret: None,
+            allowed_numbers: vec![],
+        });
+
+        let mut refused_ctx = test_context();
+        refused_ctx.running_whatsapp_surface = web_only.channels_config.running_whatsapp_surface();
+        let refused = PairCommand.execute("whatsapp", &mut refused_ctx).unwrap();
+        let mut minted_ctx = test_context();
+        minted_ctx.running_whatsapp_surface = with_cloud.channels_config.running_whatsapp_surface();
+        let minted = PairCommand.execute("whatsapp", &mut minted_ctx).unwrap();
+        restore_home(prev_home);
+
+        match refused {
+            CommandResult::Message(m) => assert!(
+                m.contains("whatsapp_web"),
+                "the refusal must name the surface that works: {m}"
+            ),
+            CommandResult::SensitiveMessage { display, .. } => {
+                panic!("a code no listener accepts was minted: {display}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            matches!(minted, CommandResult::SensitiveMessage { .. }),
+            "the Cloud API is a listener for `whatsapp`: {minted:?}"
+        );
     }
 }

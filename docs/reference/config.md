@@ -839,8 +839,15 @@ Notes:
   `whatsapp-web` feature logs that it cannot run this table rather than pretending.
 - If **both** this table and `[channels_config.whatsapp]` are present, the Cloud
   API transport runs and this one is skipped, with a warning naming both tables.
-  The two are mutually exclusive at runtime because they share
-  `Channel::name() == "whatsapp"`. Remove one table to choose deliberately.
+  Only one WhatsApp transport runs at a time. Remove one table to choose
+  deliberately.
+- This channel's runtime name is `whatsapp_web`; the Cloud API's is `whatsapp`.
+  The runtime name keys the health component (`channel:whatsapp_web`), the
+  conversation history and per-chat `/model` choice, and pairing codes, so mint
+  codes for this channel with `rantaiclaw channels pair --channel whatsapp_web`.
+  Until the release that renamed it, this channel reported `whatsapp`: history
+  stored under that name stays where it is and no longer loads, and codes minted
+  as `whatsapp` are not accepted here.
 - Upgrading from v31 moves `session_path`, `pair_phone` and `pair_code` here
   automatically and copies `allowed_numbers`. See [Schema version and downgrades](#schema-version-and-downgrades)
   for what a downgrade needs.

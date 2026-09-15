@@ -155,6 +155,11 @@ pub struct TuiContext {
         crate::channels::ChannelSupport,
         crate::channels::ChannelVerification,
     )>,
+    /// Which WhatsApp transport the loaded config runs, from
+    /// `ChannelsConfig::running_whatsapp_surface`. Precomputed like
+    /// `channels_summary` so `/pair` can refuse a code with no listener without
+    /// the command carrying `Config`. Refreshed by `reload_config`.
+    pub running_whatsapp_surface: Option<&'static str>,
     /// The approval boundary a channel message meets: `(approval owner count,
     /// autonomous_tools)`. Precomputed like `channels_summary` so the panel
     /// does not carry `Config`.
@@ -268,6 +273,7 @@ impl TuiContext {
             available_commands: Vec::new(),
             channels_autostart_count: 0,
             channels_summary: Vec::new(),
+            running_whatsapp_surface: None,
             approval_boundary: (0, false),
             provider_key_ok: None,
             input_history: Vec::new(),

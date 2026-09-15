@@ -3186,6 +3186,35 @@ impl WhatsAppConfig {
     }
 }
 
+impl ChannelsConfig {
+    /// The runtime name of the WhatsApp transport this config runs, if any.
+    ///
+    /// The same choice `channels::factory::build_configured_channels` makes, so
+    /// a caller with no channel runtime can ask it: the Cloud API when its table
+    /// is usable (`is_cloud_config`); otherwise WhatsApp Web when its table names
+    /// a session and this build has the `whatsapp-web` feature; otherwise none.
+    /// Only one WhatsApp ever runs, and a pairing code is accepted only by the
+    /// channel whose runtime name matches its surface, so this is also the one
+    /// WhatsApp surface a code can be claimed on.
+    ///
+    /// A test in `channels::factory` holds this to the factory's own answer.
+    pub fn running_whatsapp_surface(&self) -> Option<&'static str> {
+        if self
+            .whatsapp
+            .as_ref()
+            .is_some_and(WhatsAppConfig::is_cloud_config)
+        {
+            return Some("whatsapp");
+        }
+        let web_runs = cfg!(feature = "whatsapp-web")
+            && self
+                .whatsapp_web
+                .as_ref()
+                .is_some_and(|web| !web.session_path.trim().is_empty());
+        web_runs.then_some("whatsapp_web")
+    }
+}
+
 /// IRC channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IrcConfig {
