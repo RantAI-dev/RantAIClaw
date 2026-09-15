@@ -546,7 +546,7 @@ impl WhatsAppWebChannel {
             Some((user, server)) => (user, server),
             // Bare number: normalise and gate.
             None => {
-                let normalized = Self::normalize_e164(trimmed);
+                let normalized = crate::config::WhatsAppWebConfig::plus_form(trimmed);
                 return if Self::number_allowed_in(allowed, &normalized) {
                     RecipientDecision::Allow
                 } else {
@@ -572,24 +572,13 @@ impl WhatsAppWebChannel {
             }
             // Everything else is a user JID whose user part is the number.
             _ => {
-                let normalized = Self::normalize_e164(user);
+                let normalized = crate::config::WhatsAppWebConfig::plus_form(user);
                 if Self::number_allowed_in(allowed, &normalized) {
                     RecipientDecision::Allow
                 } else {
                     RecipientDecision::Deny(format!("{normalized} is not in allowed_numbers"))
                 }
             }
-        }
-    }
-
-    /// `+`-prefixed form of a bare user part.
-    #[cfg(feature = "whatsapp-web")]
-    fn normalize_e164(user: &str) -> String {
-        let user = user.trim();
-        if user.starts_with('+') {
-            user.to_string()
-        } else {
-            format!("+{user}")
         }
     }
 
@@ -751,11 +740,7 @@ impl WhatsAppWebChannel {
     /// without a live wa-rs client.
     #[cfg(feature = "whatsapp-web")]
     fn normalize_sender(resolved_pn: Option<&str>, sender_user: &str) -> String {
-        match resolved_pn {
-            Some(pn) => format!("+{pn}"),
-            None if sender_user.starts_with('+') => sender_user.to_string(),
-            None => format!("+{sender_user}"),
-        }
+        crate::config::WhatsAppWebConfig::plus_form(resolved_pn.unwrap_or(sender_user))
     }
 
     /// The identity to report for an inbound sender.
@@ -1453,6 +1438,27 @@ pub struct PairOptions {
     pub timeout: std::time::Duration,
 }
 
+/// How long a pairing waits, at least, for the phone to accept a code.
+///
+/// wa-rs shows the first QR code for 60 s and each later one for 20 s
+/// (`wa-rs-0.2.0/src/pair.rs:72-78`); how many codes there are is the
+/// server's choice, not the library's. Three minutes covers six codes, 160 s,
+/// and the connect before the first, and a code still on screen when it runs
+/// out keeps the wait open until that code expires, so the count does not
+/// have to be right. When the last code expires wa-rs disconnects on its own,
+/// which ends the wait as a timeout. Once the phone accepts a code this window
+/// no longer applies; see `await_pairing`.
+pub const PAIR_WINDOW: std::time::Duration = std::time::Duration::from_mins(3);
+
+/// How long an accepted code gets to become a connected session.
+#[cfg(feature = "whatsapp-web")]
+const PAIRED_CONNECT_WAIT: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// How long an outcome the event handler is still recording gets, once
+/// wa-rs's run loop has returned.
+#[cfg(feature = "whatsapp-web")]
+const HANDLER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl PairOptions {
     /// Build options for a session file the caller has already resolved.
     ///
@@ -1464,7 +1470,7 @@ impl PairOptions {
         Self {
             session_path,
             pair_phone: None,
-            timeout: std::time::Duration::from_secs(60),
+            timeout: PAIR_WINDOW,
         }
     }
 }
@@ -1478,15 +1484,202 @@ pub enum PairEvent {
     Failed(String),
 }
 
+/// What `pair_once` does with one wa-rs event.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, PartialEq, Eq)]
+enum PairStep {
+    Qr {
+        code: String,
+        shown_for: std::time::Duration,
+    },
+    PairCode(String),
+    Paired,
+    Connected,
+    Failed(String),
+    Ignore,
+}
+
+/// The step `pair_once` takes for one wa-rs event.
+///
+/// A function of the event, outside the handler, so each mapping is tested
+/// with a constructed event and no WhatsApp connection.
+#[cfg(feature = "whatsapp-web")]
+fn pair_step(event: &wa_rs_core::types::events::Event) -> PairStep {
+    use wa_rs_core::types::events::Event;
+    match event {
+        Event::PairingQrCode { code, timeout } => PairStep::Qr {
+            code: code.clone(),
+            shown_for: *timeout,
+        },
+        Event::PairingCode { code, .. } => PairStep::PairCode(code.clone()),
+        // Not connected yet: the server closes the stream with 515 and wa-rs
+        // reconnects as the new device (`wa-rs-0.2.0/src/client.rs:1736`).
+        Event::PairSuccess(_) => PairStep::Paired,
+        Event::Connected(_) => PairStep::Connected,
+        // The text only: the event also carries the account's JIDs.
+        Event::PairError(refused) => PairStep::Failed(refused.error.clone()),
+        Event::QrScannedWithoutMultidevice(_) => PairStep::Failed(
+            "the phone that scanned the code cannot link devices; update WhatsApp on the \
+             phone, then link again"
+                .into(),
+        ),
+        Event::LoggedOut(_) => PairStep::Failed("logged out".into()),
+        Event::StreamError(e) => PairStep::Failed(format!("stream error: {e:?}")),
+        // wa-rs turns reconnecting off for these, so its run loop ends; say
+        // why instead of letting the link read as a timeout. The reason's name
+        // only: the failure's raw node is WhatsApp's, not ours to show.
+        Event::ClientOutdated(_) => PairStep::Failed(
+            "WhatsApp rejected this client version as outdated; update RantaiClaw, then link \
+             again"
+                .into(),
+        ),
+        Event::TemporaryBan(_) => PairStep::Failed(
+            "WhatsApp has temporarily banned this account; wait before linking again".into(),
+        ),
+        Event::ConnectFailure(failure) if !failure.reason.should_reconnect() => PairStep::Failed(
+            format!("WhatsApp refused the connection ({:?})", failure.reason),
+        ),
+        Event::StreamReplaced(_) => {
+            PairStep::Failed("another WhatsApp Web session replaced this one; link again".into())
+        }
+        _ => PairStep::Ignore,
+    }
+}
+
+/// How far a pairing has got, as the event handler last recorded it.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairProgress {
+    Waiting,
+    /// A QR code is on screen until `until`.
+    QrShown {
+        until: tokio::time::Instant,
+    },
+    /// The phone accepted a code; wa-rs is reconnecting as the new device.
+    Paired,
+    Connected,
+    Failed(String),
+}
+
+/// Wait for a pairing to end, and say how it ended.
+///
+/// The wait lasts at least `window`, and a QR code on screen keeps it open
+/// until that code expires, so a phone that scans a code is never cut off,
+/// however long the connect took or however many codes the server sends. It
+/// stops at the acceptance: wa-rs then reconnects as the new device before
+/// `Connected`, and that gets `connect_wait` of its own. A run loop that
+/// returns with nothing accepted means wa-rs gave up after its last code
+/// (`wa-rs-0.2.0/src/pair.rs:95-96`), which is a timeout.
+#[cfg(feature = "whatsapp-web")]
+async fn await_pairing(
+    run: &mut tokio::task::JoinHandle<()>,
+    progress: &mut tokio::sync::watch::Receiver<PairProgress>,
+    window: std::time::Duration,
+    connect_wait: std::time::Duration,
+) -> PairEvent {
+    let mut deadline = tokio::time::Instant::now() + window;
+    loop {
+        let seen = progress.borrow_and_update().clone();
+        match seen {
+            PairProgress::Waiting => {}
+            PairProgress::QrShown { until } => deadline = deadline.max(until),
+            PairProgress::Paired => break,
+            PairProgress::Connected => return PairEvent::Connected,
+            PairProgress::Failed(reason) => return PairEvent::Failed(reason),
+        }
+        // `biased`: a change already recorded is read before the run loop's
+        // end in the same poll; `after_run_ended` covers one still on its way.
+        let joined = tokio::select! {
+            biased;
+            changed = progress.changed() => match changed {
+                Ok(()) => continue,
+                Err(_) => return PairEvent::Failed("the pairing event handler stopped".into()),
+            },
+            joined = &mut *run => joined,
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!("pair_once: no code was accepted before the wait ran out");
+                return PairEvent::Timeout;
+            }
+        };
+        return after_run_ended(joined, progress, PairEvent::Timeout).await;
+    }
+
+    let not_connected = || {
+        PairEvent::Failed(format!(
+            "the phone accepted the code, but the session did not connect within {} s; \
+             remove the new device under Linked Devices on the phone, then link again",
+            connect_wait.as_secs()
+        ))
+    };
+    let joined = tokio::select! {
+        biased;
+        seen = progress.wait_for(|p| matches!(p, PairProgress::Connected | PairProgress::Failed(_))) => {
+            return match seen.map(|p| (*p).clone()) {
+                Ok(PairProgress::Failed(reason)) => PairEvent::Failed(reason),
+                Ok(_) => PairEvent::Connected,
+                Err(_) => PairEvent::Failed("the pairing event handler stopped".into()),
+            };
+        }
+        joined = &mut *run => joined,
+        () = tokio::time::sleep(connect_wait) => return not_connected(),
+    };
+    after_run_ended(joined, progress, not_connected()).await
+}
+
+/// The outcome once wa-rs's run loop has returned.
+///
+/// wa-rs runs each event handler in a task of its own
+/// (`wa-rs-0.2.0/src/bot.rs:92`), so the event that ended the loop, such as a
+/// logout or a refused connection, can still be on its way when the loop is
+/// gone. It gets `HANDLER_GRACE` to arrive; without one the pairing ended as
+/// `otherwise`.
+#[cfg(feature = "whatsapp-web")]
+async fn after_run_ended(
+    joined: Result<(), tokio::task::JoinError>,
+    progress: &mut tokio::sync::watch::Receiver<PairProgress>,
+    otherwise: PairEvent,
+) -> PairEvent {
+    if let Err(e) = joined {
+        return PairEvent::Failed(format!("bot task panicked: {e}"));
+    }
+    let recorded = tokio::time::timeout(
+        HANDLER_GRACE,
+        progress.wait_for(|p| matches!(p, PairProgress::Connected | PairProgress::Failed(_))),
+    )
+    .await;
+    match recorded {
+        Ok(Ok(seen)) => match (*seen).clone() {
+            PairProgress::Connected => PairEvent::Connected,
+            PairProgress::Failed(reason) => PairEvent::Failed(reason),
+            PairProgress::Waiting | PairProgress::QrShown { .. } | PairProgress::Paired => {
+                otherwise
+            }
+        },
+        Ok(Err(_)) | Err(_) => otherwise,
+    }
+}
+
+/// The pair-code request for a link, when it asks for one.
+///
+/// wa-rs starts a pair-code request whenever one is configured, and one with
+/// no phone fails at once with `PairError` (`wa-rs-0.2.0/src/bot.rs:161-205`).
+/// `pair_once` ends the link on that event, so a QR link configures none.
+#[cfg(feature = "whatsapp-web")]
+fn pair_code_options(phone: Option<&str>) -> Option<wa_rs::pair_code::PairCodeOptions> {
+    let phone = phone.map(str::trim).filter(|phone| !phone.is_empty())?;
+    Some(wa_rs::pair_code::PairCodeOptions {
+        phone_number: phone.to_string(),
+        ..Default::default()
+    })
+}
+
 #[cfg(feature = "whatsapp-web")]
 pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + Send {
     use super::whatsapp_http::ReqwestHttpClient;
     use async_stream::stream;
     use tokio::sync::mpsc;
     use wa_rs::bot::Bot;
-    use wa_rs::pair_code::PairCodeOptions;
     use wa_rs::store::{Device, DeviceStore};
-    use wa_rs_core::types::events::Event;
     use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
 
     let opts = std::sync::Arc::new(opts);
@@ -1504,7 +1697,8 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                 return;
             }
         };
-        runtime.block_on(async {
+        // `None` when a failure was already sent, before any bot existed.
+        let outcome = runtime.block_on(async {
             tracing::info!(
                 "pair_once: thread started, opening storage at {}",
                 opts.session_path.display()
@@ -1515,7 +1709,7 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                     let _ = tx
                         .send(PairEvent::Failed(format!("storage init failed: {e}")))
                         .await;
-                    return;
+                    return None;
                 }
             };
             tracing::info!("pair_once: storage opened, building bot");
@@ -1535,7 +1729,7 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                                     .into(),
                             ))
                             .await;
-                        return;
+                        return None;
                     }
                     Err(e) => {
                         let _ = tx
@@ -1544,7 +1738,7 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                                  it — move or delete the session file to start fresh"
                             )))
                             .await;
-                        return;
+                        return None;
                     }
                 },
                 Ok(false) => {}
@@ -1554,7 +1748,7 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                             "could not check for an existing session: {e}"
                         )))
                         .await;
-                    return;
+                    return None;
                 }
             }
             let mut transport_factory = TokioWebSocketTransportFactory::new();
@@ -1562,39 +1756,61 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                 transport_factory = transport_factory.with_url(ws_url);
             }
             let tx_clone = tx.clone();
-            let builder = Bot::builder()
+            // The handler records where the link got to; `await_pairing` reads it.
+            let (progress_tx, mut progress) = tokio::sync::watch::channel(PairProgress::Waiting);
+            let qr_codes_shown = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
-                .with_http_client(ReqwestHttpClient::new())
-                .with_pair_code(PairCodeOptions {
-                    phone_number: opts.pair_phone.clone().unwrap_or_default(),
-                    ..Default::default()
-                })
-                .on_event(move |ev, _client| {
-                    let tx = tx_clone.clone();
-                    async move {
-                        match ev {
-                            Event::PairingQrCode { code, .. } => {
-                                let _ = tx.send(PairEvent::Qr(code)).await;
-                            }
-                            Event::PairingCode { code, .. } => {
-                                let _ = tx.send(PairEvent::PairCode(code)).await;
-                            }
-                            Event::Connected(_) => {
-                                let _ = tx.send(PairEvent::Connected).await;
-                            }
-                            Event::LoggedOut(_) => {
-                                let _ = tx.send(PairEvent::Failed("logged out".into())).await;
-                            }
-                            Event::StreamError(e) => {
-                                let _ = tx
-                                    .send(PairEvent::Failed(format!("stream error: {e:?}")))
-                                    .await;
-                            }
-                            _ => {}
+                .with_http_client(ReqwestHttpClient::new());
+            if let Some(options) = pair_code_options(opts.pair_phone.as_deref()) {
+                builder = builder.with_pair_code(options);
+            }
+            let builder = builder.on_event(move |ev, _client| {
+                let tx = tx_clone.clone();
+                let progress = progress_tx.clone();
+                let qr_codes_shown = qr_codes_shown.clone();
+                async move {
+                    match pair_step(&ev) {
+                        PairStep::Qr { code, shown_for } => {
+                            // The count, never the code: the code is the link.
+                            let shown = qr_codes_shown
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                + 1;
+                            tracing::info!("pair_once: QR code {shown} shown");
+                            // The wait stays open while this code is on screen,
+                            // unless the phone has already accepted one.
+                            let until = tokio::time::Instant::now() + shown_for;
+                            progress.send_if_modified(|seen| {
+                                let before_acceptance = matches!(
+                                    seen,
+                                    PairProgress::Waiting | PairProgress::QrShown { .. }
+                                );
+                                if before_acceptance {
+                                    *seen = PairProgress::QrShown { until };
+                                }
+                                before_acceptance
+                            });
+                            let _ = tx.send(PairEvent::Qr(code)).await;
                         }
+                        PairStep::PairCode(code) => {
+                            let _ = tx.send(PairEvent::PairCode(code)).await;
+                        }
+                        PairStep::Paired => {
+                            // No fields: they are the account's JIDs.
+                            tracing::info!("pair_once: the phone accepted the code");
+                            progress.send_replace(PairProgress::Paired);
+                        }
+                        PairStep::Connected => {
+                            progress.send_replace(PairProgress::Connected);
+                        }
+                        PairStep::Failed(reason) => {
+                            progress.send_replace(PairProgress::Failed(reason));
+                        }
+                        PairStep::Ignore => {}
                     }
-                });
+                }
+            });
             let mut bot = match builder.build().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -1602,7 +1818,7 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                     let _ = tx
                         .send(PairEvent::Failed(format!("bot build failed: {e}")))
                         .await;
-                    return;
+                    return None;
                 }
             };
             tracing::info!("pair_once: bot built, calling run() to spawn event loop");
@@ -1612,36 +1828,47 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
             // runs — discarding it lets the runtime drop, which kills the
             // task before it ever connects (symptom: user sees "Starting
             // WhatsApp Web pairing…" forever, no QR).
-            let join_handle = match bot.run().await {
+            let mut join_handle = match bot.run().await {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::error!("pair_once: bot.run() failed to spawn: {e}");
                     let _ = tx
                         .send(PairEvent::Failed(format!("bot run failed: {e}")))
                         .await;
-                    return;
+                    return None;
                 }
             };
-            tracing::info!("pair_once: event loop spawned, awaiting JoinHandle");
-            // Bounded by `opts.timeout`, which the struct has always declared
-            // and nothing ever read — `PairEvent::Timeout` had exactly one
-            // occurrence in the repo, the arm that handles it. The bot
-            // auto-reconnects, so an unbounded await never returns.
-            match tokio::time::timeout(opts.timeout, join_handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!("pair_once: bot task join failed: {e}");
-                    let _ = tx
-                        .send(PairEvent::Failed(format!("bot task panicked: {e}")))
-                        .await;
-                }
-                Err(_elapsed) => {
-                    tracing::warn!("pair_once: timed out after {:?}", opts.timeout);
-                    let _ = tx.send(PairEvent::Timeout).await;
-                }
+            tracing::info!("pair_once: event loop spawned, waiting for the phone");
+            // Bounded by `opts.timeout`, which the struct had always declared
+            // and nothing read. The bot auto-reconnects, so an unbounded wait
+            // never returns.
+            let outcome = await_pairing(
+                &mut join_handle,
+                &mut progress,
+                opts.timeout,
+                PAIRED_CONNECT_WAIT,
+            )
+            .await;
+            // The gateway restarts the runtime when it sees `Connected`, and
+            // the channel that starts then opens this session file. Stop the
+            // pairing bot first, so two clients never hold one session.
+            bot.client().disconnect().await;
+            if tokio::time::timeout(std::time::Duration::from_secs(10), join_handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!("pair_once: the pairing bot did not stop within 10 s");
             }
-            tracing::info!("pair_once: thread exiting");
+            Some(outcome)
         });
+        // Shutting the runtime down ends the tasks wa-rs spawned, which hold
+        // the session store. Bounded, because a blocking task would hold a
+        // plain drop forever.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        tracing::info!("pair_once: thread exiting");
+        if let Some(outcome) = outcome {
+            let _ = tx.blocking_send(outcome);
+        }
     });
 
     Box::pin(stream! {
@@ -2375,7 +2602,8 @@ mod tests {
 
     /// `opts.timeout` was declared and never read, so pairing never ended: the
     /// bot auto-reconnects, and the awaited handle only resolves when the event
-    /// loop dies.
+    /// loop dies. The wait is `await_pairing`, whose tests below show how it
+    /// ends; this pins that `pair_once` hands it the declared timeout.
     #[test]
     fn pair_once_honours_its_timeout() {
         let src = include_str!("whatsapp_web.rs");
@@ -2385,12 +2613,8 @@ mod tests {
             .nth(1)
             .expect("pair_once exists");
         assert!(
-            body.contains("tokio::time::timeout(opts.timeout"),
+            body.contains("await_pairing(") && body.contains("opts.timeout"),
             "the pairing wait must be bounded by the declared timeout"
-        );
-        assert!(
-            body.contains("PairEvent::Timeout"),
-            "the timeout must be reported to the caller"
         );
         assert!(
             !body.contains("expect(\"runtime\")"),
@@ -2416,6 +2640,361 @@ mod tests {
         assert!(
             body.contains("refusing to pair over"),
             "the refusal must say why"
+        );
+    }
+
+    /// F-38. wa-rs shows the first QR code for 60 s and each later one for
+    /// 20 s (`wa-rs-0.2.0/src/pair.rs:72-78`), and the server decides how many
+    /// codes it sends. A 60 s window ended during the first code, so a phone
+    /// that scanned a later one was already cut off. The window alone covers
+    /// six codes; a code still on screen after it keeps the wait open, which
+    /// `a_code_on_screen_keeps_the_wait_open_until_it_expires` covers.
+    #[test]
+    fn the_pairing_window_outlasts_the_qr_codes() {
+        let first_code = std::time::Duration::from_mins(1);
+        let later_code = std::time::Duration::from_secs(20);
+        let codes = 6;
+        assert!(
+            PAIR_WINDOW >= first_code + later_code * (codes - 1),
+            "a {PAIR_WINDOW:?} window ends before the last QR code"
+        );
+        assert_eq!(
+            PairOptions::new(std::path::PathBuf::from("/tmp/rantaiclaw/wa.db")).timeout,
+            PAIR_WINDOW,
+            "the window is set in one place"
+        );
+    }
+
+    /// F-38. `pair_once` ignored `PairSuccess`, `PairError` and
+    /// `QrScannedWithoutMultidevice`, so a refused link reached the operator
+    /// as "timed out" and a phone that accepted late was cut off.
+    #[test]
+    fn pairing_events_that_end_or_advance_a_link_are_not_ignored() {
+        use wa_rs_binary::jid::Jid;
+        use wa_rs_core::types::events::{
+            Connected, Event, PairError, PairSuccess, QrScannedWithoutMultidevice,
+        };
+
+        let refused = Event::PairError(PairError {
+            id: Jid::default(),
+            lid: Jid::default(),
+            business_name: String::new(),
+            platform: String::new(),
+            error: "the phone refused the code".into(),
+        });
+        assert_eq!(
+            pair_step(&refused),
+            PairStep::Failed("the phone refused the code".into()),
+            "a refusal reaches the operator with its own text"
+        );
+
+        match pair_step(&Event::QrScannedWithoutMultidevice(
+            QrScannedWithoutMultidevice,
+        )) {
+            PairStep::Failed(reason) => assert!(
+                reason.contains("update WhatsApp"),
+                "the operator needs something to do: {reason}"
+            ),
+            other => panic!("a phone that cannot link must end the link, got {other:?}"),
+        }
+
+        let accepted = Event::PairSuccess(PairSuccess {
+            id: Jid::default(),
+            lid: Jid::default(),
+            business_name: String::new(),
+            platform: String::new(),
+        });
+        assert_eq!(
+            pair_step(&accepted),
+            PairStep::Paired,
+            "an accepted code stops the pairing window"
+        );
+        assert_eq!(pair_step(&Event::Connected(Connected)), PairStep::Connected);
+    }
+
+    /// F-38. After the phone accepts a code, wa-rs still reconnects as the new
+    /// device before `Connected`. The window has to stop at the acceptance, or
+    /// a phone that scans near its end is cut off halfway through the link.
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_code_is_not_cut_off_by_the_pairing_window() {
+        let (progress_tx, mut progress) = tokio::sync::watch::channel(PairProgress::Waiting);
+        let mut run = tokio::spawn(std::future::pending::<()>());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(170)).await;
+            progress_tx.send_replace(PairProgress::Paired);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            progress_tx.send_replace(PairProgress::Connected);
+            std::future::pending::<()>().await;
+        });
+
+        let outcome = await_pairing(
+            &mut run,
+            &mut progress,
+            std::time::Duration::from_mins(3),
+            std::time::Duration::from_mins(1),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, PairEvent::Connected),
+            "accepted at 170 s and connected at 200 s: {outcome:?}"
+        );
+        run.abort();
+    }
+
+    /// The other bound. An accepted code that never connects still ends, and
+    /// not as "timed out": the phone now lists a device that never came up.
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_code_that_never_connects_ends_with_what_to_do() {
+        let (progress_tx, mut progress) = tokio::sync::watch::channel(PairProgress::Waiting);
+        let mut run = tokio::spawn(std::future::pending::<()>());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            progress_tx.send_replace(PairProgress::Paired);
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+
+        let outcome = await_pairing(
+            &mut run,
+            &mut progress,
+            std::time::Duration::from_mins(3),
+            std::time::Duration::from_mins(1),
+        )
+        .await;
+
+        match outcome {
+            PairEvent::Failed(reason) => assert!(
+                reason.contains("Linked Devices"),
+                "the operator needs something to do: {reason}"
+            ),
+            other => panic!("an accepted code that never connects must fail, got {other:?}"),
+        }
+        assert_eq!(
+            started.elapsed().as_secs(),
+            70,
+            "accepted at 10 s, then 60 s to connect"
+        );
+        run.abort();
+    }
+
+    /// wa-rs disconnects when its last QR code expires, and its run loop
+    /// returns (`wa-rs-0.2.0/src/pair.rs:95-96`). That is a timeout; it reached
+    /// the operator as "Pairing failed: channel closed".
+    #[tokio::test(start_paused = true)]
+    async fn codes_that_run_out_end_the_link_as_a_timeout() {
+        let (_progress_tx, mut progress) = tokio::sync::watch::channel(PairProgress::Waiting);
+        let mut run = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(160)));
+
+        let outcome = await_pairing(
+            &mut run,
+            &mut progress,
+            std::time::Duration::from_mins(3),
+            std::time::Duration::from_mins(1),
+        )
+        .await;
+
+        assert!(matches!(outcome, PairEvent::Timeout), "{outcome:?}");
+    }
+
+    /// A fixed window counted from the bot's start cut the last code off when
+    /// the connect was slow or the server sent more codes than it was sized
+    /// for. A code on screen keeps the wait open until that code expires.
+    #[tokio::test(start_paused = true)]
+    async fn a_code_on_screen_keeps_the_wait_open_until_it_expires() {
+        let (progress_tx, mut progress) = tokio::sync::watch::channel(PairProgress::Waiting);
+        let mut run = tokio::spawn(std::future::pending::<()>());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(170)).await;
+            progress_tx.send_replace(PairProgress::QrShown {
+                until: tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+            });
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            progress_tx.send_replace(PairProgress::Paired);
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            progress_tx.send_replace(PairProgress::Connected);
+            std::future::pending::<()>().await;
+        });
+
+        let outcome = await_pairing(
+            &mut run,
+            &mut progress,
+            std::time::Duration::from_mins(3),
+            std::time::Duration::from_mins(1),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, PairEvent::Connected),
+            "a code shown at 170 s and accepted at 185 s, past the 180 s window: {outcome:?}"
+        );
+        run.abort();
+    }
+
+    /// wa-rs runs each event handler in a task of its own
+    /// (`wa-rs-0.2.0/src/bot.rs:92`), so the event that ended the run loop can
+    /// be recorded just after the loop is gone. It is still the outcome.
+    #[tokio::test(start_paused = true)]
+    async fn an_outcome_recorded_just_after_the_run_loop_ends_is_reported() {
+        let (progress_tx, mut progress) = tokio::sync::watch::channel(PairProgress::Waiting);
+        let mut run = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(10)));
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10_100)).await;
+            progress_tx.send_replace(PairProgress::Failed("logged out".into()));
+            std::future::pending::<()>().await;
+        });
+
+        let outcome = await_pairing(
+            &mut run,
+            &mut progress,
+            std::time::Duration::from_mins(3),
+            std::time::Duration::from_mins(1),
+        )
+        .await;
+
+        assert!(
+            matches!(&outcome, PairEvent::Failed(reason) if reason == "logged out"),
+            "the logout must not read as a timeout: {outcome:?}"
+        );
+    }
+
+    /// F-38. wa-rs turns reconnecting off when WhatsApp refuses the connection
+    /// for good (`handle_connect_failure`, `wa-rs-0.2.0/src/client.rs`), and
+    /// the run loop ends. Those used to be ignored, so the link read as a
+    /// timeout. A refusal wa-rs retries is not the end of the link.
+    #[test]
+    fn a_connection_whatsapp_refuses_for_good_ends_the_link() {
+        use wa_rs_core::types::events::{
+            ClientOutdated, ConnectFailure, ConnectFailureReason, Event, StreamReplaced,
+            TempBanReason, TemporaryBan,
+        };
+
+        let refused = |reason| {
+            Event::ConnectFailure(ConnectFailure {
+                reason,
+                message: String::new(),
+                raw: None,
+            })
+        };
+        for event in [
+            refused(ConnectFailureReason::BadUserAgent),
+            Event::ClientOutdated(ClientOutdated),
+            Event::TemporaryBan(TemporaryBan {
+                code: TempBanReason::Unknown(0),
+                expire: chrono::Duration::zero(),
+            }),
+            Event::StreamReplaced(StreamReplaced),
+        ] {
+            assert!(
+                matches!(pair_step(&event), PairStep::Failed(_)),
+                "{event:?} ends the link"
+            );
+        }
+        assert_eq!(
+            pair_step(&refused(ConnectFailureReason::InternalServerError)),
+            PairStep::Ignore,
+            "wa-rs reconnects after this one, so the link goes on"
+        );
+    }
+
+    /// The handler records the code's display time, which is what keeps the
+    /// wait open; a live client is needed to drive that, so the handler's use
+    /// of it is pinned by source.
+    #[test]
+    fn a_qr_code_shown_keeps_the_pairing_open() {
+        use wa_rs_core::types::events::Event;
+
+        assert_eq!(
+            pair_step(&Event::PairingQrCode {
+                code: "2@rantaiclaw".into(),
+                timeout: std::time::Duration::from_secs(20),
+            }),
+            PairStep::Qr {
+                code: "2@rantaiclaw".into(),
+                shown_for: std::time::Duration::from_secs(20),
+            }
+        );
+
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let body = production
+            .split("pub fn pair_once(")
+            .nth(1)
+            .expect("pair_once exists");
+        assert!(
+            body.contains("PairProgress::QrShown { until }"),
+            "the handler must record how long a code stays on screen"
+        );
+    }
+
+    /// A LID that resolved to a number already carrying its `+` became `++…`,
+    /// which no allowlist entry matches. The sender rule is `plus_form`, the
+    /// one the gateway saves numbers with.
+    #[test]
+    fn a_resolved_number_that_already_has_a_plus_keeps_one() {
+        assert_eq!(
+            WhatsAppWebChannel::normalize_sender(Some("+15551234567"), "200000000000001"),
+            "+15551234567"
+        );
+    }
+
+    /// With no phone, wa-rs still started its pair-code request and failed it
+    /// with `PairError` (`wa-rs-0.2.0/src/bot.rs:161-205`,
+    /// `wa-rs-0.2.0/src/pair_code.rs:110-111`). Harmless while `PairError` was
+    /// ignored; now that it ends the link, a QR link must not ask for a code.
+    #[test]
+    fn a_qr_link_does_not_request_a_pair_code() {
+        assert!(
+            pair_code_options(None).is_none(),
+            "no phone, no pair-code request"
+        );
+        assert!(
+            pair_code_options(Some("  ")).is_none(),
+            "a blank phone is no phone"
+        );
+        assert_eq!(
+            pair_code_options(Some("15551234567"))
+                .map(|options| options.phone_number)
+                .as_deref(),
+            Some("15551234567")
+        );
+
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let body = production
+            .split("pub fn pair_once(")
+            .nth(1)
+            .expect("pair_once exists");
+        assert!(
+            body.contains("pair_code_options(opts.pair_phone"),
+            "pair_once must ask pair_code_options whether to request a code"
+        );
+    }
+
+    /// F-37. The gateway restarts the runtime when it sees `Connected`, and the
+    /// channel that starts opens this same session file. So the pairing bot is
+    /// disconnected and its runtime shut down before the outcome is sent. That
+    /// takes a live client to drive, so the order is pinned by source.
+    #[test]
+    fn pair_once_stops_its_bot_before_reporting_the_outcome() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let body = production
+            .split("pub fn pair_once(")
+            .nth(1)
+            .expect("pair_once exists");
+        let disconnect = body
+            .find(".disconnect().await")
+            .expect("the pairing bot must be disconnected");
+        let shutdown = body
+            .find("shutdown_timeout(")
+            .expect("the pairing runtime must be shut down");
+        let report = body
+            .find("blocking_send(outcome)")
+            .expect("the outcome must be sent after the runtime has stopped");
+        assert!(
+            disconnect < shutdown && shutdown < report,
+            "disconnect the bot, then shut the runtime down, then report"
         );
     }
 

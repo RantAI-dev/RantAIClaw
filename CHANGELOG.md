@@ -84,6 +84,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A WhatsApp Web link from the console starts the channel.** After the phone linked, the gateway
+  saved the session and the allowlist but never scheduled the daemon reload, so the console waited for
+  a restart that did not come and WhatsApp Web stayed down until someone restarted the daemon. The
+  reload is now scheduled once the save succeeds, the `connected` event carries
+  `"restarts_runtime": true`, and the pairing client disconnects before that event is sent, so it no
+  longer holds the session file when the channel starts. A save that fails still ends in `failed` and
+  restarts nothing.
+- **The WhatsApp Web pairing window no longer closes while a code is on screen.** It was 60 s from the
+  start of the connection, which ended during the first QR code, so a phone that scanned a later code
+  was cut off. It is now at least three minutes, set in one place that the console and `rantaiclaw
+  setup whatsapp-web` share (the setup command had its own 120 s); a code on screen keeps it open
+  until that code expires, and it stops when the phone accepts a code, after which the session has
+  60 s to connect. A phone that refuses the link, or a connection WhatsApp refuses for good (an
+  outdated client, a temporary ban), now shows why instead of "timed out", and codes that run out end
+  as a timeout instead of "channel closed". A QR link no longer starts a pair-code request with no
+  phone, which failed at once; with a phone set, `rantaiclaw setup whatsapp-web` now ends with the
+  reason when that request fails, where it used to leave only the QR on screen. The journal logs one
+  line per QR code shown and one when the phone accepts, with no code, number or JID.
+- **WhatsApp Web numbers saved from the console match their senders.** The runtime compares an
+  allowlist entry with the sender's `+` form, and the console handlers only trimmed, so `15551234567`
+  saved as typed allowed nobody. `POST /api/v1/channels/whatsapp_web` and the pair request now save a
+  number with its `+`, keep `*` and `lid:<digits>` as they are, and refuse any other entry with a
+  `400` that names it.
 - **A channel change from the console no longer SIGKILLs the daemon on systemd.** Disconnecting or
   reconnecting a channel asked systemd to restart this process, then waited for that restart job to
   finish in `schedule_daemon_reload`. The job first stops the unit — systemd sends SIGTERM to this very

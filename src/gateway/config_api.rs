@@ -1545,6 +1545,17 @@ struct WhatsAppWebConnectBody {
 /// same primitive the `pair` handler exchanges through it.
 pub type PairGuard = Arc<std::sync::atomic::AtomicBool>;
 
+/// The allowlist a request asks to save, each entry in the form the runtime
+/// compares, or a 400 that names the first entry that cannot be one.
+fn allowed_numbers_to_save(entries: &[String]) -> Result<Vec<String>, ApiError> {
+    entries
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| crate::config::WhatsAppWebConfig::allowlist_entry(entry).map_err(err_400))
+        .collect()
+}
+
 async fn whatsapp_web_connect(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1558,12 +1569,7 @@ async fn whatsapp_web_connect(
     // pushes the new list through `Channel::apply_allowed_senders` on the
     // next message (`whatsapp_web.rs:1291`), so editing it does NOT need
     // a restart — the same rule plan 366 applied to Discord/Slack.
-    let normalised = body
-        .allowed_numbers
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
+    let normalised = allowed_numbers_to_save(&body.allowed_numbers)?;
 
     let next = match previous {
         Some(mut existing) => {
@@ -1634,6 +1640,11 @@ async fn whatsapp_web_pair(
 ) -> Result<Response, ApiError> {
     check_auth(&state, &headers)?;
 
+    // Before the guards below and before a pairing starts: this list is saved
+    // on `Connected`, and the phone scan is no time to learn it cannot be.
+    // Returning here also leaves the in-flight flag untouched.
+    let normalised = allowed_numbers_to_save(&body.allowed_numbers)?;
+
     // D-3: refuse while a WhatsApp Web section is configured. Two clients
     // holding one session is the problem this guard closes.
     {
@@ -1676,13 +1687,6 @@ async fn whatsapp_web_pair(
         .unwrap_or(0);
     let session_path = workspace.join(format!("whatsapp-{unix_now}.db"));
 
-    let normalised = body
-        .allowed_numbers
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-
     // Build the pair stream. `pair_once` is only available with the
     // `whatsapp-web` feature, and the entire handler is gated behind it.
     let pair_stream = {
@@ -1714,28 +1718,15 @@ async fn whatsapp_web_pair(
                     continue;
                 }
                 crate::channels::whatsapp_web::PairEvent::Connected => {
-                    // Persist the freshly-minted session and the allowed
-                    // numbers so the runtime picks them up after the
-                    // scheduled reload. `Box::pin` so the surrounding
-                    // async-stream future stays under the strict lint
-                    // size budget (clippy::large_futures).
-                    let persist_result = Box::pin(persist_paired_session(
+                    // `Box::pin` so the surrounding async-stream future stays
+                    // under the strict lint size budget (clippy::large_futures).
+                    Box::pin(finish_pairing(
                         &state_for_stream,
                         session_path.clone(),
                         normalised.clone(),
+                        schedule_daemon_reload,
                     ))
-                    .await;
-                    let payload = match persist_result {
-                        Ok(()) => json!({
-                            "type": "connected",
-                            "session_path": session_path.display().to_string(),
-                        }),
-                        Err(err) => json!({
-                            "type": "failed",
-                            "reason": err,
-                        }),
-                    };
-                    payload
+                    .await
                 }
                 crate::channels::whatsapp_web::PairEvent::Timeout => json!({
                     "type": "timeout",
@@ -1794,6 +1785,41 @@ fn render_qr_svg(payload: &str) -> String {
             .min_dimensions(200, 200)
             .build(),
         Err(e) => format!("<!-- qr render failed: {e} -->"),
+    }
+}
+
+/// Save a linked session and its allowlist, then restart the runtime so the
+/// channel starts on them.
+///
+/// The reload is scheduled only once the save succeeded: a restart before it
+/// would start without WhatsApp Web, and a failed save must not restart
+/// anything. `schedule_reload` is a parameter so a test can count the calls.
+#[cfg(feature = "whatsapp-web")]
+async fn finish_pairing(
+    state: &AppState,
+    session_path: PathBuf,
+    allowed_numbers: Vec<String>,
+    schedule_reload: impl FnOnce(),
+) -> serde_json::Value {
+    match Box::pin(persist_paired_session(
+        state,
+        session_path.clone(),
+        allowed_numbers,
+    ))
+    .await
+    {
+        Ok(()) => {
+            schedule_reload();
+            json!({
+                "type": "connected",
+                "session_path": session_path.display().to_string(),
+                "restarts_runtime": true,
+            })
+        }
+        Err(err) => json!({
+            "type": "failed",
+            "reason": err,
+        }),
     }
 }
 
@@ -3131,5 +3157,268 @@ mod tests {
         cfg.api_url = Some("not-a-url".into());
 
         assert_eq!(secrets_view(&cfg)["api_url"], "not-a-url");
+    }
+
+    // ── WhatsApp Web (plan 373) ──
+
+    struct UnusedProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for UnusedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("these tests make no model call")
+        }
+    }
+
+    /// A gateway running `config`, with pairing off as on a local console.
+    fn console_state(config: Config) -> AppState {
+        AppState {
+            config: Arc::new(parking_lot::Mutex::new(config)),
+            config_fingerprint: Arc::new(parking_lot::Mutex::new("test".to_string())),
+            provider: Arc::new(UnusedProvider),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(crate::memory::NoneMemory::new()),
+            auto_save: false,
+            tools_factory: Arc::new(|_: &Config| Vec::new()),
+            webhook_secret_hash: None,
+            pairing: Arc::new(crate::security::pairing::PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(crate::gateway::GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(crate::gateway::IdempotencyStore::new(
+                std::time::Duration::from_mins(5),
+                1000,
+            )),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: PairGuard::default(),
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
+        }
+    }
+
+    /// A running config under `root` with WhatsApp Web linked. Nothing is on
+    /// disk yet, so the first write saves this config to `root`.
+    fn linked_config(root: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.config_path = root.join("config.toml");
+        config.workspace_dir = root.join("workspace");
+        config.channels_config.whatsapp_web = Some(crate::config::WhatsAppWebConfig {
+            session_path: root
+                .join("workspace")
+                .join("whatsapp-1700000000.db")
+                .display()
+                .to_string(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["+15550000000".into()],
+        });
+        config
+    }
+
+    /// F-39. The runtime compares an entry with the sender's `+` form for
+    /// exact equality, and the handler only trimmed, so a number typed without
+    /// the `+` was saved as an allowlist that matched nobody.
+    #[tokio::test]
+    async fn whatsapp_web_allowlist_is_saved_in_the_form_the_runtime_compares() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let state = console_state(linked_config(tmp.path()));
+
+        let saved = whatsapp_web_connect(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(WhatsAppWebConnectBody {
+                allowed_numbers: vec![
+                    "15551234567".into(),
+                    " +15557654321 ".into(),
+                    "*".into(),
+                    "lid:200000000000001".into(),
+                    "  ".into(),
+                ],
+            }),
+        )
+        .await;
+
+        assert!(saved.is_ok(), "a list of numbers must be saved");
+        let running = state
+            .config
+            .lock()
+            .channels_config
+            .whatsapp_web
+            .clone()
+            .expect("still linked");
+        assert_eq!(
+            running.allowed_numbers,
+            vec!["+15551234567", "+15557654321", "*", "lid:200000000000001"],
+            "each entry is saved the way the runtime compares it"
+        );
+    }
+
+    /// F-39. An entry that could never match anyone is refused with the entry
+    /// named, and nothing is saved.
+    #[tokio::test]
+    async fn whatsapp_web_allowlist_refuses_an_entry_that_is_not_a_number() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let state = console_state(linked_config(tmp.path()));
+
+        let refused = whatsapp_web_connect(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(WhatsAppWebConnectBody {
+                allowed_numbers: vec!["+15551234567".into(), "1555-01x".into()],
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = refused else {
+            panic!("an entry that is not a number must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("1555-01x"),
+            "the refusal names the entry: {body}"
+        );
+        let running = state
+            .config
+            .lock()
+            .channels_config
+            .whatsapp_web
+            .clone()
+            .expect("still linked");
+        assert_eq!(
+            running.allowed_numbers,
+            vec!["+15550000000"],
+            "nothing is saved"
+        );
+    }
+
+    /// F-39. The pair request's list is saved on `Connected`, so it is checked
+    /// by the same rule, and first: before the "already linked" check and
+    /// before a pairing starts. This state is linked, so a handler that skips
+    /// the check answers 409 and still opens no WhatsApp connection.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn whatsapp_web_pairing_refuses_an_entry_that_is_not_a_number_before_it_starts() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let state = console_state(linked_config(tmp.path()));
+
+        let refused = whatsapp_web_pair(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(WhatsAppWebConnectBody {
+                allowed_numbers: vec!["1555-01x".into()],
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = refused else {
+            panic!("an entry that is not a number must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("1555-01x"),
+            "the refusal names the entry: {body}"
+        );
+        assert!(
+            !state.whatsapp_pair_guard.load(Ordering::SeqCst),
+            "a refused request leaves no pairing marked in progress"
+        );
+    }
+
+    /// F-37. After a link the gateway saved the session and never scheduled
+    /// the reload, so the channel stayed down until someone restarted the
+    /// daemon. The reload runs once the save succeeds, and never without it.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn a_linked_session_restarts_the_runtime_only_once_it_is_saved() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let session = tmp.path().join("workspace").join("whatsapp-1700000001.db");
+
+        let mut unlinked = linked_config(tmp.path());
+        unlinked.channels_config.whatsapp_web = None;
+        let state = console_state(unlinked);
+        let reloads = std::sync::atomic::AtomicUsize::new(0);
+        let frame = finish_pairing(&state, session.clone(), vec!["+15551234567".into()], || {
+            reloads.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(frame["type"], "connected", "{frame}");
+        assert_eq!(frame["restarts_runtime"], true, "{frame}");
+        assert_eq!(
+            reloads.load(Ordering::SeqCst),
+            1,
+            "a saved session must restart the runtime"
+        );
+        let saved = state
+            .config
+            .lock()
+            .channels_config
+            .whatsapp_web
+            .clone()
+            .expect("the session is saved");
+        assert_eq!(saved.allowed_numbers, vec!["+15551234567"]);
+
+        let broken = tmp.path().join("broken");
+        std::fs::create_dir_all(&broken).expect("broken dir");
+        std::fs::write(broken.join("config.toml"), "this is not = [ toml").expect("broken config");
+        let mut unreadable = Config::default();
+        unreadable.config_path = broken.join("config.toml");
+        let state = console_state(unreadable);
+        let reloads = std::sync::atomic::AtomicUsize::new(0);
+        let frame = finish_pairing(&state, session, Vec::new(), || {
+            reloads.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(frame["type"], "failed", "{frame}");
+        assert_eq!(
+            reloads.load(Ordering::SeqCst),
+            0,
+            "a session that was not saved must not restart anything"
+        );
+    }
+
+    /// `finish_pairing` takes the reload as a parameter so the test above can
+    /// count it; the pair stream must hand it the real one.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn the_pair_stream_restarts_the_runtime_through_finish_pairing() {
+        let src = include_str!("config_api.rs");
+        let handler = src
+            .split("async fn whatsapp_web_pair(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the pair handler");
+        assert!(
+            handler.contains("finish_pairing(") && handler.contains("schedule_daemon_reload,"),
+            "the Connected arm must pass schedule_daemon_reload to finish_pairing"
+        );
     }
 }
