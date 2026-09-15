@@ -3240,7 +3240,7 @@ mod tests {
         let _home = crate::test_env::HomeGuard::set(tmp.path());
         let state = console_state(linked_config(tmp.path()));
 
-        let saved = whatsapp_web_connect(
+        let saved = Box::pin(whatsapp_web_connect(
             State(state.clone()),
             HeaderMap::new(),
             Json(WhatsAppWebConnectBody {
@@ -3252,7 +3252,7 @@ mod tests {
                     "  ".into(),
                 ],
             }),
-        )
+        ))
         .await;
 
         assert!(saved.is_ok(), "a list of numbers must be saved");
@@ -3279,13 +3279,13 @@ mod tests {
         let _home = crate::test_env::HomeGuard::set(tmp.path());
         let state = console_state(linked_config(tmp.path()));
 
-        let refused = whatsapp_web_connect(
+        let refused = Box::pin(whatsapp_web_connect(
             State(state.clone()),
             HeaderMap::new(),
             Json(WhatsAppWebConnectBody {
                 allowed_numbers: vec!["+15551234567".into(), "1555-01x".into()],
             }),
-        )
+        ))
         .await;
 
         let Err((status, Json(body))) = refused else {
