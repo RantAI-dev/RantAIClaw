@@ -118,11 +118,15 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
             .await
             .ok();
 
+        // The window is `PairOptions::new`'s, the one the console uses too.
         let opts = PairOptions {
-            session_path: session_path.clone(),
             pair_phone: pair_phone.clone(),
-            timeout: std::time::Duration::from_secs(120),
+            ..PairOptions::new(session_path.clone())
         };
+        let timed_out = format!(
+            "Pairing timed out ({}s). Try again.",
+            opts.timeout.as_secs()
+        );
         let mut stream = pair_once(opts);
         let mut paired = false;
         while let Some(ev) = stream.next().await {
@@ -159,13 +163,11 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                 PairEvent::Timeout => {
                     events
                         .send(ProvisionEvent::Failed {
-                            error: "Pairing timed out (120s). Try again.".into(),
+                            error: timed_out.clone(),
                         })
                         .await
                         .ok();
-                    return Ok(ProvisionOutcome::Aborted(
-                        "Pairing timed out (120s). Try again.".into(),
-                    ));
+                    return Ok(ProvisionOutcome::Aborted(timed_out));
                 }
                 PairEvent::Failed(e) => {
                     events

@@ -94,7 +94,7 @@ Single-topic examples:
 - `rantaiclaw setup provider` — re-run provider section only
 - `rantaiclaw setup channels` — re-run channels section only
 - `rantaiclaw setup knowledge` — set the Knowledge Base API keys (`[knowledge].embedding_api_key` / `vision_api_key`, encrypted at rest; vision falls back to the embedding key). Env `KB_EMBEDDING_API_KEY` / `KB_EXTRACT_VISION_API_KEY` override config at load, with `OPENROUTER_API_KEY` as the final fallback. See [config-reference.md](config.md) for the gateway `GET`/`PUT /api/v1/config/knowledge` endpoints.
-- `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (120s timeout; a timeout exits non-zero)
+- `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (a three-minute window, the same as the console's; a timeout exits non-zero)
 
 `onboard` is the legacy entry point, kept for existing scripts. It is **not** an alias for `setup` — it is a separate command with its own flags (`--interactive`, `--channels-only`, `--api-key`, `--provider`, `--model`, `--memory`), documented below. New work should use `setup`.
 

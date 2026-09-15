@@ -1140,10 +1140,10 @@ Plan 367. Web-mode WhatsApp is linked by scanning a QR; the gateway mints a fres
 clears the section and schedules the daemon reload; the session file itself is set aside on the next
 runtime start, before any listener opens it (plan 364 D-4).
 
-- **POST request** (after a successful pair): `{ "allowed_numbers": ["+15551234567", "*"] }`. Numbers
-  are normalised (trimmed, `+` ensured where missing) — the same rule the inbound gate uses
-  (`whatsapp_web.rs:513`), so the list you save matches the list the runtime checks. Pairing before
-  this endpoint returns `400`.
+- **POST request** (after a successful pair): `{ "allowed_numbers": ["+15551234567", "*"] }`. Each
+  entry is saved the way the runtime compares it with a sender: a number gets a leading `+` if it has
+  none, and `*` and `lid:<digits>` stay as they are. Any other entry, such as `1555-0100`, is refused
+  with `400` and a `detail` that names it, and nothing is saved. Posting before a pair returns `400`.
 - **POST response** `200`: `{ "connected": true, "channel": "whatsapp_web", "allowed_numbers": 1,
   "warning": "...", "restarts_runtime": false, "note": "..." }`. An empty `allowed_numbers` produces
   a `warning` saying the bot denies everyone; a list containing `"*"` produces a warning saying the
@@ -1163,20 +1163,30 @@ phone scans. The QR is rendered server-side as SVG (plan 364 D-2: QR only; no pa
 to the browser) and never logged. Refused while a `channels_config.whatsapp_web` section is already
 configured, and while another pairing is in flight.
 
-- **Request**: `{ "allowed_numbers": ["+15551234567"] }` — persisted on `Connected`. Empty list is
-  allowed at pair time so an operator can pair first and lock down later through `POST
-  /api/v1/channels/whatsapp_web`.
+- **Request**: `{ "allowed_numbers": ["+15551234567"] }`, saved on `Connected`. The entries follow the
+  rule of `POST /api/v1/channels/whatsapp_web`, and one that breaks it is refused with `400` before
+  the pairing starts. An empty list is allowed, so an operator can pair first and lock down later.
 - **Events**: each is a JSON object with a `type` and the relevant fields. Example QR frame:
   `{"type":"qr","svg":"<svg ...>...</svg>"}`. Example terminal frames: `{"type":"connected",
-  "session_path":"/var/lib/rantaiclaw/workspace/whatsapp-1700000000.db"}`,
+  "session_path":"/var/lib/rantaiclaw/workspace/whatsapp-1700000000.db","restarts_runtime":true}`,
   `{"type":"timeout"}`, `{"type":"failed","reason":"could not open storage"}`.
+- **Window**: the phone has at least three minutes to accept a code, and a code on screen keeps the
+  stream open until that code expires, so a scan is never cut off. wa-rs shows the first QR code for
+  60 s and each later one for 20 s, and WhatsApp decides how many codes there are; when the last one
+  expires the stream ends with `timeout`. Once the phone accepts a code the window stops, and the
+  session then has 60 s to connect.
+- **`failed` reasons** include the text wa-rs reports when the phone refuses the link, a phone that
+  cannot link devices, a connection WhatsApp refuses for good (an outdated client, a temporary ban),
+  and an accepted code whose session did not connect in time.
 - **PairCode events** are dropped — D-2 says QR only. The browser never receives a pair code.
-- **Status codes**: `200` (stream opened), `401` (no auth), `409` (`already_linked` /
-  `pairing_in_progress`), `500`. The stream itself ends with one of `connected`, `timeout`,
-  `failed`; closing the browser drops the pairing on the gateway side so the runtime stops trying.
-- **Restart**: a successful `connected` event triggers a scheduled daemon reload, just like the
-  other channel connect paths; the runtime picks up the freshly-persisted `session_path` on
-  `build_channel_runtime`.
+- **Status codes**: `200` (stream opened), `400` (an `allowed_numbers` entry), `401` (no auth),
+  `409` (`already_linked` / `pairing_in_progress`), `500`. The stream itself ends with one of
+  `connected`, `timeout`, `failed`; closing the browser drops the pairing on the gateway side so the
+  runtime stops trying.
+- **Restart**: `connected` is sent once the session and the allowlist are saved and the pairing
+  client has disconnected, and it carries `"restarts_runtime": true`: the gateway has scheduled the
+  daemon reload, and the channel starts on the new session. A save that fails sends `failed` and
+  schedules nothing. If RantaiClaw does not run as a managed service, restart `rantaiclaw daemon`.
 
 ## Cron
 

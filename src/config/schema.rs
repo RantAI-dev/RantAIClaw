@@ -3143,6 +3143,45 @@ pub struct WhatsAppWebConfig {
     pub allowed_numbers: Vec<String>,
 }
 
+impl WhatsAppWebConfig {
+    /// The `+` form of a number, which is how WhatsApp Web compares a sender
+    /// with `allowed_numbers`.
+    ///
+    /// The channel applies it to the senders and recipients it checks, and the
+    /// gateway to the numbers an operator saves, so what is saved is what gets
+    /// compared.
+    pub fn plus_form(number: &str) -> String {
+        let number = number.trim();
+        if number.starts_with('+') {
+            number.to_string()
+        } else {
+            format!("+{number}")
+        }
+    }
+
+    /// One `allowed_numbers` entry as the runtime compares it.
+    ///
+    /// `*` stays as it is, and so does `lid:<digits>`, the name the channel
+    /// gives a sender whose number it cannot see and saves when that sender
+    /// pairs. A number gets its `+` form, so `15551234567` typed without the
+    /// `+` still matches that sender. Anything else could never match anyone,
+    /// and is refused with a sentence that names it.
+    pub fn allowlist_entry(entry: &str) -> Result<String, String> {
+        let entry = entry.trim();
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if entry == "*" || entry.strip_prefix("lid:").is_some_and(digits) {
+            return Ok(entry.to_string());
+        }
+        if digits(entry.strip_prefix('+').unwrap_or(entry)) {
+            return Ok(Self::plus_form(entry));
+        }
+        Err(format!(
+            "`{entry}` is not a phone number: use digits with an optional leading +, \
+             like +15551234567, or * for everyone"
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LinqConfig {
     /// Linq Partner API token (Bearer auth)
