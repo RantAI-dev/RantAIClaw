@@ -147,6 +147,12 @@ pub fn set_aside_unreferenced_sessions(
 
 /// Move `base_path` and any `-wal` / `-shm` companion into `target`. Each
 /// sibling is moved independently so a missing companion is not an error.
+///
+/// A companion moves to `{target file name}{suffix}`, where the suffix is what
+/// `companion_names` appended to the base (`-wal` or `-shm`). So every name in
+/// `.unlinked/` is the original name with one `<unix>-` prefix, and restoring a
+/// session means moving the files back and dropping that prefix: SQLite finds
+/// the WAL beside the base only under the base's name plus `-wal`.
 fn move_with_companions(base_path: &Path, base_name: &str, target: &Path) -> anyhow::Result<()> {
     std::fs::rename(base_path, target).map_err(|e| {
         anyhow::anyhow!(
@@ -157,14 +163,19 @@ fn move_with_companions(base_path: &Path, base_name: &str, target: &Path) -> any
     })?;
     let target_parent = target.parent().unwrap_or_else(|| Path::new("."));
     for sibling_name in companion_names(base_name) {
-        let sibling = base_path.with_file_name(sibling_name);
+        let sibling = base_path.with_file_name(&sibling_name);
         if !sibling.exists() {
             continue;
         }
+        // `companion_names` builds every name as the base plus a suffix, so
+        // this always matches. A name that did not would stay where it is
+        // rather than be moved under a name SQLite cannot pair with its base.
+        let Some(suffix) = sibling_name.strip_prefix(base_name) else {
+            continue;
+        };
         let sibling_target_name = format!(
-            "{}-{}",
-            target.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-            sibling.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            "{}{suffix}",
+            target.file_name().and_then(|n| n.to_str()).unwrap_or("")
         );
         let sibling_target = target_parent.join(sibling_target_name);
         if let Err(e) = std::fs::rename(&sibling, &sibling_target) {
@@ -292,13 +303,76 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert!(
-            entries.iter().any(|n| n.ends_with("-whatsapp.db")),
-            "unlinked contains the base: {entries:?}"
+        // The exact set, not "some entry contains wal": the old check passed
+        // while every companion carried the base name twice
+        // (`<unix>-whatsapp.db-whatsapp.db-wal`), which no restore can use.
+        let (prefixes, originals) = split_unlinked_names(&entries);
+        assert_eq!(
+            originals,
+            vec!["whatsapp.db", "whatsapp.db-shm", "whatsapp.db-wal"],
+            "each file keeps its original name behind one `<unix>-` prefix: {entries:?}"
         );
-        assert!(
-            entries.iter().any(|n| n.contains("whatsapp.db-wal")),
-            "unlinked contains the wal: {entries:?}"
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "a base and its companions share one prefix: {entries:?}"
+        );
+
+        fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// Split every `.unlinked/` name into its `<unix>` prefix and the original
+    /// name. Splits on the FIRST dash: the prefix is digits only, while a
+    /// console-minted base (`whatsapp-<unix>.db`) has a dash of its own.
+    fn split_unlinked_names(entries: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut prefixes = Vec::new();
+        let mut originals = Vec::new();
+        for entry in entries {
+            let (prefix, original) = entry
+                .split_once('-')
+                .unwrap_or_else(|| panic!("`{entry}` has no `<unix>-` prefix"));
+            assert!(
+                !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_digit()),
+                "`{entry}` does not start with a unix timestamp"
+            );
+            if !prefixes.iter().any(|p| p == prefix) {
+                prefixes.push(prefix.to_string());
+            }
+            originals.push(original.to_string());
+        }
+        originals.sort();
+        (prefixes, originals)
+    }
+
+    /// F-36. Restoring a set-aside session means moving its files back and
+    /// dropping the timestamp. That only works if stripping the `<unix>-`
+    /// prefix from every entry gives back exactly the names that were in the
+    /// workspace; the WAL of the owner's session held most of it, and under its
+    /// old name a restored `.db` would have opened without it.
+    #[test]
+    fn stripping_the_prefix_from_set_aside_files_gives_back_the_workspace_names() {
+        let ws = unique_tmp("restore");
+        let originals = [
+            "whatsapp-1789455121.db",
+            "whatsapp-1789455121.db-shm",
+            "whatsapp-1789455121.db-wal",
+        ];
+        for name in originals {
+            fs::write(ws.join(name), name.as_bytes()).unwrap();
+        }
+
+        let report = set_aside_unreferenced_sessions(&ws, &[]).expect("set-aside must succeed");
+        assert_eq!(report.moved, 1, "one base, moved with its companions");
+
+        let entries: Vec<String> = fs::read_dir(ws.join(".unlinked"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let (_, restored) = split_unlinked_names(&entries);
+        assert_eq!(
+            restored, originals,
+            "stripping the prefix must give back the workspace names: {entries:?}"
         );
 
         fs::remove_dir_all(&ws).unwrap();
