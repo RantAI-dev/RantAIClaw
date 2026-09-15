@@ -48,9 +48,9 @@ Instead of asking for someone's identity up front, an owner can hand out a
 something like "give me an invite code for Telegram" or "make a single-use
 WhatsApp code that expires in 5 minutes", call `issue_pairing_code`:
 
-- `channel` (required) — the surface, e.g. `telegram`, `whatsapp`, `discord`,
-  `slack`, or `gateway`. A code minted for one channel cannot be claimed on
-  another.
+- `channel` (required) — the surface, e.g. `telegram`, `discord`, `slack`,
+  `whatsapp_web` for WhatsApp Web, `whatsapp` for the WhatsApp Cloud API, or
+  `gateway`. A code minted for one channel cannot be claimed on another.
 - `ttl_minutes` (default 15) — how long the code stays valid.
 - `max_uses` (optional) — bound the number of claims; omit for unlimited within
   the window.

@@ -2528,6 +2528,7 @@ impl TuiApp {
                 (name.to_string(), configured, support, verification)
             })
             .collect();
+        self.context.running_whatsapp_surface = config.channels_config.running_whatsapp_surface();
         let new_channels = channels_fingerprint(&config);
         let new_channels_count = crate::channels::configured_channel_count(&config);
         self.context.channels_autostart_count = new_channels_count;
@@ -8371,6 +8372,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
             (name.to_string(), configured, support, verification)
         })
         .collect();
+    app.context.running_whatsapp_surface = app_config.channels_config.running_whatsapp_surface();
     if configured_channels > 0 {
         // Spawn the channel runtime as a cancellable supervisor (stored on
         // `app`) rather than a fire-and-forget task, so a mid-session

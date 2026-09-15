@@ -42,7 +42,7 @@ pub fn render_qr_with_header(payload: &str, header: &str) {
         tracing::info!(
             "WhatsApp Web is waiting to be linked, but stderr is not a terminal so the QR \
              is not being rendered (it would be written to the journal as a credential). \
-             Run the pairing flow interactively: `rantaiclaw channels pair whatsapp`."
+             Run the pairing flow interactively: `rantaiclaw setup whatsapp-web`."
         );
         return;
     }
@@ -85,7 +85,7 @@ pub fn render_pair_code(code: &str) {
         tracing::info!(
             "WhatsApp Web issued a pair code, but stderr is not a terminal so it is not being \
              printed (it would be written to the journal as a credential). Run the pairing flow \
-             interactively: `rantaiclaw channels pair whatsapp`."
+             interactively: `rantaiclaw setup whatsapp-web`."
         );
         return;
     }

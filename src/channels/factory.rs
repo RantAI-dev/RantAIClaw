@@ -24,12 +24,13 @@ use std::sync::Arc;
 /// had no live caller at all.
 ///
 /// `key` is the lowercase `Channel::name()` value — the same identifier
-/// `channels_by_name`, the per-channel allowlists and cron delivery use. `display`
-/// is operator-facing. The two WhatsApp variants share the key `whatsapp` because
-/// they share `Channel::name()`; they are mutually exclusive, so only one is
-/// ever built. Which one is decided by `WhatsAppConfig::backend_type()`, which
-/// infers the mode from which keys are filled — there is no `mode` key in the
-/// schema, and this comment named one until 2026-09-09.
+/// `channels_by_name`, the per-channel allowlists and cron delivery use, and the
+/// one the console and the health snapshot look a channel up by. `display` is
+/// operator-facing. The two WhatsApp transports have their own keys, `whatsapp`
+/// for the Cloud API and `whatsapp_web` for WhatsApp Web, and every built channel
+/// must report its key from `Channel::name()`, which
+/// `every_built_channel_reports_the_key_the_factory_files_it_under` checks. Only
+/// one of the two is ever built; `build_configured_channels` says which.
 /// The ONE construction of the WhatsApp Cloud channel.
 ///
 /// The gateway used to build its own for the webhook path, and the two drifted:
@@ -258,13 +259,11 @@ pub(crate) fn build_configured_channels(
     }
 
     // Cloud API and Web are still mutually exclusive at runtime, and Cloud
-    // still wins, exactly as before the v32 table split. They are not two
-    // independent channels: both `WhatsAppChannel` and `WhatsAppWebChannel`
-    // return `"whatsapp"` from `Channel::name()`, and `channels_by_name` is
-    // keyed by that name, so building both would put two channels under one
-    // key and let one silently shadow the other. Giving Web its own runtime
-    // name would move the pairing surface and re-key conversation history,
-    // which is a behaviour change and not part of a config split.
+    // still wins, exactly as before the v32 table split. Since D-5 the two
+    // report different runtime names (`whatsapp` and `whatsapp_web`), so the
+    // exclusivity is no longer forced by a collision in `channels_by_name`.
+    // It is kept because it is the behaviour operators already have, and
+    // changing it was not part of that rename.
     //
     // What the split did change is that the choice is no longer inferred from
     // which keys happen to be filled. It is which table the operator wrote.
@@ -529,9 +528,8 @@ mod tests {
         );
     }
 
-    /// Both usable: Cloud wins, and only one is built. They share
-    /// `Channel::name() == "whatsapp"`, so building both would put two channels
-    /// under one key in `channels_by_name` and let one shadow the other.
+    /// Both usable: Cloud wins, and only one is built, as it was before the two
+    /// transports got separate runtime names (D-5).
     #[test]
     fn cloud_wins_when_both_tables_are_usable_and_only_one_is_built() {
         let mut config = Config::default();
@@ -558,6 +556,66 @@ mod tests {
             !built.contains(&"whatsapp_web"),
             "only one WhatsApp transport may run: {built:?}"
         );
+    }
+
+    /// D-5. `ChannelsConfig::running_whatsapp_surface` answers, without a
+    /// channel runtime, which WhatsApp the factory builds, and the pairing-code
+    /// refusal on every mint surface relies on it. Held here to the factory's
+    /// own answer over every shape that decides it, including the two a
+    /// table-presence rule got wrong: a Cloud table that cannot run beside a
+    /// Web table (Web runs), and a Web table with no session (nothing runs).
+    #[test]
+    fn running_whatsapp_surface_names_the_transport_the_factory_builds() {
+        let cloud = |access_token: Option<&str>| crate::config::schema::WhatsAppConfig {
+            access_token: access_token.map(String::from),
+            phone_number_id: Some("p".into()),
+            verify_token: Some("v".into()),
+            app_secret: None,
+            allowed_numbers: vec![],
+        };
+        let web = |session_path: &str| crate::config::schema::WhatsAppWebConfig {
+            session_path: session_path.into(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        };
+        let cases = [
+            ("nothing", None, None),
+            ("a usable Cloud table", Some(cloud(Some("t"))), None),
+            (
+                "a usable Cloud table beside a Web table",
+                Some(cloud(Some("t"))),
+                Some(web("/nonexistent/rantaiclaw-wa.db")),
+            ),
+            (
+                "a Cloud table with no token beside a Web table",
+                Some(cloud(None)),
+                Some(web("/nonexistent/rantaiclaw-wa.db")),
+            ),
+            (
+                "a Web table alone",
+                None,
+                Some(web("/nonexistent/rantaiclaw-wa.db")),
+            ),
+            ("a Web table with no session", None, Some(web("   "))),
+        ];
+
+        for (shape, whatsapp, whatsapp_web) in cases {
+            let mut config = Config::default();
+            config.channels_config.whatsapp = whatsapp;
+            config.channels_config.whatsapp_web = whatsapp_web;
+            let built: Vec<&str> = build_configured_channels(&config)
+                .into_iter()
+                .map(|(key, _, _)| key)
+                .filter(|key| key.starts_with("whatsapp"))
+                .collect();
+            let answered: Vec<&str> = config
+                .channels_config
+                .running_whatsapp_surface()
+                .into_iter()
+                .collect();
+            assert_eq!(answered, built, "{shape}");
+        }
     }
 
     #[test]

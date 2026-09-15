@@ -23,7 +23,7 @@ pub enum AllowlistField {
     /// `allowed_users` — telegram/discord/slack/mattermost/matrix/irc/lark/
     /// dingtalk/qq/nextcloud_talk.
     AllowedUsers,
-    /// `allowed_numbers` — whatsapp (cloud + web).
+    /// `allowed_numbers` — whatsapp (Cloud API) and whatsapp_web (WhatsApp Web).
     AllowedNumbers,
     /// `allowed_from` — signal.
     AllowedFrom,
@@ -132,7 +132,7 @@ pub fn expected_field_for(channel: &str) -> Option<AllowlistField> {
         "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "irc" | "lark"
         | "dingtalk" | "qq" | "nextcloud_talk" => AllowlistField::AllowedUsers,
         "signal" => AllowlistField::AllowedFrom,
-        "whatsapp" => AllowlistField::AllowedNumbers,
+        "whatsapp" | "whatsapp_web" => AllowlistField::AllowedNumbers,
         "linq" => AllowlistField::AllowedSenders,
         "imessage" => AllowlistField::AllowedContacts,
         _ => return None,
@@ -178,16 +178,10 @@ pub fn apply_pairing(
         "qq" => cc.qq.as_mut().map(|c| &mut c.allowed_users),
         "nextcloud_talk" => cc.nextcloud_talk.as_mut().map(|c| &mut c.allowed_users),
         "signal" => cc.signal.as_mut().map(|c| &mut c.allowed_from),
-        // Both WhatsApp transports answer to `Channel::name() == "whatsapp"`,
-        // so a `/bind` from WhatsApp Web arrives under this arm and has to
-        // reach the Web table. Cloud first, matching the factory.
-        "whatsapp" => {
-            if cc.whatsapp.is_some() {
-                cc.whatsapp.as_mut().map(|c| &mut c.allowed_numbers)
-            } else {
-                cc.whatsapp_web.as_mut().map(|c| &mut c.allowed_numbers)
-            }
-        }
+        // Each WhatsApp transport pairs into its own table under its own
+        // runtime name (D-5), so neither falls through to the other.
+        "whatsapp" => cc.whatsapp.as_mut().map(|c| &mut c.allowed_numbers),
+        "whatsapp_web" => cc.whatsapp_web.as_mut().map(|c| &mut c.allowed_numbers),
         "linq" => cc.linq.as_mut().map(|c| &mut c.allowed_senders),
         "imessage" => cc.imessage.as_mut().map(|c| &mut c.allowed_contacts),
         _ => None,
@@ -417,6 +411,12 @@ mod tests {
         // somebody else's list.
         assert_eq!(expected_field_for("telgram"), None);
         assert_eq!(expected_field_for(""), None);
+
+        // WhatsApp Web shares the allowlist shape with Cloud.
+        assert_eq!(
+            expected_field_for("whatsapp_web"),
+            Some(AllowlistField::AllowedNumbers),
+        );
     }
 
     /// The wrong field for a channel used to be accepted silently — the

@@ -27,6 +27,7 @@
 //! next `/bind`/`/claim` message with no restart.
 
 use super::traits::{Tool, ToolResult};
+use crate::config::Config;
 use crate::security::{pairing_store, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
@@ -45,11 +46,14 @@ pub struct IssuePairingCodeTool {
     /// Gates the tool under ReadOnly/Strict: minting an owner-capable pairing
     /// code is an authority grant and must not run when the agent is read-only.
     security: Arc<SecurityPolicy>,
+    /// Which channels this host runs, so a code with no listener is refused
+    /// rather than minted. The same config the rest of the registry holds.
+    config: Arc<Config>,
 }
 
 impl IssuePairingCodeTool {
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+    pub fn new(security: Arc<SecurityPolicy>, config: Arc<Config>) -> Self {
+        Self { security, config }
     }
 }
 
@@ -81,7 +85,8 @@ impl Tool for IssuePairingCodeTool {
          Forward the returned code to the recipient: they DM the bot `/claim \
          <code>` to become an owner (if the code grants it) or `/bind <code>` to \
          become an allowed chat user. `channel` is the surface (e.g. telegram, \
-         whatsapp, discord, slack, or gateway). `ttl_minutes` sets the validity \
+         discord, slack, whatsapp_web for WhatsApp Web, whatsapp for the WhatsApp \
+         Cloud API, or gateway). `ttl_minutes` sets the validity \
          window (default 15). `max_uses` bounds claims (omit for unlimited within \
          the window). `owner` (default true) controls whether `/claim` may \
          promote the recipient to owner; set false for a chat-only invite."
@@ -93,7 +98,7 @@ impl Tool for IssuePairingCodeTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "The surface this code is scoped to (e.g. telegram, whatsapp, discord, slack, gateway). A code minted for one channel cannot be claimed on another."
+                    "description": "The surface this code is scoped to (e.g. telegram, discord, slack, whatsapp_web for WhatsApp Web, whatsapp for the WhatsApp Cloud API, gateway). A code minted for one channel cannot be claimed on another."
                 },
                 "ttl_minutes": {
                     "type": "integer",
@@ -130,8 +135,14 @@ impl Tool for IssuePairingCodeTool {
             .to_string();
         if channel.is_empty() {
             return Ok(err(
-                "missing `channel` (the surface to mint a code for, e.g. telegram, whatsapp, gateway)",
+                "missing `channel` (the surface to mint a code for, e.g. telegram, whatsapp_web, gateway)",
             ));
+        }
+        if let Some(refusal) = pairing_store::whatsapp_surface_refusal(
+            &channel,
+            self.config.channels_config.running_whatsapp_surface(),
+        ) {
+            return Ok(err(refusal));
         }
 
         let ttl_minutes = args
@@ -215,9 +226,12 @@ mod tests {
     #[tokio::test]
     async fn readonly_blocks_minting() {
         // can_act() fails first, before any pairing work — no HOME/env setup.
-        let tool = IssuePairingCodeTool::new(Arc::new(
-            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly),
-        ));
+        let tool = IssuePairingCodeTool::new(
+            Arc::new(
+                SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly),
+            ),
+            Arc::new(Config::default()),
+        );
         let res = tool
             .execute(json!({"channel": "telegram", "ttl_minutes": 5}))
             .await
@@ -233,7 +247,10 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
-        let tool = IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = IssuePairingCodeTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(Config::default()),
+        );
         let res = tool
             .execute(json!({"channel": "telegram", "ttl_minutes": 5}))
             .await
@@ -260,7 +277,10 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
-        let tool = IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = IssuePairingCodeTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(Config::default()),
+        );
         let res = tool
             .execute(json!({"channel": "whatsapp", "owner": false}))
             .await
@@ -284,11 +304,67 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
-        let tool = IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = IssuePairingCodeTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(Config::default()),
+        );
         let res = tool.execute(json!({"ttl_minutes": 10})).await.unwrap();
         assert!(!res.success);
         assert!(res.error.unwrap_or_default().contains("missing `channel`"));
 
         restore_home(prev_home);
+    }
+
+    /// D-5. On a host that runs WhatsApp Web, a `whatsapp` code has no
+    /// listener, so the tool refuses it rather than handing the owner a code
+    /// that never works. Where the Cloud API runs, it still mints.
+    #[tokio::test]
+    async fn a_whatsapp_code_is_refused_only_where_whatsapp_web_is_what_runs() {
+        let _g = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let mut web_only = Config::default();
+        web_only.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+            session_path: "/nonexistent/rantaiclaw-test/whatsapp.db".into(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        });
+        let mut with_cloud = web_only.clone();
+        with_cloud.channels_config.whatsapp = serde_json::from_value(json!({
+            "phone_number_id": "1", "access_token": "t", "verify_token": "v",
+            "allowed_numbers": []
+        }))
+        .expect("whatsapp");
+
+        let refused =
+            IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()), Arc::new(web_only))
+                .execute(json!({"channel": "whatsapp"}))
+                .await
+                .unwrap();
+        let minted =
+            IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()), Arc::new(with_cloud))
+                .execute(json!({"channel": "whatsapp"}))
+                .await
+                .unwrap();
+
+        restore_home(prev_home);
+
+        assert!(
+            !refused.success,
+            "a code no listener accepts must be refused: {}",
+            refused.output
+        );
+        assert!(
+            refused.error.unwrap_or_default().contains("whatsapp_web"),
+            "the refusal must name the surface that works"
+        );
+        assert!(
+            minted.success,
+            "a Cloud table is a listener for `whatsapp`: {:?}",
+            minted.error
+        );
     }
 }

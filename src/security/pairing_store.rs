@@ -262,9 +262,50 @@ pub fn contains(profile_root: &Path, surface: &str, code: &str, now: i64) -> Res
     }))
 }
 
+/// Why a pairing code must not be minted for `surface`, or `None` when it may.
+///
+/// D-5 gave WhatsApp Web its own runtime name, `whatsapp_web`, and a code is
+/// accepted only by the channel whose runtime name matches its surface. When
+/// the WhatsApp a host runs is WhatsApp Web, a `whatsapp` code has no listener,
+/// yet every mint surface used to hand one out as though it would work.
+///
+/// `running_whatsapp` is `ChannelsConfig::running_whatsapp_surface`, read
+/// wherever the caller can read it: the CLI and the chat tool from their
+/// `Config`, the TUI from the snapshot it refreshes on every config load. One
+/// rule and one input, so the three surfaces cannot disagree.
+///
+/// Operator guidance, not a security boundary: minting is already limited to
+/// the local operator and to owner turns, and a code with no listener grants
+/// nothing.
+pub fn whatsapp_surface_refusal(surface: &str, running_whatsapp: Option<&str>) -> Option<String> {
+    (surface == "whatsapp" && running_whatsapp == Some("whatsapp_web")).then(|| {
+        "no listener accepts a `whatsapp` code on this host: it runs WhatsApp Web, which answers \
+         pairing codes under `whatsapp_web`. Mint the code for `whatsapp_web` instead."
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-5. A `whatsapp` code is refused only where the WhatsApp that runs is
+    /// WhatsApp Web. Where the Cloud API runs, or no WhatsApp runs at all and so
+    /// there is no better surface to point at, the helper stays out of the way.
+    #[test]
+    fn a_whatsapp_code_is_refused_only_where_whatsapp_web_is_what_runs() {
+        let refusal = whatsapp_surface_refusal("whatsapp", Some("whatsapp_web")).expect("refused");
+        assert!(refusal.contains("whatsapp_web"), "{refusal}");
+
+        assert!(whatsapp_surface_refusal("whatsapp", Some("whatsapp")).is_none());
+        assert!(whatsapp_surface_refusal("whatsapp", None).is_none());
+        for surface in ["whatsapp_web", "telegram", "gateway"] {
+            assert!(
+                whatsapp_surface_refusal(surface, Some("whatsapp_web")).is_none(),
+                "{surface} must not be refused"
+            );
+        }
+    }
 
     #[test]
     fn generate_code_is_grouped_eight_chars() {
