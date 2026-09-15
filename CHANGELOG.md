@@ -84,6 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Set-aside WhatsApp Web session files keep names SQLite can reopen.** When the runtime moved an
+  unreferenced session into `workspace/.unlinked/`, each `-wal` and `-shm` companion got the base name
+  twice, `<unix>-whatsapp.db-whatsapp.db-wal`, so a session restored by moving the files back and
+  dropping the prefix would open without its WAL, which holds most of its recent state. A companion now
+  keeps the base name plus its own suffix, `<unix>-whatsapp.db-wal`. Files already set aside under the
+  old names are left as they are.
 - **A WhatsApp Web link from the console starts the channel.** After the phone linked, the gateway
   saved the session and the allowlist but never scheduled the daemon reload, so the console waited for
   a restart that did not come and WhatsApp Web stayed down until someone restarted the daemon. The
