@@ -3401,7 +3401,7 @@ mod tests {
         let _home = crate::test_env::HomeGuard::set(tmp.path());
         let state = console_state(running_lark_config(tmp.path()));
 
-        let response = connect_lark(
+        let response = Box::pin(connect_lark(
             State(state.clone()),
             HeaderMap::new(),
             Json(LarkConnectBody {
@@ -3412,7 +3412,7 @@ mod tests {
                 allowed_users: vec!["U_NEW".into()],
                 use_feishu: None,
             }),
-        )
+        ))
         .await
         .expect("an allowlist-only edit must succeed without a live probe");
 
@@ -3447,7 +3447,7 @@ mod tests {
         let _home = crate::test_env::HomeGuard::set(tmp.path());
         let state = console_state(running_lark_config(tmp.path()));
 
-        let refused = connect_lark(
+        let refused = Box::pin(connect_lark(
             State(state.clone()),
             HeaderMap::new(),
             Json(LarkConnectBody {
@@ -3458,7 +3458,7 @@ mod tests {
                 allowed_users: vec![],
                 use_feishu: None,
             }),
-        )
+        ))
         .await;
 
         let Err((status, Json(body))) = refused else {
@@ -3483,7 +3483,7 @@ mod tests {
         let _home = crate::test_env::HomeGuard::set(tmp.path());
         let state = console_state(running_lark_config(tmp.path()));
 
-        let response = disconnect_lark(State(state.clone()), HeaderMap::new())
+        let response = Box::pin(disconnect_lark(State(state.clone()), HeaderMap::new()))
             .await
             .expect("disconnect must succeed");
 
@@ -3506,7 +3506,7 @@ mod tests {
         config.workspace_dir = tmp.path().join("workspace");
         let state = console_state(config);
 
-        let response = disconnect_lark(State(state.clone()), HeaderMap::new())
+        let response = Box::pin(disconnect_lark(State(state.clone()), HeaderMap::new()))
             .await
             .expect("disconnect must succeed even when nothing was configured");
 
