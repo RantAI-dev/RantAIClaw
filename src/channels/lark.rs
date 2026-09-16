@@ -692,6 +692,27 @@ impl LarkChannel {
                             None => continue,
                         },
                         "image" => {
+                            // Gate before spending a network round trip and a
+                            // budget slot, unlike `text`/`post` which only
+                            // parse JSON: an unauthorized sender or an
+                            // unmentioned group member must not cost
+                            // anything, the same rule Discord's
+                            // `attachment_markers` follows. `text`/`post`
+                            // decode before this gate too, but that decode is
+                            // free and the pairing intercept below needs it
+                            // decoded first for self-onboarding; an image
+                            // never carries a pairing code, so it has no
+                            // reason to jump the gate.
+                            if !self.is_user_allowed(sender_open_id) {
+                                tracing::warn!("Lark WS: ignoring image from {sender_open_id} (not in allowed_users)");
+                                continue;
+                            }
+                            if lark_msg.chat_type == "group" {
+                                let me = self.bot_identity.read().await.clone();
+                                if !should_respond_in_group(&lark_msg.mentions, me.as_ref()) {
+                                    continue;
+                                }
+                            }
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
                                 Ok(v) => v,
                                 Err(_) => continue,
@@ -1341,38 +1362,84 @@ impl LarkChannel {
     async fn upload_lark_image(&self, bytes: Vec<u8>, file_name: &str) -> anyhow::Result<String> {
         // Sniffed from the bytes so the part's declared type matches what was
         // actually read, not what the marker's extension guesses.
-        let mime =
-            crate::channels::media::sniff_image_mime(&bytes).unwrap_or("application/octet-stream");
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(file_name.to_string())
-            .mime_str(mime)?;
-        let form = reqwest::multipart::Form::new()
-            .text("image_type", "message")
-            .part("image", part);
-        self.upload_and_extract_key(&self.upload_image_url(), form, "image_key")
-            .await
+        let mime = crate::channels::media::sniff_image_mime(&bytes)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let file_name = file_name.to_string();
+        self.upload_and_extract_key(
+            &self.upload_image_url(),
+            bytes,
+            move |b| {
+                let part = reqwest::multipart::Part::bytes(b)
+                    .file_name(file_name.clone())
+                    .mime_str(&mime)?;
+                Ok(reqwest::multipart::Form::new()
+                    .text("image_type", "message")
+                    .part("image", part))
+            },
+            "image_key",
+        )
+        .await
     }
 
     /// `POST im/v1/files`, returning the `file_key` to reference in a
     /// message. `"stream"` is Lark's generic binary bucket — the only one of
     /// its six `file_type` values that accepts arbitrary content.
     async fn upload_lark_file(&self, bytes: Vec<u8>, file_name: &str) -> anyhow::Result<String> {
-        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
-        let form = reqwest::multipart::Form::new()
-            .text("file_type", "stream")
-            .text("file_name", file_name.to_string())
-            .part("file", part);
-        self.upload_and_extract_key(&self.upload_file_url(), form, "file_key")
-            .await
+        let file_name = file_name.to_string();
+        self.upload_and_extract_key(
+            &self.upload_file_url(),
+            bytes,
+            move |b| {
+                let part = reqwest::multipart::Part::bytes(b).file_name(file_name.clone());
+                Ok(reqwest::multipart::Form::new()
+                    .text("file_type", "stream")
+                    .text("file_name", file_name.clone())
+                    .part("file", part))
+            },
+            "file_key",
+        )
+        .await
     }
 
+    /// Upload with the same token-expired-retry-once shape every other Lark
+    /// send has. `reqwest::multipart::Form` is not `Clone`, so the caller
+    /// hands over the raw bytes plus a builder rather than a built form, and
+    /// this rebuilds it for the retry attempt.
     async fn upload_and_extract_key(
         &self,
         url: &str,
-        form: reqwest::multipart::Form,
+        bytes: Vec<u8>,
+        build_form: impl Fn(Vec<u8>) -> anyhow::Result<reqwest::multipart::Form>,
         key_field: &str,
     ) -> anyhow::Result<String> {
         let token = self.get_tenant_access_token().await?;
+        let form = build_form(bytes.clone())?;
+        let (status, body) = self.upload_once(url, &token, form).await?;
+
+        if should_refresh_lark_tenant_token(status, &body) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let retry_form = build_form(bytes)?;
+            let (retry_status, retry_body) = self.upload_once(url, &new_token, retry_form).await?;
+            ensure_lark_send_success(
+                retry_status,
+                &retry_body,
+                "uploading an attachment after token refresh",
+            )?;
+            return extract_upload_key(&retry_body, key_field);
+        }
+
+        ensure_lark_send_success(status, &body, "uploading an attachment")?;
+        extract_upload_key(&body, key_field)
+    }
+
+    async fn upload_once(
+        &self,
+        url: &str,
+        token: &str,
+        form: reqwest::multipart::Form,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
         let resp = self
             .http_client()
             .post(url)
@@ -1382,14 +1449,11 @@ impl LarkChannel {
             .await?;
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        ensure_lark_send_success(status, &body, "uploading an attachment")?;
-        body.pointer(&format!("/data/{key_field}"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("Lark upload response carried no {key_field}"))
+        Ok((status, body))
     }
 
-    /// Send a message referencing an already-uploaded attachment key.
+    /// Send a message referencing an already-uploaded attachment key, with
+    /// the same token-expired-retry-once shape `send_text_message` has.
     async fn send_key_message(
         &self,
         recipient: &str,
@@ -1397,6 +1461,7 @@ impl LarkChannel {
         key: &str,
     ) -> anyhow::Result<()> {
         let (msg_type, content) = lark_key_message_body(kind, key);
+        let url = self.send_message_url();
 
         let token = self.get_tenant_access_token().await?;
         let body = serde_json::json!({
@@ -1404,11 +1469,31 @@ impl LarkChannel {
             "msg_type": msg_type,
             "content": content.to_string(),
         });
-        let (status, response) = self
-            .send_text_once(&self.send_message_url(), &token, &body)
-            .await?;
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.send_text_once(&url, &new_token, &body).await?;
+            return ensure_lark_send_success(
+                retry_status,
+                &retry_response,
+                "sending an attachment reference after token refresh",
+            );
+        }
+
         ensure_lark_send_success(status, &response, "sending an attachment reference")
     }
+}
+
+/// Pull the upload's returned key out of the response body. A free function
+/// so it is reachable from a test without a network call.
+fn extract_upload_key(body: &serde_json::Value, key_field: &str) -> anyhow::Result<String> {
+    body.pointer(&format!("/data/{key_field}"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Lark upload response carried no {key_field}"))
 }
 
 #[async_trait]
