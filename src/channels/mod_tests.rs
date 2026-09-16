@@ -1239,6 +1239,20 @@ impl Channel for TelegramRecordingChannel {
             .push(allowed.to_vec());
     }
 
+    // Exact-or-wildcard match against the most recently applied list — the
+    // same rule the real single-form channels (Lark, Discord, Slack) use —
+    // so a dispatch-level test can exercise a real revoke/re-add cycle
+    // without a live transport. Unrestricted until something is actually
+    // applied: unlike a real channel, this fake has no boot-time list to
+    // fall back on, and most tests using it never touch allowlists at all.
+    fn is_sender_still_allowed(&self, msg: &traits::ChannelMessage) -> bool {
+        self.applied_allowlists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .is_none_or(|list| list.iter().any(|u| u == "*" || u == &msg.sender))
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         self.sent_messages
             .lock()
@@ -2455,6 +2469,72 @@ async fn allowlist_edit_reaches_the_live_channel_without_restart() {
         applied.last().map(Vec::as_slice),
         Some(["user_a".to_string(), "user_b".to_string()].as_slice()),
         "the edited allowlist reached the live channel handle"
+    );
+}
+
+/// F-49, the revocation half: a message from a sender the listener already
+/// let through must still be dropped by dispatch if the sender was revoked
+/// before dispatch got to it — the exact race a queued message can hit.
+/// Reuses `TelegramRecordingChannel`'s own `is_sender_still_allowed` (an
+/// honest exact-match fake, the same rule Lark/Discord/Slack use for real),
+/// so this exercises dispatch's re-check itself, not the config-file plumbing
+/// `allowlist_edit_reaches_the_live_channel_without_restart` already covers.
+#[tokio::test]
+async fn a_revoked_sender_is_dropped_by_dispatch_after_the_refresh() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let config_path = temp.path().join("config.toml");
+
+    let write_config = |allowed: Vec<String>| {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("openrouter".to_string());
+        config.channels_config.telegram = Some(
+            serde_json::from_value(serde_json::json!({
+                "bot_token": "111:aaaaaaaaaaaaaaaaaaaaaaaaa",
+                "allowed_users": allowed,
+            }))
+            .expect("build TelegramConfig"),
+        );
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+    };
+
+    write_config(vec!["user_a".to_string()]);
+    let channel = Arc::new(TelegramRecordingChannel::default());
+    let ctx = Arc::new(allowlist_test_ctx(temp.path(), Arc::clone(&channel)));
+
+    let msg_from_a = || traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "msg-1".to_string(),
+        sender: "user_a".to_string(),
+        reply_target: "chat-1".to_string(),
+        content: "hello".to_string(),
+        channel: "telegram".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+    };
+
+    // Revoke, then deliver: the message must be dropped, nothing sent.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write_config(vec![]);
+    process_channel_message(Arc::clone(&ctx), msg_from_a(), CancellationToken::new()).await;
+    assert!(
+        channel.sent_messages.lock().await.is_empty(),
+        "a revoked sender's queued message must not be sent"
+    );
+
+    // Re-add, then deliver again — no other message in between: it must go
+    // through, since the SAME dispatch call refreshes and re-checks.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write_config(vec!["user_a".to_string()]);
+    process_channel_message(Arc::clone(&ctx), msg_from_a(), CancellationToken::new()).await;
+    assert_eq!(
+        channel.sent_messages.lock().await.len(),
+        1,
+        "a re-added sender's very next message must be answered, with no restart"
     );
 }
 

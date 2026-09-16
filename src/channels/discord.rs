@@ -434,6 +434,10 @@ impl Channel for DiscordChannel {
         }
     }
 
+    fn is_sender_still_allowed(&self, msg: &ChannelMessage) -> bool {
+        self.is_user_allowed(&msg.sender)
+    }
+
     fn render_target(&self) -> crate::channels::format::RenderTarget {
         // Discord renders CommonMark markup but NOT tables, so `tables_native:
         // false` turns tables into an aligned ASCII grid in a ``` fence (which
@@ -1744,6 +1748,26 @@ mod tests {
         // Dedupes.
         ch.add_allowed_identity_runtime("999");
         assert_eq!(ch.allowed_users.read().unwrap().len(), 1);
+    }
+
+    /// F-49's dispatch-side re-check: a revoked sender fails it immediately
+    /// after the config write, a re-added one passes it, with no restart and
+    /// no other message in between.
+    #[test]
+    fn is_sender_still_allowed_reflects_the_live_allowlist() {
+        let ch = DiscordChannel::new("fake".into(), None, vec!["999".into()], false, false);
+        let msg = ChannelMessage {
+            sender: "999".to_string(),
+            channel: "discord".to_string(),
+            ..ChannelMessage::default()
+        };
+        assert!(ch.is_sender_still_allowed(&msg));
+
+        ch.apply_allowed_senders(&[]);
+        assert!(!ch.is_sender_still_allowed(&msg));
+
+        ch.apply_allowed_senders(&["999".to_string()]);
+        assert!(ch.is_sender_still_allowed(&msg));
     }
 
     /// A store-minted "discord" code (the kind `rantaiclaw channels pair` issues)

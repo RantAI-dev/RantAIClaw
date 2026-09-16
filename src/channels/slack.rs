@@ -687,6 +687,10 @@ impl Channel for SlackChannel {
         }
     }
 
+    fn is_sender_still_allowed(&self, msg: &ChannelMessage) -> bool {
+        self.is_user_allowed(&msg.sender)
+    }
+
     fn render_target(&self) -> crate::channels::format::RenderTarget {
         // Slack renders its own mrkdwn (`*bold*`, `_italic_`, `<url|text>`), not
         // CommonMark, so the agent's `**bold**`/`[](url)`/tables leak today.
@@ -1931,6 +1935,26 @@ mod tests {
         // Dedupes.
         ch.add_allowed_identity_runtime("U999");
         assert_eq!(ch.allowed_users.read().unwrap().len(), 1);
+    }
+
+    /// F-49's dispatch-side re-check: a revoked sender fails it immediately
+    /// after the config write, a re-added one passes it, with no restart and
+    /// no other message in between.
+    #[test]
+    fn is_sender_still_allowed_reflects_the_live_allowlist() {
+        let ch = SlackChannel::new("fake".into(), Some("C1".into()), vec!["U999".into()]);
+        let msg = ChannelMessage {
+            sender: "U999".to_string(),
+            channel: "slack".to_string(),
+            ..ChannelMessage::default()
+        };
+        assert!(ch.is_sender_still_allowed(&msg));
+
+        ch.apply_allowed_senders(&[]);
+        assert!(!ch.is_sender_still_allowed(&msg));
+
+        ch.apply_allowed_senders(&["U999".to_string()]);
+        assert!(ch.is_sender_still_allowed(&msg));
     }
 
     /// A store-minted "slack" code (the kind `rantaiclaw channels pair` issues)
