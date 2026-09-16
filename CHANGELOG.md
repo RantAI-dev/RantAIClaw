@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lark answers the runtime commands, and shuts down cleanly.** `/model`, `/models`, `/new` and
+  `/clear` never worked on Lark, because `commands.rs` never named it; an unknown command reached
+  the model instead of getting the same runtime reply other tier channels give. Lark now joins
+  `supports_runtime_model_switch`, and `/new`/`/clear` add a chat-menu hint worded for Lark on the
+  same pattern Telegram and WhatsApp use. Lark's WebSocket long-connection already tore itself down
+  deliberately on shutdown (a `biased` cancellation arm sending a proper close frame), so no `close()`
+  override was needed — that hook exists only for a channel that sends through the same connection it
+  listens on, which Lark does not. Lark's Open Platform API has no bot-drivable typing indicator, so
+  `start_typing`/`stop_typing` stay at the trait default rather than faking one; see
+  `docs/reference/channels.md` §4.11.
 - **Lark joined the default build, and `channel doctor` now probes it.** Lark was fully
   implemented but shipped behind a non-default `channel-lark` Cargo feature, so a stock install
   with a filled `[channels_config.lark]` silently ignored it: the channel never started, and the

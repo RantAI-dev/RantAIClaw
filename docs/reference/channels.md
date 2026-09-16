@@ -1045,6 +1045,30 @@ Runtime token behavior:
 - send requests automatically retry once after token invalidation when Feishu/Lark returns either HTTP `401` or business error code `99991663` (`Invalid access token`).
 - if the retry still returns token-invalid responses, the send call fails with the upstream status/body for easier troubleshooting.
 
+Runtime commands and shutdown (plan 378):
+
+- **`/model`, `/models`, `/new` and `/clear` all work on Lark.** Lark has no platform-level
+  slash-command interception (unlike Slack), so the default `/` prefix reaches the bot unchanged —
+  confirmed by reading `listen_ws`'s message decode, which treats every inbound message as opaque
+  text (`src/channels/lark.rs`, the `"text"`/`"post"` match arms). `/new` and `/clear` add a
+  chat-menu hint worded for Lark, on the same "still shows the earlier messages" pattern as
+  Telegram and WhatsApp — not yet confirmed against a live tenant (see the drive note below).
+- **No typing indicator.** Lark's Open Platform bot API has no publicly documented endpoint for a
+  "typing" or "composing" status a bot can drive (nothing resembling Telegram's `sendChatAction` or
+  a first-party equivalent of Slack's message-based placeholder). `start_typing`/`stop_typing` are
+  left at the trait's no-op default rather than faking an indicator. Revisit if Lark's Open Platform
+  ships one.
+- **`close()` is intentionally the trait's no-op default, not an oversight.** Lark sends over a
+  plain HTTP call (`send_message_url`) and only *receives* over the WebSocket long-connection, so
+  nothing is "kept open for sending" the way WhatsApp Web's connection is — `close()` exists for
+  that one case (see the trait's own doc comment). `listen_ws`'s own event loop already tears the
+  WebSocket down deliberately: its `cancel.cancelled()` arm is `biased` (checked first) and sends a
+  proper WS close frame before the task ends, matching the shutdown contract every non-WhatsApp-Web
+  channel follows.
+- **Not verified against a live Lark tenant**: the exact chat-menu wording for clearing history, and
+  a daemon restart mid-answer draining and closing the connection with the same restart notice the
+  other channels send.
+
 ### 4.12 DingTalk
 
 ```toml
