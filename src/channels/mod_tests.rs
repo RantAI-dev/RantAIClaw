@@ -3996,6 +3996,23 @@ fn feature_gated_channels_follow_the_build() {
     );
 }
 
+/// A filled `[channels_config.lark]` used to be silently ignored in the
+/// default build: `channel_is_configured` answered no because the feature
+/// that compiles `LarkChannel` was not on by default, so the daemon never
+/// started it and the catalog row read "not configured" with no explanation.
+/// Lark joined `default` in `Cargo.toml`, so this must hold unconditionally
+/// now — unlike `feature_gated_channels_follow_the_build` above, this does
+/// not compare against `cfg!(feature = "channel-lark")`, it asserts the
+/// feature is simply on.
+#[test]
+fn lark_is_configured_in_the_default_build() {
+    let config = config_with_every_channel();
+    assert!(
+        channel_is_configured("lark", &config),
+        "a filled lark table must be configured in the default build"
+    );
+}
+
 /// The "keep in sync" comment on `channel_supports_announce_delivery` asks
 /// for an invariant nothing enforced. The factory can build fifteen channels;
 /// cron delivers to four. That gap is deliberate — widening delivery is a

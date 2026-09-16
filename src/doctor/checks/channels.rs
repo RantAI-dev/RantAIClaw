@@ -14,6 +14,12 @@
 //!   under the configured token.
 //! * **WhatsApp Web** — non-network: confirm `session_path` exists and is
 //!   non-empty. Without that file the daemon has to re-pair on next run.
+//! * **Lark/Feishu** — `POST <region>/open-apis/auth/v3/tenant_access_token/internal`
+//!   with `app_id`/`app_secret`, reusing the setup wizard's own probe
+//!   (`onboard/provision/channels/lark.rs`). A `code: 0` body with a
+//!   `tenant_access_token` confirms the app credentials; a non-zero `code` is
+//!   the platform rejecting them, and anything else (a timeout, a 5xx, an
+//!   unparseable body) is inconclusive rather than a hard failure.
 //!
 //! All probes are wrapped in a 5s timeout per channel — the doctor command
 //! prioritises completing quickly over thoroughness.
@@ -36,7 +42,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// "no channels configured". `probed_keys_cover_the_supported_tier` pins that
 /// this list keeps up with promotions — a channel promoted to `Supported`
 /// without a probe would claim the tier with no ongoing evidence behind it.
-const PROBED_KEYS: [&str; 5] = ["telegram", "discord", "slack", "whatsapp", "whatsapp_web"];
+const PROBED_KEYS: [&str; 6] = [
+    "telegram",
+    "discord",
+    "slack",
+    "whatsapp",
+    "whatsapp_web",
+    "lark",
+];
 
 /// Configured channels this check does not probe, with their tier.
 ///
@@ -185,6 +198,19 @@ pub fn inspect_channels(config: &crate::config::Config) -> ChannelSummary {
     }
     check_token!("whatsapp_web", cc.whatsapp_web, session_path);
 
+    // Two required fields, so `check_token!`'s single-field shape does not
+    // fit — same reason `whatsapp` above is a manual block instead of the
+    // macro. Lark is now in `PROBED_KEYS`, so leaving it out here would make
+    // a lark-only offline config report "no channels configured" instead of
+    // the "not probed" footnote it used to get.
+    if let Some(c) = cc.lark.as_ref() {
+        if c.app_id.trim().is_empty() || c.app_secret.trim().is_empty() {
+            missing.push("lark");
+        } else {
+            configured.push("lark");
+        }
+    }
+
     let n_total = configured.len() + missing.len();
     if n_total == 0 {
         return ChannelSummary {
@@ -293,6 +319,20 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
                     );
                 }
                 ProbeWebResult::SessionPathBad(e) => bad.push(format!("whatsapp web session: {e}")),
+            }
+        }
+    }
+
+    if let Some(c) = cc.lark.as_ref() {
+        match probe_lark(&c.app_id, &c.app_secret, c.use_feishu).await {
+            crate::onboard::provision::validate::verdict::ProbeVerdict::Accepted => {
+                ok.push("lark".to_string());
+            }
+            crate::onboard::provision::validate::verdict::ProbeVerdict::Rejected(reason) => {
+                bad.push(format!("lark: {reason}"));
+            }
+            crate::onboard::provision::validate::verdict::ProbeVerdict::Inconclusive(reason) => {
+                warn.push(format!("lark: {reason}"));
             }
         }
     }
@@ -420,6 +460,36 @@ async fn probe_whatsapp_cloud(
         return Err(format!("HTTP {}", resp.status()));
     }
     Ok(())
+}
+
+/// Validate a Lark/Feishu app credential the same way the setup wizard does,
+/// by reusing its tenant-access-token probe rather than a second copy of the
+/// HTTP call.
+///
+/// Empty credentials short-circuit to `Rejected` before any request is sent —
+/// there is nothing to probe, and a `probe_post` over an empty body only
+/// tells us the platform rejects blanks, which we already know.
+async fn probe_lark(
+    app_id: &str,
+    app_secret: &str,
+    use_feishu: bool,
+) -> crate::onboard::provision::validate::verdict::ProbeVerdict {
+    use crate::onboard::provision::channels::lark::{classify_tenant_token_body, tenant_token_url};
+    use crate::onboard::provision::validate::http::probe_post;
+    use crate::onboard::provision::validate::verdict::ProbeVerdict;
+
+    if app_id.trim().is_empty() || app_secret.trim().is_empty() {
+        return ProbeVerdict::Rejected("app_id/app_secret is empty".into());
+    }
+    let url = tenant_token_url(use_feishu);
+    let body = serde_json::json!({
+        "app_id": app_id.trim(),
+        "app_secret": app_secret.trim(),
+    });
+    match probe_post(url, &[], &serde_json::to_string(&body).unwrap_or_default()).await {
+        Ok(r) => classify_tenant_token_body(&r.body),
+        Err(e) => ProbeVerdict::Inconclusive(format!("{e}")),
+    }
 }
 
 enum ProbeWebResult {
@@ -580,6 +650,41 @@ mod tests {
         assert!(s.message.contains("telegram"));
     }
 
+    fn lark_cfg(app_id: &str, app_secret: &str) -> crate::config::schema::LarkConfig {
+        crate::config::schema::LarkConfig {
+            app_id: app_id.into(),
+            app_secret: app_secret.into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+        }
+    }
+
+    /// Lark joined `PROBED_KEYS` in the same PR that added it here — without
+    /// this branch, a lark-only offline config would have gone from "not
+    /// probed: lark" (informative) to "no channels configured" (wrong),
+    /// because `unprobed_note` stops naming a key once it is in
+    /// `PROBED_KEYS`, and nothing else here would have counted it.
+    #[test]
+    fn lark_with_credentials_counts_as_configured_offline() {
+        let mut cfg = Config::default();
+        cfg.channels_config.lark = Some(lark_cfg("app-1", "secret-1"));
+        let s = inspect_channels(&cfg);
+        assert_eq!(s.severity, Severity::Ok);
+        assert!(s.message.contains("lark"), "{}", s.message);
+    }
+
+    #[test]
+    fn lark_missing_app_secret_returns_fail_offline() {
+        let mut cfg = Config::default();
+        cfg.channels_config.lark = Some(lark_cfg("app-1", ""));
+        let s = inspect_channels(&cfg);
+        assert_eq!(s.severity, Severity::Fail);
+    }
+
     /// A session path used to satisfy the *Cloud* table's credential report,
     /// because both transports shared one table and either key counted. Since
     /// v32 it satisfies its own table and nothing else.
@@ -700,5 +805,35 @@ mod tests {
         // Smoke test that the helper compiles + runs; the network round-
         // trip belongs in an integration test that controls DNS.
         telegram_probe_ok().await;
+    }
+
+    /// `probe_lark` must not hit the network for a table so incomplete the
+    /// answer is already known — a real Lark/Feishu tenant is not reachable
+    /// from a CI runner, so the assertion is really "returns fast", but a
+    /// version of this that forgot the short-circuit would hang on the
+    /// `probe_post` timeout instead of the near-instant path this asserts.
+    #[tokio::test]
+    async fn lark_probe_rejects_empty_credentials_without_a_network_call() {
+        let verdict = tokio::time::timeout(Duration::from_millis(200), probe_lark("", "", false))
+            .await
+            .expect("must return before the probe's own 8s HTTP timeout");
+        assert!(
+            matches!(
+                verdict,
+                crate::onboard::provision::validate::verdict::ProbeVerdict::Rejected(_)
+            ),
+            "empty app_id/app_secret is not a credential to probe, got {verdict:?}"
+        );
+    }
+
+    /// Pins `PROBED_KEYS` against the drift plan 377 fixed: a filled
+    /// `[channels_config.lark]` used to report as "not probed" forever,
+    /// because nothing added its key here.
+    #[test]
+    fn probed_keys_includes_lark() {
+        assert!(
+            PROBED_KEYS.contains(&"lark"),
+            "lark must be probed now that it can run in the default build"
+        );
     }
 }
