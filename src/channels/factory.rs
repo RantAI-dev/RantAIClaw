@@ -342,7 +342,9 @@ pub(crate) fn build_configured_channels(
         channels.push((
             "lark",
             "Lark",
-            Arc::new(super::LarkChannel::from_config(lk)),
+            Arc::new(
+                super::LarkChannel::from_config(lk).with_multimodal(config.multimodal.clone()),
+            ),
         ));
     }
 
