@@ -268,7 +268,7 @@ rppal = { version = "0.22", optional = true }
 libc = "0.2"
 
 [features]
-default = ["tui", "whatsapp-web", "remote-install", "kb"]
+default = ["tui", "whatsapp-web", "remote-install", "kb", "channel-lark"]
 # Re-enables the pre-rig hand-rolled provider implementations for
 # Anthropic/OpenAI/Gemini. Default off — those providers route
 # through `RigProvider` (src/providers/rig_native.rs). Build with

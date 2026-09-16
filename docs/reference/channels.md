@@ -520,18 +520,23 @@ Operational notes:
 
 ## Channel Matrix
 
-### Build Feature Toggles (`channel-matrix`, `channel-lark`)
+### Build Feature Toggles (`channel-matrix`)
 
-Matrix and Lark support are controlled at compile time.
+Matrix support is controlled at compile time. Lark joined the default build
+(`plans/377`); `channel-lark` remains a feature flag only so a minimal build
+can opt back out of it, the same way `channel-matrix` opts in.
 
-- Default builds do **not** include Matrix or Lark. They do include WhatsApp Web:
-  `default = ["tui", "whatsapp-web", "remote-install", "kb"]` (`Cargo.toml:268`).
-  WhatsApp Web mode therefore ships **enabled** — read the
+- Default builds do **not** include Matrix. They do include WhatsApp Web and,
+  as of this build, Lark:
+  `default = ["tui", "whatsapp-web", "remote-install", "kb", "channel-lark"]`
+  (`Cargo.toml:271`). WhatsApp Web mode therefore ships **enabled** — read the
   [security warning](#47-whatsapp) before configuring it.
-- **No release binary carries Matrix or Lark.** `pub-release.yml` builds with default
+- **No release binary carries Matrix.** `pub-release.yml` builds with default
   features only, so an operator who installs a release and configures
-  `[channels_config.matrix]` gets a channel that reports as not configured. Running
-  either one means building from source.
+  `[channels_config.matrix]` gets a channel that reports as not configured.
+  Lark does not have this gap any more: a release binary's default features
+  include `channel-lark`, so `[channels_config.lark]` runs out of the box.
+  Running Matrix means building from source.
 - Typical local check with only hardware support:
 
 ```bash
@@ -554,13 +559,14 @@ rustup toolchain install 1.93.0
 cargo +1.93.0 build --release --features channel-matrix
 ```
 
-- Enable Lark explicitly when needed:
+- Lark ships in the default build, no extra flag needed. To build **without**
+  it (a smaller binary that cannot run Lark at all):
 
 ```bash
-cargo check --features hardware,channel-lark
+cargo check --no-default-features --features tui,whatsapp-web,remote-install,kb,hardware
 ```
 
-If `[channels_config.matrix]` or `[channels_config.lark]` is present but the corresponding feature is not compiled in, `rantaiclaw channel list`, `rantaiclaw channel doctor`, and `rantaiclaw channel start` will report that the channel is intentionally skipped for this build.
+If `[channels_config.matrix]` is present but the feature is not compiled in — or `[channels_config.lark]` on a build that deliberately dropped `channel-lark` — `rantaiclaw channel list`, `rantaiclaw channel doctor`, and `rantaiclaw channel start` will report that the channel is intentionally skipped for this build.
 
 ---
 

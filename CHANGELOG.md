@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lark joined the default build, and `channel doctor` now probes it.** Lark was fully
+  implemented but shipped behind a non-default `channel-lark` Cargo feature, so a stock install
+  with a filled `[channels_config.lark]` silently ignored it: the channel never started, and the
+  catalog row read "not configured" with no explanation. `channel-lark` is now part of `default`.
+  The only real cost is compiling `lark.rs` itself, because `prost` was already pulled in by
+  `whatsapp-web`; the default binary grew 0.66% (32,152,976 to 32,366,160 bytes). `rantaiclaw
+  channel doctor` also gained a Lark probe that reuses the setup wizard's tenant access token
+  check, so a bad app secret is reported instead of a silent "not probed" gap.
 - **Discord and Slack can be connected, edited and disconnected from the console.** Until now the
   gateway could set up exactly one channel, Telegram, and the other two driven channels could only be
   configured by hand in `config.toml`. `POST` and `DELETE /api/v1/channels/discord` and

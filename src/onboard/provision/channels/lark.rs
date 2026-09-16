@@ -164,19 +164,8 @@ impl TuiProvisioner for LarkProvisioner {
             &serde_json::to_string(&body).unwrap_or_default(),
         )
         .await;
-        // Lark answers 200 with a non-zero `code` when it rejects the app
-        // credentials, so the status alone proves nothing. A non-zero `code`
-        // is the platform saying no; anything else unrecognised is not.
         let verdict = match &probe {
-            Ok(r)
-                if r.body.contains("\"code\":0") || r.body.contains("\"tenant_access_token\"") =>
-            {
-                verdict::ProbeVerdict::Accepted
-            }
-            Ok(r) if r.body.contains("\"code\":") => {
-                verdict::ProbeVerdict::Rejected("the app credentials were refused".into())
-            }
-            Ok(_) => verdict::ProbeVerdict::Inconclusive("unrecognised response".into()),
+            Ok(r) => classify_tenant_token_body(&r.body),
             Err(e) => verdict::ProbeVerdict::Inconclusive(format!("{e}")),
         };
         if !verdict::resolve(&events, &mut responses, verdict, "app credentials")
@@ -307,11 +296,34 @@ impl TuiProvisioner for LarkProvisioner {
 ///
 /// Feishu and Lark are separate deployments; a credential issued by one is not
 /// valid on the other, so probing the wrong one can only ever fail.
-fn tenant_token_url(use_feishu: bool) -> &'static str {
+///
+/// `pub(crate)` so `doctor/checks/channels.rs` can send its own probe at the
+/// same URL rather than hardcoding a second copy of the two hosts.
+pub(crate) fn tenant_token_url(use_feishu: bool) -> &'static str {
     if use_feishu {
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
     } else {
         "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
+    }
+}
+
+/// Classifies the body of a Lark/Feishu tenant-access-token response.
+///
+/// Lark answers 200 even when it rejects the app credentials, carrying a
+/// non-zero `code` instead — so the HTTP status alone proves nothing. A
+/// non-zero `code` is the platform saying no; anything else unrecognised is
+/// not evidence either way.
+///
+/// `pub(crate)` and shared with `doctor/checks/channels.rs`'s `lark` probe, so
+/// the provisioner's live validation and the doctor's read-only check cannot
+/// silently disagree on what counts as a rejection.
+pub(crate) fn classify_tenant_token_body(body: &str) -> verdict::ProbeVerdict {
+    if body.contains("\"code\":0") || body.contains("\"tenant_access_token\"") {
+        verdict::ProbeVerdict::Accepted
+    } else if body.contains("\"code\":") {
+        verdict::ProbeVerdict::Rejected("the app credentials were refused".into())
+    } else {
+        verdict::ProbeVerdict::Inconclusive("unrecognised response".into())
     }
 }
 
@@ -337,6 +349,36 @@ mod tests {
             feishu.host_str(),
             intl.host_str(),
             "the two regions must not collapse onto one host"
+        );
+    }
+
+    /// Deliberately a pure check against synthetic response bodies, not a
+    /// live probe: neither Lark nor Feishu is reachable from a CI runner, and
+    /// the doctor's `lark` probe (`doctor/checks/channels.rs`) relies on this
+    /// same function to tell a rejected credential from an unreachable one.
+    #[test]
+    fn classify_tenant_token_body_accepts_a_successful_response() {
+        let verdict = classify_tenant_token_body(
+            r#"{"code":0,"msg":"ok","tenant_access_token":"t-x","expire":7200}"#,
+        );
+        assert_eq!(verdict, verdict::ProbeVerdict::Accepted);
+    }
+
+    #[test]
+    fn classify_tenant_token_body_rejects_a_nonzero_code() {
+        let verdict = classify_tenant_token_body(r#"{"code":10003,"msg":"invalid app_secret"}"#);
+        assert!(
+            matches!(verdict, verdict::ProbeVerdict::Rejected(_)),
+            "a non-zero code is the platform refusing the credential, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn classify_tenant_token_body_is_inconclusive_on_an_unrecognised_body() {
+        let verdict = classify_tenant_token_body("<html>502 Bad Gateway</html>");
+        assert!(
+            matches!(verdict, verdict::ProbeVerdict::Inconclusive(_)),
+            "a body with no `code` key is not evidence about the credential, got {verdict:?}"
         );
     }
 }
