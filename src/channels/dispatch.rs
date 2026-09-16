@@ -481,6 +481,23 @@ pub(crate) async fn process_channel_message(
     if let Err(err) = routing::maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
+    // Re-check the sender against the allowlist this refresh just applied.
+    // `msg` already passed the listener's own gate, but only against whatever
+    // list was live at the moment it was received — a revocation that landed
+    // while this message sat queued would otherwise still be processed in
+    // full (F-49). Pairing (`/bind`, `/claim`) never reaches here: every
+    // listener intercepts and fully handles those before a `ChannelMessage`
+    // is ever sent, so there is nothing to exempt.
+    if let Some(channel) = target_channel.as_ref() {
+        if !channel.is_sender_still_allowed(&msg) {
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                "sender no longer allowed after config refresh; dropping message"
+            );
+            return TurnEnd::NotStarted;
+        }
+    }
     if commands::handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await
     {
         return TurnEnd::Finished;

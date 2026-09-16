@@ -165,6 +165,30 @@ pub trait Channel: Send + Sync {
     /// that hold it behind a lock override this — see `TelegramChannel`.
     fn apply_allowed_senders(&self, _allowed: &[String]) {}
 
+    /// Whether `msg`'s sender is still allowed on this channel, checked against
+    /// whatever allowlist is live **right now**.
+    ///
+    /// Closes the gap `apply_allowed_senders` cannot: a listener's own gate runs
+    /// once, when the message is first received, against the allowlist at that
+    /// instant. A message that passed can still sit queued for dispatch after a
+    /// later edit revokes its sender, and dispatch used to process it anyway
+    /// (F-49). Call this again right after refreshing the runtime config, and
+    /// drop the message if it now returns `false`.
+    ///
+    /// Implementations reuse their own existing identity matching (the exact
+    /// check their `listen` gate already runs) rather than a second copy of it,
+    /// so the two can never disagree. A channel whose sender can take more than
+    /// one form (Telegram: username or numeric id) must check every form
+    /// [`ChannelMessage`] carries — `sender` and `sender_aliases` — the same way
+    /// its own gate does, or this would reject a sender the gate just accepted.
+    ///
+    /// Defaults to `true`: a channel that keeps `apply_allowed_senders`'s no-op
+    /// default never refreshes its allowlist from config, so there is no
+    /// refresh-then-stale-message window for this to close.
+    fn is_sender_still_allowed(&self, _msg: &ChannelMessage) -> bool {
+        true
+    }
+
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 

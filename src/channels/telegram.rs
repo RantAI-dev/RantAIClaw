@@ -1947,6 +1947,19 @@ impl Channel for TelegramChannel {
         }
     }
 
+    /// The gate itself checks both the numeric id and the username
+    /// (`is_any_user_allowed`, since a `@username` can be released and
+    /// re-registered — see `sender_identity`'s comment); this must check the
+    /// same two forms or it would reject a sender the gate just accepted
+    /// whenever the operator listed the *other* form. `sender_aliases` carries
+    /// exactly that other form for this reason.
+    fn is_sender_still_allowed(&self, msg: &ChannelMessage) -> bool {
+        self.is_any_user_allowed(
+            std::iter::once(msg.sender.as_str())
+                .chain(msg.sender_aliases.iter().map(String::as_str)),
+        )
+    }
+
     fn supports_draft_updates(&self) -> bool {
         self.stream_mode != StreamMode::Off
     }
@@ -2947,6 +2960,50 @@ mod tests {
             ctor_list, runtime_list,
             "runtime-applied allowlist must normalize identically to the constructor's"
         );
+    }
+
+    /// F-49's dispatch-side re-check must accept exactly what the listener's
+    /// own gate accepts. The listener checks `[username, numeric_id]`
+    /// (`is_any_user_allowed`) but reports `sender` as the numeric id when one
+    /// is present — an allowlist entry that names only the username would make
+    /// a naive re-check on `sender` alone reject a sender the gate just let
+    /// through. `sender_aliases` carries the username for exactly this reason.
+    #[test]
+    fn is_sender_still_allowed_accepts_either_identity_form() {
+        use crate::channels::traits::{Channel, ChannelMessage};
+
+        let ch = TelegramChannel::new("t".into(), vec!["alice".into()], false);
+        let msg = ChannelMessage {
+            sender: "123456789".to_string(),
+            sender_aliases: vec!["alice".to_string()],
+            channel: "telegram".to_string(),
+            ..ChannelMessage::default()
+        };
+        assert!(
+            ch.is_sender_still_allowed(&msg),
+            "allowlisted by username, reported by numeric id: the re-check must \
+             still accept it via sender_aliases"
+        );
+
+        ch.apply_allowed_senders(&[]);
+        assert!(
+            !ch.is_sender_still_allowed(&msg),
+            "a revoked sender must fail the re-check under either identity form"
+        );
+    }
+
+    #[test]
+    fn is_sender_still_allowed_rejects_when_neither_form_matches() {
+        use crate::channels::traits::{Channel, ChannelMessage};
+
+        let ch = TelegramChannel::new("t".into(), vec!["someone_else".into()], false);
+        let msg = ChannelMessage {
+            sender: "123456789".to_string(),
+            sender_aliases: vec!["alice".to_string()],
+            channel: "telegram".to_string(),
+            ..ChannelMessage::default()
+        };
+        assert!(!ch.is_sender_still_allowed(&msg));
     }
 
     #[test]

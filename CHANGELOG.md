@@ -122,6 +122,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A revoked sender's next message is dropped, not answered.** Every live-allowlist channel
+  (Telegram, Discord, Slack, WhatsApp Web, Lark) refreshed its allowlist only when dispatch dequeued
+  a message, and never re-checked the sender against the fresh list afterward. A sender removed from
+  the console reached the model and its tools one more time, because the listener had already admitted
+  their message under the old list before the refresh ran. Dispatch now re-checks the sender through
+  each channel's own matching rule (Telegram's numeric-id/username pair included) right after the
+  refresh, and drops the message with one INFO line if it no longer passes — before any command,
+  model call or tool. Pairing (`/bind`, `/claim`) is unaffected: every listener already handles those
+  before a message ever reaches dispatch. Re-adding a sender still only takes effect once some
+  message reaches dispatch on any channel; making that apply on the config write itself, independent
+  of traffic, ran into an unresolved watcher-integration issue and is not part of this fix.
 - **Set-aside WhatsApp Web session files keep names SQLite can reopen.** When the runtime moved an
   unreferenced session into `workspace/.unlinked/`, each `-wal` and `-shm` companion got the base name
   twice, `<unix>-whatsapp.db-whatsapp.db-wal`, so a session restored by moving the files back and

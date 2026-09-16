@@ -1555,6 +1555,10 @@ impl Channel for LarkChannel {
         }
     }
 
+    fn is_sender_still_allowed(&self, msg: &ChannelMessage) -> bool {
+        self.is_user_allowed(&msg.sender)
+    }
+
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
@@ -1990,7 +1994,16 @@ fn should_respond_in_group(mentions: &[serde_json::Value], identity: Option<&Bot
 #[cfg(test)]
 mod allowlist_runtime_tests {
     use super::LarkChannel;
-    use crate::channels::traits::Channel;
+    use crate::channels::traits::{Channel, ChannelMessage};
+    use std::sync::Arc;
+
+    fn msg_from(sender: &str) -> ChannelMessage {
+        ChannelMessage {
+            sender: sender.to_string(),
+            channel: "lark".to_string(),
+            ..ChannelMessage::default()
+        }
+    }
 
     fn ch(users: Vec<&str>) -> LarkChannel {
         LarkChannel::new(
@@ -2039,6 +2052,36 @@ mod allowlist_runtime_tests {
             !c.is_user_allowed("ou_old"),
             "a removal must take effect too, or revoking access needs a restart"
         );
+    }
+
+    /// F-49's dispatch-side re-check, exercised through `Arc<dyn Channel>` (not
+    /// the inherent method) so a mismatch between the trait dispatch and
+    /// `is_user_allowed` would actually surface. A revoked sender is rejected
+    /// the moment the allowlist changes, with no restart and no other message
+    /// in between — the re-add case too, since that is the other half of F-49.
+    #[test]
+    fn is_sender_still_allowed_reflects_the_live_allowlist() {
+        let c: Arc<dyn Channel> = Arc::new(ch(vec!["ou_a"]));
+        assert!(c.is_sender_still_allowed(&msg_from("ou_a")));
+
+        c.apply_allowed_senders(&[]);
+        assert!(
+            !c.is_sender_still_allowed(&msg_from("ou_a")),
+            "a revoked sender must fail the re-check right after the config write, \
+             with no other message in between"
+        );
+
+        c.apply_allowed_senders(&["ou_a".to_string()]);
+        assert!(
+            c.is_sender_still_allowed(&msg_from("ou_a")),
+            "a re-added sender must pass the re-check right after the config write"
+        );
+    }
+
+    #[test]
+    fn is_sender_still_allowed_honours_the_wildcard() {
+        let c: Arc<dyn Channel> = Arc::new(ch(vec!["*"]));
+        assert!(c.is_sender_still_allowed(&msg_from("ou_anyone")));
     }
 }
 

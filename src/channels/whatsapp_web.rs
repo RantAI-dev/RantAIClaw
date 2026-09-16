@@ -1287,6 +1287,15 @@ impl Channel for WhatsAppWebChannel {
         }
     }
 
+    /// `msg.sender` is already the canonical form the gate itself produced
+    /// (`inbound_identity`: `lid:<id>` or the `+E.164` number), so the same
+    /// exact-or-wildcard check the gate runs (`number_allowed_in`) applies to
+    /// it directly — no re-derivation of `is_lid`/`resolved_pn` needed or
+    /// possible from the message alone.
+    fn is_sender_still_allowed(&self, msg: &ChannelMessage) -> bool {
+        Self::number_allowed_in(&self.allowed_numbers, &msg.sender)
+    }
+
     /// Healthy means a live client, not merely a handle that was once set.
     ///
     /// The handle used to be left in place on `LoggedOut` and `StreamError`, so
@@ -3095,6 +3104,32 @@ mod tests {
         let ch = make_channel(vec!["+1234567890".into()]);
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(!ch.is_number_allowed("+9999999999"));
+    }
+
+    /// F-49's dispatch-side re-check. `msg.sender` is already the canonical
+    /// form (`+E.164` or `lid:<id>`) `inbound_identity` produced, for both
+    /// identity forms — the same exact-or-wildcard match the listener runs.
+    #[test]
+    fn is_sender_still_allowed_reflects_the_live_allowlist() {
+        let ch = make_channel(vec!["+1234567890".into()]);
+        let pn_msg = ChannelMessage {
+            sender: "+1234567890".to_string(),
+            channel: "whatsapp_web".to_string(),
+            ..ChannelMessage::default()
+        };
+        assert!(ch.is_sender_still_allowed(&pn_msg));
+
+        ch.apply_allowed_senders(&[]);
+        assert!(!ch.is_sender_still_allowed(&pn_msg));
+
+        ch.apply_allowed_senders(&["lid:99887766".to_string()]);
+        let lid_msg = ChannelMessage {
+            sender: "lid:99887766".to_string(),
+            channel: "whatsapp_web".to_string(),
+            ..ChannelMessage::default()
+        };
+        assert!(ch.is_sender_still_allowed(&lid_msg));
+        assert!(!ch.is_sender_still_allowed(&pn_msg));
     }
 
     #[test]
