@@ -366,8 +366,7 @@ mod tests {
 
     #[test]
     fn classify_tenant_token_body_rejects_a_nonzero_code() {
-        let verdict =
-            classify_tenant_token_body(r#"{"code":10003,"msg":"invalid app_secret"}"#);
+        let verdict = classify_tenant_token_body(r#"{"code":10003,"msg":"invalid app_secret"}"#);
         assert!(
             matches!(verdict, verdict::ProbeVerdict::Rejected(_)),
             "a non-zero code is the platform refusing the credential, got {verdict:?}"
