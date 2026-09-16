@@ -728,6 +728,29 @@ mod tests {
         );
     }
 
+    /// The plan asked for an "unknown command" row alongside model-switch,
+    /// reset-hint and prefix, and none of those tables actually covered it —
+    /// on every prefix channel an unrecognised slash command must reach the
+    /// runtime's own reply, not the model, and a bare-verb channel has no
+    /// slash commands to recognise as unknown at all.
+    #[test]
+    fn unknown_command_is_recognised_on_every_prefix_channel_and_nowhere_else() {
+        for channel in ["telegram", "discord", "whatsapp", "whatsapp_web", "lark"] {
+            assert_eq!(
+                parse_runtime_command(channel, "/frobnicate", None),
+                Some(ChannelRuntimeCommand::UnknownCommand(
+                    "/frobnicate".to_string()
+                )),
+                "{channel} must recognise an unrecognised slash command as unknown, not chat"
+            );
+        }
+        assert_eq!(
+            parse_runtime_command("slack", "/frobnicate", None),
+            None,
+            "Slack has no slash commands, so this is chat, not an unknown command"
+        );
+    }
+
     /// F-30: `route_overrides` is built empty on every runtime start
     /// (`mod.rs:1293`) and is never written to disk, so a restart returns every
     /// conversation to the configured model. The reply promised "The model
