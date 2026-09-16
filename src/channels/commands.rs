@@ -45,6 +45,13 @@ pub(crate) enum ChannelRuntimeCommand {
 ///
 /// An explicit list, not a guess: a channel is added here after its platform is
 /// shown to intercept the prefix.
+///
+/// Lark falls to the default `/`: `listen_ws`'s message decode (`lark.rs`,
+/// the `"text"`/`"post"` match arms) treats every inbound message as opaque
+/// text with no slash-command interception — unlike Slack, Lark has no
+/// platform-level feature that intercepts a message starting with `/` before
+/// it reaches the bot. A typed `/model` arrives at `parse_runtime_command`
+/// unchanged.
 pub(crate) fn command_prefix(channel_name: &str) -> &'static str {
     match channel_name {
         "slack" => "",
@@ -52,14 +59,14 @@ pub(crate) fn command_prefix(channel_name: &str) -> &'static str {
     }
 }
 
-/// The channels that answer runtime commands: the four supported tier
+/// The channels that answer runtime commands: the five supported tier
 /// channels. WhatsApp appears under both runtime names, `"whatsapp"` for the
 /// Cloud API and `"whatsapp_web"` for WhatsApp Web, since either may be the
 /// one this host runs.
 pub(crate) fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(
         channel_name,
-        "telegram" | "discord" | "slack" | "whatsapp" | "whatsapp_web"
+        "telegram" | "discord" | "slack" | "whatsapp" | "whatsapp_web" | "lark"
     )
 }
 
@@ -93,6 +100,10 @@ pub(crate) fn manual_clear_hint(channel_name: &str) -> Option<&'static str> {
         "discord" => {
             Some("Discord still shows the earlier messages, and the bot cannot remove them.")
         }
+        "lark" => Some(
+            "Lark still shows the earlier messages. Clearing them is done in Lark, from this \
+             chat's menu.",
+        ),
         _ => None,
     }
 }
@@ -696,6 +707,7 @@ mod tests {
             ("discord", &slash),
             ("whatsapp", &slash),
             ("whatsapp_web", &slash),
+            ("lark", &slash),
             ("slack", &bare),
             ("mattermost", &not_a_tier_channel),
         ];
@@ -793,6 +805,22 @@ mod tests {
         );
     }
 
+    /// Same chat-menu shape as Telegram and WhatsApp: Lark is a persistent
+    /// chat surface, not a DM-only one like Discord.
+    #[test]
+    fn lark_reset_reply_points_at_the_chat_menu() {
+        let reply = reset_message("lark");
+        assert!(
+            reply.starts_with(RESET_MESSAGE),
+            "the hint is added to the reply, never in place of it: {reply}"
+        );
+        assert!(
+            reply.contains("Lark still shows the earlier messages"),
+            "{reply}"
+        );
+        assert!(reply.contains("this chat's menu"), "{reply}");
+    }
+
     /// Saying nothing beats inventing an app's behaviour, so a channel nobody
     /// has checked gets today's message byte for byte.
     #[test]
@@ -809,8 +837,8 @@ mod tests {
     /// The honesty guard. A hint may name the app and say where the control
     /// lives; it may not quote a label nobody has verified. Asserted as a closed
     /// list of spellings plus the quote characters that would wrap one, rather
-    /// than as a pattern: three hints are short enough for a reviewer to read,
-    /// and a fourth channel's hint has to pass here before it ships.
+    /// than as a pattern: these hints are short enough for a reviewer to read,
+    /// and a new channel's hint has to pass here before it ships.
     ///
     /// The ASCII apostrophe is deliberately absent. English writes a possessive
     /// with it, and forbidding it flagged "this chat's menu" on the first run:
@@ -826,7 +854,7 @@ mod tests {
             "\u{201C}",
             "\u{201D}",
         ];
-        for channel in ["telegram", "whatsapp", "whatsapp_web", "discord"] {
+        for channel in ["telegram", "whatsapp", "whatsapp_web", "discord", "lark"] {
             let hint = manual_clear_hint(channel).expect("this channel has a hint");
             for label in forbidden {
                 assert!(
