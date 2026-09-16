@@ -1132,6 +1132,31 @@ never probed, because the only real check opens a live socket and `doctor` owns 
   edit does not.
 - **Status codes**: `200`, `400`, `401`, `500`.
 
+### POST / DELETE /api/v1/channels/lark
+
+Connects, edits or disconnects a Lark/Feishu channel. The app ID and app secret are validated together
+against Lark's tenant-access-token endpoint — the same probe `rantaiclaw setup lark` and `channel doctor`
+already share — before anything is written; a rejected or unreachable check is refused rather than saved.
+
+- **POST request**: `{ "app_id": "...", "app_secret": "...", "encrypt_key": "...",
+  "verification_token": "...", "allowed_users": ["..."], "use_feishu": false }` — `app_id` and
+  `app_secret` may both be omitted to edit the allowlist or region on an already connected channel
+  without re-entering the credential pair (one without the other is refused as malformed); `use_feishu`
+  may be omitted to leave the saved region alone (D-2: unset, and on a fresh connect, defaults to Lark
+  International).
+- **POST response** `200`: `{ "connected": true, "channel": "lark", "app_id": "...",
+  "allowed_users": 2, "warning": null, "restarts_runtime": false, "note": "..." }` — `app_id` is a public
+  application identifier, not the secret; `app_secret`, `encrypt_key` and `verification_token` never
+  appear in the response.
+- **`warning`**: set for the same empty/`"*"` allowlist cases as the other channels, and also when
+  `encrypt_key` is set — this build does not decrypt event bodies, so a non-empty key means the channel
+  refuses to start until it is cleared.
+- **DELETE response** `200`: `{ "disconnected": true, "channel": "lark", "restarts_runtime": true }`
+- **Restarts**: only a *changed* app ID, app secret or region restarts the channel runtime — resubmitting
+  the same credentials or region does not, because the daemon hosts this gateway. An allowlist-only edit
+  applies live through `Channel::apply_allowed_senders`, like the other tier channels.
+- **Status codes**: `200`, `400`, `401`, `500`.
+
 ### POST / DELETE /api/v1/channels/whatsapp_web
 
 Plan 367. Web-mode WhatsApp is linked by scanning a QR; the gateway mints a fresh session file per link

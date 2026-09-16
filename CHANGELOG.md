@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The gateway can connect, edit and disconnect Lark.** Until now the gateway knew Lark only as a
+  secret to redact; the console had no way to set it up and an operator had to edit `config.toml` by
+  hand. `POST /api/v1/channels/lark` now validates the app ID and app secret together against Lark's
+  tenant-access-token endpoint — the same probe `rantaiclaw setup lark` and `channel doctor` already
+  share — before writing anything, and `DELETE /api/v1/channels/lark` clears the section. The restart
+  decision compares the actual credential and region *values* against what is already saved, not
+  merely their presence in the request body, so resubmitting the same app ID, app secret or region
+  (an allowlist-only edit) applies live through `Channel::apply_allowed_senders` and never restarts
+  the channel runtime; a real credential or region change still does. The response never echoes
+  `app_secret`, `encrypt_key` or `verification_token`.
 - **Lark carries attachments in both directions.** Lark had no attachment path at all: inbound
   handled `text` and `post` only, and a reply that produced a file silently lost it. Inbound now
   accepts the `image` message type, downloading the `image_key` through

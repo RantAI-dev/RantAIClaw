@@ -33,7 +33,9 @@ use std::convert::Infallible;
 
 use super::AppState;
 use crate::config::api_url::{looks_like_api_key, validate_api_url};
-use crate::config::schema::{DiscordConfig, McpServerConfig, SlackConfig, TelegramConfig};
+use crate::config::schema::{
+    DiscordConfig, LarkConfig, McpServerConfig, SlackConfig, TelegramConfig,
+};
 use crate::security::AutonomyLevel;
 
 /// Build the `/api/v1/config*` router. Merged alongside `api_v1::router()` so
@@ -64,6 +66,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/channels/slack",
             post(connect_slack).delete(disconnect_slack),
+        )
+        .route(
+            "/api/v1/channels/lark",
+            post(connect_lark).delete(disconnect_lark),
         )
         // Plan 367: WhatsApp Web can be linked and unlinked from the console.
         // The connect/disconnect routes are always registered; allowlist-only
@@ -1511,6 +1517,292 @@ async fn disconnect_slack(
     })))
 }
 
+// ── POST/DELETE /channels/lark ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LarkConnectBody {
+    /// App ID from the Lark/Feishu developer console. Optional: omit (with
+    /// `app_secret`) to edit the allowlist or region on an already connected
+    /// channel without re-entering the credential pair.
+    #[serde(default)]
+    app_id: String,
+    /// App Secret. Validated live (via the tenant-access-token endpoint)
+    /// before persisting. Must be supplied together with `app_id`.
+    #[serde(default)]
+    app_secret: String,
+    /// Encrypt key for webhook event-body decryption. Absent leaves the saved
+    /// value untouched; present (even empty) sets or clears it. This build
+    /// does not decrypt event bodies, so a non-empty key here means Lark
+    /// refuses to start until it is cleared — the connect response warns.
+    #[serde(default)]
+    encrypt_key: Option<String>,
+    /// Verification token for webhook validation. Same absent/present
+    /// convention as `encrypt_key`.
+    #[serde(default)]
+    verification_token: Option<String>,
+    /// Lark/Feishu user or union IDs allowed to talk to the bot. Empty = deny
+    /// all, "*" = allow all. Always replaces the saved list, same convention
+    /// as every other channel here.
+    #[serde(default)]
+    allowed_users: Vec<String>,
+    /// Region: `true` selects Feishu (CN), `false`/omitted selects Lark
+    /// International (D-2's default). `None` (omitted from the request body)
+    /// keeps the saved region so an allowlist-only edit cannot silently flip
+    /// it back to the default.
+    #[serde(default)]
+    use_feishu: Option<bool>,
+}
+
+/// How a `POST /channels/lark` request treats the credential pair.
+///
+/// Unlike Discord/Slack/Telegram's single bot token, Lark's credential is two
+/// fields that must travel together: a probe needs both to mint a tenant
+/// access token, and persisting one without the other can never be valid.
+#[derive(Debug)]
+enum LarkCredentialPlan {
+    /// A new, non-empty pair was supplied — the caller must live-validate it
+    /// against Lark/Feishu before persisting.
+    Validate { app_id: String, app_secret: String },
+    /// Both fields were omitted but a channel is already configured — keep
+    /// the saved pair so an operator can edit the allowlist or region without
+    /// re-entering credentials.
+    KeepExisting,
+}
+
+/// Decide how to treat the credential pair on a `POST /channels/lark`
+/// request. Mirrors [`plan_channel_token`]'s three cases, adapted for a
+/// two-field credential: both empty keeps the saved pair (or refuses a fresh
+/// connect), one empty and the other not is refused as malformed, both
+/// present is a fresh pair to validate.
+fn plan_lark_credentials(
+    existing: Option<&LarkConfig>,
+    app_id: &str,
+    app_secret: &str,
+) -> Result<LarkCredentialPlan, ApiError> {
+    let app_id = app_id.trim();
+    let app_secret = app_secret.trim();
+    if app_id.is_empty() && app_secret.is_empty() {
+        return if existing.is_some() {
+            Ok(LarkCredentialPlan::KeepExisting)
+        } else {
+            Err(err_400(
+                "app_id and app_secret are required to connect a new Lark channel",
+            ))
+        };
+    }
+    if app_id.is_empty() || app_secret.is_empty() {
+        return Err(err_400("app_id and app_secret must be provided together"));
+    }
+    Ok(LarkCredentialPlan::Validate {
+        app_id: app_id.to_string(),
+        app_secret: app_secret.to_string(),
+    })
+}
+
+/// Build the `LarkConfig` to persist from the existing one (if any) plus this
+/// request's changes, preserving every option the request does not mention.
+/// `receive_mode`/`port` are out of this endpoint's scope (D-1/D-2: the
+/// console connects websocket-mode Lark International/Feishu only) and are
+/// left at whatever the existing config had, or the schema default for a
+/// fresh connect.
+fn apply_lark_update(
+    existing: Option<LarkConfig>,
+    new_credentials: Option<(&str, &str)>,
+    allowed_users: Vec<String>,
+    encrypt_key: Option<&str>,
+    verification_token: Option<&str>,
+    use_feishu: bool,
+) -> Result<LarkConfig, ApiError> {
+    let mut lc = match existing {
+        Some(lc) => lc,
+        None => {
+            serde_json::from_value(json!({ "app_id": "", "app_secret": "", "allowed_users": [] }))
+                .map_err(err_500)?
+        }
+    };
+    if let Some((app_id, app_secret)) = new_credentials {
+        lc.app_id = app_id.to_string();
+        lc.app_secret = app_secret.to_string();
+    }
+    lc.allowed_users = allowed_users;
+    lc.use_feishu = use_feishu;
+    if let Some(key) = encrypt_key {
+        let key = key.trim();
+        lc.encrypt_key = (!key.is_empty()).then(|| key.to_string());
+    }
+    if let Some(token) = verification_token {
+        let token = token.trim();
+        lc.verification_token = (!token.is_empty()).then(|| token.to_string());
+    }
+    Ok(lc)
+}
+
+/// Whether a Lark save needs the channels runtime restarted.
+///
+/// A real credential change does (the WS/webhook client is built from it at
+/// construction), and so does a real region change (it selects the host the
+/// long-connection dials). Per plan 380's correction to the shape Discord and
+/// Slack established: this compares VALUES, not presence — resubmitting the
+/// same app_id/app_secret/region the config already has must not restart,
+/// because the daemon hosts this gateway and a debounce-free restart storm can
+/// trip systemd's start limit.
+fn lark_restart_needed(credentials_changed: bool, region_before: bool, region_after: bool) -> bool {
+    credentials_changed || region_before != region_after
+}
+
+/// Whether a validated credential pair actually differs from what is already
+/// saved. Extracted as a pure function (mirroring how [`discord_restart_needed`]
+/// takes `before`/`after` directly) so the VALUES-not-presence guarantee is
+/// unit-testable without a live Lark/Feishu probe: `new_credentials.is_some()`
+/// alone would be true even when an operator resubmits the unchanged pair,
+/// which must not restart the channels runtime.
+fn lark_credentials_changed(
+    previous: Option<&LarkConfig>,
+    new_app_id: &str,
+    new_app_secret: &str,
+) -> bool {
+    previous.is_none_or(|p| p.app_id != new_app_id || p.app_secret != new_app_secret)
+}
+
+/// The connect response for Lark. Carries no credential: `app_id` is a public
+/// application identifier (not the secret), reported the way `bot_username`
+/// confirms identity for the other channels.
+fn lark_connect_response(
+    app_id: &str,
+    allowed_users: usize,
+    warning: Option<&str>,
+    restarts_runtime: bool,
+) -> serde_json::Value {
+    json!({
+        "connected": true,
+        "channel": "lark",
+        "app_id": app_id,
+        "allowed_users": allowed_users,
+        "warning": warning,
+        "restarts_runtime": restarts_runtime,
+        "note": runtime_restart_note(restarts_runtime),
+    })
+}
+
+/// A non-empty `encrypt_key` bricks Lark's own startup (`lark.rs`'s
+/// `encrypt_key` guard refuses to run because this build cannot decrypt event
+/// bodies). The provisioner never asks for it for the same reason; this
+/// endpoint accepts it for schema parity but warns, so a console operator
+/// finds out at save time instead of from a channel that silently never
+/// starts.
+fn lark_encrypt_key_warning(encrypt_key: Option<&str>) -> Option<&'static str> {
+    encrypt_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(|_| {
+            "encrypt_key is set — this build does not decrypt event bodies, and Lark will refuse \
+             to start until it is cleared."
+        })
+}
+
+async fn connect_lark(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LarkConnectBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+
+    let existing = state.config.lock().channels_config.lark.clone();
+    let plan = plan_lark_credentials(existing.as_ref(), &body.app_id, &body.app_secret)?;
+
+    let effective_use_feishu = body
+        .use_feishu
+        .unwrap_or_else(|| existing.as_ref().map(|c| c.use_feishu).unwrap_or(false));
+
+    // The probe (and any refusal) happens BEFORE `lock_and_load`/
+    // `persist_and_swap` are ever reached, so a rejected credential writes
+    // nothing — enforced by control flow (the `?` below), not by a
+    // separate rollback step.
+    let new_credentials = match &plan {
+        LarkCredentialPlan::Validate { app_id, app_secret } => {
+            let token_url =
+                crate::onboard::provision::channels::lark::tenant_token_url(effective_use_feishu);
+            let probe_body = json!({ "app_id": app_id, "app_secret": app_secret });
+            let probe = crate::onboard::provision::validate::http::probe_post(
+                token_url,
+                &[],
+                &serde_json::to_string(&probe_body).unwrap_or_default(),
+            )
+            .await;
+            let verdict = match &probe {
+                Ok(r) => {
+                    crate::onboard::provision::channels::lark::classify_tenant_token_body(&r.body)
+                }
+                Err(e) => crate::onboard::provision::validate::verdict::ProbeVerdict::Inconclusive(
+                    format!("{e}"),
+                ),
+            };
+            refuse_unless_accepted(verdict, "Lark")?;
+            Some((app_id.clone(), app_secret.clone()))
+        }
+        LarkCredentialPlan::KeepExisting => None,
+    };
+
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let previous = cfg.channels_config.lark.clone();
+    let lc = apply_lark_update(
+        previous.clone(),
+        new_credentials
+            .as_ref()
+            .map(|(id, secret)| (id.as_str(), secret.as_str())),
+        body.allowed_users.clone(),
+        body.encrypt_key.as_deref(),
+        body.verification_token.as_deref(),
+        effective_use_feishu,
+    )?;
+    // Decided against the freshly loaded config, before the new one replaces
+    // it, so resending unchanged credentials or region does not bounce the
+    // daemon (plan 380's correction to the Discord/Slack shape: a real value
+    // change, not mere presence in the body).
+    let credentials_changed = match &new_credentials {
+        Some((id, secret)) => lark_credentials_changed(previous.as_ref(), id, secret),
+        None => false,
+    };
+    let region_before = previous.as_ref().map(|p| p.use_feishu).unwrap_or(false);
+    let restarts_runtime =
+        lark_restart_needed(credentials_changed, region_before, effective_use_feishu);
+    let app_id = lc.app_id.clone();
+    cfg.channels_config.lark = Some(lc);
+    persist_and_swap(&state, cfg, "channels.lark").await?;
+
+    if restarts_runtime {
+        schedule_daemon_reload();
+    }
+
+    let warning = allowlist_warning(&body.allowed_users, "Lark")
+        .or_else(|| lark_encrypt_key_warning(body.encrypt_key.as_deref()).map(str::to_string));
+    Ok(Json(lark_connect_response(
+        &app_id,
+        body.allowed_users.len(),
+        warning.as_deref(),
+        restarts_runtime,
+    )))
+}
+
+async fn disconnect_lark(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let was_configured = cfg.channels_config.lark.is_some();
+    cfg.channels_config.lark = None;
+    persist_and_swap(&state, cfg, "channels.lark").await?;
+    if was_configured {
+        schedule_daemon_reload();
+    }
+    Ok(Json(json!({
+        "disconnected": was_configured,
+        "channel": "lark",
+        "restarts_runtime": was_configured,
+    })))
+}
+
 // ── POST/DELETE /channels/whatsapp_web + POST /channels/whatsapp_web/pair ────
 //
 // Plan 367. Three rules bound the surface:
@@ -2896,6 +3188,355 @@ mod tests {
         assert!(
             caveat.to_lowercase().contains("direct message"),
             "the caveat must name what is dropped: {caveat}"
+        );
+    }
+
+    fn lark_config(app_id: &str, app_secret: &str, use_feishu: bool) -> LarkConfig {
+        serde_json::from_value(json!({
+            "app_id": app_id,
+            "app_secret": app_secret,
+            "allowed_users": ["U_KEEP"],
+            "use_feishu": use_feishu,
+        }))
+        .expect("a Lark section")
+    }
+
+    /// The three cases the credential-pair planner distinguishes: a fresh pair
+    /// is validated, an omitted pair keeps the saved one so an allowlist/region
+    /// edit needs no re-entry, and an omitted pair with nothing saved is
+    /// refused rather than written half-empty.
+    #[test]
+    fn lark_credential_plan_covers_new_kept_and_missing() {
+        match plan_lark_credentials(None, "  app-1  ", "  secret-not-real  ").expect("a new pair") {
+            LarkCredentialPlan::Validate { app_id, app_secret } => {
+                assert_eq!(app_id, "app-1", "the app_id is trimmed");
+                assert_eq!(app_secret, "secret-not-real", "the app_secret is trimmed");
+            }
+            LarkCredentialPlan::KeepExisting => panic!("a supplied pair must be validated"),
+        }
+
+        let existing = lark_config("saved-app", "saved-secret-not-real", false);
+        assert!(matches!(
+            plan_lark_credentials(Some(&existing), "", "").expect("keeps the saved pair"),
+            LarkCredentialPlan::KeepExisting
+        ));
+
+        let err = plan_lark_credentials(None, "", "").expect_err("nothing saved, nothing supplied");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// A credential is two fields that must travel together — one without the
+    /// other can never validate, so it is refused as malformed rather than
+    /// silently paired with whatever the other field defaults to.
+    #[test]
+    fn lark_credential_plan_refuses_a_half_supplied_pair() {
+        let err = plan_lark_credentials(None, "app-1", "")
+            .expect_err("app_secret alone is not a credential");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = plan_lark_credentials(None, "", "secret-not-real")
+            .expect_err("app_id alone is not a credential");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The half that is easy to lose: an allowlist-only edit must not clear the
+    /// credential pair, region, or webhook options the request does not
+    /// mention.
+    #[test]
+    fn a_lark_allowlist_edit_keeps_every_other_option() {
+        let mut existing = lark_config("saved-app", "saved-secret-not-real", true);
+        existing.encrypt_key = Some("saved-encrypt-key".into());
+        existing.verification_token = Some("saved-verification-token".into());
+
+        let updated =
+            apply_lark_update(Some(existing), None, vec!["U_NEW".into()], None, None, true)
+                .expect("apply");
+
+        assert_eq!(updated.app_id, "saved-app", "the saved app_id survives");
+        assert_eq!(
+            updated.app_secret, "saved-secret-not-real",
+            "the saved app_secret survives"
+        );
+        assert_eq!(updated.allowed_users, vec!["U_NEW".to_string()]);
+        assert!(
+            updated.use_feishu,
+            "the region survives when re-passed unchanged"
+        );
+        assert_eq!(
+            updated.encrypt_key.as_deref(),
+            Some("saved-encrypt-key"),
+            "an unmentioned encrypt_key was cleared"
+        );
+        assert_eq!(
+            updated.verification_token.as_deref(),
+            Some("saved-verification-token"),
+            "an unmentioned verification_token was cleared"
+        );
+    }
+
+    /// `encrypt_key`/`verification_token` follow the present-even-empty-clears
+    /// convention `guild_id` established for Discord: `Some("")` clears,
+    /// `Some(value)` sets, `None` (the field omitted) leaves the saved value.
+    #[test]
+    fn lark_encrypt_key_and_verification_token_can_be_cleared_explicitly() {
+        let mut existing = lark_config("saved-app", "saved-secret-not-real", false);
+        existing.encrypt_key = Some("saved-encrypt-key".into());
+        existing.verification_token = Some("saved-verification-token".into());
+
+        let updated = apply_lark_update(Some(existing), None, vec![], Some(""), Some(""), false)
+            .expect("apply");
+
+        assert!(
+            updated.encrypt_key.is_none(),
+            "an explicitly empty encrypt_key clears it"
+        );
+        assert!(
+            updated.verification_token.is_none(),
+            "an explicitly empty verification_token clears it"
+        );
+    }
+
+    /// Plan 380's correction to the shape Discord/Slack established: the
+    /// restart decision compares VALUES, not the mere presence of a field in
+    /// the body. Resubmitting the same credentials or region must not restart
+    /// the channels runtime, which hosts this gateway.
+    #[test]
+    fn lark_restart_decision_compares_values_not_presence() {
+        assert!(
+            !lark_restart_needed(false, false, false),
+            "an allowlist-only edit (same region) must not restart"
+        );
+        assert!(
+            !lark_restart_needed(false, true, true),
+            "resubmitting the same region must not restart"
+        );
+        assert!(
+            lark_restart_needed(true, false, false),
+            "a changed credential must restart even with the region unchanged"
+        );
+        assert!(
+            lark_restart_needed(false, false, true),
+            "a changed region must restart even with credentials unchanged"
+        );
+    }
+
+    /// The half `lark_restart_decision_compares_values_not_presence` cannot
+    /// reach: whether a supplied, live-validated pair actually differs from
+    /// what is saved, not merely that a pair was supplied. Resubmitting the
+    /// unchanged credentials on an already-connected channel must compute
+    /// `false` here, or the handler would restart on every re-save.
+    #[test]
+    fn lark_credentials_changed_compares_values_not_presence() {
+        let existing = lark_config("saved-app", "saved-secret-not-real", false);
+
+        assert!(
+            !lark_credentials_changed(Some(&existing), "saved-app", "saved-secret-not-real"),
+            "resubmitting the identical pair must not count as a change"
+        );
+        assert!(
+            lark_credentials_changed(Some(&existing), "new-app", "saved-secret-not-real"),
+            "a changed app_id is a real change"
+        );
+        assert!(
+            lark_credentials_changed(Some(&existing), "saved-app", "new-secret-not-real"),
+            "a changed app_secret is a real change"
+        );
+        assert!(
+            lark_credentials_changed(None, "saved-app", "saved-secret-not-real"),
+            "a fresh connect (nothing saved yet) is always a change"
+        );
+    }
+
+    /// The response never carries a credential — `app_id` is a public
+    /// identifier, but nothing else from the request reaches the JSON, the
+    /// same guarantee Discord/Slack give by never taking a credential
+    /// parameter at all.
+    #[test]
+    fn lark_connect_response_never_echoes_a_credential() {
+        let response = lark_connect_response("app-1", 2, None, false);
+        let serialized = response.to_string();
+        assert!(
+            !serialized.contains("secret-not-real"),
+            "the response must never contain an app_secret value"
+        );
+        assert_eq!(response["app_id"], "app-1");
+        assert_eq!(response["channel"], "lark");
+        assert!(response.get("app_secret").is_none());
+        assert!(response.get("encrypt_key").is_none());
+        assert!(response.get("verification_token").is_none());
+    }
+
+    /// A non-empty `encrypt_key` bricks Lark's own startup guard
+    /// (`lark.rs`'s check that this build cannot decrypt event bodies). The
+    /// connect response warns about it instead of saving it silently.
+    #[test]
+    fn lark_encrypt_key_warning_fires_only_when_set() {
+        assert!(lark_encrypt_key_warning(None).is_none());
+        assert!(lark_encrypt_key_warning(Some("")).is_none());
+        assert!(lark_encrypt_key_warning(Some("   ")).is_none());
+        let warning = lark_encrypt_key_warning(Some("a-real-key")).expect("a warning");
+        assert!(warning.contains("does not decrypt"));
+    }
+
+    /// A running Lark channel, for the direct-handler tests below. Nothing on
+    /// disk yet, so the first write saves this config to `root`.
+    fn running_lark_config(root: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.config_path = root.join("config.toml");
+        config.workspace_dir = root.join("workspace");
+        config.channels_config.lark =
+            Some(lark_config("saved-app", "saved-secret-not-real", false));
+        config
+    }
+
+    /// The only `connect_lark` path this suite can exercise without a live
+    /// Lark/Feishu endpoint: both credential fields omitted, so
+    /// `plan_lark_credentials` returns `KeepExisting` and the probe (and any
+    /// network call) never runs. Exercises the real handler end to end:
+    /// allowlist applied, credentials/region untouched, no restart.
+    #[tokio::test]
+    async fn lark_allowlist_only_edit_persists_without_touching_credentials() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let state = console_state(running_lark_config(tmp.path()));
+
+        let response = connect_lark(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(LarkConnectBody {
+                app_id: String::new(),
+                app_secret: String::new(),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec!["U_NEW".into()],
+                use_feishu: None,
+            }),
+        )
+        .await
+        .expect("an allowlist-only edit must succeed without a live probe");
+
+        assert_eq!(response.0["restarts_runtime"], false);
+        assert_eq!(response.0["app_id"], "saved-app");
+        let serialized = response.0.to_string();
+        assert!(
+            !serialized.contains("saved-secret-not-real"),
+            "the response must never contain the app_secret"
+        );
+
+        let saved = state
+            .config
+            .lock()
+            .channels_config
+            .lark
+            .clone()
+            .expect("still connected");
+        assert_eq!(saved.app_id, "saved-app", "credentials untouched");
+        assert_eq!(saved.app_secret, "saved-secret-not-real");
+        assert!(!saved.use_feishu, "region untouched");
+        assert_eq!(saved.allowed_users, vec!["U_NEW".to_string()]);
+    }
+
+    /// A request that supplies only one half of the credential pair is
+    /// refused before any config is touched — `connect_lark` end to end, not
+    /// just the pure planner.
+    #[tokio::test]
+    async fn lark_connect_refuses_a_half_supplied_pair_and_writes_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let state = console_state(running_lark_config(tmp.path()));
+
+        let refused = connect_lark(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(LarkConnectBody {
+                app_id: "new-app".into(),
+                app_secret: String::new(),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec![],
+                use_feishu: None,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = refused else {
+            panic!("a half-supplied pair must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let saved = state
+            .config
+            .lock()
+            .channels_config
+            .lark
+            .clone()
+            .expect("still connected");
+        assert_eq!(saved.app_id, "saved-app", "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn disconnect_lark_clears_the_section_and_restarts() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let state = console_state(running_lark_config(tmp.path()));
+
+        let response = disconnect_lark(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("disconnect must succeed");
+
+        assert_eq!(response.0["disconnected"], true);
+        assert_eq!(response.0["channel"], "lark");
+        assert_eq!(response.0["restarts_runtime"], true);
+        assert!(
+            state.config.lock().channels_config.lark.is_none(),
+            "the section must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_lark_on_an_unconfigured_channel_does_not_restart() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let state = console_state(config);
+
+        let response = disconnect_lark(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("disconnect must succeed even when nothing was configured");
+
+        assert_eq!(response.0["disconnected"], false);
+        assert_eq!(response.0["restarts_runtime"], false);
+    }
+
+    /// Structural guarantee for the one path this suite cannot exercise
+    /// behaviourally without a live Lark/Feishu endpoint: a fresh connect's
+    /// probe-and-refuse must run BEFORE `lock_and_load`/`persist_and_swap`, so
+    /// a rejected credential writes nothing. `classify_tenant_token_body` and
+    /// `refuse_unless_accepted` already have their own unit coverage; this
+    /// pins the ordering between them and the write.
+    #[test]
+    fn lark_connect_probes_before_it_writes() {
+        let src = include_str!("config_api.rs");
+        let handler = src
+            .split("async fn connect_lark(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn disconnect_lark(").next())
+            .expect("the connect_lark handler");
+        let probe_at = handler
+            .find("refuse_unless_accepted(verdict, \"Lark\")?;")
+            .expect("the handler must refuse an unaccepted verdict");
+        let write_at = handler
+            .find("lock_and_load(&state)")
+            .expect("the handler must load before writing");
+        assert!(
+            probe_at < write_at,
+            "the probe refusal must happen before the config is loaded for writing"
         );
     }
 
