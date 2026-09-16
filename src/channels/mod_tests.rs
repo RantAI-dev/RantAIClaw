@@ -8457,6 +8457,7 @@ fn every_tier_channel_with_inbound_media_charges_the_shared_budget() {
             include_str!("whatsapp_web.rs"),
             "fn image_marker_from_bytes",
         ),
+        ("lark", include_str!("lark.rs"), "fn resolve_image_outcome"),
     ];
 
     for (channel, src, collector) in wiring {
@@ -8528,6 +8529,7 @@ fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
             include_str!("slack.rs"),
             "async fn send_attachment(",
         ),
+        ("lark", include_str!("lark.rs"), "async fn send_attachment("),
     ];
 
     for (channel, src, sender) in wiring {

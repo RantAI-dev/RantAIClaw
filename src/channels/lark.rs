@@ -198,6 +198,25 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+/// The `msg_type` and content body for a message referencing an already
+/// uploaded attachment key. Pure, so the part that is easy to get wrong —
+/// whether an image is referenced by `image_key` in an `image` message and
+/// everything else by `file_key` in a `file` message — is reachable from a
+/// test without a network call, the same split `outgoing_media_message`
+/// gives WhatsApp Web's per-kind media messages.
+fn lark_key_message_body(
+    kind: crate::channels::media::AttachmentKind,
+    key: &str,
+) -> (&'static str, serde_json::Value) {
+    use crate::channels::media::AttachmentKind;
+
+    if kind == AttachmentKind::Image {
+        ("image", serde_json::json!({ "image_key": key }))
+    } else {
+        ("file", serde_json::json!({ "file_key": key }))
+    }
+}
+
 /// Lark/Feishu channel.
 ///
 /// Supports two receive modes (configured via `receive_mode` in config):
@@ -229,6 +248,11 @@ pub struct LarkChannel {
     bot_identity: Arc<RwLock<Option<BotIdentity>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// The operator's inbound-image caps, applied to a downloaded `image_key`
+    /// the same way every other channel applies them. Defaults to
+    /// `MultimodalConfig::default()` until `with_multimodal` is called, the
+    /// same gap plan 375's WhatsApp fix closed for the webhook path.
+    multimodal: crate::config::MultimodalConfig,
 }
 
 impl LarkChannel {
@@ -251,6 +275,7 @@ impl LarkChannel {
             tenant_token: Arc::new(RwLock::new(None)),
             bot_identity: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            multimodal: crate::config::MultimodalConfig::default(),
         }
     }
 
@@ -267,6 +292,13 @@ impl LarkChannel {
         ch.receive_mode = config.receive_mode.clone();
         ch.encrypt_key = config.encrypt_key.clone();
         ch
+    }
+
+    /// Apply the operator's `[multimodal]` limits to inbound images.
+    #[must_use]
+    pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
+        self.multimodal = multimodal;
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -295,6 +327,14 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    fn upload_image_url(&self) -> String {
+        format!("{}/im/v1/images", self.api_base())
+    }
+
+    fn upload_file_url(&self) -> String {
+        format!("{}/im/v1/files", self.api_base())
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -651,6 +691,36 @@ impl LarkChannel {
                             Some(t) => t,
                             None => continue,
                         },
+                        "image" => {
+                            // Gate before spending a network round trip and a
+                            // budget slot, unlike `text`/`post` which only
+                            // parse JSON: an unauthorized sender or an
+                            // unmentioned group member must not cost
+                            // anything, the same rule Discord's
+                            // `attachment_markers` follows. `text`/`post`
+                            // decode before this gate too, but that decode is
+                            // free and the pairing intercept below needs it
+                            // decoded first for self-onboarding; an image
+                            // never carries a pairing code, so it has no
+                            // reason to jump the gate.
+                            if !self.is_user_allowed(sender_open_id) {
+                                tracing::warn!("Lark WS: ignoring image from {sender_open_id} (not in allowed_users)");
+                                continue;
+                            }
+                            if lark_msg.chat_type == "group" {
+                                let me = self.bot_identity.read().await.clone();
+                                if !should_respond_in_group(&lark_msg.mentions, me.as_ref()) {
+                                    continue;
+                                }
+                            }
+                            let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let Some(image_key) = v.get("image_key").and_then(|k| k.as_str()) else { continue };
+                            let url = self.image_resource_url(&lark_msg.message_id, image_key);
+                            self.resolve_image_outcome(&url, sender_open_id).await.to_marker()
+                        }
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -989,6 +1059,57 @@ impl LarkChannel {
         *cached = None;
     }
 
+    /// The authenticated URL that downloads one inbound `image_key`.
+    fn image_resource_url(&self, message_id: &str, image_key: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/resources/{image_key}?type=image",
+            self.api_base()
+        )
+    }
+
+    /// Resolve one inbound `image_key` to an `[IMAGE:…]` marker or the note the
+    /// user should see, through the same budget/size/sniff policy every other
+    /// channel's inbound image applies (`docs/reference/channels.md` §"Inbound
+    /// Image Marker Protocol").
+    ///
+    /// `download_url` is a parameter rather than built from `self.api_base()`
+    /// here, so this is reachable from a test with a loopback server and never
+    /// opens a real Lark connection — the same seam Telegram's
+    /// `resolve_photo_marker` uses for `getFile`.
+    async fn resolve_image_outcome(
+        &self,
+        download_url: &str,
+        sender_open_id: &str,
+    ) -> crate::channels::media::MediaOutcome {
+        use crate::channels::media::MediaOutcome;
+
+        let sender_key = format!("lark:{sender_open_id}");
+        // Budget first: minting a tenant token is an authenticated round trip,
+        // and the charge inside the fetch below happens a request too late to
+        // spare an exhausted sender that one.
+        if let Err(note) = crate::channels::media::peek(&sender_key) {
+            return MediaOutcome::Rejected(note);
+        }
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(_) => {
+                return MediaOutcome::Rejected("Attachment unavailable: media fetch failed".into())
+            }
+        };
+
+        let cap = crate::channels::media::max_bytes(&self.multimodal);
+        crate::channels::media::fetch_image(
+            &self.http_client(),
+            download_url,
+            Some(&token),
+            Some("image/*"),
+            cap,
+            &sender_key,
+        )
+        .await
+    }
+
     async fn send_text_once(
         &self,
         url: &str,
@@ -1011,7 +1132,7 @@ impl LarkChannel {
     }
 
     /// Parse an event callback payload and extract text messages
-    pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+    pub async fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
         // Lark event v2 structure:
@@ -1057,6 +1178,11 @@ impl LarkChannel {
             .and_then(|c| c.as_str())
             .unwrap_or("");
 
+        let message_id = event
+            .pointer("/message/message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
         let text: String = match msg_type {
             "text" => {
                 let extracted = serde_json::from_str::<serde_json::Value>(content_str)
@@ -1076,6 +1202,20 @@ impl LarkChannel {
                 Some(t) => t,
                 None => return messages,
             },
+            "image" => {
+                let Some(image_key) = serde_json::from_str::<serde_json::Value>(content_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("image_key")
+                            .and_then(|k| k.as_str())
+                            .map(String::from)
+                    })
+                else {
+                    return messages;
+                };
+                let url = self.image_resource_url(message_id, &image_key);
+                self.resolve_image_outcome(&url, open_id).await.to_marker()
+            }
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
                 return messages;
@@ -1107,10 +1247,11 @@ impl LarkChannel {
             sender_aliases: vec![chat_id.to_string()],
             // Carry the platform id: a UUID minted here makes a redelivery
             // undetectable, and Lark retries a callback it considers unacked.
-            id: event
-                .pointer("/message/message_id")
-                .and_then(|v| v.as_str())
-                .map_or_else(|| Uuid::new_v4().to_string(), |id| format!("lark_{id}")),
+            id: if message_id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                format!("lark_{message_id}")
+            },
             sender: open_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
@@ -1122,30 +1263,23 @@ impl LarkChannel {
 
         messages
     }
-}
 
-#[async_trait]
-impl Channel for LarkChannel {
-    fn name(&self) -> &str {
-        "lark"
-    }
-
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+    /// Send plain text, stripped of markdown (Lark's `text` msg_type renders
+    /// no markup), with the same token-expired-retry-once shape every Lark
+    /// send has always used.
+    async fn send_text_message(&self, content: &str, recipient: &str) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        // This sends Lark's `text` msg_type, which renders plain — no markup — so
-        // strip the agent's markdown. (A future `post`/`interactive` rich type
-        // would need a different target; the Plain choice rests on `text` here.)
         let rendered = crate::channels::format::render_to_string(
-            &message.content,
+            content,
             &crate::channels::format::RenderTarget::Plain,
         );
-        let content = serde_json::json!({ "text": rendered }).to_string();
+        let text_content = serde_json::json!({ "text": rendered }).to_string();
         let body = serde_json::json!({
-            "receive_id": message.recipient,
+            "receive_id": recipient,
             "msg_type": "text",
-            "content": content,
+            "content": text_content,
         });
 
         let (status, response) = self.send_text_once(&url, &token, &body).await?;
@@ -1169,6 +1303,223 @@ impl Channel for LarkChannel {
 
         ensure_lark_send_success(status, &response, "without token refresh")?;
         Ok(())
+    }
+
+    /// Upload one attachment's bytes to Lark and reference the returned key
+    /// in a follow-up message. An image uses `im/v1/images`; everything else
+    /// uses the generic `im/v1/files` bucket — Lark's own `file_type` enum
+    /// (opus/mp4/pdf/doc/xls/ppt/**stream**) collapses most non-image kinds
+    /// into "stream" anyway, so a per-kind Lark category would not buy
+    /// anything a marker's five kinds do not already have.
+    async fn send_attachment(
+        &self,
+        recipient: &str,
+        attachment: &crate::channels::media::OutboundAttachment,
+    ) -> anyhow::Result<()> {
+        use crate::channels::media::AttachmentKind;
+
+        let target = attachment.target.trim();
+
+        if crate::channels::media::is_http_url(target) {
+            // A remote URL is sent as text: Lark previews links, and
+            // re-uploading someone else's public file would spend bandwidth
+            // to gain nothing. Same rule Discord and WhatsApp apply.
+            return self.send_text_message(target, recipient).await;
+        }
+
+        // One resolver for every channel: expands `~`, resolves a relative
+        // path against the workspace rather than the daemon's working
+        // directory, checks the file exists, and fails closed outside the
+        // workspace — a reply a guest can influence must not post the config
+        // into the chat.
+        let path =
+            crate::channels::media::resolve_attachment_path_in_workspace("Lark", target).await?;
+
+        let bytes = {
+            use anyhow::Context as _;
+            tokio::fs::read(&path)
+                .await
+                .with_context(|| format!("cannot read attachment: {target}"))?
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+
+        let key = if attachment.kind == AttachmentKind::Image {
+            self.upload_lark_image(bytes, &file_name).await?
+        } else {
+            self.upload_lark_file(bytes, &file_name).await?
+        };
+
+        self.send_key_message(recipient, attachment.kind, &key)
+            .await
+    }
+
+    /// `POST im/v1/images`, returning the `image_key` to reference in a
+    /// message.
+    async fn upload_lark_image(&self, bytes: Vec<u8>, file_name: &str) -> anyhow::Result<String> {
+        // Sniffed from the bytes so the part's declared type matches what was
+        // actually read, not what the marker's extension guesses.
+        let mime = crate::channels::media::sniff_image_mime(&bytes)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let file_name = file_name.to_string();
+        self.upload_and_extract_key(
+            &self.upload_image_url(),
+            bytes,
+            move |b| {
+                let part = reqwest::multipart::Part::bytes(b)
+                    .file_name(file_name.clone())
+                    .mime_str(&mime)?;
+                Ok(reqwest::multipart::Form::new()
+                    .text("image_type", "message")
+                    .part("image", part))
+            },
+            "image_key",
+        )
+        .await
+    }
+
+    /// `POST im/v1/files`, returning the `file_key` to reference in a
+    /// message. `"stream"` is Lark's generic binary bucket — the only one of
+    /// its six `file_type` values that accepts arbitrary content.
+    async fn upload_lark_file(&self, bytes: Vec<u8>, file_name: &str) -> anyhow::Result<String> {
+        let file_name = file_name.to_string();
+        self.upload_and_extract_key(
+            &self.upload_file_url(),
+            bytes,
+            move |b| {
+                let part = reqwest::multipart::Part::bytes(b).file_name(file_name.clone());
+                Ok(reqwest::multipart::Form::new()
+                    .text("file_type", "stream")
+                    .text("file_name", file_name.clone())
+                    .part("file", part))
+            },
+            "file_key",
+        )
+        .await
+    }
+
+    /// Upload with the same token-expired-retry-once shape every other Lark
+    /// send has. `reqwest::multipart::Form` is not `Clone`, so the caller
+    /// hands over the raw bytes plus a builder rather than a built form, and
+    /// this rebuilds it for the retry attempt.
+    async fn upload_and_extract_key(
+        &self,
+        url: &str,
+        bytes: Vec<u8>,
+        build_form: impl Fn(Vec<u8>) -> anyhow::Result<reqwest::multipart::Form>,
+        key_field: &str,
+    ) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let form = build_form(bytes.clone())?;
+        let (status, body) = self.upload_once(url, &token, form).await?;
+
+        if should_refresh_lark_tenant_token(status, &body) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let retry_form = build_form(bytes)?;
+            let (retry_status, retry_body) = self.upload_once(url, &new_token, retry_form).await?;
+            ensure_lark_send_success(
+                retry_status,
+                &retry_body,
+                "uploading an attachment after token refresh",
+            )?;
+            return extract_upload_key(&retry_body, key_field);
+        }
+
+        ensure_lark_send_success(status, &body, "uploading an attachment")?;
+        extract_upload_key(&body, key_field)
+    }
+
+    async fn upload_once(
+        &self,
+        url: &str,
+        token: &str,
+        form: reqwest::multipart::Form,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// Send a message referencing an already-uploaded attachment key, with
+    /// the same token-expired-retry-once shape `send_text_message` has.
+    async fn send_key_message(
+        &self,
+        recipient: &str,
+        kind: crate::channels::media::AttachmentKind,
+        key: &str,
+    ) -> anyhow::Result<()> {
+        let (msg_type, content) = lark_key_message_body(kind, key);
+        let url = self.send_message_url();
+
+        let token = self.get_tenant_access_token().await?;
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": msg_type,
+            "content": content.to_string(),
+        });
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.send_text_once(&url, &new_token, &body).await?;
+            return ensure_lark_send_success(
+                retry_status,
+                &retry_response,
+                "sending an attachment reference after token refresh",
+            );
+        }
+
+        ensure_lark_send_success(status, &response, "sending an attachment reference")
+    }
+}
+
+/// Pull the upload's returned key out of the response body. A free function
+/// so it is reachable from a test without a network call.
+fn extract_upload_key(body: &serde_json::Value, key_field: &str) -> anyhow::Result<String> {
+    body.pointer(&format!("/data/{key_field}"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Lark upload response carried no {key_field}"))
+}
+
+#[async_trait]
+impl Channel for LarkChannel {
+    fn name(&self) -> &str {
+        "lark"
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Attachments first: the markers must come out of the text before it
+        // is rendered, or they reach the reader as literal `[IMAGE:…]`. Same
+        // shape Discord and Slack's `send` use.
+        let (text, attachments) =
+            crate::channels::media::parse_attachment_markers(&message.content);
+        if !attachments.is_empty() {
+            if !text.is_empty() {
+                self.send_text_message(&text, &message.recipient).await?;
+            }
+            for attachment in &attachments {
+                self.send_attachment(&message.recipient, attachment).await?;
+            }
+            return Ok(());
+        }
+
+        self.send_text_message(&message.content, &message.recipient)
+            .await
     }
 
     async fn listen(
@@ -1281,7 +1632,7 @@ impl LarkChannel {
             }
 
             // Parse event messages
-            let messages = state.channel.parse_event_payload(&payload);
+            let messages = state.channel.parse_event_payload(&payload).await;
             if !messages.is_empty() {
                 if let Some(message_id) = payload
                     .pointer("/event/message/message_id")
@@ -1806,6 +2157,7 @@ mod placeholder_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::media::AttachmentKind;
 
     /// Webhook mode must stop when the supervisor cancels it.
     ///
@@ -1854,6 +2206,155 @@ mod tests {
             None,
             vec!["ou_testuser123".into()],
         )
+    }
+
+    /// Seed a cached tenant token directly, so a test exercising
+    /// `get_tenant_access_token` never opens a real Lark connection to mint
+    /// one.
+    async fn seed_tenant_token(ch: &LarkChannel, token: &str) {
+        let mut cached = ch.tenant_token.write().await;
+        *cached = Some(CachedTenantToken {
+            value: token.to_string(),
+            refresh_after: Instant::now() + Duration::from_secs(600),
+        });
+    }
+
+    /// Whether an image is referenced by `image_key` in an `image` message,
+    /// and everything else by `file_key` in a `file` message. Pure: no
+    /// network, exactly the plan's "upload request shaping" requirement.
+    #[test]
+    fn lark_key_message_body_uses_image_key_for_images_and_file_key_otherwise() {
+        let (msg_type, content) = lark_key_message_body(AttachmentKind::Image, "img_abc");
+        assert_eq!(msg_type, "image");
+        assert_eq!(content, serde_json::json!({ "image_key": "img_abc" }));
+
+        for kind in [
+            AttachmentKind::Document,
+            AttachmentKind::Video,
+            AttachmentKind::Audio,
+            AttachmentKind::Voice,
+        ] {
+            let (msg_type, content) = lark_key_message_body(kind, "file_xyz");
+            assert_eq!(msg_type, "file", "{kind:?} must reference a file_key");
+            assert_eq!(content, serde_json::json!({ "file_key": "file_xyz" }));
+        }
+    }
+
+    /// The upload endpoint an attachment kind goes to: images to
+    /// `im/v1/images`, everything else to `im/v1/files`. Region-qualified,
+    /// mirroring `lark_reaction_url_matches_region`.
+    #[test]
+    fn lark_upload_endpoints_are_region_qualified() {
+        let ch_cn = make_channel();
+        assert_eq!(
+            ch_cn.upload_image_url(),
+            "https://open.feishu.cn/open-apis/im/v1/images"
+        );
+        assert_eq!(
+            ch_cn.upload_file_url(),
+            "https://open.feishu.cn/open-apis/im/v1/files"
+        );
+
+        let mut ch_intl = make_channel();
+        ch_intl.use_feishu = false;
+        assert_eq!(
+            ch_intl.upload_image_url(),
+            "https://open.larksuite.com/open-apis/im/v1/images"
+        );
+        assert_eq!(
+            ch_intl.upload_file_url(),
+            "https://open.larksuite.com/open-apis/im/v1/files"
+        );
+    }
+
+    /// A screenshot sent to the agent on Lark becomes an `[IMAGE:…]` marker,
+    /// through the same budget/size/sniff policy every other channel's
+    /// inbound image applies. `download_url` is a loopback server standing in
+    /// for `im/v1/messages/{id}/resources/{key}`, so this never opens a real
+    /// Lark connection.
+    #[tokio::test]
+    async fn lark_inbound_image_becomes_an_image_marker() {
+        async fn png(headers: axum::http::HeaderMap) -> (axum::http::StatusCode, Vec<u8>) {
+            assert_eq!(
+                headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some("Bearer test-tenant-token"),
+                "the resource download must carry the tenant token"
+            );
+            let mut body = b"\x89PNG\r\n\x1a\n".to_vec();
+            body.extend(std::iter::repeat_n(0u8, 32));
+            (axum::http::StatusCode::OK, body)
+        }
+
+        let app = axum::Router::new().route("/shot.png", axum::routing::get(png));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let ch = make_channel();
+        seed_tenant_token(&ch, "test-tenant-token").await;
+
+        let marker = ch
+            .resolve_image_outcome(&format!("http://{addr}/shot.png"), "ou_media_user")
+            .await
+            .to_marker();
+        assert!(
+            marker.starts_with("[IMAGE:data:image/png;base64,"),
+            "{marker}"
+        );
+    }
+
+    /// The budget key is channel-qualified: a Lark open_id cannot spend a
+    /// Discord id's allowance, and a sender who has already spent the window
+    /// gets the rejection note instead of a fetch attempt.
+    #[tokio::test]
+    async fn lark_inbound_image_charges_the_media_budget_under_a_channel_qualified_key() {
+        use crate::channels::media;
+
+        let sender = "lark_budget_user";
+        for _ in 0..media::BUDGET_IMAGES {
+            assert!(media::charge(&format!("lark:{sender}")).is_ok());
+        }
+
+        let ch = make_channel();
+        seed_tenant_token(&ch, "test-tenant-token").await;
+
+        // Port 1 on loopback: nothing listens there. Getting the budget note
+        // rather than a fetch failure is itself proof the refusal lands
+        // before the request goes out.
+        let outcome = ch
+            .resolve_image_outcome("http://127.0.0.1:1/shot.png", sender)
+            .await;
+        assert!(
+            matches!(outcome, media::MediaOutcome::Rejected(ref note) if note.contains("budget")),
+            "{outcome:?}"
+        );
+    }
+
+    /// A reply naming a file that does not exist in the workspace must fail
+    /// visibly rather than silently, and must never reach an upload call —
+    /// this is also the guard against the "route every attachment to
+    /// `im/v1/images` regardless of kind" and "drop the failure notice"
+    /// mutations: neither can make this pass while still shipping.
+    #[tokio::test]
+    async fn lark_send_attachment_surfaces_a_missing_file_as_an_error() {
+        let ch = make_channel();
+        let attachment = crate::channels::media::OutboundAttachment {
+            kind: AttachmentKind::Document,
+            target: "does-not-exist.pdf".to_string(),
+        };
+
+        let err = ch
+            .send_attachment("oc_chat123", &attachment)
+            .await
+            .expect_err("a missing attachment must not be reported as sent");
+        assert!(
+            err.to_string().contains("attachment path not found"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1964,8 +2465,8 @@ mod tests {
         assert!(!ch.is_user_allowed("ou_anyone"));
     }
 
-    #[test]
-    fn lark_parse_challenge() {
+    #[tokio::test]
+    async fn lark_parse_challenge() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "challenge": "abc123",
@@ -1973,15 +2474,15 @@ mod tests {
             "type": "url_verification"
         });
         // Challenge payloads should not produce messages
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
     /// The gate that decides this lives inside `parse_event_payload`; the
     /// suite only ever exercised `is_user_allowed` directly, so the two could
     /// drift apart with everything green.
-    #[test]
-    fn lark_parse_event_payload_drops_an_unlisted_sender() {
+    #[tokio::test]
+    async fn lark_parse_event_payload_drops_an_unlisted_sender() {
         let ch = make_channel();
         let payload = |open_id: &str| {
             serde_json::json!({
@@ -2000,15 +2501,22 @@ mod tests {
         };
 
         assert!(
-            ch.parse_event_payload(&payload("ou_stranger")).is_empty(),
+            ch.parse_event_payload(&payload("ou_stranger"))
+                .await
+                .is_empty(),
             "a sender outside allowed_users must not produce a message"
         );
         // Control on the same fixture: the allowlisted sender does.
-        assert_eq!(ch.parse_event_payload(&payload("ou_testuser123")).len(), 1);
+        assert_eq!(
+            ch.parse_event_payload(&payload("ou_testuser123"))
+                .await
+                .len(),
+            1
+        );
     }
 
-    #[test]
-    fn lark_parse_valid_text_message() {
+    #[tokio::test]
+    async fn lark_parse_valid_text_message() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": {
@@ -2030,7 +2538,7 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello RantaiClaw!");
         assert_eq!(msgs[0].channel, "lark");
@@ -2058,8 +2566,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lark_parse_unauthorized_user() {
+    #[tokio::test]
+    async fn lark_parse_unauthorized_user() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -2074,12 +2582,14 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_non_text_message_skipped() {
+    /// A malformed `image` payload (no `image_key`) is skipped rather than
+    /// panicking or resolving an empty URL.
+    #[tokio::test]
+    async fn lark_parse_image_without_key_skipped() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2099,12 +2609,39 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_empty_text_skipped() {
+    /// A message type this channel has no handling for at all (unlike
+    /// `image`, which is handled but can still be malformed) is skipped.
+    #[tokio::test]
+    async fn lark_parse_unsupported_message_type_skipped() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "audio",
+                    "content": "{}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lark_parse_empty_text_skipped() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2124,24 +2661,24 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_wrong_event_type() {
+    #[tokio::test]
+    async fn lark_parse_wrong_event_type() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": { "event_type": "im.chat.disbanded_v1" },
             "event": {}
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_missing_sender() {
+    #[tokio::test]
+    async fn lark_parse_missing_sender() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2160,12 +2697,12 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_unicode_message() {
+    #[tokio::test]
+    async fn lark_parse_unicode_message() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2186,24 +2723,24 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello world 🌍");
     }
 
-    #[test]
-    fn lark_parse_missing_event() {
+    #[tokio::test]
+    async fn lark_parse_missing_event() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_invalid_content_json() {
+    #[tokio::test]
+    async fn lark_parse_invalid_content_json() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2223,7 +2760,7 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
@@ -2302,8 +2839,8 @@ mod tests {
         assert_eq!(ch.port, Some(9898));
     }
 
-    #[test]
-    fn lark_parse_fallback_sender_to_open_id() {
+    #[tokio::test]
+    async fn lark_parse_fallback_sender_to_open_id() {
         // `sender` is the open_id regardless; this covers the case where the
         // event carries no chat_id, so `reply_target` has to fall back to it
         // too. The comment here used to read "sender should fall back to
@@ -2328,7 +2865,7 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "ou_user");
     }

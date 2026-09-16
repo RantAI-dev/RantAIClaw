@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lark carries attachments in both directions.** Lark had no attachment path at all: inbound
+  handled `text` and `post` only, and a reply that produced a file silently lost it. Inbound now
+  accepts the `image` message type, downloading the `image_key` through
+  `im/v1/messages/{message_id}/resources/{key}` with the tenant access token and applying the same
+  per-sender budget, size cap and byte-sniffed type check as every other channel. Outbound, a
+  marker uploads to `im/v1/images` (images) or `im/v1/files` (everything else, as Lark's generic
+  `stream` type) and the reply then references the returned key; a failed upload surfaces as an
+  error rather than a reply that claims a file was attached. `LarkChannel` also gained the
+  `with_multimodal` wiring every other channel already had, so the operator's `[multimodal]` caps
+  now actually reach it.
 - **Lark answers the runtime commands, and shuts down cleanly.** `/model`, `/models`, `/new` and
   `/clear` never worked on Lark, because `commands.rs` never named it; an unknown command reached
   the model instead of getting the same runtime reply other tier channels give. Lark now joins

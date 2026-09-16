@@ -487,13 +487,20 @@ Operational notes:
 - Marker parsing applies to user-role messages before provider calls.
 - Provider capability is enforced at runtime: if the selected provider does not support vision, the request fails with a structured capability error (`capability=vision`).
 - Linq webhook `media` parts with `image/*` MIME type are automatically converted to this marker format.
-- **Discord, Telegram, Slack, both WhatsApp transports, Linq and Email accept inbound images.** An
-  attachment is fetched, its type is sniffed from the bytes (the sender's claimed
-  MIME is only an early filter), and it is embedded as a `data:` URI — nothing is
-  written to disk. Over the `[multimodal].max_image_size_mb` cap, an unsupported
-  type, or a failed fetch produces a **visible note** in the message rather than
-  silence. Full rules:
+- **Discord, Telegram, Slack, both WhatsApp transports, Lark, Linq and Email accept
+  inbound images.** An attachment is fetched, its type is sniffed from the bytes
+  (the sender's claimed MIME is only an early filter), and it is embedded as a
+  `data:` URI — nothing is written to disk. Over the `[multimodal].max_image_size_mb`
+  cap, an unsupported type, or a failed fetch produces a **visible note** in the
+  message rather than silence. Full rules:
   [inbound media policy](../security/inbound-media-policy.md).
+- **Lark downloads an `image_key` through `im/v1/messages/{message_id}/resources/{key}`**,
+  bearer-authenticated with the tenant access token, then applies the same size
+  cap, byte sniffing and per-sender budget as every other channel (plan 379).
+  Outbound, a marker uploads to `im/v1/images` (images) or `im/v1/files` (anything
+  else, as Lark's generic `stream` file type) and the reply then references the
+  returned key — a remote URL is sent as text instead, the same rule every other
+  channel applies.
 - **Slack needs the `files:read` scope to see an upload at all.** `url_private` is
   authenticated, so without that scope the fetch is refused and the attachment
   becomes a note rather than an image. It is not in the scopes the first-run
