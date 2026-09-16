@@ -22,7 +22,10 @@
 //!   unparseable body) is inconclusive rather than a hard failure.
 //!
 //! All probes are wrapped in a 5s timeout per channel — the doctor command
-//! prioritises completing quickly over thoroughness.
+//! prioritises completing quickly over thoroughness. Lark is the one
+//! exception: it goes through the setup wizard's own `probe_post`, which
+//! builds its own client with an 8s timeout, rather than the 5s `client` this
+//! file builds for the others.
 //!
 //! When `ctx.offline` is true the probes are skipped and the check falls
 //! back to the synchronous config-sanity pass (`inspect_channels`).
@@ -465,6 +468,16 @@ async fn probe_whatsapp_cloud(
 /// Validate a Lark/Feishu app credential the same way the setup wizard does,
 /// by reusing its tenant-access-token probe rather than a second copy of the
 /// HTTP call.
+///
+/// This is the only probe in this file that reaches into another subsystem
+/// (`onboard::provision`) instead of speaking to the platform directly. That
+/// crossing is deliberate, not an oversight: Lark's 200-with-error-`code`
+/// response shape is the one genuinely tricky part of this probe, and a
+/// second, independently-maintained copy of that classification is how the
+/// provisioner and the doctor would eventually disagree on what counts as a
+/// rejected credential. `routing.rs`'s `load_cached_model_preview` reuses
+/// `onboard::wizard::provider_model_catalog` for the identical reason: to
+/// avoid a second reader of one set of rules.
 ///
 /// Empty credentials short-circuit to `Rejected` before any request is sent —
 /// there is nothing to probe, and a `probe_post` over an empty body only
