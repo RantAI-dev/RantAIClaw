@@ -149,7 +149,7 @@ impl WhatsAppChannel {
                 let (media_id, claimed) = inner.split_once('|').unwrap_or((inner, ""));
                 let claimed = (!claimed.is_empty()).then_some(claimed);
                 let replacement = self
-                    .resolve_media(media_id, claimed, &message.sender)
+                    .resolve_media(media_id, claimed, &message.sender, &message.id)
                     .await
                     .to_marker();
                 message.content.replace_range(start..end, &replacement);
@@ -164,6 +164,7 @@ impl WhatsAppChannel {
         media_id: &str,
         claimed: Option<&str>,
         sender: &str,
+        message_id: &str,
     ) -> crate::channels::media::MediaOutcome {
         use crate::channels::media::MediaOutcome;
 
@@ -211,6 +212,7 @@ impl WhatsAppChannel {
             claimed,
             crate::channels::media::max_bytes(&self.multimodal),
             &format!("whatsapp:{sender}"),
+            Some(message_id),
         )
         .await
     }

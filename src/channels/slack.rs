@@ -494,6 +494,7 @@ impl SlackChannel {
         let cap = crate::channels::media::max_bytes(&self.multimodal);
         let client = self.http_client();
         let sender_key = format!("slack:{sender}");
+        let message_id = message.get("ts").and_then(|ts| ts.as_str());
 
         let mut markers = Vec::new();
         for file in files.iter().take(max_images) {
@@ -518,6 +519,7 @@ impl SlackChannel {
                 claimed,
                 cap,
                 &sender_key,
+                message_id,
             )
             .await;
             markers.push(outcome.to_marker());

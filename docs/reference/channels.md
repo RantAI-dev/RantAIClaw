@@ -431,8 +431,9 @@ workspace, or the attachment is refused and the error names the path the model
 wrote. Until 2026-09-12 each channel checked the string as written, so only the
 absolute form ever arrived.
 
-**All four tier channels can deliver attachments**: Telegram, Discord, Slack and
-WhatsApp Web. Every other channel returns `None` and is never told the syntax,
+**Telegram, Discord, Slack, WhatsApp Web and Lark can deliver attachments.**
+WhatsApp Cloud has no upload path (`whatsapp.rs` never calls `send_attachment`)
+and, like every other channel, returns `None` and is never told the syntax,
 because telling a channel that cannot deliver them leaks `[IMAGE:…]` to the
 reader as literal text.
 
@@ -1025,6 +1026,19 @@ The wizard now includes a dedicated **Lark/Feishu** step with:
 - credential verification against official Open Platform auth endpoint
 - receive mode selection (`websocket` or `webhook`)
 - webhook verification token prompt — **required** when `receive_mode = "webhook"`
+
+**Required app scopes** (confirmed against a live tenant), each with the API it opens:
+
+| Scope | Opens |
+|---|---|
+| `im:message.p2p_msg:readonly` | Receive direct messages |
+| `im:message.group_at_msg.include_bot:readonly` | Receive group @-mentions |
+| `im:message:send_as_bot` | Send messages (`im/v1/messages`) |
+| `im:message:readonly` | Download an inbound image's resource (`im/v1/messages/{id}/resources/{key}`) — without it, Lark answers error code `99991672` |
+| `im:resource` | Upload an attachment (`im/v1/images`, `im/v1/files`) |
+| `im:message.reactions:write_only` | Reactions |
+
+Persistent-connection mode also needs the `im.message.receive_v1` event subscribed in the developer console. `im:resource` alone is not enough to read a message's own inbound attachment: that is `im:message:readonly`, a distinct scope a 2026-09-16 drive found missing even though upload already worked.
 
 Webhook-mode authenticity (accurate as of plan 124, merged):
 

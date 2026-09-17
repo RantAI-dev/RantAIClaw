@@ -62,7 +62,10 @@ impl TuiProvisioner for LarkProvisioner {
             &events,
             ProvisionEvent::Message {
                 severity: Severity::Info,
-                text: "Let's configure Lark/Feishu.".into(),
+                text: "Let's configure Lark/Feishu. Your app needs specific scopes enabled in \
+                       the developer console — see docs/reference/channels.md §4.11 \"Required \
+                       app scopes\" for the exact list."
+                    .into(),
             },
         )
         .await?;

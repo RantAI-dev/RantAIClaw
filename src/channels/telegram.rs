@@ -1232,6 +1232,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         &self,
         file_id: &str,
         sender: &str,
+        message_id: &str,
     ) -> crate::channels::media::MediaOutcome {
         use crate::channels::media::{ImageBytes, MediaOutcome};
         use base64::Engine as _;
@@ -1273,6 +1274,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             None,
             crate::channels::media::max_bytes(&self.multimodal),
             &format!("telegram:{sender}"),
+            Some(message_id),
         )
         .await
         {
@@ -2377,7 +2379,7 @@ Ensure only one `rantaiclaw` process is using this bot token."
                     // it did not resolve. A dropped image used to be silent.
                     if let Some(file_id) = photo_file_id {
                         let marker = self
-                            .resolve_photo_marker(&file_id, &msg.sender)
+                            .resolve_photo_marker(&file_id, &msg.sender, &msg.id)
                             .await
                             .to_marker();
                         if msg.content.is_empty() {
@@ -3625,7 +3627,7 @@ mod tests {
         // The stub answers `getFile` with `{"ok":true,"result":{}}` — no
         // `file_path` — which is the shape a revoked/expired file id produces.
         let marker = ch
-            .resolve_photo_marker("file-1", "tg_user_a")
+            .resolve_photo_marker("file-1", "tg_user_a", "msg-fake-1")
             .await
             .to_marker();
         assert!(marker.contains("Attachment unavailable"), "got: {marker}");
@@ -3668,7 +3670,7 @@ mod tests {
         // Control first: an unrelated sender with budget left DOES reach getFile,
         // so the zero below cannot come from an unreachable server.
         let fresh = ch
-            .resolve_photo_marker("file-1", "telegram_budget_control")
+            .resolve_photo_marker("file-1", "telegram_budget_control", "msg-fake-2")
             .await
             .to_marker();
         assert!(!fresh.contains("media budget spent"), "got: {fresh}");
@@ -3678,7 +3680,10 @@ mod tests {
             "the control must reach getFile"
         );
 
-        let marker = ch.resolve_photo_marker("file-1", sender).await.to_marker();
+        let marker = ch
+            .resolve_photo_marker("file-1", sender, "msg-fake-3")
+            .await
+            .to_marker();
         assert!(marker.contains("media budget spent"), "got: {marker}");
         // The point of this change: `getFile` is an authenticated round trip,
         // and an exhausted sender must not be able to make it either.
@@ -3721,7 +3726,7 @@ mod tests {
         let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false)
             .with_api_base(format!("http://{addr}"));
         let marker = ch
-            .resolve_photo_marker("file-1", "tg_user_b")
+            .resolve_photo_marker("file-1", "tg_user_b", "msg-fake-4")
             .await
             .to_marker();
         assert!(marker.contains("unsupported type"), "got: {marker}");

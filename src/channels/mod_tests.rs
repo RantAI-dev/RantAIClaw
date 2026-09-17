@@ -66,6 +66,22 @@ fn delivery_instructions_default_is_none() {
         .expect("Telegram can deliver media");
     assert!(instructions.contains("[IMAGE:"));
 
+    // Lark can upload attachments; this pin must move whenever a channel's
+    // upload path ships, or the override can sit stale while the trait
+    // default silently takes over.
+    let lark = crate::channels::lark::LarkChannel::new(
+        "cli_placeholder".into(),
+        "secret".into(),
+        "token".into(),
+        None,
+        vec!["*".into()],
+    );
+    assert!(
+        lark.delivery_instructions(workspace)
+            .is_some_and(|t| t.contains("[IMAGE:")),
+        "Lark can deliver attachments and must say so"
+    );
+
     // Behaviour-preserving: the prompt is assembled exactly as the central
     // `match` assembled it.
     let with = prompt::build_channel_system_prompt(
@@ -8765,6 +8781,105 @@ fn every_channel_that_uploads_a_local_file_confines_it_to_the_workspace() {
              instead of the workspace"
         );
     }
+}
+
+/// Every channel that can send an attachment must tell the model the marker
+/// syntax exists, inside its own `impl Channel for` block.
+///
+/// A channel that gains an upload path but never overrides
+/// `delivery_instructions` (default `None`, `traits.rs`) leaves that path
+/// unreachable: the model is never told the marker syntax exists, so it
+/// never writes one. `channel_impl_method_body` is used rather than a plain
+/// substring search, per memory `trait-method-in-inherent-impl`: a
+/// definition sitting in a plain `impl LarkChannel` block would satisfy a
+/// substring check while remaining invisible through `Arc<dyn Channel>`.
+#[test]
+fn every_channel_that_sends_an_attachment_tells_the_model_how() {
+    // The exact string each channel's `delivery_instructions_for` call names
+    // itself as — checked below against the whole file, not just the impl
+    // block, because Telegram's override calls a same-file helper
+    // (`telegram_delivery_instructions`) rather than the shared function
+    // directly. Checking that `delivery_instructions` merely exists is not
+    // enough: `fn delivery_instructions(..) -> Option<String> { None }` would
+    // satisfy that check while leaving the model with no idea it can attach
+    // a file. Mutation-confirmed.
+    const EXPECTED_PLATFORM: &[(&str, &str)] = &[
+        ("telegram.rs", "Telegram"),
+        ("discord.rs", "Discord"),
+        ("slack.rs", "Slack"),
+        ("whatsapp_web.rs", "WhatsApp"),
+        ("lark.rs", "Lark"),
+    ];
+
+    // Every file under src/channels, not a fixed list of channel names: a
+    // hardcoded array here would go silently stale the next time a channel
+    // gains `send_attachment` — the test would keep passing (green on the
+    // channels it knows about) while giving zero signal on the one it does
+    // not.
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut checked = 0;
+    for path in channel_source_files(&src_root) {
+        let src = std::fs::read_to_string(&path).expect("read a channel source file");
+        if !src.contains("async fn send_attachment(") {
+            continue;
+        }
+        checked += 1;
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let production = production_half(&src);
+        let Some(body) = channel_impl_method_body(production, "fn delivery_instructions(") else {
+            panic!(
+                "{file}: sends attachments but never overrides `delivery_instructions` inside \
+                 `impl Channel for`, so the model is never told it can attach a file"
+            );
+        };
+        let body_text = body.join("\n");
+        assert!(
+            body_text.contains("Some("),
+            "{file}: `delivery_instructions` does not wrap its result in `Some`, so it returns \
+             `None` (or something else falsy) and the model is never told it can attach a \
+             file: {body_text}"
+        );
+        let Some((_, expected_platform)) = EXPECTED_PLATFORM.iter().find(|(f, _)| *f == file)
+        else {
+            panic!(
+                "{file}: sends attachments but has no expected platform name recorded in this \
+                 guard — add one so the guard can check the right value is returned, not just \
+                 that the method exists"
+            );
+        };
+        // Tied to the first argument of an actual `delivery_instructions_for(`
+        // call, not a bare substring search over the whole file: `"Lark"` (or
+        // any other platform name) appears elsewhere in most of these files
+        // for unrelated reasons (log lines, the channel's own `name()`), so a
+        // whole-file search would pass even when the wrong name reaches this
+        // call and never actually catch the mutation it exists to catch.
+        let wanted = format!("\"{expected_platform}\"");
+        let calls_with_right_name = production
+            .match_indices("delivery_instructions_for(")
+            .filter(|&(at, m)| {
+                let first_argument = production[at + m.len()..].trim_start();
+                first_argument.starts_with(&wanted)
+            })
+            .count();
+        assert!(
+            calls_with_right_name > 0,
+            "{file}: found no `delivery_instructions_for({wanted}, ...)` call — a wrong platform \
+             name may reach the model, or the naming convention changed and this guard's \
+             expectation is stale"
+        );
+    }
+    // A control on the scan itself: this must find the channels known to
+    // upload today, or a change to the walk or the marker string could leave
+    // this test vacuously green.
+    assert!(
+        checked >= 5,
+        "found only {checked} channel(s) with `send_attachment` — expected at least the 5 known \
+         to upload (telegram, discord, slack, whatsapp_web, lark); the scan may be broken"
+    );
 }
 
 /// One indent level, `fn name(` or `async fn name(`, with any visibility. Used

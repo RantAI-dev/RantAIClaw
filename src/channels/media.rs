@@ -237,8 +237,13 @@ pub async fn fetch_image(
     claimed: Option<&str>,
     max_bytes: u64,
     sender_key: &str,
+    message_id: Option<&str>,
 ) -> MediaOutcome {
-    match fetch_image_bytes(client, url, bearer, claimed, max_bytes, sender_key).await {
+    match fetch_image_bytes(
+        client, url, bearer, claimed, max_bytes, sender_key, message_id,
+    )
+    .await
+    {
         ImageBytes::Ok { mime, bytes } => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             MediaOutcome::Image(format!("data:{mime};base64,{encoded}"))
@@ -256,7 +261,13 @@ pub async fn fetch_image_bytes(
     claimed: Option<&str>,
     max_bytes: u64,
     sender_key: &str,
+    message_id: Option<&str>,
 ) -> ImageBytes {
+    // `sender_key` is always `"{platform}:{id}"` (every caller builds it that
+    // way), so the platform for the log below comes from data already passed
+    // in rather than a second parameter every caller would also have to thread.
+    let platform = sender_key.split_once(':').map_or(sender_key, |(p, _)| p);
+
     if !claimed_type_is_image(claimed) {
         return ImageBytes::Rejected(format!(
             "Attachment rejected: unsupported type ({})",
@@ -275,12 +286,23 @@ pub async fn fetch_image_bytes(
         request = request.bearer_auth(token);
     }
     let Ok(response) = request.send().await else {
+        // No status to report: the request never got a response (DNS, TLS,
+        // timeout, connection refused). The url and any bearer stay out of the
+        // log line either way.
+        tracing::warn!(
+            "{platform}: inbound media fetch failed before a response arrived (message {})",
+            message_id.unwrap_or("unknown")
+        );
         return ImageBytes::Rejected("Attachment unavailable: media fetch failed".into());
     };
     if !response.status().is_success() {
+        let status = response.status().as_u16();
+        tracing::warn!(
+            "{platform}: inbound media fetch failed with HTTP {status} (message {})",
+            message_id.unwrap_or("unknown")
+        );
         return ImageBytes::Rejected(format!(
-            "Attachment unavailable: media fetch failed (HTTP {})",
-            response.status().as_u16()
+            "Attachment unavailable: media fetch failed (HTTP {status})"
         ));
     }
     if let Some(len) = response.content_length() {
@@ -399,7 +421,7 @@ mod tests {
 
         // Control first: the same call succeeds and does reach the server, so
         // the assertion below cannot pass because the server was unreachable.
-        let outcome = fetch_image(&client, &url, None, Some("image/png"), 65536, key).await;
+        let outcome = fetch_image(&client, &url, None, Some("image/png"), 65536, key, None).await;
         assert!(matches!(outcome, MediaOutcome::Image(_)), "{outcome:?}");
         let after_control = HITS.load(Ordering::SeqCst);
         assert_eq!(
@@ -411,7 +433,7 @@ mod tests {
             assert!(charge(key).is_ok());
         }
 
-        let outcome = fetch_image(&client, &url, None, Some("image/png"), 65536, key).await;
+        let outcome = fetch_image(&client, &url, None, Some("image/png"), 65536, key, None).await;
         assert!(
             matches!(outcome, MediaOutcome::Rejected(ref note) if note.contains("media budget spent")),
             "{outcome:?}"
@@ -503,6 +525,52 @@ mod tests {
         assert_eq!(marker, "[IMAGE:data:image/png;base64,AAA]");
     }
 
+    /// A failed inbound download must leave a trace in the journal beyond the
+    /// note the user saw, or an operator has no way to tell a network problem
+    /// from a missing permission. The fetch is shared by every channel, so
+    /// the log line lives here once rather than in each caller.
+    #[test]
+    fn a_non_success_download_status_is_logged_with_no_token_or_query_string() {
+        let logged = warnings_from(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a runtime")
+                .block_on(async {
+                    async fn not_found() -> axum::http::StatusCode {
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                    let app = axum::Router::new().route("/media", axum::routing::get(not_found));
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind loopback");
+                    let addr = listener.local_addr().expect("addr");
+                    tokio::spawn(async move {
+                        let _ = axum::serve(listener, app).await;
+                    });
+
+                    let client = reqwest::Client::new();
+                    let _ = fetch_image_bytes(
+                        &client,
+                        &format!("http://{addr}/media?access_key=fake-not-real"),
+                        Some("fake-bearer-not-real"),
+                        Some("image/png"),
+                        1024,
+                        "lark:ou_fake_not_real",
+                        Some("om_fake_not_real"),
+                    )
+                    .await;
+                });
+        });
+        assert!(logged.contains("HTTP 404"), "log was: {logged}");
+        assert!(logged.contains("om_fake_not_real"), "log was: {logged}");
+        assert!(logged.contains("lark"), "log was: {logged}");
+        assert!(
+            !logged.contains("access_key") && !logged.contains("fake-bearer-not-real"),
+            "log carried the query string or the bearer token: {logged}"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_failure_is_reported_not_silent() {
         let client = reqwest::Client::new();
@@ -514,6 +582,7 @@ mod tests {
             Some("image/png"),
             1024,
             "test:fetch_failure",
+            None,
         )
         .await;
         let MediaOutcome::Rejected(note) = outcome else {
@@ -553,6 +622,7 @@ mod tests {
             Some("image/png"),
             1024,
             "test:oversized",
+            None,
         )
         .await;
         assert!(
@@ -569,6 +639,7 @@ mod tests {
             Some("image/png"),
             65536,
             "test:oversized_control",
+            None,
         )
         .await;
         assert!(
