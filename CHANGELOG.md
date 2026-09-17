@@ -130,9 +130,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each channel's own matching rule (Telegram's numeric-id/username pair included) right after the
   refresh, and drops the message with one INFO line if it no longer passes — before any command,
   model call or tool. Pairing (`/bind`, `/claim`) is unaffected: every listener already handles those
-  before a message ever reaches dispatch. Re-adding a sender still only takes effect once some
-  message reaches dispatch on any channel; making that apply on the config write itself, independent
-  of traffic, ran into an unresolved watcher-integration issue and is not part of this fix.
+  before a message ever reaches dispatch.
+- **Re-adding a sender takes effect from the config write itself, not the next message.** The
+  revocation fix above still left the opposite case broken: a sender added back to `config.toml` was
+  rejected by the listener's stale in-memory list until some *other* message reached dispatch on any
+  channel (or the daemon restarted) and triggered the refresh that also happens to apply this
+  channel's edit. Each channel runtime now keeps its own `config.toml` watcher alive for as long as
+  it runs and applies a change the moment the watcher's debounce fires, independent of traffic.
+  `ConfigWatcher` no longer exposes its tick channel as a public field — a caller that moved the
+  receiver out on its own, without keeping the watcher itself alive, silently stopped seeing ticks;
+  it now exposes `changed()` and `try_changed()` instead, and the two existing hot-reload consumers
+  (the TUI, the gateway) were updated to use them.
 - **Lark tells the model it can attach a file.** `send_attachment` shipped in plan 379, but nothing
   overrode `delivery_instructions` (the trait default is `None`), so the model was never told the
   marker syntax and the upload path went unreached — the bot told the owner it could not send
