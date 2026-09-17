@@ -740,7 +740,13 @@ impl LarkChannel {
                             };
                             let Some(image_key) = v.get("image_key").and_then(|k| k.as_str()) else { continue };
                             let url = self.image_resource_url(&lark_msg.message_id, image_key);
-                            self.resolve_image_outcome(&url, sender_open_id).await.to_marker()
+                            self.resolve_image_outcome(
+                                &url,
+                                sender_open_id,
+                                Some(&lark_msg.message_id),
+                            )
+                                .await
+                                .to_marker()
                         }
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
@@ -1101,6 +1107,7 @@ impl LarkChannel {
         &self,
         download_url: &str,
         sender_open_id: &str,
+        message_id: Option<&str>,
     ) -> crate::channels::media::MediaOutcome {
         use crate::channels::media::MediaOutcome;
 
@@ -1127,6 +1134,7 @@ impl LarkChannel {
             Some("image/*"),
             cap,
             &sender_key,
+            message_id,
         )
         .await
     }
@@ -1235,7 +1243,10 @@ impl LarkChannel {
                     return messages;
                 };
                 let url = self.image_resource_url(message_id, &image_key);
-                self.resolve_image_outcome(&url, open_id).await.to_marker()
+                let message_id = (!message_id.is_empty()).then_some(message_id);
+                self.resolve_image_outcome(&url, open_id, message_id)
+                    .await
+                    .to_marker()
             }
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
@@ -1582,6 +1593,16 @@ impl Channel for LarkChannel {
 
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
+    }
+
+    /// Lark can deliver attachments (`send_attachment`), so the model is told
+    /// the marker syntax. Telling a channel that cannot deliver them leaks
+    /// `[IMAGE:…]` to the reader as literal text, which is why this is
+    /// per-channel and not a default.
+    fn delivery_instructions(&self, workspace: &std::path::Path) -> Option<String> {
+        Some(crate::channels::media::delivery_instructions_for(
+            "Lark", workspace,
+        ))
     }
 }
 
@@ -2362,7 +2383,11 @@ mod tests {
         seed_tenant_token(&ch, "test-tenant-token").await;
 
         let marker = ch
-            .resolve_image_outcome(&format!("http://{addr}/shot.png"), "ou_media_user")
+            .resolve_image_outcome(
+                &format!("http://{addr}/shot.png"),
+                "ou_media_user",
+                Some("om_fake_not_real"),
+            )
             .await
             .to_marker();
         assert!(
@@ -2390,7 +2415,11 @@ mod tests {
         // rather than a fetch failure is itself proof the refusal lands
         // before the request goes out.
         let outcome = ch
-            .resolve_image_outcome("http://127.0.0.1:1/shot.png", sender)
+            .resolve_image_outcome(
+                "http://127.0.0.1:1/shot.png",
+                sender,
+                Some("om_fake_not_real"),
+            )
             .await;
         assert!(
             matches!(outcome, media::MediaOutcome::Rejected(ref note) if note.contains("budget")),
@@ -2425,6 +2454,27 @@ mod tests {
     fn lark_channel_name() {
         let ch = make_channel();
         assert_eq!(ch.name(), "lark");
+    }
+
+    /// A channel that can upload a file but never tells the model the marker
+    /// syntax leaves the upload path unreachable: the model has no way to
+    /// know a bare `[IMAGE:<path>]` in its reply does anything. Through
+    /// `Arc<dyn Channel>`, the real dispatch path (`dispatch.rs` holds every
+    /// channel this way), not the concrete type — a definition in a plain
+    /// `impl LarkChannel` block would pass a direct call and still be
+    /// invisible here.
+    #[test]
+    fn lark_through_the_real_channel_trait_object_tells_the_model_how_to_attach() {
+        let ch: std::sync::Arc<dyn Channel> = std::sync::Arc::new(make_channel());
+        let workspace = std::path::Path::new("/ws/rantaiclaw");
+        let instructions = ch
+            .delivery_instructions(workspace)
+            .expect("Lark can send attachments, so this must be Some");
+        assert!(instructions.contains("Lark"), "{instructions}");
+        assert!(
+            instructions.contains("/ws/rantaiclaw"),
+            "the workspace path the resolver accepts must be named: {instructions}"
+        );
     }
 
     #[test]

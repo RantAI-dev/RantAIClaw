@@ -228,6 +228,7 @@ impl LinqChannel {
                     claimed,
                     cap,
                     &sender_key,
+                    Some(message.id.as_str()),
                 )
                 .await
                 .to_marker();

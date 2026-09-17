@@ -229,6 +229,7 @@ impl DiscordChannel {
         let cap = crate::channels::media::max_bytes(&self.multimodal);
         let client = self.http_client();
         let sender_key = format!("discord:{sender}");
+        let message_id = message.get("id").and_then(|id| id.as_str());
 
         let mut markers = Vec::new();
         for attachment in attachments.iter().take(max_images) {
@@ -239,9 +240,16 @@ impl DiscordChannel {
             // Discord CDN links are pre-authorized; the bot token is not sent,
             // which keeps the credential out of a request whose host is chosen
             // by the payload.
-            let outcome =
-                crate::channels::media::fetch_image(&client, url, None, claimed, cap, &sender_key)
-                    .await;
+            let outcome = crate::channels::media::fetch_image(
+                &client,
+                url,
+                None,
+                claimed,
+                cap,
+                &sender_key,
+                message_id,
+            )
+            .await;
             markers.push(outcome.to_marker());
         }
         markers

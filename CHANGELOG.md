@@ -133,6 +133,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before a message ever reaches dispatch. Re-adding a sender still only takes effect once some
   message reaches dispatch on any channel; making that apply on the config write itself, independent
   of traffic, ran into an unresolved watcher-integration issue and is not part of this fix.
+- **Lark tells the model it can attach a file.** `send_attachment` shipped in plan 379, but nothing
+  overrode `delivery_instructions` (the trait default is `None`), so the model was never told the
+  marker syntax and the upload path went unreached — the bot told the owner it could not send
+  attachments "on this WhatsApp/Telegram channel" while chatting on Lark. Lark now returns the same
+  shared instructions Telegram, Discord, Slack and WhatsApp Web do. A non-success inbound media
+  download now logs one WARN naming the platform, the HTTP status and the real per-message id
+  (Telegram's chat message, WhatsApp Cloud's `wamid`, Lark's `om_…`, never the media/file handle
+  used to fetch it), and never the URL's query string or a bearer token — the previous silence is
+  why a failed Lark image download left no trace of why in the journal. The required Lark
+  app scopes are documented (`docs/reference/channels.md` §4.11): `im:resource` covers uploading, but
+  reading an inbound image's own resource needs the separate `im:message:readonly` scope, missing from
+  the scope table an operator was given, and its absence answers Lark error `99991672`.
 - **Set-aside WhatsApp Web session files keep names SQLite can reopen.** When the runtime moved an
   unreferenced session into `workspace/.unlinked/`, each `-wal` and `-shm` companion got the base name
   twice, `<unix>-whatsapp.db-whatsapp.db-wal`, so a session restored by moving the files back and
