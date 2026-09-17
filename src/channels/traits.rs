@@ -208,9 +208,13 @@ pub trait Channel: Send + Sync {
     /// server's graceful shutdown. The exception is a connection the channel
     /// also sends through (WhatsApp Web): it stops forwarding when `cancel`
     /// fires but stays open, so replies still go out while dispatch drains, and
-    /// is torn down in [`close`](Self::close). The supervisor also drops the
-    /// future, but that is a backstop for channels with nothing to tear down,
-    /// not the contract: a dropped future sends nothing and frees no port.
+    /// is torn down in [`close`](Self::close). The supervisor gives that
+    /// teardown a bounded grace period (`supervisor::LISTENER_SHUTDOWN_GRACE`)
+    /// after `cancel` fires, then drops the future regardless of whether it
+    /// finished; that drop is a backstop for channels with nothing to tear
+    /// down, not the contract, and a dropped future sends nothing and frees no
+    /// port, so teardown that takes longer than the grace period is not
+    /// guaranteed to complete.
     async fn listen(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,

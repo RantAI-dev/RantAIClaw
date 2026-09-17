@@ -201,6 +201,16 @@ const CHANNEL_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_se
 /// cannot use up the drain that the other conversations' notices need.
 const CHANNEL_NOTICE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// On shutdown, how long a listener's own cancel-handling gets to run (e.g.
+/// sending a close frame) before the supervisor stops polling it and moves
+/// on. Applies once per channel, and every channel's supervisor loop runs in
+/// its own task racing the same shutdown token the dispatch drain does, so in
+/// practice this finishes well inside the drain's own window rather than
+/// after it. Two seconds keeps the conservative, easy-to-check sum below
+/// treating all three durations as if they added up in sequence, even though
+/// they do not; see the assertion below for why that simplification is safe.
+pub(crate) const LISTENER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long the channel runtime may take to stop once its shutdown token fires:
 /// the drain deadline, its notices, and closing the channels after it. The
 /// daemon's drain (`daemon::DRAIN_TIMEOUT`) is this value, and the TUI waits
@@ -209,10 +219,24 @@ const CHANNEL_NOTICE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::fr
 pub(crate) const CHANNEL_RUNTIME_STOP_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(16);
 
+// Compares nanoseconds, not `.as_secs()`, so a future sub-second value in any
+// of the three durations cannot truncate away and pass this by accident.
+//
+// The dispatch drain, its one notice, and a listener's shutdown grace do not
+// actually run in series — the per-channel supervisor loops race the same
+// shutdown token the dispatch drain does, starting at the same instant, so a
+// listener's grace period is normally already spent well before a busy
+// drain's own worst case elapses. Summing them as if they did run in series
+// is a deliberately pessimistic simplification: it is simple to state, cheap
+// to check at compile time, and still safe, since the real worst case is
+// never larger than this sum.
 const _: () = assert!(
-    CHANNEL_DRAIN_DEADLINE.as_secs() + CHANNEL_NOTICE_SEND_TIMEOUT.as_secs()
-        < CHANNEL_RUNTIME_STOP_TIMEOUT.as_secs(),
-    "the drain deadline and one notice must fit inside the runtime's stop timeout"
+    CHANNEL_DRAIN_DEADLINE.as_nanos()
+        + CHANNEL_NOTICE_SEND_TIMEOUT.as_nanos()
+        + LISTENER_SHUTDOWN_GRACE.as_nanos()
+        <= CHANNEL_RUNTIME_STOP_TIMEOUT.as_nanos(),
+    "the drain deadline, one notice and the listener's shutdown grace must fit inside the \
+     runtime's stop timeout even under the pessimistic assumption that they run in series"
 );
 
 /// Backstop for waiting on a previous in-flight turn to signal completion.
