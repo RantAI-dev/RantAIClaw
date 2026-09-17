@@ -8006,14 +8006,17 @@ async fn supervised_listener_refreshes_health_while_running() {
     assert!(calls.load(Ordering::SeqCst) >= 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn supervised_listener_stops_on_shutdown_cancellation() {
     // Regression guard for the in-place channel restart path: cancelling
     // the shutdown token must stop the listener even while the message
     // bus is still open (rx alive) AND the channel ignores the token —
     // `BlockUntilClosedChannel` parks on `tx.closed()` and never reads
     // `_cancel`, so only the supervisor's `shutdown.cancelled()` backstop
-    // can unstick it. Without it the TUI could not restart channels.
+    // can unstick it. Without it the TUI could not restart channels. A
+    // token-ignoring listener now gets `LISTENER_SHUTDOWN_GRACE` before
+    // being dropped rather than being dropped the instant cancellation
+    // fires, so the bound here allows for that plus a margin.
     let calls = Arc::new(AtomicUsize::new(0));
     let channel_name = format!("test-supervised-shutdown-{}", uuid::Uuid::new_v4());
     let channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
@@ -8034,10 +8037,10 @@ async fn supervised_listener_stops_on_shutdown_cancellation() {
     );
 
     shutdown.cancel();
-    let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    let join = tokio::time::timeout(LISTENER_SHUTDOWN_GRACE + Duration::from_secs(1), handle).await;
     assert!(
         join.is_ok(),
-        "listener should stop promptly when shutdown is cancelled"
+        "listener should stop within its shutdown grace period plus a margin"
     );
 }
 
@@ -9247,4 +9250,92 @@ fn every_tier_channel_shows_and_clears_a_working_signal() {
              token reports healthy"
         );
     }
+}
+
+// ── a listener gets to run its own shutdown before it is dropped ──────────
+
+/// A listener whose own cancel-handling is nothing but waiting on the same
+/// token the supervisor also watches, with no further async step after that.
+/// The moment the token fires, both the supervisor's own wait and this future
+/// become ready on the very same poll, a genuine tie that `race_until_cancelled`'s
+/// `biased` select must resolve toward cancellation every time, not by luck.
+/// Many iterations exist to catch a regression that drops `biased`: without
+/// it, tokio picks between two ready branches roughly like a coin flip, and
+/// this loop would then fail on close to half of a large run, not silently.
+#[tokio::test(start_paused = true)]
+async fn cancellation_wins_every_tie_against_a_listener_that_only_waits_on_it() {
+    for _ in 0..500 {
+        let shutdown = CancellationToken::new();
+        let waits_on_shutdown = shutdown.clone();
+        let listen_future = async move { waits_on_shutdown.cancelled().await };
+        tokio::pin!(listen_future);
+
+        shutdown.cancel();
+        let outcome =
+            supervisor::race_until_cancelled(listen_future, &shutdown, Duration::from_secs(2))
+                .await;
+
+        assert!(
+            outcome.is_none(),
+            "cancellation must win a tie against a listener with nothing left to do, every time"
+        );
+    }
+}
+
+/// A listener that notices cancellation and then does a little more work
+/// before it is really done, such as Lark sending a close frame. This is not
+/// a tie, since it needs a further poll after the token fires. Run over many
+/// iterations for the same reason as the tie test above, so this is never
+/// lost to scheduling luck.
+#[tokio::test(start_paused = true)]
+async fn a_listener_gets_the_grace_period_to_finish_closing_after_cancellation() {
+    for _ in 0..500 {
+        let shutdown = CancellationToken::new();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_write = Arc::clone(&closed);
+        let waits_on_shutdown = shutdown.clone();
+        let listen_future = async move {
+            waits_on_shutdown.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            closed_write.store(true, Ordering::SeqCst);
+        };
+        tokio::pin!(listen_future);
+
+        shutdown.cancel();
+        supervisor::race_until_cancelled(listen_future, &shutdown, Duration::from_secs(2)).await;
+
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "a listener must get to finish its own cancel-handling within the grace period"
+        );
+    }
+}
+
+/// A listener that never reacts to the token at all (ignores it entirely):
+/// this is the older, simpler case the cancel arm already existed to handle,
+/// and it must still be dropped rather than polled forever.
+#[tokio::test(start_paused = true)]
+async fn a_listener_that_ignores_the_token_is_dropped_once_the_grace_period_elapses() {
+    let shutdown = CancellationToken::new();
+    let listen_future = std::future::pending::<()>();
+    tokio::pin!(listen_future);
+
+    shutdown.cancel();
+    let start = tokio::time::Instant::now();
+    let outcome =
+        supervisor::race_until_cancelled(listen_future, &shutdown, Duration::from_secs(2)).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        outcome.is_none(),
+        "a listener that never returns must still count as cancelled"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "must wait out the full grace period before giving up on an unresponsive listener, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "must not wait past the grace period plus a small margin, took {elapsed:?}"
+    );
 }

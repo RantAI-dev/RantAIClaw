@@ -145,6 +145,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   app scopes are documented (`docs/reference/channels.md` §4.11): `im:resource` covers uploading, but
   reading an inbound image's own resource needs the separate `im:message:readonly` scope, missing from
   the scope table an operator was given, and its absence answers Lark error `99991672`.
+- **A channel listener gets two more seconds to finish closing before the supervisor drops it.** On
+  shutdown, the supervisor raced the same cancellation token against the listener's own future with a
+  plain, unbiased `select!`; a listener honouring the token by sending a close frame (Lark's WS) could
+  lose that race and be dropped mid-close, live evidence showed it happening more often than not. The
+  cancel arm now always wins, and the listener gets a two-second grace period afterward to finish on
+  its own before it is dropped — a bound, not a guarantee, so a close that occasionally needs longer
+  can still be cut short, just far less often than before. A listener that ignores the token entirely
+  is still dropped once that grace period elapses, so restarting a channel is never blocked on one
+  that never reacts to shutdown.
 - **Set-aside WhatsApp Web session files keep names SQLite can reopen.** When the runtime moved an
   unreferenced session into `workspace/.unlinked/`, each `-wal` and `-shm` companion got the base name
   twice, `<unix>-whatsapp.db-whatsapp.db-wal`, so a session restored by moving the files back and

@@ -11,7 +11,7 @@ use super::{
     CHANNEL_HEALTH_FAILURE_THRESHOLD, CHANNEL_HEALTH_HEARTBEAT_SECS,
     CHANNEL_HEALTH_PROBE_TIMEOUT_SECS, CHANNEL_MAX_IN_FLIGHT_MESSAGES,
     CHANNEL_MIN_IN_FLIGHT_MESSAGES, CHANNEL_PARALLELISM_PER_CHANNEL,
-    CHANNEL_TYPING_REFRESH_INTERVAL_SECS,
+    CHANNEL_TYPING_REFRESH_INTERVAL_SECS, LISTENER_SHUTDOWN_GRACE,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -117,6 +117,32 @@ pub(crate) fn acquire_channel_lock(channel: &str) -> ChannelLock {
     }
 }
 
+/// Races `listen_future` against `shutdown`. While neither has fired, whichever
+/// resolves first wins; `biased` makes cancellation win a tie so it is never
+/// missed. Once `shutdown` fires, `listen_future` still gets up to `grace` to
+/// return on its own (e.g. a listener sending a close frame in response to the
+/// same token) before this gives up on it. Returns `None` whenever shutdown
+/// fired, whether or not `listen_future` finished inside the grace window;
+/// returns `Some` only for a listener that finished on its own, unprompted by
+/// shutdown.
+pub(crate) async fn race_until_cancelled<F: std::future::Future>(
+    mut listen_future: std::pin::Pin<&mut F>,
+    shutdown: &CancellationToken,
+    grace: Duration,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => {
+            // Wait for it to finish, but a listener whose own cancel-handling
+            // happens to complete inside the grace window still counts as
+            // cancelled, never mistaken for a normal return on its own.
+            let _ = tokio::time::timeout(grace, listen_future.as_mut()).await;
+            None
+        }
+        result = &mut listen_future => Some(result),
+    }
+}
+
 pub(crate) fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
@@ -191,23 +217,21 @@ pub(crate) fn spawn_supervised_listener_with_health_interval(
 
         'supervise: loop {
             crate::health::mark_component_ok(&component);
-            let result = {
+            let outcome = {
                 // Pass the shared shutdown token so a well-behaved channel
-                // (e.g. Telegram) aborts its long-poll cleanly. The
-                // `shutdown.cancelled()` select arm is a backstop for
-                // channels that ignore the token: breaking the loop drops
-                // the pinned listen future, cancelling its in-flight work.
+                // (e.g. Telegram) aborts its long-poll cleanly.
                 let listen_future = ch.listen(tx.clone(), shutdown.clone());
                 tokio::pin!(listen_future);
-
-                loop {
-                    tokio::select! {
-                        () = shutdown.cancelled() => break 'supervise,
-                        result = &mut listen_future => break result,
-                    }
-                }
+                race_until_cancelled(listen_future, &shutdown, LISTENER_SHUTDOWN_GRACE).await
+            };
+            let Some(result) = outcome else {
+                break 'supervise;
             };
 
+            // `shutdown.is_cancelled()` is normally already caught above by
+            // `race_until_cancelled` returning `None`; it stays as a second
+            // check for the narrow window where cancellation lands between
+            // that call returning `Some` and this line running.
             if tx.is_closed() || shutdown.is_cancelled() {
                 break;
             }
