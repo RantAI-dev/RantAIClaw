@@ -9,11 +9,13 @@
 //! why the runtime modules use `tracing` instead.
 
 use super::factory;
+use super::traits::Channel;
 use super::{
     channel_is_configured, CHANNEL_CATALOG, OPENRC_RESTART_ARGS, OPENRC_STATUS_ARGS,
     SYSTEMD_STATUS_ARGS,
 };
 use crate::config::Config;
+use crate::doctor::checks::channels::{probe_whatsapp_web, ProbeWebResult};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
@@ -533,6 +535,84 @@ pub(crate) fn classify_health_result(
     }
 }
 
+/// WhatsApp Web's in-process client and bot task only exist once `listen` has
+/// run, which happens in the daemon, never in this CLI process — so asking a
+/// freshly built channel object whether it holds one always answers no, blaming
+/// auth, config or network for a problem that does not exist. Judge it instead
+/// by the same offline session-file probe the general doctor check already
+/// uses, and word the verdict around what was actually checked: the saved
+/// session, not a live connection this process never opens.
+async fn whatsapp_web_doctor_state(config: &Config) -> (ChannelHealthState, String) {
+    let session_path = config
+        .channels_config
+        .whatsapp_web
+        .as_ref()
+        .expect(
+            "channel_doctor_state is only called with key \"whatsapp_web\" for a channel \
+             build_configured_channels registered, and that only happens when \
+             config.channels_config.whatsapp_web is Some",
+        )
+        .session_path
+        .clone();
+
+    // `probe_whatsapp_web` is a blocking filesystem call; bound it the same
+    // 10s every other channel's health check is bounded to, so a stalled
+    // network mount under the session path cannot hang the whole command.
+    let probed = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || probe_whatsapp_web(&session_path)),
+    )
+    .await;
+
+    match probed {
+        Ok(Ok(ProbeWebResult::Ok)) => (ChannelHealthState::Healthy, "session present".to_string()),
+        Ok(Ok(ProbeWebResult::SessionMissing)) => (
+            ChannelHealthState::Unhealthy,
+            "no session file yet; run `rantaiclaw setup whatsapp-web` to link".to_string(),
+        ),
+        Ok(Ok(ProbeWebResult::SessionPathBad(e))) => (
+            ChannelHealthState::Unhealthy,
+            format!("session file unreadable: {e}"),
+        ),
+        Ok(Err(_)) => (
+            ChannelHealthState::Unhealthy,
+            "session probe task panicked".to_string(),
+        ),
+        Err(_) => (ChannelHealthState::Timeout, "timed out (>10s)".to_string()),
+    }
+}
+
+/// A channel judged by asking the object built in this process whether it
+/// already holds a live connection, wrapped in the doctor's shared timeout.
+/// Wrong for a channel whose connection only exists in the daemon process
+/// (see `whatsapp_web_doctor_state`), right for every channel that connects
+/// on demand instead of through a long-running listener.
+async fn in_process_doctor_state(channel: &dyn Channel) -> (ChannelHealthState, String) {
+    let result = tokio::time::timeout(Duration::from_secs(10), channel.health_check()).await;
+    let state = classify_health_result(&result);
+    let detail = match state {
+        ChannelHealthState::Healthy => "healthy".to_string(),
+        ChannelHealthState::Unhealthy => "unhealthy (auth/config/network)".to_string(),
+        ChannelHealthState::Timeout => "timed out (>10s)".to_string(),
+    };
+    (state, detail)
+}
+
+/// One configured channel's doctor verdict, keyed by its registry key so a
+/// channel whose live state only exists in the daemon process can be judged a
+/// different way than one this CLI process can ask directly.
+async fn channel_doctor_state(
+    key: &str,
+    channel: &dyn Channel,
+    config: &Config,
+) -> (ChannelHealthState, String) {
+    if key == "whatsapp_web" {
+        whatsapp_web_doctor_state(config).await
+    } else {
+        in_process_doctor_state(channel).await
+    }
+}
+
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     factory::warn_unused_channel_config(&config);
@@ -550,22 +630,21 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     let mut unhealthy = 0_u32;
     let mut timeout = 0_u32;
 
-    for (_key, name, channel) in channels {
-        let result = tokio::time::timeout(Duration::from_secs(10), channel.health_check()).await;
-        let state = classify_health_result(&result);
+    for (key, name, channel) in channels {
+        let (state, detail) = channel_doctor_state(key, channel.as_ref(), &config).await;
 
         match state {
             ChannelHealthState::Healthy => {
                 healthy += 1;
-                println!("  ✅ {name:<9} healthy");
+                println!("  ✅ {name:<9} {detail}");
             }
             ChannelHealthState::Unhealthy => {
                 unhealthy += 1;
-                println!("  ❌ {name:<9} unhealthy (auth/config/network)");
+                println!("  ❌ {name:<9} {detail}");
             }
             ChannelHealthState::Timeout => {
                 timeout += 1;
-                println!("  ⏱️  {name:<9} timed out (>10s)");
+                println!("  ⏱️  {name:<9} {detail}");
             }
         }
     }
@@ -577,4 +656,117 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     println!();
     println!("Summary: {healthy} healthy, {unhealthy} unhealthy, {timeout} timed out");
     Ok(())
+}
+
+#[cfg(test)]
+mod doctor_channels_tests {
+    use super::*;
+
+    fn config_with_session(session_path: &str) -> Config {
+        let mut config = Config::default();
+        config.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+            session_path: session_path.to_string(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["+15550000001".into()],
+        });
+        config
+    }
+
+    #[tokio::test]
+    async fn a_readable_session_file_reads_healthy_and_says_so() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.db");
+        std::fs::write(&path, b"not empty").expect("write a fixture session file");
+
+        let (state, detail) =
+            whatsapp_web_doctor_state(&config_with_session(path.to_str().expect("utf8 path")))
+                .await;
+
+        assert_eq!(state, ChannelHealthState::Healthy);
+        assert_eq!(detail, "session present");
+    }
+
+    #[tokio::test]
+    async fn a_missing_session_names_that_specifically_not_the_generic_wording() {
+        let (state, detail) =
+            whatsapp_web_doctor_state(&config_with_session("/nonexistent/path/to/session.db"))
+                .await;
+
+        assert_eq!(state, ChannelHealthState::Unhealthy);
+        assert!(
+            detail.contains("session"),
+            "must name the session, not a generic cause: {detail}"
+        );
+        assert_ne!(
+            detail, "unhealthy (auth/config/network)",
+            "must not reuse the generic wording meant for channels that need a live connection"
+        );
+    }
+
+    /// The bug this plan fixes: a fresh, CLI-built `WhatsAppWebChannel` never
+    /// ran `listen`, so it never holds a live client, and `health_check` on it
+    /// always answers false regardless of whether the daemon is actually
+    /// connected. Proven through the exact registration `doctor_channels`
+    /// itself uses (`factory::build_configured_channels`, not a hand-built
+    /// channel with a hardcoded key), so a future rename of either side's key
+    /// string in isolation fails this test rather than silently regressing to
+    /// always-unhealthy with every test still green.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn the_doctor_dispatch_reads_a_present_session_healthy_though_health_check_would_not() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.db");
+        std::fs::write(&path, b"not empty").expect("write a fixture session file");
+        let config = config_with_session(path.to_str().expect("utf8 path"));
+
+        let (key, _name, channel) = factory::build_configured_channels(&config)
+            .into_iter()
+            .find(|(key, ..)| *key == "whatsapp_web")
+            .expect("a filled whatsapp_web table registers under the real doctor_channels path");
+        assert!(
+            !channel.health_check().await,
+            "control: a freshly built channel object never ran `listen`, so it must not \
+             already claim a live client"
+        );
+
+        let (state, detail) = channel_doctor_state(key, channel.as_ref(), &config).await;
+        assert_eq!(
+            state,
+            ChannelHealthState::Healthy,
+            "the doctor's own verdict must come from the session file, not the channel object: {detail}"
+        );
+        assert_eq!(detail, "session present");
+    }
+
+    /// A channel keyed by anything other than `whatsapp_web` must still go
+    /// through the in-process `health_check` path (default `true`) — this
+    /// plan changes what judges WhatsApp Web specifically, not every channel.
+    #[tokio::test]
+    async fn a_different_key_still_goes_through_health_check() {
+        struct AlwaysHealthy;
+        #[async_trait::async_trait]
+        impl Channel for AlwaysHealthy {
+            fn name(&self) -> &str {
+                "always-healthy-test-double"
+            }
+
+            async fn send(&self, _message: &super::super::SendMessage) -> Result<()> {
+                unimplemented!("not exercised by this test")
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> Result<()> {
+                unimplemented!("not exercised by this test")
+            }
+        }
+
+        let (state, detail) =
+            channel_doctor_state("not-whatsapp-web", &AlwaysHealthy, &Config::default()).await;
+        assert_eq!(state, ChannelHealthState::Healthy);
+        assert_eq!(detail, "healthy");
+    }
 }

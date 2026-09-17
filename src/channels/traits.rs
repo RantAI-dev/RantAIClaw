@@ -231,6 +231,14 @@ pub trait Channel: Send + Sync {
     /// status. The probe runs in its own task, so a slow one cannot stall
     /// message delivery.
     ///
+    /// One exception: a channel whose live connection only exists once
+    /// `listen` has run cannot answer this meaningfully from the separate,
+    /// short-lived process `doctor channels` runs in, since that process
+    /// never calls `listen`. WhatsApp Web's `doctor_channels` verdict comes
+    /// from its saved session file instead, bypassing this method entirely
+    /// for that one command while the supervisor's heartbeat still uses it
+    /// unchanged.
+    ///
     /// An implementation MUST be able to fail for the condition it exists to
     /// catch. A probe that only checks the HTTP status of an API that reports
     /// errors in its body reports healthy for a revoked token.

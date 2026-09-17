@@ -505,13 +505,13 @@ async fn probe_lark(
     }
 }
 
-enum ProbeWebResult {
+pub(crate) enum ProbeWebResult {
     Ok,
     SessionMissing,
     SessionPathBad(String),
 }
 
-fn probe_whatsapp_web(path: &str) -> ProbeWebResult {
+pub(crate) fn probe_whatsapp_web(path: &str) -> ProbeWebResult {
     let expanded = shellexpand::tilde(path).to_string();
     let p = std::path::Path::new(&expanded);
     match std::fs::metadata(p) {
