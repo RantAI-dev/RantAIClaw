@@ -1478,6 +1478,44 @@ pub(crate) async fn spawn_webhook_dispatch(
     })))
 }
 
+/// Watch this runtime's `config.toml` and apply a change as soon as it lands,
+/// instead of waiting for the next message to pass through dispatch (which is
+/// the only other place a reload runs). Keeps the whole `ConfigWatcher` alive
+/// for the task's life — dropping everything but its receiver stops the
+/// notify watch and the debounce task feeding it, which would silently turn
+/// this into a task that never wakes up again.
+///
+/// `None` when this runtime has no resolvable config path (`build_channel_runtime`
+/// seeded no `rantaiclaw_dir`) or the watch could not be set up; the runtime
+/// still works, it just keeps relying on dispatch to pick up config changes.
+fn spawn_config_watch_refresh(
+    ctx: Arc<ChannelRuntimeContext>,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let config_path = routing::runtime_config_path(&ctx)?;
+    let mut watcher = match crate::config::watcher::ConfigWatcher::watch(&config_path) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("channel config hot-reload disabled: {e:#}");
+            return None;
+        }
+    };
+    Some(tokio::spawn(async move {
+        loop {
+            let tick = tokio::select! {
+                t = watcher.changed() => t,
+                () = shutdown.cancelled() => break,
+            };
+            if tick.is_none() {
+                break;
+            }
+            if let Err(err) = routing::maybe_apply_runtime_config_update(&ctx).await {
+                tracing::warn!("failed to apply a channel config change: {err:#}");
+            }
+        }
+    }))
+}
+
 /// Supervise the listeners and run the dispatch loop for an already-built runtime.
 pub(crate) async fn run_channel_runtime(
     runtime: ChannelRuntime,
@@ -1504,6 +1542,7 @@ pub(crate) async fn run_channel_runtime(
             shutdown.clone(),
         ));
     }
+    let config_watch_handle = spawn_config_watch_refresh(ctx.clone(), shutdown.clone());
     // Publish before dropping our copy: the bus keeps its own clone, so the
     // gateway can enqueue for as long as this runtime lives. Cleared on exit so
     // an inbound webhook during a restart is refused rather than accepted into a
@@ -1520,6 +1559,10 @@ pub(crate) async fn run_channel_runtime(
 
     if let Some(ref bus) = bus {
         bus.clear().await;
+    }
+
+    if let Some(h) = config_watch_handle {
+        let _ = h.await;
     }
 
     // Dispatch has returned, so every reply and restart notice has gone out.

@@ -2618,6 +2618,76 @@ async fn allowlist_edit_reaches_the_live_channel_without_restart() {
     );
 }
 
+/// The re-add half of the allowlist race: a sender added back to the
+/// allowlist must reach the live channel from the config file watch alone —
+/// no other message may pass through dispatch to trigger the refresh dispatch
+/// itself runs. Reuses `allowlist_test_ctx`; the only new thing under test is
+/// the watch task, not the config-file plumbing
+/// `allowlist_edit_reaches_the_live_channel_without_restart` already covers.
+#[tokio::test]
+async fn a_re_added_sender_reaches_the_live_channel_from_the_file_watch_alone() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let config_path = temp.path().join("config.toml");
+
+    let write_config = |allowed: Vec<String>| {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("openrouter".to_string());
+        config.channels_config.telegram = Some(
+            serde_json::from_value(serde_json::json!({
+                "bot_token": "111:aaaaaaaaaaaaaaaaaaaaaaaaa",
+                "allowed_users": allowed,
+            }))
+            .expect("build TelegramConfig"),
+        );
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+    };
+
+    write_config(vec![]);
+
+    let channel = Arc::new(TelegramRecordingChannel::default());
+    let ctx = Arc::new(allowlist_test_ctx(temp.path(), Arc::clone(&channel)));
+
+    routing::maybe_apply_runtime_config_update(&ctx)
+        .await
+        .expect("initial apply");
+
+    let shutdown = CancellationToken::new();
+    let handle = spawn_config_watch_refresh(Arc::clone(&ctx), shutdown.clone())
+        .expect("a runtime with a resolvable config path spawns a watch task");
+
+    // Stamp is mtime+len, so the rewrite must be distinguishable. Nothing
+    // else in this test ever calls `maybe_apply_runtime_config_update` or
+    // dispatches a message — the watch task is the only path that can make
+    // this land.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write_config(vec!["watcher_test_user".to_string()]);
+
+    let saw_it = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let applied = channel
+                .applied_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned();
+            if applied.as_deref() == Some(["watcher_test_user".to_string()].as_slice()) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    shutdown.cancel();
+    handle.await.expect("watch task joins cleanly on shutdown");
+
+    saw_it.expect("the re-added sender must reach the live channel from the watch alone");
+}
+
 /// The revocation half of the allowlist race: a message from a sender the
 /// listener already let through must still be dropped by dispatch if the
 /// sender was revoked before dispatch got to it — the exact race a queued

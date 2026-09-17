@@ -4,11 +4,12 @@
 //! `src/skills/watcher.rs` uses, so editor saves and `cat >> config.toml`
 //! both arrive as a single tick.
 //!
-//! Consumers drain `reload_rx` and reload the running config on each tick:
-//! the TUI (`TuiApp::reload_config`, per-frame) and the gateway
-//! (`run_gateway` swaps its shared `Config` so the web console reflects the
-//! change). This closes the "edited config.toml directly — running process
-//! still uses the old provider / MCP servers" gap on both surfaces.
+//! Consumers call `changed()` or `try_changed()` and reload the running
+//! config on each tick: the TUI (`TuiApp::reload_config`, per-frame) and the
+//! gateway (`run_gateway` swaps its shared `Config` so the web console
+//! reflects the change). This closes the "edited config.toml directly —
+//! running process still uses the old provider / MCP servers" gap on both
+//! surfaces.
 
 use std::path::Path;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use tokio::sync::mpsc;
 
 pub struct ConfigWatcher {
     _watcher: notify::RecommendedWatcher,
-    pub reload_rx: mpsc::UnboundedReceiver<()>,
+    reload_rx: mpsc::UnboundedReceiver<()>,
 }
 
 /// How long to collapse a burst of events into a single reload tick. 500ms
@@ -110,6 +111,27 @@ impl ConfigWatcher {
             reload_rx,
         })
     }
+
+    /// Wait for the next debounced reload tick. `None` means the background
+    /// task feeding this receiver has ended, which only happens once this
+    /// watcher itself is dropped — so a caller can only observe it by first
+    /// dropping the watcher out from under its own receiver, which the private
+    /// field prevents from happening by accident.
+    pub async fn changed(&mut self) -> Option<()> {
+        self.reload_rx.recv().await
+    }
+
+    /// Non-blocking: drain every pending tick and report whether at least one
+    /// was there. A burst of ticks (several writes in the debounce window)
+    /// collapses to a single `true`, matching `changed`'s one-tick-per-burst
+    /// behavior for a caller that polls instead of awaiting.
+    pub fn try_changed(&mut self) -> bool {
+        let mut any = false;
+        while self.reload_rx.try_recv().is_ok() {
+            any = true;
+        }
+        any
+    }
 }
 
 #[cfg(test)]
@@ -183,10 +205,46 @@ mod tests {
         // Modify the file.
         std::fs::write(&config_path, "initial = 2\n").expect("modify");
 
-        tokio::time::timeout(Duration::from_secs(2), watcher.reload_rx.recv())
+        tokio::time::timeout(Duration::from_secs(2), watcher.changed())
             .await
             .expect("reload within timeout")
             .expect("reload event");
+    }
+
+    /// A local `let ConfigWatcher { reload_rx, .. } = watcher;` at a
+    /// function's own top level does NOT close the channel promptly: Rust
+    /// only drops the un-bound remainder of a partially-moved local when
+    /// *that local's own scope* ends, so `_watcher` stays alive for the rest
+    /// of this test function regardless of what `reload_rx` does. The same
+    /// extraction inside a short-lived scope (a helper that returns just the
+    /// receiver, a `{ }` block) drops the remainder as soon as that scope
+    /// exits — which is exactly the shape a caller reaches for when they
+    /// want "just the receiver" out of the struct, and exactly what closes
+    /// the channel at once.
+    #[tokio::test]
+    async fn extracting_the_receiver_in_a_short_lived_scope_closes_it_at_once() {
+        fn reload_rx_only(watcher: ConfigWatcher) -> mpsc::UnboundedReceiver<()> {
+            let ConfigWatcher { reload_rx, .. } = watcher;
+            reload_rx
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, "initial = 1\n").expect("write initial");
+        let watcher = ConfigWatcher::watch(&config_path).expect("watcher");
+        let mut reload_rx = reload_rx_only(watcher);
+
+        let received = tokio::time::timeout(Duration::from_secs(2), reload_rx.recv())
+            .await
+            .expect(
+                "must not time out: the channel should close as soon as the watcher's \
+                 scope ends, not hang",
+            );
+
+        assert_eq!(
+            received, None,
+            "extracting the receiver out of a short-lived scope must close the channel"
+        );
     }
 
     #[tokio::test]
@@ -199,8 +257,7 @@ mod tests {
         // Touch a sibling — must NOT trigger a reload.
         std::fs::write(temp.path().join("other.toml"), "other = 1\n").expect("write sibling");
 
-        let result =
-            tokio::time::timeout(Duration::from_millis(900), watcher.reload_rx.recv()).await;
+        let result = tokio::time::timeout(Duration::from_millis(900), watcher.changed()).await;
         assert!(
             result.is_err(),
             "sibling file changes must not trigger a reload"

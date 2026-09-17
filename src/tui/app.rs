@@ -3739,9 +3739,7 @@ impl TuiApp {
     fn drain_config_reload_events(&mut self) {
         let mut should_reload = false;
         if let Some(watcher) = self.config_watcher.as_mut() {
-            while watcher.reload_rx.try_recv().is_ok() {
-                should_reload = true;
-            }
+            should_reload = watcher.try_changed();
         }
         if !should_reload {
             return;

@@ -1422,7 +1422,7 @@ fn spawn_config_reloader(
             // this gateway invocation ends — otherwise every gateway restart leaked
             // a permanently-live watch + task, exhausting max_user_watches in a loop.
             let event = tokio::select! {
-                r = watcher.reload_rx.recv() => r,
+                r = watcher.changed() => r,
                 () = shutdown.cancelled() => break,
             };
             if event.is_none() {
