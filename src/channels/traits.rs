@@ -171,8 +171,8 @@ pub trait Channel: Send + Sync {
     /// Closes the gap `apply_allowed_senders` cannot: a listener's own gate runs
     /// once, when the message is first received, against the allowlist at that
     /// instant. A message that passed can still sit queued for dispatch after a
-    /// later edit revokes its sender, and dispatch used to process it anyway
-    /// (F-49). Call this again right after refreshing the runtime config, and
+    /// later edit revokes its sender, and dispatch used to process it anyway.
+    /// Call this again right after refreshing the runtime config, and
     /// drop the message if it now returns `false`.
     ///
     /// Implementations reuse their own existing identity matching (the exact

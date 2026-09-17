@@ -2964,7 +2964,7 @@ mod tests {
         );
     }
 
-    /// F-49's dispatch-side re-check must accept exactly what the listener's
+    /// Dispatch's post-refresh re-check must accept exactly what the listener's
     /// own gate accepts. The listener checks `[username, numeric_id]`
     /// (`is_any_user_allowed`) but reports `sender` as the numeric id when one
     /// is present — an allowlist entry that names only the username would make

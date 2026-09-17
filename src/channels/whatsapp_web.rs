@@ -3106,7 +3106,7 @@ mod tests {
         assert!(!ch.is_number_allowed("+9999999999"));
     }
 
-    /// F-49's dispatch-side re-check. `msg.sender` is already the canonical
+    /// Dispatch's post-refresh re-check. `msg.sender` is already the canonical
     /// form (`+E.164` or `lid:<id>`) `inbound_identity` produced, for both
     /// identity forms — the same exact-or-wildcard match the listener runs.
     #[test]

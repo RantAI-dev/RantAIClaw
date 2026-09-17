@@ -1758,7 +1758,7 @@ mod tests {
         assert_eq!(ch.allowed_users.read().unwrap().len(), 1);
     }
 
-    /// F-49's dispatch-side re-check: a revoked sender fails it immediately
+    /// Dispatch's post-refresh re-check: a revoked sender fails it immediately
     /// after the config write, a re-added one passes it, with no restart and
     /// no other message in between.
     #[test]

@@ -533,7 +533,7 @@ fn no_log_or_print_call_carries_message_or_reply_text() {
     );
 }
 
-/// Plan 390 (F-43): no log or print call in `src/channels/` or the gateway's
+/// No log or print call in `src/channels/` or the gateway's
 /// webhook hand-off interpolates a WebSocket or endpoint URL by a name this
 /// guard recognizes. Lark's `wss_url` carried an `access_key` query parameter
 /// straight into the journal at `tracing::info!("Lark: connecting to
@@ -2618,9 +2618,10 @@ async fn allowlist_edit_reaches_the_live_channel_without_restart() {
     );
 }
 
-/// F-49, the revocation half: a message from a sender the listener already
-/// let through must still be dropped by dispatch if the sender was revoked
-/// before dispatch got to it — the exact race a queued message can hit.
+/// The revocation half of the allowlist race: a message from a sender the
+/// listener already let through must still be dropped by dispatch if the
+/// sender was revoked before dispatch got to it — the exact race a queued
+/// message can hit.
 /// Reuses `TelegramRecordingChannel`'s own `is_sender_still_allowed` (an
 /// honest exact-match fake, the same rule Lark/Discord/Slack use for real),
 /// so this exercises dispatch's re-check itself, not the config-file plumbing
