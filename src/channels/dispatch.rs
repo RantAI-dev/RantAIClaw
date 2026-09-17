@@ -485,7 +485,7 @@ pub(crate) async fn process_channel_message(
     // `msg` already passed the listener's own gate, but only against whatever
     // list was live at the moment it was received — a revocation that landed
     // while this message sat queued would otherwise still be processed in
-    // full (F-49). Pairing (`/bind`, `/claim`) never reaches here: every
+    // full. Pairing (`/bind`, `/claim`) never reaches here: every
     // listener intercepts and fully handles those before a `ChannelMessage`
     // is ever sent, so there is nothing to exempt.
     if let Some(channel) = target_channel.as_ref() {

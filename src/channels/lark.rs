@@ -220,7 +220,7 @@ fn lark_key_message_body(
 /// Drops a URL's query string and any embedded userinfo, keeping scheme, host,
 /// port and path. The WS endpoint URL Lark hands back (`get_ws_endpoint`)
 /// carries an `access_key` there, so this is the only form the connect/
-/// reconnect log line may print (F-43). Parses with `reqwest::Url`, the same
+/// reconnect log line may print. Parses with `reqwest::Url`, the same
 /// approach `onboard::wizard::redact_endpoint_for_display` already uses, so a
 /// malformed value redacts to a fixed placeholder instead of passing the raw
 /// string through.
@@ -2096,11 +2096,11 @@ mod allowlist_runtime_tests {
         );
     }
 
-    /// F-49's dispatch-side re-check, exercised through `Arc<dyn Channel>` (not
-    /// the inherent method) so a mismatch between the trait dispatch and
+    /// Dispatch's post-refresh re-check, exercised through `Arc<dyn Channel>`
+    /// (not the inherent method) so a mismatch between the trait dispatch and
     /// `is_user_allowed` would actually surface. A revoked sender is rejected
     /// the moment the allowlist changes, with no restart and no other message
-    /// in between — the re-add case too, since that is the other half of F-49.
+    /// in between — the re-add case too.
     #[test]
     fn is_sender_still_allowed_reflects_the_live_allowlist() {
         let c: Arc<dyn Channel> = Arc::new(ch(vec!["ou_a"]));
@@ -3084,7 +3084,7 @@ mod tests {
 
     /// `redact_url_query` keeps scheme, host and path, and drops the query
     /// string, so a connect log never carries the `access_key` Lark's WS
-    /// endpoint URL puts there (F-43). No real endpoint is contacted; the URL
+    /// endpoint URL puts there. No real endpoint is contacted; the URL
     /// here is a fixture shaped like Lark's response, not a live value.
     #[test]
     fn redact_url_query_drops_the_query_string() {
