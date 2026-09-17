@@ -504,6 +504,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Lark's connection URL no longer reaches the journal with its credential.** `listen_ws` logged
+  the WebSocket endpoint URL Lark hands back on every connect and reconnect, and that URL carries
+  an `access_key` query parameter — a connection credential written to the systemd journal at INFO,
+  the same class of leak plan 352 closed for message text. The line now logs scheme, host and path
+  only. The log-scan guard from plan 352 is extended to catch a future line that interpolates a
+  WebSocket or endpoint URL by name, including through an inline `{name}` capture, not just a
+  positional argument. **Journals already holding the old line still carry the credential**; a
+  restart requests a fresh endpoint URL from Lark, and the console can confirm afterward whether
+  its `access_key` changed. Consider `journalctl --user --vacuum-time=2d` (or another retention
+  window) to clear the old entries.
 - **Channel logs no longer carry message or reply text, and Telegram's startup pairing code no
   longer reaches the journal.** Two INFO lines in the dispatch core wrote the first 80 characters
   of every inbound message and of every reply on every channel, and the gateway wrote the first 50

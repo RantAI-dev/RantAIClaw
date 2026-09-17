@@ -455,7 +455,10 @@ fn no_log_or_print_call_carries_message_or_reply_text() {
         let calls = log_calls(&code);
         calls_per_file.insert(file.clone(), calls.len());
         for (at, args) in calls {
-            let mut named = printed_text_bindings(&String::from_utf8_lossy(&code[args.clone()]));
+            let mut named =
+                printed_bindings(&String::from_utf8_lossy(&code[args.clone()]), |name| {
+                    name == "truncate_with_ellipsis" || is_text_binding(name)
+                });
             for literal in literals
                 .iter()
                 .filter(|literal| args.start <= literal.start && literal.end <= args.end)
@@ -514,6 +517,121 @@ fn no_log_or_print_call_carries_message_or_reply_text() {
     );
 }
 
+/// Plan 390 (F-43): no log or print call in `src/channels/` or the gateway's
+/// webhook hand-off interpolates a WebSocket or endpoint URL by a name this
+/// guard recognizes. Lark's `wss_url` carried an `access_key` query parameter
+/// straight into the journal at `tracing::info!("Lark: connecting to
+/// {wss_url}")` — an inline capture, which is why this reads captures inside
+/// literals the same way the text guard does, not just positional arguments.
+///
+/// The fix is the same "rename past the pattern" convention the text guard
+/// already relies on: redact the query string, then bind the result under a
+/// name this guard does not recognize (`safe_url`), and log that instead.
+///
+/// A hit that is a URL with no credential in its query — an outbound
+/// attachment URL the model or user supplied, or a tunnel URL an operator
+/// explicitly asked to see — is listed in `URL_CLASSIFIED` with the reason,
+/// rather than added to [`is_connection_url_binding`]'s name list.
+#[test]
+fn no_log_or_print_call_carries_a_connection_url_with_credentials() {
+    const URL_CLASSIFIED: &[(&str, &str, &str)] = &[];
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = vec![src_root.join("gateway").join("mod.rs")];
+    let mut dirs = vec![src_root.join("channels")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if name.ends_with(".rs") && name != "mod_tests.rs" && name != "tests.rs" {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut unclassified = Vec::new();
+    let mut matched = vec![0_usize; URL_CLASSIFIED.len()];
+    let mut calls_per_file = std::collections::BTreeMap::new();
+    for path in files {
+        let file = path
+            .strip_prefix(&src_root)
+            .expect("a file under src")
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let src = std::fs::read_to_string(&path).expect("read a source file");
+        let production = production_half(&src);
+        let (code, literals) = mask_comments_and_literals(production);
+        let calls = log_calls(&code);
+        calls_per_file.insert(file.clone(), calls.len());
+        for (at, args) in calls {
+            let mut named = printed_bindings(
+                &String::from_utf8_lossy(&code[args.clone()]),
+                is_connection_url_binding,
+            );
+            for literal in literals
+                .iter()
+                .filter(|literal| args.start <= literal.start && literal.end <= args.end)
+            {
+                named.extend(
+                    inline_captures(&production[literal.clone()])
+                        .into_iter()
+                        .filter(|name| is_connection_url_binding(name))
+                        .map(|name| format!("{{{name}}}")),
+                );
+            }
+            if named.is_empty() {
+                continue;
+            }
+            let call = &production[at..(args.end + 1).min(production.len())];
+            match URL_CLASSIFIED
+                .iter()
+                .position(|(f, fragment, _)| file == *f && call.contains(fragment))
+            {
+                Some(entry) => matched[entry] += 1,
+                None => unclassified.push(format!(
+                    "{file}:{} names {named:?}: {}",
+                    production[..at].matches('\n').count() + 1,
+                    call.split_whitespace().collect::<Vec<_>>().join(" ")
+                )),
+            }
+        }
+    }
+
+    // The scan must be reading what it claims to, the same canary the sibling
+    // text guard uses: if a future change to `log_calls` or the directory walk
+    // silently stops finding calls, `unclassified` stays empty and this test
+    // would pass with no detection capability at all.
+    for file in ["channels/dispatch.rs", "gateway/mod.rs"] {
+        assert!(
+            calls_per_file.get(file).is_some_and(|&calls| calls > 0),
+            "found no log calls in {file}, so the scan is not reading it"
+        );
+    }
+    let stale: Vec<String> = URL_CLASSIFIED
+        .iter()
+        .zip(&matched)
+        .filter(|(_, calls)| **calls != 1)
+        .map(|((file, fragment, _), calls)| {
+            format!("{file}: `{fragment}` is classified but matched {calls} calls, not 1")
+        })
+        .collect();
+    assert!(
+        unclassified.is_empty() && stale.is_empty(),
+        "log or print calls that interpolate a connection/endpoint URL by a recognized name; \
+         redact the query string and rebind under a name this guard does not recognize, or \
+         classify a URL that carries no credential:\n{}\n{}",
+        unclassified.join("\n"),
+        stale.join("\n")
+    );
+}
+
 /// Names that hold message or reply text in the scanned code: the inbound text
 /// each channel binds (`text`, `content`, `body`, `caption`), the dispatch
 /// core's `msg` (a `ChannelMessage`, whose `Debug` prints its content), the
@@ -544,15 +662,29 @@ fn is_text_binding(name: &str) -> bool {
     .any(|suffix| name.ends_with(suffix))
 }
 
+/// Names that hold a connection or endpoint URL fetched at runtime, which may
+/// carry a credential in its query string — a WebSocket URL, or an API
+/// endpoint the channel resolved for itself. Not every URL binding belongs
+/// here: an outbound attachment URL a user or the model supplied (Telegram's
+/// `url`), or a tunnel URL an operator explicitly asked to see
+/// (`gateway/mod.rs`), carry no such credential and are not runtime-resolved
+/// connection endpoints, so they stay out of this list.
+fn is_connection_url_binding(name: &str) -> bool {
+    matches!(
+        name,
+        "wss_url" | "ws_url" | "endpoint_url" | "connection_url"
+    )
+}
+
 fn is_identifier(token: &str) -> bool {
     token.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
 }
 
-/// The text bindings that a call's masked arguments print. A binding followed
-/// by `.len()`, `.is_empty()` or `.chars().count()` is only measured, one
-/// followed by a field (`msg.sender`) is judged by that field's own name, and
-/// one followed by `=` is a tracing field's key.
-fn printed_text_bindings(args: &str) -> Vec<String> {
+/// The bindings a call's masked arguments print, matched against `is_target`.
+/// A binding followed by `.len()`, `.is_empty()` or `.chars().count()` is only
+/// measured, one followed by a field (`msg.sender`) is judged by that field's
+/// own name, and one followed by `=` is a tracing field's key.
+fn printed_bindings(args: &str, is_target: impl Fn(&str) -> bool) -> Vec<String> {
     let tokens = rust_tokens(args);
     let mut printed = Vec::new();
     for (index, &token) in tokens.iter().enumerate() {
@@ -564,9 +696,7 @@ fn printed_text_bindings(args: &str) -> Vec<String> {
             && after.get(1).is_some_and(|name| is_identifier(name))
             && !matches!(after.get(2), Some(&"(" | &":"));
         let key = after.first() == Some(&"=") && after.get(1) != Some(&"=");
-        if token == "truncate_with_ellipsis"
-            || (is_text_binding(token) && !measured && !field && !key)
-        {
+        if is_target(token) && !measured && !field && !key {
             printed.push(token.to_string());
         }
     }

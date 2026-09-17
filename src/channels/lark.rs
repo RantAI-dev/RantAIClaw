@@ -217,6 +217,26 @@ fn lark_key_message_body(
     }
 }
 
+/// Drops a URL's query string and any embedded userinfo, keeping scheme, host,
+/// port and path. The WS endpoint URL Lark hands back (`get_ws_endpoint`)
+/// carries an `access_key` there, so this is the only form the connect/
+/// reconnect log line may print (F-43). Parses with `reqwest::Url`, the same
+/// approach `onboard::wizard::redact_endpoint_for_display` already uses, so a
+/// malformed value redacts to a fixed placeholder instead of passing the raw
+/// string through.
+fn redact_url_query(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return "<unparseable endpoint, redacted>".to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "<unparseable endpoint, redacted>".to_string();
+    };
+    match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}{}", parsed.scheme(), parsed.path()),
+        None => format!("{}://{host}{}", parsed.scheme(), parsed.path()),
+    }
+}
+
 /// Lark/Feishu channel.
 ///
 /// Supports two receive modes (configured via `receive_mode` in config):
@@ -487,7 +507,8 @@ impl LarkChannel {
                     .and_then(|v| v.parse::<i32>().ok())
             })
             .unwrap_or(0);
-        tracing::info!("Lark: connecting to {wss_url}");
+        let safe_url = redact_url_query(&wss_url);
+        tracing::info!("Lark: connecting to {safe_url}");
 
         let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url).await?;
         let (mut write, mut read) = ws_stream.split();
@@ -3009,5 +3030,48 @@ mod tests {
             .contains(&"ou_new".to_string()));
 
         std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    }
+
+    /// `redact_url_query` keeps scheme, host and path, and drops the query
+    /// string, so a connect log never carries the `access_key` Lark's WS
+    /// endpoint URL puts there (F-43). No real endpoint is contacted; the URL
+    /// here is a fixture shaped like Lark's response, not a live value.
+    #[test]
+    fn redact_url_query_drops_the_query_string() {
+        assert_eq!(
+            redact_url_query(
+                "wss://example.larksuite.com/ws/v2?access_key=fake-not-real&ticket=fake"
+            ),
+            "wss://example.larksuite.com/ws/v2"
+        );
+    }
+
+    #[test]
+    fn redact_url_query_is_a_no_op_without_a_query_string() {
+        assert_eq!(
+            redact_url_query("wss://example.larksuite.com/ws/v2"),
+            "wss://example.larksuite.com/ws/v2"
+        );
+    }
+
+    #[test]
+    fn redact_url_query_drops_embedded_userinfo_too() {
+        assert_eq!(
+            redact_url_query(
+                "wss://fake-not-real:also-fake@example.larksuite.com/ws/v2?access_key=fake"
+            ),
+            "wss://example.larksuite.com/ws/v2"
+        );
+    }
+
+    #[test]
+    fn redact_url_query_redacts_to_a_fixed_placeholder_on_a_malformed_url() {
+        // A value that fails to parse is never passed through raw: a fallback
+        // that echoed the input back could still leak whatever credential-shaped
+        // text triggered the parse failure.
+        assert_eq!(
+            redact_url_query("not a url"),
+            "<unparseable endpoint, redacted>"
+        );
     }
 }
