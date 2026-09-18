@@ -74,6 +74,16 @@ impl CommandHandler for SetupCommand {
                             .unwrap_or(ProvisionerCategory::Core);
                         (c == cat).then_some(*name)
                     })
+                    // The Channels category counts what a user can actually
+                    // set up here. The locked channels still exist as their
+                    // own dimmed rows one level down; a count that included
+                    // them would promise more than `/setup channels` opens.
+                    .filter(|name| {
+                        cat != ProvisionerCategory::Channel
+                            || crate::channels::channel_is_usable(
+                                crate::channels::catalog_key_for_provisioner(name),
+                            )
+                    })
                     .collect();
 
                 // Show count + a teaser of the first 4 names.
@@ -94,6 +104,7 @@ impl CommandHandler for SetupCommand {
                     key: format!("cat:{}", category_key(cat)),
                     primary: cat_label(cat).to_string(),
                     secondary,
+                    disabled: false,
                 }
             })
             .collect();
@@ -159,6 +170,46 @@ pub fn category_from_key(key: &str) -> Option<ProvisionerCategory> {
         "routing" => Some(ProvisionerCategory::Routing),
         _ => None,
     }
+}
+
+/// The channel sub-picker's rows: usable provisioners first, then — only if
+/// any exist — a static "Under development" heading followed by the locked
+/// ones, dimmed. Derived from the provisioner registry and the catalog on
+/// every call, so a channel added to one and not the other shows up here as
+/// wrong rather than as a silent omission.
+pub fn channel_picker_entries() -> Vec<crate::tui::widgets::ListPickerEntry> {
+    use crate::onboard::provision::{available, provisioner_for};
+    use crate::tui::widgets::{ListPickerEntry, ListPickerItem};
+
+    let mut usable = Vec::new();
+    let mut locked = Vec::new();
+    for (name, desc) in available() {
+        let Some(p) = provisioner_for(name) else {
+            continue;
+        };
+        if p.category() != ProvisionerCategory::Channel {
+            continue;
+        }
+        let catalog_key = crate::channels::catalog_key_for_provisioner(name);
+        let is_usable = crate::channels::channel_is_usable(catalog_key);
+        let entry = ListPickerEntry::Item(ListPickerItem {
+            key: name.to_string(),
+            primary: name.to_string(),
+            secondary: desc.to_string(),
+            disabled: !is_usable,
+        });
+        if is_usable {
+            usable.push(entry);
+        } else {
+            locked.push(entry);
+        }
+    }
+    let mut entries = usable;
+    if !locked.is_empty() {
+        entries.push(ListPickerEntry::static_heading("Under development"));
+        entries.extend(locked);
+    }
+    entries
 }
 
 fn cat_order(c: ProvisionerCategory) -> u8 {
@@ -270,6 +321,42 @@ mod tests {
     }
 
     #[test]
+    fn top_picker_channels_row_counts_only_usable_channels() {
+        // The Channels category in the top `/setup` picker used to count
+        // every channel provisioner, locked or not — reading "17 items" when
+        // only six can actually be opened here. It must count (and list)
+        // only what `channel_is_usable` allows.
+        let (mut ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let result = SetupCommand.execute("", &mut ctx).unwrap();
+        let CommandResult::OpenListPicker(picker) = result else {
+            panic!("expected OpenListPicker, got {result:?}");
+        };
+        let usable_channel_count = crate::onboard::provision::available()
+            .into_iter()
+            .filter(|(name, _)| {
+                crate::onboard::provision::provisioner_for(name)
+                    .is_some_and(|p| p.category() == ProvisionerCategory::Channel)
+                    && crate::channels::channel_is_usable(
+                        crate::channels::catalog_key_for_provisioner(name),
+                    )
+            })
+            .count();
+        let channel_row_key = format!("cat:{}", category_key(ProvisionerCategory::Channel));
+        let channels_row = picker
+            .entries()
+            .iter()
+            .find_map(|e| e.as_item().filter(|i| i.key == channel_row_key))
+            .expect("a Channels row in the top picker");
+        assert!(
+            channels_row
+                .secondary
+                .starts_with(&format!("{usable_channel_count} ")),
+            "expected the count {usable_channel_count} in {:?}",
+            channels_row.secondary
+        );
+    }
+
+    #[test]
     fn execute_category_only_arg_opens_the_category() {
         // `channels` is a category but not a provisioner, so it falls through to
         // the category overlay (the arg that used to error).
@@ -280,6 +367,83 @@ mod tests {
                 assert_eq!(category, category_key(ProvisionerCategory::Channel));
             }
             other => panic!("expected OpenSetupCategory, got {other:?}"),
+        }
+    }
+
+    /// Every disabled state in `channel_picker_entries` must come from
+    /// `channel_is_usable`, derived by iterating the provisioner registry —
+    /// never a name literal in this test. A provisioner name with no entry
+    /// in `catalog_key_for_provisioner` falls through to itself, and
+    /// `channel_is_usable` answers `false` for any key `CHANNEL_CATALOG`
+    /// does not carry — so a provisioner nobody mapped reads as locked, not
+    /// as usable, and this test would catch that disagreement too.
+    #[test]
+    fn channel_picker_disabled_state_matches_channel_is_usable_for_the_whole_registry() {
+        use crate::onboard::provision::{available, provisioner_for};
+
+        let entries = channel_picker_entries();
+        let channel_names: std::collections::HashSet<&str> = available()
+            .into_iter()
+            .filter_map(|(name, _)| {
+                provisioner_for(name)
+                    .and_then(|p| (p.category() == ProvisionerCategory::Channel).then_some(name))
+            })
+            .collect();
+
+        // Every channel provisioner appears exactly once, as an Item (never
+        // as the heading).
+        let item_keys: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e.as_item().map(|i| i.key.as_str()))
+            .collect();
+        for name in &channel_names {
+            assert!(
+                item_keys.contains(name),
+                "{name} is a channel provisioner but is missing from the picker"
+            );
+        }
+        assert_eq!(
+            item_keys.len(),
+            channel_names.len(),
+            "the picker must not add or drop channel rows"
+        );
+
+        for entry in &entries {
+            let Some(item) = entry.as_item() else {
+                continue;
+            };
+            let catalog_key = crate::channels::catalog_key_for_provisioner(&item.key);
+            assert_eq!(
+                item.disabled,
+                !crate::channels::channel_is_usable(catalog_key),
+                "{}'s disabled flag disagrees with channel_is_usable",
+                item.key
+            );
+        }
+    }
+
+    #[test]
+    fn usable_channel_rows_come_before_the_heading_which_comes_before_locked_rows() {
+        let entries = channel_picker_entries();
+        let mut seen_heading = false;
+        for entry in &entries {
+            match entry {
+                crate::tui::widgets::ListPickerEntry::StaticHeading { label } => {
+                    assert_eq!(label, "Under development");
+                    assert!(!seen_heading, "the heading must appear at most once");
+                    seen_heading = true;
+                }
+                crate::tui::widgets::ListPickerEntry::Item(item) => {
+                    assert_eq!(
+                        item.disabled, seen_heading,
+                        "row {} is on the wrong side of the heading",
+                        item.key
+                    );
+                }
+                crate::tui::widgets::ListPickerEntry::CategoryHeader { .. } => {
+                    panic!("the channel picker does not use collapsible categories")
+                }
+            }
         }
     }
 }

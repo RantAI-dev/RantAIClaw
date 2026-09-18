@@ -18,8 +18,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 pub const WHATSAPP_CLOUD_NAME: &str = "whatsapp-cloud";
-pub const WHATSAPP_CLOUD_DESC: &str =
-    "WhatsApp Cloud API — access token, phone ID, webhook verify token";
+pub const WHATSAPP_CLOUD_DESC: &str = "WhatsApp Cloud API — access token, phone ID, webhook \
+    verify token; needs a public HTTPS URL for Meta's webhook to reach";
 
 #[derive(Debug, Clone)]
 pub struct WhatsAppCloudProvisioner;

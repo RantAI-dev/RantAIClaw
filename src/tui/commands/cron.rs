@@ -228,6 +228,7 @@ pub fn build_cron_picker(config: &Config) -> ListPicker {
                     j.next_run.to_rfc3339(),
                     j.last_status.as_deref().unwrap_or("never run")
                 ),
+                disabled: false,
             }
         })
         .collect();

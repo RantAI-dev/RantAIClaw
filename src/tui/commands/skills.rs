@@ -238,6 +238,7 @@ pub(crate) fn build_skill_items(
                 key: s.name.clone(),
                 primary,
                 secondary,
+                disabled: false,
             }
         })
         .collect()
@@ -522,6 +523,7 @@ impl CommandHandler for PersonalityCommand {
                     key: slug.to_string(),
                     primary: slug.to_string(),
                     secondary,
+                    disabled: false,
                 }
             })
             .collect();

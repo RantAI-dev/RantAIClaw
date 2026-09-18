@@ -63,6 +63,7 @@ impl CommandHandler for AutonomyCommand {
                         key: p.id().to_string(),
                         primary,
                         secondary: preset_blurb(*p).to_string(),
+                        disabled: false,
                     }
                 })
                 .collect();

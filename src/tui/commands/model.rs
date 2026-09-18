@@ -118,6 +118,7 @@ impl CommandHandler for ModelCommand {
                 key: e.target(),
                 primary: e.target(),
                 secondary: e.description.clone(),
+                disabled: false,
             })
             .collect();
 
