@@ -117,6 +117,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         std::sync::Arc::clone(&channel_bus),
     );
 
+    // Fires even when no supervisor starts at all, so an operator whose only
+    // configured channel cannot run in this build still sees why, instead of a
+    // silently quiet daemon.
+    crate::channels::warn_configured_channels_that_will_not_start(&config);
+
     // Channels are held separately too, so shutdown can DRAIN them instead of a
     // bare `abort()`. They run under `start_channels_with_cancellation` (the same
     // cancellable path the TUI uses): cancelling the token stops each listener,
@@ -632,42 +637,7 @@ async fn run_heartbeat_worker(
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    let crate::config::ChannelsConfig {
-        cli: _,     // `cli` is used only when running the CLI manually
-        webhook: _, // Managed by the gateway
-        telegram,
-        discord,
-        slack,
-        mattermost,
-        imessage,
-        matrix,
-        signal,
-        whatsapp,
-        email,
-        irc,
-        lark,
-        dingtalk,
-        linq,
-        nextcloud_talk,
-        qq,
-        ..
-    } = &config.channels_config;
-
-    telegram.is_some()
-        || discord.is_some()
-        || slack.is_some()
-        || mattermost.is_some()
-        || imessage.is_some()
-        || matrix.is_some()
-        || signal.is_some()
-        || whatsapp.is_some()
-        || email.is_some()
-        || irc.is_some()
-        || lark.is_some()
-        || dingtalk.is_some()
-        || linq.is_some()
-        || nextcloud_talk.is_some()
-        || qq.is_some()
+    crate::channels::any_catalog_channel_configured(config)
 }
 
 #[cfg(test)]
@@ -876,65 +846,37 @@ mod tests {
     }
 
     #[test]
-    fn detects_supervised_channels_present() {
-        let mut config = Config::default();
-        config.channels_config.telegram = Some(crate::config::TelegramConfig {
-            bot_token: "token".into(),
-            allowed_users: vec![],
-            stream_mode: crate::config::StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            interrupt_on_new_message: false,
-            mention_only: false,
-        });
-        assert!(has_supervised_channels(&config));
+    fn a_webhook_only_config_has_no_supervised_channel() {
+        let config = crate::channels::tests::config_with_only_channel("webhook");
+        assert!(!has_supervised_channels(&config));
     }
 
+    /// One table-driven case per catalog key (except `webhook`, served by the
+    /// gateway, not the supervisor), so a channel added to the catalog without
+    /// wiring it here fails this test instead of silently never starting.
+    ///
+    /// `matrix` and `lark` are feature-gated: their expected answer follows
+    /// whether this build actually compiles them in, the same rule
+    /// `channel_is_configured` applies — a configured table for a feature this
+    /// build lacks is not a channel the supervisor can run.
     #[test]
-    fn detects_dingtalk_as_supervised_channel() {
-        let mut config = Config::default();
-        config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
-            client_id: "client_id".into(),
-            client_secret: "client_secret".into(),
-            allowed_users: vec!["*".into()],
-        });
-        assert!(has_supervised_channels(&config));
-    }
-
-    #[test]
-    fn detects_mattermost_as_supervised_channel() {
-        let mut config = Config::default();
-        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
-            url: "https://mattermost.example.com".into(),
-            bot_token: "token".into(),
-            channel_id: Some("channel-id".into()),
-            allowed_users: vec!["*".into()],
-            thread_replies: Some(true),
-            mention_only: Some(false),
-        });
-        assert!(has_supervised_channels(&config));
-    }
-
-    #[test]
-    fn detects_qq_as_supervised_channel() {
-        let mut config = Config::default();
-        config.channels_config.qq = Some(crate::config::schema::QQConfig {
-            app_id: "app-id".into(),
-            app_secret: "app-secret".into(),
-            allowed_users: vec!["*".into()],
-        });
-        assert!(has_supervised_channels(&config));
-    }
-
-    #[test]
-    fn detects_nextcloud_talk_as_supervised_channel() {
-        let mut config = Config::default();
-        config.channels_config.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
-            base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
-            webhook_secret: None,
-            allowed_users: vec!["*".into()],
-        });
-        assert!(has_supervised_channels(&config));
+    fn every_catalog_channel_that_can_run_in_this_build_is_supervised() {
+        for key in crate::channels::channel_catalog_keys() {
+            if crate::channels::NON_CHANNEL_CATALOG_KEYS.contains(&key) {
+                continue;
+            }
+            let config = crate::channels::tests::config_with_only_channel(key);
+            let expected = match key {
+                "matrix" => cfg!(feature = "channel-matrix"),
+                "lark" => cfg!(feature = "channel-lark"),
+                _ => true,
+            };
+            assert_eq!(
+                has_supervised_channels(&config),
+                expected,
+                "{key}: expected has_supervised_channels to answer {expected}"
+            );
+        }
     }
 
     #[test]

@@ -768,6 +768,79 @@ pub(crate) fn channel_catalog_keys() -> Vec<&'static str> {
     CHANNEL_CATALOG.iter().map(|(key, _, _, _)| *key).collect()
 }
 
+/// Whether any catalog channel (other than the gateway-served `webhook`) is
+/// configured in this build. The one place that answers "does this config set
+/// up at least one channel" — the daemon's decision to start the channel
+/// supervisor and onboarding's decision to skip the channel wizard both read
+/// this instead of each keeping their own hand list of field names, which is
+/// exactly how one of them silently forgot a channel before.
+pub(crate) fn any_catalog_channel_configured(config: &Config) -> bool {
+    channel_catalog_keys()
+        .into_iter()
+        .filter(|key| !NON_CHANNEL_CATALOG_KEYS.contains(key))
+        .any(|key| channel_is_configured(key, config))
+}
+
+/// Why a configured catalog channel will not actually run once something
+/// tries to build it, despite [`channel_is_configured`] answering true for its
+/// table. One enum so every reason funnels through the same WARN wording
+/// instead of each caller inventing its own sentence.
+pub(crate) enum ChannelWontStartReason {
+    NotCompiledIntoThisBuild,
+}
+
+impl ChannelWontStartReason {
+    fn warn(&self, key: &str) {
+        match self {
+            Self::NotCompiledIntoThisBuild => tracing::warn!(
+                "the \"{key}\" channel is configured but this build was compiled without its \
+                 feature; it will not start"
+            ),
+        }
+    }
+}
+
+/// Why `key` will not run, given its table is populated, or `None` when it
+/// can run. `None` for an unpopulated table too — there is nothing to warn
+/// about a channel nobody set up.
+///
+/// Checks the raw config field, not [`channel_is_configured`]: that helper
+/// already folds "missing feature" into its `false`, which is exactly the
+/// distinction this function exists to recover — a table that is *populated*
+/// but silently uncompiled needs its own WARN, not to look identical to a
+/// table nobody touched.
+pub(crate) fn channel_wont_start_reason(
+    key: &str,
+    config: &Config,
+) -> Option<ChannelWontStartReason> {
+    let c = &config.channels_config;
+    match key {
+        "matrix" if !cfg!(feature = "channel-matrix") && c.matrix.is_some() => {
+            Some(ChannelWontStartReason::NotCompiledIntoThisBuild)
+        }
+        "lark" if !cfg!(feature = "channel-lark") && c.lark.is_some() => {
+            Some(ChannelWontStartReason::NotCompiledIntoThisBuild)
+        }
+        _ => None,
+    }
+}
+
+/// Log one WARN per configured catalog table that will not actually run,
+/// naming the table and why. Called unconditionally at daemon start so it
+/// fires even when nothing else about channel startup runs at all — an
+/// all-unstartable config starts no supervisor but still warns about each
+/// table in it.
+pub(crate) fn warn_configured_channels_that_will_not_start(config: &Config) {
+    for key in channel_catalog_keys() {
+        if NON_CHANNEL_CATALOG_KEYS.contains(&key) {
+            continue;
+        }
+        if let Some(reason) = channel_wont_start_reason(key, config) {
+            reason.warn(key);
+        }
+    }
+}
+
 /// Whether `key`'s config block carries the credential it needs to run.
 ///
 /// Stronger than [`channel_is_configured`], which only asks whether the section
@@ -1580,4 +1653,4 @@ pub(crate) async fn run_channel_runtime(
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]
-mod tests;
+pub(crate) mod tests;

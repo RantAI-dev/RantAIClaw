@@ -130,6 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The daemon starts channels for a WhatsApp-Web-only config, and warns about a table it cannot
+  run.** `has_supervised_channels` and the onboarding wizard's `any_channel_set` each hand-listed the
+  channels that count as "configured," and both lists fell behind when `whatsapp_web` got its own
+  config table: a host with only `[channels_config.whatsapp_web]` set ran the gateway but never
+  started the channel supervisor, and the onboarding wizard kept re-prompting for channels as if none
+  were set up. Both now derive their answer from the channel catalog directly, so a channel cannot be
+  silently missing from one of two hand-copied lists again. Following the catalog also means a table
+  whose feature is not compiled into this build (Matrix without `channel-matrix`, say) no longer
+  starts an empty supervisor for it — the daemon now logs one WARN naming the table and the reason
+  instead.
 - **A revoked sender's next message is dropped, not answered.** Every live-allowlist channel
   (Telegram, Discord, Slack, WhatsApp Web, Lark) refreshed its allowlist only when dispatch dequeued
   a message, and never re-checked the sender against the fresh list afterward. A sender removed from
