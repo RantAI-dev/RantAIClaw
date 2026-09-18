@@ -722,6 +722,13 @@ pub(crate) fn channel_roster_note(
     support: ChannelSupport,
     verification: ChannelVerification,
 ) -> String {
+    // A configured, locked channel never runs at all — telling it apart from
+    // a channel that still runs but has no verification outcome yet matters
+    // more here than the usual configured/not-configured framing, since a
+    // locked one never gets a verification outcome to report at all.
+    if configured && support == ChannelSupport::UnderDevelopment {
+        return format!("{} · not started", support.label());
+    }
     let state = if configured {
         "configured"
     } else {
@@ -768,6 +775,30 @@ pub(crate) fn channel_catalog_keys() -> Vec<&'static str> {
     CHANNEL_CATALOG.iter().map(|(key, _, _, _)| *key).collect()
 }
 
+/// Whether `key` may be used at all, independent of whether it is configured.
+/// The whole rule: the catalog's support for `key` is `Supported`. Every entry
+/// point that opens, lists or refuses a channel reads this rather than keeping
+/// its own notion of which channels are allowed.
+pub(crate) fn channel_is_usable(key: &str) -> bool {
+    CHANNEL_CATALOG
+        .iter()
+        .find(|(k, _, _, _)| *k == key)
+        .is_some_and(|(_, _, support, _)| *support == ChannelSupport::Supported)
+}
+
+/// A provisioner's setup-flow name, mapped to the catalog key it configures.
+/// Most provisioners already use the catalog key as their name; the three
+/// that do not (a runtime split, or a naming convention the catalog does not
+/// share) are named here once so every caller checking usability agrees.
+pub(crate) fn catalog_key_for_provisioner(name: &str) -> &str {
+    match name {
+        "whatsapp-cloud" => "whatsapp",
+        "whatsapp-web" => "whatsapp_web",
+        "nextcloud-talk" => "nextcloud_talk",
+        other => other,
+    }
+}
+
 /// Whether any catalog channel (other than the gateway-served `webhook`) is
 /// configured in this build. The one place that answers "does this config set
 /// up at least one channel" — the daemon's decision to start the channel
@@ -787,6 +818,10 @@ pub(crate) fn any_catalog_channel_configured(config: &Config) -> bool {
 /// instead of each caller inventing its own sentence.
 pub(crate) enum ChannelWontStartReason {
     NotCompiledIntoThisBuild,
+    /// The catalog has not taken this channel past `UnderDevelopment` yet.
+    /// Distinct from the build-feature case above: recompiling would not fix
+    /// this one, only the catalog row changing after a drive would.
+    UnderDevelopment,
 }
 
 impl ChannelWontStartReason {
@@ -796,6 +831,10 @@ impl ChannelWontStartReason {
                 "the \"{key}\" channel is configured but this build was compiled without its \
                  feature; it will not start"
             ),
+            Self::UnderDevelopment => tracing::warn!(
+                "the \"{key}\" channel is configured but is {}; it will not start",
+                ChannelSupport::UnderDevelopment.label()
+            ),
         }
     }
 }
@@ -804,11 +843,13 @@ impl ChannelWontStartReason {
 /// can run. `None` for an unpopulated table too — there is nothing to warn
 /// about a channel nobody set up.
 ///
-/// Checks the raw config field, not [`channel_is_configured`]: that helper
-/// already folds "missing feature" into its `false`, which is exactly the
-/// distinction this function exists to recover — a table that is *populated*
-/// but silently uncompiled needs its own WARN, not to look identical to a
-/// table nobody touched.
+/// The build-feature checks match the raw config field, not
+/// [`channel_is_configured`]: that helper already folds "missing feature"
+/// into its `false`, which is exactly the distinction those checks exist to
+/// recover — a table that is *populated* but silently uncompiled needs its
+/// own WARN, not to look identical to a table nobody touched. They run first
+/// and return early because they are the more actionable reason (recompile
+/// with the feature) when both could apply to the same key.
 pub(crate) fn channel_wont_start_reason(
     key: &str,
     config: &Config,
@@ -816,13 +857,17 @@ pub(crate) fn channel_wont_start_reason(
     let c = &config.channels_config;
     match key {
         "matrix" if !cfg!(feature = "channel-matrix") && c.matrix.is_some() => {
-            Some(ChannelWontStartReason::NotCompiledIntoThisBuild)
+            return Some(ChannelWontStartReason::NotCompiledIntoThisBuild);
         }
         "lark" if !cfg!(feature = "channel-lark") && c.lark.is_some() => {
-            Some(ChannelWontStartReason::NotCompiledIntoThisBuild)
+            return Some(ChannelWontStartReason::NotCompiledIntoThisBuild);
         }
-        _ => None,
+        _ => {}
     }
+    if channel_is_configured(key, config) && !channel_is_usable(key) {
+        return Some(ChannelWontStartReason::UnderDevelopment);
+    }
+    None
 }
 
 /// Log one WARN per configured catalog table that will not actually run,

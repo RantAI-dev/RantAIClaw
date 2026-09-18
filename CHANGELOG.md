@@ -130,6 +130,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A locked channel's populated table is never started, and every surface says so.** The channel
+  factory used to build every configured channel unconditionally; a channel outside the supported
+  six (Telegram, Discord, Slack, WhatsApp Cloud, WhatsApp Web, Lark) now stays unbuilt even when its
+  config table is filled, with one WARN naming the table and the reason at daemon start. `doctor`,
+  `channel list` and `status` show a configured locked channel as "under development · not started"
+  instead of the same wording a channel nobody set up gets. The config section itself is never
+  touched or removed.
 - **The daemon starts channels for a WhatsApp-Web-only config, and warns about a table it cannot
   run.** `has_supervised_channels` and the onboarding wizard's `any_channel_set` each hand-listed the
   channels that count as "configured," and both lists fell behind when `whatsapp_web` got its own

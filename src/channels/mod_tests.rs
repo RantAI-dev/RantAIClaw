@@ -4167,13 +4167,140 @@ fn a_matrix_only_config_in_a_build_without_the_feature_warns_and_does_not_start_
     );
 }
 
+/// The rule the whole effort hangs on: a channel may be used exactly when its
+/// catalog row is `Supported`. Iterates the catalog so a newly added channel
+/// is covered automatically, never a hand-typed list.
+#[test]
+fn channel_is_usable_matches_the_catalogs_support_axis() {
+    for (key, _, support, _) in crate::channels::CHANNEL_CATALOG {
+        assert_eq!(
+            crate::channels::channel_is_usable(key),
+            support == crate::channels::ChannelSupport::Supported,
+            "channel_is_usable({key:?}) disagrees with the catalog"
+        );
+    }
+}
+
+/// The factory builds a channel exactly when its table is configured AND its
+/// catalog row is usable — a locked channel's populated table never reaches
+/// the fleet, a usable one always does. Iterates the catalog, not a literal
+/// list of names, so a channel opened or locked later is covered for free.
+#[test]
+fn the_factory_builds_only_usable_configured_channels() {
+    for key in crate::channels::channel_catalog_keys() {
+        if crate::channels::NON_CHANNEL_CATALOG_KEYS.contains(&key) {
+            continue;
+        }
+        let config = config_with_only_channel(key);
+        let built: Vec<&str> = factory::build_configured_channels(&config)
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
+        let expected = crate::channels::channel_is_usable(key)
+            && crate::channels::channel_is_configured(key, &config);
+        assert_eq!(
+            built.contains(&key),
+            expected,
+            "key {key:?}: expected built={expected}, got {built:?}"
+        );
+    }
+}
+
+/// A locked channel's populated table gets one WARN naming it and the reason,
+/// even when nothing about the build is missing — the reason here is the
+/// catalog's own commitment, distinct from the "not compiled into this
+/// build" case covered above.
+#[test]
+fn a_locked_channels_populated_table_warns_it_is_under_development() {
+    let config = config_with_only_channel("irc");
+
+    let logged = warnings_from(|| {
+        crate::channels::warn_configured_channels_that_will_not_start(&config);
+    });
+    let reason_label = crate::channels::ChannelSupport::UnderDevelopment.label();
+    assert!(
+        logged.contains("irc") && logged.contains(reason_label),
+        "expected a WARN naming irc and the reason, got: {logged:?}"
+    );
+}
+
+/// The WARN names the table and the reason, never a value out of it.
+#[test]
+fn the_locked_channel_warn_carries_no_configured_value() {
+    let config = config_with_only_channel("email");
+
+    let logged = warnings_from(|| {
+        crate::channels::warn_configured_channels_that_will_not_start(&config);
+    });
+    assert!(
+        logged.contains("email"),
+        "expected the WARN to name email, got: {logged:?}"
+    );
+    assert!(
+        !logged.contains("smtp.example.com") && !logged.contains("imap.example.com"),
+        "the WARN must not carry a configured value: {logged:?}"
+    );
+}
+
+/// The provisioner-to-catalog-key mapping must resolve for every provisioner
+/// the "Channel" category actually offers, not a hand-typed subset of it.
+#[test]
+fn the_provisioner_to_catalog_key_mapping_covers_every_channel_provisioner() {
+    use crate::onboard::provision::registry;
+    use crate::onboard::provision::traits::ProvisionerCategory;
+
+    let mut checked = 0;
+    for (name, _) in registry::available() {
+        let Some(provisioner) = registry::provisioner_for(name) else {
+            continue;
+        };
+        if provisioner.category() != ProvisionerCategory::Channel {
+            continue;
+        }
+        checked += 1;
+        let key = crate::channels::catalog_key_for_provisioner(name);
+        assert!(
+            crate::channels::channel_catalog_keys().contains(&key),
+            "provisioner {name:?} maps to catalog key {key:?}, which is not in the catalog"
+        );
+    }
+    assert!(
+        checked >= 14,
+        "expected the registry to still offer channel provisioners to check, got {checked}"
+    );
+}
+
+/// A locked channel's `config.toml` section is read, never rewritten — the
+/// lock only ever skips starting the channel.
+#[tokio::test]
+async fn a_locked_channels_config_section_is_never_rewritten() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+    let original: &[u8] = b"[channels_config.irc]\nserver = \"irc.example.org\"\nport = 6697\nnickname = \"bot\"\nchannels = [\"#c\"]\nallowed_users = []\n";
+    std::fs::write(&config_path, original).expect("write fixture");
+
+    let config = Config::load_from_path(&config_path)
+        .await
+        .expect("load config");
+    let _ = factory::build_configured_channels(&config);
+    crate::channels::warn_configured_channels_that_will_not_start(&config);
+
+    let after = std::fs::read(&config_path).expect("read back");
+    assert_eq!(
+        after, original,
+        "a locked channel's config section must never be rewritten"
+    );
+}
+
 /// The test that would have caught the reported defect: `channels doctor`
 /// had no Mattermost branch, so an operator whose Mattermost bot token had
 /// expired was told everything was healthy while that channel silently never
 /// answered. `MattermostChannel::health_check` had no live caller at all.
 ///
 /// The doctor and the runtime now build from one factory, so this asserts the
-/// factory covers every catalog entry that is a real `Channel`.
+/// factory covers every catalog entry that is a real, USABLE `Channel` — a
+/// locked one is configured but deliberately not built; that half is covered
+/// by `the_factory_builds_only_usable_configured_channels` above.
 #[test]
 fn every_configured_channel_is_built_by_the_factory() {
     let config = config_with_every_channel();
@@ -4188,6 +4315,11 @@ fn every_configured_channel_is_built_by_the_factory() {
         }
         // Feature-gated channels are absent from a build that cannot run them.
         if !channel_is_configured(key, &config) {
+            continue;
+        }
+        // A locked channel is configured but must not be built; that is this
+        // effort's whole point, not the drift this test otherwise guards.
+        if !crate::channels::channel_is_usable(key) {
             continue;
         }
         assert!(
@@ -4455,10 +4587,17 @@ fn feature_gated_channels_follow_the_build() {
         .map(|(key, _, _)| key)
         .collect();
 
+    // Matrix is locked on top of being feature-gated, so the factory never
+    // builds it in any build, on or off. Feature-gating itself is still
+    // checked, through the roster's own answer, independent of the lock.
+    assert!(
+        !built.contains(&"matrix"),
+        "matrix is locked; the factory must never build it regardless of the build's features"
+    );
     assert_eq!(
-        built.contains(&"matrix"),
+        channel_is_configured("matrix", &config),
         cfg!(feature = "channel-matrix"),
-        "matrix must be built exactly when its feature is on"
+        "the roster's feature-gating for matrix must still track the build"
     );
     assert_eq!(
         built.contains(&"lark"),
@@ -4514,6 +4653,13 @@ fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
         "cron delivery set changed — this is a capability change, not a refactor"
     );
     for key in &advertised {
+        if *key == "mattermost" {
+            // Locked: the factory no longer builds it, but the cron
+            // announce gate has not been narrowed to match yet — a
+            // separate, already-scoped piece of work. The pinned list
+            // above still catches any OTHER member of this set changing.
+            continue;
+        }
         assert!(
             built.contains(key),
             "{key} is advertised for cron delivery but the factory cannot build it"

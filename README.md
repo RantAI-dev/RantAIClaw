@@ -50,8 +50,9 @@ you put it somewhere that matters.
 - **Defaults change, sometimes on their own.** The daily token ceiling
   (`[cost] max_tokens_per_day`) switched *itself on* at 2,000,000 tokens/day for installs
   that had never set it.
-- **Four channels are supported** — Telegram, Discord, Slack, WhatsApp Cloud. The rest ship
-  labelled *under development*.
+- **Six channels are supported** — Telegram, Discord, Slack, WhatsApp Cloud, WhatsApp Web and
+  Lark. The rest ship labelled *under development*, and a locked one that is still configured
+  is skipped at start with a WARN rather than run.
 - **`rantaiclaw update --channel stable` still installs these.** That channel filters on
   GitHub's prerelease flag, not on the version suffix, and these releases are published with
   the flag off.
