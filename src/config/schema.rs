@@ -3164,21 +3164,108 @@ impl WhatsAppWebConfig {
     /// `*` stays as it is, and so does `lid:<digits>`, the name the channel
     /// gives a sender whose number it cannot see and saves when that sender
     /// pairs. A number gets its `+` form, so `15551234567` typed without the
-    /// `+` still matches that sender. Anything else could never match anyone,
-    /// and is refused with a sentence that names it.
+    /// `+` still matches that sender. A leading `0` is the local-format
+    /// trunk prefix; the runtime writes `+E.164`, so `0812…` would never
+    /// match and is refused with a sentence that asks for the country code.
+    /// Anything else could never match anyone, and is refused with a
+    /// sentence that names it.
     pub fn allowlist_entry(entry: &str) -> Result<String, String> {
         let entry = entry.trim();
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         if entry == "*" || entry.strip_prefix("lid:").is_some_and(digits) {
             return Ok(entry.to_string());
         }
-        if digits(entry.strip_prefix('+').unwrap_or(entry)) {
+        let body = entry.strip_prefix('+').unwrap_or(entry);
+        if digits(body) {
+            if body.starts_with('0') {
+                return Err(format!(
+                    "`{entry}` starts with 0 — that's the local trunk prefix, not \
+                     the country code. Use the country code, like +6281234567890"
+                ));
+            }
             return Ok(Self::plus_form(entry));
         }
         Err(format!(
             "`{entry}` is not a phone number: use digits with an optional leading +, \
              like +15551234567, or * for everyone"
         ))
+    }
+}
+
+#[cfg(test)]
+mod whatsapp_web_config_tests {
+    use super::WhatsAppWebConfig;
+
+    /// F-11. A leading `0` is a local-format digit, not the country code the
+    /// runtime normalises to. Saving it locks the channel into deny-all.
+    #[test]
+    fn allowlist_entry_refuses_a_leading_zero() {
+        let err = WhatsAppWebConfig::allowlist_entry("081234567890").expect_err("must refuse");
+        assert!(
+            err.contains("081234567890"),
+            "the bad entry is named: {err}"
+        );
+        assert!(
+            err.contains("country code"),
+            "the sentence names the fix: {err}"
+        );
+    }
+
+    /// F-11. A bare country-code-without-`+` form is the one operators actually
+    /// type, and it saves as `62812…` next to the runtime's `+62…`. `plus_form`
+    /// normalises it so the saved value matches what the channel compares.
+    #[test]
+    fn allowlist_entry_normalises_a_bare_country_code() {
+        let saved = WhatsAppWebConfig::allowlist_entry("628123456789").expect("must accept");
+        assert_eq!(saved, "+628123456789");
+    }
+
+    /// The wildcard is a documented exemption, not a phone number.
+    #[test]
+    fn allowlist_entry_keeps_a_wildcard() {
+        assert_eq!(
+            WhatsAppWebConfig::allowlist_entry("*").expect("wildcard must pass"),
+            "*"
+        );
+    }
+
+    /// `lid:` is the form the channel writes for an unmapped-LID sender the
+    /// operator adds by hand. The helper has to keep it intact or the runtime
+    /// cannot match the next inbound from the same LID.
+    #[test]
+    fn allowlist_entry_keeps_a_lid_marker() {
+        assert_eq!(
+            WhatsAppWebConfig::allowlist_entry("lid:99887766").expect("lid marker must pass"),
+            "lid:99887766"
+        );
+    }
+
+    /// A `+`-prefixed number passes through with its `+` and its digits.
+    #[test]
+    fn allowlist_entry_keeps_an_explicit_plus() {
+        assert_eq!(
+            WhatsAppWebConfig::allowlist_entry("+15551234567").expect("must accept"),
+            "+15551234567"
+        );
+    }
+
+    /// F-11. `plus_form` is what every entry that has only digits goes through.
+    #[test]
+    fn plus_form_prepends_plus_to_bare_digits() {
+        assert_eq!(WhatsAppWebConfig::plus_form("15551234567"), "+15551234567");
+    }
+
+    #[test]
+    fn plus_form_keeps_an_existing_plus() {
+        assert_eq!(WhatsAppWebConfig::plus_form("+15551234567"), "+15551234567");
+    }
+
+    #[test]
+    fn plus_form_trims_surrounding_whitespace() {
+        assert_eq!(
+            WhatsAppWebConfig::plus_form("  +15551234567  "),
+            "+15551234567"
+        );
     }
 }
 
