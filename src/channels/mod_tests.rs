@@ -3988,6 +3988,186 @@ fn config_with_every_channel() -> Config {
     config
 }
 
+/// A config with exactly one catalog channel's table populated, everything
+/// else default. Lets a table-driven test iterate [`channel_catalog_keys`]
+/// and check each key in isolation, the way a real single-channel deployment
+/// (a WhatsApp-Web-only host, say) is actually shaped.
+///
+/// Panics on a key not in this match — that is the test failing loudly for a
+/// catalog key nobody taught this builder about yet, not a silent no-op.
+pub(crate) fn config_with_only_channel(key: &str) -> Config {
+    use serde_json::json;
+    let mut config = Config::default();
+    let c = &mut config.channels_config;
+    match key {
+        "telegram" => {
+            c.telegram = serde_json::from_value(json!({
+                "bot_token": "111:aaaaaaaaaaaaaaaaaaaaaaaaa", "allowed_users": []
+            }))
+            .expect("telegram");
+        }
+        "discord" => {
+            c.discord = serde_json::from_value(json!({"bot_token": "t", "allowed_users": []}))
+                .expect("discord");
+        }
+        "slack" => {
+            c.slack = serde_json::from_value(json!({
+                "bot_token": "t", "app_token": "a", "channel_id": "C1", "allowed_users": []
+            }))
+            .expect("slack");
+        }
+        "mattermost" => {
+            c.mattermost = serde_json::from_value(json!({
+                "url": "https://example.com", "bot_token": "t", "channel_id": "C1", "allowed_users": []
+            }))
+            .expect("mattermost");
+        }
+        "webhook" => {
+            c.webhook = serde_json::from_value(json!({"port": 8080})).expect("webhook");
+        }
+        "imessage" => {
+            c.imessage = serde_json::from_value(json!({"allowed_contacts": []})).expect("imessage");
+        }
+        "matrix" => {
+            c.matrix = serde_json::from_value(json!({
+                "homeserver": "https://example.org", "access_token": "t",
+                "room_id": "!r:example.org", "allowed_users": []
+            }))
+            .expect("matrix");
+        }
+        "signal" => {
+            c.signal = serde_json::from_value(json!({
+                "http_url": "http://localhost:8080", "account": "+15550000000",
+                "allowed_from": [], "ignore_attachments": false, "ignore_stories": true
+            }))
+            .expect("signal");
+        }
+        "whatsapp" => {
+            c.whatsapp = serde_json::from_value(json!({
+                "mode": "cloud", "phone_number_id": "1", "access_token": "t",
+                "verify_token": "v", "allowed_numbers": []
+            }))
+            .expect("whatsapp");
+        }
+        "whatsapp_web" => {
+            c.whatsapp_web =
+                serde_json::from_value(json!({"session_path": "wa.db"})).expect("whatsapp_web");
+        }
+        "linq" => {
+            c.linq = serde_json::from_value(json!({
+                "api_token": "k", "from_phone": "+15550000001", "allowed_senders": []
+            }))
+            .expect("linq");
+        }
+        "nextcloud_talk" => {
+            c.nextcloud_talk = serde_json::from_value(json!({
+                "base_url": "https://example.com", "app_token": "t", "allowed_users": []
+            }))
+            .expect("nextcloud_talk");
+        }
+        "email" => {
+            c.email = serde_json::from_value(json!({
+                "imap_host": "imap.example.com", "imap_port": 993, "imap_folder": "INBOX",
+                "smtp_host": "smtp.example.com", "smtp_port": 587, "smtp_tls": true,
+                "username": "u", "password": "p", "from_address": "bot@example.com",
+                "idle_timeout_secs": 60
+            }))
+            .expect("email");
+        }
+        "irc" => {
+            c.irc = serde_json::from_value(json!({
+                "server": "irc.example.org", "port": 6697, "nickname": "bot",
+                "channels": ["#c"], "allowed_users": []
+            }))
+            .expect("irc");
+        }
+        "lark" => {
+            c.lark = serde_json::from_value(json!({
+                "app_id": "a", "app_secret": "s", "allowed_users": [],
+                "use_feishu": false, "receive_mode": "webhook"
+            }))
+            .expect("lark");
+        }
+        "dingtalk" => {
+            c.dingtalk = serde_json::from_value(json!({
+                "client_id": "a", "client_secret": "s", "allowed_users": []
+            }))
+            .expect("dingtalk");
+        }
+        "qq" => {
+            c.qq = serde_json::from_value(json!({
+                "app_id": "a", "app_secret": "s", "allowed_users": []
+            }))
+            .expect("qq");
+        }
+        other => panic!("config_with_only_channel: unknown catalog key {other:?}"),
+    }
+    config
+}
+
+/// Collect the WARN lines emitted while `run` executes. Thread-local via a
+/// scoped subscriber, so parallel tests cannot see each other's events.
+fn warnings_from(run: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("lock the log buffer")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Buffer {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buffer = Buffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let bytes = buffer.0.lock().expect("lock the log buffer").clone();
+    String::from_utf8(bytes).expect("log output is utf-8")
+}
+
+/// D-5 in `plans/383`: a config that names a channel whose feature is not
+/// compiled into this build must not start an empty supervisor for it, and
+/// must say why. Gated to a build without `channel-matrix` — the one this
+/// case is actually about; a build that DOES compile Matrix in has nothing to
+/// warn about here.
+#[cfg(not(feature = "channel-matrix"))]
+#[test]
+fn a_matrix_only_config_in_a_build_without_the_feature_warns_and_does_not_start_it() {
+    let config = config_with_only_channel("matrix");
+
+    assert!(
+        !crate::channels::any_catalog_channel_configured(&config),
+        "nothing in this config can actually run, so the supervisor must not start"
+    );
+
+    let logged = warnings_from(|| {
+        crate::channels::warn_configured_channels_that_will_not_start(&config);
+    });
+    assert!(
+        logged.contains("matrix") && logged.to_lowercase().contains("compiled without"),
+        "expected a WARN naming matrix and the missing feature, got: {logged:?}"
+    );
+}
+
 /// The test that would have caught the reported defect: `channels doctor`
 /// had no Mattermost branch, so an operator whose Mattermost bot token had
 /// expired was told everything was healthy while that channel silently never

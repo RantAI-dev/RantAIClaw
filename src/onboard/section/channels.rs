@@ -12,7 +12,7 @@
 use anyhow::Result;
 
 use super::{SetupContext, SetupSection};
-use crate::config::{ChannelsConfig, Config};
+use crate::config::Config;
 use crate::onboard::wizard;
 use crate::profile::Profile;
 
@@ -28,7 +28,7 @@ impl SetupSection for ChannelsSection {
     }
 
     fn is_already_configured(&self, _profile: &Profile, config: &Config) -> bool {
-        any_channel_set(&config.channels_config)
+        any_channel_set(config)
     }
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
@@ -42,7 +42,7 @@ impl SetupSection for ChannelsSection {
         // the full toolset; everyone else is a "guest" under a capability
         // ceiling. If a multi-user channel was configured, offer to set both
         // now (and fall back to /claim guidance if no owner ends up set).
-        if any_channel_set(&ctx.config.channels_config) {
+        if any_channel_set(&ctx.config) {
             prompt_owners_and_guest_ceiling(ctx)?;
             if ctx.config.channels_config.approval_owners.is_empty() {
                 print_owner_claim_guidance();
@@ -182,22 +182,8 @@ fn print_owner_claim_guidance() {
 /// Returns `true` if any non-CLI channel has at least one configuration
 /// block populated. CLI + webhook are bundled defaults and are not
 /// evidence of user-driven configuration.
-fn any_channel_set(c: &ChannelsConfig) -> bool {
-    c.telegram.is_some()
-        || c.discord.is_some()
-        || c.slack.is_some()
-        || c.mattermost.is_some()
-        || c.imessage.is_some()
-        || c.matrix.is_some()
-        || c.signal.is_some()
-        || c.whatsapp.is_some()
-        || c.email.is_some()
-        || c.irc.is_some()
-        || c.lark.is_some()
-        || c.dingtalk.is_some()
-        || c.linq.is_some()
-        || c.qq.is_some()
-        || c.nextcloud_talk.is_some()
+fn any_channel_set(config: &Config) -> bool {
+    crate::channels::any_catalog_channel_configured(config)
 }
 
 #[cfg(test)]
@@ -221,5 +207,35 @@ mod tests {
         };
         let cfg = Config::default();
         assert!(!s.is_already_configured(&dummy, &cfg));
+    }
+
+    #[test]
+    fn a_webhook_only_config_is_not_configured() {
+        let config = crate::channels::tests::config_with_only_channel("webhook");
+        assert!(!any_channel_set(&config));
+    }
+
+    /// Table-driven over the catalog, mirroring
+    /// `daemon::tests::every_catalog_channel_that_can_run_in_this_build_is_supervised`
+    /// — a channel added to the catalog without wiring it here fails loudly
+    /// instead of the onboarding wizard silently re-prompting for it.
+    #[test]
+    fn every_catalog_channel_that_can_run_in_this_build_is_set() {
+        for key in crate::channels::channel_catalog_keys() {
+            if crate::channels::NON_CHANNEL_CATALOG_KEYS.contains(&key) {
+                continue;
+            }
+            let config = crate::channels::tests::config_with_only_channel(key);
+            let expected = match key {
+                "matrix" => cfg!(feature = "channel-matrix"),
+                "lark" => cfg!(feature = "channel-lark"),
+                _ => true,
+            };
+            assert_eq!(
+                any_channel_set(&config),
+                expected,
+                "{key}: expected any_channel_set to answer {expected}"
+            );
+        }
     }
 }
