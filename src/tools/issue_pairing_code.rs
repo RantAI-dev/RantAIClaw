@@ -144,6 +144,12 @@ impl Tool for IssuePairingCodeTool {
         ) {
             return Ok(err(refusal));
         }
+        if let Some(key) = crate::channels::locked_channel_key_for_provisioner(&channel) {
+            return Ok(err(format!(
+                "\"{key}\" is {} and cannot be paired yet.",
+                crate::channels::ChannelSupport::UnderDevelopment.label()
+            )));
+        }
 
         let ttl_minutes = args
             .get("ttl_minutes")
@@ -366,5 +372,36 @@ mod tests {
             "a Cloud table is a listener for `whatsapp`: {:?}",
             minted.error
         );
+    }
+
+    /// A locked channel has a real catalog row, so nothing upstream rejects
+    /// it as an unknown surface — the tool must refuse it itself rather than
+    /// mint a code nothing will ever answer.
+    #[tokio::test]
+    async fn a_locked_channel_is_refused_but_gateway_still_mints() {
+        let _g = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let tool = IssuePairingCodeTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(Config::default()),
+        );
+        let refused = tool.execute(json!({"channel": "irc"})).await.unwrap();
+        let minted = tool.execute(json!({"channel": "gateway"})).await.unwrap();
+
+        restore_home(prev_home);
+
+        assert!(
+            !refused.success,
+            "a locked channel must be refused: {}",
+            refused.output
+        );
+        assert!(
+            refused.error.unwrap_or_default().contains("under development"),
+            "must name why it was refused"
+        );
+        assert!(minted.success, "{:?}", minted.error);
     }
 }

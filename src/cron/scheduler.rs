@@ -717,13 +717,23 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     }
 
     // Construction goes through the channels factory, so cron cannot drift from
-    // what the runtime and the doctor build — these four were hand-rolled here
+    // what the runtime and the doctor build — these three were hand-rolled here
     // with their own copies of every constructor argument list.
     //
     // The *gate* deliberately stays `channel_supports_announce_delivery`. The
     // factory can build fifteen channels; widening delivery to all of them is a
     // capability change, not a refactor, so it is surfaced rather than taken.
+    //
+    // The store already refuses a new or edited job naming a locked channel;
+    // this covers a job that reached the database before that gate existed, or
+    // through some other path it does not sit in front of.
     let key = channel.to_ascii_lowercase();
+    if let Some(locked_key) = crate::channels::locked_channel_key_for_provisioner(&key) {
+        anyhow::bail!(
+            "delivery.channel \"{locked_key}\" is {} and cannot receive scheduled announcements",
+            crate::channels::ChannelSupport::UnderDevelopment.label()
+        );
+    }
     if !crate::channels::channel_supports_announce_delivery(&key) {
         anyhow::bail!("unsupported delivery channel: {key}");
     }
@@ -2027,6 +2037,45 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    /// A job whose `delivery.channel` names a locked channel reaching this
+    /// point (predating the store's own creation-time gate, or written by a
+    /// path that does not sit behind it) must fail to deliver, and the
+    /// attempt must not touch the stored job at all.
+    #[tokio::test]
+    async fn deliver_if_configured_refuses_a_locked_channel_and_leaves_the_job_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo ok",
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let mut locked = job.clone();
+        locked.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("mattermost".into()),
+            to: Some("target".into()),
+            best_effort: true,
+        };
+
+        let err = deliver_if_configured(&config, &locked, "x").await.unwrap_err();
+        assert!(err.to_string().contains("under development"), "{err}");
+
+        let stored = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            stored.delivery.mode, "none",
+            "the failed delivery attempt must not have written the locked delivery back"
+        );
     }
 
     #[tokio::test]

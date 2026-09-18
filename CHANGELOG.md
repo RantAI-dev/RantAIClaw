@@ -130,6 +130,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The CLI, pairing and scheduled delivery refuse a locked channel by name.** `rantaiclaw setup
+  <name>` (interactive and `--non-interactive`), `/pair` in the TUI, `rantaiclaw channels pair`, the
+  `issue_pairing_code` tool, and a scheduled job's `delivery.channel` all used to accept a locked
+  channel's real catalog key and either run its setup flow, mint a pairing code nothing would ever
+  claim, or save a cron job whose output could never be delivered. Each now refuses with a sentence
+  naming the channel and that it is under development, before anything is written; `gateway` and
+  every usable channel are unaffected. A cron job's `delivery.channel` is checked on both creation
+  and every later edit, so a job cannot be re-pointed at a locked channel after the fact either — a
+  job already carrying one (from before this check existed) still fails cleanly at send time instead
+  of erroring past a missing gate, and the attempt never touches the stored job. Mattermost, which is
+  locked, is also dropped from the small set of channels cron can announce to at all, and from the
+  legacy `onboard` channel menu's selectable choices (still named in a dimmed note below it).
+  `rantaiclaw integrations` now shows a locked channel as "under development" via the same catalog
+  label doctor and `channel list` use, rather than "Active" or "Available".
 - **A locked channel's populated table is never started, and every surface says so.** The channel
   factory used to build every configured channel unconditionally; a channel outside the supported
   six (Telegram, Discord, Slack, WhatsApp Cloud, WhatsApp Web, Lark) now stays unbuilt even when its

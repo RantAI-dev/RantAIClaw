@@ -189,6 +189,12 @@ impl CommandHandler for PairCommand {
         {
             return Ok(CommandResult::Message(format!("✗ {refusal}")));
         }
+        if let Some(key) = crate::channels::locked_channel_key_for_provisioner(&parsed.channel) {
+            let reason = crate::channels::ChannelSupport::UnderDevelopment.label();
+            return Ok(CommandResult::Message(format!(
+                "✗ \"{key}\" is {reason} and cannot be paired yet."
+            )));
+        }
         match mint_and_render(&parsed) {
             Ok((display, persisted)) => Ok(CommandResult::SensitiveMessage { display, persisted }),
             Err(e) => Ok(CommandResult::Message(format!(
@@ -375,5 +381,36 @@ mod tests {
             matches!(minted, CommandResult::SensitiveMessage { .. }),
             "the Cloud API is a listener for `whatsapp`: {minted:?}"
         );
+    }
+
+    /// A locked channel has a catalog row, so it passes `valid_pair_surface`,
+    /// but nothing will ever be listening on it. Minting a code there looks
+    /// like it worked and never does.
+    #[test]
+    fn pair_refuses_a_locked_channel() {
+        let mut ctx = test_context();
+        match PairCommand.execute("irc", &mut ctx).unwrap() {
+            CommandResult::Message(m) => assert!(
+                m.contains("under development"),
+                "must name why it was refused: {m}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A usable channel and the gateway must still mint — the lock only
+    /// narrows what a valid surface accepts, it never widens what a refusal
+    /// covers.
+    #[test]
+    fn pair_still_mints_for_a_usable_channel_and_the_gateway() {
+        let mut ctx = test_context();
+        assert!(matches!(
+            PairCommand.execute("telegram", &mut ctx).unwrap(),
+            CommandResult::SensitiveMessage { .. }
+        ));
+        assert!(matches!(
+            PairCommand.execute("gateway", &mut ctx).unwrap(),
+            CommandResult::SensitiveMessage { .. }
+        ));
     }
 }

@@ -799,6 +799,23 @@ pub(crate) fn catalog_key_for_provisioner(name: &str) -> &str {
     }
 }
 
+/// The catalog key `name` is locked under, or `None` when `name` is not a
+/// channel at all (a core or runtime-surface setup topic) or names a usable
+/// channel. The single check every setup, pairing and cron surface refusing a
+/// locked channel shares, so "is this a channel" and "is it locked" are asked
+/// together exactly once.
+pub(crate) fn locked_channel_key_for_provisioner(name: &str) -> Option<&str> {
+    let key = catalog_key_for_provisioner(name);
+    if channel_catalog_keys().contains(&key)
+        && !NON_CHANNEL_CATALOG_KEYS.contains(&key)
+        && !channel_is_usable(key)
+    {
+        Some(key)
+    } else {
+        None
+    }
+}
+
 /// Whether any catalog channel (other than the gateway-served `webhook`) is
 /// configured in this build. The one place that answers "does this config set
 /// up at least one channel" — the daemon's decision to start the channel

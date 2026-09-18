@@ -12,6 +12,10 @@ pub enum IntegrationStatus {
     Active,
     /// Planned but not yet implemented
     ComingSoon,
+    /// A channel this build can run, but the catalog does not yet commit to —
+    /// built and tested, locked from use until it is opened. Distinct from
+    /// `ComingSoon`, which names something not built at all.
+    UnderDevelopment,
 }
 
 /// Integration category
@@ -92,6 +96,7 @@ fn list_integrations(config: &Config) -> Result<()> {
                 IntegrationStatus::Active => "✅",
                 IntegrationStatus::Available => "⚪",
                 IntegrationStatus::ComingSoon => "🔜",
+                IntegrationStatus::UnderDevelopment => "🔒",
             };
             println!("    {icon} {} — {}", entry.name, entry.description);
         }
@@ -111,10 +116,12 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
     };
 
     let status = (entry.status_fn)(config);
+    let under_development_label = crate::channels::ChannelSupport::UnderDevelopment.label();
     let (icon, label) = match status {
         IntegrationStatus::Active => ("✅", "Active"),
         IntegrationStatus::Available => ("⚪", "Available"),
         IntegrationStatus::ComingSoon => ("🔜", "Coming Soon"),
+        IntegrationStatus::UnderDevelopment => ("🔒", under_development_label),
     };
 
     println!();
@@ -191,6 +198,9 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             if status == IntegrationStatus::ComingSoon {
                 println!("  This integration is planned. Stay tuned!");
                 println!("  Track progress: https://github.com/theonlyhennygod/rantaiclaw");
+            }
+            if status == IntegrationStatus::UnderDevelopment {
+                println!("  This channel is built and tested, but not yet opened for use.");
             }
         }
     }

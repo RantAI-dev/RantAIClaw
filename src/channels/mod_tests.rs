@@ -4181,6 +4181,63 @@ fn channel_is_usable_matches_the_catalogs_support_axis() {
     }
 }
 
+/// `locked_channel_key_for_provisioner` only fires for a name that maps to an
+/// actual catalog channel, and only when that channel is locked. A
+/// non-channel setup topic (a runtime surface, a core section) must never be
+/// refused: it has no catalog row to be locked against.
+#[test]
+fn locked_channel_key_for_provisioner_covers_every_registered_provisioner() {
+    for (name, _) in crate::onboard::provision::registry::available() {
+        let mapped = crate::channels::catalog_key_for_provisioner(name);
+        let is_catalog_key = crate::channels::channel_catalog_keys().contains(&mapped);
+        let expected = if is_catalog_key && !crate::channels::channel_is_usable(mapped) {
+            Some(mapped)
+        } else {
+            None
+        };
+        assert_eq!(
+            crate::channels::locked_channel_key_for_provisioner(name),
+            expected,
+            "provisioner {name:?} (mapped to {mapped:?})"
+        );
+    }
+}
+
+#[test]
+fn locked_channel_key_for_provisioner_never_refuses_a_non_channel_topic() {
+    assert_eq!(
+        crate::channels::locked_channel_key_for_provisioner("gateway"),
+        None
+    );
+    assert_eq!(
+        crate::channels::locked_channel_key_for_provisioner("persona"),
+        None
+    );
+}
+
+/// `webhook` carries an `UnderDevelopment` catalog row, but it is served by
+/// the gateway, not opened by a setup/pairing surface — it is explicitly not
+/// an entry point this lock covers, so it must never be refused as "locked".
+#[test]
+fn locked_channel_key_for_provisioner_never_refuses_webhook() {
+    assert_eq!(
+        crate::channels::locked_channel_key_for_provisioner("webhook"),
+        None
+    );
+}
+
+#[test]
+fn locked_channel_key_for_provisioner_refuses_irc_but_not_whatsapp_web() {
+    assert_eq!(
+        crate::channels::locked_channel_key_for_provisioner("irc"),
+        Some("irc")
+    );
+    assert_eq!(
+        crate::channels::locked_channel_key_for_provisioner("whatsapp-web"),
+        None
+    );
+}
+
 /// The factory builds a channel exactly when its table is configured AND its
 /// catalog row is usable — a locked channel's populated table never reaches
 /// the fleet, a usable one always does. Iterates the catalog, not a literal
@@ -4507,6 +4564,53 @@ async fn channel_pair_refuses_whatsapp_only_where_whatsapp_web_is_what_runs() {
     assert!(stored_after_mint, "the Cloud code must reach the store");
 }
 
+/// `channels pair --channel <locked>` has a real catalog row to accept, but
+/// nothing will ever listen on it. It must refuse before minting, and a
+/// usable channel plus `gateway` must still mint.
+#[tokio::test]
+async fn channel_pair_refuses_a_locked_channel_but_not_gateway() {
+    let _guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let config = Config::default();
+    let locked = crate::ChannelCommands::Pair {
+        channel: "irc".to_string(),
+        ttl: 15,
+        max_uses: None,
+        no_owner: true,
+    };
+    let usable = crate::ChannelCommands::Pair {
+        channel: "telegram".to_string(),
+        ttl: 15,
+        max_uses: None,
+        no_owner: true,
+    };
+    let gateway = crate::ChannelCommands::Pair {
+        channel: "gateway".to_string(),
+        ttl: 15,
+        max_uses: None,
+        no_owner: true,
+    };
+    let locked_result = admin::handle_command(locked, &config).await;
+    let usable_result = admin::handle_command(usable, &config).await;
+    let gateway_result = admin::handle_command(gateway, &config).await;
+
+    match prev_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let err = locked_result.expect_err("a locked channel must be refused");
+    assert!(
+        err.to_string().contains("under development"),
+        "must name why it was refused: {err}"
+    );
+    assert!(usable_result.is_ok(), "{usable_result:?}");
+    assert!(gateway_result.is_ok(), "{gateway_result:?}");
+}
+
 /// The roster is what `channel list` and `status` report. It used to be a
 /// separate hand-maintained list documented as the single source of truth,
 /// and it disagreed with what was actually constructed.
@@ -4630,9 +4734,12 @@ fn lark_is_configured_in_the_default_build() {
 
 /// The "keep in sync" comment on `channel_supports_announce_delivery` asks
 /// for an invariant nothing enforced. The factory can build fifteen channels;
-/// cron delivers to four. That gap is deliberate — widening delivery is a
+/// cron delivers to three. That gap is deliberate — widening delivery is a
 /// capability change, not a refactor — so this pins the advertised set
-/// instead of letting it drift silently in either direction.
+/// instead of letting it drift silently in either direction. Every advertised
+/// channel must also be one the factory can actually build: a locked channel
+/// dropped out of the gate entirely rather than staying advertised for a
+/// factory that will never build it.
 #[test]
 fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
     let config = config_with_every_channel();
@@ -4649,17 +4756,10 @@ fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
 
     assert_eq!(
         advertised,
-        vec!["telegram", "discord", "slack", "mattermost"],
+        vec!["telegram", "discord", "slack"],
         "cron delivery set changed — this is a capability change, not a refactor"
     );
     for key in &advertised {
-        if *key == "mattermost" {
-            // Locked: the factory no longer builds it, but the cron
-            // announce gate has not been narrowed to match yet — a
-            // separate, already-scoped piece of work. The pinned list
-            // above still catches any OTHER member of this set changing.
-            continue;
-        }
         assert!(
             built.contains(key),
             "{key} is advertised for cron delivery but the factory cannot build it"

@@ -1628,6 +1628,19 @@ async fn main() -> Result<()> {
         let non_interactive = *non_interactive;
         let is_headless = non_interactive || !std::io::stdin().is_terminal();
 
+        // A locked channel's provisioner exists and compiles, but the catalog
+        // does not commit to it yet — refuse before either path below loads or
+        // touches config.toml, interactive or not.
+        if let Some(ref topic_name) = topic {
+            if let Some(locked_key) = channels::locked_channel_key_for_provisioner(topic_name) {
+                eprintln!(
+                    "✗ \"{locked_key}\" is {} and cannot be set up yet.",
+                    channels::ChannelSupport::UnderDevelopment.label()
+                );
+                std::process::exit(1);
+            }
+        }
+
         // Headless / CI path.
         if is_headless {
             // Route provisioners through a dedicated headless runner;
