@@ -40,6 +40,8 @@ use std::sync::Arc;
 #[cfg(feature = "whatsapp-web")]
 use std::sync::RwLock;
 use tokio::select;
+#[cfg(feature = "whatsapp-web")]
+use wa_rs_binary::jid::Jid;
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -489,6 +491,7 @@ impl WhatsAppWebChannel {
         text: &str,
         phone: &str,
         chat_jid: wa_rs_binary::jid::Jid,
+        resolved_pn: Option<&str>,
     ) -> bool {
         let Some(root) = crate::channels::pairing::profile_root("whatsapp_web") else {
             return false;
@@ -501,9 +504,14 @@ impl WhatsAppWebChannel {
             conversation: Some(reply),
             ..Default::default()
         };
+        // Send on the same Jid normal replies use. The raw chat Jid is a
+        // `@lid` for LID-addressed chats, and WhatsApp delivers nothing there
+        // the operator can see — `pick_reply_target` swaps it for the
+        // resolved phone-number thread when one is known.
+        let target = Self::pick_reply_target(&chat_jid, resolved_pn);
         // `send_message` returns a large future; box it so it doesn't bloat this
         // fn's (already boxed) future further.
-        if let Err(e) = Box::pin(client.send_message(chat_jid, outgoing)).await {
+        if let Err(e) = Box::pin(client.send_message(target, outgoing)).await {
             tracing::error!("WhatsApp Web pairing reply send failed: {e}");
         }
         true
@@ -719,19 +727,39 @@ impl WhatsAppWebChannel {
     /// PN→LID for the encryption session, so a LID `to` is delivered to the LID
     /// thread rather than the visible phone-number chat.
     ///
+    /// Pick the Jid a reply should target.
+    ///
+    /// When the chat is a LID and the sender's phone number is known (either
+    /// from the inbound message's `lid_pn_cache` or looked up explicitly),
+    /// replies belong on the phone-number (PN) thread — the one the operator
+    /// actually reads. Falling back to the LID is the documented behaviour for
+    /// unmapped LIDs, groups and broadcasts, and is what the un-resolved path
+    /// already did. Pure so every caller is testable without a live wa-rs
+    /// client (`:1101` is the only one; `try_reply_pairing` is the other).
+    #[cfg(feature = "whatsapp-web")]
+    fn pick_reply_target(chat: &Jid, resolved_pn: Option<&str>) -> Jid {
+        use wa_rs_binary::jid::{JidExt as _, HIDDEN_USER_SERVER};
+        if chat.server() == HIDDEN_USER_SERVER {
+            if let Some(pn) = resolved_pn {
+                return Jid::pn(pn);
+            }
+        }
+        chat.clone()
+    }
+
     /// When the chat is a LID and wa-rs has learned the phone-number mapping
     /// from the inbound message (its `lid_pn_cache`), reply on the phone-number
     /// (PN) thread instead. Falls back to the original JID for groups,
     /// broadcasts, and unmapped LIDs so nothing regresses.
     #[cfg(feature = "whatsapp-web")]
-    async fn resolve_reply_target(client: &wa_rs::Client, chat: &wa_rs_binary::jid::Jid) -> String {
-        use wa_rs_binary::jid::{JidExt as _, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER};
-        if chat.server() == HIDDEN_USER_SERVER {
-            if let Some(pn) = client.get_phone_number_from_lid(chat.user()).await {
-                return format!("{pn}@{DEFAULT_USER_SERVER}");
-            }
-        }
-        chat.to_string()
+    async fn resolve_reply_target(client: &wa_rs::Client, chat: &Jid) -> Jid {
+        use wa_rs_binary::jid::{JidExt as _, HIDDEN_USER_SERVER};
+        let pn = if chat.server() == HIDDEN_USER_SERVER {
+            client.get_phone_number_from_lid(chat.user()).await
+        } else {
+            None
+        };
+        Self::pick_reply_target(chat, pn.as_deref())
     }
 
     /// Normalize an inbound sender to the E.164 `+` form used for allowlist and
@@ -1028,6 +1056,7 @@ impl Channel for WhatsAppWebChannel {
                                 text,
                                 &normalized,
                                 chat_jid.clone(),
+                                resolved_pn.as_deref(),
                             ))
                             .await;
                             if handled {
@@ -1099,7 +1128,7 @@ impl Channel for WhatsAppWebChannel {
                                 // in a thread the user never sees). Typing reuses
                                 // this target, so it follows the reply.
                                 let reply_target =
-                                    Self::resolve_reply_target(&client, &chat_jid).await;
+                                    Self::resolve_reply_target(&client, &chat_jid).await.to_string();
                                 let inbound = Self::inbound_channel_message(
                                     &info.id,
                                     normalized.clone(),
@@ -3156,6 +3185,63 @@ mod tests {
             WhatsAppWebChannel::normalize_sender(None, "+1234567890"),
             "+1234567890"
         );
+    }
+
+    /// F-15. The pairing reply used to be sent to the raw event chat Jid,
+    /// which on a LID-addressed DM is a `@lid` the operator never sees. With
+    /// the phone number resolved, the reply has to land on the phone-number
+    /// thread the same way normal replies do.
+    #[test]
+    fn pick_reply_target_routes_lid_chat_to_resolved_phone() {
+        use wa_rs_binary::jid::JidExt as _;
+        let lid_chat = wa_rs_binary::jid::Jid::lid("200000000000001");
+        let target = WhatsAppWebChannel::pick_reply_target(&lid_chat, Some("628123456789"));
+        assert!(
+            target.is_pn(),
+            "LID chat with a known PN must reply on the PN thread, got {target:?}"
+        );
+        assert_eq!(target.user(), "628123456789");
+    }
+
+    /// An unmapped LID has nothing better to fall back to than the LID itself.
+    /// The chat's original Jid is what the operator addressed, and the wa-rs
+    /// delivery surface covers it even if their client does not.
+    #[test]
+    fn pick_reply_target_keeps_lid_chat_when_unresolved() {
+        use wa_rs_binary::jid::JidExt as _;
+        let lid_chat = wa_rs_binary::jid::Jid::lid("200000000000001");
+        let target = WhatsAppWebChannel::pick_reply_target(&lid_chat, None);
+        assert!(
+            target.is_lid(),
+            "unresolved LID chat must keep its LID, got {target:?}"
+        );
+        assert_eq!(target.user(), "200000000000001");
+    }
+
+    /// A PN-addressed chat is already the right thread. A `resolved_pn` may
+    /// still be present (the inbound cache warmed it); it is ignored.
+    #[test]
+    fn pick_reply_target_passes_pn_chat_through() {
+        use wa_rs_binary::jid::JidExt as _;
+        let pn_chat = wa_rs_binary::jid::Jid::pn("628123456789");
+        let target = WhatsAppWebChannel::pick_reply_target(&pn_chat, Some("999999"));
+        assert!(target.is_pn());
+        assert_eq!(target.user(), "628123456789");
+    }
+
+    /// Group chats carry their own thread; the helper must not rewrite them.
+    /// `pick_reply_target` runs on every inbound, and only LIDs are mapped.
+    #[test]
+    fn pick_reply_target_passes_group_chat_through() {
+        use wa_rs_binary::jid::JidExt as _;
+        let group = wa_rs_binary::jid::Jid::group("123456789");
+        let target = WhatsAppWebChannel::pick_reply_target(&group, Some("628123456789"));
+        assert!(
+            !target.is_pn(),
+            "group chat must not be remapped to a PN, got {target:?}"
+        );
+        assert!(!target.is_lid());
+        assert_eq!(target.user(), "123456789");
     }
 
     #[test]

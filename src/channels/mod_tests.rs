@@ -305,6 +305,25 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
     }
 }
 
+/// F-15. Pairing replies (`/bind`, `/claim`) used to be sent to the raw
+/// event chat Jid, which is a `@lid` on LID-addressed DMs and lands in a
+/// thread the operator never sees. The helper `pick_reply_target` swaps it
+/// for the resolved phone-number thread the same way normal replies do, and
+/// every pairing send has to go through it.
+#[test]
+fn whatsapp_web_pairing_reply_routes_through_pick_reply_target() {
+    let src = include_str!("whatsapp_web.rs");
+    let production = production_half(src);
+    let body = fn_body(production, "fn try_reply_pairing(")
+        .expect("`try_reply_pairing` not found in production code");
+    assert!(
+        body.contains("Self::pick_reply_target("),
+        "whatsapp_web pairing reply no longer goes through `pick_reply_target` — \
+         a LID-addressed chat will get the confirmation in a thread the operator \
+         never sees"
+    );
+}
+
 /// The function a hop call names: `self.handle_inbound(` is `handle_inbound`.
 /// Receivers vary (`self.`, `Self::`, or nothing when rustfmt broke the line)
 /// so all three are stripped.
