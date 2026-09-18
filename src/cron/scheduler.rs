@@ -2068,8 +2068,14 @@ mod tests {
             best_effort: true,
         };
 
-        let err = deliver_if_configured(&config, &locked, "x").await.unwrap_err();
-        assert!(err.to_string().contains("under development"), "{err}");
+        let err = deliver_if_configured(&config, &locked, "x")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(crate::channels::ChannelSupport::UnderDevelopment.label()),
+            "{err}"
+        );
 
         let stored = cron::get_job(&config, &job.id).unwrap();
         assert_eq!(

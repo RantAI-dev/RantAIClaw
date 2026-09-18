@@ -399,7 +399,10 @@ mod tests {
             refused.output
         );
         assert!(
-            refused.error.unwrap_or_default().contains("under development"),
+            refused
+                .error
+                .unwrap_or_default()
+                .contains(crate::channels::ChannelSupport::UnderDevelopment.label()),
             "must name why it was refused"
         );
         assert!(minted.success, "{:?}", minted.error);

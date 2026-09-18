@@ -391,7 +391,7 @@ mod tests {
         let mut ctx = test_context();
         match PairCommand.execute("irc", &mut ctx).unwrap() {
             CommandResult::Message(m) => assert!(
-                m.contains("under development"),
+                m.contains(crate::channels::ChannelSupport::UnderDevelopment.label()),
                 "must name why it was refused: {m}"
             ),
             other => panic!("expected a refusal, got {other:?}"),

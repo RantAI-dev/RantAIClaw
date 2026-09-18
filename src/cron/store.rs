@@ -992,7 +992,11 @@ mod tests {
             None,
         )
         .expect_err("a locked delivery channel must be refused at creation");
-        assert!(err.to_string().contains("under development"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(crate::channels::ChannelSupport::UnderDevelopment.label()),
+            "{err}"
+        );
     }
 
     /// The same refusal applies to a later edit — a job created with no
@@ -1027,7 +1031,11 @@ mod tests {
         };
         let err = update_job(&config, &job.id, patch)
             .expect_err("re-pointing delivery at a locked channel must be refused");
-        assert!(err.to_string().contains("under development"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(crate::channels::ChannelSupport::UnderDevelopment.label()),
+            "{err}"
+        );
 
         // The job itself must be untouched by the rejected edit.
         let reread = get_job(&config, &job.id).unwrap();

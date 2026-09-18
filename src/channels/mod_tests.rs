@@ -4604,7 +4604,8 @@ async fn channel_pair_refuses_a_locked_channel_but_not_gateway() {
 
     let err = locked_result.expect_err("a locked channel must be refused");
     assert!(
-        err.to_string().contains("under development"),
+        err.to_string()
+            .contains(ChannelSupport::UnderDevelopment.label()),
         "must name why it was refused: {err}"
     );
     assert!(usable_result.is_ok(), "{usable_result:?}");
