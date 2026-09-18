@@ -4144,11 +4144,10 @@ fn warnings_from(run: impl FnOnce()) -> String {
     String::from_utf8(bytes).expect("log output is utf-8")
 }
 
-/// D-5 in `plans/383`: a config that names a channel whose feature is not
-/// compiled into this build must not start an empty supervisor for it, and
-/// must say why. Gated to a build without `channel-matrix` — the one this
-/// case is actually about; a build that DOES compile Matrix in has nothing to
-/// warn about here.
+/// A config that names a channel whose feature is not compiled into this
+/// build must not start an empty supervisor for it, and must say why. Gated
+/// to a build without `channel-matrix` — the one this case is actually
+/// about; a build that DOES compile Matrix in has nothing to warn about here.
 #[cfg(not(feature = "channel-matrix"))]
 #[test]
 fn a_matrix_only_config_in_a_build_without_the_feature_warns_and_does_not_start_it() {
