@@ -59,6 +59,7 @@ impl CommandHandler for HelpCommand {
                 key: c.name.clone(),
                 primary: c.headline(),
                 secondary: c.description.clone(),
+                disabled: false,
             })
             .collect();
         let picker = ListPicker::new(

@@ -169,6 +169,7 @@ fn clawhub_result_item(
         key,
         primary,
         secondary,
+        disabled: false,
     }
 }
 
@@ -197,6 +198,7 @@ fn clawhub_candidate_items(
                 key: format!("@{}/{}", m.owner_handle, ambiguous.slug),
                 primary,
                 secondary: m.url.clone(),
+                disabled: false,
             }
         })
         .collect()
@@ -4143,6 +4145,13 @@ impl TuiApp {
         let prov =
             provisioner_for(&name).ok_or_else(|| anyhow::anyhow!("unknown provisioner: {name}"))?;
 
+        if prov.category() == crate::onboard::provision::ProvisionerCategory::Channel {
+            let catalog_key = crate::channels::catalog_key_for_provisioner(&name);
+            if !crate::channels::channel_is_usable(catalog_key) {
+                anyhow::bail!("\"{name}\" is under development and cannot be set up yet");
+            }
+        }
+
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(32);
         let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
         // Oneshot the spawn task uses to send the post-save Config back
@@ -4351,8 +4360,8 @@ impl TuiApp {
     /// category. `cat_key` is one of `core` / `channel` /
     /// `integration` / `runtime` / `hardware` / `routing`.
     fn open_category_sub_picker(&mut self, cat_key: &str) {
-        use crate::onboard::provision::{available, provisioner_for};
-        use crate::tui::commands::setup::{cat_label, category_from_key};
+        use crate::onboard::provision::{available, provisioner_for, ProvisionerCategory};
+        use crate::tui::commands::setup::{cat_label, category_from_key, channel_picker_entries};
         use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
         let Some(category) = category_from_key(cat_key) else {
@@ -4362,35 +4371,45 @@ impl TuiApp {
             return;
         };
 
-        let items: Vec<ListPickerItem> = available()
-            .into_iter()
-            .filter_map(|(name, desc)| {
-                let p = provisioner_for(name)?;
-                if p.category() == category {
-                    Some(ListPickerItem {
-                        key: name.to_string(),
-                        primary: name.to_string(),
-                        secondary: desc.to_string(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
         let title = format!("{} setup", cat_label(category));
         let empty_hint = format!(
             "no {} provisioners available",
             cat_label(category).to_lowercase()
         );
 
-        let picker = ListPicker::new(
-            ListPickerKind::SetupChannel, // re-used as the generic "category sub-picker" kind
-            title,
-            items,
-            None,
-            empty_hint,
-        );
+        let picker = if category == ProvisionerCategory::Channel {
+            ListPicker::with_entries(
+                ListPickerKind::SetupChannel,
+                title,
+                channel_picker_entries(),
+                None,
+                empty_hint,
+            )
+        } else {
+            let items: Vec<ListPickerItem> = available()
+                .into_iter()
+                .filter_map(|(name, desc)| {
+                    let p = provisioner_for(name)?;
+                    if p.category() == category {
+                        Some(ListPickerItem {
+                            key: name.to_string(),
+                            primary: name.to_string(),
+                            secondary: desc.to_string(),
+                            disabled: false,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            ListPicker::new(
+                ListPickerKind::SetupChannel, // re-used as the generic "category sub-picker" kind
+                title,
+                items,
+                None,
+                empty_hint,
+            )
+        };
         self.list_picker = Some(picker);
     }
 
@@ -9305,6 +9324,35 @@ mod submit_tests {
             text.contains("mock-model  │  —  │"),
             "an unreported count must read as unknown, not as 0: {text:?}"
         );
+    }
+
+    /// `/setup <locked-channel>` must refuse before it ever spawns the
+    /// provisioner task — no config write, no overlay.
+    #[test]
+    fn open_setup_overlay_refuses_a_locked_channel() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        let err = app
+            .open_setup_overlay("irc".to_string())
+            .expect_err("irc is under development and must be refused");
+        assert!(err.to_string().contains("under development"), "got: {err}");
+        assert!(
+            app.setup_overlay.is_none(),
+            "a refused channel must never open the setup overlay"
+        );
+    }
+
+    /// A usable channel is unaffected by the lock. `open_setup_overlay`
+    /// spawns the provisioner's task on success, so this needs a runtime —
+    /// the refusal case above does not, since it returns before ever
+    /// reaching the spawn.
+    #[tokio::test]
+    async fn open_setup_overlay_still_opens_a_usable_channel() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.open_setup_overlay("telegram".to_string())
+            .expect("telegram is usable and must open");
+        assert!(app.setup_overlay.is_some());
     }
 
     /// The other half: a reported count still renders as a number.

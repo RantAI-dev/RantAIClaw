@@ -83,10 +83,15 @@ pub struct ListPickerItem {
     pub key: String,
     pub primary: String,
     pub secondary: String,
+    /// Renders dimmed, is skipped by cursor movement, and does nothing on
+    /// Enter. For a row that exists so the user can see it is not available
+    /// yet (a channel the catalog marks under development), rather than one
+    /// that should simply be absent from the list.
+    pub disabled: bool,
 }
 
-/// An entry in the list picker — either a regular item or a collapsible
-/// category header.
+/// An entry in the list picker — a regular item, a collapsible category
+/// header, or a static heading.
 #[derive(Debug, Clone)]
 pub enum ListPickerEntry {
     Item(ListPickerItem),
@@ -95,6 +100,14 @@ pub enum ListPickerEntry {
         label: String,
         item_count: usize,
         collapsed: bool,
+    },
+    /// A label row with no interaction at all: never focused, never
+    /// toggled, always visible. Unlike `CategoryHeader`, which the cursor
+    /// can land on to collapse/expand it, this exists purely to separate two
+    /// groups of items visually (e.g. "Under development" above a run of
+    /// disabled rows).
+    StaticHeading {
+        label: String,
     },
 }
 
@@ -112,10 +125,16 @@ impl ListPickerEntry {
         }
     }
 
+    pub fn static_heading(label: impl Into<String>) -> Self {
+        Self::StaticHeading {
+            label: label.into(),
+        }
+    }
+
     pub fn as_item(&self) -> Option<&ListPickerItem> {
         match self {
             Self::Item(i) => Some(i),
-            Self::CategoryHeader { .. } => None,
+            Self::CategoryHeader { .. } | Self::StaticHeading { .. } => None,
         }
     }
 
@@ -127,14 +146,25 @@ impl ListPickerEntry {
                 item_count,
                 collapsed,
             } => Some((id.as_str(), label.as_str(), *item_count, *collapsed)),
-            Self::Item(_) => None,
+            Self::Item(_) | Self::StaticHeading { .. } => None,
+        }
+    }
+
+    /// Whether the cursor may ever land on this entry. A disabled item is
+    /// shown (and still matched by the filter) but is not a stop the cursor
+    /// makes; a static heading never was.
+    fn is_selectable(&self) -> bool {
+        match self {
+            Self::Item(i) => !i.disabled,
+            Self::CategoryHeader { .. } => true,
+            Self::StaticHeading { .. } => false,
         }
     }
 
     fn primary_text(&self) -> String {
         match self {
             Self::Item(i) => i.primary.clone(),
-            Self::CategoryHeader { label, .. } => label.clone(),
+            Self::CategoryHeader { label, .. } | Self::StaticHeading { label } => label.clone(),
         }
     }
 
@@ -146,6 +176,7 @@ impl ListPickerEntry {
                 item_count,
                 if *item_count == 1 { "" } else { "s" }
             ),
+            Self::StaticHeading { .. } => String::new(),
         }
     }
 }
@@ -380,6 +411,7 @@ impl ListPicker {
             self.selected = 0;
             self.list_state.select(Some(0));
             self.focus = Focus::Search;
+            self.skip_leading_unselectable_on_page();
         }
     }
 
@@ -389,6 +421,32 @@ impl ListPicker {
             self.selected = 0;
             self.list_state.select(Some(0));
             self.focus = Focus::Search;
+            self.skip_leading_unselectable_on_page();
+        }
+    }
+
+    /// After landing on a fresh page at `selected = 0`, advance past a run of
+    /// disabled items or a static heading that starts the page, so the
+    /// highlighted row is always one the cursor could actually stop on.
+    /// Bounded by the page's own length: a page that is entirely
+    /// unselectable (a pathological, all-locked catalog) leaves `selected`
+    /// wherever this loop's last step put it rather than looping forever.
+    fn skip_leading_unselectable_on_page(&mut self) {
+        let page_len = self.page_indices().len();
+        for _ in 0..page_len {
+            let stopped = self
+                .page_indices()
+                .get(self.selected)
+                .and_then(|&i| self.entries.get(i))
+                .is_none_or(ListPickerEntry::is_selectable);
+            if stopped {
+                return;
+            }
+            if self.selected + 1 >= page_len {
+                return;
+            }
+            self.selected += 1;
+            self.list_state.select(Some(self.selected));
         }
     }
 
@@ -428,6 +486,10 @@ impl ListPicker {
                         // No query: always include headers (even collapsed ones).
                         true
                     }
+                    // A static heading carries no searchable text of its own
+                    // and never hides a match beneath it (nothing collapses
+                    // under it), so it is simplest to always show it.
+                    ListPickerEntry::StaticHeading { .. } => true,
                     ListPickerEntry::Item(item) => {
                         // When searching, items in collapsed categories are hidden.
                         if !searching {
@@ -448,7 +510,36 @@ impl ListPicker {
         self.filtered_indices().len()
     }
 
+    /// Whether the cursor has landed somewhere it may legally stop: the search
+    /// bar, or a selectable entry. Landing on a disabled item or a static
+    /// heading means a skip step must run again.
+    fn cursor_stopped_on_selectable(&self) -> bool {
+        match self.focus {
+            Focus::Search => true,
+            Focus::List | Focus::Category => self
+                .page_indices()
+                .get(self.selected)
+                .and_then(|&i| self.entries.get(i))
+                .is_none_or(ListPickerEntry::is_selectable),
+        }
+    }
+
     pub fn move_up(&mut self) {
+        // Bounded by the entry count plus one: that is the most steps a full
+        // traversal of every entry (selectable or not) could ever take before
+        // either landing on a selectable one or cycling back to the search
+        // bar, so a picker with no selectable entries at all still
+        // terminates instead of looping.
+        let bound = self.entries.len() + 1;
+        for _ in 0..bound {
+            self.move_up_step();
+            if self.cursor_stopped_on_selectable() {
+                return;
+            }
+        }
+    }
+
+    fn move_up_step(&mut self) {
         match self.focus {
             Focus::Search => {}
             Focus::List | Focus::Category => {
@@ -474,6 +565,16 @@ impl ListPicker {
     }
 
     pub fn move_down(&mut self) {
+        let bound = self.entries.len() + 1;
+        for _ in 0..bound {
+            self.move_down_step();
+            if self.cursor_stopped_on_selectable() {
+                return;
+            }
+        }
+    }
+
+    fn move_down_step(&mut self) {
         let len = self.page_indices().len();
         if len == 0 {
             return;
@@ -550,10 +651,17 @@ impl ListPicker {
         page.get(pos).and_then(|i| self.entries.get(*i))
     }
 
-    /// The currently-highlighted item, or `None` if a category header
-    /// is currently selected.
+    /// The currently-highlighted item, or `None` if a category header, a
+    /// static heading, or a disabled item is currently selected. Normal
+    /// cursor movement never stops on a disabled item, but a query that
+    /// filters the view down to only disabled rows still has to leave Enter
+    /// inert on the one row left — checking `disabled` here, not just at the
+    /// movement layer, is what makes that true regardless of how the cursor
+    /// got there.
     pub fn current(&self) -> Option<&ListPickerItem> {
-        self.current_entry().and_then(|e| e.as_item())
+        self.current_entry()
+            .and_then(|e| e.as_item())
+            .filter(|item| !item.disabled)
     }
 
     /// Append a character to the query and reset the filtered cursor to
@@ -877,19 +985,32 @@ impl ListPicker {
                         ];
                         ListItem::new(Line::from(spans))
                     }
+                    ListPickerEntry::StaticHeading { label } => {
+                        // Never highlighted — the cursor can't land here — so
+                        // this has one style, not a highlight/plain pair.
+                        let spans = vec![Span::styled(
+                            format!(" {} ", label),
+                            Style::default().fg(muted).add_modifier(Modifier::BOLD),
+                        )];
+                        ListItem::new(Line::from(spans))
+                    }
                     ListPickerEntry::Item(item) => {
-                        let primary_style = if highlight {
-                            Style::default()
-                                .fg(dark_bg)
-                                .bg(sky)
-                                .add_modifier(Modifier::BOLD)
+                        // A disabled row never highlights (the cursor skips
+                        // it) and always renders in the same dim, un-boxed
+                        // style so it reads as unavailable rather than merely
+                        // unselected.
+                        let (primary_style, secondary_style) = if item.disabled {
+                            (Style::default().fg(muted), Style::default().fg(muted))
+                        } else if highlight {
+                            (
+                                Style::default()
+                                    .fg(dark_bg)
+                                    .bg(sky)
+                                    .add_modifier(Modifier::BOLD),
+                                Style::default().fg(dark_bg).bg(sky),
+                            )
                         } else {
-                            Style::default().fg(sky)
-                        };
-                        let secondary_style = if highlight {
-                            Style::default().fg(dark_bg).bg(sky)
-                        } else {
-                            Style::default().fg(muted)
+                            (Style::default().fg(sky), Style::default().fg(muted))
                         };
                         let primary = flatten_to_row(&item.primary);
                         let secondary = flatten_to_row(&item.secondary);
@@ -959,6 +1080,14 @@ mod tests {
             key: key.into(),
             primary: primary.into(),
             secondary: format!("{primary} desc"),
+            disabled: false,
+        }
+    }
+
+    fn disabled_item(key: &str, primary: &str) -> ListPickerItem {
+        ListPickerItem {
+            disabled: true,
+            ..item(key, primary)
         }
     }
 
@@ -1232,6 +1361,7 @@ mod tests {
             key: "k".into(),
             primary: "scheduler-reminders · v0.1.0".into(),
             secondary: long.into(),
+            disabled: false,
         }]);
         let text = pane_text(&mut p, 60, 20);
         assert!(text.contains('…'), "no ellipsis marks the cut: {text}");
@@ -1249,6 +1379,7 @@ mod tests {
             key: "k".into(),
             primary: "Weather  @steipete ✓".into(),
             secondary: "Get current weather and forecasts (no API key required).".into(),
+            disabled: false,
         }]);
         let buf = draw(&mut p, 70, 20);
         let text: String = (0..20u16)
@@ -1277,6 +1408,7 @@ mod tests {
             key: "k".into(),
             primary: "weather  @congwupiece".into(),
             secondary: cjk.into(),
+            disabled: false,
         }]);
         let w = 50u16;
         let text = pane_text(&mut p, w, 20);
@@ -1510,6 +1642,89 @@ mod tests {
     }
 
     #[test]
+    fn down_from_the_last_usable_row_skips_the_heading_and_every_disabled_row() {
+        // Two usable items, a static heading, then two disabled items — the
+        // shape the channel picker builds.
+        let entries = vec![
+            ListPickerEntry::Item(item("telegram", "Telegram")),
+            ListPickerEntry::Item(item("discord", "Discord")),
+            ListPickerEntry::static_heading("Under development"),
+            ListPickerEntry::Item(disabled_item("signal", "Signal")),
+            ListPickerEntry::Item(disabled_item("matrix", "Matrix")),
+        ];
+        let mut p =
+            ListPicker::with_entries(ListPickerKind::SetupChannel, "Test", entries, None, "empty");
+        p.move_down(); // focus -> List, on "telegram"
+        assert_eq!(p.current().unwrap().key, "telegram");
+        p.move_down();
+        assert_eq!(
+            p.current().unwrap().key,
+            "discord",
+            "still lands on the second usable row"
+        );
+        // One more down must skip the heading AND both disabled rows and
+        // wrap to the top of the list, landing back on the first usable row —
+        // there is nothing selectable below "discord".
+        p.move_down();
+        assert_eq!(
+            p.current().unwrap().key,
+            "telegram",
+            "down from the last usable row wraps past the heading and every disabled row"
+        );
+    }
+
+    #[test]
+    fn move_up_never_stops_on_a_disabled_row_it_passes_through() {
+        // A disabled row ahead of the one usable row — the generic widget
+        // must still refuse to stop the cursor there, whichever direction
+        // put it in front of it.
+        let entries = vec![
+            ListPickerEntry::Item(disabled_item("signal", "Signal")),
+            ListPickerEntry::Item(item("telegram", "Telegram")),
+        ];
+        let mut p =
+            ListPicker::with_entries(ListPickerKind::SetupChannel, "Test", entries, None, "empty");
+        p.move_down(); // must skip the leading disabled row and land on telegram
+        assert_eq!(p.current().unwrap().key, "telegram");
+        // Up from telegram passes back over the disabled "signal" row; it
+        // must not stop there, landing on the search bar instead.
+        p.move_up();
+        assert_eq!(p.focus, Focus::Search);
+    }
+
+    #[test]
+    fn a_filter_matching_only_a_disabled_row_still_shows_it_but_it_cannot_activate() {
+        let entries = vec![
+            ListPickerEntry::Item(item("telegram", "Telegram")),
+            ListPickerEntry::Item(disabled_item("matrix", "Matrix — end-to-end encrypted")),
+        ];
+        let mut p =
+            ListPicker::with_entries(ListPickerKind::SetupChannel, "Test", entries, None, "empty");
+        for c in "matrix".chars() {
+            p.push_query_char(c);
+        }
+        // The query matches only the disabled "matrix" row — it must still
+        // render (not "no matches"), so the user can see why the name they
+        // typed did not open anything.
+        let visible = p.filtered_indices();
+        assert_eq!(
+            visible.len(),
+            1,
+            "the disabled row is shown, not filtered away: {visible:?}"
+        );
+        assert_eq!(p.entries()[visible[0]].as_item().unwrap().key, "matrix");
+        // It is the only row on screen, so the cursor has nowhere selectable
+        // to land — current() must say so rather than exposing the disabled
+        // item as if Enter could act on it.
+        p.focus = Focus::List;
+        p.selected = 0;
+        assert!(
+            p.current().is_none(),
+            "a disabled row must never be returned by current(), even as the only match"
+        );
+    }
+
+    #[test]
     fn typing_returns_focus_to_search() {
         let mut p = picker(vec![item("a", "alpha"), item("b", "beta")]);
         p.move_down(); // focus → List
@@ -1574,11 +1789,13 @@ mod tests {
                 key: "a".into(),
                 primary: "session-1".into(),
                 secondary: "yesterday · 5 msgs".into(),
+                disabled: false,
             },
             ListPickerItem {
                 key: "b".into(),
                 primary: "session-2".into(),
                 secondary: "today · 12 msgs".into(),
+                disabled: false,
             },
         ]);
         p.push_query_char('1');

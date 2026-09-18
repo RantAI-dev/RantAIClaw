@@ -30,6 +30,7 @@ fn build_session_items(
                 key: s.id.clone(),
                 primary: format!("{short_id} · {title}"),
                 secondary: format!("{date} · {} msgs · {}", s.message_count, s.model),
+                disabled: false,
             }
         })
         .collect()

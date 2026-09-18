@@ -137,6 +137,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `channel list` and `status` show a configured locked channel as "under development · not started"
   instead of the same wording a channel nobody set up gets. The config section itself is never
   touched or removed.
+- **The TUI's channel picker dims a locked channel and refuses to open it.** `/setup channels` and
+  the `/setup` category count used to list and open every channel provisioner, including the eleven
+  outside the supported six; picking one queued a provisioner that would only warn at daemon start
+  that its table would never run. The picker now lists usable channels first, an "Under development"
+  heading, then the rest disabled — the cursor skips a disabled row on every kind of movement and
+  Enter does nothing on one, even when a search narrows the list down to just it. `/setup <name>`
+  for a locked channel answers that it is under development and opens nothing. The first-run
+  wizard's own channel step uses a different, simpler picker that cannot take a disabled row without
+  its own rewrite; it still lists every channel, locked or not, and is not covered by this fix.
 - **The daemon starts channels for a WhatsApp-Web-only config, and warns about a table it cannot
   run.** `has_supervised_channels` and the onboarding wizard's `any_channel_set` each hand-listed the
   channels that count as "configured," and both lists fell behind when `whatsapp_web` got its own
