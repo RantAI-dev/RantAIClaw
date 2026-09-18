@@ -11,8 +11,9 @@
 use super::factory;
 use super::traits::Channel;
 use super::{
-    channel_is_configured, CHANNEL_CATALOG, OPENRC_RESTART_ARGS, OPENRC_STATUS_ARGS,
-    SYSTEMD_STATUS_ARGS,
+    channel_is_configured, channel_is_usable, channel_roster_note, ChannelSupport,
+    ChannelVerification, CHANNEL_CATALOG, NON_CHANNEL_CATALOG_KEYS, OPENRC_RESTART_ARGS,
+    OPENRC_STATUS_ARGS, SYSTEMD_STATUS_ARGS,
 };
 use crate::config::Config;
 use crate::doctor::checks::channels::{probe_whatsapp_web, ProbeWebResult};
@@ -614,11 +615,39 @@ async fn channel_doctor_state(
 }
 
 /// Run health checks for configured channels.
+/// Every catalog channel whose table is configured but is locked, so the
+/// factory deliberately did not build it. Pulled out of [`doctor_channels`]
+/// so the "a locked-only config still gets a real answer" case is testable
+/// without capturing stdout.
+fn locked_configured_channels(
+    config: &Config,
+) -> Vec<(
+    &'static str,
+    &'static str,
+    ChannelSupport,
+    ChannelVerification,
+)> {
+    CHANNEL_CATALOG
+        .iter()
+        .copied()
+        .filter(|(key, _, _, _)| {
+            !NON_CHANNEL_CATALOG_KEYS.contains(key)
+                && channel_is_configured(key, config)
+                && !channel_is_usable(key)
+        })
+        .collect()
+}
+
 pub async fn doctor_channels(config: Config) -> Result<()> {
     factory::warn_unused_channel_config(&config);
     let channels = factory::build_configured_channels(&config);
 
-    if channels.is_empty() {
+    // Computed first so a config whose only channel is locked still gets a
+    // real answer instead of falling into the "nothing configured" branch
+    // beneath it.
+    let locked = locked_configured_channels(&config);
+
+    if channels.is_empty() && locked.is_empty() {
         println!("No real-time channels configured. Run `rantaiclaw onboard` first.");
         return Ok(());
     }
@@ -649,6 +678,13 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         }
     }
 
+    for (_, display, support, verification) in &locked {
+        println!(
+            "  🔒 {display:<9} {}",
+            channel_roster_note(true, *support, *verification)
+        );
+    }
+
     if config.channels_config.webhook.is_some() {
         println!("  ℹ️  Webhook   check via `rantaiclaw gateway` then GET /health");
     }
@@ -661,6 +697,46 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 #[cfg(test)]
 mod doctor_channels_tests {
     use super::*;
+
+    /// A config whose only channel is locked must still name it, not fall
+    /// into the "nothing configured" branch `doctor_channels` uses when
+    /// nothing at all is set up.
+    #[test]
+    fn a_locked_only_config_is_not_reported_as_unconfigured() {
+        let mut config = Config::default();
+        config.channels_config.irc = Some(crate::config::schema::IrcConfig {
+            server: "irc.example.org".into(),
+            port: 6697,
+            nickname: "bot".into(),
+            username: None,
+            channels: vec!["#c".into()],
+            allowed_users: vec![],
+            server_password: None,
+            nickserv_password: None,
+            sasl_password: None,
+            verify_tls: None,
+            allow_insecure_tls_with_password: false,
+        });
+
+        let locked = locked_configured_channels(&config);
+        assert_eq!(
+            locked.len(),
+            1,
+            "expected exactly the locked irc table, got {locked:?}"
+        );
+        assert_eq!(locked[0].0, "irc");
+        assert!(
+            factory::build_configured_channels(&config).is_empty(),
+            "the factory must not build a locked channel"
+        );
+    }
+
+    /// A config with only usable channels has nothing locked to report.
+    #[test]
+    fn a_fully_usable_config_has_nothing_locked() {
+        let config = config_with_session("/nonexistent/rantaiclaw-guard/whatsapp.db");
+        assert!(locked_configured_channels(&config).is_empty());
+    }
 
     fn config_with_session(session_path: &str) -> Config {
         let mut config = Config::default();

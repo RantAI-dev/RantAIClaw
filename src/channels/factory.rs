@@ -379,6 +379,12 @@ pub(crate) fn build_configured_channels(
         ));
     }
 
+    // A locked channel's table is still read above (a constructor only holds
+    // data; nothing here opens a connection), then dropped before it ever
+    // reaches a supervisor. Filtering the built vector, rather than guarding
+    // every `if let` above, keeps this the one place that enforces the rule.
+    channels.retain(|(key, _, _)| super::channel_is_usable(key));
+
     channels
 }
 

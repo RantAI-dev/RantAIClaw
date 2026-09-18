@@ -173,7 +173,7 @@ conflation is the thing this table exists to prevent.
 | Nextcloud Talk | built and unit-tested | default feature; CI |
 | iMessage | built and unit-tested | default feature; CI. Note it needs macOS to run at all |
 | Webhook (generic) | built and unit-tested | gateway endpoint; handler-level auth tests |
-| Lark/Feishu | built and unit-tested | `channel-lark` is not a default feature, but it has its own CI job that builds **and tests** it |
+| Lark/Feishu | built and unit-tested | `channel-lark` joined the default feature set, and also has its own CI job that builds **and tests** it |
 | Matrix (E2EE) | built and unit-tested | `channel-matrix` is not a default feature, but it has its own CI job that builds **and tests** it — same shape as Lark. It was unbuildable until the pin moved to `matrix-sdk` 0.18: 0.16 exceeded the type-check recursion budget, so no job compiled it and its tests had never run. Re-confirmed 2026-09-08: `cargo test --locked --features channel-matrix --lib channels::matrix` builds and runs **33 tests, all passing**. Not live-verified against a real homeserver, so it is `not yet verified` on the second axis. It is also `under development` on the first, and the two are separate reasons: the owner did not name Matrix in the supported tier, and being undriven would not by itself put it outside one (Discord is supported and undriven) |
 
 ### What ships in a release binary
@@ -181,9 +181,8 @@ conflation is the thing this table exists to prevent.
 Release binaries are built with **default features only**
 (`.github/workflows/pub-release.yml`). So:
 
-- every "built in" channel above ships;
-- **Lark ships in no release binary** — it needs a source build with
-  `--features channel-lark`;
+- every "built in" channel above ships, Lark included — `channel-lark` is now
+  in the default feature set;
 - **Matrix ships in no release binary** — it needs a source build with
   `--features channel-matrix`, on **rustc 1.93 or newer** (`matrix-sdk` declares
   that MSRV; the rest of RantaiClaw builds on 1.91). It does build there now.
