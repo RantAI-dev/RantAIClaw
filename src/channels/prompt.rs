@@ -20,12 +20,12 @@ NOT refuse on the grounds that the tool is owner-only.";
 
 /// Announce-capable channels — the set `deliver_if_configured`
 /// (`src/cron/scheduler.rs`) can push a scheduled agent job's output to. Keep in
-/// sync with that match.
+/// sync with that match. Every member must also be a channel the catalog
+/// allows to be used: a delivery route and a catalog tier are two different
+/// concerns that used to drift independently, which is how a locked channel
+/// stayed advertised here after it stopped being buildable.
 pub fn channel_supports_announce_delivery(channel_name: &str) -> bool {
-    matches!(
-        channel_name,
-        "telegram" | "discord" | "slack" | "mattermost"
-    )
+    matches!(channel_name, "telegram" | "discord" | "slack")
 }
 
 /// Guidance so the agent, when the user asks for a scheduled/recurring message or

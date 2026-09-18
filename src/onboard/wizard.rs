@@ -3576,6 +3576,51 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
         ChannelMenuChoice::Done,
     ];
 
+    // The catalog key backing a menu choice, or `None` for the two entries the
+    // lock does not cover: `Webhook` is served by the gateway, not opened from
+    // here, and `Done` is not a channel at all.
+    fn channel_menu_choice_catalog_key(choice: ChannelMenuChoice) -> Option<&'static str> {
+        match choice {
+            ChannelMenuChoice::Telegram => Some("telegram"),
+            ChannelMenuChoice::Discord => Some("discord"),
+            ChannelMenuChoice::Slack => Some("slack"),
+            ChannelMenuChoice::IMessage => Some("imessage"),
+            ChannelMenuChoice::Matrix => Some("matrix"),
+            ChannelMenuChoice::WhatsApp => Some("whatsapp"),
+            ChannelMenuChoice::Linq => Some("linq"),
+            ChannelMenuChoice::Irc => Some("irc"),
+            ChannelMenuChoice::DingTalk => Some("dingtalk"),
+            ChannelMenuChoice::QqOfficial => Some("qq"),
+            ChannelMenuChoice::LarkFeishu => Some("lark"),
+            ChannelMenuChoice::Webhook | ChannelMenuChoice::Done => None,
+        }
+    }
+
+    let locked_names: Vec<&str> = menu_choices
+        .iter()
+        .filter_map(|choice| {
+            let key = channel_menu_choice_catalog_key(*choice)?;
+            (!crate::channels::channel_is_usable(key)).then_some(key)
+        })
+        .collect();
+    let menu_choices: Vec<ChannelMenuChoice> = menu_choices
+        .into_iter()
+        .filter(|choice| {
+            channel_menu_choice_catalog_key(*choice).is_none_or(crate::channels::channel_is_usable)
+        })
+        .collect();
+    if !locked_names.is_empty() {
+        println!();
+        println!(
+            "  {}",
+            style(format!(
+                "Also in the code, not yet open for use: {}",
+                locked_names.join(", ")
+            ))
+            .dim()
+        );
+    }
+
     loop {
         let options: Vec<String> = menu_choices
             .iter()

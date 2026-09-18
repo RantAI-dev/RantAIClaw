@@ -296,6 +296,33 @@ fn headless_provider_setup_succeeds_when_the_key_comes_from_the_environment() {
     );
 }
 
+/// A locked channel's provisioner exists and compiles, so it must be refused
+/// by name rather than falling through to "unknown topic" or, worse, running
+/// and saving a channel section the catalog does not commit to.
+#[test]
+fn setup_a_locked_channel_fails_and_writes_nothing() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+    let (config_path, before) = baseline_config(&home);
+
+    let assert = cmd(&home)
+        .args(["setup", "--non-interactive", "irc"])
+        .assert()
+        .failure();
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("under development"),
+        "must name why it was refused: {stderr}"
+    );
+
+    let after = std::fs::read(&config_path).expect("config.toml still readable");
+    assert_eq!(
+        before, after,
+        "a refused locked-channel setup must leave config.toml byte-identical"
+    );
+}
+
 #[test]
 fn setup_unknown_topic_errors_and_lists_valid_topics() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());

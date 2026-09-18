@@ -74,7 +74,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Privacy-focused via signal-cli",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.signal.is_some() {
+                if !crate::channels::channel_is_usable("signal") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.signal.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -86,7 +88,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "macOS AppleScript bridge",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.imessage.is_some() {
+                if !crate::channels::channel_is_usable("imessage") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.imessage.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -104,7 +108,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Matrix protocol (Element)",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.matrix.is_some() {
+                if !crate::channels::channel_is_usable("matrix") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.matrix.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -127,7 +133,15 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Nextcloud Talk",
             description: "Self-hosted Nextcloud chat",
             category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if !crate::channels::channel_is_usable("nextcloud_talk") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.nextcloud_talk.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Zalo",
@@ -140,7 +154,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "DingTalk Stream Mode",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.dingtalk.is_some() {
+                if !crate::channels::channel_is_usable("dingtalk") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.dingtalk.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -152,7 +168,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Tencent QQ Bot SDK",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.qq.is_some() {
+                if !crate::channels::channel_is_usable("qq") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.qq.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -669,7 +687,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "IMAP/SMTP email channel",
             category: IntegrationCategory::Social,
             status_fn: |c| {
-                if c.channels_config.email.is_some() {
+                if !crate::channels::channel_is_usable("email") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.email.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -809,30 +829,36 @@ mod tests {
         ));
     }
 
+    /// A locked channel reports `UnderDevelopment` whether or not it is
+    /// configured — a config section does not make it usable, so `Active`
+    /// would claim it runs when the factory will never build it.
     #[test]
-    fn imessage_active_when_configured() {
+    fn imessage_under_development_when_configured() {
         let mut config = Config::default();
         config.channels_config.imessage = Some(IMessageConfig {
             allowed_contacts: vec!["*".into()],
         });
         let entries = all_integrations();
         let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
-        assert!(matches!((im.status_fn)(&config), IntegrationStatus::Active));
+        assert!(matches!(
+            (im.status_fn)(&config),
+            IntegrationStatus::UnderDevelopment
+        ));
     }
 
     #[test]
-    fn imessage_available_when_not_configured() {
+    fn imessage_under_development_when_not_configured() {
         let config = Config::default();
         let entries = all_integrations();
         let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
         assert!(matches!(
             (im.status_fn)(&config),
-            IntegrationStatus::Available
+            IntegrationStatus::UnderDevelopment
         ));
     }
 
     #[test]
-    fn matrix_active_when_configured() {
+    fn matrix_under_development_when_configured() {
         let mut config = Config::default();
         config.channels_config.matrix = Some(MatrixConfig {
             homeserver: "https://m.org".into(),
@@ -844,17 +870,20 @@ mod tests {
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
-        assert!(matches!((mx.status_fn)(&config), IntegrationStatus::Active));
+        assert!(matches!(
+            (mx.status_fn)(&config),
+            IntegrationStatus::UnderDevelopment
+        ));
     }
 
     #[test]
-    fn matrix_available_when_not_configured() {
+    fn matrix_under_development_when_not_configured() {
         let config = Config::default();
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
         assert!(matches!(
             (mx.status_fn)(&config),
-            IntegrationStatus::Available
+            IntegrationStatus::UnderDevelopment
         ));
     }
 
@@ -883,13 +912,26 @@ mod tests {
     }
 
     #[test]
-    fn email_available_when_not_configured() {
-        let config = Config::default();
+    fn email_under_development_regardless_of_configuration() {
         let entries = all_integrations();
         let email = entries.iter().find(|e| e.name == "Email").unwrap();
         assert!(matches!(
-            (email.status_fn)(&config),
-            IntegrationStatus::Available
+            (email.status_fn)(&Config::default()),
+            IntegrationStatus::UnderDevelopment
+        ));
+
+        let mut configured = Config::default();
+        configured.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
+            imap_host: "imap.example.com".into(),
+            smtp_host: "smtp.example.com".into(),
+            username: "bot@example.com".into(),
+            password: "secret".into(),
+            from_address: "bot@example.com".into(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            (email.status_fn)(&configured),
+            IntegrationStatus::UnderDevelopment
         ));
     }
 

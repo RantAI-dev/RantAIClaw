@@ -9,6 +9,27 @@ use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
+/// Refuse to persist a job whose announce delivery names a locked channel.
+/// `deliver_if_configured` (`scheduler.rs`) already refuses this at delivery
+/// time; this stops the job from ever being written with a target that can
+/// never receive it, on creation and on every later edit.
+fn validate_announce_delivery(delivery: &DeliveryConfig) -> Result<()> {
+    if !delivery.mode.eq_ignore_ascii_case("announce") {
+        return Ok(());
+    }
+    let Some(channel) = delivery.channel.as_deref() else {
+        return Ok(());
+    };
+    let key = channel.to_ascii_lowercase();
+    if let Some(locked_key) = crate::channels::locked_channel_key_for_provisioner(&key) {
+        anyhow::bail!(
+            "delivery.channel \"{locked_key}\" is {} and cannot receive scheduled announcements",
+            crate::channels::ChannelSupport::UnderDevelopment.label()
+        );
+    }
+    Ok(())
+}
+
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
@@ -44,6 +65,7 @@ pub fn add_shell_job(
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
     let delivery = delivery.unwrap_or_default();
+    validate_announce_delivery(&delivery)?;
 
     with_connection(config, |conn| {
         conn.execute(
@@ -90,6 +112,7 @@ pub fn add_agent_job(
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
     let delivery = delivery.unwrap_or_default();
+    validate_announce_delivery(&delivery)?;
 
     with_connection(config, |conn| {
         conn.execute(
@@ -285,6 +308,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             job.enabled = enabled;
         }
         if let Some(delivery) = patch.delivery {
+            validate_announce_delivery(&delivery)?;
             job.delivery = delivery;
         }
         if let Some(model) = patch.model {
@@ -940,6 +964,82 @@ mod tests {
         assert_eq!(job.delivery.mode, "announce");
         assert_eq!(job.delivery.channel.as_deref(), Some("telegram"));
         assert_eq!(job.delivery.to.as_deref(), Some("123"));
+    }
+
+    /// A locked channel has a real catalog row, so nothing about `delivery`
+    /// deserialization rejects it — the job store itself must refuse it
+    /// before a job naming an unreachable channel is ever written.
+    #[test]
+    fn add_shell_job_refuses_a_locked_delivery_channel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("mattermost".into()),
+            to: Some("123".into()),
+            best_effort: true,
+        };
+        let err = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            Some(delivery),
+            false,
+            None,
+        )
+        .expect_err("a locked delivery channel must be refused at creation");
+        assert!(
+            err.to_string()
+                .contains(crate::channels::ChannelSupport::UnderDevelopment.label()),
+            "{err}"
+        );
+    }
+
+    /// The same refusal applies to a later edit — a job created with no
+    /// delivery, or a usable one, cannot be re-pointed at a locked channel
+    /// either.
+    #[test]
+    fn update_job_refuses_re_pointing_delivery_at_a_locked_channel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let patch = CronJobPatch {
+            delivery: Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("mattermost".into()),
+                to: Some("123".into()),
+                best_effort: true,
+            }),
+            ..Default::default()
+        };
+        let err = update_job(&config, &job.id, patch)
+            .expect_err("re-pointing delivery at a locked channel must be refused");
+        assert!(
+            err.to_string()
+                .contains(crate::channels::ChannelSupport::UnderDevelopment.label()),
+            "{err}"
+        );
+
+        // The job itself must be untouched by the rejected edit.
+        let reread = get_job(&config, &job.id).unwrap();
+        assert_eq!(reread.delivery.mode, "none");
     }
 
     #[test]

@@ -513,6 +513,12 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             ) {
                 anyhow::bail!(refusal);
             }
+            if let Some(key) = crate::channels::locked_channel_key_for_provisioner(&channel) {
+                anyhow::bail!(
+                    "\"{key}\" is {} and cannot be paired yet.",
+                    crate::channels::ChannelSupport::UnderDevelopment.label()
+                );
+            }
             pair_channel(&channel, ttl, max_uses, !no_owner)?;
             Ok(())
         }

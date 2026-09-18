@@ -740,7 +740,7 @@ mod tests {
         // allows, else a valid delivery target would fail to construct. Not
         // configured here, so each returns None — but the key is recognized.
         let config = Config::default();
-        for key in ["telegram", "discord", "slack", "mattermost"] {
+        for key in ["telegram", "discord", "slack"] {
             assert!(
                 crate::channels::channel_supports_announce_delivery(key),
                 "{key} must be an announce channel"
