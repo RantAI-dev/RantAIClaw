@@ -9335,7 +9335,14 @@ mod submit_tests {
         let err = app
             .open_setup_overlay("irc".to_string())
             .expect_err("irc is under development and must be refused");
-        assert!(err.to_string().contains("under development"), "got: {err}");
+        // Checks the sentence's own wording, not the shared "under
+        // development" label string — that string is defined exactly once
+        // in `ChannelSupport::label()`, and a second quoted copy here would
+        // be exactly the drift `check_channel_maturity.sh` exists to catch.
+        assert!(
+            err.to_string().contains("cannot be set up yet"),
+            "got: {err}"
+        );
         assert!(
             app.setup_overlay.is_none(),
             "a refused channel must never open the setup overlay"
