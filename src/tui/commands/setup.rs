@@ -372,10 +372,11 @@ mod tests {
 
     /// Every disabled state in `channel_picker_entries` must come from
     /// `channel_is_usable`, derived by iterating the provisioner registry —
-    /// never a name literal in this test. A channel provisioner with no
-    /// mapping to a catalog key would silently read as usable (`channel_is_usable`
-    /// on an unknown key returns `false` via `CHANNEL_CATALOG`'s `find`, so an
-    /// unmapped name would actually read locked) — either way the two must agree.
+    /// never a name literal in this test. A provisioner name with no entry
+    /// in `catalog_key_for_provisioner` falls through to itself, and
+    /// `channel_is_usable` answers `false` for any key `CHANNEL_CATALOG`
+    /// does not carry — so a provisioner nobody mapped reads as locked, not
+    /// as usable, and this test would catch that disagreement too.
     #[test]
     fn channel_picker_disabled_state_matches_channel_is_usable_for_the_whole_registry() {
         use crate::onboard::provision::{available, provisioner_for};
