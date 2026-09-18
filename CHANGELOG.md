@@ -119,6 +119,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot those comments reach verbatim, and the two tests that pin each axis. The evidence table now
   carries dates instead of "never". No support value moved, no config key was added, and the schema
   stays at 32, because only description text changed.
+- **The catalog says Lark has been driven, and moves it into the supported tier.** Lark read "under
+  development" / "not yet verified" even after commands, an outbound file, a restart, and an allowlist
+  edit in both directions were all exercised against the owner's real workspace between 2026-09-16 and
+  2026-09-18, with a `config.toml` watcher fix along the way for the allowlist half. Lark now reads
+  "supported" / "verified", the same promotion Discord, Slack and WhatsApp Web already had. Its inbound
+  image path reaches the model, but describing an image was not driven: the deployed provider has no
+  vision capability, and the evidence table says so rather than claiming a pass. No support value moved
+  for any other channel, no config key was added, and the schema stays at 32.
 
 ### Fixed
 

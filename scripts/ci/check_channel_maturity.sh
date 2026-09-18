@@ -158,21 +158,23 @@ done <<<"$rows"
 # combined assertion would pass while a channel moved from one axis to the
 # other, which is the exact confusion this split removed.
 #
-# Five supported: the owner's 2026-09-04 commitment of four, plus WhatsApp Web,
-# split onto its own row and its own config table in schema v32 after the owner
-# recorded it Supported on 2026-09-09.
-if [ "$supported" -ne 5 ]; then
-  echo "ERROR: $supported channels are marked Supported; the recorded decision is 5."
+# Six supported: the owner's 2026-09-04 commitment of four, plus WhatsApp Web
+# and Lark, each split onto its own row and its own config table after being
+# driven and promoted (WhatsApp Web in schema v32 on 2026-09-09; Lark on
+# 2026-09-18).
+if [ "$supported" -ne 6 ]; then
+  echo "ERROR: $supported channels are marked Supported; the recorded decision is 6."
   echo "       The support axis is the OWNER's call, not a checklist outcome. If"
   echo "       the owner moved it, update this number and say which channel."
   fail=1
 fi
 
-# Four driven is the evidence that exists: Telegram (#770), and Discord, Slack and
+# Five driven is the evidence that exists: Telegram (#770), Discord, Slack and
 # WhatsApp Web, which the owner drove against real accounts on this host on
-# 2026-09-12, with the times and the per-channel results written down.
-if [ "$driven" -ne 4 ]; then
-  echo "ERROR: $driven channels are marked Driven; the recorded evidence covers 4."
+# 2026-09-12, and Lark, driven 2026-09-16 through 2026-09-18, with the times
+# and the per-channel results written down.
+if [ "$driven" -ne 5 ]; then
+  echo "ERROR: $driven channels are marked Driven; the recorded evidence covers 5."
   echo "       The verification axis moves only when a round trip was actually run"
   echo "       against a real account and written down. See $DOCS §0."
   fail=1
