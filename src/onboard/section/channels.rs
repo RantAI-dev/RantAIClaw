@@ -42,7 +42,7 @@ impl SetupSection for ChannelsSection {
         // the full toolset; everyone else is a "guest" under a capability
         // ceiling. If a multi-user channel was configured, offer to set both
         // now (and fall back to /claim guidance if no owner ends up set).
-        if any_channel_set(&ctx.config) {
+        if any_channel_set(ctx.config) {
             prompt_owners_and_guest_ceiling(ctx)?;
             if ctx.config.channels_config.approval_owners.is_empty() {
                 print_owner_claim_guidance();
