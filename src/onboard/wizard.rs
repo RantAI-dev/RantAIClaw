@@ -4290,9 +4290,25 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     print_bullet("3. Keep session_path persistent so relogin is not required");
                     println!();
 
+                    // Re-running setup used to point the channel at a fresh,
+                    // unlinked session file and reset the allowlist to `*`.
+                    // Carry the existing Web table forward and use its values
+                    // as the prompt defaults so Enter keeps them.
+                    let existing_session = config
+                        .whatsapp_web
+                        .as_ref()
+                        .filter(|c| !c.session_path.is_empty())
+                        .map(|c| c.session_path.clone());
+                    let existing_allowlist = config
+                        .whatsapp_web
+                        .as_ref()
+                        .filter(|c| !c.allowed_numbers.is_empty())
+                        .map(|c| c.allowed_numbers.join(","));
                     let session_path: String = Input::new()
                         .with_prompt("  Session database path")
-                        .default("~/.rantaiclaw/state/whatsapp-web/session.db".into())
+                        .default(existing_session.clone().unwrap_or_else(|| {
+                            "~/.rantaiclaw/state/whatsapp-web/session.db".into()
+                        }))
                         .interact_text()?;
 
                     if session_path.trim().is_empty() {
@@ -4303,6 +4319,12 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     let pair_phone: String = Input::new()
                         .with_prompt(
                             "  Pair phone (optional, digits only; leave empty to use QR flow)",
+                        )
+                        .default(
+                            existing_session
+                                .as_ref()
+                                .and_then(|_| config.whatsapp_web.as_ref()?.pair_phone.clone())
+                                .unwrap_or_default(),
                         )
                         .allow_empty(true)
                         .interact_text()?;
@@ -4318,18 +4340,40 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                             .interact_text()?
                     };
 
+                    // F-11: pre-fill from the existing allowlist (not `*`),
+                    // and validate each entry through the helper the gateway
+                    // already uses. A bad entry fails the wizard with the
+                    // helper's own sentence.
                     let users_str: String = Input::new()
                         .with_prompt(
-                            "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
+                            "  Allowed phone numbers (comma-separated, e.g. +6281234567890, or * for all)",
                         )
-                        .default("*".into())
+                        .default(existing_allowlist.clone().unwrap_or_default())
+                        .allow_empty(true)
                         .interact_text()?;
 
-                    let allowed_numbers = if users_str.trim() == "*" {
+                    if users_str.trim().is_empty() {
+                        println!(
+                            "  {} Skipped — allowed numbers required (use * for any)",
+                            style("→").dim()
+                        );
+                        continue;
+                    }
+
+                    let raw_entries: Vec<String> = if users_str.trim() == "*" {
                         vec!["*".into()]
                     } else {
                         users_str.split(',').map(|s| s.trim().to_string()).collect()
                     };
+                    let mut allowed_numbers: Vec<String> = Vec::with_capacity(raw_entries.len());
+                    for entry in &raw_entries {
+                        match WhatsAppWebConfig::allowlist_entry(entry) {
+                            Ok(normalised) => allowed_numbers.push(normalised),
+                            Err(sentence) => {
+                                bail!("{sentence}");
+                            }
+                        }
+                    }
 
                     // Its own table since schema v32, so choosing Web mode no
                     // longer writes a WhatsApp table full of empty Cloud keys.

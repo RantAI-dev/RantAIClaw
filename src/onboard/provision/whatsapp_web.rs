@@ -58,10 +58,24 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
             mut responses,
         } = io;
 
+        // The Web table from the running config, if there is one. F-9 used
+        // to read only `pair_code` from it on a re-run; the session path and
+        // the allowlist defaulted to the workspace and `[]`, so a re-run
+        // pointed the channel at a fresh, unlinked session file and wiped the
+        // allowlist to deny-all. Carry the whole Web table forward and use its
+        // values as the prompt defaults.
+        let existing = config.channels_config.whatsapp_web.clone();
+
         // ── 1. Prompt for session DB path ──────────────────────────
         // Default under the active profile's workspace so each profile links
         // its own WhatsApp device instead of sharing one global session store.
-        let default_session: PathBuf = profile.workspace_dir().join("whatsapp.db");
+        // On a re-run, keep the path the channel already talks to — otherwise
+        // the new link goes to a fresh, unlinked file.
+        let default_session: PathBuf = existing
+            .as_ref()
+            .filter(|c| !c.session_path.is_empty())
+            .map(|c| PathBuf::from(&c.session_path))
+            .unwrap_or_else(|| profile.workspace_dir().join("whatsapp.db"));
         events
             .send(ProvisionEvent::Prompt {
                 id: "session_path".into(),
@@ -193,18 +207,28 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
         }
 
         // ── 4. Prompt for allowed numbers ──────────────────────────
+        // F-11: the runtime compares `allowed_numbers` against the `+E.164`
+        // form every sender is rewritten to. The provisioner used to store
+        // whatever the operator typed — `0812…`, `62812…`, `+62 877-9800-…`
+        // all save and never match. Run every entry through the helper the
+        // gateway already uses; refuse one that would never match with the
+        // helper's own sentence. On a re-run, pre-fill with the entries the
+        // config already holds so Enter keeps them byte-identical.
+        let existing_default = existing
+            .as_ref()
+            .filter(|c| !c.allowed_numbers.is_empty())
+            .map(|c| c.allowed_numbers.join(","));
         events
             .send(ProvisionEvent::Prompt {
                 id: "allowed_numbers".into(),
-                label: "Allowed numbers (comma-separated E.164, or * for any)".into(),
-                default: None,
+                label: "Allowed numbers (comma-separated E.164, e.g. +6281234567890, or * for any)"
+                    .into(),
+                default: existing_default,
                 secret: false,
             })
             .await
             .ok();
-        // An empty answer means empty. It used to fall through to `*`, so
-        // pressing Enter here linked a device and opened it to every number.
-        let allowed_numbers: Vec<String> = match responses.recv().await {
+        let raw_entries: Vec<String> = match responses.recv().await {
             Some(ProvisionResponse::Text(s)) => s
                 .split(',')
                 .map(|n| n.trim().to_string())
@@ -212,6 +236,26 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                 .collect(),
             _ => Vec::new(),
         };
+        // Validate every entry through the same helper the gateway uses to
+        // save operator edits (`config_api.rs`), so the runtime gets nothing
+        // it cannot match. A bad entry fails the provisioner with the
+        // helper's own sentence — the render loop surfaces it in both the
+        // TUI overlay and headless stderr.
+        let mut allowed_numbers: Vec<String> = Vec::with_capacity(raw_entries.len());
+        for entry in &raw_entries {
+            match WhatsAppWebConfig::allowlist_entry(entry) {
+                Ok(normalised) => allowed_numbers.push(normalised),
+                Err(sentence) => {
+                    events
+                        .send(ProvisionEvent::Failed {
+                            error: sentence.clone(),
+                        })
+                        .await
+                        .ok();
+                    return Ok(ProvisionOutcome::Aborted(sentence));
+                }
+            }
+        }
         crate::onboard::provision::validate::allowlist::warn_on_reach(
             &events,
             &allowed_numbers,
@@ -223,7 +267,6 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
         // Its own table since schema v32. The Cloud table is not read and not
         // written here: setting up Web mode must not disturb Cloud keys, and
         // it no longer has to reach across to preserve them.
-        let existing = config.channels_config.whatsapp_web.clone();
         config.channels_config.whatsapp_web = Some(WhatsAppWebConfig {
             session_path: session_path.to_string_lossy().into_owned(),
             pair_phone: pair_phone.clone(),
@@ -300,5 +343,54 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
             .await
             .ok();
         Ok(ProvisionOutcome::Configured)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// F-9, F-11. Every `allowed_numbers` entry the provisioner is about to
+    /// save has to pass through `WhatsAppWebConfig::allowlist_entry`. The
+    /// helper then writes the entry in the form the runtime compares
+    /// (`+E.164`), so `6281…` becomes `+6281…` and `0812…` is refused
+    /// outright. A provisioner that bypassed the helper would silently
+    /// re-introduce F-9 / F-11, so a source guard binds the call site.
+    #[test]
+    fn allowed_numbers_run_through_allowlist_entry() {
+        let production = production_half(include_str!("whatsapp_web.rs"));
+        let body =
+            fn_body(production, "async fn run(").expect("`run` not found in production code");
+        assert!(
+            body.contains("WhatsAppWebConfig::allowlist_entry("),
+            "the whatsapp web provisioner no longer runs every entry through \
+             `WhatsAppWebConfig::allowlist_entry` — a typed entry will be saved \
+             in a form the runtime cannot match"
+        );
+    }
+
+    fn production_half(src: &str) -> &str {
+        let cut = ["\n#[cfg(test)]\nmod "]
+            .iter()
+            .flat_map(|marker| src.match_indices(marker))
+            .map(|(at, _)| at)
+            .min()
+            .unwrap_or(src.len());
+        &src[..cut]
+    }
+
+    fn fn_body<'a>(production: &'a str, header: &str) -> Option<&'a str> {
+        let after = production.split(header).nth(1)?;
+        let end = [
+            "\n    async fn ",
+            "\n    fn ",
+            "\n    pub fn ",
+            "\n    pub async fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(crate) async fn ",
+        ]
+        .iter()
+        .filter_map(|marker| after.find(marker))
+        .min()
+        .unwrap_or(after.len());
+        Some(&after[..end])
     }
 }
