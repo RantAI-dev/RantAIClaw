@@ -117,7 +117,7 @@ probing three channels the owner committed to.
 | `nextcloud_talk` | under development | not yet verified |
 | `email` | under development | not yet verified |
 | `irc` | under development | not yet verified |
-| `lark` | under development | not yet verified |
+| `lark` | supported | verified |
 | `dingtalk` | under development | not yet verified |
 | `qq` | under development | not yet verified |
 
@@ -130,7 +130,7 @@ by a default, and it can never become verified while that stays true.
 
 ## 0.1 Build and test evidence, per channel
 
-**Seventeen channels are wired. One has been driven against a real platform.**
+**Seventeen channels are wired. Five have been driven against a real platform.**
 
 That count is the length of `CHANNEL_CATALOG`, and
 `scripts/ci/check_channel_maturity.sh` fails the build if this sentence and the
@@ -194,7 +194,8 @@ The README's channel table carries the same columns; the two are meant to agree.
 
 The supported tier is the owner's 2026-09-04 decision (§0). It is a statement of
 intent about what this project stands behind; it is **not**, by itself, a record
-that anything was run. As of 2026-09-12:
+that anything was run. Telegram through WhatsApp Cloud below are as of 2026-09-12;
+Lark's row carries its own, later dates:
 
 | Supported channel | Credential available here | Driven |
 |---|---|---|
@@ -202,9 +203,10 @@ that anything was run. As of 2026-09-12:
 | Discord | yes | 2026-09-12, against a real bot: commands answered and a file delivered |
 | Slack | yes | 2026-09-12, against a real workspace: bare-verb commands, an upload, and a delivery-failure notice |
 | WhatsApp Web | yes | 2026-09-12, against a linked account: commands answered and files delivered both ways |
+| Lark | yes | 2026-09-16 through 2026-09-18, against the owner's real workspace: WebSocket connect, the allowlist gate, `/model`/`/models`/`/clear`/unknown-command replies, group @-mention gating, a restart mid-answer with the close frame sent, disconnect and reconnect from the console, an outbound file delivered, the connection URL's credential kept out of the journal, and an allowlist edit applied in both directions with no restart and no other traffic in between. An inbound image reaches the model, but its description was not driven: the deployed model has no vision capability |
 | WhatsApp Cloud | **no** | never |
 
-Four of the five now have a credential on the machine this was checked from, and
+Five of the six now have a credential on the machine this was checked from, and
 the round trips are recorded with timestamps in the drive log rather than
 summarised here. WhatsApp Cloud has still never been driven, and it stays in the
 supported tier with no evidence: that combination is the owner's call to make and

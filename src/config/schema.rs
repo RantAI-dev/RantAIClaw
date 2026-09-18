@@ -2821,7 +2821,7 @@ pub struct ChannelsConfig {
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     /// IRC channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub irc: Option<IrcConfig>,
-    /// Lark/Feishu channel configuration. Support: **under development**. Verification: **not yet verified**.
+    /// Lark/Feishu channel configuration. Support: **supported**. Verification: **verified**.
     pub lark: Option<LarkConfig>,
     /// DingTalk channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub dingtalk: Option<DingTalkConfig>,

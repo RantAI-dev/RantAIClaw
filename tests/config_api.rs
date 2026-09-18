@@ -393,11 +393,11 @@ async fn get_channels_publishes_the_catalog_with_both_axes() {
     // Counted separately, because they are separate facts. One assertion over
     // both would pass while a channel moved from one axis to the other.
     assert_eq!(
-        supported, 5,
+        supported, 6,
         "the support axis is a product commitment, not a refactor: {body}"
     );
     assert_eq!(
-        driven, 4,
+        driven, 5,
         "the verification axis moves only when a round trip was run: {body}"
     );
 

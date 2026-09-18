@@ -573,8 +573,8 @@ pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerificat
     (
         "lark",
         "Lark",
-        ChannelSupport::UnderDevelopment,
-        ChannelVerification::NotDriven,
+        ChannelSupport::Supported,
+        ChannelVerification::Driven,
     ),
     (
         "dingtalk",

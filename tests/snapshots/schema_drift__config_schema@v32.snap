@@ -1,6 +1,5 @@
 ---
 source: tests/schema_drift.rs
-assertion_line: 42
 description: "Config JSON Schema fingerprint. If this test fails, you changed the on-disk config.toml surface. Bump config::migrations::CURRENT_VERSION, add a migrate_vN function, write a unit test, then `cargo insta accept` here."
 expression: pretty
 ---
@@ -882,7 +881,7 @@ expression: pretty
           "default": null
         },
         "lark": {
-          "description": "Lark/Feishu channel configuration. Support: **under development**. Verification: **not yet verified**.",
+          "description": "Lark/Feishu channel configuration. Support: **supported**. Verification: **verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/LarkConfig"

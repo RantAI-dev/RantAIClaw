@@ -8499,7 +8499,7 @@ fn has_credentials_separates_a_filled_section_from_an_empty_one() {
 }
 
 #[test]
-fn catalog_declares_seventeen_channels_and_five_supported() {
+fn catalog_declares_seventeen_channels_and_names_the_supported_set() {
     assert_eq!(CHANNEL_CATALOG.len(), 17);
 
     let supported: Vec<&str> = CHANNEL_CATALOG
@@ -8510,7 +8510,14 @@ fn catalog_declares_seventeen_channels_and_five_supported() {
 
     assert_eq!(
         supported,
-        vec!["telegram", "discord", "slack", "whatsapp", "whatsapp_web"],
+        vec![
+            "telegram",
+            "discord",
+            "slack",
+            "whatsapp",
+            "whatsapp_web",
+            "lark"
+        ],
         "the supported tier changed — that is a promise to operators, not a refactor"
     );
 }
@@ -8520,10 +8527,11 @@ fn catalog_declares_seventeen_channels_and_five_supported() {
 /// Separately on purpose. These are two different facts, and a single assertion
 /// covering both would pass while one of them silently moved. Telegram was the
 /// only driven channel until 2026-09-12, when the owner drove Discord, Slack and
-/// WhatsApp Web against real accounts on this host. WhatsApp Cloud still has no
-/// credential anywhere this project has run.
+/// WhatsApp Web against real accounts on this host, and Lark joined them after
+/// its own round trip. WhatsApp Cloud still has no credential anywhere this
+/// project has run.
 #[test]
-fn the_catalog_names_the_four_channels_that_were_driven() {
+fn the_catalog_names_the_channels_that_were_driven() {
     let driven: Vec<&str> = CHANNEL_CATALOG
         .iter()
         .filter(|(_, _, _, verification)| *verification == ChannelVerification::Driven)
@@ -8532,7 +8540,7 @@ fn the_catalog_names_the_four_channels_that_were_driven() {
 
     assert_eq!(
         driven,
-        vec!["telegram", "discord", "slack", "whatsapp_web"],
+        vec!["telegram", "discord", "slack", "whatsapp_web", "lark"],
         "the driven set changed — that is evidence, and it moves only when a \
          round trip was actually run and written down"
     );
