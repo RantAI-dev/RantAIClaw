@@ -1141,6 +1141,62 @@ fn should_execute_tools_in_parallel(
 /// deterministically; an explicit non-"none" `delivery` the model DID set is
 /// always preserved. Returns `Some(modified_call)` only when it injects; `None`
 /// means "leave the original call unchanged" (non-chat surfaces, non-cron_add
+/// Inject the chat that a cron_* tool call came from, so every cron_*
+/// operation is scoped to the chat that owns the job. TUI / CLI / web
+/// console / delegate paths pass `reply_target = None` and the call is
+/// returned unchanged — those callers see every job.
+///
+/// The four cron tools accept `origin_channel` / `origin_chat` as optional
+/// parameters; this helper sets them when both are known. Adding the params
+/// to the call is safe because every cron_* tool's schema declares them.
+fn maybe_inject_cron_origin(
+    call: &ParsedToolCall,
+    channel_name: &str,
+    reply_target: Option<&str>,
+) -> Option<ParsedToolCall> {
+    let reply_target = reply_target?;
+    const CRON_TOOLS: &[&str] = &[
+        "cron_add",
+        "cron_list",
+        "cron_remove",
+        "cron_update",
+        "cron_run",
+        "cron_runs",
+    ];
+    if !CRON_TOOLS.contains(&call.name.as_str()) {
+        return None;
+    }
+    let mut arguments = call.arguments.clone();
+    let obj = arguments.as_object_mut()?;
+    obj.insert(
+        "origin_channel".to_string(),
+        serde_json::Value::String(channel_name.to_string()),
+    );
+    obj.insert(
+        "origin_chat".to_string(),
+        serde_json::Value::String(reply_target.to_string()),
+    );
+    Some(ParsedToolCall {
+        name: call.name.clone(),
+        arguments,
+        tool_call_id: call.tool_call_id.clone(),
+    })
+}
+
+/// Compose the origin injection (for all cron_* tools) and the default delivery
+/// injection (for bare `cron_add`) so a chat turn gets both without one shadowing
+/// the other.
+fn inject_chat_cron_parameters(
+    call: &ParsedToolCall,
+    channel_name: &str,
+    reply_target: Option<&str>,
+) -> Option<ParsedToolCall> {
+    let with_origin = maybe_inject_cron_origin(call, channel_name, reply_target);
+    let base = with_origin.as_ref().unwrap_or(call);
+    let with_delivery = maybe_inject_channel_delivery(base, channel_name, reply_target);
+    with_delivery.or(with_origin)
+}
+
 /// tools, non-announce channels, or an already-set delivery).
 fn maybe_inject_channel_delivery(
     call: &ParsedToolCall,
@@ -1385,12 +1441,12 @@ pub(crate) async fn execute_tool_calls_collecting(
     // A guest turn must run serially so every call passes the gate below; the
     // parallel fast-path skips per-call checks.
     if parallel && guest_gate.is_none() {
-        // Materialize any channel-delivery injection so the owned modified calls
-        // outlive the joined futures (which borrow them).
+        // Materialize any channel-delivery / cron-origin injection so the owned
+        // modified calls outlive the joined futures (which borrow them).
         let effective: Vec<ParsedToolCall> = calls
             .iter()
             .map(|call| {
-                maybe_inject_channel_delivery(call, channel_name, channel_reply_target)
+                inject_chat_cron_parameters(call, channel_name, channel_reply_target)
                     .unwrap_or_else(|| call.clone())
             })
             .collect();
@@ -1585,9 +1641,11 @@ pub(crate) async fn execute_tool_calls_collecting(
             }
         }
 
-        // Inject the origin-chat delivery default for a bare channel `cron_add`
-        // (gating/approval above intentionally ran on the original call).
-        let injected = maybe_inject_channel_delivery(call, channel_name, channel_reply_target);
+        // Inject the origin chat for cron_* tools, then the default delivery
+        // for a bare channel `cron_add` (gating/approval above intentionally
+        // ran on the original call — the operator approved THIS call, not the
+        // rewritten one).
+        let injected = inject_chat_cron_parameters(call, channel_name, channel_reply_target);
         let exec_call = injected.as_ref().unwrap_or(call);
         results.push(
             execute_one_tool_structured(

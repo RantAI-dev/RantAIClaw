@@ -1083,6 +1083,8 @@ mod tests {
             last_status: None,
             last_output: None,
             created_by: None,
+            origin_channel: None,
+            origin_chat: None,
         }
     }
 
@@ -1845,6 +1847,8 @@ mod tests {
             None,
             true,
             None,
+            None,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -1878,6 +1882,8 @@ mod tests {
             None,
             None,
             true,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -1975,6 +1981,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert!(
@@ -2025,6 +2033,8 @@ mod tests {
             None,
             true, // delete_after_run — now honored for shell jobs
             None,
+            None,
+            None,
         )
         .unwrap();
         assert!(
@@ -2069,6 +2079,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -2135,6 +2147,8 @@ mod tests {
             "echo ok",
             None,
             false,
+            None,
+            None,
             None,
         )
         .unwrap();

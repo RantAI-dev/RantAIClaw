@@ -137,6 +137,14 @@ pub struct CronJob {
     /// the gateway principal, …). `None` for rows written before this column
     /// existed. Used to scope a scheduled agent job's capability ceiling.
     pub created_by: Option<String>,
+    /// The chat (channel + reply target) a job was created from, when it was
+    /// created from one. Together with `origin_channel` this scopes every
+    /// cron_* tool call to the chat that owns the job: a Telegram chat can
+    /// only see, change, run, or remove its own jobs. `None` for jobs
+    /// created from CLI / TUI / web console / a path that does not set
+    /// them — those jobs are not scoped and remain visible to every chat.
+    pub origin_channel: Option<String>,
+    pub origin_chat: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
