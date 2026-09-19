@@ -389,26 +389,47 @@ pub(crate) fn build_configured_channels(
 }
 
 /// Build exactly one channel by its lowercase `key`, for the cron delivery path
-/// (which needs a single target, not the whole fleet). Covers only the
-/// announce-capable channels — the set `channel_supports_announce_delivery`
+/// (which needs a single target, not the whole fleet). Covers every
+/// announce-capable channel — the set `channel_supports_announce_delivery`
 /// allows, which is the only set cron delivery selects on; returns `None` for any
 /// other key or when that channel is not configured. Unlike
 /// `build_configured_channels` this allocates one channel, not ~15, and emits no
-/// construction-time warnings. Keep this key set a superset of
-/// `channel_supports_announce_delivery`; if that gate widens, add the key here.
-/// Construction goes through the same `build_*` functions
-/// `build_configured_channels` uses, so the two cannot drift on fields. They
-/// used to be verbatim copies, which is a promise a reviewer has to keep by
-/// hand: `app_token` in #778 had to be added to both, and missing one would
-/// have dropped Socket Mode here with no test failing.
+/// construction-time warnings. Keep this key set in sync with the catalog's
+/// `Supported` rows; if that gate widens, add the key here. Construction goes
+/// through the same `build_*` functions `build_configured_channels` uses, so the
+/// two cannot drift on fields. They used to be verbatim copies, which is a
+/// promise a reviewer has to keep by hand: `app_token` in #778 had to be added
+/// to both, and missing one would have dropped Socket Mode here with no test
+/// failing.
+///
+/// WhatsApp Web has no entry here on purpose. Its `client` is set by `listen`
+/// once the wa-rs handshake completes, so a freshly built instance reports
+/// "client not connected" on send. Cron delivery reaches it through the live
+/// registry the daemon populates, never via this fallback.
 pub(crate) fn build_one(config: &Config, key: &str) -> Option<Arc<dyn Channel>> {
     match key {
         "telegram" => build_telegram(config).map(|c| c as Arc<dyn Channel>),
         "discord" => build_discord(config).map(|c| c as Arc<dyn Channel>),
         "slack" => build_slack(config).map(|c| c as Arc<dyn Channel>),
         "mattermost" => build_mattermost(config).map(|c| c as Arc<dyn Channel>),
+        "whatsapp" => build_whatsapp_cloud(config).map(|c| c as Arc<dyn Channel>),
+        #[cfg(feature = "channel-lark")]
+        "lark" => build_lark_channel(config).map(|c| c as Arc<dyn Channel>),
         _ => None,
     }
+}
+
+/// Standalone construction for Lark, used only by `build_one` because the
+/// fleet builder inlines Lark construction (`feature = "channel-lark"` guards
+/// every use). Kept separate from `build_lark` above so the standalone path
+/// stays self-contained and one future flag flip cannot quietly hand cron
+/// delivery an unconfigured channel.
+#[cfg(feature = "channel-lark")]
+fn build_lark_channel(config: &Config) -> Option<Arc<dyn Channel>> {
+    let lk = config.channels_config.lark.as_ref()?;
+    Some(Arc::new(
+        super::LarkChannel::from_config(lk).with_multimodal(config.multimodal.clone()),
+    ))
 }
 
 /// One-time, operator-facing warnings about channel config that is set but
@@ -734,18 +755,103 @@ mod tests {
         assert!(build_one(&config, "nope").is_none());
     }
 
+    /// `build_one` must cover every key `channel_supports_announce_delivery`
+    /// accepts (derived from the catalog's `Supported` set). Iterate the catalog
+    /// here so a new supported row is automatically picked up, and assert each
+    /// row's key reaches the `build_one` match — i.e. an unrecognized key would
+    /// fail to construct even when configured.
     #[test]
     fn build_one_covers_every_announce_gate_key() {
-        // build_one must recognize every key channel_supports_announce_delivery
-        // allows, else a valid delivery target would fail to construct. Not
-        // configured here, so each returns None — but the key is recognized.
-        let config = Config::default();
-        for key in ["telegram", "discord", "slack"] {
-            assert!(
-                crate::channels::channel_supports_announce_delivery(key),
-                "{key} must be an announce channel"
-            );
-            assert!(build_one(&config, key).is_none());
+        let catalog: Vec<&'static str> = crate::channels::CHANNEL_CATALOG
+            .iter()
+            .filter_map(|(key, _, support, _)| {
+                if crate::channels::channel_supports_announce_delivery(key)
+                    && *support == crate::channels::ChannelSupport::Supported
+                {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            !catalog.is_empty(),
+            "the catalog should have at least one Supported announce-capable row"
+        );
+
+        // `build_one` for HTTP-sending channels must construct from the config;
+        // for WhatsApp Web it must NOT have an entry (no fallback — the runtime
+        // registry is the only path). Split the test accordingly so the catalog
+        // shape is the source of truth and a new Supported row picks up the
+        // right behaviour automatically.
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::schema::TelegramConfig {
+            bot_token: "placeholder".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1_000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.channels_config.discord = Some(crate::config::schema::DiscordConfig {
+            bot_token: "placeholder".into(),
+            guild_id: None,
+            allowed_users: vec![],
+            listen_to_bots: false,
+            mention_only: false,
+        });
+        config.channels_config.slack = Some(crate::config::schema::SlackConfig {
+            bot_token: "placeholder".into(),
+            app_token: None,
+            channel_id: None,
+            allowed_users: vec![],
+        });
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("placeholder".into()),
+            phone_number_id: Some("placeholder".into()),
+            verify_token: Some("placeholder".into()),
+            app_secret: None,
+            allowed_numbers: vec![],
+        });
+        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: "https://example.test".into(),
+            bot_token: "placeholder".into(),
+            channel_id: None,
+            allowed_users: vec![],
+            thread_replies: None,
+            mention_only: None,
+        });
+        #[cfg(feature = "channel-lark")]
+        {
+            config.channels_config.lark = Some(crate::config::schema::LarkConfig {
+                app_id: "placeholder".into(),
+                app_secret: "placeholder".into(),
+                encrypt_key: None,
+                verification_token: None,
+                use_feishu: false,
+                receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+                port: None,
+                allowed_users: vec![],
+            });
         }
+
+        for key in catalog {
+            if key == "whatsapp_web" {
+                // The runtime registry is the only path; `build_one` does not
+                // include it.
+                continue;
+            }
+            assert!(
+                build_one(&config, key).is_some(),
+                "build_one must construct a configured {key} channel; the announce \
+                 gate now derives from the catalog, so missing this means the \
+                 factory diverged from `channel_supports_announce_delivery`"
+            );
+        }
+        assert!(
+            build_one(&config, "whatsapp_web").is_none(),
+            "WhatsApp Web has no `build_one` fallback — the runtime registry is \
+             the only delivery path"
+        );
     }
 }

@@ -4762,6 +4762,13 @@ fn lark_is_configured_in_the_default_build() {
 /// factory that will never build it.
 #[test]
 fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
+    // The announce gate now derives from the catalog's `Supported` set
+    // (`channel_is_usable`), so a future `Supported` row is automatically
+    // accepted by cron delivery. This test still pins two contracts: every
+    // advertised key is a real catalog entry, and every advertised key the
+    // factory can construct from a complete config builds. WhatsApp Web has no
+    // factory fallback — it goes through the runtime registry — so the
+    // factory-build check skips it.
     let config = config_with_every_channel();
     let built: Vec<&str> = factory::build_configured_channels(&config)
         .into_iter()
@@ -4774,12 +4781,33 @@ fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
         .filter(|key| channel_supports_announce_delivery(key))
         .collect();
 
-    assert_eq!(
-        advertised,
-        vec!["telegram", "discord", "slack"],
-        "cron delivery set changed — this is a capability change, not a refactor"
+    // The catalog is the single source of truth — iterate it the same way the
+    // gate does, and assert every Supported row is announced.
+    for &(key, _, support, _) in &CHANNEL_CATALOG {
+        if support == ChannelSupport::Supported {
+            assert!(
+                channel_supports_announce_delivery(key),
+                "{key} is Supported in the catalog but the announce gate skipped it — \
+                 the gate is no longer derived from the catalog"
+            );
+        } else {
+            assert!(
+                !channel_supports_announce_delivery(key),
+                "{key} is {support:?} in the catalog but the announce gate accepted it"
+            );
+        }
+    }
+    assert!(
+        !advertised.is_empty(),
+        "no Supported channels found; the catalog or gate changed shape"
     );
     for key in &advertised {
+        if *key == "whatsapp_web" {
+            // The runtime registry is the only delivery path; the factory
+            // does not build a fresh WhatsApp Web instance. Other advertised
+            // channels must be in the factory's fleet.
+            continue;
+        }
         assert!(
             built.contains(key),
             "{key} is advertised for cron delivery but the factory cannot build it"
@@ -9862,4 +9890,86 @@ async fn a_listener_that_ignores_the_token_is_dropped_once_the_grace_period_elap
         elapsed < Duration::from_secs(3),
         "must not wait past the grace period plus a small margin, took {elapsed:?}"
     );
+}
+
+/// The shared handle the daemon threads between the channel runtime and the cron
+/// scheduler. It is a small struct with two operations: replace the whole
+/// registry once the runtime builds it, and read one channel by key when a
+/// scheduled job fires.
+#[cfg(test)]
+mod channels_registry_tests {
+    use crate::channels::traits::Channel;
+    use crate::channels::ChannelsRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    /// A no-op channel that just identifies itself; the registry does not call
+    /// send on it in this test, only looks it up. Only `name` is meaningful.
+    struct Probe(&'static str);
+    #[async_trait::async_trait]
+    impl Channel for Probe {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn send(
+            &self,
+            _message: &crate::channels::traits::SendMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A freshly built registry has nothing under any key — the cron scheduler
+    /// reads `None` from a registry the runtime has not populated yet.
+    #[test]
+    fn empty_registry_returns_none() {
+        let reg = ChannelsRegistry::new();
+        assert!(reg.get("telegram").is_none());
+        assert!(reg.get("whatsapp_web").is_none());
+    }
+
+    /// `replace` swaps the whole map; a previous reader's `get` call after the
+    /// swap sees the new contents, and the old map's channels are dropped when
+    /// the last reader finishes with them.
+    #[test]
+    fn replace_swaps_the_whole_registry() {
+        let reg = ChannelsRegistry::new();
+        let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        map.insert("telegram".into(), Arc::new(Probe("telegram")));
+        reg.replace(map);
+
+        let ch = reg.get("telegram").expect("replaced registry has telegram");
+        assert_eq!(ch.name(), "telegram");
+        assert!(reg.get("slack").is_none());
+
+        // A second replace with an empty map clears the entry.
+        reg.replace(HashMap::new());
+        assert!(reg.get("telegram").is_none());
+    }
+
+    /// `ChannelsRegistry` is `Clone` so the daemon's two supervisor tasks (the
+    /// channel runtime and the cron scheduler) can each hold their own copy.
+    /// Each clone observes the latest `replace`.
+    #[test]
+    fn clones_observe_replaces() {
+        let reg = ChannelsRegistry::new();
+        let clone = reg.clone();
+        assert!(reg.get("probe").is_none());
+        assert!(clone.get("probe").is_none());
+
+        let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        map.insert("probe".into(), Arc::new(Probe("probe")));
+        reg.replace(map);
+
+        // The clone sees the swap without any further coordination.
+        assert!(clone.get("probe").is_some());
+    }
 }

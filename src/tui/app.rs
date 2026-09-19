@@ -2369,8 +2369,10 @@ impl TuiApp {
                     .await;
                 }
                 crate::channels::auto_start_state::mark_starting();
-                match crate::channels::start_channels_with_cancellation(cfg, task_token, None, None)
-                    .await
+                match crate::channels::start_channels_with_cancellation(
+                    cfg, task_token, None, None, None,
+                )
+                .await
                 {
                     Ok(()) => {
                         crate::channels::auto_start_state::mark_terminated();

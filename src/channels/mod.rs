@@ -370,6 +370,60 @@ pub(crate) const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "ranta
 pub(crate) const OPENRC_STATUS_ARGS: [&str; 2] = ["rantaiclaw", "status"];
 pub(crate) const OPENRC_RESTART_ARGS: [&str; 2] = ["rantaiclaw", "restart"];
 
+/// Shared, mutable handle to the live channel registry the daemon's channel
+/// runtime built.
+///
+/// The cron scheduler needs to deliver a scheduled job's output on the same
+/// channel instance that the gateway and the dispatch loop are talking to —
+/// WhatsApp Web, in particular, only sends after `listen` has set its wa-rs
+/// client, so building a fresh `WhatsAppWebChannel` for a cron send would
+/// fail with "client not connected". For HTTP-sending channels
+/// (Telegram, Discord, Slack, WhatsApp Cloud, Lark) the scheduler can also
+/// fall back to `factory::build_one` when no daemon is running, e.g. a
+/// `rantaiclaw cron run` from a script.
+///
+/// `replace` is called once per channel-runtime build by the daemon, and
+/// `get` is read each time a scheduled job fires. The container is small,
+/// read-mostly, and `Send + Sync` so the scheduler and the runtime can hold
+/// their own clones across the supervisor gap without a third coordinator.
+type ChannelMap = HashMap<String, Arc<dyn Channel>>;
+
+#[derive(Clone)]
+pub struct ChannelsRegistry {
+    inner: Arc<std::sync::RwLock<Arc<ChannelMap>>>,
+}
+
+impl ChannelsRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::RwLock::new(Arc::new(HashMap::new()))),
+        }
+    }
+
+    /// Replace the whole registry in one shot. The argument becomes the
+    /// canonical map; the old channels are dropped here when the Arc's last
+    /// reader finishes. Cheap when called once at startup; the channel
+    /// runtime only rebuilds this on a full restart, not on every config
+    /// reload, so a reload never blocks delivery with a write lock.
+    pub fn replace(&self, channels: ChannelMap) {
+        let mut guard = self.inner.write().expect("channels registry poisoned");
+        *guard = Arc::new(channels);
+    }
+
+    /// The channel registered under `key`, or `None` when no daemon runtime
+    /// has populated this slot yet.
+    pub fn get(&self, key: &str) -> Option<Arc<dyn Channel>> {
+        let guard = self.inner.read().expect("channels registry poisoned");
+        guard.get(key).cloned()
+    }
+}
+
+impl Default for ChannelsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ChannelRuntimeContext {
     /// Reloaded config state for *this* runtime's config file.
@@ -381,7 +435,7 @@ pub(crate) struct ChannelRuntimeContext {
     /// state; `None` means nothing has been loaded yet, which is the same
     /// condition the old "no entry for this path" fallback keyed on.
     pub(crate) runtime_config: Arc<Mutex<routing::RuntimeConfigSlot>>,
-    pub(crate) channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    pub(crate) channels_by_name: Arc<ChannelMap>,
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) default_provider: Arc<String>,
     pub(crate) memory: Arc<dyn Memory>,
@@ -1566,7 +1620,10 @@ pub(crate) async fn build_channel_runtime(
 ///
 /// Builds the process's one [`ChannelRuntime`] when none is handed in. The
 /// daemon hands one in so the gateway can share its bus; `channel start` and the
-/// TUI pass `None` because each is its own process.
+/// TUI pass `None` because each is its own process. When `channels_registry` is
+/// `Some`, the runtime replaces its contents with the live registry as soon as
+/// the channel fleet is built, so a peer (the cron scheduler) holding a clone
+/// can read the running channels without rebuilding them.
 pub async fn start_channels_with_cancellation(
     config: Config,
     shutdown: CancellationToken,
@@ -1574,10 +1631,25 @@ pub async fn start_channels_with_cancellation(
     // The process's bus handle when something else needs to reach this runtime
     // — the gateway, in daemon mode. `None` ⇒ nobody else is producing.
     bus: Option<Arc<ChannelBus>>,
+    // The shared registry the daemon threads between this runtime and the cron
+    // scheduler so scheduled delivery goes through the live channel. `None`
+    // means no peer needs it — `channel start`, the TUI, and `gateway`
+    // standalone have no scheduler to feed.
+    channels_registry: Option<Arc<ChannelsRegistry>>,
 ) -> Result<()> {
     let Some(runtime) = build_channel_runtime(&config, observer).await? else {
         return Ok(());
     };
+    if let Some(reg) = channels_registry.as_ref() {
+        reg.replace(
+            runtime
+                .ctx
+                .channels_by_name
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect(),
+        );
+    }
     run_channel_runtime(runtime, shutdown, bus).await
 }
 
