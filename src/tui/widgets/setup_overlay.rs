@@ -82,6 +82,12 @@ impl SetupOverlayState {
                     Severity::Success => "✓",
                 };
                 self.log.push(format!("{prefix} {text}"));
+                // The phone just linked — the QR invites another scan
+                // otherwise. Drop it on any prompt, success message, done or
+                // failed event so a linked device no longer sits under a QR.
+                if matches!(severity, Severity::Success) {
+                    self.qr = None;
+                }
             }
             ProvisionEvent::QrCode { payload, caption } => {
                 self.qr = Some((render_qr_block(&payload), caption));
@@ -92,6 +98,7 @@ impl SetupOverlayState {
                 default,
                 secret,
             } => {
+                self.qr = None;
                 self.prompt = Some(ActivePrompt {
                     id,
                     label,
@@ -116,12 +123,14 @@ impl SetupOverlayState {
                 });
             }
             ProvisionEvent::Done { summary } => {
+                self.qr = None;
                 self.log.push(format!("✓ {summary}"));
                 self.log.push(String::new());
                 self.log.push("All done. Press Esc to close.".to_string());
                 self.finished = true;
             }
             ProvisionEvent::Failed { error } => {
+                self.qr = None;
                 self.log.push(format!("✗ {error}"));
                 self.log.push(String::new());
                 self.log.push("Press Esc to close.".to_string());
@@ -1063,5 +1072,126 @@ mod tests {
         s.choose_scroll = 2;
         let _ = s.submit_choose();
         assert_eq!(s.choose_scroll, 0);
+    }
+
+    /// The setup overlay stored each QR and drew it whenever one was stored.
+    /// Nothing cleared it, so a linked device sat under a QR that still
+    /// invited a scan. Any prompt, a success message, done or failed event
+    /// must drop the QR.
+    fn with_a_qr_loaded() -> SetupOverlayState {
+        let mut s = SetupOverlayState::new("test");
+        s.handle_event(ProvisionEvent::QrCode {
+            payload: "1@first-qr".into(),
+            caption: "scan me".into(),
+        });
+        assert!(s.qr.is_some(), "the QR should be stored until cleared");
+        s
+    }
+
+    #[test]
+    fn a_prompt_event_clears_the_stored_qr() {
+        let mut s = with_a_qr_loaded();
+        s.handle_event(ProvisionEvent::Prompt {
+            id: "session_path".into(),
+            label: "Session DB path".into(),
+            default: None,
+            secret: false,
+        });
+        assert!(
+            s.qr.is_none(),
+            "the QR panel must drop the code once a prompt replaces it"
+        );
+    }
+
+    #[test]
+    fn a_success_message_clears_the_stored_qr() {
+        let mut s = with_a_qr_loaded();
+        s.handle_event(ProvisionEvent::Message {
+            severity: Severity::Success,
+            text: "Linked successfully!".into(),
+        });
+        assert!(
+            s.qr.is_none(),
+            "the QR panel must drop the code once the phone links"
+        );
+    }
+
+    #[test]
+    fn a_non_success_message_keeps_the_stored_qr() {
+        let mut s = with_a_qr_loaded();
+        s.handle_event(ProvisionEvent::Message {
+            severity: Severity::Info,
+            text: "still waiting".into(),
+        });
+        assert!(
+            s.qr.is_some(),
+            "an Info message during pairing must not drop the QR"
+        );
+    }
+
+    #[test]
+    fn a_done_event_clears_the_stored_qr() {
+        let mut s = with_a_qr_loaded();
+        s.handle_event(ProvisionEvent::Done {
+            summary: "WhatsApp Web setup complete.".into(),
+        });
+        assert!(s.qr.is_none(), "Done must drop the QR");
+        assert!(s.finished, "Done marks the overlay finished");
+    }
+
+    #[test]
+    fn a_failed_event_clears_the_stored_qr() {
+        let mut s = with_a_qr_loaded();
+        s.handle_event(ProvisionEvent::Failed {
+            error: "pairing timed out".into(),
+        });
+        assert!(s.qr.is_none(), "Failed must drop the QR");
+        assert_eq!(s.failure_reason.as_deref(), Some("pairing timed out"));
+    }
+
+    /// The overlay's QR clear lives on the same site as the QR store.
+    /// A class-guard on the source binds them so a future revert cannot
+    /// bring back the "linked device under a QR" bug.
+    #[test]
+    fn qr_clear_lives_on_the_overlay_handle_event() {
+        let production = production_half(include_str!("setup_overlay.rs"));
+        let body = fn_body(production, "pub fn handle_event(")
+            .expect("`handle_event` not found in production code");
+        assert!(
+            body.contains("self.qr = None"),
+            "the setup overlay no longer clears `self.qr` on a linking event — \
+             a paired device will keep inviting another scan"
+        );
+        assert!(
+            body.contains("ProvisionEvent::QrCode"),
+            "the overlay no longer handles `QrCode` events at all"
+        );
+    }
+
+    fn production_half(src: &str) -> &str {
+        let cut = ["\n#[cfg(test)]\nmod "]
+            .iter()
+            .flat_map(|marker| src.match_indices(marker))
+            .map(|(at, _)| at)
+            .min()
+            .unwrap_or(src.len());
+        &src[..cut]
+    }
+
+    fn fn_body<'a>(production: &'a str, header: &str) -> Option<&'a str> {
+        let after = production.split(header).nth(1)?;
+        let end = [
+            "\n    async fn ",
+            "\n    fn ",
+            "\n    pub fn ",
+            "\n    pub async fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(crate) async fn ",
+        ]
+        .iter()
+        .filter_map(|marker| after.find(marker))
+        .min()
+        .unwrap_or(after.len());
+        Some(&after[..end])
     }
 }

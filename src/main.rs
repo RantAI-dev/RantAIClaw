@@ -3283,25 +3283,38 @@ async fn run_provisioner_headless(
     let render_loop = async {
         // Choice ids already answered once, so a retry loop is recognisable.
         let mut seen_choices = std::collections::HashSet::new();
+        // Tracks the previous QR block so rotations replace, not stack.
+        // The headless render used to print a fresh header for every QR, so
+        // each rotation stacked a new block on top of the previous one.
+        let mut qr_state = rantaiclaw::channels::qr_terminal::QrRenderState::fresh();
         while let Some(ev) = events_rx.recv().await {
             match ev {
                 ProvisionEvent::Message { severity, text } => {
                     eprintln!("[{prov_name}] {severity:?}: {text}");
                 }
                 ProvisionEvent::QrCode { payload, caption } => {
+                    // Print the header + caption + footer so the operator
+                    // knows this is a pairing event. On a tty stderr the QR
+                    // itself is rendered in place (or replaces the previous
+                    // rotation); on a non-tty stderr `redraw_qr_block`
+                    // returns a one-line "QR refreshed" so the payload
+                    // never lands in a captured journal.
                     println!("\n=== WhatsApp Web Pairing QR ===");
                     println!("{caption}");
                     println!("=============================\n");
                     let _ = std::io::stdout().flush();
-                    // The payload is device-linking credential material: anyone
-                    // who reads it out of a captured stdout can link their own
-                    // device. This is the headless path, whose stdout is what CI
-                    // and install scripts record — so render the QR the operator
-                    // actually needs instead of printing the secret behind it.
-                    rantaiclaw::channels::qr_terminal::render_qr_with_header(
+                    let (qr_text, next_state) = rantaiclaw::channels::qr_terminal::redraw_qr_block(
                         &payload,
                         "WhatsApp Web Pairing QR",
+                        qr_state,
                     );
+                    qr_state = next_state;
+                    {
+                        use std::io::Write as _;
+                        let mut sink = std::io::stderr().lock();
+                        let _ = sink.write_all(qr_text.as_bytes());
+                        let _ = sink.flush();
+                    }
                     println!(
                         "Scan the QR code above with WhatsApp > Linked Devices > Link a Device"
                     );
