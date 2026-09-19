@@ -55,8 +55,9 @@ pub fn build_qr_block(payload: &str, header: &str) -> Option<RenderedQr> {
         Ok(c) => c,
         Err(e) => {
             let mut text = String::new();
-            text.push_str(&format!("(could not render QR: {e})\n"));
-            text.push_str(&format!("Raw QR payload: {payload}\n"));
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "(could not render QR: {e})");
+            let _ = writeln!(text, "Raw QR payload: {payload}");
             let lines = text.lines().count();
             return Some(RenderedQr { text, lines });
         }
@@ -70,10 +71,11 @@ pub fn build_qr_block(payload: &str, header: &str) -> Option<RenderedQr> {
 
     let mut text = String::new();
     text.push('\n');
-    text.push_str(&format!("┌─ {header} ─\n"));
+    use std::fmt::Write as _;
+    let _ = writeln!(text, "┌─ {header} ─");
     text.push('\n');
     for line in art.lines() {
-        text.push_str(&format!("  {line}\n"));
+        let _ = writeln!(text, "  {line}");
     }
     text.push('\n');
     text.push_str("└─ Scan with the app's \"link a device\" or \"add device\" flow.\n");
@@ -122,7 +124,8 @@ pub fn redraw_qr_block(
         Some(rendered) => {
             let mut out = String::new();
             if let Some(prev) = state.lines {
-                out.push_str(&format!("\x1b[{prev}A"));
+                use std::fmt::Write as _;
+                let _ = write!(out, "\x1b[{prev}A");
                 out.push_str("\x1b[J");
             }
             out.push_str(&rendered.text);
