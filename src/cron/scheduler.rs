@@ -1164,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = test_job("echo scheduler-ok");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -1177,7 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_test");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -1473,7 +1473,7 @@ mod tests {
     #[tokio::test]
     async fn single_attempt_success_records_one_row_with_attempt_one() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
 
         let t0 = Utc::now();
@@ -1564,7 +1564,7 @@ mod tests {
         );
 
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
@@ -1610,7 +1610,7 @@ mod tests {
     #[tokio::test]
     async fn process_due_jobs_marks_component_ok_even_when_idle() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
@@ -1639,7 +1639,7 @@ mod tests {
     #[tokio::test]
     async fn process_due_jobs_failure_does_not_mark_component_unhealthy() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
@@ -1667,7 +1667,7 @@ mod tests {
     #[tokio::test]
     async fn process_due_jobs_skips_job_already_in_flight() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
@@ -1701,7 +1701,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_manual_refuses_a_concurrent_run_of_the_same_job() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -1729,7 +1729,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_records_run_and_reschedules_shell_job() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -1754,7 +1754,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_delivery_failure_does_not_mark_job_errored() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         // Announce to a telegram channel NOT configured in the test Config, so
         // deliver_if_configured returns Err. With best_effort=false this used to
         // flip the recorded status to "error" for a job that executed fine.
@@ -1802,7 +1802,7 @@ mod tests {
         // Documentation (holds before and after the fix): a refused job records
         // "error" and returns false.
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -1833,7 +1833,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_success_deletes_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
@@ -1867,7 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_failure_disables_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
@@ -1902,7 +1902,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_manual_records_without_rescheduling() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let before = cron::get_job(&config, &job.id).unwrap().next_run;
 
@@ -1922,7 +1922,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_manual_survives_missing_job_row() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         // A job value whose row was never inserted: recording its run fails the FK
         // INSERT internally, but that must not fail the run or panic. (Logging is a
@@ -1964,7 +1964,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_disables_shell_one_shot_instead_of_refiring() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         // Shell one-shot as created by CLI `add-at`/`once`: delete_after_run = false.
         let job = cron::add_shell_job(
@@ -2015,7 +2015,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_deletes_shell_one_shot_when_flagged() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_shell_job(
             &config,
@@ -2055,7 +2055,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_keeps_run_history_for_undeleted_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         // Agent one-shot with delete_after_run = false (the no-delivery default
         // after the fix): must be kept+disabled, and its run row must survive
@@ -2098,7 +2098,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_if_configured_handles_none_and_invalid_channel() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let mut job = test_job("echo ok");
 
         assert!(deliver_if_configured(&config, &job, "x", &empty_channels())
@@ -2124,7 +2124,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_if_configured_refuses_a_locked_channel_and_leaves_the_job_untouched() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let job = cron::add_shell_job(
             &config,
             None,
@@ -2165,7 +2165,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_if_configured_rejects_empty_target() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         let mut job = test_job("echo ok");
         // Announce on a supported channel but with a whitespace `to`: must error
         // (fail-safe), never announce to an unspecified target.
