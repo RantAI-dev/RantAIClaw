@@ -386,9 +386,11 @@ pub(crate) const OPENRC_RESTART_ARGS: [&str; 2] = ["rantaiclaw", "restart"];
 /// `get` is read each time a scheduled job fires. The container is small,
 /// read-mostly, and `Send + Sync` so the scheduler and the runtime can hold
 /// their own clones across the supervisor gap without a third coordinator.
+type ChannelMap = HashMap<String, Arc<dyn Channel>>;
+
 #[derive(Clone)]
 pub struct ChannelsRegistry {
-    inner: Arc<std::sync::RwLock<Arc<HashMap<String, Arc<dyn Channel>>>>>,
+    inner: Arc<std::sync::RwLock<Arc<ChannelMap>>>,
 }
 
 impl ChannelsRegistry {
@@ -403,7 +405,7 @@ impl ChannelsRegistry {
     /// reader finishes. Cheap when called once at startup; the channel
     /// runtime only rebuilds this on a full restart, not on every config
     /// reload, so a reload never blocks delivery with a write lock.
-    pub fn replace(&self, channels: HashMap<String, Arc<dyn Channel>>) {
+    pub fn replace(&self, channels: ChannelMap) {
         let mut guard = self.inner.write().expect("channels registry poisoned");
         *guard = Arc::new(channels);
     }
@@ -433,7 +435,7 @@ pub(crate) struct ChannelRuntimeContext {
     /// state; `None` means nothing has been loaded yet, which is the same
     /// condition the old "no entry for this path" fallback keyed on.
     pub(crate) runtime_config: Arc<Mutex<routing::RuntimeConfigSlot>>,
-    pub(crate) channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    pub(crate) channels_by_name: Arc<ChannelMap>,
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) default_provider: Arc<String>,
     pub(crate) memory: Arc<dyn Memory>,
