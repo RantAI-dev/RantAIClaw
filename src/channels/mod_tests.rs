@@ -4783,8 +4783,8 @@ fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
 
     // The catalog is the single source of truth — iterate it the same way the
     // gate does, and assert every Supported row is announced.
-    for (key, _, support, _) in CHANNEL_CATALOG.iter() {
-        if *support == ChannelSupport::Supported {
+    for &(key, _, support, _) in &CHANNEL_CATALOG {
+        if support == ChannelSupport::Supported {
             assert!(
                 channel_supports_announce_delivery(key),
                 "{key} is Supported in the catalog but the announce gate skipped it — \
