@@ -62,6 +62,13 @@ pub async fn run(
     // The process's observer in daemon mode. Cron jobs are agent runs, and an
     // agent run that builds its own registry reports into one nothing scrapes.
     observer: Option<Arc<dyn crate::observability::Observer>>,
+    // The daemon's live channel registry, populated by `start_channels_with_cancellation`
+    // after the channel runtime is up. Cron delivery prefers the live channel so
+    // WhatsApp Web can send through the wa-rs client `listen` already opened and
+    // HTTP senders reuse the listener's connection state. `None` when no daemon
+    // runtime is around (a `rantaiclaw cron run` from a script) — the HTTP
+    // senders fall back to `factory::build_one`; WhatsApp Web has no fallback.
+    channels: crate::channels::ChannelsRegistry,
 ) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
@@ -190,6 +197,7 @@ pub async fn run(
         let security = Arc::clone(&security);
         let batch_observer = observer.clone();
         let batch_mcp = Arc::clone(&mcp);
+        let batch_channels = channels.clone();
         batches.spawn(async move {
             process_due_jobs(
                 &config,
@@ -198,6 +206,7 @@ pub async fn run(
                 SCHEDULER_COMPONENT,
                 batch_observer.as_ref(),
                 Some(&batch_mcp),
+                &batch_channels,
             )
             .await;
         });
@@ -318,6 +327,7 @@ async fn process_due_jobs(
     component: &str,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
     mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
+    channels: &crate::channels::ChannelsRegistry,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -329,6 +339,7 @@ async fn process_due_jobs(
         let component = component.to_owned();
         let obs = observer.cloned();
         let pool = mcp.cloned();
+        let channels = channels.clone();
         async move {
             // Claim the job on the process-wide registry; skip if a previous
             // (long-running) invocation — scheduled or manual — is still going,
@@ -348,6 +359,7 @@ async fn process_due_jobs(
                 &component,
                 obs.as_ref(),
                 pool.as_ref(),
+                &channels,
             )
             .await
         }
@@ -368,13 +380,14 @@ async fn execute_and_persist_job(
     component: &str,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
     mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
+    channels: &crate::channels::ChannelsRegistry,
 ) -> (String, bool) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
     let (success, output, attempts) =
         execute_job_with_retry(config, security, job, observer, mcp).await;
-    let success = persist_job_result(config, job, success, &output, &attempts).await;
+    let success = persist_job_result(config, job, success, &output, &attempts, channels).await;
 
     (job.id.clone(), success)
 }
@@ -527,6 +540,7 @@ async fn persist_job_result(
     success: bool,
     output: &str,
     attempts: &[AttemptOutcome],
+    channels: &crate::channels::ChannelsRegistry,
 ) -> bool {
     // The final attempt's finish time stamps last_run / reschedule below.
     let finished_at = attempts.last().map_or_else(Utc::now, |a| a.finished_at);
@@ -547,7 +561,7 @@ async fn persist_job_result(
     // job error.
     match announcement_for(success, output) {
         Some(announced) => {
-            if let Err(e) = deliver_if_configured(config, job, &announced).await {
+            if let Err(e) = deliver_if_configured(config, job, &announced, channels).await {
                 if job.delivery.best_effort {
                     tracing::warn!("Cron delivery failed (best_effort): {e}");
                 } else {
@@ -696,7 +710,12 @@ pub(crate) fn run_status(success: bool, output: &str) -> &'static str {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+async fn deliver_if_configured(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+    channels: &crate::channels::ChannelsRegistry,
+) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
@@ -716,17 +735,12 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         anyhow::bail!("delivery.to is empty; refusing to announce to an unspecified target");
     }
 
-    // Construction goes through the channels factory, so cron cannot drift from
-    // what the runtime and the doctor build — these three were hand-rolled here
-    // with their own copies of every constructor argument list.
-    //
-    // The *gate* deliberately stays `channel_supports_announce_delivery`. The
-    // factory can build fifteen channels; widening delivery to all of them is a
-    // capability change, not a refactor, so it is surfaced rather than taken.
-    //
-    // The store already refuses a new or edited job naming a locked channel;
-    // this covers a job that reached the database before that gate existed, or
-    // through some other path it does not sit in front of.
+    // The gate is the catalog's `Supported` set. The store already refuses a
+    // new or edited job naming a locked channel; this covers a job that reached
+    // the database before that gate existed, or through some path that does
+    // not sit in front of it. The list of keys `build_one` can construct is
+    // the same set, so the next branch's fallback cannot pick up a channel
+    // the gate rejected.
     let key = channel.to_ascii_lowercase();
     if let Some(locked_key) = crate::channels::locked_channel_key_for_provisioner(&key) {
         anyhow::bail!(
@@ -738,11 +752,35 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         anyhow::bail!("unsupported delivery channel: {key}");
     }
 
-    // Build only the one channel this delivery needs — not the whole fleet of
-    // ~15 — and emit no construction-time warnings on this per-run path (the
-    // Slack app_token note lives on the startup/doctor paths instead).
-    let Some(channel_impl) = crate::channels::build_one(config, &key) else {
-        anyhow::bail!("{key} channel not configured");
+    // Prefer the live channel the daemon already built and connected.
+    // WhatsApp Web, in particular, only sends after `listen` has set its wa-rs
+    // client, so a freshly built instance would fail with "client not connected"
+    // and a second instance opening the same session file would collide with
+    // the live one. For HTTP-sending channels (Telegram, Discord, Slack,
+    // WhatsApp Cloud, Lark, Mattermost) the live one is also better: it shares
+    // the operator's per-channel state and the listener's webhook offsets.
+    //
+    // Fall back to a fresh build for the channels whose constructor only
+    // touches the config (no live connection to clash with), e.g. a
+    // `rantaiclaw cron run` from a script outside the daemon. WhatsApp Web has
+    // no fallback — without the live runtime the delivery fails with a
+    // sentence saying the daemon must be running.
+    let channel_impl = if let Some(live) = channels.get(&key) {
+        live
+    } else if key == "whatsapp_web" {
+        anyhow::bail!(
+            "delivery.channel \"whatsapp_web\" needs the daemon: the wa-rs client is set \
+             by listen() and is not available outside the running channel runtime. \
+             Start the daemon or run `rantaiclaw service restart` and try again."
+        );
+    } else {
+        // Build only the one channel this delivery needs — not the whole fleet
+        // — and emit no construction-time warnings on this per-run path (the
+        // Slack app_token note lives on the startup/doctor paths instead).
+        let Some(channel_impl) = crate::channels::build_one(config, &key) else {
+            anyhow::bail!("{key} channel not configured");
+        };
+        channel_impl
     };
     channel_impl.send(&SendMessage::new(output, target)).await?;
 
@@ -1116,10 +1154,17 @@ mod tests {
         }]
     }
 
+    /// Empty channels registry for tests that don't exercise delivery through a
+    /// live runtime. Delivery falls back to `factory::build_one` for HTTP senders
+    /// and refuses WhatsApp Web with the daemon-required sentence.
+    fn empty_channels() -> crate::channels::ChannelsRegistry {
+        crate::channels::ChannelsRegistry::new()
+    }
+
     #[tokio::test]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = test_job("echo scheduler-ok");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -1132,7 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_test");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -1409,7 +1454,8 @@ mod tests {
                 output: "ok".into(),
             },
         ];
-        let success = persist_job_result(&config, &job, true, "ok", &attempts).await;
+        let success =
+            persist_job_result(&config, &job, true, "ok", &attempts, &empty_channels()).await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -1427,12 +1473,13 @@ mod tests {
     #[tokio::test]
     async fn single_attempt_success_records_one_row_with_attempt_one() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
 
         let t0 = Utc::now();
         let attempts = one_attempt(t0, t0 + ChronoDuration::milliseconds(5), true, "ok");
-        let success = persist_job_result(&config, &job, true, "ok", &attempts).await;
+        let success =
+            persist_job_result(&config, &job, true, "ok", &attempts, &empty_channels()).await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -1517,7 +1564,7 @@ mod tests {
         );
 
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
@@ -1563,7 +1610,7 @@ mod tests {
     #[tokio::test]
     async fn process_due_jobs_marks_component_ok_even_when_idle() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
@@ -1571,7 +1618,16 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component, None, None).await;
+        process_due_jobs(
+            &config,
+            &security,
+            Vec::new(),
+            &component,
+            None,
+            None,
+            &empty_channels(),
+        )
+        .await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1583,7 +1639,7 @@ mod tests {
     #[tokio::test]
     async fn process_due_jobs_failure_does_not_mark_component_unhealthy() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
@@ -1592,7 +1648,16 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component, None, None).await;
+        process_due_jobs(
+            &config,
+            &security,
+            vec![job],
+            &component,
+            None,
+            None,
+            &empty_channels(),
+        )
+        .await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1602,7 +1667,7 @@ mod tests {
     #[tokio::test]
     async fn process_due_jobs_skips_job_already_in_flight() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
@@ -1621,6 +1686,7 @@ mod tests {
             &component,
             None,
             None,
+            &empty_channels(),
         )
         .await;
 
@@ -1635,7 +1701,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_manual_refuses_a_concurrent_run_of_the_same_job() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -1663,7 +1729,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_records_run_and_reschedules_shell_job() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -1674,6 +1740,7 @@ mod tests {
             true,
             "ok",
             &one_attempt(started, finished, true, "ok"),
+            &empty_channels(),
         )
         .await;
         assert!(success);
@@ -1687,7 +1754,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_delivery_failure_does_not_mark_job_errored() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         // Announce to a telegram channel NOT configured in the test Config, so
         // deliver_if_configured returns Err. With best_effort=false this used to
         // flip the recorded status to "error" for a job that executed fine.
@@ -1707,6 +1774,7 @@ mod tests {
             true,
             "job ran fine",
             &one_attempt(started, finished, true, "job ran fine"),
+            &empty_channels(),
         )
         .await;
         assert!(success, "a delivery failure must not fail the job");
@@ -1734,7 +1802,7 @@ mod tests {
         // Documentation (holds before and after the fix): a refused job records
         // "error" and returns false.
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -1749,6 +1817,7 @@ mod tests {
                 false,
                 "blocked by security policy: command not allowed: example",
             ),
+            &empty_channels(),
         )
         .await;
         assert!(!success);
@@ -1764,7 +1833,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_success_deletes_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
@@ -1787,6 +1856,7 @@ mod tests {
             true,
             "ok",
             &one_attempt(started, finished, true, "ok"),
+            &empty_channels(),
         )
         .await;
         assert!(success);
@@ -1797,7 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_failure_disables_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
@@ -1820,6 +1890,7 @@ mod tests {
             false,
             "boom",
             &one_attempt(started, finished, false, "boom"),
+            &empty_channels(),
         )
         .await;
         assert!(!success);
@@ -1831,7 +1902,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_manual_records_without_rescheduling() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let before = cron::get_job(&config, &job.id).unwrap().next_run;
 
@@ -1851,7 +1922,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_manual_survives_missing_job_row() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         // A job value whose row was never inserted: recording its run fails the FK
         // INSERT internally, but that must not fail the run or panic. (Logging is a
@@ -1893,7 +1964,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_disables_shell_one_shot_instead_of_refiring() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         // Shell one-shot as created by CLI `add-at`/`once`: delete_after_run = false.
         let job = cron::add_shell_job(
@@ -1919,6 +1990,7 @@ mod tests {
             true,
             "ok",
             &one_attempt(started, finished, true, "ok"),
+            &empty_channels(),
         )
         .await;
         assert!(success);
@@ -1943,7 +2015,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_deletes_shell_one_shot_when_flagged() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_shell_job(
             &config,
@@ -1968,6 +2040,7 @@ mod tests {
             true,
             "ok",
             &one_attempt(started, finished, true, "ok"),
+            &empty_channels(),
         )
         .await;
         assert!(success);
@@ -1982,7 +2055,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_keeps_run_history_for_undeleted_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         // Agent one-shot with delete_after_run = false (the no-delivery default
         // after the fix): must be kept+disabled, and its run row must survive
@@ -2008,6 +2081,7 @@ mod tests {
             true,
             "ok",
             &one_attempt(started, finished, true, "ok"),
+            &empty_channels(),
         )
         .await;
         assert!(success);
@@ -2024,10 +2098,12 @@ mod tests {
     #[tokio::test]
     async fn deliver_if_configured_handles_none_and_invalid_channel() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let mut job = test_job("echo ok");
 
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert!(deliver_if_configured(&config, &job, "x", &empty_channels())
+            .await
+            .is_ok());
 
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
@@ -2035,7 +2111,9 @@ mod tests {
             to: Some("target".into()),
             best_effort: true,
         };
-        let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
+        let err = deliver_if_configured(&config, &job, "x", &empty_channels())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
     }
 
@@ -2046,7 +2124,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_if_configured_refuses_a_locked_channel_and_leaves_the_job_untouched() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = cron::add_shell_job(
             &config,
             None,
@@ -2068,7 +2146,7 @@ mod tests {
             best_effort: true,
         };
 
-        let err = deliver_if_configured(&config, &locked, "x")
+        let err = deliver_if_configured(&config, &locked, "x", &empty_channels())
             .await
             .unwrap_err();
         assert!(
@@ -2087,7 +2165,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_if_configured_rejects_empty_target() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let mut job = test_job("echo ok");
         // Announce on a supported channel but with a whitespace `to`: must error
         // (fail-safe), never announce to an unspecified target.
@@ -2097,7 +2175,156 @@ mod tests {
             to: Some("   ".into()),
             best_effort: true,
         };
-        let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
+        let err = deliver_if_configured(&config, &job, "x", &empty_channels())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    /// WhatsApp Web has no `build_one` fallback — the wa-rs client is set by
+    /// `listen`, so a freshly built instance would fail with "client not
+    /// connected" and a second instance opening the same session file would
+    /// collide with the live one. The scheduler must instead tell the
+    /// operator that the daemon has to be running.
+    #[tokio::test]
+    async fn deliver_if_configured_refuses_whatsapp_web_without_runtime() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        // Configure the Web table so the announce gate accepts the key.
+        config.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+            session_path: "/tmp/rantaiclaw-test-whatsapp.db".into(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        });
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("whatsapp_web".into()),
+            to: Some("+6281234567890".into()),
+            best_effort: false,
+        };
+
+        let err = deliver_if_configured(&config, &job, "x", &empty_channels())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("whatsapp_web") && msg.contains("daemon"),
+            "the error must name the channel and the daemon requirement, got: {msg}"
+        );
+    }
+
+    /// The cron gate now derives from `channel_is_usable`, which adds Lark,
+    /// WhatsApp (Cloud), Mattermost and the rest of the supported catalog
+    /// beyond the old hand list. A job whose delivery channel is one of those
+    /// must pass the gate — even when no runtime registry is around.
+    #[tokio::test]
+    async fn deliver_if_configured_accepts_every_supported_catalog_key() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        // Configure every supported channel so build_one has something to build.
+        config.channels_config.telegram = Some(crate::config::schema::TelegramConfig {
+            bot_token: "placeholder".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1_000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.channels_config.discord = Some(crate::config::schema::DiscordConfig {
+            bot_token: "placeholder".into(),
+            guild_id: None,
+            allowed_users: vec![],
+            listen_to_bots: false,
+            mention_only: false,
+        });
+        config.channels_config.slack = Some(crate::config::schema::SlackConfig {
+            bot_token: "placeholder".into(),
+            app_token: None,
+            channel_id: None,
+            allowed_users: vec![],
+        });
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("placeholder".into()),
+            phone_number_id: Some("placeholder".into()),
+            verify_token: Some("placeholder".into()),
+            app_secret: None,
+            allowed_numbers: vec![],
+        });
+        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: "https://example.test".into(),
+            bot_token: "placeholder".into(),
+            channel_id: None,
+            allowed_users: vec![],
+            thread_replies: None,
+            mention_only: None,
+        });
+        #[cfg(feature = "channel-lark")]
+        {
+            config.channels_config.lark = Some(crate::config::schema::LarkConfig {
+                app_id: "placeholder".into(),
+                app_secret: "placeholder".into(),
+                encrypt_key: None,
+                verification_token: None,
+                use_feishu: false,
+                receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+                port: None,
+                allowed_users: vec![],
+            });
+        }
+
+        // The catalog is the single source of truth: iterate every supported
+        // row and confirm the gate accepts it. WhatsApp Web is excluded — it
+        // has no build_one fallback.
+        for key in catalog_supported_keys() {
+            if key == "whatsapp_web" {
+                continue;
+            }
+            assert!(
+                crate::channels::channel_supports_announce_delivery(key),
+                "{key} must be an announce-capable channel"
+            );
+            let mut job = test_job("echo ok");
+            job.delivery = DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some(key.into()),
+                to: Some("target".into()),
+                best_effort: false,
+            };
+            // An empty registry triggers the build_one fallback. The
+            // narrowest sanity check is that the call reaches the channel's
+            // send (it will fail there because the credentials are placeholders,
+            // and that failure is fine — the gate was passed). The gate itself
+            // is the unit under test.
+            let result = deliver_if_configured(&config, &job, "x", &empty_channels()).await;
+            assert!(
+                result.is_err(),
+                "a placeholder credential should surface an error; got {result:?}"
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                !err.contains("unsupported delivery channel"),
+                "{key} was rejected by the gate even though the catalog says it \
+                 is supported: {err}"
+            );
+            assert!(
+                !err.contains("not configured"),
+                "{key} was not configured even though the test set it up: {err}"
+            );
+        }
+    }
+
+    fn catalog_supported_keys() -> Vec<&'static str> {
+        crate::channels::CHANNEL_CATALOG
+            .iter()
+            .filter_map(|(key, _, support, _)| {
+                if *support == crate::channels::ChannelSupport::Supported {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }

@@ -18,14 +18,14 @@ the runtime has already authorized them for owner-privileged actions. When they 
 owner-only tool (for example manage_permissions or issue_pairing_code), use it on their behalf — do \
 NOT refuse on the grounds that the tool is owner-only.";
 
-/// Announce-capable channels — the set `deliver_if_configured`
-/// (`src/cron/scheduler.rs`) can push a scheduled agent job's output to. Keep in
-/// sync with that match. Every member must also be a channel the catalog
-/// allows to be used: a delivery route and a catalog tier are two different
-/// concerns that used to drift independently, which is how a locked channel
-/// stayed advertised here after it stopped being buildable.
+/// Channels the scheduler can deliver a scheduled job's output to — i.e. the
+/// catalog's `Supported` set. The hand list it used to keep (telegram,
+/// discord, slack) lagged the catalog by two channels: Lark and WhatsApp Web
+/// were supported but their cron jobs silently fell back to deny-all. The
+/// catalog is the single source of truth, derived once, so a new `Supported`
+/// row is automatically allowed without re-editing this gate.
 pub fn channel_supports_announce_delivery(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "slack")
+    super::channel_is_usable(channel_name)
 }
 
 /// Guidance so the agent, when the user asks for a scheduled/recurring message or

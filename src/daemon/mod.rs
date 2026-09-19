@@ -122,6 +122,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // silently quiet daemon.
     crate::channels::warn_configured_channels_that_will_not_start(&config);
 
+    // The cron scheduler needs the live channel registry the daemon builds —
+    // delivery on WhatsApp Web only sends through the wa-rs client `listen`
+    // already opened, and HTTP senders reuse the listener's connection state.
+    // Both supervisor tasks share this handle; each call gets its own clone.
+    let channels_registry = std::sync::Arc::new(crate::channels::ChannelsRegistry::new());
+
     // Channels are held separately too, so shutdown can DRAIN them instead of a
     // bare `abort()`. They run under `start_channels_with_cancellation` (the same
     // cancellable path the TUI uses): cancelling the token stops each listener,
@@ -134,6 +140,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         let channels_shutdown = shutdown.clone();
         let channels_observer = observer.clone();
         let channels_bus = std::sync::Arc::clone(&channel_bus);
+        let channels_registry_for_runtime = std::sync::Arc::clone(&channels_registry);
         channels_handle = Some(spawn_component_supervisor(
             "channels",
             initial_backoff,
@@ -144,9 +151,16 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 let sd = channels_shutdown.clone();
                 let obs = channels_observer.clone();
                 let bus = std::sync::Arc::clone(&channels_bus);
+                let reg = std::sync::Arc::clone(&channels_registry_for_runtime);
                 async move {
-                    crate::channels::start_channels_with_cancellation(cfg, sd, Some(obs), Some(bus))
-                        .await
+                    crate::channels::start_channels_with_cancellation(
+                        cfg,
+                        sd,
+                        Some(obs),
+                        Some(bus),
+                        Some(reg),
+                    )
+                    .await
                 }
             },
         ));
@@ -173,6 +187,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     if scheduler_enabled(&config) {
         let scheduler_cfg = config.clone();
         let scheduler_observer = observer.clone();
+        let scheduler_channels = std::sync::Arc::clone(&channels_registry);
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
@@ -181,12 +196,13 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = scheduler_cfg.clone();
                 let obs = scheduler_observer.clone();
+                let ch = scheduler_channels.clone();
                 // Box the CALL, not the enclosing block: `scheduler::run`
                 // crossed clippy::large_futures (23 KB) once it carried the
                 // shared observer, and it is the `.await` of that future that
                 // sits on the supervisor's poll stack. Same shape as the
                 // heartbeat worker below.
-                Box::pin(crate::cron::scheduler::run(cfg, Some(obs)))
+                Box::pin(crate::cron::scheduler::run(cfg, Some(obs), (*ch).clone()))
             },
         ));
     } else {

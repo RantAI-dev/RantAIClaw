@@ -2622,7 +2622,7 @@ async fn run_channels_until_signal(config: config::Config) -> Result<()> {
         info!("Shutdown signal received; stopping channel listeners");
         shutdown_trigger.cancel();
     });
-    channels::start_channels_with_cancellation(config, shutdown, None, None).await
+    channels::start_channels_with_cancellation(config, shutdown, None, None, None).await
 }
 
 async fn handle_permissions_command(
