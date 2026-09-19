@@ -14,9 +14,9 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_shell_job, due_jobs, get_job, is_run_stale, list_jobs, list_runs,
-    record_last_run, record_run, record_run_attempt, remove_job, reschedule_after_run,
-    set_next_run, skip_stale_run, update_job,
+    add_agent_job, add_job, add_shell_job, due_jobs, ensure_visible_to_origin, get_job,
+    is_run_stale, list_jobs, list_jobs_for_origin, list_runs, record_last_run, record_run,
+    record_run_attempt, remove_job, reschedule_after_run, set_next_run, skip_stale_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
@@ -266,6 +266,8 @@ fn add_scheduled(
             None,
             delete_after_run,
             Some("cli"),
+            None,
+            None,
         )
     } else {
         add_shell_job(
@@ -276,6 +278,8 @@ fn add_scheduled(
             None,
             delete_after_run,
             Some("cli"),
+            None,
+            None,
         )
     }
 }
@@ -350,7 +354,17 @@ pub fn add_once_at(
     command: &str,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job(config, None, schedule, command, None, false, Some("cli"))
+    add_shell_job(
+        config,
+        None,
+        schedule,
+        command,
+        None,
+        false,
+        Some("cli"),
+        None,
+        None,
+    )
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -444,6 +458,8 @@ mod tests {
             cmd,
             None,
             false,
+            None,
+            None,
             None,
         )
         .unwrap()
@@ -570,6 +586,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -690,6 +708,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            None,
         )
         .unwrap();
         let out = run_job_report(&config, &job.id).await.unwrap();
@@ -716,6 +736,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            None,
         )
         .unwrap();
         let out = run_job_report(&config, &job.id).await.unwrap();
@@ -737,6 +759,8 @@ mod tests {
             "echo x",
             None,
             false,
+            None,
+            None,
             None,
         )
         .unwrap();

@@ -169,3 +169,32 @@ pub(crate) fn parse_schedule(raw: &Value) -> Result<Schedule, String> {
 
     Ok(schedule)
 }
+
+/// The two internal origin properties every cron_* tool schema carries. The
+/// agent loop overwrites both on every chat turn, so a model cannot forge an
+/// origin; on the TUI / CLI / web console they are absent and every job is
+/// visible.
+pub(crate) fn origin_channel_schema() -> Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "internal: set by the runtime, not by the model"
+    })
+}
+
+pub(crate) fn origin_chat_schema() -> Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "internal: set by the runtime, not by the model"
+    })
+}
+
+/// The chat a cron_* call came from, when it came from one. `None` on the
+/// TUI / CLI / web console, which see and manage every job.
+pub(crate) fn origin_filter(args: &Value) -> Option<(String, String)> {
+    let channel = args.get("origin_channel").and_then(Value::as_str)?;
+    let chat = args.get("origin_chat").and_then(Value::as_str)?;
+    if channel.is_empty() || chat.is_empty() {
+        return None;
+    }
+    Some((channel.to_string(), chat.to_string()))
+}

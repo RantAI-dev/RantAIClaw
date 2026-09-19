@@ -44,7 +44,9 @@ impl Tool for CronRunsTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" },
-                "limit": { "type": "integer" }
+                "limit": { "type": "integer" },
+                "origin_channel": crate::tools::cron_schema::origin_channel_schema(),
+                "origin_chat": crate::tools::cron_schema::origin_chat_schema()
             },
             "required": ["job_id"]
         })
@@ -74,6 +76,28 @@ impl Tool for CronRunsTool {
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| usize::try_from(v).unwrap_or(10));
+
+        // A chat may only see run history of a job it created. Un-scoped
+        // callers (TUI / CLI / console) pass — they own every job.
+        let job = match cron::get_job(&self.config, job_id) {
+            Ok(j) => j,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        let origin_owned = crate::tools::cron_schema::origin_filter(&args);
+        let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
+        if let Err(reason) = cron::ensure_visible_to_origin(&job, origin_ref) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(reason),
+            });
+        }
 
         match cron::list_runs(&self.config, job_id, limit) {
             Ok(runs) => {

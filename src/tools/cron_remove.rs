@@ -67,7 +67,9 @@ impl Tool for CronRemoveTool {
         json!({
             "type": "object",
             "properties": {
-                "job_id": { "type": "string" }
+                "job_id": { "type": "string" },
+                "origin_channel": crate::tools::cron_schema::origin_channel_schema(),
+                "origin_chat": crate::tools::cron_schema::origin_chat_schema()
             },
             "required": ["job_id"]
         })
@@ -95,6 +97,28 @@ impl Tool for CronRemoveTool {
 
         if let Some(blocked) = self.enforce_mutation_allowed("cron_remove") {
             return Ok(blocked);
+        }
+
+        // A chat may only remove a job it created. Un-scoped callers (TUI /
+        // CLI / console) pass — they own every job.
+        let job = match cron::get_job(&self.config, job_id) {
+            Ok(j) => j,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        let origin_owned = crate::tools::cron_schema::origin_filter(&args);
+        let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
+        if let Err(reason) = cron::ensure_visible_to_origin(&job, origin_ref) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(reason),
+            });
         }
 
         match cron::remove_job(&self.config, job_id) {
@@ -181,5 +205,71 @@ mod tests {
         let result = tool.execute(json!({"job_id": job.id})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
+    }
+
+    /// A chat refusing a job from another chat must not confirm the job
+    /// exists: the sentence names nothing but the caller's own chat.
+    #[tokio::test]
+    async fn removing_another_chats_job_is_refused_without_revealing_it() {
+        use crate::cron::{Schedule, SessionTarget};
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronRemoveTool::new(cfg.clone(), test_security(&cfg));
+
+        // chat-b creates a job with a distinctive name.
+        let job_b = cron::add_agent_job(
+            &cfg,
+            Some("chat-b-private-name".into()),
+            Schedule::At {
+                at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            },
+            "remind B",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some("agent-tool"),
+            Some("discord"),
+            Some("chat-b"),
+        )
+        .unwrap();
+
+        // chat-a asks to remove it: refused, and the sentence does not carry
+        // the job's name.
+        let result = tool
+            .execute(json!({
+                "job_id": job_b.id,
+                "origin_channel": "telegram",
+                "origin_chat": "chat-a",
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success, "chat-a must not remove chat-b's job");
+        let err = result.error.unwrap_or_default();
+        assert!(
+            !err.contains("chat-b-private-name"),
+            "the refusal must not reveal the job name: {err}"
+        );
+
+        // The job still exists, untouched.
+        assert!(cron::get_job(&cfg, &job_b.id).is_ok());
+
+        // The owner chat removes its own job: fine.
+        let result = tool
+            .execute(json!({
+                "job_id": job_b.id,
+                "origin_channel": "discord",
+                "origin_chat": "chat-b",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(cron::get_job(&cfg, &job_b.id).is_err());
+
+        // An un-scoped caller removes any job without an origin check.
+        let job_any = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let result = tool.execute(json!({"job_id": job_any.id})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
     }
 }

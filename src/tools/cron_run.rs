@@ -31,7 +31,9 @@ impl Tool for CronRunTool {
         json!({
             "type": "object",
             "properties": {
-                "job_id": { "type": "string" }
+                "job_id": { "type": "string" },
+                "origin_channel": crate::tools::cron_schema::origin_channel_schema(),
+                "origin_chat": crate::tools::cron_schema::origin_chat_schema()
             },
             "required": ["job_id"]
         })
@@ -86,6 +88,18 @@ impl Tool for CronRunTool {
                 });
             }
         };
+
+        // A chat may only run a job it created. Un-scoped callers (TUI / CLI
+        // / console) pass — they own every job.
+        let origin_owned = crate::tools::cron_schema::origin_filter(&args);
+        let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
+        if let Err(reason) = cron::ensure_visible_to_origin(&job, origin_ref) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(reason),
+            });
+        }
 
         if matches!(job.job_type, JobType::Shell) {
             if let Err(reason) = self

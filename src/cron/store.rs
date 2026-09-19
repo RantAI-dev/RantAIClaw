@@ -45,7 +45,9 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command, None, false, None)
+    add_shell_job(
+        config, None, schedule, command, None, false, None, None, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -57,6 +59,8 @@ pub fn add_shell_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
     created_by: Option<&str>,
+    origin_channel: Option<&str>,
+    origin_chat: Option<&str>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -71,8 +75,10 @@ pub fn add_shell_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run, created_by
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10)",
+                enabled, delivery, delete_after_run, created_at, next_run, created_by,
+                origin_channel, origin_chat
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10,
+                       ?11, ?12)",
             params![
                 id,
                 expression,
@@ -84,6 +90,8 @@ pub fn add_shell_job(
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
                 created_by,
+                origin_channel,
+                origin_chat,
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -104,6 +112,8 @@ pub fn add_agent_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
     created_by: Option<&str>,
+    origin_channel: Option<&str>,
+    origin_chat: Option<&str>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -118,8 +128,10 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run, created_by
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)",
+                enabled, delivery, delete_after_run, created_at, next_run, created_by,
+                origin_channel, origin_chat
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12,
+                       ?13, ?14)",
             params![
                 id,
                 expression,
@@ -133,6 +145,8 @@ pub fn add_agent_job(
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
                 created_by,
+                origin_channel,
+                origin_chat,
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -146,7 +160,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -160,11 +174,46 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     })
 }
 
+/// List jobs visible from a given chat. The TUI, CLI, and web console pass
+/// `None` and see every job; a chat passes `Some((channel, chat))` and sees
+/// only the jobs it created. Origin-less jobs (CLI / TUI / web console / a
+/// path that did not set them) are managed only from those surfaces — a chat
+/// neither lists nor changes them.
+pub fn list_jobs_for_origin(config: &Config, origin: Option<(&str, &str)>) -> Result<Vec<CronJob>> {
+    let all = list_jobs(config)?;
+    Ok(match origin {
+        None => all,
+        Some((channel, chat)) => all
+            .into_iter()
+            .filter(|job| {
+                matches!(
+                    (job.origin_channel.as_deref(), job.origin_chat.as_deref()),
+                    (Some(c), Some(h)) if c == channel && h == chat
+                )
+            })
+            .collect(),
+    })
+}
+
+/// `Ok(())` when the caller may see and manage the job; `Err` with the exact
+/// sentence a missing job produces, so a chat cannot distinguish "not mine"
+/// from "nowhere" — the refusal carries no trace that the job exists.
+/// Un-scoped callers (TUI / CLI / console) always pass — they own every job.
+pub fn ensure_visible_to_origin(job: &CronJob, origin: Option<(&str, &str)>) -> Result<(), String> {
+    let Some((channel, chat)) = origin else {
+        return Ok(());
+    };
+    match (job.origin_channel.as_deref(), job.origin_chat.as_deref()) {
+        (Some(c), Some(h)) if c == channel && h == chat => Ok(()),
+        _ => Err(format!("Cron job '{}' not found", job.id)),
+    }
+}
+
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -196,7 +245,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -278,7 +327,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         let mut job = {
             let mut stmt = tx.prepare(
                 "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                        enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, created_by
+                        enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat
                  FROM cron_jobs WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![job_id])?;
@@ -651,6 +700,8 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         last_status: row.get(15)?,
         last_output: row.get(16)?,
         created_by: row.get(17)?,
+        origin_channel: row.get(18)?,
+        origin_chat: row.get(19)?,
     })
 }
 
@@ -774,7 +825,9 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             last_run         TEXT,
             last_status      TEXT,
             last_output      TEXT,
-            created_by       TEXT
+            created_by       TEXT,
+            origin_channel   TEXT,
+            origin_chat      TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
 
@@ -843,6 +896,39 @@ fn migrate_cron_columns_once(conn: &Connection, db_path: &std::path::Path) -> Re
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(conn, "cron_jobs", "created_by", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "origin_channel", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "origin_chat", "TEXT")?;
+    // Backfill the origin from the delivery target when an agent created the
+    // job from a chat before this column existed — the spec scopes by the
+    // delivery's channel+target, whatever the mode. Other rows (cli / tui /
+    // gateway / an agent job without a chat delivery) stay origin-less and
+    // are managed only from the TUI / CLI / console.
+    let backfilled = conn
+        .execute(
+            "UPDATE cron_jobs
+                SET origin_channel = json_extract(delivery, '$.channel'),
+                    origin_chat = json_extract(delivery, '$.to')
+              WHERE origin_channel IS NULL
+                AND origin_chat IS NULL
+                AND created_by = 'agent-tool'
+                AND json_extract(delivery, '$.channel') IS NOT NULL
+                AND json_extract(delivery, '$.to') IS NOT NULL",
+            [],
+        )
+        .context("Failed to backfill cron job origin columns")?;
+    let origin_less: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cron_jobs WHERE origin_channel IS NULL OR origin_chat IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to count origin-less cron jobs")?;
+    // Counts only — never a job name, id or target.
+    tracing::info!(
+        backfilled,
+        origin_less,
+        "cron job origin columns migrated; origin-less jobs are managed only from the TUI / CLI / console"
+    );
     // Retry attempts are recorded as separate cron_runs rows (plan 185); legacy
     // DBs get the column with DEFAULT 1 so old rows read as attempt 1.
     add_column_if_missing(conn, "cron_runs", "attempt", "INTEGER NOT NULL DEFAULT 1")?;
@@ -910,6 +996,8 @@ mod tests {
             None,
             false,
             Some("cli"),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(job.created_by.as_deref(), Some("cli"));
@@ -931,9 +1019,139 @@ mod tests {
             None,
             false,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(anon.created_by, None);
+    }
+
+    #[test]
+    fn origin_columns_round_trip_and_default_none() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let scoped = add_agent_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "remind",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some("agent-tool"),
+            Some("telegram"),
+            Some("chat-a"),
+        )
+        .unwrap();
+        let loaded = get_job(&config, &scoped.id).unwrap();
+        assert_eq!(loaded.origin_channel.as_deref(), Some("telegram"));
+        assert_eq!(loaded.origin_chat.as_deref(), Some("chat-a"));
+
+        let unscoped = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo ok",
+            None,
+            false,
+            Some("cli"),
+            None,
+            None,
+        )
+        .unwrap();
+        let loaded = get_job(&config, &unscoped.id).unwrap();
+        assert_eq!(loaded.origin_channel, None);
+        assert_eq!(loaded.origin_chat, None);
+    }
+
+    /// A legacy agent-tool job whose announce delivery names a chat gets its
+    /// origin backfilled from that delivery on the first store open; a TUI job
+    /// (or any row without a chat delivery) stays origin-less.
+    #[test]
+    fn migration_backfills_agent_tool_jobs_from_delivery_and_leaves_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        // Seed the shapes the migration has to tell apart, by writing the
+        // rows through the normal path and then clearing the origin columns
+        // to simulate a DB from a binary that predated the columns.
+        let from_chat = add_agent_job(
+            &config,
+            Some("from-chat".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "remind",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("legacy-chat".into()),
+                best_effort: true,
+            }),
+            false,
+            Some("agent-tool"),
+            None,
+            None,
+        )
+        .unwrap();
+        let from_tui = add_shell_job(
+            &config,
+            Some("from-tui".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo ok",
+            None,
+            false,
+            Some("tui"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Simulate the legacy DB: no origin columns filled.
+        with_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET origin_channel = NULL, origin_chat = NULL",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        // Force the one-shot migration to run again for this test's DB.
+        MIGRATED_CRON_DBS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap()
+            .remove(&config.workspace_dir.join("cron").join("jobs.db"));
+
+        // Any store call re-runs the migration.
+        let _ = list_jobs(&config).unwrap();
+
+        let loaded = get_job(&config, &from_chat.id).unwrap();
+        assert_eq!(
+            loaded.origin_channel.as_deref(),
+            Some("telegram"),
+            "an agent-tool job with a chat delivery gets its origin backfilled"
+        );
+        assert_eq!(loaded.origin_chat.as_deref(), Some("legacy-chat"));
+
+        let loaded = get_job(&config, &from_tui.id).unwrap();
+        assert_eq!(loaded.origin_channel, None, "a TUI job stays origin-less");
+        assert_eq!(loaded.origin_chat, None);
     }
 
     #[test]
@@ -956,6 +1174,8 @@ mod tests {
             "echo hi",
             Some(delivery),
             false,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -990,6 +1210,8 @@ mod tests {
             Some(delivery),
             false,
             None,
+            None,
+            None,
         )
         .expect_err("a locked delivery channel must be refused at creation");
         assert!(
@@ -1016,6 +1238,8 @@ mod tests {
             "echo hi",
             None,
             false,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -1082,6 +1306,8 @@ mod tests {
             "echo once",
             None,
             false,
+            None,
+            None,
             None,
         )
         .unwrap();

@@ -86,7 +86,9 @@ ask which configured channel to deliver to — do not imply a message will arriv
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
                 "model": { "type": "string" },
                 "delivery": crate::tools::cron_schema::delivery_schema(),
-                "delete_after_run": { "type": "boolean" }
+                "delete_after_run": { "type": "boolean" },
+                "origin_channel": { "type": "string", "description": "internal: the chat that created the job" },
+                "origin_chat":    { "type": "string", "description": "internal: the chat reply-target that created the job" }
             },
             "required": ["schedule"]
         })
@@ -196,6 +198,11 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     return Ok(blocked);
                 }
 
+                let origin_channel = args
+                    .get("origin_channel")
+                    .and_then(serde_json::Value::as_str);
+                let origin_chat = args.get("origin_chat").and_then(serde_json::Value::as_str);
+
                 cron::add_shell_job(
                     &self.config,
                     name,
@@ -204,6 +211,8 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     delivery,
                     delete_after_run,
                     Some("agent-tool"),
+                    origin_channel,
+                    origin_chat,
                 )
             }
             JobType::Agent => {
@@ -278,6 +287,11 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     "cron_add: creating a scheduled agent job"
                 );
 
+                let origin_channel = args
+                    .get("origin_channel")
+                    .and_then(serde_json::Value::as_str);
+                let origin_chat = args.get("origin_chat").and_then(serde_json::Value::as_str);
+
                 cron::add_agent_job(
                     &self.config,
                     name,
@@ -288,6 +302,8 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     delivery,
                     delete_after_run,
                     Some("agent-tool"),
+                    origin_channel,
+                    origin_chat,
                 )
             }
         };

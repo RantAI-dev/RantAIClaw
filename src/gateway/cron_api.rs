@@ -313,6 +313,8 @@ async fn create_cron(
                     delivery,
                     delete_after,
                     Some("gateway"),
+                    None,
+                    None,
                 )
             })
             .await
@@ -357,6 +359,8 @@ async fn create_cron(
                     delivery,
                     delete_after,
                     Some("gateway"),
+                    None,
+                    None,
                 )
             })
             .await

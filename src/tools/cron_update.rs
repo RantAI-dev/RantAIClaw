@@ -68,7 +68,9 @@ impl Tool for CronUpdateTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" },
-                "patch": crate::tools::cron_schema::patch_schema()
+                "patch": crate::tools::cron_schema::patch_schema(),
+                "origin_channel": crate::tools::cron_schema::origin_channel_schema(),
+                "origin_chat": crate::tools::cron_schema::origin_chat_schema()
             },
             "required": ["job_id", "patch"]
         })
@@ -115,6 +117,30 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+
+        // A chat may only patch a job it created. Un-scoped callers (TUI /
+        // CLI / console) pass — they own every job. The refused call has the
+        // same shape as `cron_remove` / `cron_run`, so an operator who hits
+        // it from a chat knows exactly where the job lives.
+        let job = match cron::get_job(&self.config, job_id) {
+            Ok(j) => j,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        let origin_owned = crate::tools::cron_schema::origin_filter(&args);
+        let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
+        if let Err(reason) = cron::ensure_visible_to_origin(&job, origin_ref) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(reason),
+            });
+        }
 
         if let Some(command) = &patch.command {
             if let Err(reason) = self.security.validate_command_execution(command, false) {
