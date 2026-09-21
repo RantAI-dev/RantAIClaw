@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A scheduled job reaches every usable channel and the same live client.** The scheduler only
+  accepted the three channels the announce gate hand-listed; on every other usable channel it
+  refused the job, even when `factory::build_one` would have constructed one and the running
+  daemon already had the live client. WhatsApp Web specifically could not use the fallback
+  path: its client is set by `listen`, so a freshly built instance fails with "client not
+  connected" and a second one would collide with the live session. The fix shares the channel
+  runtime's live registry with the cron scheduler through a small, cloneable registry the daemon
+  threads between the two supervisor tasks. `deliver_if_configured` prefers the registry; the
+  HTTP senders (Telegram, Discord, Slack, WhatsApp Cloud, Lark, Mattermost) still have
+  `factory::build_one` as a fallback for `rantaiclaw cron run` from a script outside the
+  daemon. WhatsApp Web has no fallback: the scheduler returns a sentence naming the daemon
+  requirement instead of opening a second instance on the same session file. The announce
+  delivery gate now derives from the catalog's `Supported` set, so a new `Supported` row is
+  automatically a delivery target. `factory::build_one` learns `whatsapp` and `lark` so the
+  fallback path can construct them.
+- **A chat sees and manages only the cron jobs it created.** Every `cron_*` tool call returned
+  and mutated the whole job store regardless of where it came from: anyone who could chat
+  could list the operator's jobs and cancel them. From a chat, a job is now visible and
+  manageable only in the chat it was created from; the TUI, CLI and web console still see
+  everything. The cron job store gains nullable origin columns (the config schema stays at
+  32 — the job store is not the config). The agent loop injects the calling chat into every
+  `cron_*` tool call on a chat surface, overwriting whatever the model supplied — a chat
+  cannot forge an origin to escape the scope; TUI / CLI / web console pass nothing and stay
+  unrestricted. From a chat, `cron_list` and `cron_runs` return only that chat's jobs;
+  `cron_remove`, `cron_update` and `cron_run` refuse a foreign job with the exact sentence a
+  missing job produces, so a chat cannot even probe whether a job exists elsewhere. The
+  store migration backfills an agent-tool job's origin from its delivery target and leaves
+  every other row origin-less; the migration logs counts only.
+
 - **The gateway can connect, edit and disconnect Lark.** Until now the gateway knew Lark only as a
   secret to redact; the console had no way to set it up and an operator had to edit `config.toml` by
   hand. `POST /api/v1/channels/lark` now validates the app ID and app secret together against Lark's
@@ -130,6 +159,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WhatsApp Web routes the `/claim` pairing reply through the resolved phone-number thread.**
+  A successful `/claim` used to send its confirmation to the raw event chat Jid, which on a
+  LID-addressed DM is an `@lid` the operator never sees. Normal replies resolved it first, but
+  the pairing send skipped that step, so a `/claim` that succeeded silently dropped its
+  confirmation in a thread WhatsApp does not show in the phone-number chat. A pure helper
+  does the LID-to-PN mapping without a live wa-rs client; the resolution step is now a thin
+  wrapper around it; the pairing send takes the sender's already-resolved phone number and
+  calls the helper, so the pairing reply lands on the same thread a normal reply would.
+- **Re-running the WhatsApp Web setup keeps the session and allowlist, normalises numbers.**
+  Re-running setup pointed the channel at a fresh, unlinked session file every time and
+  replaced the allowlist with deny-all. An operator's `0812…` or `62812…` typed without the
+  leading `+` was saved as-is, so the runtime's `+E.164` sender rewrite never matched, and
+  the "E.164" label never showed an example. Both the provisioner (TUI overlay and headless)
+  and the legacy onboard wizard now read the existing section before prompting and offer its
+  session path and allowlist as defaults, so Enter keeps them byte-identical; every typed
+  entry runs through the same helper the gateway uses to save operator edits, and an invalid
+  entry fails the run with the helper's own sentence; the prompt label shows `+E.164` so the
+  country code is obvious without reading the docs. The helper itself now refuses a leading
+  `0` with its own sentence, since the original "use digits with an optional leading +" was
+  the wrong sentence for the operator's most common mistake.
+- **The pairing QR disappears once the phone links.** The TUI overlay stored each QR and
+  drew it whenever one was stored, so a device that had already linked still showed a QR
+  inviting another scan; nothing cleared it on a prompt, a success message, done or failed
+  event. The headless renderer printed a full block per QR rotation, so each new code
+  stacked on top of the previous one (the payload itself stayed in stderr, which a managed
+  daemon's journal captures). The overlay now drops its stored QR on any of those four
+  events; multiple QR events still replace each other. The headless renderer carries render
+  state across events: on a tty stderr it emits the ANSI cursor-up + clear escape before
+  drawing the new block; on a non-tty stderr it prints one short "QR refreshed" line on each
+  rotation, so the payload stays out of any captured stream.
 - **The CLI, pairing and scheduled delivery refuse a locked channel by name.** `rantaiclaw setup
   <name>` (interactive and `--non-interactive`), `/pair` in the TUI, `rantaiclaw channels pair`, the
   `issue_pairing_code` tool, and a scheduled job's `delivery.channel` all used to accept a locked
