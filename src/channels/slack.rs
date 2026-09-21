@@ -990,7 +990,9 @@ impl SlackChannel {
         ) {
             return None;
         }
-        // A DM carries a `D…` channel id that can never equal a configured `C…` or `G…` filter, and the filter's purpose is to scope public/private channels, not to silence the owner when they message the bot.
+        // A DM carries a `D…` channel id that can never equal a configured `C…` or
+        // `G…` filter, and the filter's purpose is to scope public/private channels,
+        // not to silence the owner when they message the bot.
         if let Some(want) = only_channel.filter(|c| !c.trim().is_empty()) {
             let is_dm = event
                 .get("channel_type")
@@ -1669,7 +1671,7 @@ mod tests {
         // A private channel whose id does not match is still filtered out.
         let private = envelope(serde_json::json!({
             "type": "message", "user": "U1", "text": "hai",
-            "ts": "1.1", "channel": "G0PRIVATE", "channel_type": "private"
+            "ts": "1.1", "channel": "G0PRIVATE", "channel_type": "group"
         }));
         assert!(
             SlackChannel::socket_event_message(&private, Some("C0WANTED")).is_none(),
