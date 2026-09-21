@@ -3981,6 +3981,13 @@ mod tests {
         let _home = crate::test_env::HomeGuard::set(tmp.path());
         let profile = crate::profile::ProfileManager::active().expect("profile tree");
         let log_path = profile.root.join("audit.log");
+        // Test build: under cfg(test) `record_tool_call` reads its dir from
+        // this override, so redirect it at the same temp profile root the
+        // assertion looks at.
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
 
         let mgr = supervised_manager();
         let call = ParsedToolCall {
@@ -4080,6 +4087,13 @@ mod tests {
         let _home = crate::test_env::HomeGuard::set(tmp.path());
         let profile = crate::profile::ProfileManager::active().expect("profile tree");
         let log_path = profile.root.join("audit.log");
+        // Test build: under cfg(test) `record_tool_call` reads its dir from
+        // this override, so redirect it at the same temp profile root the
+        // assertion looks at.
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
 
         // Full autonomy: `needs_approval` is false, so no backend is consulted
         // and no human ever sees a prompt.

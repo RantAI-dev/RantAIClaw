@@ -159,6 +159,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Tests can no longer write to the operator's real audit log.** `record_tool_call` used
+  to resolve its directory from the operator's home and the active profile, and any
+  `#[tokio::test]` that exercised a tool through the agent funnel (five in
+  `channels/mod_tests.rs`, two in `tools/delegate.rs`) silently appended to the real
+  `audit.log`. A test build now refuses the real profile: `record_tool_call` only writes
+  when `RANTAICLAW_AUDIT_DIR_OVERRIDE` points at a temp directory. The seven affected
+  tests redirect to a temp dir via the existing `test_env::EnvGuard` pattern; future
+  tests cannot reach the real profile by accident. Two new tests in
+  `src/security/audit.rs` pin the contract (one asserts no write without the override,
+  one asserts the write lands in the override dir).
 - **WhatsApp Web routes the `/claim` pairing reply through the resolved phone-number thread.**
   A successful `/claim` used to send its confirmation to the raw event chat Jid, which on a
   LID-addressed DM is an `@lid` the operator never sees. Normal replies resolved it first, but
