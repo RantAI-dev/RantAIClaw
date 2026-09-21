@@ -642,9 +642,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is not yet recognised — the real path is `rantaiclaw channels pair --channel <name>`
   on the host, then `/claim <code>` in chat. All three denial texts now end with that
   sentence, named through a single helper so a future wording change lands in one place.
-  The channel name stays as the literal `<channel>` placeholder; the gate does not see
-  one, and threading the runtime's `channel_name` through would mean touching the caller
-  the plan keeps out of scope.
+  The channel name stays as the literal `<channel>` placeholder, because the gate does
+  not know which channel it runs on.
 
 ### Security
 
