@@ -130,6 +130,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rantaiclaw status` and `rantaiclaw service status` warn when the running daemon is an older
+  build.** After `cargo install` the managed daemon kept running the old build and nothing said so:
+  `rantaiclaw status` printed only the CLI's version and `rantaiclaw service status` printed only
+  the systemd state. Both now probe the running gateway's version with the same helper the web
+  console already used (`probe_gateway_identity`), and when it differs from the CLI's they print
+  one line naming both versions and pointing at the restart command. An unreachable daemon prints
+  that fact, with the URL it tried, instead of a version claim; a daemon whose version matches
+  the CLI's is silent, since the title already names the CLI version.
 - **The CLI, pairing and scheduled delivery refuse a locked channel by name.** `rantaiclaw setup
   <name>` (interactive and `--non-interactive`), `/pair` in the TUI, `rantaiclaw channels pair`, the
   `issue_pairing_code` tool, and a scheduled job's `delivery.channel` all used to accept a locked

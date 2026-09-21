@@ -2048,6 +2048,25 @@ async fn main() -> Result<()> {
                 cli_style::field("Boards", W, "none (disabled)");
             }
 
+            // Probe the running daemon off the async worker — `curl` + the 300 ms
+            // retry sleep would stall the runtime otherwise. Capture both fields
+            // the helper needs so the closure is `Send + 'static`.
+            let status_host = config.gateway.host.clone();
+            let status_port = config.gateway.port;
+            let version_line = tokio::task::spawn_blocking(move || {
+                webui::probe_and_format_version_status(
+                    env!("CARGO_PKG_VERSION"),
+                    &status_host,
+                    status_port,
+                )
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(line) = version_line {
+                println!("\n  {}", cli_style::warn(&format!("⚠  {line}")));
+            }
+
             Ok(())
         }
 
@@ -2131,12 +2150,34 @@ async fn main() -> Result<()> {
             // `service::handle_command` shells out synchronously — `systemctl
             // restart` blocks up to the unit's TimeoutStopSec (30s). Run it off
             // the async worker so it doesn't stall the runtime, mirroring `ui`.
-            let config = config.clone();
-            tokio::task::spawn_blocking(move || {
-                service::handle_command(&service_command, &config, init_system)
+            let is_status = matches!(service_command, ServiceCommands::Status);
+            let service_config = config.clone();
+            let service_outcome = tokio::task::spawn_blocking(move || {
+                service::handle_command(&service_command, &service_config, init_system)
             })
             .await
-            .map_err(|e| anyhow::anyhow!("service command panicked: {e}"))?
+            .map_err(|e| anyhow::anyhow!("service command panicked: {e}"))?;
+            // For `service status` only, add the version-line probe. The other
+            // subcommands either restart the daemon (which would race our probe)
+            // or don't care about the running build.
+            if is_status {
+                let svc_host = config.gateway.host.clone();
+                let svc_port = config.gateway.port;
+                if let Some(line) = tokio::task::spawn_blocking(move || {
+                    webui::probe_and_format_version_status(
+                        env!("CARGO_PKG_VERSION"),
+                        &svc_host,
+                        svc_port,
+                    )
+                })
+                .await
+                .ok()
+                .flatten()
+                {
+                    println!("\n  {}", cli_style::warn(&format!("⚠  {line}")));
+                }
+            }
+            service_outcome
         }
 
         Some(Commands::Ui { ui_command }) => {
