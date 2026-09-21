@@ -130,6 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Tests can no longer write to the operator's real audit log.** `record_tool_call` used
+  to resolve its directory from the operator's home and the active profile, and any
+  `#[tokio::test]` that exercised a tool through the agent funnel (five in
+  `channels/mod_tests.rs`, two in `tools/delegate.rs`) silently appended to the real
+  `audit.log`. A test build now refuses the real profile: `record_tool_call` only writes
+  when `RANTAICLAW_AUDIT_DIR_OVERRIDE` points at a temp directory. The seven affected
+  tests redirect to a temp dir via the existing `test_env::EnvGuard` pattern; future
+  tests cannot reach the real profile by accident. Two new tests in
+  `src/security/audit.rs` pin the contract (one asserts no write without the override,
+  one asserts the write lands in the override dir).
 - **The CLI, pairing and scheduled delivery refuse a locked channel by name.** `rantaiclaw setup
   <name>` (interactive and `--non-interactive`), `/pair` in the TUI, `rantaiclaw channels pair`, the
   `issue_pairing_code` tool, and a scheduled job's `delivery.channel` all used to accept a locked

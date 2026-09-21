@@ -1819,6 +1819,10 @@ impl Tool for MockPriceTool {
 
 #[tokio::test]
 async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp(
+        "process_channel_message_executes_tool_calls_instead_of_sending_raw_json",
+    )
+    .await;
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -1890,6 +1894,10 @@ async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json
 
 #[tokio::test]
 async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp(
+        "process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply",
+    )
+    .await;
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -1961,6 +1969,10 @@ async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_repl
 
 #[tokio::test]
 async fn process_channel_message_executes_tool_calls_with_alias_tags() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp(
+        "process_channel_message_executes_tool_calls_with_alias_tags",
+    )
+    .await;
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -3465,6 +3477,10 @@ async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_
 // error. (This asserts the current design, reconciled in plan 017.)
 #[tokio::test]
 async fn process_channel_message_respects_configured_max_tool_iterations_above_default() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp(
+        "process_channel_message_respects_configured_max_tool_iterations_above_default",
+    )
+    .await;
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -3546,6 +3562,10 @@ async fn process_channel_message_respects_configured_max_tool_iterations_above_d
 // design, reconciled in plan 017.)
 #[tokio::test]
 async fn process_channel_message_reports_configured_max_tool_iterations_limit() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp(
+        "process_channel_message_reports_configured_max_tool_iterations_limit",
+    )
+    .await;
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 

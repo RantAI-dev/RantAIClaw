@@ -204,18 +204,23 @@ pub struct ToolCallRecord {
 /// prompts and — for `shell` — whatever the model composed. The audit trail
 /// answers "what ran, was it approved, did it succeed", which is what the
 /// operator-facing docs have always claimed it answers.
+///
+/// **Test builds cannot reach the operator profile by accident.** Under
+/// `cfg(test)` the directory is read from the `RANTAICLAW_AUDIT_DIR_OVERRIDE`
+/// env var; if it is unset (or empty) the record is dropped with a `debug`
+/// log line. A test that wants to capture audit records must point that var
+/// at a temp directory while holding `crate::test_env::ENV_LOCK`, e.g. via
+/// `crate::test_env::EnvGuard::set("RANTAICLAW_AUDIT_DIR_OVERRIDE", tmp.path())`.
+/// Under `cfg(not(test))` the path is resolved from the active profile name,
+/// unchanged from before.
 pub fn record_tool_call(record: ToolCallRecord) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    let dir =
-        crate::profile::paths::profile_dir(&crate::profile::ProfileManager::resolve_active_name());
+    let Some(dir) = audit_dir_for_record() else {
+        return;
+    };
     tokio::task::spawn_blocking(move || {
-        // `SecurityConfig` is still not a field of `Config`, so there is no
-        // reachable per-deployment `[security.audit]` to read; defaults
-        // (enabled, `audit.log`, 100 MB rotation) are what the config-change
-        // trail in `gateway/config_api.rs` already uses. Threading the operator's
-        // block through is part of the sandbox decision that gates it.
         let Ok(logger) = AuditLogger::new(crate::config::AuditConfig::default(), dir) else {
             return;
         };
@@ -231,6 +236,38 @@ pub fn record_tool_call(record: ToolCallRecord) {
             tracing::warn!(target: "security", error = %e, "failed to write tool-call audit record");
         }
     });
+}
+
+/// Resolve the directory `record_tool_call` should write into. Under
+/// `cfg(test)` the operator's home is never reachable unless an env-var
+/// override is set by the caller (typically a test holding `ENV_LOCK`); under
+/// `cfg(not(test))` the active profile directory is used as before.
+fn audit_dir_for_record() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        // Test build: refuse the real operator profile. A test that wants to
+        // capture audit records must point this env var at a temp directory
+        // (crate::test_env::EnvGuard::set("RANTAICLAW_AUDIT_DIR_OVERRIDE", …)
+        // while holding ENV_LOCK); otherwise the record is dropped with a
+        // debug log line and no file is written.
+        match std::env::var_os("RANTAICLAW_AUDIT_DIR_OVERRIDE") {
+            Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+            _ => {
+                tracing::debug!(
+                    "record_tool_call: RANTAICLAW_AUDIT_DIR_OVERRIDE is unset in a \
+                     test build; dropping the audit record to keep the operator's \
+                     real audit log untouched"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(test))]
+    {
+        Some(crate::profile::paths::profile_dir(
+            &crate::profile::ProfileManager::resolve_active_name(),
+        ))
+    }
 }
 
 /// Whether the log file at `path` ends in content whose last byte is not a
@@ -593,6 +630,78 @@ mod tests {
             success: true,
             duration_ms: 1,
         });
+    }
+
+    /// Pin the contract that a `#[tokio::test]` cannot reach the operator's
+    /// real audit log without an explicit override. The plan was triggered by
+    /// `~/.../profiles/default/audit.log` gaining `mock_price` / `test-channel`
+    /// entries whenever a channel funnel test ran.
+    #[tokio::test]
+    async fn record_tool_call_in_a_test_without_override_does_not_touch_the_real_profile() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        // Explicitly UNSET the override so a leak from a sibling test cannot
+        // redirect the write somewhere it would also miss the assertion.
+        let _audit_off = crate::test_env::EnvGuard::unset("RANTAICLAW_AUDIT_DIR_OVERRIDE");
+
+        // The operator's real profile dir, as resolved by the production
+        // code path. If the audit log does not exist on the test host, that
+        // is fine: this test only asserts the call did NOT add a new file
+        // under it, and did not grow an existing one.
+        let real_dir = crate::profile::paths::profile_dir(
+            &crate::profile::ProfileManager::resolve_active_name(),
+        );
+        let real_log = real_dir.join("audit.log");
+        let before = std::fs::metadata(&real_log).ok(); // None if absent.
+
+        record_tool_call(ToolCallRecord {
+            channel: "test-channel".into(),
+            tool: "noop".into(),
+            risk_level: "executed".into(),
+            approval: ApprovalOutcome::NotRequired,
+            allowed: true,
+            success: true,
+            duration_ms: 1,
+        });
+
+        // Give the `spawn_blocking` a chance to run before we sample `after`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let after = std::fs::metadata(&real_log).ok();
+        let before_len = before.as_ref().map(|m| m.len());
+        let after_len = after.as_ref().map(|m| m.len());
+        assert_eq!(
+            before_len, after_len,
+            "record_tool_call under cfg(test) without the override must not write \
+             to the operator's real audit.log; before={before:?}, after={after:?}"
+        );
+    }
+
+    /// Pin the other half of the contract: when a test DOES opt in to
+    /// capturing audit records by pointing the override at a temp dir, the
+    /// write lands there, not in the operator profile.
+    #[tokio::test]
+    async fn record_tool_call_in_a_test_with_override_writes_to_the_override_dir() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let _audit = crate::test_env::EnvGuard::set("RANTAICLAW_AUDIT_DIR_OVERRIDE", tmp.path());
+
+        record_tool_call(ToolCallRecord {
+            channel: "test-channel".into(),
+            tool: "noop".into(),
+            risk_level: "executed".into(),
+            approval: ApprovalOutcome::NotRequired,
+            allowed: true,
+            success: true,
+            duration_ms: 1,
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let log = tmp.path().join("audit.log");
+        assert!(
+            log.exists(),
+            "with the override set, record_tool_call must write to <override>/audit.log"
+        );
     }
 
     // ── §8.1 Log rotation tests ─────────────────────────────
