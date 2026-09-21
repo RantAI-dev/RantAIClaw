@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`rantaiclaw status` and `rantaiclaw service status` warn when the running daemon's version
+  differs from the CLI's.** After `cargo install` the managed daemon kept running the old build
+  and nothing said so: `rantaiclaw status` printed only the CLI's version and `rantaiclaw service
+  status` printed only the systemd state. Both now probe the running gateway's version with the
+  same helper the web console already used (`probe_gateway_identity`), and when it differs from
+  the CLI's they print one line naming both versions and pointing at `rantaiclaw service restart`
+  to run the installed build. An unreachable daemon prints that fact, with the URL it tried,
+  instead of a version claim; a daemon whose version matches the CLI's is silent, since the title
+  already names the CLI version.
 - **A scheduled job reaches every usable channel and the same live client.** The scheduler only
   accepted the three channels the announce gate hand-listed; on every other usable channel it
   refused the job, even when `factory::build_one` would have constructed one and the running
@@ -159,15 +168,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`rantaiclaw status` and `rantaiclaw service status` warn when the running daemon's version
-  differs from the CLI's.** After `cargo install` the managed daemon kept running the old build
-  and nothing said so: `rantaiclaw status` printed only the CLI's version and `rantaiclaw service
-  status` printed only the systemd state. Both now probe the running gateway's version with the
-  same helper the web console already used (`probe_gateway_identity`), and when it differs from
-  the CLI's they print one line naming both versions and pointing at `rantaiclaw service restart`
-  to run the installed build. An unreachable daemon prints that fact, with the URL it tried,
-  instead of a version claim; a daemon whose version matches the CLI's is silent, since the title
-  already names the CLI version.
+- **Tests can no longer write to the operator's real audit log.** `record_tool_call` used
+  to resolve its directory from the operator's home and the active profile, and any
+  `#[tokio::test]` that exercised a tool through the agent funnel (five in
+  `channels/mod_tests.rs`, two in `tools/delegate.rs`) silently appended to the real
+  `audit.log`. A test build now refuses the real profile: `record_tool_call` only writes
+  when `RANTAICLAW_AUDIT_DIR_OVERRIDE` points at a temp directory. The seven affected
+  tests redirect to a temp dir via the existing `test_env::EnvGuard` pattern; future
+  tests cannot reach the real profile by accident. Two new tests in
+  `src/security/audit.rs` pin the contract (one asserts no write without the override,
+  one asserts the write lands in the override dir).
 - **WhatsApp Web routes the `/claim` pairing reply through the resolved phone-number thread.**
   A successful `/claim` used to send its confirmation to the raw event chat Jid, which on a
   LID-addressed DM is an `@lid` the operator never sees. Normal replies resolved it first, but
@@ -653,6 +663,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sentence, named through a single helper so a future wording change lands in one place.
   The channel name stays as the literal `<channel>` placeholder, because the gate does
   not know which channel it runs on.
+- **Discord and WhatsApp Web answer a command addressed to them by name.** `/new@<botname>` (or
+  `/clear@<botname>`, `/start@<botname>`, etc.) used to be answered as "addressed elsewhere" on
+  both channels and silently consumed, because only Telegram overrode `Channel::bot_username` and
+  the trait default returns `None`. Discord now caches the `users/@me` username on first call and
+  answers from the cache; WhatsApp Web answers to the linked account's phone number, refreshed
+  once `listen` connects to wa-rs, because that is what WhatsApp's own @-mention inserts into the
+  message text, not the push name, so an operator addressing the bot in a group chat works the
+  same way it does on Telegram. Both overrides sit in their `impl Channel for` blocks; a copy in a
+  plain `impl` block would compile and never run because the runtime holds channels as
+  `Arc<dyn Channel>`. The `None` default is kept for every other channel and for both of these
+  before they learn their identity, so a bot that has never looked up its own identity answers no
+  addressed command at all. No config key, schema stays at 32.
 
 ### Security
 
