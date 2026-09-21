@@ -578,6 +578,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because a tag pushed by hand never runs the script and `prepare` is the only gate every
   publish passes through. It fails before a single artefact is built. Seen to refuse and seen
   to accept, in both places.
+- **Cargo-deny now ignores `RUSTSEC-2026-0292` (`imbl-sized-chunks` 0.1.3) with the rest of the
+  `imbl`/`matrix-sdk` tree.** The advisory was published after 0.31.0-alpha's CI ran green; it
+  flags a use-after-free / double-free in `Chunk` and `InlineArray` removal methods reachable from
+  safe Rust when an element's `Drop` panics. The trigger requires a panicking Drop impl — none of
+  our code or matrix-sdk's internal types exhibit that pattern — and the path is opt-in (`--features
+  channel-matrix`); the upstream fix is `imbl-sized-chunks >= 0.2.0`, which matrix-sdk 0.18 has not
+  yet pulled in. Reviewed with the other imbl/matrix-sdk entries; revisit on 2026-11-15 or when
+  matrix-sdk ships an imbl bump.
+- **Discord and WhatsApp Web answer a command addressed to them by name.** `/new@<botname>` (or
+  `/clear@<botname>`, `/start@<botname>`, etc.) used to be answered as "addressed elsewhere" on
+  both channels and silently consumed, because only Telegram overrode `Channel::bot_username` and
+  the trait default returns `None`. Discord now caches the `users/@me` username on first call and
+  answers from the cache; WhatsApp Web answers the linked account's push name, refreshed once
+  `listen` connects to wa-rs, so an operator addressing the bot by their own profile name on a group
+  chat works the same way it does on Telegram. Both overrides sit in their `impl Channel for`
+  blocks; a copy in a plain `impl` block would compile and never run because the runtime holds
+  channels as `Arc<dyn Channel>`. The `None` default is kept for every other channel and for both
+  of these before they learn their name, so a bot that has never looked up its own name answers no
+  addressed command at all (F-23). No config key, schema stays at 32.
 
 ### Security
 

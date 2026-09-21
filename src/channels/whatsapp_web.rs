@@ -76,6 +76,13 @@ pub struct WhatsAppWebChannel {
     client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
+    /// Cached own-identity push name, fetched from the linked wa-rs client so
+    /// `/new@<own name>` can be answered here instead of refused as "addressed
+    /// elsewhere" (plan 408). `None` until `listen` connects; on error the
+    /// override returns `None` and F-23's refusal stays live. Tests fill the
+    /// cache directly through `set_bot_identity_for_test` because a live wa-rs
+    /// client cannot run inside a unit test.
+    bot_identity: Mutex<Option<String>>,
 }
 
 /// What became of an inbound message offered to the dispatch queue.
@@ -151,6 +158,8 @@ impl WhatsAppWebChannel {
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
+            // Lazy: refreshed once `listen` connects to wa-rs.
+            bot_identity: Mutex::new(None),
         }
     }
 
@@ -783,6 +792,29 @@ impl WhatsAppWebChannel {
         }
         Self::normalize_sender(resolved_pn, sender_user)
     }
+
+    /// Read our own push name from the live wa-rs client and cache it. Called
+    /// once after `listen` establishes the connection. An empty push name
+    /// (wa-rs still warming up) leaves the cache untouched so a later call
+    /// retries.
+    #[cfg(feature = "whatsapp-web")]
+    async fn refresh_bot_identity(&self) {
+        let client_opt = self.client.lock().clone();
+        if let Some(client) = client_opt {
+            let name = client.get_push_name().await;
+            if !name.is_empty() {
+                *self.bot_identity.lock() = Some(name);
+            }
+        }
+    }
+
+    /// Pin our identity from a test fixture, bypassing the live wa-rs client.
+    /// The live path is `refresh_bot_identity` above; this exists because a
+    /// unit test cannot stand up a wa-rs session.
+    #[cfg(test)]
+    pub(crate) fn set_bot_identity_for_test(&self, name: Option<String>) {
+        *self.bot_identity.lock() = name;
+    }
 }
 
 /// What the event loop should do about a terminal wa-rs event.
@@ -821,6 +853,17 @@ impl Channel for WhatsAppWebChannel {
         // up as `whatsapp_web`. The factory guard in `mod_tests.rs` holds the
         // two together.
         "whatsapp_web"
+    }
+
+    /// Plan 408. Cached wa-rs push name so `/new@<own name>` answers here
+    /// instead of being refused as "addressed elsewhere". The runtime holds
+    /// channels as `Arc<dyn Channel>` (`routing.rs`), so this must sit inside
+    /// `impl Channel for`; a copy in a plain `impl` block would compile and
+    /// never run. Reads from a cache populated either by
+    /// `refresh_bot_identity` (after `listen` connects) or by the test helper
+    /// `set_bot_identity_for_test`.
+    async fn bot_username(&self) -> Option<String> {
+        self.bot_identity.lock().clone()
     }
 
     fn render_target(&self) -> crate::channels::format::RenderTarget {
@@ -1261,6 +1304,14 @@ impl Channel for WhatsAppWebChannel {
 
         let mut bot = builder.build().await?;
         *self.client.lock() = Some(bot.client());
+
+        // Cache our own push name now that wa-rs has a live client. The
+        // `bot_username` trait override reads from this cache so `/new@<own
+        // name>` answers here instead of being refused as "addressed
+        // elsewhere". wa-rs may report an empty name while warming up; the
+        // helper leaves the cache untouched in that case so a later refresh
+        // can fill it.
+        self.refresh_bot_identity().await;
 
         // Run the bot
         let bot_handle = bot.run().await?;
@@ -3358,5 +3409,49 @@ mod tests {
         );
 
         std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    }
+
+    // ── bot_username (plan 408) ────────────────────────────────────
+
+    /// Plan 408. WhatsApp Web now answers `/new@<own push name>` instead of
+    /// refusing it as "addressed elsewhere". The override sits in `impl Channel
+    /// for WhatsAppWebChannel`; going through `Arc<dyn Channel>` is the only
+    /// way to reach it, because a copy in a plain `impl` block would compile
+    /// and never run. A live wa-rs client cannot run inside a unit test, so
+    /// the cache is seeded directly via the test-only setter. The mutation
+    /// check: if the override dropped the cache and returned `None`, this
+    /// assertion fails.
+    #[tokio::test]
+    async fn whatsapp_web_bot_username_returns_cached_name_through_the_trait_object() {
+        let ch = std::sync::Arc::new(WhatsAppWebChannel::new(
+            "/tmp/wa-test.db".into(),
+            None,
+            None,
+            vec![],
+        ));
+        ch.set_bot_identity_for_test(Some("agent".to_string()));
+
+        let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
+        assert_eq!(
+            as_the_runtime_holds_it.bot_username().await.as_deref(),
+            Some("agent"),
+            "the cache must reach the trait object's call"
+        );
+    }
+
+    /// The cache empty (no live client, or a connect that never saw a push
+    /// name) yields `None`, the same safe default every other channel
+    /// inherits until it learns its own name. A bot that has never looked up
+    /// its own name answers no addressed command — F-23's refusal stays live.
+    #[tokio::test]
+    async fn whatsapp_web_bot_username_is_none_when_the_cache_is_empty() {
+        let ch = std::sync::Arc::new(WhatsAppWebChannel::new(
+            "/tmp/wa-test.db".into(),
+            None,
+            None,
+            vec![],
+        ));
+        let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
+        assert_eq!(as_the_runtime_holds_it.bot_username().await, None);
     }
 }
