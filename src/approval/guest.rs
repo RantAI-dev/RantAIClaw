@@ -125,13 +125,15 @@ impl GuestGate {
         if Self::OWNER_ONLY_TOOLS.contains(&tool) {
             return Some(format!(
                 "The `{tool}` tool is owner-only and cannot be used by non-owner users \
-                 (it changes who owns the bot). An owner must do this."
+                 (it changes who owns the bot). An owner must do this. {}",
+                Self::how_to_become_owner_sentence()
             ));
         }
         if !self.tool_permitted(tool) {
             return Some(format!(
                 "The `{tool}` tool isn't available to non-owner users on this channel. \
-                 Ask an owner to run it, or to add it to the guest allowlist."
+                 Ask an owner to run it, or to add it to the guest allowlist. {}",
+                Self::how_to_become_owner_sentence()
             ));
         }
         // Shell is permitted as a tool — now gate the specific command.
@@ -144,12 +146,24 @@ impl GuestGate {
             if !self.command_permitted(&command) {
                 return Some(format!(
                     "As a non-owner you can only run commands an owner has allowlisted for guests \
-                     (and only simple, single commands). `{}` isn't permitted.",
-                    command.trim()
+                     (and only simple, single commands). `{}` isn't permitted. {}",
+                    command.trim(),
+                    Self::how_to_become_owner_sentence()
                 ));
             }
         }
         None
+    }
+
+    /// One-line trailing sentence every guest denial carries: the real path to
+    /// becoming an owner, instead of the misleading "ask an owner to add you to
+    /// the allowlist" wording some denials used to give. The channel name is
+    /// not in scope here, so it is left as the literal placeholder the operator
+    /// reads as "the channel they are chatting on".
+    fn how_to_become_owner_sentence() -> &'static str {
+        "To become an owner, ask a current owner to run \
+         `rantaiclaw channels pair --channel <channel>` on the host, \
+         then `/claim <code>` in this chat."
     }
 }
 
@@ -261,6 +275,14 @@ mod tests {
             assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
             let reason = g.deny_reason(tool, &json!({})).unwrap();
             assert!(reason.contains("owner-only"), "{tool}: {reason}");
+            assert!(
+                reason.contains("channels pair"),
+                "{tool}: not told how to become an owner: {reason}"
+            );
+            assert!(
+                reason.contains("/claim"),
+                "{tool}: not told how to become an owner: {reason}"
+            );
         }
     }
 
@@ -282,6 +304,14 @@ mod tests {
         for tool in ["skills_install", "author_skill", "skills_install_deps"] {
             let reason = g.deny_reason(tool, &json!({})).unwrap();
             assert!(reason.contains("owner-only"), "{tool}: {reason}");
+            assert!(
+                reason.contains("channels pair"),
+                "{tool}: not told how to become an owner: {reason}"
+            );
+            assert!(
+                reason.contains("/claim"),
+                "{tool}: not told how to become an owner: {reason}"
+            );
         }
     }
 
@@ -307,6 +337,14 @@ mod tests {
             assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
             let reason = g.deny_reason(tool, &json!({})).unwrap();
             assert!(reason.contains("owner-only"), "{tool}: {reason}");
+            assert!(
+                reason.contains("channels pair"),
+                "{tool}: not told how to become an owner: {reason}"
+            );
+            assert!(
+                reason.contains("/claim"),
+                "{tool}: not told how to become an owner: {reason}"
+            );
         }
         // Read-only cron tools must remain usable by guests when allowlisted.
         assert!(g.tool_permitted("cron_list"));
@@ -316,8 +354,20 @@ mod tests {
     #[test]
     fn deny_reason_paths() {
         let g = gate();
-        // disallowed tool
-        assert!(g.deny_reason("file_write", &json!({})).is_some());
+        // disallowed tool — also assert the wording names the owner-pair flow,
+        // so a regression that drops the helper from this arm (the only one of
+        // the three that no other test exercises the wording of) is caught.
+        let disallowed_reason = g
+            .deny_reason("file_write", &json!({}))
+            .expect("file_write is not in the gate and must be denied");
+        assert!(
+            disallowed_reason.contains("channels pair"),
+            "tool-not-permitted arm must name the owner-pair flow: {disallowed_reason:?}"
+        );
+        assert!(
+            disallowed_reason.contains("/claim"),
+            "tool-not-permitted arm must name /claim: {disallowed_reason:?}"
+        );
         // allowed safe tool
         assert!(g.deny_reason("file_read", &json!({})).is_none());
         // shell allowed + command allowed
@@ -328,5 +378,29 @@ mod tests {
         assert!(g
             .deny_reason("shell", &json!({"command": "rm -rf /"}))
             .is_some());
+    }
+
+    #[test]
+    fn deny_reason_shell_command_path_names_the_owner_pair_flow() {
+        let g = GuestGate::new(
+            Vec::<String>::new(),
+            &["shell".to_string()],
+            &["ls".to_string()],
+        );
+        let reason = g
+            .deny_reason("shell", &json!({"command": "rm -rf /"}))
+            .expect("a non-allowlisted shell command must deny");
+        assert!(
+            reason.contains("owner"),
+            "the shell denial must still mention owner wording; got: {reason:?}"
+        );
+        assert!(
+            reason.contains("channels pair"),
+            "the shell denial must name the owner-pair flow; got: {reason:?}"
+        );
+        assert!(
+            reason.contains("/claim"),
+            "the shell denial must name the /claim reply; got: {reason:?}"
+        );
     }
 }

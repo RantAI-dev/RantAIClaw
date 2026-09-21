@@ -578,6 +578,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because a tag pushed by hand never runs the script and `prepare` is the only gate every
   publish passes through. It fails before a single artefact is built. Seen to refuse and seen
   to accept, in both places.
+- **A guest who hits the owner-only ceiling is told how to become an owner.** Each
+  `deny_reason` arm used to suggest the guest allowlist, which misleads an operator who
+  is not yet recognised — the real path is `rantaiclaw channels pair --channel <name>`
+  on the host, then `/claim <code>` in chat. All three denial texts now end with that
+  sentence, named through a single helper so a future wording change lands in one place.
+  The channel name stays as the literal `<channel>` placeholder; the gate does not see
+  one, and threading the runtime's `channel_name` through would mean touching the caller
+  the plan keeps out of scope.
 
 ### Security
 
