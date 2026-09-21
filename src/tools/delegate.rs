@@ -1042,10 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
-        let (_env, _audit) = crate::test_env::redirect_audit_temp(
-            "execute_agentic_runs_tool_call_loop_with_filtered_tools",
-        )
-        .await;
+        let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
             Arc::new(vec![
@@ -1092,8 +1089,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_respects_max_iterations() {
-        let (_env, _audit) =
-            crate::test_env::redirect_audit_temp("execute_agentic_respects_max_iterations").await;
+        let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
         let config = agentic_config(vec!["echo_tool".to_string()], 2);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));

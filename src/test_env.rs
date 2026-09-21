@@ -139,25 +139,33 @@ impl Drop for EnvGuard {
 /// test lands there instead of in the operator's real `audit.log`. Returns
 /// the two guards so the test body binds them as `let (_env, _audit) = …`.
 ///
-/// `salt` must be unique per test (use the test's own name); per-process
-/// `pid` already disambiguates between concurrent `cargo test` runners.
+/// The directory is a [`tempfile::TempDir`] held inside the returned
+/// [`EnvAuditRedirect`], so it is removed from disk the moment the test drops
+/// the guard, rather than left behind under the system temp directory.
 #[must_use = "both guards revert the moment they drop; bind them to named locals"]
-pub(crate) async fn redirect_audit_temp(salt: &str) -> (EnvAuditRedirect, EnvGuard) {
+pub(crate) async fn redirect_audit_temp() -> (EnvAuditRedirect, EnvGuard) {
     let env = ENV_LOCK.lock().await;
-    let path = std::env::temp_dir().join(format!(
-        "rantaiclaw-audit-redirect-{}-{}",
-        std::process::id(),
-        salt,
-    ));
-    std::fs::create_dir_all(&path).expect("audit redirect dir");
-    let audit = EnvGuard::set("RANTAICLAW_AUDIT_DIR_OVERRIDE", &path);
-    (EnvAuditRedirect { _env: env }, audit)
+    let dir = tempfile::Builder::new()
+        .prefix("rantaiclaw-audit-redirect-")
+        .tempdir()
+        .expect("audit redirect tempdir");
+    let audit = EnvGuard::set("RANTAICLAW_AUDIT_DIR_OVERRIDE", dir.path());
+    (
+        EnvAuditRedirect {
+            _env: env,
+            _dir: dir,
+        },
+        audit,
+    )
 }
 
 /// Marker guard held for as long as the audit redirect must stay in effect.
-/// Carries no data beyond the `ENV_LOCK` guard — it exists so the helper can
-/// return a tuple `(env_guard, audit_guard)` without leaking the lock type.
+/// Carries the `ENV_LOCK` guard and the temp directory
+/// `RANTAICLAW_AUDIT_DIR_OVERRIDE` points at, so the helper can return a
+/// tuple `(env_guard, audit_guard)` without leaking the lock type, and the
+/// directory is deleted when the test drops this guard.
 #[must_use = "the ENV_LOCK is released the moment this drops; bind it to a named local"]
 pub(crate) struct EnvAuditRedirect {
     _env: tokio::sync::MutexGuard<'static, ()>,
+    _dir: tempfile::TempDir,
 }

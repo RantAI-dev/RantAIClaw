@@ -633,25 +633,37 @@ mod tests {
     }
 
     /// Pin the contract that a `#[tokio::test]` cannot reach the operator's
-    /// real audit log without an explicit override. The plan was triggered by
-    /// `~/.../profiles/default/audit.log` gaining `mock_price` / `test-channel`
-    /// entries whenever a channel funnel test ran.
+    /// real audit log without an explicit override. A channel funnel test
+    /// that exercised this path used to append `mock_price` /
+    /// `test-channel` entries to the operator's real
+    /// `~/.../profiles/default/audit.log`, and the same happened whenever
+    /// the live daemon happened to write there while this test ran, which is
+    /// what made a before/after length comparison against the real file
+    /// flaky. `HOME` is redirected to a temp directory so the assertion
+    /// checks a profile dir nothing else on the machine can write to.
     #[tokio::test]
     async fn record_tool_call_in_a_test_without_override_does_not_touch_the_real_profile() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp_home = TempDir::new().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp_home.path());
         // Explicitly UNSET the override so a leak from a sibling test cannot
         // redirect the write somewhere it would also miss the assertion.
         let _audit_off = crate::test_env::EnvGuard::unset("RANTAICLAW_AUDIT_DIR_OVERRIDE");
 
-        // The operator's real profile dir, as resolved by the production
-        // code path. If the audit log does not exist on the test host, that
-        // is fine: this test only asserts the call did NOT add a new file
-        // under it, and did not grow an existing one.
-        let real_dir = crate::profile::paths::profile_dir(
+        // Resolve the profile dir the production way, now rooted under the
+        // isolated temp `HOME` rather than the operator's real one. Create it
+        // up front so a write, if one happened, would not fail merely
+        // because the directory tree is missing — the only thing this test
+        // wants to prove is that the override guard stops it.
+        let profile_dir = crate::profile::paths::profile_dir(
             &crate::profile::ProfileManager::resolve_active_name(),
         );
-        let real_log = real_dir.join("audit.log");
-        let before = std::fs::metadata(&real_log).ok(); // None if absent.
+        std::fs::create_dir_all(&profile_dir).expect("create isolated profile dir");
+        let audit_log = profile_dir.join("audit.log");
+        assert!(
+            !audit_log.exists(),
+            "the isolated temp profile dir must start clean, got: {audit_log:?}"
+        );
 
         record_tool_call(ToolCallRecord {
             channel: "test-channel".into(),
@@ -663,16 +675,13 @@ mod tests {
             duration_ms: 1,
         });
 
-        // Give the `spawn_blocking` a chance to run before we sample `after`.
+        // Give the `spawn_blocking` a chance to run before checking.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let after = std::fs::metadata(&real_log).ok();
-        let before_len = before.as_ref().map(|m| m.len());
-        let after_len = after.as_ref().map(|m| m.len());
-        assert_eq!(
-            before_len, after_len,
+        assert!(
+            !audit_log.exists(),
             "record_tool_call under cfg(test) without the override must not write \
-             to the operator's real audit.log; before={before:?}, after={after:?}"
+             any audit.log, got: {audit_log:?}"
         );
     }
 
