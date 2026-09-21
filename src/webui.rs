@@ -287,7 +287,7 @@ mod version_status_tests {
             "the line must name the CLI's version, got: {out:?}"
         );
         assert!(
-            out.contains("restart"),
+            out.contains("service restart"),
             "the line must point the operator at the restart command, got: {out:?}"
         );
     }
@@ -541,9 +541,9 @@ pub(crate) fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<Gate
 }
 
 /// Build the one-line trailing message `status` and `service status` print when
-/// the running daemon is older than the CLI (or unreachable). Returns `None`
-/// when there's nothing useful to add — the title already shows the CLI's
-/// version, so a match is silent by design.
+/// the running daemon's version differs from the CLI (or the daemon is
+/// unreachable). Returns `None` when there's nothing useful to add — the title
+/// already shows the CLI's version, so a match is silent by design.
 pub(crate) fn version_status_line(
     cli_version: &str,
     gw: Option<&GatewayIdentity>,
@@ -553,8 +553,8 @@ pub(crate) fn version_status_line(
     match gw {
         Some(id) if id.version == cli_version => None,
         Some(id) => Some(format!(
-            "the running daemon reports version {}, but this CLI is {} — restart it to pick \
-             up the new build (e.g. `systemctl --user restart rantaiclaw.service`)",
+            "the running daemon reports version {}, but this CLI is {}; run \
+             `rantaiclaw service restart` to run the installed build",
             id.version, cli_version
         )),
         None => Some(format!(
