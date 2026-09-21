@@ -29,9 +29,9 @@ pub struct DiscordChannel {
     multimodal: crate::config::MultimodalConfig,
     typing_handles: Mutex<HashMap<String, TypingSignal>>,
     /// Cached bot username, fetched once from `users/@me` so `/new@<own name>`
-    /// can be answered here instead of refused as "addressed elsewhere" (plan
-    /// 408). `None` until the first successful fetch; on error the override
-    /// returns `None` and F-23's refusal stays live.
+    /// can be answered here instead of refused as "addressed elsewhere".
+    /// `None` until the first successful fetch; on error the override returns
+    /// `None` and the addressed-elsewhere refusal stays in force.
     bot_username: Mutex<Option<String>>,
 }
 
@@ -293,8 +293,9 @@ impl DiscordChannel {
     /// Fetch the bot's own username from `users/@me` once.
     ///
     /// Returns `Err` on any network, status, or parse failure; the override
-    /// swallows that and answers `None` so F-23's refusal keeps a bot that has
-    /// never looked up its name from claiming an addressed command.
+    /// swallows that and answers `None` so the addressed-elsewhere refusal
+    /// keeps a bot that has never looked up its name from claiming an
+    /// addressed command.
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
         let resp = self
             .http_client()
@@ -566,8 +567,8 @@ impl Channel for DiscordChannel {
             .unwrap_or(false)
     }
 
-    /// Plan 408. Cached `users/@me` username so `/new@<own name>` answers here
-    /// instead of being refused as "addressed elsewhere". The runtime holds
+    /// Cached `users/@me` username so `/new@<own name>` answers here instead
+    /// of being refused as "addressed elsewhere". The runtime holds
     /// channels as `Arc<dyn Channel>` (`routing.rs`), so this must sit inside
     /// `impl Channel for`; a copy in a plain `impl` block would compile and
     /// never run.
@@ -1909,10 +1910,10 @@ mod tests {
         std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
-    // ── bot_username (plan 408) ────────────────────────────────────
+    // ── bot_username ────────────────────────────────────────────────
 
-    /// Plan 408. Discord now answers `/new@<own name>` instead of refusing it
-    /// as "addressed elsewhere". The override sits in `impl Channel for
+    /// Discord now answers `/new@<own name>` instead of refusing it as
+    /// "addressed elsewhere". The override sits in `impl Channel for
     /// DiscordChannel`; going through `Arc<dyn Channel>` is
     /// the only way to reach it, because a copy in a plain `impl` block would
     /// compile and never run. The cache is filled by the production fetcher in
@@ -1944,7 +1945,8 @@ mod tests {
     /// The cache empty (the production fetcher has not run yet, or it failed)
     /// yields `None`, the same safe default every other channel inherits until
     /// it learns its own name. A bot that has never looked up its own name
-    /// answers no addressed command — F-23's refusal stays live.
+    /// answers no addressed command; the addressed-elsewhere refusal stays in
+    /// force.
     #[tokio::test]
     async fn discord_bot_username_is_none_when_the_cache_is_empty() {
         let ch = std::sync::Arc::new(DiscordChannel::new(

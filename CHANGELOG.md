@@ -649,13 +649,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/clear@<botname>`, `/start@<botname>`, etc.) used to be answered as "addressed elsewhere" on
   both channels and silently consumed, because only Telegram overrode `Channel::bot_username` and
   the trait default returns `None`. Discord now caches the `users/@me` username on first call and
-  answers from the cache; WhatsApp Web answers the linked account's push name, refreshed once
-  `listen` connects to wa-rs, so an operator addressing the bot by their own profile name on a group
-  chat works the same way it does on Telegram. Both overrides sit in their `impl Channel for`
-  blocks; a copy in a plain `impl` block would compile and never run because the runtime holds
-  channels as `Arc<dyn Channel>`. The `None` default is kept for every other channel and for both
-  of these before they learn their name, so a bot that has never looked up its own name answers no
-  addressed command at all (F-23). No config key, schema stays at 32.
+  answers from the cache; WhatsApp Web answers to the linked account's phone number, refreshed
+  once `listen` connects to wa-rs, because that is what WhatsApp's own @-mention inserts into the
+  message text, not the push name, so an operator addressing the bot in a group chat works the
+  same way it does on Telegram. Both overrides sit in their `impl Channel for` blocks; a copy in a
+  plain `impl` block would compile and never run because the runtime holds channels as
+  `Arc<dyn Channel>`. The `None` default is kept for every other channel and for both of these
+  before they learn their identity, so a bot that has never looked up its own identity answers no
+  addressed command at all. No config key, schema stays at 32.
 
 ### Security
 
