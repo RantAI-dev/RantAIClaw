@@ -159,6 +159,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Tests can no longer write to the operator's real audit log.** `record_tool_call` used
+  to resolve its directory from the operator's home and the active profile, and any
+  `#[tokio::test]` that exercised a tool through the agent funnel (five in
+  `channels/mod_tests.rs`, two in `tools/delegate.rs`) silently appended to the real
+  `audit.log`. A test build now refuses the real profile: `record_tool_call` only writes
+  when `RANTAICLAW_AUDIT_DIR_OVERRIDE` points at a temp directory. The seven affected
+  tests redirect to a temp dir via the existing `test_env::EnvGuard` pattern; future
+  tests cannot reach the real profile by accident. Two new tests in
+  `src/security/audit.rs` pin the contract (one asserts no write without the override,
+  one asserts the write lands in the override dir).
 - **A Slack direct message reaches the bot even when a `channel_id` filter is set under Socket
   Mode.** `socket_event_message` used to drop every event whose channel differed from the configured
   `channel_id`, and a DM's `D…` id can never equal a `C…` or `G…` filter, so direct messages were
@@ -651,6 +661,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sentence, named through a single helper so a future wording change lands in one place.
   The channel name stays as the literal `<channel>` placeholder, because the gate does
   not know which channel it runs on.
+- **Discord and WhatsApp Web answer a command addressed to them by name.** `/new@<botname>` (or
+  `/clear@<botname>`, `/start@<botname>`, etc.) used to be answered as "addressed elsewhere" on
+  both channels and silently consumed, because only Telegram overrode `Channel::bot_username` and
+  the trait default returns `None`. Discord now caches the `users/@me` username on first call and
+  answers from the cache; WhatsApp Web answers to the linked account's phone number, refreshed
+  once `listen` connects to wa-rs, because that is what WhatsApp's own @-mention inserts into the
+  message text, not the push name, so an operator addressing the bot in a group chat works the
+  same way it does on Telegram. Both overrides sit in their `impl Channel for` blocks; a copy in a
+  plain `impl` block would compile and never run because the runtime holds channels as
+  `Arc<dyn Channel>`. The `None` default is kept for every other channel and for both of these
+  before they learn their identity, so a bot that has never looked up its own identity answers no
+  addressed command at all. No config key, schema stays at 32.
 
 ### Security
 

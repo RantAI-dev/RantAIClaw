@@ -28,6 +28,11 @@ pub struct DiscordChannel {
     /// `[multimodal]` defaults; the factory overrides it with the operator's.
     multimodal: crate::config::MultimodalConfig,
     typing_handles: Mutex<HashMap<String, TypingSignal>>,
+    /// Cached bot username, fetched once from `users/@me` so `/new@<own name>`
+    /// can be answered here instead of refused as "addressed elsewhere".
+    /// `None` until the first successful fetch; on error the override returns
+    /// `None` and the addressed-elsewhere refusal stays in force.
+    bot_username: Mutex<Option<String>>,
 }
 
 /// One recipient's typing indicator: the task reposting it, and whether a
@@ -179,6 +184,8 @@ impl DiscordChannel {
             mention_only,
             multimodal: crate::config::MultimodalConfig::default(),
             typing_handles: Mutex::new(HashMap::new()),
+            // Lazy: `bot_username` fetches from `users/@me` on first call.
+            bot_username: Mutex::new(None),
         }
     }
 
@@ -281,6 +288,62 @@ impl DiscordChannel {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
+    }
+
+    /// Fetch the bot's own username from `users/@me` once.
+    ///
+    /// Returns `Err` on any network, status, or parse failure; the override
+    /// swallows that and answers `None` so the addressed-elsewhere refusal
+    /// keeps a bot that has never looked up its name from claiming an
+    /// addressed command.
+    async fn fetch_bot_username(&self) -> anyhow::Result<String> {
+        let resp = self
+            .http_client()
+            .get(DISCORD_IDENTITY_URL)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to fetch bot username: {}", resp.status());
+        }
+
+        let data: serde_json::Value = resp.json().await?;
+        use anyhow::Context as _;
+        let username = data
+            .get("username")
+            .and_then(|u| u.as_str())
+            .context("Bot username not found in response")?;
+
+        Ok(username.to_string())
+    }
+
+    /// Cached read: one fetch per process, then every call returns the clone.
+    /// Fetches on a miss, caches the success, and returns `None` on any error
+    /// — never panic, never broaden what an addressed command can do.
+    async fn bot_username_cached(&self) -> Option<String> {
+        {
+            let cache = self.bot_username.lock();
+            if let Some(ref username) = *cache {
+                return Some(username.clone());
+            }
+        }
+
+        match self.fetch_bot_username().await {
+            Ok(username) => {
+                let mut cache = self.bot_username.lock();
+                *cache = Some(username.clone());
+                Some(username)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "channels",
+                    channel = "discord",
+                    "failed to fetch bot username: {e}"
+                );
+                None
+            }
+        }
     }
 
     /// Sender identity form(s) for the shared pairing store, drawn from a
@@ -502,6 +565,15 @@ impl Channel for DiscordChannel {
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
+    }
+
+    /// Cached `users/@me` username so `/new@<own name>` answers here instead
+    /// of being refused as "addressed elsewhere". The runtime holds
+    /// channels as `Arc<dyn Channel>` (`routing.rs`), so this must sit inside
+    /// `impl Channel for`; a copy in a plain `impl` block would compile and
+    /// never run.
+    async fn bot_username(&self) -> Option<String> {
+        self.bot_username_cached().await
     }
 
     async fn start_typing(&self, recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
@@ -1836,5 +1908,55 @@ mod tests {
         assert!(owners.contains(&"999".to_string()), "owners: {owners:?}");
 
         std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    }
+
+    // ── bot_username ────────────────────────────────────────────────
+
+    /// Discord now answers `/new@<own name>` instead of refusing it as
+    /// "addressed elsewhere". The override sits in `impl Channel for
+    /// DiscordChannel`; going through `Arc<dyn Channel>` is
+    /// the only way to reach it, because a copy in a plain `impl` block would
+    /// compile and never run. The cache is filled by the production fetcher in
+    /// real life; this test seeds it directly because the test does not want
+    /// the HTTP round trip. The mutation check: if the override dropped the
+    /// cache and returned `None`, this assertion fails.
+    #[tokio::test]
+    async fn discord_bot_username_returns_cached_name_through_the_trait_object() {
+        let ch = std::sync::Arc::new(DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec![],
+            false,
+            false,
+        ));
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("botname".to_string());
+        }
+
+        let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
+        assert_eq!(
+            as_the_runtime_holds_it.bot_username().await.as_deref(),
+            Some("botname"),
+            "the cache must reach the trait object's call"
+        );
+    }
+
+    /// The cache empty (the production fetcher has not run yet, or it failed)
+    /// yields `None`, the same safe default every other channel inherits until
+    /// it learns its own name. A bot that has never looked up its own name
+    /// answers no addressed command; the addressed-elsewhere refusal stays in
+    /// force.
+    #[tokio::test]
+    async fn discord_bot_username_is_none_when_the_cache_is_empty() {
+        let ch = std::sync::Arc::new(DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec![],
+            false,
+            false,
+        ));
+        let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
+        assert_eq!(as_the_runtime_holds_it.bot_username().await, None);
     }
 }
