@@ -990,8 +990,15 @@ impl SlackChannel {
         ) {
             return None;
         }
+        // A DM carries a `D…` channel id that can never equal a configured `C…` or
+        // `G…` filter, and the filter's purpose is to scope public/private channels,
+        // not to silence the owner when they message the bot.
         if let Some(want) = only_channel.filter(|c| !c.trim().is_empty()) {
-            if event.get("channel").and_then(serde_json::Value::as_str) != Some(want) {
+            let is_dm = event
+                .get("channel_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("im");
+            if !is_dm && event.get("channel").and_then(serde_json::Value::as_str) != Some(want) {
                 return None;
             }
         }
@@ -1650,6 +1657,26 @@ mod tests {
         assert!(SlackChannel::socket_event_message(&env, Some("C0OTHER")).is_some());
         // Blank is not a filter: under Socket Mode the key is optional.
         assert!(SlackChannel::socket_event_message(&env, Some("   ")).is_some());
+        // A DM (`channel_type` "im") bypasses the filter: its `D…` id can
+        // never equal a configured `C…` or `G…` id, and the filter scopes
+        // public/private channels, not the owner's direct messages.
+        let dm = envelope(serde_json::json!({
+            "type": "message", "user": "U1", "text": "hai",
+            "ts": "1.1", "channel": "D0DM", "channel_type": "im"
+        }));
+        assert!(
+            SlackChannel::socket_event_message(&dm, Some("C0WANTED")).is_some(),
+            "a DM must pass the channel filter so the bot can be reached in private"
+        );
+        // A private channel whose id does not match is still filtered out.
+        let private = envelope(serde_json::json!({
+            "type": "message", "user": "U1", "text": "hai",
+            "ts": "1.1", "channel": "G0PRIVATE", "channel_type": "group"
+        }));
+        assert!(
+            SlackChannel::socket_event_message(&private, Some("C0WANTED")).is_none(),
+            "a non-DM event with a non-matching channel must still be dropped"
+        );
     }
 
     #[test]

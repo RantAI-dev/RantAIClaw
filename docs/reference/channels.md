@@ -745,7 +745,12 @@ Slack notes:
 - **Socket Mode** holds one outbound WebSocket carrying events for every
   conversation the bot is in: channels, threads and DMs alike. `channel_id` stops
   being a requirement here and becomes what the schema always called it, an
-  optional filter. No public inbound port either way.
+  optional filter. When set, the filter in `socket_event_message` still scopes
+  public (`channel_type` `channel`) and private (`channel_type` `group`)
+  channels to that id, and a group DM (`channel_type` `mpim`) is scoped the same
+  way; a direct message (`channel_type` `im`) always reaches the bot, since its
+  `D…` id can never equal a configured `C…` or `G…` id. No public inbound port
+  either way.
 - **Polling** reads one `conversations.history` page every 3 seconds. It
   **requires** `channel_id` — `listen_polling` returns `Err` without one — and it
   cannot see direct messages, nor replies inside a thread. That last one includes

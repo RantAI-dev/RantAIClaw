@@ -169,6 +169,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests cannot reach the real profile by accident. Two new tests in
   `src/security/audit.rs` pin the contract (one asserts no write without the override,
   one asserts the write lands in the override dir).
+- **A Slack direct message reaches the bot even when a `channel_id` filter is set under Socket
+  Mode.** `socket_event_message` used to drop every event whose channel differed from the configured
+  `channel_id`, and a DM's `D…` id can never equal a `C…` or `G…` filter, so direct messages were
+  silently ignored. The filter now lets a `channel_type` `im` message through regardless of its
+  channel id while still scoping public (`channel_type` `channel`) and private (`channel_type`
+  `group`) channels to the configured one; a group DM (`channel_type` `mpim`) is scoped the same
+  way. `docs/reference/channels.md` §4.3 describes the resulting rule.
 - **WhatsApp Web routes the `/claim` pairing reply through the resolved phone-number thread.**
   A successful `/claim` used to send its confirmation to the raw event chat Jid, which on a
   LID-addressed DM is an `@lid` the operator never sees. Normal replies resolved it first, but
