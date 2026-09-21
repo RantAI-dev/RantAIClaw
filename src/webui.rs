@@ -154,7 +154,7 @@ fn spawn_detached(cmd: &mut Command, log: &Path) -> Result<u32> {
 
 /// Identity reported by a gateway's `GET /api/v1/version`.
 #[derive(Debug, Clone, PartialEq)]
-struct GatewayIdentity {
+pub(crate) struct GatewayIdentity {
     name: String,
     version: String,
     config_fingerprint: String,
@@ -248,6 +248,73 @@ mod gateway_action_tests {
         assert_eq!(
             decide_gateway_action(true, None, "1.0", "aa"),
             GatewayAction::UnconfirmedError
+        );
+    }
+}
+
+#[cfg(test)]
+mod version_status_tests {
+    use super::*;
+
+    fn ident(v: &str) -> Option<GatewayIdentity> {
+        Some(GatewayIdentity {
+            name: "rantaiclaw".into(),
+            version: v.into(),
+            config_fingerprint: "x".into(),
+        })
+    }
+
+    #[test]
+    fn matching_version_says_nothing() {
+        let out = version_status_line("1.2.3", ident("1.2.3").as_ref(), "127.0.0.1", 3939);
+        assert!(
+            out.is_none(),
+            "when the daemon matches the CLI the title already shows the version \
+             — an extra line would be noise, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn older_daemon_prints_mismatch_line_naming_both_and_restart_command() {
+        let out = version_status_line("1.2.3", ident("0.9.7").as_ref(), "127.0.0.1", 3939)
+            .expect("a daemon on a different version must produce a line");
+        assert!(
+            out.contains("0.9.7"),
+            "the line must name the daemon's version, got: {out:?}"
+        );
+        assert!(
+            out.contains("1.2.3"),
+            "the line must name the CLI's version, got: {out:?}"
+        );
+        assert!(
+            out.contains("service restart"),
+            "the line must point the operator at the restart command, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn unreachable_daemon_prints_unreachable_not_a_version() {
+        let out = version_status_line("1.2.3", None, "127.0.0.1", 3939)
+            .expect("an unreachable daemon must produce a line");
+        assert!(
+            out.contains("not reachable"),
+            "the line must say the daemon is not reachable, got: {out:?}"
+        );
+        // Guard against silently printing the CLI's own version as if it were the
+        // daemon's. A "version-shaped" token is two or three dot-separated digit
+        // runs (e.g. "0.9.7", "1.2"). IP addresses (four runs) and URLs (mixed
+        // chars) are not version-shaped.
+        let versionish = |tok: &str| {
+            let parts: Vec<&str> = tok.split('.').collect();
+            (2..=3).contains(&parts.len())
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let leak = out.split_whitespace().any(versionish);
+        assert!(
+            !leak,
+            "the unreachable line must not print a version-shaped token, got: {out:?}"
         );
     }
 }
@@ -440,7 +507,7 @@ mod tests {
 
 /// GET http://host:port/api/v1/version via curl, parse the identity. Retries
 /// once (the gateway may be momentarily busy). `None` on repeated failure.
-fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<GatewayIdentity> {
+pub(crate) fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<GatewayIdentity> {
     let url = format!("http://{gw_host}:{gw_port}/api/v1/version");
     for attempt in 0..2 {
         if attempt == 1 {
@@ -471,6 +538,46 @@ fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<GatewayIdentity
         }
     }
     None
+}
+
+/// Build the one-line trailing message `status` and `service status` print when
+/// the running daemon's version differs from the CLI (or the daemon is
+/// unreachable). Returns `None` when there's nothing useful to add — the title
+/// already shows the CLI's version, so a match is silent by design.
+pub(crate) fn version_status_line(
+    cli_version: &str,
+    gw: Option<&GatewayIdentity>,
+    gw_host: &str,
+    gw_port: u16,
+) -> Option<String> {
+    match gw {
+        Some(id) if id.version == cli_version => None,
+        Some(id) => Some(format!(
+            "the running daemon reports version {}, but this CLI is {}; run \
+             `rantaiclaw service restart` to run the installed build",
+            id.version, cli_version
+        )),
+        None => Some(format!(
+            "the running daemon is not reachable on http://{gw_host}:{gw_port} — `rantaiclaw status` cannot compare versions."
+        )),
+    }
+}
+
+/// Probe the running gateway (off the async worker — `probe_gateway_identity`
+/// shells out to `curl` and sleeps up to ~6.3 s on retry) and format the result
+/// into the trailing line `status` / `service status` print. Pure convenience
+/// wrapper around `version_status_line` so call sites stay one-liners.
+pub(crate) fn probe_and_format_version_status(
+    cli_version: &str,
+    gw_host: &str,
+    gw_port: u16,
+) -> Option<String> {
+    version_status_line(
+        cli_version,
+        probe_gateway_identity(gw_host, gw_port).as_ref(),
+        gw_host,
+        gw_port,
+    )
 }
 
 /// Stop a stale RantaiClaw gateway on `gw_port`. Prefer the PID we recorded when

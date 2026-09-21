@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`rantaiclaw status` and `rantaiclaw service status` warn when the running daemon's version
+  differs from the CLI's.** After `cargo install` the managed daemon kept running the old build
+  and nothing said so: `rantaiclaw status` printed only the CLI's version and `rantaiclaw service
+  status` printed only the systemd state. Both now probe the running gateway's version with the
+  same helper the web console already used (`probe_gateway_identity`), and when it differs from
+  the CLI's they print one line naming both versions and pointing at `rantaiclaw service restart`
+  to run the installed build. An unreachable daemon prints that fact, with the URL it tried,
+  instead of a version claim; a daemon whose version matches the CLI's is silent, since the title
+  already names the CLI version.
+  Only version strings are compared, so a rebuild that keeps the same version is not detected.
 - **A scheduled job reaches every usable channel and the same live client.** The scheduler only
   accepted the three channels the announce gate hand-listed; on every other usable channel it
   refused the job, even when `factory::build_one` would have constructed one and the running
