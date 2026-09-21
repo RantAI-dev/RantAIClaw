@@ -130,6 +130,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Slack direct message reaches the bot even when a `channel_id` filter is set under Socket
+  Mode.** `socket_event_message` used to drop every event whose channel differed from the configured
+  `channel_id`, and a DM's `D…` id can never equal a `C…` or `G…` filter, so direct messages were
+  silently ignored. The filter now lets a `channel_type` `im` message through regardless of its
+  channel id while still scoping public (`channel_type` `channel`) and private (`channel_type`
+  `private`) channels to the configured one. `docs/reference/channels.md` §4.3 describes the
+  resulting rule.
 - **The CLI, pairing and scheduled delivery refuse a locked channel by name.** `rantaiclaw setup
   <name>` (interactive and `--non-interactive`), `/pair` in the TUI, `rantaiclaw channels pair`, the
   `issue_pairing_code` tool, and a scheduled job's `delivery.channel` all used to accept a locked
