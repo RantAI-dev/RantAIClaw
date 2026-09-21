@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to run the installed build. An unreachable daemon prints that fact, with the URL it tried,
   instead of a version claim; a daemon whose version matches the CLI's is silent, since the title
   already names the CLI version.
+  Only version strings are compared, so a rebuild that keeps the same version is not detected.
 - **A scheduled job reaches every usable channel and the same live client.** The scheduler only
   accepted the three channels the announce gate hand-listed; on every other usable channel it
   refused the job, even when `factory::build_one` would have constructed one and the running
