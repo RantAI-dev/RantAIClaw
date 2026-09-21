@@ -613,6 +613,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arguments included, and fails when one names message text. **Journals written by 0.31.0-alpha
   and earlier may still hold message text and Telegram pairing codes**; upgrading does not rewrite
   them.
+- **Cargo-deny now ignores `RUSTSEC-2026-0292` (`imbl-sized-chunks` 0.1.3) with the rest of the
+  `imbl`/`matrix-sdk` tree.** The advisory was published after 0.31.0-alpha's CI ran green; it
+  flags a use-after-free / double-free in `Chunk` and `InlineArray` removal methods reachable from
+  safe Rust when an element's `Drop` panics. The trigger requires a panicking Drop impl — none of
+  our code or matrix-sdk's internal types exhibit that pattern — and the path is opt-in (`--features
+  channel-matrix`); the upstream fix is `imbl-sized-chunks >= 0.2.0`, which matrix-sdk 0.18 has not
+  yet pulled in. Reviewed with the other imbl/matrix-sdk entries; revisit on 2026-11-15 or when
+  matrix-sdk ships an imbl bump.
 
 ## [0.31.0-alpha] — 2026-09-08
 
