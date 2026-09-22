@@ -1750,6 +1750,8 @@ async fn run_gateway_chat_with_multimodal(
         None, // no streaming delta channel
         None, // no event sender
         state.ledger.as_deref(),
+        // Webhook: surface name only, no chat sender and no role.
+        &crate::security::AuditActor::surface("webhook"),
     )
     .await?;
 

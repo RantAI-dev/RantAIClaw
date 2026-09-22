@@ -686,6 +686,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Tool-call audit records now name who asked and whether they were an owner or a guest.** The
+  audit's on-disk shape (`audit.log`, JSON lines) used to write `.with_actor(channel, None, None)`
+  for every tool call, so a denial on a multi-user chat channel could not say whose call it was or
+  whether the caller was an owner. The record now carries the chat sender id on `user_id` and the
+  role (`"owner"` or `"guest"`) on a new `actor.role` field; non-chat surfaces (CLI / scheduler /
+  webhook / delegate) keep both empty, with `channel` distinguishing them. The change is additive
+  on disk — `actor.role` carries `#[serde(default)]` and the `user_id` slot is reused, so audit
+  records written by older builds still parse, with the role reading as `None`. No config key,
+  schema stays at 32.
 - **Lark's connection URL no longer reaches the journal with its credential.** `listen_ws` logged
   the WebSocket endpoint URL Lark hands back on every connect and reconnect, and that URL carries
   an `access_key` query parameter — a connection credential written to the systemd journal at INFO,

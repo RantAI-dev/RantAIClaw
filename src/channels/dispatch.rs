@@ -756,6 +756,12 @@ pub(crate) async fn process_channel_message(
         runtime_defaults.message_timeout_secs,
         runtime_defaults.max_tool_iterations,
     );
+    // Chat audit identity: the trail must say WHO asked and whether they were
+    // an owner, so a denial on a multi-user channel is attributable.
+    let audit_actor = crate::security::AuditActor::chat(
+        msg.sender.clone(),
+        if sender_is_owner { "owner" } else { "guest" },
+    );
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -787,6 +793,7 @@ pub(crate) async fn process_channel_message(
                 delta_tx,
                 None,
                 ctx.ledger.as_deref(),
+                &audit_actor,
             ),
             ),
         ) => LlmExecutionResult::Completed(result),

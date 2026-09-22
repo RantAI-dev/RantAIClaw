@@ -45,6 +45,12 @@ pub struct Actor {
     pub channel: String,
     pub user_id: Option<String>,
     pub username: Option<String>,
+    /// Whether the chat sender is an owner or a guest. `None` on non-chat
+    /// surfaces (CLI / scheduler / webhook / delegate). `#[serde(default)]` so
+    /// audit records written before this field existed still parse, with the
+    /// role reading as `None`.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// Action information (what was done)
@@ -115,7 +121,27 @@ impl AuditEvent {
             channel,
             user_id,
             username,
+            role: None,
         });
+        self
+    }
+
+    /// Set the chat sender's role (owner / guest) on the actor. Kept as a
+    /// separate setter so the existing 3-arg `with_actor` signature stays
+    /// untouched; non-chat callers simply do not invoke this.
+    pub fn with_role(mut self, role: Option<String>) -> Self {
+        if let Some(actor) = self.actor.as_mut() {
+            actor.role = role;
+        } else {
+            // No actor yet — record the role on a barebones one so the
+            // channel can be inferred from the caller's context.
+            self.actor = Some(Actor {
+                channel: String::new(),
+                user_id: None,
+                username: None,
+                role,
+            });
+        }
         self
     }
 
@@ -177,6 +203,11 @@ pub struct CommandExecutionLog<'a> {
     pub allowed: bool,
     pub success: bool,
     pub duration_ms: u64,
+    /// Chat sender id. `None` for non-chat surfaces (CLI / scheduler /
+    /// webhook / delegate), where the audit's `user_id` slot stays empty.
+    pub sender: Option<&'a str>,
+    /// `"owner"` or `"guest"` for chat; `None` for non-chat surfaces.
+    pub role: Option<&'a str>,
 }
 
 /// Owned form of [`CommandExecutionLog`], so one record can cross a
@@ -184,12 +215,46 @@ pub struct CommandExecutionLog<'a> {
 #[derive(Debug, Clone)]
 pub struct ToolCallRecord {
     pub channel: String,
+    /// Chat sender id; `None` for non-chat surfaces.
+    pub sender: Option<String>,
+    /// `"owner"` or `"guest"` for chat; `None` for non-chat surfaces.
+    pub role: Option<String>,
     pub tool: String,
     pub risk_level: String,
     pub approval: ApprovalOutcome,
     pub allowed: bool,
     pub success: bool,
     pub duration_ms: u64,
+}
+
+/// Identity of who asked for a tool call, threaded from each entry point to
+/// the audit log. Chat sends a sender id + role (owner or guest); non-chat
+/// surfaces (CLI / scheduler / webhook / delegate) record their surface name
+/// as the actor's `user_id` so the trail still says who triggered the call.
+#[derive(Debug, Clone, Default)]
+pub struct AuditActor {
+    pub sender: Option<String>,
+    pub role: Option<String>,
+}
+
+impl AuditActor {
+    /// Chat caller. `role` is `"owner"` or `"guest"`; the audit record carries
+    /// both fields.
+    pub fn chat(sender: String, role: &str) -> Self {
+        Self {
+            sender: Some(sender),
+            role: Some(role.to_string()),
+        }
+    }
+
+    /// Non-chat surface: there is no sender id, and the role does not apply,
+    /// so both stay `None`.
+    pub fn surface(_name: &str) -> Self {
+        // The surface name is already recorded on `channel` at every call
+        // site, so duplicating it onto `user_id` would just bloat the trail
+        // without adding information. Leave `sender` and `role` empty.
+        Self::default()
+    }
 }
 
 /// Append one tool-call record to the active profile's audit log.
@@ -232,6 +297,8 @@ pub fn record_tool_call(record: ToolCallRecord) {
             allowed: record.allowed,
             success: record.success,
             duration_ms: record.duration_ms,
+            sender: record.sender.as_deref(),
+            role: record.role.as_deref(),
         }) {
             tracing::warn!(target: "security", error = %e, "failed to write tool-call audit record");
         }
@@ -353,7 +420,16 @@ impl AuditLogger {
     /// Log a command execution event.
     pub fn log_command_event(&self, entry: CommandExecutionLog<'_>) -> Result<()> {
         let event = AuditEvent::new(AuditEventType::CommandExecution)
-            .with_actor(entry.channel.to_string(), None, None)
+            // The chat sender fits the existing `user_id` slot — the
+            // `with_actor` signature stays 3-arg and the role rides on a
+            // separate setter so non-chat callers don't have to thread a
+            // value they have no use for.
+            .with_actor(
+                entry.channel.to_string(),
+                entry.sender.map(str::to_string),
+                None,
+            )
+            .with_role(entry.role.map(str::to_string))
             .with_action(
                 entry.command.to_string(),
                 entry.risk_level.to_string(),
@@ -385,6 +461,8 @@ impl AuditLogger {
             allowed,
             success,
             duration_ms,
+            sender: None,
+            role: None,
         })
     }
 
@@ -438,6 +516,48 @@ mod tests {
         assert_eq!(actor.channel, "telegram");
         assert_eq!(actor.user_id, Some("123".to_string()));
         assert_eq!(actor.username, Some("@alice".to_string()));
+    }
+
+    /// The audit record for a tool call must say WHO asked (chat sender) and
+    /// WHETHER they were an owner or guest. Before this change the actor
+    /// carried `channel` only, so a denial on a multi-user channel was
+    /// unattributable. This pins the in-memory and on-disk shape: `user_id`
+    /// is the chat sender and `role` is one of `"owner"` / `"guest"` for
+    /// chat, absent otherwise.
+    #[test]
+    fn tool_call_record_carries_sender_and_role() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let logger = enabled_logger(tmp.path())?;
+        logger.log_command_event(CommandExecutionLog {
+            channel: "telegram",
+            command: "shell",
+            risk_level: "executed",
+            approval: ApprovalOutcome::Granted,
+            allowed: true,
+            success: true,
+            duration_ms: 5,
+            sender: Some("u_42"),
+            role: Some("guest"),
+        })?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        let actor = parsed.actor.as_ref().expect("actor set");
+
+        assert_eq!(actor.channel, "telegram");
+        assert_eq!(actor.user_id.as_deref(), Some("u_42"));
+        assert_eq!(actor.role.as_deref(), Some("guest"));
+
+        // Backward compat: an old record written before the `role` field
+        // existed must still parse, with `role` defaulting to None. The
+        // `#[serde(default)]` on `Actor.role` is what makes this safe; if
+        // someone removes that attribute this test fails to parse.
+        let old_json = r#"{"timestamp":"2026-09-18T00:00:00Z","event_id":"abc","event_type":"command_execution","actor":{"channel":"cli","user_id":null,"username":null},"action":{"command":"shell","risk_level":"low","approval":"not_required","allowed":true},"result":{"success":true,"exit_code":null,"duration_ms":5,"error":null},"security":{"policy_violation":false,"rate_limit_remaining":null,"sandbox_backend":null}}"#;
+        let old: AuditEvent =
+            serde_json::from_str(old_json).expect("old record without role key must still parse");
+        assert_eq!(old.actor.as_ref().unwrap().role, None);
+        Ok(())
     }
 
     #[test]
@@ -537,6 +657,8 @@ mod tests {
             allowed: true,
             success: true,
             duration_ms: 1,
+            sender: None,
+            role: None,
         }
     }
 
@@ -623,6 +745,8 @@ mod tests {
         // with no runtime would panic and take the caller down with it.
         record_tool_call(ToolCallRecord {
             channel: "cli".into(),
+            sender: None,
+            role: None,
             tool: "shell".into(),
             risk_level: "executed".into(),
             approval: ApprovalOutcome::NotRequired,
@@ -667,6 +791,8 @@ mod tests {
 
         record_tool_call(ToolCallRecord {
             channel: "test-channel".into(),
+            sender: None,
+            role: None,
             tool: "noop".into(),
             risk_level: "executed".into(),
             approval: ApprovalOutcome::NotRequired,
@@ -696,6 +822,8 @@ mod tests {
 
         record_tool_call(ToolCallRecord {
             channel: "test-channel".into(),
+            sender: None,
+            role: None,
             tool: "noop".into(),
             risk_level: "executed".into(),
             approval: ApprovalOutcome::NotRequired,
@@ -764,6 +892,8 @@ mod tests {
             allowed: true,
             success: true,
             duration_ms: 42,
+            sender: None,
+            role: None,
         })?;
 
         let log_path = tmp.path().join("audit.log");
