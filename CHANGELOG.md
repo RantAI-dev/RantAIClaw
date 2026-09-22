@@ -169,6 +169,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Slack setup checklist names every scope and setting Socket Mode needs.** The legacy wizard listed
+  three scopes (`chat:write`, `channels:history`, `files:read`), the provisioner listed none, and docs
+  §4.3 listed `connections:write` and `chat:write` only — so an operator following any of them got a
+  bot that could not see DMs (`im:history`), could not read private channels (`groups:history`) or
+  group DMs (`mpim:history`), could not upload files (`files:write`), and never enabled Socket Mode
+  or subscribed to the four `message.*` events. There is now one shared constant
+  `SLACK_SETUP_CHECKLIST` in `src/channels/slack.rs` that the wizard and the provisioner both render,
+  and docs §4.3 enumerates the same list grouped by category. The `chat:write` /
+  `connections:write` prose, the `app_token` shape, and the DM-filter paragraph from the previous
+  Slack fix are preserved. Each scope, event, and setting carries a one-line citation to Slack's
+  public docs.
 - **Slack polling no longer re-answers the ten newest messages on every restart.** `listen_polling`
   started with `last_ts = String::new()`, so the FIRST `conversations.history` request after a
   start carried no `oldest=` and Slack answered with everything since ten minutes ago — including
@@ -179,7 +190,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history) leaves `last_ts` empty, matching the pre-fix behaviour; the second tick onwards was
   already correct because `handle_inbound` updates the cursor after each batch. The Socket
   Mode path (`socket_event_message`) is untouched.
-
 - **Tests can no longer write to the operator's real audit log.** `record_tool_call` used
   to resolve its directory from the operator's home and the active profile, and any
   `#[tokio::test]` that exercised a tool through the agent funnel (five in
