@@ -1055,6 +1055,39 @@ impl SlackChannel {
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
         let mut last_ts = String::new();
 
+        // Seed the cursor so the first poll does not replay the ten newest
+        // messages from a prior run; the second poll onwards already loops fine
+        // (`handle_inbound` updates `last_ts` after each batch). One `limit=1`
+        // fetch is cheap and uses Slack's clock (not the host's), avoiding
+        // clock-skew replays. Any failure falls back to the previous
+        // `String::new()` behaviour, matching `get_bot_user_id`'s pattern above.
+        if let Ok(seed) = self
+            .http_client()
+            .get("https://slack.com/api/conversations.history")
+            .bearer_auth(&self.bot_token)
+            .query(&[("channel", channel_id.as_str()), ("limit", "1")])
+            .send()
+            .await
+        {
+            if !crate::channels::fault::is_fatal_auth_status(seed.status()) {
+                if let Ok(data) = seed.json::<serde_json::Value>().await {
+                    if data.get("ok").and_then(serde_json::Value::as_bool) != Some(false) {
+                        if let Some(ts) = data
+                            .get("messages")
+                            .and_then(|m| m.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|m| m.get("ts"))
+                            .and_then(|t| t.as_str())
+                        {
+                            if !ts.is_empty() {
+                                last_ts = ts.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::info!("Slack channel listening on #{channel_id}...");
 
         loop {
@@ -1644,6 +1677,77 @@ mod tests {
 
         // A body with no `ok` at all is not evidence of health either.
         assert!(!SlackChannel::api_response_is_ok(&serde_json::json!({})));
+    }
+
+    /// The polling listener used to start with `last_ts = String::new()`, so
+    /// the FIRST `conversations.history` call after a restart carried no
+    /// `oldest=` and Slack happily returned the ten newest messages — including
+    /// ones the bot had already answered in a prior run. Every Slack polling
+    /// restart replayed the last ≤10 messages.
+    ///
+    /// Slack hard-codes `https://slack.com/api/...` at every call site (see
+    /// `fault.rs:107-112`), so this listener cannot be pointed at a local
+    /// server and there is no routed test for it the way those exist for
+    /// Mattermost. The seam is its own change (Mattermost's routing was added later).
+    /// Until then, pin the wiring by reading the source.
+    #[test]
+    fn polling_seeds_last_ts_before_the_loop_so_a_restart_does_not_replay_old_messages() {
+        let src = include_str!("slack.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+
+        // Extract just the body of `listen_polling`. It is the last `fn` in the
+        // impl block, so it ends at the first `\n    }\n}` (function close
+        // followed by impl close) after the `async fn listen_polling(` line.
+        let poll_body = production
+            .split("async fn listen_polling(")
+            .nth(1)
+            .expect("listen_polling exists");
+        let fn_end = poll_body
+            .find("\n    }\n}")
+            .expect("listen_polling ends at the impl's closing brace");
+        let body = &poll_body[..fn_end];
+
+        // The seed call: one `limit=1` fetch against `conversations.history`
+        // before the loop, so the FIRST poll carries `oldest=<last_ts>`.
+        assert!(
+            body.contains("(\"limit\", \"1\")"),
+            "the polling listener must seed `last_ts` with a `limit=1` fetch, \
+             or the first poll replays the ten newest messages from a prior run"
+        );
+
+        // The seed must extract `ts` from the newest returned message.
+        assert!(
+            body.contains(".and_then(|m| m.get(\"ts\"))"),
+            "the seed must read the newest message's `ts` field"
+        );
+
+        // The seed's result must actually be assigned to `last_ts` — a fetch
+        // that never reaches the cursor is the same bug as no fetch at all.
+        // is supposed to flip when the seed assignment is removed.
+        assert!(
+            body.contains("last_ts = ts.to_string()"),
+            "the seed must write the fetched `ts` into `last_ts`, or the cursor \
+             stays empty and the first poll still replays old messages"
+        );
+
+        // The failure-fallback path: `last_ts` still starts as `String::new()`
+        // so a network blip at startup behaves exactly like the pre-fix code.
+        assert!(
+            body.contains("let mut last_ts = String::new()"),
+            "`last_ts` must still default to `String::new()` — the seed is \
+             best-effort and any failure must fall back to today's behaviour"
+        );
+
+        // The first-iteration `oldest=<last_ts>` branch is preserved so the
+        // SECOND tick onward keeps skipping seen messages.
+        assert!(
+            body.contains("if !last_ts.is_empty()"),
+            "the first poll's `oldest=<last_ts>` branch must be preserved"
+        );
+        assert!(
+            body.contains("(\"oldest\", last_ts.clone())"),
+            "the first poll must ask Slack for messages since `last_ts`"
+        );
     }
 
     use super::*;
