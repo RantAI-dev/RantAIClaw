@@ -40,6 +40,42 @@ pub const NO_APP_TOKEN_CONSEQUENCE: &str =
     "Without it the bot polls one conversation: it will not see direct messages, and it will \
      not see replies inside a thread — including replies to the approval prompt it posts there.";
 
+/// The Slack setup checklist rendered by every setup path. Three surfaces
+/// have to say the same list and must not drift apart: the legacy wizard
+/// (`src/onboard/wizard.rs`), the TUI provisioner (`src/onboard/provision/
+/// channels/slack.rs`), and docs §4.3 (`docs/reference/channels.md`). Each
+/// scope/event citation below points at the public Slack documentation the
+/// PR body lifts verbatim.
+///
+/// Scopes (per <https://api.slack.com/scopes>):
+/// - `chat:write` — <https://api.slack.com/scopes/chat:write>
+/// - `channels:history` — <https://api.slack.com/scopes/channels:history>
+/// - `im:history` — <https://api.slack.com/scopes/im:history>
+/// - `groups:history` — <https://api.slack.com/scopes/groups:history>
+/// - `mpim:history` — <https://api.slack.com/scopes/mpim:history>
+/// - `files:read` — <https://api.slack.com/scopes/files:read>
+/// - `files:write` — <https://api.slack.com/scopes/files:write>
+///
+/// Settings (App-level, not OAuth scopes):
+/// - Socket Mode — <https://api.slack.com/socket-mode>
+/// - Event Subscriptions `message.im`, `message.channels`, `message.groups`,
+///   `message.mpim` — <https://api.slack.com/events/message>
+/// - App Home Messages Tab — <https://api.slack.com/surfaces/app-home>
+///
+/// The constant is a single `&'static str` so both setup paths render it
+/// verbatim; a copy of the list in either path would let the wizard and the
+/// provisioner drift apart again, which is the bug this constant exists to
+/// prevent.
+pub const SLACK_SETUP_CHECKLIST: &str = "\
+Bot Token Scopes (OAuth & Permissions):
+  chat:write, channels:history, im:history, groups:history, mpim:history, files:read, files:write
+
+App-level settings:
+  Enable Socket Mode (Basic Information → Socket Mode).
+  Event Subscriptions → Subscribe to bot events:
+    message.im, message.channels, message.groups, message.mpim.
+  App Home → Messages Tab → enable and 'Always show in Home tab'.";
+
 /// The shape of a Slack app-level token. Checked for a warning only; `doctor`
 /// decides whether a token actually works.
 pub const APP_TOKEN_PREFIX: &str = "xapp-";
