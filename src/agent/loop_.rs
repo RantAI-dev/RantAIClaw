@@ -1097,6 +1097,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         ledger,
+        &crate::security::AuditActor::surface("channel"),
     )
     .await
 }
@@ -1276,6 +1277,7 @@ fn reject_foreign_cron_delivery(
 /// `cancel` (returning `ToolLoopCancelled` if it fires mid-execution). `success`
 /// reflects the tool's real outcome; error text is folded into `output`.
 /// Shared executor for both agent loops (PR2 unification).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_one_tool_structured(
     call: &ParsedToolCall,
     tools_registry: &[Box<dyn Tool>],
@@ -1291,6 +1293,10 @@ pub(crate) async fn execute_one_tool_structured(
     // funnel used to write the constant `true` for both, which is why the trail
     // could not prove that anybody had approved anything.
     approval_outcome: crate::security::ApprovalOutcome,
+    // Identity of who asked for the call. Chat sends a sender id + role
+    // (owner or guest); non-chat surfaces send `AuditActor::surface(name)`
+    // and the audit carries `user_id = None`, `role = None`.
+    audit_actor: &crate::security::AuditActor,
 ) -> Result<ToolExecutionResult> {
     let id = Uuid::new_v4().to_string();
 
@@ -1313,6 +1319,8 @@ pub(crate) async fn execute_one_tool_structured(
         }
         crate::security::record_tool_call(crate::security::ToolCallRecord {
             channel: channel_name.to_string(),
+            sender: audit_actor.sender.clone(),
+            role: audit_actor.role.clone(),
             tool: call.name.clone(),
             risk_level: "unknown_tool".into(),
             approval: approval_outcome,
@@ -1394,6 +1402,8 @@ pub(crate) async fn execute_one_tool_structured(
 
     crate::security::record_tool_call(crate::security::ToolCallRecord {
         channel: channel_name.to_string(),
+        sender: audit_actor.sender.clone(),
+        role: audit_actor.role.clone(),
         tool: call.name.clone(),
         // The gate ran before this funnel: reaching it means the call was
         // allowed. Which of the two ways it got here is what the caller passes.
@@ -1437,6 +1447,11 @@ pub(crate) async fn execute_tool_calls_collecting(
     parallel: bool,
     cancellation_token: Option<&CancellationToken>,
     events: Option<&AgentEventSender>,
+    // Identity of who asked for the call. When `guest_gate` is set and the
+    // caller did not already fill `audit_actor.role`, the executor derives
+    // `"guest"` from the gate being armed — so a guest turn cannot accidentally
+    // be recorded as owner-less but role-less in the trail.
+    audit_actor: &crate::security::AuditActor,
 ) -> Result<Vec<ToolExecutionResult>> {
     // A guest turn must run serially so every call passes the gate below; the
     // parallel fast-path skips per-call checks.
@@ -1462,6 +1477,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 // anything here — whatever the policy allowed, it allowed
                 // silently.
                 crate::security::ApprovalOutcome::NotRequired,
+                audit_actor,
             )
         });
         return futures_util::future::try_join_all(futures).await;
@@ -1497,6 +1513,8 @@ pub(crate) async fn execute_tool_calls_collecting(
                 }
                 crate::security::record_tool_call(crate::security::ToolCallRecord {
                     channel: channel_name.to_string(),
+                    sender: audit_actor.sender.clone(),
+                    role: audit_actor.role.clone(),
                     tool: call.name.clone(),
                     risk_level: "guest_ceiling".into(),
                     approval: crate::security::ApprovalOutcome::Denied,
@@ -1538,6 +1556,8 @@ pub(crate) async fn execute_tool_calls_collecting(
                 }
                 crate::security::record_tool_call(crate::security::ToolCallRecord {
                     channel: channel_name.to_string(),
+                    sender: audit_actor.sender.clone(),
+                    role: audit_actor.role.clone(),
                     tool: call.name.clone(),
                     risk_level: "foreign_cron_delivery".into(),
                     approval: crate::security::ApprovalOutcome::Denied,
@@ -1621,6 +1641,8 @@ pub(crate) async fn execute_tool_calls_collecting(
                     };
                     crate::security::record_tool_call(crate::security::ToolCallRecord {
                         channel: channel_name.to_string(),
+                        sender: audit_actor.sender.clone(),
+                        role: audit_actor.role.clone(),
                         tool: call.name.clone(),
                         risk_level: "requires_approval".into(),
                         approval: crate::security::ApprovalOutcome::Denied,
@@ -1656,6 +1678,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 events,
                 channel_name,
                 approval_outcome,
+                audit_actor,
             )
             .await?,
         );
@@ -1765,6 +1788,10 @@ pub(crate) async fn run_structured_loop(
     // The process's token ledger. `None` ⇒ no accounting on this path (tests,
     // and callers that have no workspace to write one into).
     ledger: Option<&crate::cost::CostTracker>,
+    // Identity of who asked for the call. Passed through to the executor and
+    // then on to the audit log; chat sends a sender + role, non-chat surfaces
+    // pass `AuditActor::surface(name)`.
+    audit_actor: &crate::security::AuditActor,
 ) -> Result<(String, Option<crate::providers::ProviderUsage>)> {
     // The daily ceiling, checked before the turn does any work. This is the
     // whole of the enforcement: a turn's size is not knowable before it runs, so
@@ -2004,6 +2031,7 @@ pub(crate) async fn run_structured_loop(
             should_parallel,
             cancellation_token.as_ref(),
             events.as_ref(),
+            audit_actor,
         )
         .await?;
 
@@ -2141,6 +2169,9 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     events: Option<AgentEventSender>,
     ledger: Option<&crate::cost::CostTracker>,
+    // Identity of who asked for the call. Threaded through to the audit log;
+    // chat sends a sender + role, non-chat surfaces pass `AuditActor::surface(name)`.
+    audit_actor: &crate::security::AuditActor,
 ) -> Result<String> {
     let dispatcher: Box<dyn ToolDispatcher> = if provider.supports_native_tools() {
         Box::new(NativeToolDispatcher)
@@ -2176,6 +2207,7 @@ pub(crate) async fn run_tool_call_loop(
         on_delta,
         events,
         ledger,
+        audit_actor,
     )
     .await;
 
@@ -2751,6 +2783,7 @@ pub async fn run_with_scope(
             None,
             None,
             ledger.as_deref(),
+            &crate::security::AuditActor::surface(surface),
         )
         .await?;
         final_output = response.clone();
@@ -2908,6 +2941,7 @@ pub async fn run_with_scope(
                 None,
                 None,
                 ledger.as_deref(),
+                &crate::security::AuditActor::surface("cli"),
             )
             .await
             {
@@ -3591,6 +3625,7 @@ mod tests {
             None,
             None,
             None,
+            &crate::security::AuditActor::surface("cli"),
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3642,6 +3677,7 @@ mod tests {
             None,
             None,
             None,
+            &crate::security::AuditActor::surface("cli"),
         )
         .await;
 
@@ -3698,6 +3734,7 @@ mod tests {
             None,
             None,
             None,
+            &crate::security::AuditActor::surface("cli"),
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3741,6 +3778,7 @@ mod tests {
             None,
             None,
             None,
+            &crate::security::AuditActor::surface("cli"),
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3871,6 +3909,7 @@ mod tests {
             None,
             None,
             None,
+            &crate::security::AuditActor::surface("telegram"),
         )
         .await
         .expect("parallel execution should complete");
@@ -4013,6 +4052,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::security::AuditActor::surface("telegram"),
         )
         .await
         .expect("batch completes");
@@ -4036,6 +4076,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::security::AuditActor::surface("telegram"),
         )
         .await
         .expect("batch completes");
@@ -4127,6 +4168,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::security::AuditActor::surface("telegram"),
         )
         .await
         .expect("batch completes");
@@ -4256,6 +4298,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::security::AuditActor::surface("telegram"),
         )
         .await
         .unwrap();
@@ -4292,6 +4335,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::security::AuditActor::surface("telegram"),
         )
         .await
         .unwrap();
@@ -4360,6 +4404,7 @@ mod tests {
             false,
             Some(&token),
             None,
+            &crate::security::AuditActor::surface("telegram"),
         )
         .await;
 
@@ -4407,6 +4452,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::security::AuditActor::surface("telegram"),
         )
         .await
         .unwrap();
@@ -4416,6 +4462,133 @@ mod tests {
         );
         assert!(!results[0].success);
         assert!(results[0].output.contains("non-owner"));
+    }
+
+    /// A guest-ceiling denial must record WHO asked and that they were a
+    /// guest. Before this change the actor carried `channel` only, so a
+    /// denial on a multi-user channel was unattributable.
+    #[tokio::test]
+    async fn guest_denial_record_carries_sender_and_role_as_guest() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        // Guest may use only `file_read`; `do_thing` is not permitted, so the
+        // gate hits the `guest_ceiling` denial branch in the executor.
+        let gate = crate::approval::GuestGate::new(["file_read".to_string()], &[], &[]);
+        let audit_actor = crate::security::AuditActor::chat("u_42".to_string(), "guest");
+        let _ = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "telegram",
+            None, // test: no origin chat
+            None,
+            Some(&gate),
+            false,
+            None,
+            None,
+            &audit_actor,
+        )
+        .await
+        .unwrap();
+
+        // The shared audit log accumulates records across tests in the same
+        // module invocation, so we filter to the one we wrote (user_id = u_42)
+        // rather than assuming the log holds a single line.
+        let text = audit_log_after_writes(&log_path, 1).await;
+        let mut records: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad record ({e}): {l}")))
+            .collect();
+        let record = records
+            .iter_mut()
+            .find(|r| r["actor"]["user_id"] == "u_42")
+            .unwrap_or_else(|| panic!("no u_42 record in log: {text}"));
+        let actor = &record["actor"];
+        assert_eq!(actor["channel"], "telegram");
+        assert_eq!(actor["user_id"], "u_42");
+        assert_eq!(actor["role"], "guest");
+    }
+
+    /// An owner turn's audit record must say so. The defect this guards: a
+    /// misconfigured `if sender_is_owner` would silently downgrade an owner
+    /// to "guest" in the trail; this test catches that.
+    #[tokio::test]
+    async fn owner_call_record_carries_sender_and_role_as_owner() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        // No guest gate ⇒ owner path; tool runs through the happy path.
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        let audit_actor = crate::security::AuditActor::chat("u_42".to_string(), "owner");
+        let _ = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "telegram",
+            None, // test: no origin chat
+            None,
+            None, // owner: no guest gate
+            false,
+            None,
+            None,
+            &audit_actor,
+        )
+        .await
+        .unwrap();
+        assert!(ran.load(Ordering::SeqCst), "owner tool must run");
+
+        // The shared audit log accumulates records across tests in the same
+        // module invocation, so we filter to the one we wrote (user_id = u_42)
+        // rather than assuming the log holds a single line.
+        let text = audit_log_after_writes(&log_path, 1).await;
+        let mut records: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad record ({e}): {l}")))
+            .collect();
+        let record = records
+            .iter_mut()
+            .find(|r| r["actor"]["user_id"] == "u_42")
+            .unwrap_or_else(|| panic!("no u_42 record in log: {text}"));
+        let actor = &record["actor"];
+        assert_eq!(actor["channel"], "telegram");
+        assert_eq!(actor["user_id"], "u_42");
+        assert_eq!(actor["role"], "owner");
     }
 
     #[test]
@@ -5710,6 +5883,7 @@ Let me check the result."#;
             None,
             None,
             ledger,
+            &crate::security::AuditActor::surface("cli"),
         )
         .await
     }
@@ -5812,6 +5986,7 @@ Let me check the result."#;
             None,            // on_delta: None
             Some(events_tx), // events: Some
             None,
+            &crate::security::AuditActor::surface("test"),
         )
         .await
         .expect("loop succeeds");
@@ -5914,6 +6089,7 @@ Let me check the result."#;
             None,
             Some(events_tx),
             None,
+            &crate::security::AuditActor::surface("test"),
         )
         .await
         .expect("loop succeeds");
@@ -6012,6 +6188,7 @@ Let me check the result."#;
             None,
             Some(events_tx),
             None,
+            &crate::security::AuditActor::surface("test"),
         )
         .await;
         assert!(res.is_err(), "expected cancellation error");
@@ -6064,6 +6241,7 @@ Let me check the result."#;
             None,
             Some(events_tx),
             None,
+            &crate::security::AuditActor::surface("test"),
         )
         .await
         .unwrap();
@@ -6116,6 +6294,7 @@ Let me check the result."#;
             None,
             Some(events_tx),
             None,
+            &crate::security::AuditActor::surface("test"),
         )
         .await
         .expect("loop completes");

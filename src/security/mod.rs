@@ -29,7 +29,8 @@ pub mod secrets;
 
 #[allow(unused_imports)]
 pub use audit::{
-    record_tool_call, ApprovalOutcome, AuditEvent, AuditEventType, AuditLogger, ToolCallRecord,
+    record_tool_call, ApprovalOutcome, AuditActor, AuditEvent, AuditEventType, AuditLogger,
+    ToolCallRecord,
 };
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;

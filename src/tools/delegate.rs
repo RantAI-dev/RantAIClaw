@@ -426,6 +426,8 @@ impl DelegateTool {
                 None,
                 None,
                 self.ledger.as_deref(),
+                // Sub-agent: surface name only, no chat sender and no role.
+                &crate::security::AuditActor::surface("delegate"),
             ),
         )
         .await;
