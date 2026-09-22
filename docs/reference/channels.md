@@ -735,6 +735,38 @@ channel_id = "C1234567890"         # required for polling, optional filter under
 allowed_users = ["*"]
 ```
 
+Required Slack app configuration:
+
+- **Bot Token Scopes** (OAuth & Permissions):
+  - `chat:write` — post and delete messages as the bot.
+    <https://api.slack.com/scopes/chat:write>
+  - `channels:history` — read public channel messages.
+    <https://api.slack.com/scopes/channels:history>
+  - `im:history` — read direct message history (otherwise DMs are invisible).
+    <https://api.slack.com/scopes/im:history>
+  - `groups:history` — read private channel messages.
+    <https://api.slack.com/scopes/groups:history>
+  - `mpim:history` — read group DM messages.
+    <https://api.slack.com/scopes/mpim:history>
+  - `files:read` — open an image the operator sends so the model can describe it.
+    <https://api.slack.com/scopes/files:read>
+  - `files:write` — upload files as the bot.
+    <https://api.slack.com/scopes/files:write>
+- **App-level token scope**: `connections:write` — required by the optional
+  `app_token` for Socket Mode. <https://api.slack.com/scopes/connections:write>
+- **Socket Mode** (Basic Information → Socket Mode → Enable). Holds one
+  outbound WebSocket carrying events for every conversation the bot is in:
+  channels, threads and DMs alike. <https://api.slack.com/socket-mode>
+- **Event Subscriptions** (Features → Event Subscriptions → Subscribe to bot
+  events). All four are needed so the bot sees every conversation type under
+  Socket Mode. <https://api.slack.com/events/message>
+  - `message.im`
+  - `message.channels`
+  - `message.groups`
+  - `message.mpim`
+- **App Home → Messages Tab** → enable and select "Always show in Home tab"
+  so the bot can post into a DM thread. <https://api.slack.com/surfaces/app-home>
+
 Slack notes:
 
 - **Two receive transports, chosen by `app_token`.** `SlackChannel::listen` calls

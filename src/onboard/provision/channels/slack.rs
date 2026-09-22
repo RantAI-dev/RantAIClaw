@@ -89,6 +89,18 @@ impl TuiProvisioner for SlackProvisioner {
             return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
 
+        // Setup checklist — same list the legacy wizard prints and the docs
+        // §4.3 enumerates. Rendered before the Socket Mode prompt so the
+        // operator sees which scopes and toggles the rest of the form needs.
+        send(
+            &events,
+            ProvisionEvent::Message {
+                severity: Severity::Info,
+                text: crate::channels::slack::SLACK_SETUP_CHECKLIST.to_string(),
+            },
+        )
+        .await?;
+
         // App-level token, optional. Asked here rather than after the
         // `auth.test` round-trip below because both tokens come off the same
         // Slack app page, so the operator pastes them together.
@@ -337,6 +349,42 @@ mod tests {
             "skipping it must state the cost, in the same words the runtime warning uses: {:?}",
             t.messages()
         );
+
+        // The setup checklist must reach the operator: every scope and event
+        // Slack requires for the bot to see DMs and upload files. Drop one
+        // literal from the provisioner and this fails.
+        let messages = t.messages();
+        let checklist_bullet = messages
+            .iter()
+            .find(|m| m.contains("Bot Token Scopes") || m.contains("chat:write"))
+            .unwrap_or_else(|| panic!("no bot-scope checklist bullet was offered: {messages:?}"));
+        for literal in [
+            "chat:write",
+            "channels:history",
+            "im:history",
+            "groups:history",
+            "mpim:history",
+            "files:read",
+            "files:write",
+        ] {
+            assert!(
+                checklist_bullet.contains(literal),
+                "the checklist bullet is missing `{literal}`: {checklist_bullet}"
+            );
+        }
+        for literal in [
+            "Socket Mode",
+            "message.im",
+            "message.channels",
+            "message.groups",
+            "message.mpim",
+            "App Home",
+        ] {
+            assert!(
+                checklist_bullet.contains(literal),
+                "the checklist bullet is missing setting `{literal}`: {checklist_bullet}"
+            );
+        }
     }
 
     /// Skipping stays valid: an empty answer means polling, which is what every
@@ -413,6 +461,85 @@ mod tests {
                      operator's answer: {line}"
                 );
             }
+        }
+    }
+
+    /// Both setup paths must render the same Slack setup checklist, not a
+    /// copy of one. Three scopes (DMs / private channels / group DMs) and
+    /// `files:write` were missing from both the wizard's bullet and the docs;
+    /// the provisioner listed no scopes at all. Each is required for the bot
+    /// to see DMs and to upload files, which is what every operator following
+    /// either setup path was promised. Slicing the test module off the source
+    /// first so this test cannot accidentally match itself.
+    ///
+    /// Mirrors the existing `NO_APP_TOKEN_CONSEQUENCE` pattern: the literal
+    /// text lives once in `src/channels/slack.rs`, and both setup paths
+    /// reference the constant. So the test iterates over all three sources
+    /// and checks the role each one plays: the constant carries every
+    /// literal; the wizard and the provisioner both render the constant.
+    #[test]
+    fn slack_setup_checklist_renders_in_both_setup_paths() {
+        // Slice the `#[cfg(test)]` module off the source so this test cannot
+        // accidentally match itself. Mirrors the helper in
+        // `provision/whatsapp_web.rs` and keeps the test order-independent.
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod ";
+        fn production_half(src: &str) -> &str {
+            let cut = [TEST_MODULE_MARKER]
+                .iter()
+                .flat_map(|marker| src.match_indices(marker))
+                .map(|(at, _)| at)
+                .min()
+                .unwrap_or(src.len());
+            &src[..cut]
+        }
+        let required_scopes = [
+            "chat:write",
+            "channels:history",
+            "im:history",
+            "groups:history",
+            "mpim:history",
+            "files:read",
+            "files:write",
+        ];
+        let required_settings = [
+            "Socket Mode",
+            "message.im",
+            "message.channels",
+            "message.groups",
+            "message.mpim",
+            "App Home",
+        ];
+        // The constant's value must carry every literal. Asserted against
+        // the constant directly (not the surrounding source), so dropping a
+        // scope from the `&str` body is what makes the assertion fall —
+        // rather than a stale match in a doc comment. `chat:write` shows up
+        // in a doc comment further down the file, so a substring search on
+        // the whole file would not exercise the constant itself.
+        for scope in required_scopes {
+            assert!(
+                crate::channels::slack::SLACK_SETUP_CHECKLIST.contains(scope),
+                "SLACK_SETUP_CHECKLIST must list `{scope}`"
+            );
+        }
+        for setting in required_settings {
+            assert!(
+                crate::channels::slack::SLACK_SETUP_CHECKLIST.contains(setting),
+                "SLACK_SETUP_CHECKLIST must instruct the operator on `{setting}`"
+            );
+        }
+        // Both setup paths render THAT constant, not a copy. Drop the
+        // reference from either one and the substring assertion falls — the
+        // path goes back to a private literal the constant cannot catch.
+        for (path, src) in [
+            ("provision/channels/slack.rs", include_str!("slack.rs")),
+            ("wizard.rs", include_str!("../../wizard.rs")),
+        ] {
+            let prod = production_half(src);
+            assert!(
+                prod.contains("crate::channels::slack::SLACK_SETUP_CHECKLIST"),
+                "{path} must reference the shared constant `crate::channels::slack::SLACK_SETUP_CHECKLIST` \
+                 so the wizard and provisioner cannot drift"
+            );
         }
     }
 }
