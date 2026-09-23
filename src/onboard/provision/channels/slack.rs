@@ -542,4 +542,20 @@ mod tests {
             );
         }
     }
+
+    /// The checklist must explain what `files:read` does and what happens
+    /// without it. An operator following either setup path was told to add
+    /// the scope but never told why; the wizard's `print_bullet` only
+    /// indented the first line of the body, so the multi-line checklist
+    /// dropped the consequence sentence. Drop the consequence from the
+    /// constant and this falls.
+    #[test]
+    fn slack_setup_checklist_explains_the_files_read_consequence() {
+        assert!(
+            crate::channels::slack::SLACK_SETUP_CHECKLIST.contains("fetch failed"),
+            "SLACK_SETUP_CHECKLIST must explain what happens without `files:read`; \
+             got: {:?}",
+            crate::channels::slack::SLACK_SETUP_CHECKLIST
+        );
+    }
 }

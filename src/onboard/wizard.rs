@@ -24,6 +24,7 @@ use dialoguer::{Confirm, Input, Password, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -2305,6 +2306,36 @@ fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
 }
 
+/// Render (without printing) a numbered multi-line step block: a `› N. title`
+/// line followed by each non-empty line of `body` indented under the title so
+/// the block reads as one step.
+///
+/// Empty body lines stay empty so the block can carry a blank-line paragraph
+/// break without losing it. `print_bullet` only indented the first line of
+/// its argument, which made a multi-line body collapse into the surrounding
+/// output; this helper exists for the cases where the body is more than one
+/// line.
+pub fn render_step_block(current: u8, title: &str, body: &str) -> String {
+    let mut out = String::new();
+    // "  › N. " is 7 chars before the title; body lines start with the same
+    // 7 spaces so they line up under the title.
+    let _ = writeln!(out, "  {} {}. {}", style("›").cyan(), current, title);
+    for line in body.lines() {
+        if line.is_empty() {
+            out.push('\n');
+        } else {
+            let _ = writeln!(out, "       {line}");
+        }
+    }
+    out
+}
+
+/// Print a numbered multi-line step block. Used where the body has to read as
+/// one numbered step rather than a continuation of the previous bullet.
+pub fn print_step_block(current: u8, title: &str, body: &str) {
+    print!("{}", render_step_block(current, title, body));
+}
+
 fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<()> {
     if !config_path.exists() {
         return Ok(());
@@ -3943,7 +3974,11 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     style("— talk to RantaiClaw from Slack").dim()
                 );
                 print_bullet("1. Go to https://api.slack.com/apps → Create New App");
-                print_bullet(crate::channels::slack::SLACK_SETUP_CHECKLIST);
+                print_step_block(
+                    2,
+                    "Configure the Slack app",
+                    crate::channels::slack::SLACK_SETUP_CHECKLIST,
+                );
                 print_bullet("3. Install to workspace and copy the Bot Token");
                 println!();
 
@@ -5844,6 +5879,7 @@ fn print_summary(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use console::strip_ansi_codes;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -7517,5 +7553,91 @@ mod tests {
             allowed_users: vec!["*".into()],
         });
         assert!(has_launchable_channels(&channels));
+    }
+
+    // ── Slack setup checklist renders as one numbered step ────────
+
+    /// The wizard used to print step "1.", then a multi-line `print_bullet`
+    /// for the checklist (whose body lines lost the bullet indent and
+    /// collapsed into the surrounding output), then "3." — the "2." was
+    /// missing and the checklist looked like a continuation of step 1. The
+    /// new helper indents every body line under the title so the block
+    /// reads as one numbered step.
+    ///
+    /// Drop the `files:read` consequence sentence from
+    /// `SLACK_SETUP_CHECKLIST` and this test falls.
+    #[test]
+    fn render_step_block_carries_the_slack_checklist_with_files_read_consequence() {
+        let rendered = render_step_block(
+            2,
+            "Configure the Slack app",
+            crate::channels::slack::SLACK_SETUP_CHECKLIST,
+        );
+        let stripped = strip_ansi_codes(&rendered);
+        assert!(
+            stripped.contains("2."),
+            "step number must appear in the rendered block: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("Configure the Slack app"),
+            "title must appear in the rendered block: {stripped:?}"
+        );
+        for line in crate::channels::slack::SLACK_SETUP_CHECKLIST.lines() {
+            if !line.is_empty() {
+                assert!(
+                    stripped.contains(line),
+                    "missing checklist line `{line}` from rendered block: {stripped:?}"
+                );
+            }
+        }
+        assert!(
+            stripped.contains("fetch failed"),
+            "rendered block must carry the `files:read` consequence: {stripped:?}"
+        );
+    }
+
+    /// Pin the call site. A wizard that reverted to `print_bullet` would pass
+    /// the visual test above but still ship the bug: step "2." would vanish
+    /// again and the multi-line checklist would lose its indent. Slicing the
+    /// `#[cfg(test)]` module off the source keeps the test from matching
+    /// itself, mirroring the helper in `provision/channels/slack.rs` and
+    /// `provision/whatsapp_web.rs`.
+    #[test]
+    fn slack_setup_step_calls_print_step_block() {
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod ";
+        fn production_half(src: &str) -> &str {
+            let cut = [TEST_MODULE_MARKER]
+                .iter()
+                .flat_map(|marker| src.match_indices(marker))
+                .map(|(at, _)| at)
+                .min()
+                .unwrap_or(src.len());
+            &src[..cut]
+        }
+        let production = production_half(include_str!("wizard.rs"));
+        // The first occurrence is the function definition (`fn print_step_block(current: u8, ...)`).
+        // The call site is the next one — it has no parameter type annotations.
+        let def_idx = production
+            .find("print_step_block(")
+            .expect("`print_step_block` must be defined and called in wizard.rs");
+        let call_idx = production[def_idx + 1..]
+            .find("print_step_block(")
+            .map(|off| def_idx + 1 + off)
+            .expect("`print_step_block` must be called, not just defined");
+        // A generous window covers any reasonable `rustfmt` split.
+        let window_end = (call_idx + 400).min(production.len());
+        let window = &production[call_idx..window_end];
+        assert!(
+            window.contains("2,"),
+            "the call site must pass `2` as the step number: {window:?}"
+        );
+        assert!(
+            window.contains("\"Configure the Slack app\""),
+            "the call site must pass the title: {window:?}"
+        );
+        assert!(
+            window.contains("crate::channels::slack::SLACK_SETUP_CHECKLIST"),
+            "the call site must pass the shared checklist constant: {window:?}"
+        );
     }
 }

@@ -69,6 +69,7 @@ pub const NO_APP_TOKEN_CONSEQUENCE: &str =
 pub const SLACK_SETUP_CHECKLIST: &str = "\
 Bot Token Scopes (OAuth & Permissions):
   chat:write, channels:history, im:history, groups:history, mpim:history, files:read, files:write
+  `files:read` lets the bot download what users upload — without it, an uploaded image arrives in chat as a note saying the fetch failed.
 
 App-level settings:
   Enable Socket Mode (Basic Information → Socket Mode).
