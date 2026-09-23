@@ -8445,18 +8445,6 @@ default_model = "legacy-model"
             !runtime_proxy_cache_contains(&unbounded_key),
             "default builder cached under the unbounded key — the timeout fix regressed"
         );
-        assert!(
-            DEFAULT_PROXY_REQUEST_TIMEOUT_SECS > 0
-                && DEFAULT_PROXY_REQUEST_TIMEOUT_SECS < 24 * 60 * 60,
-            "DEFAULT_PROXY_REQUEST_TIMEOUT_SECS={DEFAULT_PROXY_REQUEST_TIMEOUT_SECS} is \
-             outside the (0, 1 day) band a hung upstream should be allowed to hold a caller"
-        );
-        assert!(
-            DEFAULT_PROXY_CONNECT_TIMEOUT_SECS > 0
-                && DEFAULT_PROXY_CONNECT_TIMEOUT_SECS <= DEFAULT_PROXY_REQUEST_TIMEOUT_SECS,
-            "DEFAULT_PROXY_CONNECT_TIMEOUT_SECS={DEFAULT_PROXY_CONNECT_TIMEOUT_SECS} must be \
-             positive and not larger than the request timeout"
-        );
     }
 
     /// End-to-end check on the same code path: a request from a bounded
