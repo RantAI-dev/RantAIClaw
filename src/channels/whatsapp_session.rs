@@ -268,8 +268,13 @@ mod tests {
             vec!["whatsapp-111.db", "whatsapp-222.db", "whatsapp.db"]
         );
 
-        // Referenced one stays.
-        let plan = plan_set_aside(&ws, &["whatsapp.db".to_string()]);
+        // Referenced one stays. The plan is sorted because the file walk
+        // order is filesystem/HashMap order — the previous assertion above
+        // already does the same `.sort()` for the same reason, and skipping
+        // it here turned this into a flake that surfaced on the second
+        // `cargo test --locked --workspace` run after a fresh checkout.
+        let mut plan = plan_set_aside(&ws, &["whatsapp.db".to_string()]);
+        plan.sort();
         let names: Vec<String> = plan
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
