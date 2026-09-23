@@ -4,7 +4,10 @@ use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::cost::TokenUsage;
-use crate::memory::{self, Memory, MemoryCategory};
+use crate::memory::{self, Memory};
+
+#[cfg(test)]
+use crate::memory::MemoryCategory;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;

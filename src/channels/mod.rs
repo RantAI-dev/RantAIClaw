@@ -106,7 +106,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::build_tool_instructions;
 use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
@@ -115,14 +115,10 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
-use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use anyhow::Result;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
