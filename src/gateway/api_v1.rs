@@ -368,6 +368,11 @@ fn load_session_history(session_id: Option<&str>) -> Vec<(String, String)> {
 async fn version(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
+        // Short git commit (or ISO-8601 timestamp fallback) emitted by
+        // build.rs. Lets `rantaiclaw status` detect a daemon running an
+        // older binary when the version string hasn't moved (every `main`
+        // build between releases carries the same `CARGO_PKG_VERSION`).
+        "build": option_env!("RANTAICLAW_BUILD_ID").unwrap_or("unknown"),
         "name": "rantaiclaw",
         "config_fingerprint": state.config_fingerprint.lock().clone(),
     }))
@@ -381,6 +386,9 @@ async fn status(
     let cfg = state.config.lock();
     Ok(Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
+        // Mirror the `build` field from `/api/v1/version` so a consumer that
+        // only calls `/status` still has enough to detect a binary drift.
+        "build": option_env!("RANTAICLAW_BUILD_ID").unwrap_or("unknown"),
         "provider": cfg.default_provider.clone().unwrap_or_default(),
         "model": cfg.default_model.clone().unwrap_or_default(),
         "memory_backend": cfg.memory.backend,
@@ -3249,6 +3257,16 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
         assert_eq!(json["config_fingerprint"], "abc123");
         assert_eq!(json["name"], "rantaiclaw");
+        // `build` is populated by build.rs (`RANTAICLAW_BUILD_ID`) at compile
+        // time. It must be present and non-empty so `rantaiclaw status` can
+        // detect a daemon running an older binary when the version string
+        // hasn't moved (every `main` build between releases carries the same
+        // `CARGO_PKG_VERSION`).
+        let build = json["build"].as_str().expect("`build` must be a string");
+        assert!(
+            !build.is_empty(),
+            "`build` must be non-empty (build.rs sets RANTAICLAW_BUILD_ID at compile time)"
+        );
     }
 
     #[tokio::test]
