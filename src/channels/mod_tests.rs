@@ -9747,6 +9747,14 @@ fn no_channel_defines_a_trait_method_outside_its_channel_impl() {
 /// to ask only whether the text appeared anywhere in the file, which Discord
 /// satisfied for months with the method in a plain `impl DiscordChannel` block
 /// that the runtime could not reach (F-32).
+///
+/// The covered set is pinned against the catalog's `Supported` rows: every
+/// entry must be `channel_is_usable(key)`, and every `Supported` row that has
+/// a runtime path (i.e. is not the gateway-served `webhook`) must appear in
+/// the wiring. The four hand-listed channels the guard started with are still
+/// here, plus Lark and WhatsApp Cloud, which the guard previously missed —
+/// Lark sat with no `start_typing`/`stop_typing` overrides at all, and the
+/// `Arc<dyn Channel>` default no-op ran silently.
 #[test]
 fn every_tier_channel_shows_and_clears_a_working_signal() {
     // Assembled at runtime so this test does not match itself.
@@ -9755,19 +9763,67 @@ fn every_tier_channel_shows_and_clears_a_working_signal() {
     // Per channel, the call in `stop_typing` that actually ends the signal.
     // Asserting the method merely *exists* is not enough: a `stop_typing` whose
     // body was emptied still satisfies that, and an emptied one is precisely
-    // how a "working…" placeholder outlives its turn.
-    let wiring: &[(&str, &str, &str)] = &[
-        ("telegram", include_str!("telegram.rs"), "remove("),
-        ("discord", include_str!("discord.rs"), "remove("),
-        ("slack", include_str!("slack.rs"), "take_working_notice("),
+    // how a "working…" placeholder outlives its turn. Empty string when the
+    // channel's `stop_typing` is a documented no-op — every body line trivially
+    // contains `""`, and the assertion is a no-op rather than a vacuous match.
+    // The catalog key is the first element, so the catalog check below can
+    // match without aliasing; `display_name` keeps the human-readable label
+    // Slack picked and disambiguates WhatsApp Cloud from WhatsApp Web.
+    let wiring: &[(&str, &str, &str, &str)] = &[
+        (
+            "telegram",
+            "telegram",
+            include_str!("telegram.rs"),
+            "remove(",
+        ),
+        ("discord", "discord", include_str!("discord.rs"), "remove("),
+        (
+            "slack",
+            "slack",
+            include_str!("slack.rs"),
+            "take_working_notice(",
+        ),
+        (
+            "whatsapp (cloud)",
+            "whatsapp",
+            include_str!("whatsapp.rs"),
+            "",
+        ),
         (
             "whatsapp (web)",
+            "whatsapp_web",
             include_str!("whatsapp_web.rs"),
             "send_paused(",
         ),
+        ("lark", "lark", include_str!("lark.rs"), ""),
     ];
 
-    for (channel, src, clears) in wiring {
+    // Pin the wiring against the catalog's `Supported` rows. Two contracts:
+    // every wiring entry is a usable channel, and every usable channel with a
+    // source file is in the wiring. A new `Supported` row in `CHANNEL_CATALOG`
+    // that this guard forgets to add is what made Lark and WhatsApp Cloud
+    // invisible to it for months.
+    let wiring_keys: std::collections::BTreeSet<&str> =
+        wiring.iter().map(|(_, key, _, _)| *key).collect();
+    for &(_, key, _, _) in wiring {
+        assert!(
+            channel_is_usable(key),
+            "{key}: covered by the wiring but not `Supported` in the catalog — \
+             either promote the channel or remove it from the wiring"
+        );
+    }
+    for &(key, _, _, _) in &CHANNEL_CATALOG {
+        if channel_is_usable(key) {
+            assert!(
+                wiring_keys.contains(key),
+                "{key} is `Supported` in the catalog but the wiring does not cover it — \
+                 the trait-method guard regressed to a hand list"
+            );
+        }
+    }
+
+    for (display, _key, src, clears) in wiring {
+        let channel = display;
         // `production_half`, not a split on `"\n#[cfg(test)]"`: that misses
         // `#[cfg(all(test, feature = ...))]`, which is how `whatsapp_web.rs`
         // gates its test module, so that module was being read as production.
