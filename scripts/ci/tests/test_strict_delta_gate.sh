@@ -129,8 +129,15 @@ fi
 # --- test 2: uncommitted edit ------------------------------------------------
 
 printf '\n=== test 2: uncommitted edit ===\n'
-# Add an uncommitted change to the tracked Rust file.
-printf '\n// uncommitted edit\n' >> "$REPO_DIR/src/lib.rs"
+# Add an uncommitted Rust change that triggers a clippy/rustc lint.
+# A comment-only edit is lint-clean: clippy would exit 0 and the gate would
+# print "Strict delta gate passed: no strict warnings/errors.", conflating
+# "gate ran and found nothing" with "gate silently skipped". The line below
+# introduces a never-referenced local inside a never-called function, so the
+# `-D warnings` flag promotes both `dead_code` (for `unused_fn`) and
+# `unused_variables` (for `unused_var`) to hard errors and the gate exits
+# non-zero on a working-tree edit.
+printf '\nfn unused_fn() { let unused_var: u32 = 5; }\n' >> "$REPO_DIR/src/lib.rs"
 
 LOG2="$REPO_DIR/gate2.log"
 (
