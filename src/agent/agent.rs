@@ -785,7 +785,7 @@ impl Agent {
             // The flush spends real tokens, so it counts against the ceiling
             // and is recorded like any other turn.
             self.ledger.as_deref(),
-            &crate::security::AuditActor::surface("cli"),
+            &crate::security::AuditActor::surface(),
         )
         .await;
 
@@ -1168,7 +1168,7 @@ impl Agent {
             None,
             events.cloned(),
             self.ledger.as_deref(),
-            &crate::security::AuditActor::surface("cli"),
+            &crate::security::AuditActor::surface(),
         )
         .await;
 

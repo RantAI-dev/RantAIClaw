@@ -230,7 +230,8 @@ pub struct ToolCallRecord {
 /// Identity of who asked for a tool call, threaded from each entry point to
 /// the audit log. Chat sends a sender id + role (owner or guest); non-chat
 /// surfaces (CLI / scheduler / webhook / delegate) record their surface name
-/// as the actor's `user_id` so the trail still says who triggered the call.
+/// on the actor's `channel` field, so the trail still says who triggered the
+/// call without filling `sender` or `role`.
 #[derive(Debug, Clone, Default)]
 pub struct AuditActor {
     pub sender: Option<String>,
@@ -247,12 +248,11 @@ impl AuditActor {
         }
     }
 
-    /// Non-chat surface: there is no sender id, and the role does not apply,
-    /// so both stay `None`.
-    pub fn surface(_name: &str) -> Self {
-        // The surface name is already recorded on `channel` at every call
-        // site, so duplicating it onto `user_id` would just bloat the trail
-        // without adding information. Leave `sender` and `role` empty.
+    /// Non-chat surface: returns the default `AuditActor` with `sender` and
+    /// `role` left empty. The surface name is recorded separately on
+    /// `channel` at every call site, so this constructor carries no argument
+    /// and adds nothing to the actor.
+    pub fn surface() -> Self {
         Self::default()
     }
 }
@@ -935,5 +935,135 @@ mod tests {
             "rotation must create .1.log backup"
         );
         Ok(())
+    }
+
+    // ── The audit comments match the code ─────────────────────────
+    //
+    // Three comments in this module, `src/agent/loop_.rs` and
+    // `src/channels/slack.rs` described behaviour that did not exist.
+    // Pin the actual contract here so a future reader cannot quietly
+    // re-introduce the half-truths.
+
+    /// `AuditActor::surface` takes no argument and returns the default. The
+    /// surface name is already recorded on `channel` at every call site, so
+    /// the constructor deliberately leaves `sender` and `role` empty. A
+    /// version that took the name and stuffed it onto `sender` (or
+    /// `user_id`) would change what existing audit readers parse — keep it
+    /// that way.
+    ///
+    /// Written against the post-fix API (`surface()` with zero args). It will
+    /// fail to compile against the pre-fix `surface(_name: &str)` signature;
+    /// that compile failure is the expected red, and the implementation step
+    /// drops the parameter to turn it green.
+    #[test]
+    fn audit_actor_surface_returns_default_and_takes_no_argument() {
+        let actor = AuditActor::surface();
+        assert!(
+            actor.sender.is_none(),
+            "surface() must leave sender empty, got {:?}",
+            actor.sender
+        );
+        assert!(
+            actor.role.is_none(),
+            "surface() must leave role empty, got {:?}",
+            actor.role
+        );
+        let default = AuditActor::default();
+        assert_eq!(actor.sender, default.sender);
+        assert_eq!(actor.role, default.role);
+    }
+
+    /// Every production call site must have been migrated to the new
+    /// zero-argument form. Slicing the `#[cfg(test)]` module off first so
+    /// this assertion cannot match itself.
+    ///
+    /// Mutation: restore one call site to `AuditActor::surface("cli")` —
+    /// the substring assertion finds it and the test falls.
+    #[test]
+    fn no_production_call_site_passes_an_argument_to_audit_actor_surface() {
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod ";
+        fn production_half(src: &str) -> &str {
+            let cut = [TEST_MODULE_MARKER]
+                .iter()
+                .flat_map(|marker| src.match_indices(marker))
+                .map(|(at, _)| at)
+                .min()
+                .unwrap_or(src.len());
+            &src[..cut]
+        }
+        const SOURCE_FILES: &[(&str, &str)] = &[
+            ("agent/loop_.rs", include_str!("../agent/loop_.rs")),
+            ("agent/agent.rs", include_str!("../agent/agent.rs")),
+            ("gateway/mod.rs", include_str!("../gateway/mod.rs")),
+            ("tools/delegate.rs", include_str!("../tools/delegate.rs")),
+        ];
+        for (name, src) in SOURCE_FILES {
+            let production = production_half(src);
+            assert!(
+                !production.contains("AuditActor::surface(\""),
+                "production of {name} still calls AuditActor::surface(\"...\"); \
+                 drop the argument — the surface name is already on `channel`"
+            );
+        }
+    }
+
+    /// The 4-line comment above the `audit_actor` parameter in
+    /// `loop_.rs::execute_structured_tool_calls` once claimed the executor
+    /// derived `"guest"` from `guest_gate` when the caller left the role
+    /// empty. No such derivation exists — `role` is whatever the caller
+    /// passed (chat sets it at `channels/dispatch.rs:761`). Pin that no
+    /// `audit_actor` doc block in `loop_.rs` makes the derivation claim
+    /// or mentions `guest_gate`.
+    ///
+    /// Mutation: restore the derivation claim in any of the four
+    /// `// Identity of who asked for the call.` doc blocks — the substring
+    /// assertion finds it and the test falls.
+    #[test]
+    fn loop_rs_no_longer_claims_executor_derives_guest_role_from_gate() {
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod ";
+        fn production_half(src: &str) -> &str {
+            let cut = [TEST_MODULE_MARKER]
+                .iter()
+                .flat_map(|marker| src.match_indices(marker))
+                .map(|(at, _)| at)
+                .min()
+                .unwrap_or(src.len());
+            &src[..cut]
+        }
+        let production = production_half(include_str!("../agent/loop_.rs"));
+
+        // The loop has several `audit_actor` parameter doc blocks that all
+        // start with `// Identity of who asked for the call.` Walk every one
+        // and assert none of them claims derivation or names the gate.
+        let start_marker = "// Identity of who asked for the call.";
+        let mut search_from = 0usize;
+        let mut blocks_checked = 0usize;
+        while let Some(rel) = production[search_from..].find(start_marker) {
+            let block_start = search_from + rel;
+            // End of the doc block: the next `audit_actor:` parameter line.
+            let after = &production[block_start..];
+            let end_rel = after
+                .find("audit_actor: &crate::security::AuditActor")
+                .unwrap_or(after.len());
+            let doc_block = &after[..end_rel];
+            blocks_checked += 1;
+            assert!(
+                !doc_block.contains("derives"),
+                "an audit_actor doc block still claims the executor derives a \
+                 role; delete the derivation claim — no such code exists. \
+                 Block: {doc_block:?}"
+            );
+            assert!(
+                !doc_block.contains("guest_gate"),
+                "an audit_actor doc block still mentions guest_gate; the \
+                 parameter is independent of the gate. Block: {doc_block:?}"
+            );
+            search_from = block_start + start_marker.len();
+        }
+        assert!(
+            blocks_checked > 0,
+            "expected at least one `// Identity of who asked for the call.` \
+             doc block in loop_.rs; the test would silently pass on a delete"
+        );
     }
 }
