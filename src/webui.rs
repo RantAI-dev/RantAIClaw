@@ -157,6 +157,10 @@ fn spawn_detached(cmd: &mut Command, log: &Path) -> Result<u32> {
 pub(crate) struct GatewayIdentity {
     name: String,
     version: String,
+    /// Short git commit (or ISO-8601 timestamp fallback) emitted by `build.rs`
+    /// as `RANTAICLAW_BUILD_ID`. Lets `status` detect a daemon running an older
+    /// binary even when `version` is identical between releases.
+    build: String,
     config_fingerprint: String,
 }
 
@@ -199,6 +203,7 @@ mod gateway_action_tests {
         Some(GatewayIdentity {
             name: "rantaiclaw".into(),
             version: v.into(),
+            build: "x".into(),
             config_fingerprint: fp.into(),
         })
     }
@@ -236,6 +241,7 @@ mod gateway_action_tests {
         let other = Some(GatewayIdentity {
             name: "vite".into(),
             version: "x".into(),
+            build: "x".into(),
             config_fingerprint: "y".into(),
         });
         assert_eq!(
@@ -256,10 +262,19 @@ mod gateway_action_tests {
 mod version_status_tests {
     use super::*;
 
+    /// Default helper. Sets `build` to whatever `RANTAICLAW_BUILD_ID` was at
+    /// test compile time so the version-match-with-matching-build case stays
+    /// silent (matches the old version-only behaviour the existing tests pin).
+    /// Tests that need a specific build value use `ident_with_build`.
     fn ident(v: &str) -> Option<GatewayIdentity> {
+        ident_with_build(v, env!("RANTAICLAW_BUILD_ID"))
+    }
+
+    fn ident_with_build(v: &str, b: &str) -> Option<GatewayIdentity> {
         Some(GatewayIdentity {
             name: "rantaiclaw".into(),
             version: v.into(),
+            build: b.into(),
             config_fingerprint: "x".into(),
         })
     }
@@ -315,6 +330,115 @@ mod version_status_tests {
         assert!(
             !leak,
             "the unreachable line must not print a version-shaped token, got: {out:?}"
+        );
+    }
+
+    /// A daemon on the same version string but a different build id (typical
+    /// after `cargo install --path .` without restarting the daemon) must
+    /// produce a mismatch line that names the build — without this, F-4 slips
+    /// through and `status` stays silent on a real binary drift.
+    #[test]
+    fn matching_version_with_different_build_prints_build_mismatch() {
+        let out = version_status_line(
+            "1.2.3",
+            ident_with_build("1.2.3", "deadbeef").as_ref(),
+            "127.0.0.1",
+            3939,
+        )
+        .expect("same version with a different build must produce a line");
+        assert!(
+            out.contains("deadbeef"),
+            "the line must name the daemon's build, got: {out:?}"
+        );
+        assert!(
+            out.contains(env!("RANTAICLAW_BUILD_ID")),
+            "the line must name the CLI's build, got: {out:?}"
+        );
+        assert!(
+            out.contains("service restart"),
+            "the line must point the operator at the restart command, got: {out:?}"
+        );
+        // The build mismatch line must not be ambiguous about which axis
+        // drifted: naming the version alongside a build drift would mislead
+        // the operator.
+        assert!(
+            !out.contains("version"),
+            "a build-only mismatch must not mention `version`, got: {out:?}"
+        );
+    }
+
+    /// Same version AND same build → silent. This is the steady-state case
+    /// after a successful restart.
+    #[test]
+    fn matching_version_and_build_says_nothing() {
+        let out = version_status_line(
+            "1.2.3",
+            ident_with_build("1.2.3", env!("RANTAICLAW_BUILD_ID")).as_ref(),
+            "127.0.0.1",
+            3939,
+        );
+        assert!(
+            out.is_none(),
+            "matching version and build is the steady state, must be silent, got: {out:?}"
+        );
+    }
+
+    /// A daemon that doesn't report a build (older gateway, or curl with a
+    /// cached response from before the field shipped) must not be flagged as
+    /// drifted — we have no build to compare, so fall back to the version-only
+    /// comparison. Empty build is the sentinel for "no build field".
+    #[test]
+    fn gateway_without_build_falls_back_to_version_only_comparison() {
+        let out = version_status_line(
+            "1.2.3",
+            ident_with_build("1.2.3", "").as_ref(),
+            "127.0.0.1",
+            3939,
+        );
+        assert!(
+            out.is_none(),
+            "a gateway with no build field must keep today's version-only behaviour \
+             (silent on version match), got: {out:?}"
+        );
+
+        // And the reverse: no build field + version mismatch still flags the
+        // version mismatch (no silent fallback for real drift).
+        let out = version_status_line(
+            "1.2.3",
+            ident_with_build("0.9.7", "").as_ref(),
+            "127.0.0.1",
+            3939,
+        )
+        .expect("version mismatch with no build field must still flag the version");
+        assert!(
+            out.contains("0.9.7"),
+            "must name the daemon's version, got: {out:?}"
+        );
+        assert!(
+            out.contains("1.2.3"),
+            "must name the CLI's version, got: {out:?}"
+        );
+    }
+
+    /// Version mismatch dominates build: when the daemon is on a different
+    /// version, the line names the version even if the build also differs.
+    /// Two axes of drift can confuse the operator about which one matters.
+    #[test]
+    fn different_version_naming_takes_priority_over_build() {
+        let out = version_status_line(
+            "1.2.3",
+            ident_with_build("0.9.7", "deadbeef").as_ref(),
+            "127.0.0.1",
+            3939,
+        )
+        .expect("a daemon on a different version must produce a line");
+        assert!(
+            out.contains("0.9.7"),
+            "the line must name the daemon's version, got: {out:?}"
+        );
+        assert!(
+            out.contains("1.2.3"),
+            "the line must name the CLI's version, got: {out:?}"
         );
     }
 }
@@ -526,6 +650,11 @@ pub(crate) fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<Gate
                         return Some(GatewayIdentity {
                             name: name.to_string(),
                             version: version.to_string(),
+                            build: v
+                                .get("build")
+                                .and_then(|b| b.as_str())
+                                .unwrap_or("none")
+                                .to_string(),
                             config_fingerprint: v
                                 .get("config_fingerprint")
                                 .and_then(|f| f.as_str())
@@ -544,6 +673,14 @@ pub(crate) fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<Gate
 /// the running daemon's version differs from the CLI (or the daemon is
 /// unreachable). Returns `None` when there's nothing useful to add — the title
 /// already shows the CLI's version, so a match is silent by design.
+///
+/// Build id is the tie-breaker when the version string is identical (every
+/// `main` build between releases carries the same `CARGO_PKG_VERSION`): if the
+/// daemon's build id is set and differs from the CLI's, we flag the drift so
+/// `cargo install --path .` without a restart no longer stays silent. A gateway
+/// that doesn't report a build (older binary, or before this field shipped)
+/// falls back to the version-only comparison — `id.build.is_empty()` is the
+/// sentinel for "no build field".
 pub(crate) fn version_status_line(
     cli_version: &str,
     gw: Option<&GatewayIdentity>,
@@ -551,14 +688,28 @@ pub(crate) fn version_status_line(
     gw_port: u16,
 ) -> Option<String> {
     match gw {
-        Some(id) if id.version == cli_version => None,
+        None => Some(format!(
+            "the running daemon is not reachable on http://{gw_host}:{gw_port} — `rantaiclaw status` cannot compare versions."
+        )),
+        Some(id) if id.version == cli_version => {
+            // Version matches. Compare builds only if the gateway actually
+            // reported one; an empty `build` keeps today's version-only
+            // behaviour (silent on match).
+            let cli_build = option_env!("RANTAICLAW_BUILD_ID").unwrap_or("unknown");
+            if id.build.is_empty() || id.build == cli_build {
+                None
+            } else {
+                Some(format!(
+                    "the running daemon reports build {}, but this CLI is build {}; \
+                     run `rantaiclaw service restart` to run the installed build",
+                    id.build, cli_build
+                ))
+            }
+        }
         Some(id) => Some(format!(
             "the running daemon reports version {}, but this CLI is {}; run \
              `rantaiclaw service restart` to run the installed build",
             id.version, cli_version
-        )),
-        None => Some(format!(
-            "the running daemon is not reachable on http://{gw_host}:{gw_port} — `rantaiclaw status` cannot compare versions."
         )),
     }
 }
