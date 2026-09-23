@@ -1097,7 +1097,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         ledger,
-        &crate::security::AuditActor::surface("channel"),
+        &crate::security::AuditActor::surface(),
     )
     .await
 }
@@ -1294,7 +1294,7 @@ pub(crate) async fn execute_one_tool_structured(
     // could not prove that anybody had approved anything.
     approval_outcome: crate::security::ApprovalOutcome,
     // Identity of who asked for the call. Chat sends a sender id + role
-    // (owner or guest); non-chat surfaces send `AuditActor::surface(name)`
+    // (owner or guest); non-chat surfaces send `AuditActor::surface()`
     // and the audit carries `user_id = None`, `role = None`.
     audit_actor: &crate::security::AuditActor,
 ) -> Result<ToolExecutionResult> {
@@ -1447,10 +1447,9 @@ pub(crate) async fn execute_tool_calls_collecting(
     parallel: bool,
     cancellation_token: Option<&CancellationToken>,
     events: Option<&AgentEventSender>,
-    // Identity of who asked for the call. When `guest_gate` is set and the
-    // caller did not already fill `audit_actor.role`, the executor derives
-    // `"guest"` from the gate being armed — so a guest turn cannot accidentally
-    // be recorded as owner-less but role-less in the trail.
+    // Identity of who asked for the call. `role` is whatever the caller
+    // passed — chat sets it in `channels/dispatch.rs`, non-chat callers
+    // pass `AuditActor::surface()` and leave it empty.
     audit_actor: &crate::security::AuditActor,
 ) -> Result<Vec<ToolExecutionResult>> {
     // A guest turn must run serially so every call passes the gate below; the
@@ -1790,7 +1789,7 @@ pub(crate) async fn run_structured_loop(
     ledger: Option<&crate::cost::CostTracker>,
     // Identity of who asked for the call. Passed through to the executor and
     // then on to the audit log; chat sends a sender + role, non-chat surfaces
-    // pass `AuditActor::surface(name)`.
+    // pass `AuditActor::surface()`.
     audit_actor: &crate::security::AuditActor,
 ) -> Result<(String, Option<crate::providers::ProviderUsage>)> {
     // The daily ceiling, checked before the turn does any work. This is the
@@ -2170,7 +2169,7 @@ pub(crate) async fn run_tool_call_loop(
     events: Option<AgentEventSender>,
     ledger: Option<&crate::cost::CostTracker>,
     // Identity of who asked for the call. Threaded through to the audit log;
-    // chat sends a sender + role, non-chat surfaces pass `AuditActor::surface(name)`.
+    // chat sends a sender + role, non-chat surfaces pass `AuditActor::surface()`.
     audit_actor: &crate::security::AuditActor,
 ) -> Result<String> {
     let dispatcher: Box<dyn ToolDispatcher> = if provider.supports_native_tools() {
@@ -2783,7 +2782,7 @@ pub async fn run_with_scope(
             None,
             None,
             ledger.as_deref(),
-            &crate::security::AuditActor::surface(surface),
+            &crate::security::AuditActor::surface(),
         )
         .await?;
         final_output = response.clone();
@@ -2941,7 +2940,7 @@ pub async fn run_with_scope(
                 None,
                 None,
                 ledger.as_deref(),
-                &crate::security::AuditActor::surface("cli"),
+                &crate::security::AuditActor::surface(),
             )
             .await
             {
@@ -3625,7 +3624,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::security::AuditActor::surface("cli"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3677,7 +3676,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::security::AuditActor::surface("cli"),
+            &crate::security::AuditActor::surface(),
         )
         .await;
 
@@ -3734,7 +3733,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::security::AuditActor::surface("cli"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3778,7 +3777,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::security::AuditActor::surface("cli"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3909,7 +3908,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::security::AuditActor::surface("telegram"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect("parallel execution should complete");
@@ -4052,7 +4051,7 @@ mod tests {
             false,
             None,
             None,
-            &crate::security::AuditActor::surface("telegram"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect("batch completes");
@@ -4076,7 +4075,7 @@ mod tests {
             false,
             None,
             None,
-            &crate::security::AuditActor::surface("telegram"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect("batch completes");
@@ -4168,7 +4167,7 @@ mod tests {
             false,
             None,
             None,
-            &crate::security::AuditActor::surface("telegram"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect("batch completes");
@@ -4298,7 +4297,7 @@ mod tests {
             false,
             None,
             None,
-            &crate::security::AuditActor::surface("telegram"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .unwrap();
@@ -4335,7 +4334,7 @@ mod tests {
             false,
             None,
             None,
-            &crate::security::AuditActor::surface("telegram"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .unwrap();
@@ -4404,7 +4403,7 @@ mod tests {
             false,
             Some(&token),
             None,
-            &crate::security::AuditActor::surface("telegram"),
+            &crate::security::AuditActor::surface(),
         )
         .await;
 
@@ -4452,7 +4451,7 @@ mod tests {
             false,
             None,
             None,
-            &crate::security::AuditActor::surface("telegram"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .unwrap();
@@ -5883,7 +5882,7 @@ Let me check the result."#;
             None,
             None,
             ledger,
-            &crate::security::AuditActor::surface("cli"),
+            &crate::security::AuditActor::surface(),
         )
         .await
     }
@@ -5986,7 +5985,7 @@ Let me check the result."#;
             None,            // on_delta: None
             Some(events_tx), // events: Some
             None,
-            &crate::security::AuditActor::surface("test"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect("loop succeeds");
@@ -6089,7 +6088,7 @@ Let me check the result."#;
             None,
             Some(events_tx),
             None,
-            &crate::security::AuditActor::surface("test"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect("loop succeeds");
@@ -6188,7 +6187,7 @@ Let me check the result."#;
             None,
             Some(events_tx),
             None,
-            &crate::security::AuditActor::surface("test"),
+            &crate::security::AuditActor::surface(),
         )
         .await;
         assert!(res.is_err(), "expected cancellation error");
@@ -6241,7 +6240,7 @@ Let me check the result."#;
             None,
             Some(events_tx),
             None,
-            &crate::security::AuditActor::surface("test"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .unwrap();
@@ -6294,7 +6293,7 @@ Let me check the result."#;
             None,
             Some(events_tx),
             None,
-            &crate::security::AuditActor::surface("test"),
+            &crate::security::AuditActor::surface(),
         )
         .await
         .expect("loop completes");

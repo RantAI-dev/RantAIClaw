@@ -1724,7 +1724,6 @@ mod tests {
 
         // The seed's result must actually be assigned to `last_ts` — a fetch
         // that never reaches the cursor is the same bug as no fetch at all.
-        // is supposed to flip when the seed assignment is removed.
         assert!(
             body.contains("last_ts = ts.to_string()"),
             "the seed must write the fetched `ts` into `last_ts`, or the cursor \
@@ -1748,6 +1747,39 @@ mod tests {
         assert!(
             body.contains("(\"oldest\", last_ts.clone())"),
             "the first poll must ask Slack for messages since `last_ts`"
+        );
+    }
+
+    /// The polling seed test above was checked in (#852) with a half-sentence
+    /// `// is supposed to flip when the seed assignment is removed.` dangling
+    /// inside the test module under the `last_ts = ts.to_string()` assertion.
+    /// The full sentence it implied was untrue (the assertion checks the
+    /// assignment IS in the body, not that it would flip if removed), so plan
+    /// 421 deletes the dangling line. Pin that the half-sentence does not
+    /// return as a comment line anywhere in this file.
+    ///
+    /// We scan whole-file line-by-line rather than slicing at `#[cfg(test)]`
+    /// because the half-sentence lived INSIDE the test module, not in
+    /// production, and a substring check would catch this test's own
+    /// docstring (which quotes the half-sentence inside backticks). Matching
+    /// the line exactly — the dangling comment had no leading whitespace —
+    /// avoids that.
+    ///
+    /// Mutation: re-add the half-sentence as a `// is supposed to flip when
+    /// the seed assignment is removed.` line above the `last_ts = ts.to_string()`
+    /// assertion — the line match fires and the test falls.
+    #[test]
+    fn polling_seed_test_has_no_dangling_half_sentence() {
+        let src = include_str!("slack.rs");
+        let offender = src.lines().find(|line| {
+            line.trim() == "// is supposed to flip when the seed assignment is removed."
+        });
+        assert!(
+            offender.is_none(),
+            "the half-sentence comment from the polling-seed test has leaked \
+             back into slack.rs at line {:?}; delete it — it does not describe \
+             what the test above asserts",
+            offender
         );
     }
 

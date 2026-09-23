@@ -714,6 +714,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries the `files:read` consequence sentence (what the scope does and what happens without it)
   so both the wizard and the provisioner render it. The provisioner is unchanged; only the constant
   and the wizard's renderer move.
+- **Three audit-trail comments now describe what the code does.** Round-2 review of #853 and #852
+  found three comments that pointed at behaviour that did not exist. The 4-line doc on the
+  `audit_actor` parameter in `src/agent/loop_.rs::execute_tool_calls_collecting` claimed the
+  executor derived `"guest"` from `guest_gate` when the caller left `audit_actor.role` empty — no
+  such derivation exists, `role` is whatever the caller passed. The doc on `AuditActor` in
+  `src/security/audit.rs` said non-chat surfaces record their surface name as `user_id`, while
+  `AuditActor::surface()` ignored its `_name` argument and returned `Self::default()`. And the
+  polling-seed test in `src/channels/slack.rs` (added in #852) carried a half-sentence that did
+  not describe what its assertion actually checks. The doc on `AuditActor` and the doc on
+  `AuditActor::surface` now say what the code does — non-chat surfaces record the surface name on
+  `channel` only, so `sender` and `role` stay empty — and the constructor drops its unused
+  parameter; the 21 call sites in `src/agent/loop_.rs`, two in `src/agent/agent.rs`, and one each in
+  `src/gateway/mod.rs` and `src/tools/delegate.rs` were updated to match. The derivation claim in
+  `loop_.rs` is gone, the doc comments around `audit_actor` parameter blocks now say `role` is
+  whatever the caller passed, and the half-sentence in the slack test is removed. No audit-record
+  shape change.
 
 ### Security
 
