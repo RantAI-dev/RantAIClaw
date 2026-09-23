@@ -581,6 +581,19 @@ impl Channel for WhatsAppChannel {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
+
+    /// WhatsApp Cloud has no typing-indicator API; the trait default is the
+    /// right behaviour here, but it lives in `traits.rs` and would silently
+    /// win against `Arc<dyn Channel>` if this override were missing. The
+    /// explicit no-op makes the intent visible to the trait-method guard.
+    async fn start_typing(&self, _recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Pairs with the no-op `start_typing` above — same reason.
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
