@@ -1884,19 +1884,29 @@ pub fn apply_runtime_proxy_to_blocking_builder(
     runtime_proxy_config().apply_to_blocking_reqwest_builder(builder, service_key)
 }
 
-pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
-    let cache_key = runtime_proxy_cache_key(service_key, None, None);
-    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
-        return client;
-    }
+/// Default per-request timeout (seconds) for the unparameterised
+/// [`build_runtime_proxy_client`]. 120 matches the provider HTTP clients
+/// (`openai`, `anthropic`, `copilot`, `openrouter`, `bedrock`, `glm`,
+/// `gemini`, `compatible`) — the channel callers below (`telegram`,
+/// `discord`, `slack`, `mattermost`, `lark`, `dingtalk`, `qq`, `whatsapp`,
+/// `whatsapp_http`, `tunnel.custom`, `tool.browser`, `memory.embeddings`)
+/// each send one request at a time and would not benefit from a shorter
+/// bound, while a hung upstream must not hold the dispatch loop forever.
+/// A previous version of this builder left the timeout unbounded, so a
+/// silent peer could pin the listener indefinitely.
+pub(crate) const DEFAULT_PROXY_REQUEST_TIMEOUT_SECS: u64 = 120;
 
-    let builder = apply_runtime_proxy_to_builder(reqwest::Client::builder(), service_key);
-    let client = builder.build().unwrap_or_else(|error| {
-        tracing::warn!(service_key, "Failed to build proxied client: {error}");
-        reqwest::Client::new()
-    });
-    set_runtime_proxy_cached_client(cache_key, client.clone());
-    client
+/// Default connect timeout (seconds). 10s matches the providers above and
+/// leaves room for a cold TLS handshake before the per-request timer
+/// starts ticking.
+pub(crate) const DEFAULT_PROXY_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
+    build_runtime_proxy_client_with_timeouts(
+        service_key,
+        DEFAULT_PROXY_REQUEST_TIMEOUT_SECS,
+        DEFAULT_PROXY_CONNECT_TIMEOUT_SECS,
+    )
 }
 
 pub fn build_runtime_proxy_client_with_timeouts(
@@ -8365,7 +8375,11 @@ default_model = "legacy-model"
                 .expect("system clock should be after unix epoch")
                 .as_nanos()
         );
-        let cache_key = runtime_proxy_cache_key(&service_key, None, None);
+        let cache_key = runtime_proxy_cache_key(
+            &service_key,
+            Some(DEFAULT_PROXY_REQUEST_TIMEOUT_SECS),
+            Some(DEFAULT_PROXY_CONNECT_TIMEOUT_SECS),
+        );
 
         clear_runtime_proxy_client_cache();
         assert!(!runtime_proxy_cache_contains(&cache_key));
@@ -8394,6 +8408,90 @@ default_model = "legacy-model"
 
         set_runtime_proxy_config(ProxyConfig::default());
         assert!(!runtime_proxy_cache_contains(&cache_key));
+    }
+
+    /// `build_runtime_proxy_client` used to leave the timeout unbounded, so
+    /// a silent peer could pin the dispatch loop indefinitely. The default
+    /// builder now goes through `build_runtime_proxy_client_with_timeouts`
+    /// with [`DEFAULT_PROXY_REQUEST_TIMEOUT_SECS`] /
+    /// [`DEFAULT_PROXY_CONNECT_TIMEOUT_SECS`], which is observable through
+    /// the cache key (the unbounded key has `none|none`; the bounded one
+    /// has the timeout pair).
+    #[test]
+    async fn runtime_proxy_default_builder_carries_bounded_timeouts() {
+        let service_key = format!(
+            "provider.default_timeout_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+
+        clear_runtime_proxy_client_cache();
+        let _ = build_runtime_proxy_client(&service_key);
+
+        let bounded_key = runtime_proxy_cache_key(
+            &service_key,
+            Some(DEFAULT_PROXY_REQUEST_TIMEOUT_SECS),
+            Some(DEFAULT_PROXY_CONNECT_TIMEOUT_SECS),
+        );
+        let unbounded_key = runtime_proxy_cache_key(&service_key, None, None);
+        assert!(
+            runtime_proxy_cache_contains(&bounded_key),
+            "default builder no longer uses the bounded cache key — drop in timeout means \
+             the dispatch loop can hang on a silent upstream"
+        );
+        assert!(
+            !runtime_proxy_cache_contains(&unbounded_key),
+            "default builder cached under the unbounded key — the timeout fix regressed"
+        );
+    }
+
+    /// End-to-end check on the same code path: a request from a bounded
+    /// client to a listener that accepts but never replies fails within
+    /// the request timeout plus a small margin. Uses a one-second bound
+    /// so the test stays fast; the production defaults are 120/10 but
+    /// they share the `_with_timeouts` builder, so a regression here is
+    /// a regression for the default builder too.
+    #[tokio::test]
+    async fn runtime_proxy_bounded_client_fails_within_the_bound() {
+        // Bind a listener that accepts the TCP connection but never writes
+        // a response, so the request hangs on the read. The thread detaches
+        // so the test does not block on its own teardown — the OS reclaims
+        // the listener when the test process exits.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local listener");
+        let local_addr = listener.local_addr().expect("listener local addr");
+        std::thread::spawn(move || {
+            if let Some(Ok(stream)) = listener.incoming().next() {
+                // Hold the socket open until the OS reaps the process.
+                // The client read times out long before this sleep ends.
+                let _hold = stream;
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+
+        let service_key = format!(
+            "provider.hang_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        clear_runtime_proxy_client_cache();
+        let client = build_runtime_proxy_client_with_timeouts(&service_key, 1, 1);
+
+        let started = std::time::Instant::now();
+        let outcome = client.get(format!("http://{local_addr}/")).send().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "bounded client to a silent listener must fail, got: {outcome:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "request took {elapsed:?}, the 1s request timeout did not apply"
+        );
     }
 
     #[test]
