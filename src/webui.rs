@@ -420,6 +420,43 @@ mod version_status_tests {
         );
     }
 
+    /// End-to-end through the JSON parser: a payload that omits the `build`
+    /// field must parse to a `GatewayIdentity` whose `build` is the empty
+    /// sentinel, and `version_status_line` must stay silent on a version
+    /// match. This is the regression test for the previous sentinel
+    /// mismatch — the parser used to emit `"none"` (non-empty), which made
+    /// `version_status_line` fall through to `id.build == cli_build` and
+    /// print a spurious mismatch line on every old gateway.
+    #[test]
+    fn json_without_build_key_parses_to_empty_sentinel_and_status_is_silent() {
+        // Mirror what an older gateway emits: no `build` key, only
+        // `name` + `version` + `config_fingerprint`. Driven through
+        // `parse_identity_from_json` so the test exercises the same code
+        // path `probe_gateway_identity` uses.
+        let payload = serde_json::json!({
+            "name": "rantaiclaw",
+            "version": "1.2.3",
+            "config_fingerprint": "x",
+        });
+        let id = parse_identity_from_json(&payload)
+            .expect("a gateway payload with name + version must parse");
+        assert!(
+            id.build.is_empty(),
+            "missing `build` key must map to the empty-string sentinel \
+             (so `version_status_line`'s `is_empty()` check fires and we \
+             fall back to the version-only comparison); got: {:?}",
+            id.build
+        );
+
+        // End-to-end: silent on a version match.
+        let out = version_status_line("1.2.3", Some(&id), "127.0.0.1", 3939);
+        assert!(
+            out.is_none(),
+            "a gateway with no `build` field must keep today's \
+             version-only behaviour (silent on match), got: {out:?}"
+        );
+    }
+
     /// Version mismatch dominates build: when the daemon is on a different
     /// version, the line names the version even if the build also differs.
     /// Two axes of drift can confuse the operator about which one matters.
@@ -629,6 +666,34 @@ mod tests {
     }
 }
 
+/// Parse a `GET /api/v1/version` payload into a `GatewayIdentity`. `name` and
+/// `version` are required; `build` and `config_fingerprint` are optional and
+/// map to `""` when absent. The empty string is the sentinel `version_status_line`
+/// already relies on (`id.build.is_empty()`) to mean "no build field, fall
+/// back to the version-only comparison" — keeping that mapping in one place
+/// avoids the previous drift where the parser used `"none"` and the consumer
+/// checked `is_empty()`. The gateway itself never emits an empty `build` (it
+/// uses `option_env!("RANTAICLAW_BUILD_ID").unwrap_or("unknown")`), so `""`
+/// is unambiguously the "missing" sentinel.
+fn parse_identity_from_json(v: &serde_json::Value) -> Option<GatewayIdentity> {
+    let name = v.get("name").and_then(|x| x.as_str())?;
+    let version = v.get("version").and_then(|x| x.as_str())?;
+    Some(GatewayIdentity {
+        name: name.to_string(),
+        version: version.to_string(),
+        build: v
+            .get("build")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string(),
+        config_fingerprint: v
+            .get("config_fingerprint")
+            .and_then(|f| f.as_str())
+            .unwrap_or("none")
+            .to_string(),
+    })
+}
+
 /// GET http://host:port/api/v1/version via curl, parse the identity. Retries
 /// once (the gateway may be momentarily busy). `None` on repeated failure.
 pub(crate) fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<GatewayIdentity> {
@@ -643,24 +708,8 @@ pub(crate) fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<Gate
         if let Ok(out) = out {
             if out.status.success() {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    if let (Some(name), Some(version)) = (
-                        v.get("name").and_then(|x| x.as_str()),
-                        v.get("version").and_then(|x| x.as_str()),
-                    ) {
-                        return Some(GatewayIdentity {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            build: v
-                                .get("build")
-                                .and_then(|b| b.as_str())
-                                .unwrap_or("none")
-                                .to_string(),
-                            config_fingerprint: v
-                                .get("config_fingerprint")
-                                .and_then(|f| f.as_str())
-                                .unwrap_or("none")
-                                .to_string(),
-                        });
+                    if let Some(id) = parse_identity_from_json(&v) {
+                        return Some(id);
                     }
                 }
             }
