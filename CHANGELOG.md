@@ -704,6 +704,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Arc<dyn Channel>`. The `None` default is kept for every other channel and for both of these
   before they learn their identity, so a bot that has never looked up its own identity answers no
   addressed command at all. No config key, schema stays at 32.
+- **The Slack wizard's Slack setup step reads as one numbered bullet again.** When the wizard's
+  inline checklist was replaced by the shared constant, the step lost its number: the wizard
+  printed "1.", then a multi-line `print_bullet` for the checklist (which only indented the first
+  line), then "3." — step "2." was missing and the body lines collapsed into the surrounding output.
+  The wizard now calls a small `print_step_block` / `render_step_block` helper in
+  `src/onboard/wizard.rs`, which prefixes the bullet with "› 2. Configure the Slack app" and
+  indents every body line under the title. The shared `SLACK_SETUP_CHECKLIST` constant also now
+  carries the `files:read` consequence sentence (what the scope does and what happens without it)
+  so both the wizard and the provisioner render it. The provisioner is unchanged; only the constant
+  and the wizard's renderer move.
 
 ### Security
 
