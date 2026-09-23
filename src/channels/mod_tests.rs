@@ -948,8 +948,9 @@ use crate::observability::NoopObserver;
 use crate::providers::{ChatMessage, Provider};
 use crate::tools::{Tool, ToolResult};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// An owner turn must tell the model the sender is a verified owner so a

@@ -3,9 +3,7 @@
 use super::super::traits::{
     ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner,
 };
-use crate::config::schema::{
-    CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TunnelConfig,
-};
+use crate::config::schema::{CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig};
 use crate::config::Config;
 use crate::onboard::provision::io::{recv_selection, recv_text, send};
 use crate::onboard::provision::validate::process::validate_command_on_path;

@@ -12,7 +12,7 @@
 //! tools-disabled provider call pattern (same shape as
 //! `force_final_summary` in `loop_.rs`) — no new networking surface.
 
-use crate::providers::{ChatMessage, ChatRequest, ConversationMessage, ToolCall};
+use crate::providers::{ChatMessage, ConversationMessage, ToolCall};
 
 /// System prompt that ships with every compaction request. Kept here
 /// rather than at the call site so all callers get the same shape.
