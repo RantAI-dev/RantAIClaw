@@ -19,8 +19,19 @@ if [ -z "$BASE_SHA" ] || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; the
     exit 1
 fi
 
+# Collect Rust files from BOTH the committed diff (BASE_SHA..HEAD) AND the
+# working tree. Without the working-tree leg, an uncommitted Rust edit
+# produces no candidate files at all, the gate prints "skipping" and exits
+# 0 silently — a silent pass that checked nothing. `git diff --name-only HEAD`
+# covers staged and unstaged modifications to tracked files (untracked files
+# have no base lines to compare against, so they stay out of scope).
 if [ -z "$RUST_FILES_RAW" ]; then
-    RUST_FILES_RAW="$(git diff --name-only "$BASE_SHA" HEAD | awk '/\.rs$/ { print }')"
+    RUST_FILES_RAW="$(
+        {
+            git diff --name-only "$BASE_SHA" HEAD
+            git diff --name-only HEAD
+        } | awk '/\.rs$/' | sort -u
+    )"
 fi
 
 ALL_FILES=()
@@ -66,15 +77,10 @@ files = sys.argv[2:]
 hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 changed = {}
 
-for path in files:
-    proc = subprocess.run(
-        ["git", "diff", "--unified=0", base, "HEAD", "--", path],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+
+def parse_ranges(diff_stdout: str) -> list:
     ranges = []
-    for line in proc.stdout.splitlines():
+    for line in diff_stdout.splitlines():
         match = hunk.match(line)
         if not match:
             continue
@@ -82,13 +88,53 @@ for path in files:
         count = int(match.group(2) or "1")
         if count > 0:
             ranges.append([start, start + count - 1])
-    changed[path] = ranges
+    return ranges
+
+
+def has_working_tree_changes(path: str) -> bool:
+    proc = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD", "--", path],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return bool(proc.stdout.strip())
+
+
+def file_line_count(path: str) -> int:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+for path in files:
+    # If the file has uncommitted (working-tree) modifications, the precise
+    # ranges from BASE_SHA..HEAD do not cover the WIP edit. Coalesce the
+    # whole file into a single range so any lint in the file is "blocking".
+    # This is coarser than Option A (which would walk HEAD vs working tree
+    # and merge ranges), but it satisfies the "include them in the diff"
+    # requirement without cascading changes into the classifier below —
+    # the classifier only consumes `changed[path]` ranges.
+    if has_working_tree_changes(path):
+        line_count = file_line_count(path)
+        changed[path] = [[1, line_count]] if line_count > 0 else []
+        continue
+
+    proc = subprocess.run(
+        ["git", "diff", "--unified=0", base, "HEAD", "--", path],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    changed[path] = parse_ranges(proc.stdout)
 
 print(json.dumps(changed))
 PY
 
 set +e
-cargo clippy --quiet --locked --all-targets --message-format=json -- -D warnings >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
+cargo clippy --quiet --locked --all-targets --keep-going --message-format=json -- -D warnings >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
 CLIPPY_EXIT=$?
 set -e
 
