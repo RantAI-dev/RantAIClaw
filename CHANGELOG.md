@@ -18,7 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to run the installed build. An unreachable daemon prints that fact, with the URL it tried,
   instead of a version claim; a daemon whose version matches the CLI's is silent, since the title
   already names the CLI version.
-  Only version strings are compared, so a rebuild that keeps the same version is not detected.
+- **`rantaiclaw status` detects a rebuild that kept the same version.** The version-comparison
+  bullet above compares version strings only, so a `cargo install` from a newer `main` left
+  the daemon on the old binary and `status` stayed silent. The gateway now reports a build
+  id (short git commit, or an ISO-8601 UTC timestamp when git is absent) beside `version` on
+  `/api/v1/version`; the CLI carries the same id (from `build.rs` at compile time) and
+  compares them. On a same-version / different-build mismatch `status` prints one line
+  naming both ids and pointing at `rantaiclaw service restart`. A gateway that does not
+  send the field falls back to version-only behaviour. The build id is never printed in
+  the title line.
 - **A scheduled job reaches every usable channel and the same live client.** The scheduler only
   accepted the three channels the announce gate hand-listed; on every other usable channel it
   refused the job, even when `factory::build_one` would have constructed one and the running
