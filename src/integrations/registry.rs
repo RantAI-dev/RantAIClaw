@@ -70,6 +70,20 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             },
         },
         IntegrationEntry {
+            name: "WhatsApp Web",
+            description: "Multi-device session via wa-rs",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if !crate::channels::channel_is_usable("whatsapp_web") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.whatsapp_web.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
             name: "Signal",
             description: "Privacy-focused via signal-cli",
             category: IntegrationCategory::Chat,
@@ -171,6 +185,20 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
                 if !crate::channels::channel_is_usable("qq") {
                     IntegrationStatus::UnderDevelopment
                 } else if c.channels_config.qq.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "Lark / Feishu",
+            description: "Lark / Feishu via WebSocket",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if !crate::channels::channel_is_usable("lark") {
+                    IntegrationStatus::UnderDevelopment
+                } else if c.channels_config.lark.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -1030,5 +1058,80 @@ mod tests {
             (qianfan.status_fn)(&config),
             IntegrationStatus::Active
         ));
+    }
+
+    /// The integrations registry is the surface a chat reads to ask "do you
+    /// support channel X?" If a catalog row is `Supported` but has no entry
+    /// here, the answer is wrong — and the registry is also the only place the
+    /// answer has a human name, so the mapping key→name lives here too.
+    /// The mapping is the pin: one row per Supported catalog key, hardcoded but
+    /// small, and verified against the catalog by the tests below.
+    const SUPPORTED_CATALOG_KEYS: &[(&str, &str)] = &[
+        ("telegram", "Telegram"),
+        ("discord", "Discord"),
+        ("slack", "Slack"),
+        ("whatsapp", "WhatsApp"),
+        ("whatsapp_web", "WhatsApp Web"),
+        ("lark", "Lark / Feishu"),
+    ];
+
+    #[test]
+    fn every_supported_catalog_key_has_an_integrations_entry() {
+        let entries = all_integrations();
+        let names: std::collections::HashSet<&str> = entries.iter().map(|e| e.name).collect();
+        for (catalog_key, integrations_name) in SUPPORTED_CATALOG_KEYS {
+            let catalog_says_supported =
+                crate::channels::CHANNEL_CATALOG
+                    .iter()
+                    .any(|(k, _, support, _)| {
+                        *k == *catalog_key && *support == crate::channels::ChannelSupport::Supported
+                    });
+            assert!(
+                catalog_says_supported,
+                "Pin drift: SUPPORTED_CATALOG_KEYS names '{catalog_key}' but \
+                 CHANNEL_CATALOG does not mark it Supported.",
+            );
+            assert!(
+                names.contains(integrations_name),
+                "Missing integration entry for Supported channel catalog key \
+                 '{catalog_key}' (expected name '{integrations_name}').",
+            );
+        }
+    }
+
+    /// On an empty config, a `Supported` catalog channel's integration entry
+    /// must report `Available`, never `UnderDevelopment` or `Active`. A locked
+    /// channel reports `UnderDevelopment` whether or not it is configured —
+    /// `Available` on a locked row would claim it runs when the factory will
+    /// never build it. A row that always says `Active` would claim the same.
+    /// This pins the contract that the registry's status agrees with the
+    /// catalog's `channel_is_usable`.
+    #[test]
+    fn supported_channels_report_available_on_empty_config() {
+        let entries = all_integrations();
+        let config = Config::default();
+        for (catalog_key, integrations_name) in SUPPORTED_CATALOG_KEYS {
+            assert!(
+                crate::channels::channel_is_usable(catalog_key),
+                "Pin drift: SUPPORTED_CATALOG_KEYS names '{catalog_key}' but \
+                 channel_is_usable('{catalog_key}') is false.",
+            );
+            let entry = entries
+                .iter()
+                .find(|e| e.name == *integrations_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "No integration entry named '{integrations_name}' \
+                         for catalog key '{catalog_key}'."
+                    )
+                });
+            let status = (entry.status_fn)(&config);
+            assert!(
+                matches!(status, IntegrationStatus::Available),
+                "Catalog key '{catalog_key}' is Supported (channel_is_usable \
+                 returns true) but integration '{integrations_name}' reports \
+                 {status:?} on empty config; expected Available.",
+            );
+        }
     }
 }

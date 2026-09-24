@@ -5,7 +5,7 @@
 <h3 align="center">Multi-Agent Runtime for Production AI Agents</h3>
 
 <p align="center">
-  <strong>100% Rust</strong> · Single binary · 17 channels · Scheduled runs · Approval gate · MCP + Skills
+  <strong>100% Rust</strong> · Single binary · 6 usable channels · Scheduled runs · Approval gate · MCP + Skills
 </p>
 
 <p align="center">
@@ -248,22 +248,39 @@ Run history is redacted before storage and `jobs.db` is locked to `0600`.
 
 ## Channels
 
+Six channels are usable in this release: Telegram, Discord, Slack, WhatsApp Cloud, WhatsApp
+Web and Lark. The rest ship labelled *under development*, and a locked channel that is still
+configured is skipped at start with a WARN rather than run.
+
 Connect an agent to any combination simultaneously. Each channel renders the model's
 Markdown into what the target platform actually understands, so replies never leak raw
 CommonMark.
 
-| Channel | Build gate | In a release binary? | Reply rendering |
-|---|---|---|---|
-| Telegram | built in | yes | HTML |
-| Discord | built in | yes | Markdown (fenced-code aware splitting) |
-| Slack | built in | yes | mrkdwn |
-| Mattermost | built in | yes | Markdown (native tables) |
-| DingTalk | built in | yes | Markdown |
-| WhatsApp Cloud | built in | yes | single-char markup |
-| WhatsApp Web | `whatsapp-web` *(default on)* | yes | single-char markup |
-| Signal · Email (IMAP/SMTP) · IRC · QQ · Linq · Nextcloud Talk · iMessage · CLI | built in | yes | plain text |
-| Lark/Feishu | `channel-lark` | no | plain text |
-| Matrix (E2EE) | `channel-matrix` | no | Markdown via matrix-sdk |
+| Channel | Build gate | Reply rendering |
+|---|---|---|
+| Telegram | built in | HTML |
+| Discord | built in | Markdown (fenced-code aware splitting) |
+| Slack | built in | mrkdwn |
+| WhatsApp Cloud | built in | single-char markup |
+| WhatsApp Web | `whatsapp-web` *(default on)* | single-char markup |
+| Lark / Feishu | `channel-lark` *(default on)* | plain text |
+
+Eleven more ship but are **under development** — see `docs/reference/channels.md` §0 for the
+checklist that promotes a row from this table to the one above.
+
+| Channel | Build gate | Reply rendering |
+|---|---|---|
+| Mattermost | built in | Markdown (native tables) |
+| DingTalk | built in | Markdown |
+| Signal | built in | plain text |
+| Email (IMAP/SMTP) | built in | plain text |
+| IRC | built in | plain text |
+| QQ | built in | plain text |
+| Linq | built in | plain text |
+| Nextcloud Talk | built in | plain text |
+| iMessage | built in | plain text |
+| Webhook (gateway) | built in | plain text |
+| Matrix (E2EE) | `channel-matrix` | Markdown via matrix-sdk |
 
 ## Providers
 

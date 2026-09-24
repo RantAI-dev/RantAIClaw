@@ -177,6 +177,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **README and `rantaiclaw integrations` describe the six usable channels correctly.** The header
+  at `README.md:8` said "17 channels" against a catalog whose usable count is six; the channels
+  table at `:255` listed Lark as not in a release binary while `channel-lark` is in `default`
+  (`Cargo.toml:271`), and listed locked channels (Mattermost, DingTalk, Signal, …) with no
+  under-development label. The README is now split into one table for the six usable channels
+  and one for the eleven under development. `src/integrations/registry.rs` now ships entries
+  for Lark and WhatsApp Web whose status derives from `channel_is_usable`; a new test fails if a
+  `ChannelSupport::Supported` catalog key has no entry, or if an entry's status on an empty
+  config disagrees with the catalog.
 - **`build.rs` works in a git worktree and CI compiles `build.rs` changes.** `build.rs` declared
   `cargo:rerun-if-changed=.git/HEAD`, and `.git` is a file in a worktree (`gitdir: …`), so the
   declared path was missing — cargo reports `Dirty … the file '…' is missing`, reruns the build script
