@@ -1001,7 +1001,16 @@ impl DiscordChannel {
                                     continue;
                                 }
                             }
-                            tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                            tracing::warn!(
+                                "{}",
+                                crate::channels::rejected_sender_warn(
+                                    "discord",
+                                    &crate::security::redact(&author_id)
+                                )
+                            );
+                            tracing::debug!(
+                                "Discord: full identifier of unauthorized sender: {author_id}"
+                            );
                             continue;
                         }
                     };

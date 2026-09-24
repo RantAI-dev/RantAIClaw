@@ -552,8 +552,34 @@ fn no_log_or_print_call_carries_message_or_reply_text() {
     );
 }
 
-/// No log or print call in `src/channels/` or the gateway's
-/// webhook hand-off interpolates a WebSocket or endpoint URL by a name this
+/// The WARN sentence every channel produces for an unauthorized sender names
+/// the on-host `channels pair` CLI and the in-chat `/claim` step. The full
+/// identifier only appears in the helper input, which the caller already
+/// passed through `crate::security::redact` — so a journal reader learns how
+/// to grant access but cannot impersonate the sender on a second channel.
+#[test]
+fn rejected_sender_warn_includes_redacted_identifier_and_pairing_command() {
+    let line = rejected_sender_warn("discord", "abcd***");
+    assert!(
+        line.contains("discord"),
+        "names the channel CLI key: {line}"
+    );
+    assert!(
+        line.contains("abcd***"),
+        "interpolates the redacted identifier: {line}"
+    );
+    assert!(
+        line.contains("rantaiclaw channels pair --channel discord"),
+        "points at the on-host pairing CLI: {line}"
+    );
+    assert!(
+        line.contains("/claim"),
+        "points at the in-chat /claim step: {line}"
+    );
+}
+
+/// No log or print call in `src/channels/` or under `src/gateway/`
+/// interpolates a WebSocket or endpoint URL by a name this
 /// guard recognizes. Lark's `wss_url` carried an `access_key` query parameter
 /// straight into the journal at `tracing::info!("Lark: connecting to
 /// {wss_url}")` — an inline capture, which is why this reads captures inside
@@ -572,8 +598,8 @@ fn no_log_or_print_call_carries_a_connection_url_with_credentials() {
     const URL_CLASSIFIED: &[(&str, &str, &str)] = &[];
 
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = vec![src_root.join("gateway").join("mod.rs")];
-    let mut dirs = vec![src_root.join("channels")];
+    let mut files = Vec::new();
+    let mut dirs = vec![src_root.join("channels"), src_root.join("gateway")];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).expect("read a source directory") {
             let path = entry.expect("read a directory entry").path();
@@ -584,6 +610,7 @@ fn no_log_or_print_call_carries_a_connection_url_with_credentials() {
             if path.is_dir() {
                 dirs.push(path);
             } else if name.ends_with(".rs") && name != "mod_tests.rs" && name != "tests.rs" {
+                // `mod_tests.rs` and `format/tests.rs` are whole test modules.
                 files.push(path);
             }
         }
@@ -664,6 +691,79 @@ fn no_log_or_print_call_carries_a_connection_url_with_credentials() {
          classify a URL that carries no credential:\n{}\n{}",
         unclassified.join("\n"),
         stale.join("\n")
+    );
+}
+
+/// No `tracing::warn!` call in the four channel files that mint a
+/// rejected-sender warning interpolates the sender's identifier by a name
+/// this guard recognises. Every one of the six sites (WhatsApp Web, Discord,
+/// Slack, Lark WS × 2 and Lark HTTP) passes the identifier through
+/// `crate::security::redact()` before composing the helper sentence, so the
+/// journal holds only the redacted form at WARN; the full identifier moves
+/// to a DEBUG line that an operator has to opt into. A future regression
+/// that reverts one site to `tracing::warn!("...{author_id}...")` without
+/// going through `redact()` is caught here.
+///
+/// The recogniser list is the union of the bindings the four channel files
+/// use for the field that names the person on the wire:
+/// `normalized | author_id | user | sender_open_id | open_id`. None of them
+/// is whitelisted — every site is expected to redact — so a single hit is a
+/// regression, not a known exception.
+#[test]
+fn no_tracing_warn_call_carries_an_unredacted_rejected_sender_identifier() {
+    const RECOGNISED: &[&str] = &[
+        "normalized",
+        "author_id",
+        "user",
+        "sender_open_id",
+        "open_id",
+    ];
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/channels");
+    let channel_files = ["whatsapp_web.rs", "discord.rs", "slack.rs", "lark.rs"];
+
+    let mut unredacted = Vec::new();
+    for file_name in channel_files {
+        let path = src_root.join(file_name);
+        let src = std::fs::read_to_string(&path).expect("read a channel source file");
+        let production = production_half(&src);
+        let (code, literals) = mask_comments_and_literals(production);
+        let calls = log_calls(&code);
+        for (at, args) in calls {
+            // `log_calls` reports the offset of the macro name and the byte
+            // range of its arguments; only `warn!` carries a rejected-sender
+            // warning, so the other levels and the print macros are skipped.
+            let bang = code[at..]
+                .iter()
+                .position(|&byte| byte == b'!')
+                .map(|offset| at + offset)
+                .unwrap_or(code.len());
+            let name = std::str::from_utf8(&code[at..bang]).unwrap_or("");
+            if name != "warn" {
+                continue;
+            }
+            for literal in literals
+                .iter()
+                .filter(|lit| args.start <= lit.start && lit.end <= args.end)
+            {
+                for capture in inline_captures(&production[literal.clone()]) {
+                    if RECOGNISED.contains(&capture) {
+                        let call = &production[at..(args.end + 1).min(production.len())];
+                        unredacted.push(format!(
+                            "{file_name}:{} names `{{{capture}}}` in: {}",
+                            production[..at].matches('\n').count() + 1,
+                            call.split_whitespace().collect::<Vec<_>>().join(" ")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        unredacted.is_empty(),
+        "tracing::warn! call interpolates a raw rejected-sender identifier; pass it through \
+         crate::channels::rejected_sender_warn and `crate::security::redact` first:\n{}",
+        unredacted.join("\n")
     );
 }
 

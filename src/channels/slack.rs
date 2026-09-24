@@ -237,7 +237,11 @@ impl SlackChannel {
                 }
             }
         }
-        tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+        tracing::warn!(
+            "{}",
+            crate::channels::rejected_sender_warn("slack", &crate::security::redact(user))
+        );
+        tracing::debug!("Slack: full identifier of unauthorized sender: {user}");
         InboundOutcome::Continue
     }
 
@@ -935,12 +939,12 @@ impl SlackChannel {
             }
             anyhow::bail!("Slack apps.connections.open returned ok=false ({err})");
         }
-        let url = body
+        let wss_url = body
             .get("url")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open returned no url"))?;
 
-        let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+        let (ws, _) = tokio_tungstenite::connect_async(wss_url).await?;
         let (mut write, mut read) = ws.split();
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
         tracing::info!("Slack channel listening over Socket Mode...");
