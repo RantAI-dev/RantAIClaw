@@ -953,6 +953,27 @@ impl std::fmt::Display for GatewayStartupFatal {
 
 impl std::error::Error for GatewayStartupFatal {}
 
+/// The banner `run_gateway` prints for its startup pairing code. On an
+/// interactive stdout the full multi-line banner with the code is returned;
+/// under systemd stdout is the journal and a credential that grants a gateway
+/// client would land in a log an operator did not choose to hold, so the
+/// helper returns a single short line pointing at the commands that mint a
+/// code without going through the journal — `rantaiclaw ui start` pairs the
+/// web console and `rantaiclaw channels pair --channel gateway` mints one on
+/// demand. The actual code value never reaches the redirect line.
+fn startup_pairing_banner(code: &str, stdout_is_terminal: bool) -> String {
+    if stdout_is_terminal {
+        format!(
+            "\n  🔐 PAIRING REQUIRED — use this one-time code:\n     ┌──────────────┐\n     \
+             │  {code}  │\n     └──────────────┘\n     Send: POST /pair with header X-Pairing-Code: {code}"
+        )
+    } else {
+        "\n  🔐 Pairing required. Mint a code with `rantaiclaw channels pair --channel gateway`,\n     \
+         or run `rantaiclaw ui start` to pair the web console."
+            .to_string()
+    }
+}
+
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -1121,12 +1142,10 @@ pub async fn run_gateway(
     println!("  GET  /readyz    — readiness check (503 if a component is down)");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = state.pairing.pairing_code() {
-        println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
-        println!("     ┌──────────────┐");
-        println!("     │  {code}  │");
-        println!("     └──────────────┘");
-        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
+        println!(
+            "{}",
+            startup_pairing_banner(&code, crate::channels::qr_terminal::stdout_is_interactive())
+        );
     } else if state.pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
     } else {
@@ -5744,6 +5763,66 @@ mod tests {
         assert!(
             out.error.unwrap_or_default().contains("read-only"),
             "refusal should name the autonomy level"
+        );
+    }
+
+    /// The startup pairing code grants bearer tokens through `/pair`, and a
+    /// managed daemon's stdout is the journal, so only an interactive terminal
+    /// gets the code. When stdout is not a terminal, the banner becomes a
+    /// short redirect line that points at the two commands that mint a code
+    /// without writing it to stdout.
+    #[test]
+    fn startup_pairing_banner_omits_the_code_when_stdout_is_not_a_terminal() {
+        let code = "TEST123";
+        let banner = super::startup_pairing_banner(code, false);
+        assert!(
+            !banner.contains("X-Pairing-Code:"),
+            "redirect line must not name the code in a header: {banner}"
+        );
+        assert!(
+            !banner.contains(code),
+            "redirect line must not interpolate the actual code: {banner}"
+        );
+    }
+
+    /// An interactive terminal gets the full banner with the code, framed and
+    /// followed by the request shape to use it.
+    #[test]
+    fn startup_pairing_banner_prints_the_code_on_an_interactive_stdout() {
+        let code = "TEST123";
+        let banner = super::startup_pairing_banner(code, true);
+        assert!(
+            banner.contains("X-Pairing-Code:"),
+            "interactive banner must name the code in a header: {banner}"
+        );
+        assert!(
+            banner.contains(code),
+            "interactive banner must interpolate the actual code: {banner}"
+        );
+    }
+
+    /// `run_gateway` must ask whether stdout is a terminal rather than pass a
+    /// constant. No test can see `println!` reach the process's real stdout,
+    /// so this pins the call by source, as the wiring guard in
+    /// `channels/mod_tests.rs` does; the banner's own decision is tested above.
+    #[test]
+    fn run_gateway_asks_the_terminal_before_printing_the_pairing_code() {
+        let src = include_str!("mod.rs");
+        let production = &src[..src.find("\n#[cfg(test)]\nmod tests").expect("test module")];
+        let pair_block: String = production
+            .split("state.pairing.pairing_code() {")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("\n    } else if state.pairing.require_pairing()")
+                    .next()
+            })
+            .expect("the pairing banner block")
+            .split_whitespace()
+            .collect();
+        assert!(
+            pair_block.contains("crate::channels::qr_terminal::stdout_is_interactive()"),
+            "the pairing banner must print the code only when stdout is a terminal; \
+             got: {pair_block}"
         );
     }
 }

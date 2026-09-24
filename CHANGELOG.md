@@ -802,6 +802,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel-matrix`); the upstream fix is `imbl-sized-chunks >= 0.2.0`, which matrix-sdk 0.18 has not
   yet pulled in. Reviewed with the other imbl/matrix-sdk entries; revisit on 2026-11-15 or when
   matrix-sdk ships an imbl bump.
+- **The gateway's startup pairing code no longer reaches the journal.** The gateway printed the
+  one-time code as a framed banner with `println!` whenever `require_pairing` was on and the
+  operator had not bound a token yet, and a managed daemon's stdout is the journal, so the code
+  that grants a bearer token through `POST /pair` was readable by anyone who could read the
+  user's journal while it was valid. The banner now prints only when stdout is a terminal, and
+  on a non-tty stdout it points at `rantaiclaw channels pair --channel gateway` (mints a code on
+  demand, picked up by the running gateway on the next pairing message without a restart) and
+  `rantaiclaw ui start` (pairs the web console itself). The log-scan guard from #827 is extended
+  to recognise a binding that holds a pairing code, so a future inline `println!("…{code}…")`
+  in `src/gateway/mod.rs` fails the guard. **Journals written by 0.31.0-alpha and earlier may
+  still hold gateway pairing codes**; upgrading does not rewrite them.
 
 ## [0.31.0-alpha] — 2026-09-08
 
