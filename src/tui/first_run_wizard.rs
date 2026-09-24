@@ -238,8 +238,28 @@ impl FirstRunWizard {
     }
 
     pub fn open_picker(&mut self, options: Vec<(String, String)>) {
+        let n = options.len();
+        self.open_picker_with_disabled(options, None, vec![false; n]);
+    }
+
+    /// Open the picker with a per-row disabled flag and an optional
+    /// section heading. The wizard's channel step uses this to dim the
+    /// locked rows under a `Under development` heading, matching the
+    /// model `/setup channels` already ships.
+    pub fn open_picker_with_disabled(
+        &mut self,
+        options: Vec<(String, String)>,
+        heading: Option<String>,
+        disabled: Vec<bool>,
+    ) {
         self.picker_names = options.iter().map(|(name, _)| name.clone()).collect();
         let labels: Vec<String> = options.into_iter().map(|(_, label)| label).collect();
+        // Pad a too-short `disabled` so callers that pass `vec![]` for a
+        // fully-enabled picker do not need to repeat the option count.
+        let mut disabled = disabled;
+        if disabled.len() < labels.len() {
+            disabled.resize(labels.len(), false);
+        }
         self.choose_scroll = 0;
         self.picker = Some(ActiveChoose {
             id: match self.phase {
@@ -253,6 +273,8 @@ impl FirstRunWizard {
                 _ => "Choose".into(),
             },
             options: labels,
+            heading,
+            disabled,
             multi: true,
             cursor: 0,
             selected: Vec::new(),
@@ -261,8 +283,15 @@ impl FirstRunWizard {
 
     pub fn picker_move_up(&mut self) {
         if let Some(p) = self.picker.as_mut() {
-            if p.cursor > 0 {
-                p.cursor -= 1;
+            let mut next = p.cursor;
+            while next > 0 {
+                next -= 1;
+                if !p.disabled.get(next).copied().unwrap_or(false) {
+                    break;
+                }
+            }
+            if !p.disabled.get(next).copied().unwrap_or(false) {
+                p.cursor = next;
             }
         }
         self.clamp_choose_scroll_to_cursor();
@@ -270,8 +299,16 @@ impl FirstRunWizard {
 
     pub fn picker_move_down(&mut self) {
         if let Some(p) = self.picker.as_mut() {
-            if p.cursor + 1 < p.options.len() {
-                p.cursor += 1;
+            let len = p.options.len();
+            let mut next = p.cursor;
+            while next + 1 < len {
+                next += 1;
+                if !p.disabled.get(next).copied().unwrap_or(false) {
+                    break;
+                }
+            }
+            if !p.disabled.get(next).copied().unwrap_or(false) {
+                p.cursor = next;
             }
         }
         self.clamp_choose_scroll_to_cursor();
@@ -300,6 +337,14 @@ impl FirstRunWizard {
 
     pub fn picker_toggle(&mut self) {
         if let Some(p) = self.picker.as_mut() {
+            // Toggle is inert on a disabled row. By construction the
+            // cursor never lands on a disabled row via the move
+            // handlers, but the check is cheap and a future caller
+            // restoring cursor state directly must not be able to
+            // silently schedule a locked channel.
+            if p.disabled.get(p.cursor).copied().unwrap_or(false) {
+                return;
+            }
             let pos = p.cursor;
             if let Some(idx) = p.selected.iter().position(|&i| i == pos) {
                 p.selected.remove(idx);
@@ -311,7 +356,18 @@ impl FirstRunWizard {
     }
 
     pub fn picker_submit(&mut self) -> Option<Vec<usize>> {
-        self.picker.take().map(|p| p.selected)
+        self.picker.take().map(|p| {
+            // Defensive: drop any selected index whose row is disabled.
+            // By construction the cursor never lands on a disabled row
+            // and toggle is inert on disabled rows, but a programmatic
+            // caller could have placed one in `selected`; this filter
+            // keeps that from sneaking a locked channel past the gate.
+            let disabled = &p.disabled;
+            p.selected
+                .into_iter()
+                .filter(|&i| !disabled.get(i).copied().unwrap_or(false))
+                .collect()
+        })
     }
 
     /// Map current phase to an index into RAIL.
@@ -804,24 +860,58 @@ impl FirstRunWizard {
 
         // Option rows.
         let mut option_lines: Vec<Line> = Vec::new();
+        let heading = p.heading.as_deref();
+        // The seam between usable and locked is the first index whose
+        // `disabled` flag is true; rows past that point are the locked
+        // section. The heading is rendered exactly once, right above
+        // the first locked row, and only when locked rows exist.
+        let usable_count = (0..p.options.len())
+            .position(|i| p.disabled.get(i).copied().unwrap_or(false))
+            .unwrap_or(p.options.len());
         for (i, opt) in p.options.iter().enumerate() {
-            let is_cursor = i == p.cursor;
-            let is_checked = p.selected.contains(&i);
+            // Section heading at the seam. The literal lives here too so
+            // any future heading variant on `ActiveChoose` renders
+            // without a second branch.
+            if heading.is_some() && i == usable_count {
+                option_lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(
+                        "Under development",
+                        Style::default()
+                            .fg(muted)
+                            .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+                    ),
+                ]));
+                option_lines.push(Line::from(""));
+            }
+            let is_disabled = p.disabled.get(i).copied().unwrap_or(false);
+            // Cursor arrow is suppressed on a disabled row even if the
+            // cursor were placed there directly — the row is inert.
+            let is_cursor = i == p.cursor && !is_disabled;
+            let is_checked = !is_disabled && p.selected.contains(&i);
             let arrow = if is_cursor { "▸" } else { " " };
             let arrow_style = if is_cursor {
                 Style::default().fg(coral).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            let marker = if is_checked { "▣" } else { "□" };
-            let marker_style = if is_checked {
+            let marker = if is_disabled {
+                " "
+            } else if is_checked {
+                "▣"
+            } else {
+                "□"
+            };
+            let marker_style = if is_checked && !is_disabled {
                 Style::default().fg(emerald)
             } else if is_cursor {
                 Style::default().fg(coral)
             } else {
                 Style::default().fg(dim)
             };
-            let label_style = if is_cursor {
+            let label_style = if is_disabled {
+                Style::default().fg(dim)
+            } else if is_cursor {
                 Style::default().fg(sky).add_modifier(Modifier::BOLD)
             } else if is_checked {
                 Style::default().fg(sky)
@@ -1195,6 +1285,54 @@ pub fn channel_options() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The same derivation `channel_picker_entries` uses for `/setup channels`,
+/// shaped to feed `FirstRunWizard::open_picker_with_disabled`: usable
+/// channels first, then — only if any locked channels exist — a heading
+/// `Under development`, then the locked channels. The `disabled` flag
+/// matches the order of `options`; `disabled[i] == true` means the row
+/// at `options[i]` is locked.
+///
+/// The catalog has 6 usable channel provisioners (telegram, discord,
+/// slack, whatsapp, whatsapp_web, lark) and ≥10 locked ones today, so
+/// the heading branch is always taken. The `locked.is_empty()`
+/// short-circuit is kept so a future catalog trim drops the heading
+/// instead of rendering an empty section.
+pub fn channel_options_full() -> (Vec<(String, String)>, Option<String>, Vec<bool>) {
+    use crate::onboard::provision::{available, provisioner_for, ProvisionerCategory};
+
+    let mut usable = Vec::new();
+    let mut locked = Vec::new();
+    for (name, desc) in available() {
+        let Some(p) = provisioner_for(name) else {
+            continue;
+        };
+        if p.category() != ProvisionerCategory::Channel {
+            continue;
+        }
+        let catalog_key = crate::channels::catalog_key_for_provisioner(name);
+        let is_usable = crate::channels::channel_is_usable(catalog_key);
+        let row = (name.to_string(), desc.to_string());
+        if is_usable {
+            usable.push(row);
+        } else {
+            locked.push(row);
+        }
+    }
+    if locked.is_empty() {
+        // No locked rows → no heading, all rows enabled.
+        let n = usable.len();
+        return (usable, None, vec![false; n]);
+    }
+    let total = usable.len() + locked.len();
+    let mut disabled = vec![false; total];
+    for (i, _) in locked.iter().enumerate() {
+        disabled[usable.len() + i] = true;
+    }
+    let mut options = usable;
+    options.extend(locked);
+    (options, Some("Under development".to_string()), disabled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1291,6 +1429,324 @@ mod tests {
         assert!(
             w.queue.is_empty(),
             "stale picker selections must be cleared on restore"
+        );
+    }
+
+    // ── locked channel rows are dimmed and skipped ──────
+
+    /// `channel_options_full` mirrors `/setup channels`: usable rows first,
+    /// then — only if any locked channels exist — a heading `Under
+    /// development`, then the locked rows. The disabled flag matches row
+    /// order. Catalog has 6 usable and ≥10 locked channel provisioners
+    /// today; that shape is what `is_channel_name` /
+    /// `channel_options` already agree on (see `channel_name_matches_registry`).
+    #[test]
+    fn channel_options_full_orders_usable_before_locked_with_heading() {
+        let (options, heading, disabled) = channel_options_full();
+        assert!(!options.is_empty(), "channel_options_full returned no rows");
+        assert_eq!(
+            disabled.len(),
+            options.len(),
+            "disabled[] length must match options"
+        );
+
+        // First row is a known usable channel provisioner. `telegram` is
+        // the first Channel-category entry in the registry; using a literal
+        // (not a recomputation) so a registry reorder that swaps telegram
+        // and discord still trips the assertion.
+        assert_eq!(
+            options[0].0, "telegram",
+            "first row should be the first usable channel"
+        );
+
+        // Locate the seam between usable and locked. If every channel were
+        // usable the helper short-circuits (heading == None, disabled all
+        // false); today that branch is unreachable because the catalog
+        // has locked entries, but the seam-pos / count assertions cover
+        // both shapes when the catalog is later trimmed.
+        let locked_start = disabled.iter().position(|&d| d).unwrap_or(options.len());
+        let locked_count = options.len() - locked_start;
+        assert!(
+            locked_count >= 1,
+            "catalog today has ≥1 locked channel; if this fails the catalog was trimmed — \
+             drop the locked-rows section of this test"
+        );
+        assert!(
+            locked_start >= 6,
+            "at least the 6 supported channels must precede the locked section"
+        );
+
+        // Every row flagged disabled is unusable per the catalog.
+        for i in locked_start..options.len() {
+            assert!(
+                disabled[i],
+                "row {i} ({}) in the locked section must be flagged disabled",
+                options[i].0
+            );
+            let catalog_key = crate::channels::catalog_key_for_provisioner(&options[i].0);
+            assert!(
+                !crate::channels::channel_is_usable(catalog_key),
+                "row {i} ({}) flagged disabled but catalog says usable",
+                options[i].0
+            );
+        }
+
+        // Every row in the usable section is flagged enabled.
+        for i in 0..locked_start {
+            assert!(
+                !disabled[i],
+                "row {i} ({}) in the usable section must be enabled",
+                options[i].0
+            );
+        }
+
+        // Heading is set when at least one locked channel exists. With
+        // the current catalog that branch is always taken; an empty
+        // locked set would yield `None`, and that path is covered by the
+        // helper's short-circuit (see also the comment on the test
+        // `channel_options_full_has_no_heading_when_all_channels_usable`,
+        // which the catalog cannot satisfy today and is intentionally
+        // omitted so the test set does not depend on a temporary
+        // catalog mutation).
+        assert_eq!(
+            heading.as_deref(),
+            Some("Under development"),
+            "heading must be Some(\"Under development\") when locked rows exist"
+        );
+    }
+
+    /// Build a wizard at PickChannels whose picker has `n` rows with the
+    /// supplied per-row `disabled` flags. The cursor starts at 0; the
+    /// picker is set up via `open_picker_with_disabled` so the test
+    /// exercises the same construction the call site uses.
+    fn wizard_with_options_disabled(
+        n: usize,
+        heading: Option<String>,
+        disabled: Vec<bool>,
+    ) -> FirstRunWizard {
+        let mut w = FirstRunWizard::new(test_profile());
+        w.phase = WizardPhase::PickChannels;
+        let options = (0..n)
+            .map(|i| (format!("ch{i}"), format!("Channel {i}")))
+            .collect();
+        w.open_picker_with_disabled(options, heading, disabled);
+        w
+    }
+
+    /// Pressing `Down` repeatedly on a picker with a trailing block of
+    /// disabled rows must never let the cursor land on a disabled row.
+    /// The cursor should walk through every enabled row and stop on the
+    /// last one. Without the cursor-skip logic the cursor would land on
+    /// the first disabled row at index 6 and stay there.
+    #[test]
+    fn picker_cursor_never_lands_on_disabled_row_walking_down() {
+        let mut w = wizard_with_options_disabled(10, None, {
+            let mut v = vec![false; 6];
+            v.extend(vec![true; 4]);
+            v
+        });
+        for _ in 0..20 {
+            w.picker_move_down();
+            let p = w.picker.as_ref().unwrap();
+            assert!(
+                !p.disabled[p.cursor],
+                "cursor at {} landed on disabled row (disabled = {:?})",
+                p.cursor, p.disabled
+            );
+        }
+        // The cursor must have stopped at the last enabled row.
+        assert_eq!(w.picker.as_ref().unwrap().cursor, 5);
+    }
+
+    /// Pressing `Up` from a position below the disabled block must skip
+    /// the disabled rows on its way up.
+    #[test]
+    fn picker_cursor_never_lands_on_disabled_row_walking_up() {
+        let mut w = wizard_with_options_disabled(10, None, {
+            let mut v = vec![false; 6];
+            v.extend(vec![true; 4]);
+            v
+        });
+        // Move the cursor past the disabled block first.
+        w.picker.as_mut().unwrap().cursor = 9;
+        for _ in 0..20 {
+            w.picker_move_up();
+            let p = w.picker.as_ref().unwrap();
+            assert!(
+                !p.disabled[p.cursor],
+                "cursor at {} landed on disabled row walking up",
+                p.cursor
+            );
+        }
+        assert_eq!(w.picker.as_ref().unwrap().cursor, 0);
+    }
+
+    /// Space (toggle) on a disabled row must be inert. The cursor can
+    /// only reach a disabled row via direct mutation — by construction
+    /// `picker_move_*` keeps it off — but the toggle handler must still
+    /// refuse to flip `selected` for such a row, so a future caller that
+    /// lands the cursor on a disabled row (e.g. via a programmatic
+    /// restore) cannot silently schedule a locked channel.
+    #[test]
+    fn picker_toggle_is_inert_on_disabled_row() {
+        let mut w = wizard_with_options_disabled(10, None, {
+            let mut v = vec![false; 6];
+            v.extend(vec![true; 4]);
+            v
+        });
+        // Place the cursor on a disabled row directly.
+        w.picker.as_mut().unwrap().cursor = 7;
+        w.picker_toggle();
+        assert!(
+            w.picker.as_ref().unwrap().selected.is_empty(),
+            "toggle on a disabled row must not add it to `selected`"
+        );
+        // And the same on a different disabled index, to confirm the
+        // check is positional, not a one-off cursor==7 special case.
+        w.picker.as_mut().unwrap().cursor = 9;
+        w.picker_toggle();
+        assert!(
+            w.picker.as_ref().unwrap().selected.is_empty(),
+            "toggle on disabled index 9 must also be inert"
+        );
+    }
+
+    /// A defensive filter on `picker_submit`: even if a disabled index
+    /// were somehow placed in `selected`, `picker_submit` must drop it.
+    /// The toggle / cursor-skip tests cover the construction paths; this
+    /// one is the safety net.
+    #[test]
+    fn picker_submit_filters_disabled_indices() {
+        let mut w = wizard_with_options_disabled(10, None, {
+            let mut v = vec![false; 6];
+            v.extend(vec![true; 4]);
+            v
+        });
+        // Pre-seed `selected` with a mix of usable and disabled indices.
+        w.picker.as_mut().unwrap().selected = vec![0, 2, 7, 9];
+        let submitted = w
+            .picker_submit()
+            .expect("picker_submit returns Some while a picker exists");
+        assert_eq!(
+            submitted,
+            vec![0, 2],
+            "picker_submit must drop any selected index whose row is disabled"
+        );
+    }
+
+    /// Sanity: `open_picker_with_disabled` propagates the `heading` and
+    /// `disabled` fields the call site passes in.
+    #[test]
+    fn open_picker_with_disabled_propagates_heading_and_disabled() {
+        let mut w = FirstRunWizard::new(test_profile());
+        w.phase = WizardPhase::PickChannels;
+        w.open_picker_with_disabled(
+            vec![
+                ("telegram".into(), "Telegram".into()),
+                ("matrix".into(), "Matrix".into()),
+            ],
+            Some("Under development".into()),
+            vec![false, true],
+        );
+        let p = w.picker.as_ref().expect("picker should be open");
+        assert_eq!(p.heading.as_deref(), Some("Under development"));
+        assert_eq!(p.disabled, vec![false, true]);
+    }
+
+    // ── render-level checks: heading and dim only when expected ──────
+
+    /// Render the wizard's picker pane to a `TestBackend` and hand back
+    /// the joined row text. The pane is sized to fit the full-screen
+    /// layout (the compact fallback collapses the option list, so a
+    /// smaller area would not exercise `render_picker`).
+    fn render_pane_text(w: &mut FirstRunWizard, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+        let mut term =
+            Terminal::new(TestBackend::new(width, height)).expect("TestBackend allocation");
+        term.draw(|f| w.render_fullscreen(f, Rect::new(0, 0, width, height)))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `render_picker` must insert the `Under development` heading line
+    /// when the picker has both a heading and at least one disabled
+    /// row. This is the visual counterpart of the helper's logic: the
+    /// helper says "here is a heading" and the renderer says "yes, draw
+    /// it once at the seam". A mutation that drops the `heading.is_some()`
+    /// guard in the renderer would still draw the heading even when the
+    /// caller passed `None`, leaving a stray heading over a picker that
+    /// has no locked section.
+    #[test]
+    fn render_picker_inserts_heading_when_set_and_disabled_present() {
+        let mut w = wizard_with_options_disabled(8, Some("Under development".to_string()), {
+            let mut v = vec![false; 4];
+            v.extend(vec![true; 4]);
+            v
+        });
+        // 16 rows is the minimum for the full-screen layout, and we
+        // need enough vertical space for the option list to render the
+        // heading above the locked rows.
+        let text = render_pane_text(&mut w, 80, 24);
+        assert!(
+            text.contains("Under development"),
+            "rendered pane must contain the heading text when both heading \
+             and disabled rows are set; pane was:\n{text}"
+        );
+    }
+
+    /// The renderer must NOT draw the heading when no heading was set,
+    /// even if `disabled` is non-empty. The wizard passes `heading = None`
+    /// for non-channel pickers (e.g. integrations); an unconditional
+    /// heading line would leak into those panes. A mutation that removes
+    /// the `heading.is_some()` guard would make this test fail.
+    #[test]
+    fn render_picker_does_not_insert_heading_when_none() {
+        let mut w = wizard_with_options_disabled(8, None, {
+            // Disabled rows present but no heading: the renderer
+            // should still suppress the heading line.
+            let mut v = vec![false; 4];
+            v.extend(vec![true; 4]);
+            v
+        });
+        let text = render_pane_text(&mut w, 80, 24);
+        assert!(
+            !text.contains("Under development"),
+            "rendered pane must NOT contain the heading text when heading \
+             is None; pane was:\n{text}"
+        );
+    }
+
+    /// The renderer must dim (visually de-emphasize) the disabled rows.
+    /// Concretely, a disabled label must not pick up the `sky` cursor
+    /// or the `emerald` checked marker. We assert the simpler invariant
+    /// that the disabled label never carries the coral cursor arrow —
+    /// the renderer emits `▸` only on the cursor row, and the cursor
+    /// arrow style on a disabled row is suppressed.
+    ///
+    /// We construct a picker with a single disabled row and place the
+    /// cursor directly on it (bypassing the move handlers). If the
+    /// renderer accidentally applied the cursor arrow on a disabled row
+    /// the test would see `▸` next to the disabled label.
+    #[test]
+    fn render_picker_suppresses_cursor_arrow_on_disabled_row() {
+        let mut w = wizard_with_options_disabled(4, None, vec![false, true, false, false]);
+        // Place cursor on the disabled row.
+        w.picker.as_mut().unwrap().cursor = 1;
+        let text = render_pane_text(&mut w, 80, 24);
+        // Find the row that contains the disabled label "Channel 1".
+        let label_row = text
+            .lines()
+            .find(|l| l.contains("Channel 1"))
+            .expect("disabled label must render somewhere in the pane");
+        assert!(
+            !label_row.contains('▸'),
+            "cursor arrow must be suppressed on a disabled row; row was: {label_row:?}"
         );
     }
 }

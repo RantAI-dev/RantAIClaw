@@ -465,7 +465,7 @@ impl ListPicker {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_i, entry)| {
+            .filter(|(i, entry)| {
                 match entry {
                     ListPickerEntry::CategoryHeader { id, collapsed, .. } => {
                         // Always show headers in filtered results so users can
@@ -486,10 +486,36 @@ impl ListPicker {
                         // No query: always include headers (even collapsed ones).
                         true
                     }
-                    // A static heading carries no searchable text of its own
-                    // and never hides a match beneath it (nothing collapses
-                    // under it), so it is simplest to always show it.
-                    ListPickerEntry::StaticHeading { .. } => true,
+                    ListPickerEntry::StaticHeading { .. } => {
+                        if !searching {
+                            return true;
+                        }
+                        // While filtering, hide the heading if no item under it
+                        // (until the next heading or category header) matches
+                        // the active query. Without this, "/setup channels"
+                        // would keep the "Under development" label on screen
+                        // even when every locked row beneath it is filtered
+                        // out, which is confusing — a heading with nothing
+                        // under it has no purpose in the result list.
+                        self.entries
+                            .iter()
+                            .skip(i + 1)
+                            .take_while(|e| {
+                                !matches!(
+                                    e,
+                                    ListPickerEntry::StaticHeading { .. }
+                                        | ListPickerEntry::CategoryHeader { .. }
+                                )
+                            })
+                            .any(|e| match e {
+                                ListPickerEntry::Item(item) => {
+                                    item.primary.to_lowercase().contains(&q)
+                                        || item.secondary.to_lowercase().contains(&q)
+                                }
+                                ListPickerEntry::StaticHeading { .. }
+                                | ListPickerEntry::CategoryHeader { .. } => false,
+                            })
+                    }
                     ListPickerEntry::Item(item) => {
                         // When searching, items in collapsed categories are hidden.
                         if !searching {
@@ -1977,5 +2003,42 @@ mod tests {
     #[test]
     fn setup_topic_kind_distinct_from_channel_kind() {
         assert_ne!(ListPickerKind::SetupTopic, ListPickerKind::SetupChannel);
+    }
+
+    /// A static heading whose section has no query-matching items should be
+    /// hidden from the filtered view. `/setup channels` uses this to keep
+    /// the "Under development" heading out of the result list when the
+    /// operator's query excludes every locked channel.
+    #[test]
+    fn static_heading_hidden_when_no_item_under_it_matches_the_query() {
+        // Three usable + heading + two locked. Query matches only usable rows.
+        let entries = vec![
+            ListPickerEntry::Item(item("usable_a", "Usable A")),
+            ListPickerEntry::Item(item("usable_b", "Usable B")),
+            ListPickerEntry::Item(item("usable_c", "Usable C")),
+            ListPickerEntry::static_heading("Under development"),
+            ListPickerEntry::Item(disabled_item("locked_a", "Locked A")),
+            ListPickerEntry::Item(disabled_item("locked_b", "Locked B")),
+        ];
+        let mut p =
+            ListPicker::with_entries(ListPickerKind::SetupChannel, "Test", entries, None, "empty");
+        // Query that doesn't match either locked row's primary text.
+        p.push_query_char('u'); // matches "Usable A/B/C"
+        let visible = p.filtered_indices();
+        // No heading index should be in the visible set.
+        let heading_idx = 3; // the heading is the 4th entry (index 3)
+        assert!(
+            !visible.contains(&heading_idx),
+            "static heading should be hidden when no item under it matches; visible: {visible:?}"
+        );
+        // The locked rows themselves are also hidden.
+        assert!(
+            !visible.contains(&4),
+            "locked_a hidden; visible: {visible:?}"
+        );
+        assert!(
+            !visible.contains(&5),
+            "locked_b hidden; visible: {visible:?}"
+        );
     }
 }

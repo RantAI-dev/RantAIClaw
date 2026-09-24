@@ -177,6 +177,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **First-run wizard dims locked channels under "Under development" heading.** The wizard's channel
+  step used to render every channel provisioner as a selectable row, with no visual separation
+  between the six usable and the eleven under-development channels; the runtime refused locked
+  selections afterwards, but the missing presentation was the defect. The wizard now reuses the
+  model `/setup channels` already ships: usable channels first, then a static "Under development"
+  heading, then locked rows dimmed; cursor movement skips them, Space is inert on them, and Enter
+  confirms a selection that never includes them. `src/tui/widgets/setup_overlay.rs::ActiveChoose`
+  gains additive `heading` and `disabled` fields; the overlay's provisioner-prompt pickers
+  continue to work without changes because they populate `heading: None` and
+  `disabled: vec![false; options.len()]`. The wizard's chrome (STEP · CHANNELS, accent rule,
+  subhead, hint) is incompatible with `ListPicker` mid-step, so the same picker the wizard already
+  used was extended rather than swapped. `src/tui/widgets/list_picker.rs::filtered_indices` now
+  hides a static heading when nothing under it matches the active query, so `/setup channels` does
+  not show `Under development` while the operator is filtering for a usable channel.
 - **README and `rantaiclaw integrations` describe the six usable channels correctly.** The header
   at `README.md:8` said "17 channels" against a catalog whose usable count is six; the channels
   table at `:255` listed Lark as not in a release binary while `channel-lark` is in `default`
