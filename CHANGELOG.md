@@ -738,6 +738,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `loop_.rs` is gone, the doc comments around `audit_actor` parameter blocks now say `role` is
   whatever the caller passed, and the half-sentence in the slack test is removed. No audit-record
   shape change.
+- **The default runtime proxy client now bounds every request.** `build_runtime_proxy_client` left
+  the per-request timeout unbounded, and a silent upstream (a peer that accepts the TCP handshake
+  and never replies) could pin the dispatch loop indefinitely until the operator restarted the
+  daemon. The default builder now delegates to the bounded `_with_timeouts` variant: a 10-second
+  connect timeout and a 120-second request timeout. Every caller that uses the default proxy
+  client is affected — the channel senders (telegram, discord, slack, mattermost, lark, dingtalk,
+  qq, whatsapp, whatsapp_http), the custom-tunnel client, the browser tool, and the embeddings
+  memory backend — so a slow upload or download that used to finish now aborts after 120 seconds
+  with a request-timeout error rather than hanging the dispatch loop. The bound matches the
+  provider HTTP clients (openai, anthropic, copilot, openrouter, bedrock, glm, gemini,
+  compatible), which already used 120 seconds. No config key, schema stays at 32.
 
 ### Security
 
