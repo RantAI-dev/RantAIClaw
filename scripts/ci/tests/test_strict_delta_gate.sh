@@ -173,6 +173,64 @@ else
     log_fail "--keep-going missing from the gate script"
 fi
 
+# --- test 4: uncommitted edit on a different line than a baseline warning ----
+
+printf '\n=== test 4: uncommitted edit + baseline warning on an untouched line ===\n'
+# A separate fixture: a file with a committed baseline warning (dead_code on
+# line 1, from a never-called function) and an uncommitted edit that appends
+# a new function further down. The pre-fix gate coalesced the file into
+# `[[1, line_count]]` on any dirty edit, which reported the baseline warning
+# as blocking. The fix is to keep the working-tree diff ranges only, so the
+# baseline warning stays in the non-blocking bucket. Pre-generate Cargo.lock
+# so the gate's `cargo clippy --locked` can run on the throwaway fixture.
+BASELINE_REPO="$(mktemp -d)"
+(
+    cd "$BASELINE_REPO"
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "Test"
+    cat > Cargo.toml <<'TOML'
+[package]
+name = "strict-delta-baseline-fixture"
+version = "0.0.0"
+edition = "2021"
+TOML
+    mkdir -p src
+    cat > src/lib.rs <<'RS'
+fn unused_baseline() { let _x = 5; }
+
+pub fn answer() -> i32 {
+    42
+}
+RS
+    git add .
+    git commit -q -m "initial with baseline warning"
+    cargo generate-lockfile -q >/dev/null 2>&1 || true
+    if [ -f Cargo.lock ]; then
+        git add Cargo.lock
+        git commit -q -m "lockfile" || true
+    fi
+)
+
+BASELINE_LOG="$BASELINE_REPO/gate.log"
+(
+    cd "$BASELINE_REPO"
+    printf '\npub fn new_answer() -> i32 {\n    43\n}\n' >> src/lib.rs
+    BASE_SHA="$(git rev-parse HEAD)" bash "$GATE"
+) >"$BASELINE_LOG" 2>&1
+EC4=$?
+echo "exit=$EC4"
+cat "$BASELINE_LOG"
+
+if [ "$EC4" -eq 0 ] \
+    && grep -q "Existing strict lint issues outside changed Rust lines" "$BASELINE_LOG" \
+    && ! grep -q "Strict lint issues introduced on changed Rust lines" "$BASELINE_LOG"; then
+    log_pass "baseline warning on untouched line is non-blocking"
+else
+    log_fail "baseline warning on untouched line should be non-blocking (EC=$EC4)"
+fi
+rm -rf "$BASELINE_REPO"
+
 # --- summary -----------------------------------------------------------------
 
 printf '\n=== summary ===\n'

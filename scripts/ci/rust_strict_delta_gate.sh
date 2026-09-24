@@ -101,34 +101,33 @@ def has_working_tree_changes(path: str) -> bool:
     return bool(proc.stdout.strip())
 
 
-def file_line_count(path: str) -> int:
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return sum(1 for _ in f)
-    except OSError:
-        return 0
-
-
 for path in files:
-    # If the file has uncommitted (working-tree) modifications, the precise
-    # ranges from BASE_SHA..HEAD do not cover the WIP edit. Coalesce the
-    # whole file into a single range so any lint in the file is "blocking".
-    # This is coarser than Option A (which would walk HEAD vs working tree
-    # and merge ranges), but it satisfies the "include them in the diff"
-    # requirement without cascading changes into the classifier below —
-    # the classifier only consumes `changed[path]` ranges.
-    if has_working_tree_changes(path):
-        line_count = file_line_count(path)
-        changed[path] = [[1, line_count]] if line_count > 0 else []
-        continue
-
+    # Ranges from the committed side (BASE_SHA..HEAD) and from the
+    # working tree (HEAD vs filesystem) share the same coordinate
+    # system: both are line numbers in HEAD. The classifier only
+    # checks whether a warning's span overlaps any range, so a plain
+    # concatenation is enough — no merging needed beyond that. This
+    # is the gate's Option A and keeps a pre-existing warning on an
+    # untouched line in a dirty file out of the blocking set.
     proc = subprocess.run(
         ["git", "diff", "--unified=0", base, "HEAD", "--", path],
         check=False,
         capture_output=True,
         text=True,
     )
-    changed[path] = parse_ranges(proc.stdout)
+    committed_ranges = parse_ranges(proc.stdout)
+
+    working_tree_ranges = []
+    if has_working_tree_changes(path):
+        proc = subprocess.run(
+            ["git", "diff", "--unified=0", "HEAD", "--", path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        working_tree_ranges = parse_ranges(proc.stdout)
+
+    changed[path] = committed_ranges + working_tree_ranges
 
 print(json.dumps(changed))
 PY
