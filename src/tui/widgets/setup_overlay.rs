@@ -22,6 +22,18 @@ pub struct ActiveChoose {
     pub id: String,
     pub label: String,
     pub options: Vec<String>,
+    /// Optional section heading shown above the options. `None` for
+    /// pickers without a heading. The first-run wizard uses this for
+    /// its locked-channel section; the overlay's provisioner-choose
+    /// pickers never set it.
+    pub heading: Option<String>,
+    /// Per-option disabled flag, same length as `options`. The wizard's
+    /// picker handlers (`FirstRunWizard::picker_move_*`, `picker_toggle`,
+    /// `picker_submit`) dim disabled rows, skip them on cursor movement,
+    /// make Space inert on them, and filter them out of the submitted
+    /// selection. The overlay's `SetupOverlayState` populates every entry
+    /// with `false` and its handlers are unaware of the flag.
+    pub disabled: Vec<bool>,
     pub multi: bool,
     pub cursor: usize,
     pub selected: Vec<usize>,
@@ -113,10 +125,13 @@ impl SetupOverlayState {
                 options,
                 multi,
             } => {
+                let n = options.len();
                 self.choose = Some(ActiveChoose {
                     id,
                     label,
                     options,
+                    heading: None,
+                    disabled: vec![false; n],
                     multi,
                     cursor: 0,
                     selected: Vec::new(),

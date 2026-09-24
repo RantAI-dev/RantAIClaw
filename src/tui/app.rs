@@ -2273,7 +2273,8 @@ impl TuiApp {
             }
             super::first_run_wizard::WizardPhase::PickChannels => {
                 if let Some(w) = self.first_run_wizard.as_mut() {
-                    w.open_picker(super::first_run_wizard::channel_options());
+                    let (rows, heading, disabled) = super::first_run_wizard::channel_options_full();
+                    w.open_picker_with_disabled(rows, heading, disabled);
                 }
             }
             super::first_run_wizard::WizardPhase::PickIntegrations => {
