@@ -1595,18 +1595,10 @@ impl Channel for LarkChannel {
         self.get_tenant_access_token().await.is_ok()
     }
 
-    /// Lark has no typing-indicator API; the trait default is the right
-    /// behaviour, but it lives in `traits.rs` and would silently win against
-    /// `Arc<dyn Channel>` if this override were missing. The explicit no-op
-    /// makes the intent visible to the trait-method guard.
-    async fn start_typing(&self, _recipient: &str, _thread_ts: Option<&str>) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Pairs with the no-op `start_typing` above — same reason.
-    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
+    // Lark has no bot-drivable typing indicator: `start_typing` and
+    // `stop_typing` deliberately fall through to the trait default, and the
+    // `every_tier_channel_shows_and_clears_a_working_signal` guard asserts
+    // they remain absent here.
 
     /// Lark can deliver attachments (`send_attachment`), so the model is told
     /// the marker syntax. Telling a channel that cannot deliver them leaks
