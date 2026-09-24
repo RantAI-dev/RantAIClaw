@@ -257,6 +257,24 @@ pub struct ProviderCapabilityError {
     pub message: String,
 }
 
+impl ProviderCapabilityError {
+    /// One-sentence user-facing reply for chat channels. `prefix` is the
+    /// channel's command prefix (e.g. "/" for Lark, "" for Slack). The full
+    /// structured error stays in the tracing record.
+    pub fn user_facing_message(&self, prefix: &str) -> String {
+        match self.capability.as_str() {
+            "vision" => format!(
+                "The current model ({}) cannot read images. Send `{}model <id>` to switch to a vision-capable model.",
+                self.provider, prefix,
+            ),
+            other => format!(
+                "The current model ({}) does not support {}. Send `{}model <id>` to switch.",
+                self.provider, other, prefix,
+            ),
+        }
+    }
+}
+
 /// Provider capabilities declaration.
 ///
 /// Describes what features a provider supports, enabling intelligent
