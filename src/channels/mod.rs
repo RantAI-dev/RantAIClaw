@@ -420,6 +420,26 @@ impl Default for ChannelsRegistry {
     }
 }
 
+/// Format the WARN line a channel emits when an inbound message comes from a
+/// sender not in its allowlist. The full identifier — a phone number, a
+/// Discord `author_id`, a Slack `U…` user id, or a Lark `ou_…` open_id — is
+/// redacted before it reaches this helper, and stays redacted at WARN; the
+/// caller writes the full value to a DEBUG line that an operator has to opt
+/// into. The WARN sentence names the on-host `channels pair` CLI and the
+/// in-chat `/claim` step that grant access, without naming the sender's
+/// identifier, which a journal reader would otherwise learn.
+///
+/// `channel` is the CLI surface name (`whatsapp_web`, `discord`, `slack`,
+/// `lark`) the operator types into `rantaiclaw channels pair --channel`.
+/// The same keys are accepted by `commands.rs` and are the catalog entries
+/// the `ChannelSupport` enum enumerates.
+pub(crate) fn rejected_sender_warn(channel: &str, redacted_id: &str) -> String {
+    format!(
+        "{channel}: ignoring unauthorized sender ({redacted_id}); to allow them, mint a code \
+         with `rantaiclaw channels pair --channel {channel}`, then DM the bot `/claim <code>`"
+    )
+}
+
 #[derive(Clone)]
 pub(crate) struct ChannelRuntimeContext {
     /// Reloaded config state for *this* runtime's config file.

@@ -725,7 +725,17 @@ impl LarkChannel {
                             // never carries a pairing code, so it has no
                             // reason to jump the gate.
                             if !self.is_user_allowed(sender_open_id) {
-                                tracing::warn!("Lark WS: ignoring image from {sender_open_id} (not in allowed_users)");
+                                tracing::warn!(
+                                    "{}",
+                                    crate::channels::rejected_sender_warn(
+                                        "lark",
+                                        &crate::security::redact(sender_open_id)
+                                    )
+                                );
+                                tracing::debug!(
+                                    "Lark WS: full identifier of unauthorized sender: \
+                                     {sender_open_id}"
+                                );
                                 continue;
                             }
                             if lark_msg.chat_type == "group" {
@@ -776,7 +786,16 @@ impl LarkChannel {
                     }
 
                     if !self.is_user_allowed(sender_open_id) {
-                        tracing::warn!("Lark WS: ignoring {sender_open_id} (not in allowed_users)");
+                        tracing::warn!(
+                            "{}",
+                            crate::channels::rejected_sender_warn(
+                                "lark",
+                                &crate::security::redact(sender_open_id)
+                            )
+                        );
+                        tracing::debug!(
+                            "Lark WS: full identifier of unauthorized sender: {sender_open_id}"
+                        );
                         continue;
                     }
 
@@ -1192,7 +1211,11 @@ impl LarkChannel {
 
         // Check allowlist
         if !self.is_user_allowed(open_id) {
-            tracing::warn!("Lark: ignoring message from unauthorized user: {open_id}");
+            tracing::warn!(
+                "{}",
+                crate::channels::rejected_sender_warn("lark", &crate::security::redact(open_id))
+            );
+            tracing::debug!("Lark: full identifier of unauthorized sender: {open_id}");
             return messages;
         }
 

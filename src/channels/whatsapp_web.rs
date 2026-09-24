@@ -1230,12 +1230,23 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 }
                             } else {
-                                // Name the identity so an operator can allowlist
-                                // it — including the `lid:` form, which is the
-                                // only thing that admits an unmapped LID.
+                                // Keep the full phone number out of the
+                                // journal: the WARN only carries the
+                                // redacted form, and the helper sentence
+                                // names the on-host CLI plus `/claim` for
+                                // the operator who wants to allowlist.
+                                // The DEBUG line carries the full
+                                // identifier for the operator who has opted
+                                // into that level.
                                 tracing::warn!(
-                                    "WhatsApp Web: message from {normalized} not in allowed_numbers; \
-                                     add that exact value to allow it"
+                                    "{}",
+                                    crate::channels::rejected_sender_warn(
+                                        "whatsapp_web",
+                                        &crate::security::redact(&normalized)
+                                    )
+                                );
+                                tracing::debug!(
+                                    "WhatsApp Web: full identifier of unauthorized sender: {normalized}"
                                 );
                             }
                         }

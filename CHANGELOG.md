@@ -780,6 +780,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart requests a fresh endpoint URL from Lark, and the console can confirm afterward whether
   its `access_key` changed. Consider `journalctl --user --vacuum-time=2d` (or another retention
   window) to clear the old entries.
+- **Rejected senders' identifiers no longer reach the journal at WARN.** WhatsApp Web, Discord,
+  Slack and Lark all wrote the full sender identifier at WARN whenever the allowlist refused an
+  inbound message — a normalized phone number, a Discord `author_id`, a Slack `U…` user id, or a
+  Lark `ou_…` open_id — which on a personal WhatsApp Web logged every stranger who wrote to the
+  owner. Every one of the six sites now redacts the identifier through `crate::security::redact`
+  before a shared helper sentence names the on-host `rantaiclaw channels pair --channel <key>`
+  and the in-chat `/claim <code>`; the full identifier moves to a DEBUG line that an operator
+  has to opt into. **Journals already holding the old lines still carry the unredacted numbers
+  and ids;** a restart redacts only new messages. Consider `journalctl --user --vacuum-time=2d`
+  (or another retention window) to clear the old entries.
 - **Channel logs no longer carry message or reply text, and Telegram's startup pairing code no
   longer reaches the journal.** Two INFO lines in the dispatch core wrote the first 80 characters
   of every inbound message and of every reply on every channel, and the gateway wrote the first 50
