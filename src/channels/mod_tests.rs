@@ -9749,54 +9749,69 @@ fn no_channel_defines_a_trait_method_outside_its_channel_impl() {
 /// satisfied for months with the method in a plain `impl DiscordChannel` block
 /// that the runtime could not reach (F-32).
 ///
+/// Channels with no bot-drivable typing indicator (Lark, WhatsApp Cloud) sit in
+/// the same wiring but with `has_typing = false`; the guard then asserts
+/// `start_typing` and `stop_typing` are *absent* from the `impl Channel for`
+/// block, the trait default is the intended behaviour, and no vacuous match
+/// can hide a misrouted override. Adding a real `start_typing` to one of these
+/// without moving it out of the no-typing list fails the guard with a message
+/// that says what to do.
+///
 /// The covered set is pinned against the catalog's `Supported` rows: every
 /// entry must be `channel_is_usable(key)`, and every `Supported` row that has
 /// a runtime path (i.e. is not the gateway-served `webhook`) must appear in
 /// the wiring. The four hand-listed channels the guard started with are still
-/// here, plus Lark and WhatsApp Cloud, which the guard previously missed —
-/// Lark sat with no `start_typing`/`stop_typing` overrides at all, and the
-/// `Arc<dyn Channel>` default no-op ran silently.
+/// here, plus Lark and WhatsApp Cloud, which the guard previously missed.
 #[test]
 fn every_tier_channel_shows_and_clears_a_working_signal() {
     // Assembled at runtime so this test does not match itself.
     let start = format!("async fn start_{}(", "typing");
     let stop = format!("async fn stop_{}(", "typing");
-    // Per channel, the call in `stop_typing` that actually ends the signal.
-    // Asserting the method merely *exists* is not enough: a `stop_typing` whose
-    // body was emptied still satisfies that, and an emptied one is precisely
-    // how a "working…" placeholder outlives its turn. Empty string when the
-    // channel's `stop_typing` is a documented no-op — every body line trivially
-    // contains `""`, and the assertion is a no-op rather than a vacuous match.
-    // The catalog key is the first element, so the catalog check below can
+    // Per channel with a typing indicator, the call in `stop_typing` that
+    // actually ends the signal. Asserting the method merely *exists* is not
+    // enough: a `stop_typing` whose body was emptied still satisfies that, and
+    // an emptied one is precisely how a "working…" placeholder outlives its
+    // turn. `clears` is unused for channels declared as having no typing API.
+    // The catalog key is the second element, so the catalog check below can
     // match without aliasing; `display_name` keeps the human-readable label
     // Slack picked and disambiguates WhatsApp Cloud from WhatsApp Web.
-    let wiring: &[(&str, &str, &str, &str)] = &[
+    let wiring: &[(&str, &str, &str, bool, &str)] = &[
         (
             "telegram",
             "telegram",
             include_str!("telegram.rs"),
+            true,
             "remove(",
         ),
-        ("discord", "discord", include_str!("discord.rs"), "remove("),
+        (
+            "discord",
+            "discord",
+            include_str!("discord.rs"),
+            true,
+            "remove(",
+        ),
         (
             "slack",
             "slack",
             include_str!("slack.rs"),
+            true,
             "take_working_notice(",
         ),
         (
             "whatsapp (cloud)",
             "whatsapp",
             include_str!("whatsapp.rs"),
+            false,
             "",
         ),
         (
             "whatsapp (web)",
             "whatsapp_web",
             include_str!("whatsapp_web.rs"),
+            true,
             "send_paused(",
         ),
-        ("lark", "lark", include_str!("lark.rs"), ""),
+        ("lark", "lark", include_str!("lark.rs"), false, ""),
     ];
 
     // Pin the wiring against the catalog's `Supported` rows. Two contracts:
@@ -9805,8 +9820,8 @@ fn every_tier_channel_shows_and_clears_a_working_signal() {
     // that this guard forgets to add is what made Lark and WhatsApp Cloud
     // invisible to it for months.
     let wiring_keys: std::collections::BTreeSet<&str> =
-        wiring.iter().map(|(_, key, _, _)| *key).collect();
-    for &(_, key, _, _) in wiring {
+        wiring.iter().map(|(_, key, _, _, _)| *key).collect();
+    for &(_, key, _, _, _) in wiring {
         assert!(
             channel_is_usable(key),
             "{key}: covered by the wiring but not `Supported` in the catalog — \
@@ -9823,40 +9838,63 @@ fn every_tier_channel_shows_and_clears_a_working_signal() {
         }
     }
 
-    for (display, _key, src, clears) in wiring {
+    for (display, _key, src, has_typing, clears) in wiring {
         let channel = display;
         // `production_half`, not a split on `"\n#[cfg(test)]"`: that misses
         // `#[cfg(all(test, feature = ...))]`, which is how `whatsapp_web.rs`
         // gates its test module, so that module was being read as production.
         let production = production_half(src);
-        assert!(
-            channel_impl_method_body(production, start.as_str()).is_some(),
-            "{channel}: no `start_typing` inside `impl Channel for`, so the \
-             runtime's `Arc<dyn Channel>` falls through to the no-op default and \
-             shows nothing while the agent works"
-        );
-
-        // Structural on this side too. `production.find` matched the text
-        // anywhere in the file, which is the vacuity this guard was rewritten to
-        // remove: a `stop_typing` in a plain `impl` block satisfied it while the
-        // indicator it was supposed to clear ran on untouched.
-        let body = channel_impl_method_body(production, stop.as_str()).unwrap_or_else(|| {
-            panic!(
-                "{channel}: overrides `start_typing` without a `stop_typing` inside \
-                 `impl Channel for`"
-            )
-        });
-        assert!(
-            body.iter().any(|line| line.contains(clears)),
-            "{channel}: `stop_typing` no longer calls `{clears}`, so whatever \
-             it shows can outlive the turn"
-        );
+        let start_body = channel_impl_method_body(production, start.as_str());
+        let stop_body = channel_impl_method_body(production, stop.as_str());
+        if *has_typing {
+            // The typed-channel half. `production.find` matched the text
+            // anywhere in the file, which is the vacuity this guard was
+            // rewritten to remove: a `stop_typing` in a plain `impl` block
+            // satisfied it while the indicator it was supposed to clear ran on
+            // untouched.
+            assert!(
+                start_body.is_some(),
+                "{channel}: no `start_typing` inside `impl Channel for`, so the \
+                 runtime's `Arc<dyn Channel>` falls through to the no-op default \
+                 and shows nothing while the agent works"
+            );
+            let body = stop_body.unwrap_or_else(|| {
+                panic!(
+                    "{channel}: overrides `start_typing` without a `stop_typing` \
+                     inside `impl Channel for`"
+                )
+            });
+            assert!(
+                body.iter().any(|line| line.contains(clears)),
+                "{channel}: `stop_typing` no longer calls `{clears}`, so whatever \
+                 it shows can outlive the turn"
+            );
+        } else {
+            // The no-typing-API half. The trait default is the intended
+            // behaviour, and any override here would silently win against
+            // `Arc<dyn Channel>` — the previous version of this row held an
+            // explicit `Ok(())` whose only purpose was to satisfy an earlier
+            // version of this same test, which is a vacuous match we now refuse.
+            assert!(
+                start_body.is_none(),
+                "{channel}: defines `start_typing` inside `impl Channel for` but is \
+                 declared as having no typing API; remove the override or move \
+                 this row out of the no-typing list"
+            );
+            assert!(
+                stop_body.is_none(),
+                "{channel}: defines `stop_typing` inside `impl Channel for` but is \
+                 declared as having no typing API"
+            );
+        }
 
         // The same question for the health probe, which nothing else asks.
         // Deleting a channel's `health_check` restores the trait default `true`,
         // so the heartbeat reports healthy for a revoked token and no test
         // notices: the class guard only fires on a method in the WRONG block, and
         // `dead_code` is allowed crate-wide, so the compiler says nothing either.
+        // This applies to every channel, typed or not — a `false`-typed row
+        // that loses its health probe regresses the same way.
         assert!(
             channel_impl_method_body(production, "async fn health_check(").is_some(),
             "{channel}: no `health_check` inside `impl Channel for`, so the \
