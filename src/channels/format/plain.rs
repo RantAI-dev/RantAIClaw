@@ -30,7 +30,7 @@ fn inline_text(inlines: &[Inline]) -> String {
                 out.push_str(url);
                 out.push(')');
             }
-            Inline::SoftBreak | Inline::HardBreak => out.push(' '),
+            Inline::SoftBreak | Inline::HardBreak => out.push('\n'),
         }
     }
     out
@@ -158,5 +158,20 @@ mod tests {
     fn code_in_a_list_item_keeps_its_indent() {
         let out = joined("1. Run:\n\n   ```\n   cmd\n   ```");
         assert_eq!(out, "1. Run:\n\n       cmd");
+    }
+
+    #[test]
+    fn soft_break_keeps_a_line_break() {
+        // pulldown-cmark treats a single '\n' inside a paragraph as a soft
+        // break. The plain renderer must preserve it as '\n' so two-line replies
+        // (e.g. /model's "Current provider: … \n Current model: …") stay on
+        // separate lines in plain-text channels such as Lark.
+        assert_eq!(joined("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn hard_break_keeps_a_line_break() {
+        // Two trailing spaces + '\n' is a hard break in pulldown-cmark.
+        assert_eq!(joined("a  \nb"), "a\nb");
     }
 }
