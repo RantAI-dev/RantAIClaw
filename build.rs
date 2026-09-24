@@ -2,13 +2,44 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
-    // Re-run when the checked-out commit changes. `.git/HEAD` is rewritten by
-    // every checkout/switch; the index and refs change less often but HEAD alone
-    // is enough to catch the common case (rebuild after a `git pull`).
+    // Re-run when the checked-out commit changes.
+    //
+    // A pull on a checked-out branch does NOT rewrite `.git/HEAD` — it
+    // still reads `ref: refs/heads/<branch>` after the pull — but it DOES
+    // rewrite the ref file under `.git/refs/heads/<branch>` (or
+    // `.git/packed-refs` when the ref has been packed). Declaring any
+    // `rerun-if-changed` narrows cargo's default, which is to re-run the
+    // script on any package-file change; watching only `.git/HEAD` would
+    // miss the common pull case and the previous commit's
+    // `RANTAICLAW_BUILD_ID` would stick. Watch HEAD, the resolved ref,
+    // and packed-refs so every ref-bumping event triggers a re-run.
     println!("cargo:rerun-if-changed=.git/HEAD");
+    if let Some(ref_path) = resolved_ref_path() {
+        println!("cargo:rerun-if-changed={ref_path}");
+    }
+    println!("cargo:rerun-if-changed=.git/packed-refs");
 
     let build_id = git_short_head().unwrap_or_else(timestamp_fallback);
     println!("cargo:rustc-env=RANTAICLAW_BUILD_ID={build_id}");
+}
+
+/// Returns the on-disk ref path `.git/HEAD` points to when it is a symref,
+/// e.g. `.git/refs/heads/main`. Returns `None` for a detached HEAD (raw SHA
+/// on the first line), a missing `.git/HEAD`, a non-git build directory, or
+/// a symref target that does not exist on disk yet — cargo silently skips a
+/// declared path it cannot find, so the caller's `if let` is the right gate.
+fn resolved_ref_path() -> Option<String> {
+    let head = std::fs::read_to_string(".git/HEAD").ok()?;
+    let target = head.lines().next()?.trim().strip_prefix("ref: ")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let path = format!(".git/{target}");
+    if std::path::Path::new(&path).exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 /// `git rev-parse --short HEAD` succeeds for a normal checkout. Returns None if
