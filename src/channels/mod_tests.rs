@@ -667,6 +667,155 @@ fn no_log_or_print_call_carries_a_connection_url_with_credentials() {
     );
 }
 
+/// No log or print call in `src/channels/` or the gateway's startup banner
+/// interpolates a binding that holds a pairing code by a name this guard
+/// recognizes. The gateway used to print its startup pairing code to stdout
+/// unconditionally (`println!("…│  {code}  │")` and the matching
+/// `X-Pairing-Code: {code}` line), and under systemd stdout is the journal —
+/// the code grants a bearer token through `POST /pair`, so a credential was
+/// being written to a log an operator did not choose to hold. The banner now
+/// prints the code only on an interactive stdout and otherwise points at
+/// `rantaiclaw ui start` (which pairs the web console itself) and
+/// `rantaiclaw channels pair --channel gateway` (which mints a code on
+/// demand). This guard catches a future regression where someone re-adds an
+/// inline `println!("…{code}…")` in `src/gateway/mod.rs`.
+///
+/// The fix follows the same "rename past the pattern" convention the text
+/// guard already relies on: build the banner in a helper that formats the
+/// string before it reaches a `println!`, or bind the pairing code under a
+/// name this guard does not recognize.
+#[test]
+fn no_log_or_print_call_carries_a_pairing_code() {
+    // (file under src/, a fragment of the call, why it is not a pairing code)
+    const CLASSIFIED: &[(&str, &str, &str)] = &[
+        (
+            "channels/admin.rs",
+            "Pairing code for",
+            "pair_channel prints the freshly minted code on stdout by design",
+        ),
+        (
+            "channels/admin.rs",
+            "DM the bot:",
+            "pair_channel prints the bind/claim instructions on stdout by design",
+        ),
+        (
+            "channels/discord.rs",
+            "Discord: gateway closed with",
+            "Discord's gateway close code, not a pairing code",
+        ),
+        (
+            "channels/lark.rs",
+            "Lark: add reaction returned code=",
+            "Lark's HTTP status code, not a pairing code",
+        ),
+        (
+            "channels/qr_terminal.rs",
+            "eprintln!(\"    {code}\")",
+            "render_pair_code already gates on stderr being a tty",
+        ),
+        (
+            "gateway/mod.rs",
+            "startup_pairing_banner",
+            "the banner helper gates the code on stdout being a tty before printing it",
+        ),
+    ];
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = vec![src_root.join("gateway").join("mod.rs")];
+    let mut dirs = vec![src_root.join("channels")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if name.ends_with(".rs") && name != "mod_tests.rs" && name != "tests.rs" {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut calls_per_file = std::collections::BTreeMap::new();
+    let mut unclassified = Vec::new();
+    let mut matched = vec![0_usize; CLASSIFIED.len()];
+    for path in files {
+        let file = path
+            .strip_prefix(&src_root)
+            .expect("a file under src")
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let src = std::fs::read_to_string(&path).expect("read a source file");
+        let production = production_half(&src);
+        let (code, literals) = mask_comments_and_literals(production);
+        let calls = log_calls(&code);
+        calls_per_file.insert(file.clone(), calls.len());
+        for (at, args) in calls {
+            let mut named = printed_bindings(
+                &String::from_utf8_lossy(&code[args.clone()]),
+                is_pairing_code_binding,
+            );
+            for literal in literals
+                .iter()
+                .filter(|literal| args.start <= literal.start && literal.end <= args.end)
+            {
+                named.extend(
+                    inline_captures(&production[literal.clone()])
+                        .into_iter()
+                        .filter(|name| is_pairing_code_binding(name))
+                        .map(|name| format!("{{{name}}}")),
+                );
+            }
+            if named.is_empty() {
+                continue;
+            }
+            let call = &production[at..(args.end + 1).min(production.len())];
+            match CLASSIFIED
+                .iter()
+                .position(|(f, fragment, _)| file == *f && call.contains(fragment))
+            {
+                Some(entry) => matched[entry] += 1,
+                None => unclassified.push(format!(
+                    "{file}:{} names {named:?}: {}",
+                    production[..at].matches('\n').count() + 1,
+                    call.split_whitespace().collect::<Vec<_>>().join(" ")
+                )),
+            }
+        }
+    }
+
+    // The scan must be reading what it claims to: the future-regression guard
+    // only fires when the scan reaches the gateway banner site.
+    assert!(
+        calls_per_file
+            .get("gateway/mod.rs")
+            .is_some_and(|&calls| calls > 0),
+        "found no log calls in gateway/mod.rs, so the scan is not reading it"
+    );
+
+    let stale: Vec<String> = CLASSIFIED
+        .iter()
+        .zip(&matched)
+        .filter(|(_, calls)| **calls != 1)
+        .map(|((file, fragment, _), calls)| {
+            format!("{file}: `{fragment}` is classified but matched {calls} calls, not 1")
+        })
+        .collect();
+    assert!(
+        unclassified.is_empty() && stale.is_empty(),
+        "log or print calls that interpolate a pairing code by a recognized name; \
+         build the banner in a helper before the println! so the code never reaches the \
+         log, rebind under a name this guard does not recognize, or classify a value that \
+         is not a pairing code:\n{}\n{}",
+        unclassified.join("\n"),
+        stale.join("\n")
+    );
+}
+
 /// Names that hold message or reply text in the scanned code: the inbound text
 /// each channel binds (`text`, `content`, `body`, `caption`), the dispatch
 /// core's `msg` (a `ChannelMessage`, whose `Debug` prints its content), the
@@ -709,6 +858,17 @@ fn is_connection_url_binding(name: &str) -> bool {
         name,
         "wss_url" | "ws_url" | "endpoint_url" | "connection_url"
     )
+}
+
+/// Names that hold a pairing code in the scanned code. Pair codes are
+/// credentials — they grant a bearer token through `POST /pair` once
+/// exchanged — and printing one to stdout under systemd writes it to the
+/// journal. The sibling guard
+/// (`no_log_or_print_call_carries_a_pairing_code`) catches a future
+/// regression where a pairing code is interpolated inline in a `println!`
+/// or `tracing::*` macro.
+fn is_pairing_code_binding(name: &str) -> bool {
+    name == "code"
 }
 
 fn is_identifier(token: &str) -> bool {
