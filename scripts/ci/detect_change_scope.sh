@@ -84,7 +84,8 @@ while IFS= read -r file; do
     || [[ "$file" == scripts/ci/* ]] \
     || [[ "$file" == "Cargo.toml" ]] \
     || [[ "$file" == "Cargo.lock" ]] \
-    || [[ "$file" == "deny.toml" ]]; then
+    || [[ "$file" == "deny.toml" ]] \
+    || [[ "$file" == "build.rs" ]]; then
     rust_changed=true
   fi
 done <<< "$CHANGED"

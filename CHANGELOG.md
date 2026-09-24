@@ -177,6 +177,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`build.rs` works in a git worktree and CI compiles `build.rs` changes.** `build.rs` declared
+  `cargo:rerun-if-changed=.git/HEAD`, and `.git` is a file in a worktree (`gitdir: …`), so the
+  declared path was missing — cargo reports `Dirty … the file '…' is missing`, reruns the build script
+  and recompiles the crate on every build (every executor build was a full rebuild). `build.rs` now
+  resolves the real paths via `git rev-parse --git-dir` (the per-worktree `HEAD`) and
+  `git rev-parse --git-common-dir` (the shared `refs/` and `packed-refs` directory), and emits a
+  directive only for a path it has confirmed exists; the build id tracks branch pulls through the
+  resolved-ref path the same way it always did. `scripts/ci/detect_change_scope.sh` now treats
+  `build.rs` as a Rust change so a PR that edits only the build script compiles it in CI.
 - **The Slack setup checklist names every scope and setting Socket Mode needs.** The legacy wizard listed
   three scopes (`chat:write`, `channels:history`, `files:read`), the provisioner listed none, and docs
   §4.3 listed `connections:write` and `chat:write` only — so an operator following any of them got a

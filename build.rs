@@ -1,45 +1,107 @@
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     // Re-run when the checked-out commit changes.
     //
-    // A pull on a checked-out branch does NOT rewrite `.git/HEAD` — it
-    // still reads `ref: refs/heads/<branch>` after the pull — but it DOES
-    // rewrite the ref file under `.git/refs/heads/<branch>` (or
-    // `.git/packed-refs` when the ref has been packed). Declaring any
-    // `rerun-if-changed` narrows cargo's default, which is to re-run the
-    // script on any package-file change; watching only `.git/HEAD` would
-    // miss the common pull case and the previous commit's
-    // `RANTAICLAW_BUILD_ID` would stick. Watch HEAD, the resolved ref,
-    // and packed-refs so every ref-bumping event triggers a re-run.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Some(ref_path) = resolved_ref_path() {
-        println!("cargo:rerun-if-changed={ref_path}");
+    // A pull on a checked-out branch does NOT rewrite the `HEAD` symref —
+    // it still reads `ref: refs/heads/<branch>` after the pull — but it
+    // DOES rewrite the file under `refs/heads/<branch>` (or
+    // `packed-refs` when the ref has been packed). Declaring any
+    // `rerun-if-changed` narrows cargo's default; watching only `HEAD`
+    // would miss the common pull case.
+    //
+    // Note: cargo treats a missing `rerun-if-changed` path as dirty
+    // (`Dirty … the file '…' is missing`), reruns the build script and
+    // recompiles the crate — so we only emit a directive for a path we
+    // have confirmed exists.
+    //
+    // In a git worktree the directory holding `HEAD` is the per-worktree
+    // git dir (`git rev-parse --git-dir`), while `refs/` and `packed-refs`
+    // live in the shared common dir (`git rev-parse --git-common-dir`).
+    // Resolve both via git and emit the directives only for paths that
+    // exist. When the working tree is not a repo (e.g. a release source
+    // tarball) or git is not on PATH, fall back to watching `build.rs`
+    // alone; the timestamp id is then stable until `build.rs` itself
+    // changes.
+    println!("cargo:rerun-if-changed=build.rs");
+
+    let Some(head_path) = git_dir_head_path() else {
+        let build_id = git_short_head().unwrap_or_else(timestamp_fallback);
+        println!("cargo:rustc-env=RANTAICLAW_BUILD_ID={build_id}");
+        return;
+    };
+    let Some(common_dir) = git_common_dir() else {
+        let build_id = git_short_head().unwrap_or_else(timestamp_fallback);
+        println!("cargo:rustc-env=RANTAICLAW_BUILD_ID={build_id}");
+        return;
+    };
+
+    if head_path.exists() {
+        println!("cargo:rerun-if-changed={}", head_path.display());
     }
-    println!("cargo:rerun-if-changed=.git/packed-refs");
+    let packed = common_dir.join("packed-refs");
+    if packed.exists() {
+        println!("cargo:rerun-if-changed={}", packed.display());
+    }
+    if let Some(ref_path) = resolved_ref_path(&head_path, &common_dir) {
+        if ref_path.exists() {
+            println!("cargo:rerun-if-changed={}", ref_path.display());
+        }
+    }
 
     let build_id = git_short_head().unwrap_or_else(timestamp_fallback);
     println!("cargo:rustc-env=RANTAICLAW_BUILD_ID={build_id}");
 }
 
-/// Returns the on-disk ref path `.git/HEAD` points to when it is a symref,
-/// e.g. `.git/refs/heads/main`. Returns `None` for a detached HEAD (raw SHA
-/// on the first line), a missing `.git/HEAD`, a non-git build directory, or
-/// a symref target that does not exist on disk yet — cargo silently skips a
-/// declared path it cannot find, so the caller's `if let` is the right gate.
-fn resolved_ref_path() -> Option<String> {
-    let head = std::fs::read_to_string(".git/HEAD").ok()?;
+/// `git rev-parse --git-dir`, with `/HEAD` appended. Returns the absolute
+/// (in a worktree) or relative (in a normal repo) path to the `HEAD` file
+/// when git answers; otherwise `None` (no git on PATH, not a repo). Empty
+/// output is filtered by `git_stdout`, which returns `None` for it.
+fn git_dir_head_path() -> Option<PathBuf> {
+    let s = git_stdout(&["rev-parse", "--git-dir"])?;
+    let mut p = PathBuf::from(s);
+    p.push("HEAD");
+    Some(p)
+}
+
+/// `git rev-parse --git-common-dir`. Same return contract as
+/// `git_dir_head_path`. Holds `refs/` and `packed-refs` in worktrees and is
+/// identical to `--git-dir` in a normal repo. Empty output is filtered by
+/// `git_stdout`, which returns `None` for it.
+fn git_common_dir() -> Option<PathBuf> {
+    let s = git_stdout(&["rev-parse", "--git-common-dir"])?;
+    Some(PathBuf::from(s))
+}
+
+fn git_stdout(args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Returns the on-disk ref path `HEAD` points to when it is a symref,
+/// e.g. `<common-dir>/refs/heads/main`. Returns `None` for a detached HEAD
+/// (raw SHA on the first line), a missing `HEAD`, a symref target that
+/// does not resolve under the common dir, or a non-git build directory.
+/// The caller checks `.exists()` and skips the rerun directive when the
+/// target is not on disk (e.g. a freshly cloned, never-checked-out ref).
+fn resolved_ref_path(head_path: &std::path::Path, common_dir: &std::path::Path) -> Option<PathBuf> {
+    let head = std::fs::read_to_string(head_path).ok()?;
     let target = head.lines().next()?.trim().strip_prefix("ref: ")?.trim();
     if target.is_empty() {
         return None;
     }
-    let path = format!(".git/{target}");
-    if std::path::Path::new(&path).exists() {
-        Some(path)
-    } else {
-        None
-    }
+    Some(common_dir.join(target))
 }
 
 /// `git rev-parse --short HEAD` succeeds for a normal checkout. Returns None if
