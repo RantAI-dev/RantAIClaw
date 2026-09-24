@@ -16,7 +16,7 @@ use super::{
 };
 use crate::agent::loop_::run_tool_call_loop;
 use crate::memory::Memory;
-use crate::providers::{self, ChatMessage};
+use crate::providers::{self, ChatMessage, ProviderCapabilityError};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,6 +133,17 @@ pub(crate) fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|hint| lower.contains(hint))
+}
+
+/// Walk `err.chain()` looking for a structured `ProviderCapabilityError`.
+/// Returns the typed error so the caller can render a one-sentence reply
+/// that names the model and the channel's `/model` command, instead of
+/// shipping the cut-off `sanitize_api_error(...)` form to the user.
+pub(crate) fn find_provider_capability_error(
+    err: &anyhow::Error,
+) -> Option<&ProviderCapabilityError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderCapabilityError>())
 }
 
 pub(crate) async fn build_memory_context(
@@ -963,6 +974,29 @@ pub(crate) async fn process_channel_message(
                 return TurnEnd::Finished;
             }
 
+            if let Some(cap_err) = find_provider_capability_error(&e) {
+                let prefix = commands::command_prefix(&msg.channel);
+                let reply = cap_err.user_facing_message(prefix);
+                tracing::warn!(
+                    target: "channels",
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    provider = %cap_err.provider,
+                    capability = %cap_err.capability,
+                    "provider capability error"
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &reply)
+                            .await;
+                    } else {
+                        let _ = channel.send(&msg.reply(reply)).await;
+                    }
+                }
+                return TurnEnd::Finished;
+            }
+
             tracing::error!(
                 target: "channels",
                 channel = %msg.channel,
@@ -1368,5 +1402,83 @@ pub(crate) async fn run_message_dispatch_loop(
             },
             () = &mut deadline, if !stop_running_turns.is_cancelled() => stop_running_turns.cancel(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_provider_capability_error_matches_wrapped_typed_error() {
+        let cap_err: anyhow::Error = ProviderCapabilityError {
+            provider: "MiniMax".to_string(),
+            capability: "vision".to_string(),
+            message: "this provider does not support vision input. The image was not sent; switch to a vision-capable model to describe it.".to_string(),
+        }
+        .into();
+
+        let found = find_provider_capability_error(&cap_err).expect("typed error should match");
+        assert_eq!(found.provider, "MiniMax");
+        assert_eq!(found.capability, "vision");
+
+        // The user-facing sentence must name the channel prefix, the model, and the
+        // capability so the user can act on it without reading the cut-off error
+        // code. Sanity check: it must NOT start with the legacy sanitized form.
+        let message = found.user_facing_message("/");
+        assert!(
+            message.contains("MiniMax"),
+            "sentence must name the model; got: {message}"
+        );
+        assert!(
+            message.contains("/model"),
+            "sentence must show the channel command; got: {message}"
+        );
+        assert!(
+            message.contains("vision"),
+            "sentence must name the capability; got: {message}"
+        );
+        assert!(
+            !message.starts_with("⚠️ Error: provider_capability_error"),
+            "sentence must replace the cut-off sanitized string; got: {message}"
+        );
+    }
+
+    #[test]
+    fn find_provider_capability_error_does_not_match_unrelated_errors() {
+        let other_err =
+            anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
+        assert!(find_provider_capability_error(&other_err).is_none());
+    }
+
+    #[test]
+    fn provider_capability_error_user_facing_message_uses_channel_prefix() {
+        let cap_err = ProviderCapabilityError {
+            provider: "MiniMax".to_string(),
+            capability: "vision".to_string(),
+            message: "switch to a vision-capable model".to_string(),
+        };
+
+        // Slack has no prefix; the command is plain "model".
+        let slack = cap_err.user_facing_message("");
+        assert!(
+            slack.contains("MiniMax"),
+            "slack message must name the model; got: {slack}"
+        );
+        assert!(
+            slack.contains("model "),
+            "slack message must mention 'model ' (without leading slash); got: {slack}"
+        );
+        assert!(
+            !slack.contains("/model"),
+            "slack message must not show '/model'; got: {slack}"
+        );
+
+        // Other channels prefix commands with '/'.
+        let lark = cap_err.user_facing_message("/");
+        assert!(
+            lark.contains("/model"),
+            "non-slack message must show '/model'; got: {lark}"
+        );
     }
 }
