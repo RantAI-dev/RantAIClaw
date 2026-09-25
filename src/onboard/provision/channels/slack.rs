@@ -65,6 +65,21 @@ impl TuiProvisioner for SlackProvisioner {
         )
         .await?;
 
+        // Setup checklist — same list the legacy wizard prints and the docs
+        // §4.3 enumerates. Rendered before the bot-token prompt because
+        // installing the app is what issues the `xoxb-` token, and the scopes
+        // and events on this list have to be set first; pasting a token that
+        // lacks `im:history` or `files:write` would otherwise leave the
+        // operator on the wrong side of a reinstall.
+        send(
+            &events,
+            ProvisionEvent::Message {
+                severity: Severity::Info,
+                text: crate::channels::slack::SLACK_SETUP_CHECKLIST.to_string(),
+            },
+        )
+        .await?;
+
         // Bot token
         send(
             &events,
@@ -88,18 +103,6 @@ impl TuiProvisioner for SlackProvisioner {
             .await?;
             return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
-
-        // Setup checklist — same list the legacy wizard prints and the docs
-        // §4.3 enumerates. Rendered before the Socket Mode prompt so the
-        // operator sees which scopes and toggles the rest of the form needs.
-        send(
-            &events,
-            ProvisionEvent::Message {
-                severity: Severity::Info,
-                text: crate::channels::slack::SLACK_SETUP_CHECKLIST.to_string(),
-            },
-        )
-        .await?;
 
         // App-level token, optional. Asked here rather than after the
         // `auth.test` round-trip below because both tokens come off the same
@@ -556,6 +559,62 @@ mod tests {
             "SLACK_SETUP_CHECKLIST must explain what happens without `files:read`; \
              got: {:?}",
             crate::channels::slack::SLACK_SETUP_CHECKLIST
+        );
+    }
+
+    /// The Slack setup checklist must reach the operator before the bot-token
+    /// prompt, because installing the app is what issues the `xoxb-` token and
+    /// the scopes/events on the checklist have to be set first. The legacy
+    /// wizard and the console card both render the list above the token
+    /// input; the provisioner was the only one that asked for the token first.
+    ///
+    /// Matches the prompt by `id == "bot_token"` rather than by label or
+    /// position, because `app_token` is also a prompt and a position-based
+    /// assertion would pass on the original ordering (checklist-before-
+    /// `app_token` already holds).
+    #[tokio::test]
+    async fn the_setup_checklist_message_precedes_the_bot_token_prompt() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _offline = OfflineProbes::engage();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &SlackProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("placeholder-slack-bot-token"),
+                Answer::Text("xapp-1-A-placeholder"),
+                Answer::Pick(0),
+                Answer::Text(""),
+                Answer::Text("rantaiclaw_user"),
+            ],
+        )
+        .await;
+
+        let checklist_text = crate::channels::slack::SLACK_SETUP_CHECKLIST;
+        let checklist_idx = t
+            .events
+            .iter()
+            .position(
+                |e| matches!(e, ProvisionEvent::Message { text, .. } if text == checklist_text),
+            )
+            .unwrap_or_else(|| panic!("no checklist Message was offered: {:?}", t.events));
+        let bot_token_idx = t
+            .events
+            .iter()
+            .position(|e| matches!(e, ProvisionEvent::Prompt { id, .. } if id == "bot_token"))
+            .unwrap_or_else(|| panic!("no bot_token Prompt was offered: {:?}", t.events));
+
+        assert!(
+            checklist_idx < bot_token_idx,
+            "the Slack setup checklist must arrive before the bot-token prompt, \
+             so the operator sees the scopes and events to set before installing \
+             the app; got checklist at event {checklist_idx} and bot_token prompt \
+             at event {bot_token_idx}: {:?}",
+            t.events
         );
     }
 }
