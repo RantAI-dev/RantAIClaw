@@ -728,7 +728,7 @@ impl SetupOverlayState {
         let mut content_lines: Vec<Line> = self
             .log
             .iter()
-            .map(|l| style_log_line(l, coral, sky, emerald))
+            .flat_map(|l| log_entry_lines(l, coral, sky, emerald))
             .collect();
 
         if let Some((qr, cap)) = &self.qr {
@@ -919,6 +919,27 @@ fn truncate_to_width(s: &str, max_cols: usize) -> String {
     let take = max_cols.saturating_sub(1);
     let truncated: String = s.chars().take(take).collect();
     format!("{truncated}…")
+}
+
+/// Expand one stored log entry into the lines the RECENT panel renders.
+/// A `\n` inside a ratatui `Span` is not a line break, so a multi-line
+/// message must split here at render time (storage stays one `String` per
+/// event): the first line keeps its severity prefix via `style_log_line`,
+/// each continuation indents two spaces under the entry body (the glyph +
+/// space prefix is two columns), and blank lines stay blank. Entries
+/// without `\n` come through unchanged.
+fn log_entry_lines(l: &str, coral: Color, sky: Color, emerald: Color) -> Vec<Line<'_>> {
+    let mut segments = l.split('\n');
+    let first = segments.next().unwrap_or_default();
+    let mut lines = vec![style_log_line(first, coral, sky, emerald)];
+    for segment in segments {
+        lines.push(if segment.is_empty() {
+            Line::from("")
+        } else {
+            Line::from(format!("  {segment}"))
+        });
+    }
+    lines
 }
 
 fn style_log_line(l: &str, coral: Color, sky: Color, emerald: Color) -> Line<'_> {
@@ -1162,6 +1183,106 @@ mod tests {
         });
         assert!(s.qr.is_none(), "Failed must drop the QR");
         assert_eq!(s.failure_reason.as_deref(), Some("pairing timed out"));
+    }
+
+    /// Render the overlay over a `TestBackend` and return one string per
+    /// terminal row, so tests can assert on the rows the log actually
+    /// draws. The area must stay wide/tall enough to keep the overlay out
+    /// of its compact fallback.
+    fn render_to_rows(s: &mut SetupOverlayState, width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| s.render(f, Rect::new(0, 0, width, height)))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// A `\n` inside a ratatui `Span` is not a line break, so a stored
+    /// multi-line message collapsed into one wrapped paragraph. The RECENT
+    /// log must render each of the message's own lines on its own row: the
+    /// first line under the severity prefix, continuations indented under
+    /// the entry body, blank lines blank.
+    #[test]
+    fn multi_line_message_keeps_its_line_breaks_in_the_recent_log() {
+        let mut s = SetupOverlayState::new("test");
+        s.handle_event(ProvisionEvent::Message {
+            severity: Severity::Info,
+            text: "First paragraph.\n\nSecond paragraph: App-level settings.".into(),
+        });
+
+        let rows = render_to_rows(&mut s, 80, 24);
+        let first = rows
+            .iter()
+            .position(|r| r.contains("First paragraph."))
+            .expect("first paragraph rendered");
+        let second = rows
+            .iter()
+            .position(|r| r.contains("Second paragraph: App-level settings."))
+            .expect("second paragraph rendered");
+        assert_eq!(
+            second,
+            first + 2,
+            "the blank line between the paragraphs must occupy its own row"
+        );
+        assert!(
+            rows[first + 1].chars().all(|c| c == ' ' || c == '│'),
+            "the blank line must stay blank, got {:?}",
+            rows[first + 1]
+        );
+        // Display column (chars), not the byte offset `str::find` returns —
+        // the border and glyph are multi-byte.
+        let char_col = |row: &str, needle: &str| {
+            row.find(needle)
+                .map(|byte| row[..byte].chars().count())
+                .expect("needle column")
+        };
+        assert_eq!(
+            char_col(&rows[second], "Second"),
+            char_col(&rows[first], "First"),
+            "a continuation line must indent two spaces, under the entry body"
+        );
+        assert_eq!(
+            rows[first].matches('·').count(),
+            1,
+            "the severity glyph renders once, on the entry's first line"
+        );
+        assert!(
+            !rows[second].contains('·'),
+            "continuation lines must not repeat the severity glyph"
+        );
+    }
+
+    /// The "row N/M" scroll header drives how far the operator can scroll,
+    /// so its M must count every rendered line — including the extra rows
+    /// a multi-line message expands into — not just the stored entries.
+    #[test]
+    fn recent_log_row_counter_counts_every_rendered_line() {
+        let mut s = SetupOverlayState::new("test");
+        s.handle_event(ProvisionEvent::Message {
+            severity: Severity::Info,
+            text: "First paragraph.\n\nSecond paragraph: App-level settings.".into(),
+        });
+        for n in 0..20 {
+            s.handle_event(ProvisionEvent::Message {
+                severity: Severity::Info,
+                text: format!("Progress note {n}."),
+            });
+        }
+
+        let rows = render_to_rows(&mut s, 80, 24);
+        let header = rows
+            .iter()
+            .find(|r| r.contains("RECENT"))
+            .expect("RECENT header rendered");
+        // The multi-line entry renders 3 rows + 20 single-line entries.
+        assert!(
+            header.contains("row 1/23"),
+            "the row counter must count every rendered line, got {header:?}"
+        );
     }
 
     /// The overlay's QR clear lives on the same site as the QR store.

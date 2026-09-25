@@ -226,6 +226,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Multi-line provisioner messages keep their line breaks in the TUI setup overlay's RECENT log.** The
+  overlay stored each `ProvisionEvent::Message` as one log entry and drew each entry as a single ratatui
+  `Line`, and a `\n` inside a `Span` is not a line break — so the Slack setup checklist collapsed into one
+  wrapped paragraph ("…the fetch failed.App-level settings: …"), its indentation surviving only as stray
+  double spaces. The overlay now splits an entry's own line breaks at render time: the first line keeps the
+  severity prefix, continuation lines indent two spaces under the entry body, blank lines stay blank, and
+  the "row N/M" scroll counter counts every rendered line so scrolling still reaches the end. Storage stays
+  one `String` per event, single-line messages render byte-identical to before, and the narrow-terminal
+  compact fallback is unchanged. A render test over a `TestBackend` buffer pins the row layout and the
+  counter.
 - **A context-window overflow closes its turn in history.** The overflow branch compacts history, tells the
   chat "Please resend your last message", and finishes the turn — but it left the user turn appended at the
   start of the turn unpaired, so the resent message landed as a second consecutive user turn merged onto the
