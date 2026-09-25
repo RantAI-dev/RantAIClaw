@@ -233,6 +233,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare string of digits. Unaddressed group messages are dropped without a reply or a warning and
   do not enter the conversation history. If the linked account's phone number and LID are both not
   known yet, group messages are ignored and the journal says so once. Direct messages are unchanged.
+- **Slack channels: the bot now answers only when it is @-mentioned or in a thread it has posted in.** In a
+  channel, a private channel or a group DM every allowlisted message used to get a reply. Now only messages that
+  @-mention the bot or that reply inside a thread the bot has posted in are answered; commands in a channel need the
+  mention too. The bot's own mention token is stripped from the text the model sees. Unaddressed messages are dropped
+  without a reply or a rejected-sender warning. Thread memory is in-process and bounded to the most recent 1,000
+  thread roots, so after a daemon restart a follow-up in an old thread needs a mention again. If the bot's user id
+  cannot be resolved at listener startup, channel messages are ignored and the journal says so once. Direct messages
+  are unchanged.
 
 ### Fixed
 

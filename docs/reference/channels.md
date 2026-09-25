@@ -783,6 +783,14 @@ Slack notes:
   way; a direct message (`channel_type` `im`) always reaches the bot, since its
   `D…` id can never equal a configured `C…` or `G…` id. No public inbound port
   either way.
+- **Channel rule:** in a channel, a private channel or a group DM the bot
+  answers only when the message is addressed to it — @-mentioned with
+  `<@bot-user-id>` — or when it is a reply inside a thread the bot has posted
+  in. Commands in a channel need the mention too. Any other message is dropped
+  silently: no reply, no rejected-sender warning, and it is not added to the
+  conversation history. Direct messages are always answered. Thread memory is
+  in-process and bounded to the most recent 1,000 thread roots, so after a
+  daemon restart a follow-up in an old thread needs a mention again.
 - **Polling** reads one `conversations.history` page every 3 seconds. It
   **requires** `channel_id` — `listen_polling` returns `Err` without one — and it
   cannot see direct messages, nor replies inside a thread. That last one includes

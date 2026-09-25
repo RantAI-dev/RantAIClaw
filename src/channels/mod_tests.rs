@@ -5294,9 +5294,12 @@ fn every_tier_channel_keeps_one_conversation_across_consecutive_messages() {
         "Discord channel"
     );
 
-    let root = serde_json::json!({ "user": "U1", "text": "hi", "ts": "1700000001.000100" });
+    // The messages carry the bot mention, because in a channel the bot only
+    // answers what is addressed to it; the token is stripped from the content.
+    let root =
+        serde_json::json!({ "user": "U1", "text": "<@U_BOT> hi", "ts": "1700000001.000100" });
     let reply = serde_json::json!({
-        "user": "U1", "text": "and then", "ts": "1700000002.000100",
+        "user": "U1", "text": "<@U_BOT> and then", "ts": "1700000002.000100",
         "thread_ts": "1700000001.000100"
     });
     assert_eq!(slack_key(&root), slack_key(&reply), "Slack thread");
@@ -5348,8 +5351,10 @@ fn separate_conversations_keep_separate_keys_on_every_tier_channel() {
         "a Discord thread and its parent channel"
     );
     // Each top-level Slack message starts its own thread, by design.
-    let first = serde_json::json!({ "user": "U1", "text": "hi", "ts": "1700000001.000100" });
-    let second = serde_json::json!({ "user": "U1", "text": "hi again", "ts": "1700000003.000100" });
+    let first =
+        serde_json::json!({ "user": "U1", "text": "<@U_BOT> hi", "ts": "1700000001.000100" });
+    let second =
+        serde_json::json!({ "user": "U1", "text": "<@U_BOT> hi again", "ts": "1700000003.000100" });
     assert_ne!(
         slack_key(&first),
         slack_key(&second),
@@ -6444,7 +6449,7 @@ fn slack_thread_reply() -> traits::ChannelMessage {
         vec!["*".into()],
     );
     let message = serde_json::json!({
-        "user": "U1", "text": "and then", "ts": "1700000002.000100",
+        "user": "U1", "text": "<@U_BOT> and then", "ts": "1700000002.000100",
         "thread_ts": "1700000001.000100"
     });
     match channel.classify_inbound(&message, "U_BOT", "", "C_CHAN") {
@@ -6736,7 +6741,7 @@ fn tier_message(channel: &str, id: u32, text: &str) -> traits::ChannelMessage {
             );
             let payload = serde_json::json!({
                 "user": "U1",
-                "text": text,
+                "text": format!("<@U_BOT> {text}"),
                 "ts": format!("1700000{id:03}.000200"),
                 "thread_ts": SLACK_THREAD_ROOT,
             });
