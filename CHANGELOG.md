@@ -206,6 +206,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A context-window overflow closes its turn in history.** The overflow branch compacts history, tells the
+  chat "Please resend your last message", and finishes the turn — but it left the user turn appended at the
+  start of the turn unpaired, so the resent message landed as a second consecutive user turn merged onto the
+  failed one. The branch now appends the failed-turn marker as an assistant turn before replying, the same way
+  the capability and generic error branches beside it already do.
 - **A scheduled agent job's reply no longer reaches the daemon journal.** Scheduled agent jobs ran
   through the single-shot path that also backs `rantaiclaw agent -m`; its final-reply print wrote
   every scheduled reply into the journal under systemd (observed 2026-09-25). `run_with_scope` now

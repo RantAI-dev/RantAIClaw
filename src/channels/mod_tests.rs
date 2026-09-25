@@ -6172,6 +6172,66 @@ async fn a_vision_refusal_pairs_the_user_turn_in_history() {
     );
 }
 
+/// The context-overflow branch in `process_channel_message` (dispatch.rs)
+/// used to compact history, tell the chat to resend, and
+/// `return TurnEnd::Finished` without pairing the user turn appended at the
+/// start of the turn — the same gap the capability branch beside it had. The
+/// resent message then landed as a second consecutive user turn, and the
+/// assistant turn the model would have produced ahead of it was the failed
+/// one.
+///
+/// `FailingProvider` raises an error the overflow detector matches
+/// ("exceeds the context window"), which is what drives dispatch into the
+/// overflow branch. The message is plain text so the vision gate stays out of
+/// the way and the provider is actually called.
+#[tokio::test]
+async fn a_context_overflow_pairs_the_user_turn_in_history() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let channel_impl = Arc::new(AddressRecordingChannel::named("test-channel"));
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let ctx = dispatch_ctx(
+        vec![channel],
+        Arc::new(FailingProvider {
+            error:
+                "OpenAI Codex stream error: Your input exceeds the context window of this model."
+                    .to_string(),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    let msg = drain_message("chat-1");
+    process_channel_message(Arc::clone(&ctx), msg.clone(), CancellationToken::new()).await;
+
+    let sent = channel_impl.sent.lock().await;
+    assert_eq!(sent.len(), 1, "one overflow reply: {sent:?}");
+    assert!(
+        sent[0].content.contains("Context window exceeded")
+            && sent[0].content.contains("Please resend"),
+        "the reply asks the user to resend: {sent:?}"
+    );
+    drop(sent);
+
+    let key = conversation_history_key(&msg);
+    let histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let turns = histories.get(&key).expect("history for the conversation");
+    let last = turns.last().expect("at least one turn recorded");
+    assert_eq!(
+        last.role, "assistant",
+        "the overflow branch must pair the user turn with an assistant entry, \
+         otherwise the resent message lands as a second consecutive user turn: {turns:?}"
+    );
+    assert!(
+        last.content.contains(FAILED_TURN_MARKER),
+        "the pairing carries the failed-turn marker: {last:?}"
+    );
+}
+
 /// Control for the test above: a reply whose attachment goes through sends one
 /// message and records the reply itself, so the notice cannot be firing on
 /// success.
