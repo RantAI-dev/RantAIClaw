@@ -153,6 +153,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **wa-rs and wa-rs's `Client/*` targets default to `warn` instead of `info`.** Per-message
+  WhatsApp identifiers (LIDs, group JIDs) no longer appear in the routine journal — the
+  `info`-level lines from `wa_rs::receipt`, `wa_rs::send`, `wa_rs_libsignal`, `Client/Receipt`,
+  etc. are now filtered out, while the diagnosis-relevant `warn` lines (`Failed to resolve
+  devices`, `No sender key for group`, `Failed to establish session`) still pass through.
+  `EnvFilter` matches targets by plain string prefix, so one `wa_rs=warn` directive covers
+  `wa_rs`, `wa_rs_libsignal`, and every `wa_rs::*` target, and one `Client=warn` directive
+  covers every `Client/*` target. An explicit `RUST_LOG` still wins entirely; for a WhatsApp Web
+  diagnosis session, restart the daemon with `RUST_LOG=info,wa_rs=debug,Client=debug` and expect
+  full identifiers in the journal. The exact value is also documented in
+  `docs/operations/runbook.md` §"Logs and Diagnostics".
+- **The scheduler's per-tick config refresh logs at `debug` when the file is unchanged.** Every
+  15 s the cron scheduler reloaded `config.toml` from disk and emitted an INFO `Config loaded`
+  line even on a quiet host (~5,760 lines a day). The reload still runs — operator edits to
+  autonomy, scheduler, cron, or channels have to reach scheduled jobs without a daemon restart
+  — but the loop now tracks the last loaded path and that path's fingerprint, and emits a
+  `debug`-level `config unchanged` line when both match, skipping the full `load_or_init`. A
+  real edit moves the fingerprint, so the next refresh emits the same INFO `Config loaded`
+  line it always did.
+
 - **WhatsApp Web reports its own name, `whatsapp_web`, and that moves state keyed by it.** The console's
   Channels card never showed WhatsApp Web as running: the card, the catalog and the config table all
   call the channel `whatsapp_web`, while the channel reported `whatsapp` from `Channel::name()`, so the

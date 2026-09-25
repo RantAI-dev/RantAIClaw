@@ -85,6 +85,15 @@ code a user typed; upgrading does not rewrite them. A daemon started with Telegr
 `allowed_users` empty no longer writes its one-time pairing code to the journal. Mint a code with
 `rantaiclaw channel pair --channel telegram` and DM the bot `/claim <code>`.
 
+WhatsApp Web (the wa-rs library, plus the `wa_rs_libsignal` and `Client/*` targets) logs at `warn`
+by default because its per-message `INFO` lines carry full LIDs and group JIDs — the journal holds
+the diagnosis-relevant `warn` lines (failed device resolution, missing sender key, failed session
+establishment) but not the per-message identifiers. To diagnose a WhatsApp Web delivery problem,
+restart the daemon with `RUST_LOG=info,wa_rs=debug,Client=debug` for a diagnosis session; the
+journal will then hold full LIDs and group JIDs, so do not leave it set. `EnvFilter` matches
+targets by plain string prefix, so `wa_rs=debug` covers `wa_rs_libsignal` too and `Client=debug`
+covers every `Client/*` target.
+
 ### macOS / Windows (service wrapper logs)
 
 - `~/.rantaiclaw/logs/daemon.stdout.log`
