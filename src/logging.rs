@@ -37,9 +37,10 @@ const fn anchor_id(callsite: &'static dyn Callsite) -> Identifier {
 /// The base level is `info`. `hyper`, `reqwest`, `rustls`, and `h2` are
 /// pinned to `warn` because they are noisy during normal operation
 /// (request/response framing, TLS handshakes, h2 control frames). `wa_rs=info`
-/// makes the wa-rs bridge plan explicit; the base `info` already covers the
-/// module-path targets, but the explicit directive documents intent and
-/// matches `wa-rs`'s `Client/*` sub-targets that don't start with `wa_rs`.
+/// documents intent for the wa-rs bridge, but it matches only targets with the
+/// `wa_rs` prefix. wa-rs's explicit `Client/*` target strings (`Client/TcToken`,
+/// `Client/Receipt`) are at info/warn and pass on the base `info` level rather
+/// than through the directive.
 pub const DEFAULT_DIRECTIVES: &str = "info,hyper=warn,reqwest=warn,rustls=warn,h2=warn,wa_rs=info";
 
 /// Build the default [`EnvFilter`], honouring `RUST_LOG` if the operator set
