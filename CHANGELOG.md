@@ -186,6 +186,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shifted warning lands inside the range. Clean files keep the `BASE..HEAD` diff; it is the same
   unified-diff schema, so `parse_ranges` works unchanged either way. CI is unaffected (its tree
   is clean); the local gate the executor runs before committing is.
+- **Slack setup shows the checklist before it asks for the bot token.** `/setup slack` and the
+  headless provisioner opened with "Let's configure your Slack bot.", prompted for the bot token,
+  and only then rendered `SLACK_SETUP_CHECKLIST` — so an operator following the wizard reached the
+  list after already pasting a token that may have lacked `im:history` or `files:write`. The
+  scopes and bot events on the checklist have to be set before installing the app, because
+  installing is what issues the `xoxb-` token; the legacy wizard (#854, step 2) and the console
+  card (#132) both already show it above the token input. The checklist `Message` now sits
+  between the opening line and the `bot_token` `Prompt`; the `app_token` `Prompt` stays where
+  it was, so an operator who already has a checklist can paste both tokens together.
 - **First-run wizard dims locked channels under "Under development" heading.** The wizard's channel
   step used to render every channel provisioner as a selectable row, with no visual separation
   between the six usable and the eleven under-development channels; the runtime refused locked
