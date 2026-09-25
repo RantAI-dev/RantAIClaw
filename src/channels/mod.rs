@@ -757,6 +757,16 @@ pub(crate) struct ChannelCatalogEntry {
     /// token, and "configured" alone reads as done. The console needs to tell
     /// those apart to decide between "Connect" and "Edit".
     pub has_credentials: bool,
+    /// The platform-side setup steps the operator has to take before this
+    /// channel will work. `None` for every channel that ships with no
+    /// required extra configuration; present only on the rows whose
+    /// platform requirements are not obvious from the catalog row.
+    ///
+    /// Absent (not `null`, not `""`) on the wire because the console reads
+    /// absence as "no checklist" and renders the row differently — a `null`
+    /// would say the same thing, but the contract is the simpler shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_checklist: Option<String>,
 }
 
 /// The whole catalog, in catalog order, with each row's configured state.
@@ -771,8 +781,22 @@ pub(crate) fn channel_catalog_entries(config: &Config) -> Vec<ChannelCatalogEntr
             verification: *verification,
             configured: channel_is_configured(key, config),
             has_credentials: channel_has_credentials(key, config),
+            setup_checklist: setup_checklist_for(key),
         })
         .collect()
+}
+
+/// Which catalog rows carry a setup checklist, and where the text lives.
+///
+/// Only Slack and Discord have one today: every other row either has no
+/// platform-side setup steps at all, or its steps are obvious from the
+/// `[channels_config.<key>]` block already shown next to the row.
+fn setup_checklist_for(key: &str) -> Option<String> {
+    match key {
+        "slack" => Some(crate::channels::slack::SLACK_SETUP_CHECKLIST.to_string()),
+        "discord" => Some(crate::channels::discord::DISCORD_SETUP_CHECKLIST.to_string()),
+        _ => None,
+    }
 }
 
 /// The `note` column `channel list` and `status` print for one roster row.

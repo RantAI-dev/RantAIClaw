@@ -15,6 +15,32 @@ use uuid::Uuid;
 /// token. Named once so the two cannot drift onto different paths.
 pub(crate) const DISCORD_IDENTITY_URL: &str = "https://discord.com/api/v10/users/@me";
 
+/// The Discord setup checklist rendered by every setup path. Three surfaces
+/// have to say the same list and must not drift apart: the legacy wizard
+/// (`src/onboard/wizard.rs`), the TUI provisioner
+/// (`src/onboard/provision/channels/discord.rs`), and the `/api/v1/channels`
+/// row handed to the web console.
+///
+/// Items:
+/// - **MESSAGE CONTENT intent** (Bot → Privileged Gateway Intents) —
+///   required so message bodies reach the gateway. Without it every
+///   inbound message arrives with empty content, which is why the wizard
+///   always called it out.
+/// - **OAuth2 bot permissions** when generating the invite URL —
+///   `Send Messages`, `Read Message History`, and `Attach Files` cover
+///   every message the bot sends today.
+///
+/// The constant is a single `&'static str` so every setup path renders it
+/// verbatim; a copy of the list in any of them would let the wizard, the
+/// provisioner and the console drift apart again, which is the bug this
+/// constant exists to prevent.
+pub const DISCORD_SETUP_CHECKLIST: &str = "\
+Privileged Gateway Intents (Bot settings):
+  MESSAGE CONTENT INTENT — required so message bodies reach the gateway. Without it every inbound message arrives with empty content.
+
+OAuth2 Bot Permissions when generating the invite URL:
+  Send Messages, Read Message History, Attach Files.";
+
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
     bot_token: String,

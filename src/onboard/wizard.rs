@@ -3875,9 +3875,12 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     style("— talk to RantaiClaw from Discord").dim()
                 );
                 print_bullet("1. Go to https://discord.com/developers/applications");
-                print_bullet("2. Create a New Application → Bot → Copy token");
-                print_bullet("3. Enable MESSAGE CONTENT intent under Bot settings");
-                print_bullet("4. Invite bot to your server with messages permission");
+                print_step_block(
+                    2,
+                    "Configure the Discord bot",
+                    crate::channels::discord::DISCORD_SETUP_CHECKLIST,
+                );
+                print_bullet("3. Invite bot to your server and copy the Bot Token");
                 println!();
 
                 let token: String = Password::new().with_prompt("  Bot token").interact()?;
@@ -7616,14 +7619,30 @@ mod tests {
         }
         let production = production_half(include_str!("wizard.rs"));
         // The first occurrence is the function definition (`fn print_step_block(current: u8, ...)`).
-        // The call site is the next one — it has no parameter type annotations.
+        // Any call site comes after. The Discord section also calls
+        // `print_step_block`, so pick the call whose window carries the Slack
+        // title — that is the Slack call site regardless of source order.
         let def_idx = production
             .find("print_step_block(")
             .expect("`print_step_block` must be defined and called in wizard.rs");
-        let call_idx = production[def_idx + 1..]
-            .find("print_step_block(")
-            .map(|off| def_idx + 1 + off)
-            .expect("`print_step_block` must be called, not just defined");
+        let search_from = def_idx + 1;
+        let slack_title = "\"Configure the Slack app\"";
+        let call_idx = production[search_from..]
+            .find(slack_title)
+            .map(|off| {
+                // Walk back to the matching `print_step_block(` so the window
+                // starts at the call, not the title inside it.
+                let title_at = search_from + off;
+                production[..title_at]
+                    .rfind("print_step_block(")
+                    .unwrap_or(title_at)
+            })
+            .unwrap_or_else(|| {
+                production[search_from..]
+                    .find("print_step_block(")
+                    .map(|off| search_from + off)
+                    .expect("`print_step_block` must be called, not just defined")
+            });
         // A generous window covers any reasonable `rustfmt` split.
         let window_end = (call_idx + 400).min(production.len());
         let window = &production[call_idx..window_end];
@@ -7632,7 +7651,7 @@ mod tests {
             "the call site must pass `2` as the step number: {window:?}"
         );
         assert!(
-            window.contains("\"Configure the Slack app\""),
+            window.contains(slack_title),
             "the call site must pass the title: {window:?}"
         );
         assert!(
