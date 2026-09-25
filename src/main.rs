@@ -2355,6 +2355,9 @@ async fn main() -> Result<()> {
                         config.default_temperature,
                         Vec::new(),
                         "cli",
+                        // The caller owns the print for this surface, so the
+                        // loop must not print the reply too.
+                        true,
                     )
                     .await?;
                     if !response.is_empty() {
