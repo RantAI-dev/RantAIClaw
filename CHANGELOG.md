@@ -177,6 +177,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Slack `warning` caveat no longer claims DMs are dropped.** The Socket Mode + `channel_id`
+  check in `src/gateway/config_api.rs` returned a string saying "the bot will ignore direct
+  messages and every conversation except that one" — true of the old (pre-#844) filter, but the
+  filter was already changed to let DMs through, and the operator-facing caveat kept the old
+  wording. The caveat now reads "Socket Mode is on and channel_id is set: the bot ignores every
+  channel except that one. Direct messages still reach it. Clear channel_id to accept every
+  channel." (the byte-for-byte string the console already renders), and the helper that produces
+  it is renamed from `socket_mode_dm_caveat` to `socket_mode_channel_filter_caveat`. The four
+  condition branches (both fields, just app token, just channel_id, neither) keep their shape; only
+  the body and the name change. The doctor check `slack_listen_gap` returns `None` when both
+  fields are set, so it carried no false claim to retract.
 - **The vision sentence names the provider, and the user turn is paired.** The capability branch in
   `src/channels/dispatch.rs` shipped the user-facing sentence and returned without pairing the user
   turn appended at the start of the turn, so a vision refusal left the conversation holding an
