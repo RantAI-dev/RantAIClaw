@@ -223,6 +223,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owner rights. It now also names `/bind <code>` for the guest path (mint with the same CLI plus
   `--no-owner`), so an operator reading the journal sees both ways to allow the sender and can pick
   the one they want. The fixed prefix operators grep for is unchanged.
+- **WhatsApp groups: the bot now answers only when it is @-mentioned or replied to.** In a group
+  chat every message from an allowlisted member used to get a reply, and every message from anyone
+  else produced a rejected-sender warning — in an active group that meant the bot answered things
+  nobody asked it and the journal filled with warnings. Now only messages that @-mention the bot
+  (by its phone number or, since groups often address by LID, by its LID) or that reply directly to
+  one of the bot's own messages are answered; commands need the mention too (`/new @RantAIClaw`).
+  The bot's own mention token is stripped from the text the model sees, so it is not asked about a
+  bare string of digits. Unaddressed group messages are dropped without a reply or a warning and
+  do not enter the conversation history. If the linked account's phone number and LID are both not
+  known yet, group messages are ignored and the journal says so once. Direct messages are unchanged.
 
 ### Fixed
 

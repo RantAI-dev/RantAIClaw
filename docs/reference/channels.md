@@ -917,6 +917,13 @@ Notes:
   unofficial and can break on any WhatsApp update.
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
+- **Group rule:** in a group chat the bot answers only when a message is
+  addressed to it — @-mentioned by its phone number or by its LID (groups
+  often address by LID) — or when it is a reply directly to one of the bot's
+  own messages. Commands need the mention too (`/new @RantAIClaw`). Any other
+  group message is dropped silently: no reply, no rejected-sender warning, and
+  it is not added to the conversation history. Direct messages are always
+  answered.
 
 ### 4.7a Linq
 
