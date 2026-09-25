@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`log`-facade records reach the journal.** wa-rs (and any other third-party crate that emits
+  through the `log` crate) was silently dropped: the journal held zero `wa_rs` lines even when the
+  library warned on every group send-key retry. The CLI's `main()` and the TUI's
+  `install_tui_tracing` now register a small `log::Log` shim (`src/logging.rs`) that forwards each
+  record to `tracing::event!`, so it lands in the same daily file as tracing-native events. The
+  shared default filter (`hyper=warn,reqwest=warn,rustls=warn,h2=warn,wa_rs=info` over a base of
+  `info`) prevents third-party HTTP/TLS chatter from flooding the journal while letting wa-rs
+  warnings through. An explicit `RUST_LOG` still wins entirely. No new dependency: `log` was
+  already in `Cargo.lock` as a transitive dep of wa-rs/reqwest and is now a direct dep too, so
+  no `[[package]]` entry was added.
 - **`rantaiclaw status` and `rantaiclaw service status` warn when the running daemon's version
   differs from the CLI's.** After `cargo install` the managed daemon kept running the old build
   and nothing said so: `rantaiclaw status` printed only the CLI's version and `rantaiclaw service

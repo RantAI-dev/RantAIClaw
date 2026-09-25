@@ -5189,8 +5189,6 @@ fn compact_provider_error(s: &str) -> String {
 /// Idempotent: if a global subscriber is already set, this is a no-op.
 /// That makes the function safe to call from multiple entry points.
 fn install_tui_tracing() {
-    use tracing_subscriber::EnvFilter;
-
     // Resolve the log path. Use the rantaiclaw root so it lives next to
     // the user's other state, not buried under XDG cache.
     let log_dir = crate::profile::paths::rantaiclaw_root().join("logs");
@@ -5208,7 +5206,11 @@ fn install_tui_tracing() {
         return;
     };
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `install_log_bridge` is idempotent (one-shot process-global; the
+    // second `set_logger` returns Err, which we swallow). main() may have
+    // already installed it, so this is the common case.
+    crate::logging::install_log_bridge();
+    let filter = crate::logging::default_env_filter();
     let subscriber = tracing_subscriber::fmt::Subscriber::builder()
         .with_env_filter(filter)
         .with_writer(std::sync::Mutex::new(file))

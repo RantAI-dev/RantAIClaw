@@ -76,6 +76,11 @@ schemars = "1.2"
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+# `log` facade — already a transitive dep through wa-rs/reqwest/etc. Promoted
+# to a direct dep so we can implement `log::Log` and forward its records into
+# `tracing` (see `crate::logging`). No new [[package]] entries — the version
+# (0.4.29) is already pinned in Cargo.lock.
+log = "0.4"
 
 # Observability - Prometheus metrics
 prometheus = { version = "0.14", default-features = false }

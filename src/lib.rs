@@ -57,6 +57,7 @@ pub(crate) mod integrations;
 #[cfg(feature = "kb")]
 pub mod kb;
 pub mod lifecycle;
+pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod migration;
