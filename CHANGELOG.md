@@ -206,23 +206,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A scheduled agent job's reply no longer reaches the daemon journal.** The cron scheduler runs
-  agent jobs through `crate::agent::run_with_scope`, which also backs the single-shot CLI path;
-  the single-shot branch printed the final reply with `println!` so `rantaiclaw agent -m …` stayed
-  pipeable, and that same `println!` (plus a `print!` of model text alongside tool calls) wrote
-  every scheduled reply verbatim into stdout — which under systemd is the journal, where an operator
-  greps for diagnostics. Observed 2026-09-25 07:06 UTC: both reminders' full text appeared in
-  `journalctl --user -u rantaiclaw`. `run_with_scope` now takes an explicit `silent: bool`; the
-  scheduler (`src/cron/scheduler.rs`) and the daemon heartbeat (`src/daemon/mod.rs`) pass `true`,
-  the CLI passes `false`, and the reply travels only through the Ok return value (delivery + run
-  record). `rantaiclaw agent -m` still prints the reply to stdout; scheduled jobs and the daemon
-  heartbeat no longer write replies to the journal. The gate is pinned by a source-pinning test
-  (`agent::loop_::tests::single_shot_reply_print_stays_gated_by_silent`) that reads `loop_.rs`
-  and asserts the single-shot `println!("{response}")` is preceded by `if !silent` and wrapped
-  by a closing `}` — the log-scan guard only matches the macro call text, not the enclosing `if`,
-  so the source test fills the seam. The log-scan guard (`channels::tests::no_log_or_print_call_…`)
-  was extended to read `src/agent/loop_.rs` and pin both text-carrying prints, so any future
-  caller that introduces a *new* text-bearing print becomes an unclassified finding.
+- **A scheduled agent job's reply no longer reaches the daemon journal.** Scheduled agent jobs ran
+  through the single-shot path that also backs `rantaiclaw agent -m`; its final-reply print wrote
+  every scheduled reply into the journal under systemd (observed 2026-09-25). `run_with_scope` now
+  takes an explicit silent flag: the scheduler and the daemon heartbeat pass true, the CLI passes
+  false. `rantaiclaw agent -m` still prints and stays pipeable, scheduled jobs and the heartbeat
+  no longer write replies to the journal, and `chat` now prints its reply once instead of twice.
 - **The Slack `warning` caveat no longer claims DMs are dropped.** The Socket Mode + `channel_id`
   check in `src/gateway/config_api.rs` returned a string saying "the bot will ignore direct
   messages and every conversation except that one" — true of the old (pre-#844) filter, but the
