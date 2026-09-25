@@ -187,6 +187,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started one column short of the usable rows' text. The heading is now bold rather than italic, one
   blank line separates it from the section above and none from the rows below, and the heading plus
   the locked rows line up with the usable rows' text column.
+- **The rejected-sender WARN names both the `/bind` guest path and the `/claim` owner path.** The line
+  every channel emits for an inbound message from a sender not in its allowlist only pointed at
+  `/claim <code>` (mint with `rantaiclaw channels pair --channel <channel>`), which grants the sender
+  owner rights. It now also names `/bind <code>` for the guest path (mint with the same CLI plus
+  `--no-owner`), so an operator reading the journal sees both ways to allow the sender and can pick
+  the one they want. The fixed prefix operators grep for is unchanged.
 
 ### Fixed
 
