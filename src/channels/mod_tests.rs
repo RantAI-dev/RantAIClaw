@@ -553,13 +553,19 @@ fn no_log_or_print_call_carries_message_or_reply_text() {
 }
 
 /// The WARN sentence every channel produces for an unauthorized sender names
-/// the on-host `channels pair` CLI and the in-chat `/claim` step. The full
-/// identifier only appears in the helper input, which the caller already
-/// passed through `crate::security::redact` — so a journal reader learns how
-/// to grant access but cannot impersonate the sender on a second channel.
+/// both in-chat paths that grant access: `/bind <code>` (guest, mint with
+/// `--no-owner`) and `/claim <code>` (owner, mint without `--no-owner`), plus
+/// the on-host `channels pair` CLI for each. The full identifier only appears
+/// in the helper input, which the caller already passed through
+/// `crate::security::redact` — so a journal reader learns how to grant access
+/// but cannot impersonate the sender on a second channel.
 #[test]
 fn rejected_sender_warn_includes_redacted_identifier_and_pairing_command() {
     let line = rejected_sender_warn("discord", "abcd***");
+    assert!(
+        line.starts_with("discord: ignoring unauthorized sender (abcd***)"),
+        "keeps the fixed prefix an operator greps the journal for: {line}"
+    );
     assert!(
         line.contains("discord"),
         "names the channel CLI key: {line}"
@@ -569,12 +575,20 @@ fn rejected_sender_warn_includes_redacted_identifier_and_pairing_command() {
         "interpolates the redacted identifier: {line}"
     );
     assert!(
-        line.contains("rantaiclaw channels pair --channel discord"),
-        "points at the on-host pairing CLI: {line}"
+        line.contains("--no-owner"),
+        "names the guest-path mint flag: {line}"
+    );
+    assert!(
+        line.contains("/bind"),
+        "names the in-chat guest /bind step: {line}"
     );
     assert!(
         line.contains("/claim"),
-        "points at the in-chat /claim step: {line}"
+        "names the in-chat owner /claim step: {line}"
+    );
+    assert!(
+        line.contains("rantaiclaw channels pair --channel discord"),
+        "points at the on-host pairing CLI: {line}"
     );
 }
 
@@ -9425,6 +9439,147 @@ fn api_catalog_entries_carry_every_row_with_its_tier() {
     assert_eq!(
         old_shape, from_entries,
         "`configured` and `channels[].configured` must not disagree"
+    );
+}
+
+/// Slack and Discord rows carry their platform-side setup checklist; every
+/// other row omits it.
+///
+/// The contract is fixed in advance for the web console: field name
+/// `setup_checklist`, a JSON string, present only on `slack` and `discord`
+/// rows. Absent means absent — not `null`, not `""` — because the console
+/// renders the row from the presence of the key. A row that emitted the key
+/// as `null` would be read as "no checklist" the same way as one that
+/// omitted it, and a row that emitted `""` would tell the operator to do
+/// nothing.
+///
+/// The wire assertion runs serde directly on the entry, which is what
+/// `channels_list` does (`api_v1.rs:2369-2386`); going through the endpoint
+/// would only re-cover the same serialization path with extra wiring.
+#[test]
+fn api_catalog_entries_carry_setup_checklists() {
+    let config = config_with_every_channel();
+    let entries = crate::channels::channel_catalog_entries(&config);
+
+    let slack = entries
+        .iter()
+        .find(|e| e.key == "slack")
+        .expect("slack is in the catalog");
+    assert_eq!(
+        slack.setup_checklist.as_deref(),
+        Some(crate::channels::slack::SLACK_SETUP_CHECKLIST),
+        "Slack row's `setup_checklist` must be the constant verbatim, not a copy"
+    );
+
+    let discord = entries
+        .iter()
+        .find(|e| e.key == "discord")
+        .expect("discord is in the catalog");
+    assert_eq!(
+        discord.setup_checklist.as_deref(),
+        Some(crate::channels::discord::DISCORD_SETUP_CHECKLIST),
+        "Discord row's `setup_checklist` must be the constant verbatim, not a copy"
+    );
+
+    for key in ["telegram", "lark", "whatsapp_web"] {
+        let entry = entries
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("{key} is in the catalog"));
+        assert!(
+            entry.setup_checklist.is_none(),
+            "{key}'s `setup_checklist` must be absent (None), not an empty string \
+             or a copy of some other row — the console reads absence as 'no checklist'"
+        );
+    }
+
+    // Wire level: serde omits a `None` only when the field is tagged
+    // `skip_serializing_if`. A `null` in the JSON would still tell the
+    // console "no checklist" the same way as an absent key, so both have to
+    // be ruled out for slack's row to be distinguishable from a no-checklist
+    // row. Telegram is the no-checklist case and must not have the key at
+    // all.
+    let slack_value = serde_json::to_value(slack).expect("serialize slack row");
+    let slack_map = slack_value
+        .as_object()
+        .expect("slack row serializes to an object");
+    let slack_checklist = slack_map
+        .get("setup_checklist")
+        .expect("slack row's JSON carries the `setup_checklist` key");
+    assert_eq!(
+        slack_checklist.as_str(),
+        Some(crate::channels::slack::SLACK_SETUP_CHECKLIST),
+        "slack's `setup_checklist` is a JSON string, equal to the constant"
+    );
+
+    let telegram = entries
+        .iter()
+        .find(|e| e.key == "telegram")
+        .expect("telegram is in the catalog");
+    let telegram_value = serde_json::to_value(telegram).expect("serialize telegram row");
+    let telegram_map = telegram_value
+        .as_object()
+        .expect("telegram row serializes to an object");
+    assert!(
+        telegram_map.get("setup_checklist").is_none(),
+        "telegram's JSON has no `setup_checklist` key — the contract is absent, not null, not \"\""
+    );
+}
+
+/// The wizard's Discord section passes the Discord constant, not a copy.
+///
+/// Same source guard as `slack_setup_step_calls_print_step_block`: a wizard
+/// that hand-typed the body would pass any visual test and still ship the
+/// bug, because the wizard and the channel constant would drift apart the
+/// first time one of them moved. The test slices the wizard source above
+/// the `#[cfg(test)] mod tests` block — matching the helper that lives in
+/// `provision/channels/slack.rs` and `provision/whatsapp_web.rs` — so it
+/// can see the call site without matching itself.
+#[test]
+fn wizard_discord_step_calls_print_step_block_with_the_constant() {
+    const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod ";
+    let production = {
+        let cut = include_str!("../onboard/wizard.rs")
+            .match_indices(TEST_MODULE_MARKER)
+            .map(|(at, _)| at)
+            .min()
+            .unwrap_or(usize::MAX);
+        &include_str!("../onboard/wizard.rs")[..cut]
+    };
+    // The first occurrence is the function definition (`fn print_step_block(...)`).
+    // Pick the call whose window carries the Discord title — that is the
+    // Discord call regardless of how the other calls (Slack) are ordered.
+    let def_idx = production
+        .find("print_step_block(")
+        .expect("`print_step_block` must be defined and called in wizard.rs");
+    let search_from = def_idx + 1;
+    let discord_title = "\"Configure the Discord bot\"";
+    let title_at = production[search_from..]
+        .find(discord_title)
+        .map(|off| search_from + off)
+        .unwrap_or_else(|| {
+            panic!(
+                "the wizard must call `print_step_block(2, \"Configure the Discord bot\", ...)`; \
+                 found no such title in production_half: {production:?}"
+            )
+        });
+    let call_idx = production[..title_at]
+        .rfind("print_step_block(")
+        .unwrap_or(title_at);
+    // A generous window covers any reasonable `rustfmt` split.
+    let window_end = (call_idx + 400).min(production.len());
+    let window = &production[call_idx..window_end];
+    assert!(
+        window.contains("2,"),
+        "the Discord call site must pass `2` as the step number: {window:?}"
+    );
+    assert!(
+        window.contains(discord_title),
+        "the Discord call site must pass the title: {window:?}"
+    );
+    assert!(
+        window.contains("crate::channels::discord::DISCORD_SETUP_CHECKLIST"),
+        "the Discord call site must pass the shared checklist constant, not a copy: {window:?}"
     );
 }
 

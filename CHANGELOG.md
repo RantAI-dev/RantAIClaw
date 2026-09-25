@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warnings through. An explicit `RUST_LOG` still wins entirely. No new dependency: `log` was
   already in `Cargo.lock` as a transitive dep of wa-rs/reqwest and is now a direct dep too, so
   no `[[package]]` entry was added.
+- **`/api/v1/channels` carries each channel's setup checklist.** The Slack and Discord rows now
+  include a `setup_checklist` string built from the same `SLACK_SETUP_CHECKLIST` and
+  `DISCORD_SETUP_CHECKLIST` constants the setup wizard renders, so an operator on the console sees
+  the same list the wizard would have shown — the MESSAGE CONTENT intent for Discord and the
+  Socket Mode / scope list for Slack. The field is absent (not `null`, not `""`) on every other
+  row, and a console that does not know the field keeps working. The Discord wizard section now
+  prints the constant the same way the Slack section does, replacing a hand-typed bullet list that
+  could drift from the platform's actual requirements.
 - **`rantaiclaw status` and `rantaiclaw service status` warn when the running daemon's version
   differs from the CLI's.** After `cargo install` the managed daemon kept running the old build
   and nothing said so: `rantaiclaw status` printed only the CLI's version and `rantaiclaw service
@@ -189,6 +197,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started one column short of the usable rows' text. The heading is now bold rather than italic, one
   blank line separates it from the section above and none from the rows below, and the heading plus
   the locked rows line up with the usable rows' text column.
+- **The rejected-sender WARN names both the `/bind` guest path and the `/claim` owner path.** The line
+  every channel emits for an inbound message from a sender not in its allowlist only pointed at
+  `/claim <code>` (mint with `rantaiclaw channels pair --channel <channel>`), which grants the sender
+  owner rights. It now also names `/bind <code>` for the guest path (mint with the same CLI plus
+  `--no-owner`), so an operator reading the journal sees both ways to allow the sender and can pick
+  the one they want. The fixed prefix operators grep for is unchanged.
 
 ### Fixed
 
