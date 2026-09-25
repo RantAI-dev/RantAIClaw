@@ -22,6 +22,10 @@ pub struct SlackChannel {
     /// keyed by recipient so two concurrent chats cannot delete each other's.
     /// Value is the Slack `ts` needed to remove it.
     working_notices: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Thread roots the bot has posted into, most recent last. Slack has no
+    /// "the bot is in this thread" subscription, so the bot's own postings
+    /// are the record. Bounded by `MAX_THREAD_ROOTS`.
+    thread_roots: Arc<Mutex<std::collections::VecDeque<String>>>,
 }
 
 /// Slack's own guidance for `chat.postMessage`: "For best results, limit the
@@ -81,6 +85,18 @@ App-level settings:
 /// decides whether a token actually works.
 pub const APP_TOKEN_PREFIX: &str = "xapp-";
 
+/// How many thread roots the bot remembers as "threads it has posted in".
+/// The oldest root is evicted past the cap, and the memory is in-process: a
+/// follow-up in an evicted or forgotten (post-restart) thread needs a
+/// mention again.
+const MAX_THREAD_ROOTS: usize = 1_000;
+
+/// Set once the operator has been told why channel messages are being
+/// ignored: the bot's user id could not be resolved at listener startup, so
+/// no mention can ever match. Once per process, not once per message.
+static BOT_USER_ID_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// What the poll loop should do with one inbound Slack message.
 ///
 /// Extracted so the allowlist gate is reachable from a test. It used to sit
@@ -91,6 +107,9 @@ pub const APP_TOKEN_PREFIX: &str = "xapp-";
 pub(crate) enum SlackInbound {
     /// The bot's own message.
     Own,
+    /// In a channel, private channel or group DM that was not addressed to
+    /// the bot: no mention of it, and outside any thread it has posted in.
+    Unaddressed,
     /// Not in the allowlist. The caller runs the pairing path, which needs the
     /// network, then drops the message.
     Unauthorized {
@@ -131,6 +150,32 @@ impl SlackChannel {
             return SlackInbound::Own;
         }
 
+        // In a channel, a private channel or a group DM the bot answers only
+        // when addressed. The gate sits before the allowlist so an
+        // unaddressed message from anyone is dropped silently — no
+        // rejected-sender warning, no pairing prompt.
+        let channel_type = msg.get("channel_type").and_then(serde_json::Value::as_str);
+        if Self::requires_addressing(channel_type) {
+            if bot_user_id.is_empty() {
+                // `get_bot_user_id` failed at listener startup, so no mention
+                // can ever match: ignore channel messages rather than answer
+                // everything, and say why once.
+                if !BOT_USER_ID_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "Slack: channel messages are ignored until the bot user id is known"
+                    );
+                }
+                return SlackInbound::Unaddressed;
+            }
+            if !self.is_addressed(
+                text,
+                Self::inbound_thread_ts(msg, ts).as_deref(),
+                bot_user_id,
+            ) {
+                return SlackInbound::Unaddressed;
+            }
+        }
+
         if !self.is_user_allowed(user) {
             return SlackInbound::Unauthorized {
                 user: user.to_string(),
@@ -154,7 +199,7 @@ impl SlackChannel {
             id: format!("slack_{channel_id}_{ts}"),
             sender: user.to_string(),
             reply_target: channel_id.to_string(),
-            content: text.to_string(),
+            content: Self::strip_own_mention_tokens(text, bot_user_id),
             channel: "slack".to_string(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -185,6 +230,12 @@ impl SlackChannel {
         // network, which is why it stays here.
         let (user, text, ts) = match self.classify_inbound(msg, bot_user_id, last_ts, channel_id) {
             SlackInbound::Own | SlackInbound::EmptyOrSeen => return InboundOutcome::Continue,
+            SlackInbound::Unaddressed => {
+                // Debug only, with no sender identifier and no body: the
+                // conversation is not being refused, it is being filtered.
+                tracing::debug!("Slack: ignoring an unaddressed message");
+                return InboundOutcome::Continue;
+            }
             SlackInbound::Deliver(mut channel_msg) => {
                 *last_ts = channel_msg
                     .id
@@ -354,6 +405,7 @@ impl SlackChannel {
                 .unwrap_or("unknown");
             anyhow::bail!("Slack files.completeUploadExternal failed: {err}");
         }
+        self.remember_thread_root(message.thread_ts.as_deref());
         Ok(())
     }
 
@@ -429,6 +481,7 @@ impl SlackChannel {
             anyhow::bail!("Slack chat.postMessage failed: {err}");
         }
 
+        self.remember_thread_root(message.thread_ts.as_deref());
         Ok(())
     }
 
@@ -448,6 +501,7 @@ impl SlackChannel {
             app_token: None,
             allowed_users: Arc::new(RwLock::new(allowed_users)),
             working_notices: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            thread_roots: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -494,6 +548,73 @@ impl SlackChannel {
     /// Take this conversation's placeholder, leaving every other one alone.
     pub(crate) fn take_working_notice(&self, recipient: &str) -> Option<String> {
         self.working_notices.lock().remove(recipient)
+    }
+
+    /// Record that the bot has just posted into the thread with this root,
+    /// evicting the oldest root past the cap. `None` — a post outside any
+    /// thread — records nothing.
+    fn remember_thread_root(&self, thread_ts: Option<&str>) {
+        let Some(root) = thread_ts.filter(|root| !root.is_empty()) else {
+            return;
+        };
+        let mut roots = self.thread_roots.lock();
+        if let Some(seen) = roots.iter().position(|recorded| recorded.as_str() == root) {
+            roots.remove(seen);
+        }
+        roots.push_back(root.to_string());
+        while roots.len() > MAX_THREAD_ROOTS {
+            roots.pop_front();
+        }
+    }
+
+    /// Has the bot posted into the thread with this root?
+    fn thread_is_known(&self, root: &str) -> bool {
+        self.thread_roots
+            .lock()
+            .iter()
+            .any(|recorded| recorded.as_str() == root)
+    }
+
+    /// Slack conversation forms where the bot answers only when addressed:
+    /// public channels, private channels and group DMs. Polling reads one
+    /// `conversations.history` page, whose payload carries no `channel_type`,
+    /// and every polled conversation is a channel; a DM (`im`) is always
+    /// answered, and a form Slack has not documented is not gated.
+    fn requires_addressing(channel_type: Option<&str>) -> bool {
+        match channel_type {
+            None => true,
+            Some(form) => matches!(form, "channel" | "group" | "mpim"),
+        }
+    }
+
+    /// Whether a message in a conversation that requires addressing is
+    /// addressed to the bot: it @-mentions the bot (either mention form), or
+    /// it is a reply inside a thread the bot has posted in.
+    fn is_addressed(&self, text: &str, thread_root: Option<&str>, bot_user_id: &str) -> bool {
+        Self::contains_bot_mention(text, bot_user_id)
+            || thread_root.is_some_and(|root| self.thread_is_known(root))
+    }
+
+    /// Slack renders an @-mention in text as `<@U…>` and, for the legacy
+    /// display-name form, `<@!U…>`.
+    fn contains_bot_mention(text: &str, bot_user_id: &str) -> bool {
+        text.contains(&format!("<@{bot_user_id}>")) || text.contains(&format!("<@!{bot_user_id}>"))
+    }
+
+    /// Remove the bot's own mention tokens from the text handed onward, so
+    /// the model is not asked about a bare user id. Other users' mentions
+    /// survive. Text without an own token is returned unchanged, so nothing
+    /// else is normalized.
+    fn strip_own_mention_tokens(text: &str, bot_user_id: &str) -> String {
+        let tokens = [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")];
+        if !tokens.iter().any(|token| text.contains(token.as_str())) {
+            return text.to_string();
+        }
+        let mut stripped = text.to_string();
+        for token in &tokens {
+            stripped = stripped.replace(token.as_str(), "");
+        }
+        stripped.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// Apply the operator's `[multimodal]` limits to inbound images.
@@ -794,6 +915,7 @@ impl Channel for SlackChannel {
             tracing::debug!("Slack working notice not posted: {text}");
             return Ok(());
         }
+        self.remember_thread_root(thread_ts);
         if let Some(ts) = parsed.get("ts").and_then(|t| t.as_str()) {
             if let Some(stale) = self.remember_working_notice(recipient, ts.to_string()) {
                 // Should not happen while `has_working_notice` guards the post,
@@ -1439,6 +1561,7 @@ mod media_tests {
         let ch = channel();
         let msg = serde_json::json!({
             "user": "U1", "text": "", "ts": "1700000001.000100",
+            "channel_type": "im",
             "files": [{ "url_private": "https://files.slack.com/f/x.png", "mimetype": "image/png" }]
         });
         assert!(
@@ -1450,7 +1573,10 @@ mod media_tests {
         );
 
         // Still empty when there is genuinely nothing.
-        let bare = serde_json::json!({ "user": "U1", "text": "", "ts": "1700000001.000100" });
+        let bare = serde_json::json!({
+            "user": "U1", "text": "", "ts": "1700000001.000100",
+            "channel_type": "im"
+        });
         assert!(matches!(
             ch.classify_inbound(&bare, "U_BOT", "", "C_CHAN"),
             SlackInbound::EmptyOrSeen
@@ -1541,7 +1667,8 @@ mod tests {
         let msg = serde_json::json!({
             "ts": "1700000001.000100",
             "user": "U_OTHER",
-            "text": "status please"
+            "text": "status please",
+            "channel_type": "im"
         });
 
         assert!(
@@ -1572,7 +1699,8 @@ mod tests {
         let msg = serde_json::json!({
             "ts": "1700000001.000100",
             "user": "U_BOT",
-            "text": "my own reply"
+            "text": "my own reply",
+            "channel_type": "im"
         });
         assert!(matches!(
             ch.classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
@@ -1592,6 +1720,298 @@ mod tests {
             ch.classify_inbound(&empty, "U_BOT", "", "C_CHAN"),
             SlackInbound::EmptyOrSeen
         ));
+    }
+
+    // ── the addressing gate ──────────────────────────────────────
+
+    fn channel(allowed: &[&str]) -> SlackChannel {
+        SlackChannel::new(
+            "xoxb-placeholder".into(),
+            None,
+            allowed.iter().map(|u| (*u).to_string()).collect(),
+        )
+    }
+
+    fn msg_from(user: &str, channel_type: Option<&str>, text: &str) -> serde_json::Value {
+        let mut msg = serde_json::json!({
+            "ts": "1700000001.000100",
+            "user": user,
+            "text": text,
+        });
+        if let Some(form) = channel_type {
+            msg["channel_type"] = serde_json::json!(form);
+        }
+        msg
+    }
+
+    /// A DM is one person talking to the bot: every message is answered,
+    /// mention or not.
+    #[test]
+    fn a_dm_is_always_answered() {
+        let msg = msg_from("U_ALLOWED", Some("im"), "plain hello");
+        assert!(matches!(
+            channel(&["*"]).classify_inbound(&msg, "U_BOT", "", "D0DM"),
+            SlackInbound::Deliver(_)
+        ));
+    }
+
+    /// The drive that started this: in `#all-rantai-claw` a plain "hello"
+    /// got a reply nobody asked for. Now it is dropped.
+    #[test]
+    fn a_plain_channel_message_is_ignored() {
+        let msg = msg_from("U_ALLOWED", Some("channel"), "hello");
+        assert!(matches!(
+            channel(&["*"]).classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+            SlackInbound::Unaddressed
+        ));
+    }
+
+    /// A private channel (`group`) follows the same rule.
+    #[test]
+    fn a_plain_private_channel_message_is_ignored() {
+        let msg = msg_from("U_ALLOWED", Some("group"), "hello");
+        assert!(matches!(
+            channel(&["*"]).classify_inbound(&msg, "U_BOT", "", "G0PRIV"),
+            SlackInbound::Unaddressed
+        ));
+    }
+
+    #[test]
+    fn a_channel_message_with_a_bot_mention_is_answered() {
+        let msg = msg_from("U_ALLOWED", Some("channel"), "<@U_BOT> what is the status");
+        match channel(&["*"]).classify_inbound(&msg, "U_BOT", "", "C_CHAN") {
+            SlackInbound::Deliver(m) => assert_eq!(m.content, "what is the status"),
+            other => panic!("a mention is addressed, got {other:?}"),
+        }
+    }
+
+    /// The bot's own threaded replies are what make a thread "its": once it
+    /// has answered there, a follow-up needs no mention.
+    #[test]
+    fn a_reply_in_a_thread_the_bot_posted_in_is_answered() {
+        let ch = channel(&["*"]);
+        ch.remember_thread_root(Some("1700000000.000500"));
+        let msg = serde_json::json!({
+            "ts": "1700000001.000100",
+            "user": "U_ALLOWED",
+            "text": "thanks, one more thing",
+            "channel_type": "channel",
+            "thread_ts": "1700000000.000500"
+        });
+        assert!(matches!(
+            ch.classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+            SlackInbound::Deliver(_)
+        ));
+    }
+
+    /// A conversation between two other people that names a third user is
+    /// not a call for the bot.
+    #[test]
+    fn a_channel_message_mentioning_someone_else_only_is_ignored() {
+        let msg = msg_from("U_ALLOWED", Some("channel"), "<@U_OTHER> what do you think");
+        assert!(matches!(
+            channel(&["*"]).classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+            SlackInbound::Unaddressed
+        ));
+    }
+
+    /// A group DM (`mpim`) is a multi-party conversation like a channel.
+    #[test]
+    fn a_plain_group_dm_message_is_ignored() {
+        let msg = msg_from("U_ALLOWED", Some("mpim"), "hello");
+        assert!(matches!(
+            channel(&["*"]).classify_inbound(&msg, "U_BOT", "", "G0MPIM"),
+            SlackInbound::Unaddressed
+        ));
+    }
+
+    /// A group DM thread the bot has answered in stays answerable.
+    #[test]
+    fn a_group_dm_reply_in_a_thread_the_bot_posted_in_is_answered() {
+        let ch = channel(&["*"]);
+        ch.remember_thread_root(Some("1700000000.000500"));
+        let msg = serde_json::json!({
+            "ts": "1700000001.000100",
+            "user": "U_ALLOWED",
+            "text": "and also this",
+            "channel_type": "mpim",
+            "thread_ts": "1700000000.000500"
+        });
+        assert!(matches!(
+            ch.classify_inbound(&msg, "U_BOT", "", "G0MPIM"),
+            SlackInbound::Deliver(_)
+        ));
+    }
+
+    /// Polling's `conversations.history` payload carries no `channel_type`;
+    /// every polled conversation is a channel, and a mention still works.
+    #[test]
+    fn a_polling_message_without_channel_type_and_a_mention_is_answered() {
+        let msg = msg_from("U_ALLOWED", None, "<@U_BOT> run the nightly");
+        assert!(matches!(
+            channel(&["*"]).classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+            SlackInbound::Deliver(_)
+        ));
+    }
+
+    /// The gate must sit before the allowlist: an unaddressed channel
+    /// message from a sender nobody allowlisted is dropped as unaddressed,
+    /// not answered with a rejected-sender warning and a pairing prompt.
+    #[test]
+    fn an_unaddressed_channel_message_from_a_stranger_is_not_unauthorized() {
+        let msg = msg_from("U_STRANGER", Some("channel"), "anyone there?");
+        assert!(matches!(
+            channel(&["U_ALLOWED"]).classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+            SlackInbound::Unaddressed
+        ));
+    }
+
+    /// Both mention forms come out of the text the model sees; another
+    /// user's mention survives.
+    #[test]
+    fn the_bots_own_mention_tokens_are_stripped_from_the_text() {
+        let msg = msg_from(
+            "U_ALLOWED",
+            Some("channel"),
+            "<@!U_BOT> ping <@U_BOT> and <@U_OTHER>",
+        );
+        match channel(&["*"]).classify_inbound(&msg, "U_BOT", "", "C_CHAN") {
+            SlackInbound::Deliver(m) => assert_eq!(m.content, "ping and <@U_OTHER>"),
+            other => panic!("a mention is addressed, got {other:?}"),
+        }
+    }
+
+    /// Text without an own token is handed onward untouched, so nothing
+    /// else is normalized.
+    #[test]
+    fn text_without_the_bots_mention_token_is_left_unchanged() {
+        assert_eq!(
+            SlackChannel::strip_own_mention_tokens("two  spaces  stay", "U_BOT"),
+            "two  spaces  stay"
+        );
+    }
+
+    /// Before the bot posts into a thread a follow-up there is ignored;
+    /// after, it is answered.
+    #[test]
+    fn a_threaded_bot_reply_makes_its_root_addressed() {
+        let ch = channel(&["*"]);
+        let msg = serde_json::json!({
+            "ts": "1700000001.000100",
+            "user": "U_ALLOWED",
+            "text": "follow-up",
+            "channel_type": "channel",
+            "thread_ts": "1700000000.000500"
+        });
+        assert!(matches!(
+            ch.classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+            SlackInbound::Unaddressed
+        ));
+
+        ch.remember_thread_root(Some("1700000000.000500"));
+        assert!(matches!(
+            ch.classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+            SlackInbound::Deliver(_)
+        ));
+    }
+
+    /// The memory is bounded: past the cap the oldest root is evicted, so a
+    /// long-lived process cannot grow it without limit.
+    #[test]
+    fn thread_root_memory_evicts_the_oldest_past_the_cap() {
+        let ch = channel(&["*"]);
+        for i in 0..=MAX_THREAD_ROOTS {
+            let ts = format!("{i}.1");
+            ch.remember_thread_root(Some(ts.as_str()));
+        }
+        let roots = ch.thread_roots.lock();
+        assert_eq!(roots.len(), MAX_THREAD_ROOTS, "the cap holds");
+        assert!(!roots.contains(&"0.1".to_string()), "the oldest is evicted");
+        assert!(roots.contains(&"1.1".to_string()));
+        assert!(roots.contains(&"1000.1".to_string()));
+    }
+
+    /// STOP branch: `get_bot_user_id` can fail (`unwrap_or_default`),
+    /// leaving an empty id with which no mention can ever match. Channel
+    /// messages are then ignored — never answered — while DMs are unchanged.
+    #[test]
+    fn a_channel_message_with_an_unresolvable_bot_user_id_is_ignored() {
+        let gated = msg_from("U_ALLOWED", Some("channel"), "hello");
+        assert!(matches!(
+            channel(&["*"]).classify_inbound(&gated, "", "", "C_CHAN"),
+            SlackInbound::Unaddressed
+        ));
+
+        let dm = msg_from("U_ALLOWED", Some("im"), "hello");
+        assert!(matches!(
+            channel(&["*"]).classify_inbound(&dm, "", "", "D0DM"),
+            SlackInbound::Deliver(_)
+        ));
+    }
+
+    /// The once-per-process warning cannot be observed without a tracing
+    /// subscriber, so the wiring is pinned by source, the way the other
+    /// handler wiring here is pinned: the swap and the operator-facing text
+    /// must sit in the gate's empty-id branch.
+    #[test]
+    fn the_unresolved_bot_user_id_warning_fires_once_per_process() {
+        let src = include_str!("slack.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let gate = production
+            .split("if Self::requires_addressing(")
+            .nth(1)
+            .expect("the addressing gate exists");
+        let branch = &gate[..gate
+            .find("if !self.is_addressed(")
+            .expect("the addressed check follows the empty-id branch")];
+        assert!(
+            branch.contains("BOT_USER_ID_WARNED.swap("),
+            "the warning must fire once per process, not once per message"
+        );
+        assert!(
+            branch.contains("channel messages are ignored until the bot user id is known"),
+            "the operator must be told why the channel went quiet"
+        );
+    }
+
+    /// `post_chunk` cannot run without a live workspace, so the wiring that
+    /// records the bot's own threaded posts is pinned by source, the way the
+    /// splitter wiring above is pinned: every outbound path that can land in
+    /// a thread must remember the root.
+    #[test]
+    fn every_threaded_outbound_remembers_its_root() {
+        let src = include_str!("slack.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        for signature in [
+            "async fn post_chunk(",
+            "async fn send_attachment(",
+            "async fn start_typing(",
+        ] {
+            let body = production
+                .split(signature)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{signature} exists"));
+            let end = body.find("\n    async fn ").unwrap_or(body.len());
+            assert!(
+                body[..end].contains("self.remember_thread_root("),
+                "{signature} must remember a thread root it posts into"
+            );
+        }
+    }
+
+    /// The listener drops the classification silently, with no identifier in
+    /// the journal and nothing forwarded to the agent.
+    #[tokio::test]
+    async fn handle_inbound_drops_an_unaddressed_message_without_forwarding_it() {
+        let ch = channel(&["*"]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let msg = msg_from("U_ALLOWED", Some("channel"), "hello");
+        let mut cursor = String::new();
+        let outcome = ch
+            .handle_inbound(&msg, "U_BOT", &mut cursor, "C_CHAN", &tx)
+            .await;
+        assert!(matches!(outcome, InboundOutcome::Continue));
+        assert!(rx.try_recv().is_err(), "nothing may reach the agent");
     }
 
     /// The splitter test above proves the constant and the splitter behave; a
@@ -1959,7 +2379,7 @@ mod tests {
         let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U_ALLOWED".into()]);
         let env = envelope(serde_json::json!({
             "type": "message", "user": "U_DENIED", "text": "hai",
-            "ts": "1.1", "channel": "C0"
+            "ts": "1.1", "channel": "C0", "channel_type": "im"
         }));
         let event = SlackChannel::socket_event_message(&env, None).unwrap();
         assert!(matches!(
