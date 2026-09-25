@@ -231,6 +231,86 @@ else
 fi
 rm -rf "$BASELINE_REPO"
 
+# --- test 5: committed warning + uncommitted prepend that shifts its line ----
+
+printf '\n=== test 5: committed warning + uncommitted prepend shifts its line ===\n'
+# A separate fixture with two commits: an initial clean file, then a commit
+# that adds an unused function (a committed warning at HEAD line N). The
+# working tree then prepends M uncommitted lines, which shifts the warning
+# to working-tree line N+M. The pre-fix classifier concatenated ranges from
+# `git diff BASE..HEAD` (HEAD coordinates) with ranges from `git diff HEAD`
+# (working-tree coordinates) — two coordinate systems, both treated as one.
+# The committed ranges pointed at HEAD lines, clippy reported the warning in
+# working-tree coordinates, and a prepend could shift the warning off every
+# range, so the gate exited 0 on what is a real new warning. The fix uses one
+# diff of BASE against the working tree for dirty files, which gives all
+# ranges in working-tree coordinates (clippy's own) and covers the shifted
+# warning. This test fails on the concatenation and passes on the unified
+# coordinate system.
+PREPEND_REPO="$(mktemp -d)"
+(
+    cd "$PREPEND_REPO"
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "Test"
+    cat > Cargo.toml <<'TOML'
+[package]
+name = "strict-delta-prepend-fixture"
+version = "0.0.0"
+edition = "2021"
+TOML
+    mkdir -p src
+    cat > src/lib.rs <<'RS'
+pub fn answer() -> i32 {
+    42
+}
+RS
+    git add .
+    git commit -q -m "initial clean"
+    cargo generate-lockfile -q >/dev/null 2>&1 || true
+    if [ -f Cargo.lock ]; then
+        git add Cargo.lock
+        git commit -q -m "lockfile" || true
+    fi
+    # Commit a warning-introducing change on top of the clean base.
+    printf '\nfn unused_committed() { let _x = 5; }\n' >> src/lib.rs
+    git add src/lib.rs
+    git commit -q -m "introduce committed warning"
+)
+# Capture the SHA of the commit BEFORE the warning-introducing commit. The
+# gate must treat the committed warning as "on a changed line", so its BASE
+# has to predate the commit — test 4 used BASE_SHA=HEAD on a single commit,
+# which only works when the changed lines are uncommitted. Here the warning
+# is committed, so HEAD itself is the wrong base.
+PREPEND_BASE="$(git -C "$PREPEND_REPO" rev-parse HEAD~1)"
+
+PREPEND_LOG="$PREPEND_REPO/gate.log"
+(
+    cd "$PREPEND_REPO"
+    # Uncommitted prepend shifts the committed warning's line numbers down.
+    # Comments at the top are lint-clean, so they don't add their own
+    # blocking warnings that would mask the shifted-line defect.
+    {
+        echo '// pre1'
+        echo '// pre2'
+        echo '// pre3'
+        cat src/lib.rs
+    } > src/lib.rs.new
+    mv src/lib.rs.new src/lib.rs
+    BASE_SHA="$PREPEND_BASE" bash "$GATE"
+) >"$PREPEND_LOG" 2>&1
+EC5=$?
+echo "exit=$EC5"
+cat "$PREPEND_LOG"
+
+if [ "$EC5" -ne 0 ] \
+    && grep -q "Strict lint issues introduced on changed Rust lines" "$PREPEND_LOG"; then
+    log_pass "committed warning stays blocking after uncommitted prepend shifts its line"
+else
+    log_fail "committed warning should remain blocking after uncommitted prepend shifts its line (EC=$EC5)"
+fi
+rm -rf "$PREPEND_REPO"
+
 # --- summary -----------------------------------------------------------------
 
 printf '\n=== summary ===\n'
