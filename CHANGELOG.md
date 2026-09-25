@@ -206,6 +206,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A scheduled agent job's reply no longer reaches the daemon journal.** Scheduled agent jobs ran
+  through the single-shot path that also backs `rantaiclaw agent -m`; its final-reply print wrote
+  every scheduled reply into the journal under systemd (observed 2026-09-25). `run_with_scope` now
+  takes an explicit silent flag: the scheduler and the daemon heartbeat pass true, the CLI passes
+  false. `rantaiclaw agent -m` still prints and stays pipeable, scheduled jobs and the heartbeat
+  no longer write replies to the journal, and `chat` now prints its reply once instead of twice.
 - **The Slack `warning` caveat no longer claims DMs are dropped.** The Socket Mode + `channel_id`
   check in `src/gateway/config_api.rs` returned a string saying "the bot will ignore direct
   messages and every conversation except that one" — true of the old (pre-#844) filter, but the

@@ -632,7 +632,10 @@ async fn run_heartbeat_worker(
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(
+            // Box the agent future: `crate::agent::run` is a large future and
+            // boxing it keeps the enclosing heartbeat loop off the poll-loop
+            // stack (clippy::large_futures), mirroring the cron scheduler.
+            if let Err(e) = Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -640,7 +643,11 @@ async fn run_heartbeat_worker(
                 temp,
                 vec![],
                 "scheduler",
-            )
+                // Heartbeat runs under the daemon, where stdout is the
+                // journal; the reply (if any) is logged through the
+                // observer, not printed.
+                true,
+            ))
             .await
             {
                 crate::health::mark_component_error("heartbeat", e.to_string());
