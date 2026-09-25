@@ -962,6 +962,14 @@ pub(crate) async fn process_channel_message(
                     compacted,
                     "context window exceeded"
                 );
+                // Pair the user turn appended at the start of this turn, so the
+                // resent message is not merged onto the failed one. The reply
+                // below goes to the chat; the marker stays in history.
+                history::append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(FAILED_TURN_MARKER),
+                );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
