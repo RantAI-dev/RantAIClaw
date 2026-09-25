@@ -9,13 +9,24 @@
 //! send-key retry. [`install_log_bridge`] registers a shim that forwards
 //! each `log::Record` into a `tracing::Event`, so the same filter pipeline
 //! handles both facades and the operator-visible record lands in the journal
-//! with its original target (e.g. `wa_rs`) intact — `wa_rs=info` filtering
-//! works through the standard `EnvFilter` directive.
+//! with its original target (e.g. `wa_rs`) intact — `EnvFilter`'s
+//! target-prefix match sees the bridge's per-record target and the same
+//! directive syntax works for `log`-facade records as for `tracing`-native
+//! events.
 //!
 //! An explicit `RUST_LOG` still wins entirely; when unset,
 //! [`default_env_filter`] falls back to [`DEFAULT_DIRECTIVES`], which keeps
-//! the noisy HTTP/TLS crates at `warn` to prevent flooding and lets `wa_rs`
-//! through at `info`.
+//! the noisy HTTP/TLS crates at `warn` to prevent flooding. The wa-rs family
+//! (`wa_rs`, `wa_rs_libsignal`, and wa-rs's explicit `Client/*` targets) sits
+//! at `warn` because wa-rs's per-message `INFO` lines carry full identifiers
+//! (LIDs, group JIDs) — those names do not belong in a routine journal. The
+//! `WARN` lines (`Failed to resolve devices`, `No sender key for group`,
+//! `Failed to establish session`) are the ones worth keeping. To diagnose a
+//! WhatsApp Web delivery problem, restart the daemon with
+//! `RUST_LOG=info,wa_rs=debug,Client=debug` for a diagnosis session and
+//! expect full identifiers to appear in the journal; `EnvFilter` matches
+//! targets by plain string prefix, so `wa_rs=debug` also covers the
+//! `wa_rs_libsignal` target and `Client=debug` covers every `Client/*` target.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -36,12 +47,20 @@ const fn anchor_id(callsite: &'static dyn Callsite) -> Identifier {
 ///
 /// The base level is `info`. `hyper`, `reqwest`, `rustls`, and `h2` are
 /// pinned to `warn` because they are noisy during normal operation
-/// (request/response framing, TLS handshakes, h2 control frames). `wa_rs=info`
-/// documents intent for the wa-rs bridge, but it matches only targets with the
-/// `wa_rs` prefix. wa-rs's explicit `Client/*` target strings (`Client/TcToken`,
-/// `Client/Receipt`) are at info/warn and pass on the base `info` level rather
-/// than through the directive.
-pub const DEFAULT_DIRECTIVES: &str = "info,hyper=warn,reqwest=warn,rustls=warn,h2=warn,wa_rs=info";
+/// (request/response framing, TLS handshakes, h2 control frames). `wa_rs=warn`
+/// also covers `wa_rs_libsignal` and every `wa_rs::*` target via plain string
+/// prefix matching, and `Client=warn` covers wa-rs's explicit `Client/*`
+/// targets (`Client/TcToken`, `Client/Receipt`, `Client/Send`, …). These two
+/// pins keep wa-rs's per-message `INFO` lines (which carry full LIDs and
+/// group JIDs) out of the routine journal while leaving the diagnosis-relevant
+/// `WARN` lines (`Failed to resolve devices`, `No sender key for group`,
+/// `Failed to establish session`) visible. An explicit `RUST_LOG` overrides
+/// this entirely — for example
+/// `RUST_LOG=info,wa_rs=debug,Client=debug`
+/// is the diagnosis-session value; prefix matching means `wa_rs=debug`
+/// covers `wa_rs_libsignal` and `Client=debug` covers every `Client/*` target.
+pub const DEFAULT_DIRECTIVES: &str =
+    "info,hyper=warn,reqwest=warn,rustls=warn,h2=warn,wa_rs=warn,Client=warn";
 
 /// Build the default [`EnvFilter`], honouring `RUST_LOG` if the operator set
 /// it.
@@ -220,8 +239,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Pin the directive string. A refactor that loses the noisy-crate pins
-    /// or the `wa_rs=info` line would otherwise silently flood the journal;
-    /// this test catches it here, not in a reviewer reading a giant diff.
+    /// or the `wa_rs=warn` / `Client=warn` lines would otherwise flood the
+    /// journal with per-message WhatsApp identifiers (LIDs, group JIDs); this
+    /// test catches it here, not in a reviewer reading a giant diff.
     #[test]
     fn default_directives_contain_required_pins() {
         assert!(
@@ -245,8 +265,12 @@ mod tests {
             "h2=warn pin missing: {DEFAULT_DIRECTIVES}"
         );
         assert!(
-            DEFAULT_DIRECTIVES.contains("wa_rs=info"),
-            "wa_rs=info pin missing: {DEFAULT_DIRECTIVES}"
+            DEFAULT_DIRECTIVES.contains("wa_rs=warn"),
+            "wa_rs=warn pin missing: {DEFAULT_DIRECTIVES}"
+        );
+        assert!(
+            DEFAULT_DIRECTIVES.contains("Client=warn"),
+            "Client=warn pin missing: {DEFAULT_DIRECTIVES}"
         );
     }
 
@@ -347,9 +371,34 @@ mod tests {
             log::debug!(target: "hyper", "hyper debug line that should be filtered");
             // Above the base level but below the `hyper=warn` pin — rejected.
             log::info!(target: "hyper", "hyper info line that should be filtered");
-            // Allowed: `hyper=warn` and the explicit `wa_rs=info` pin.
+            // wa-rs per-message INFO lines carry full LIDs / group JIDs and
+            // are exactly what the `wa_rs=warn` and `Client=warn` pins exist
+            // to filter out — the prefix match must reach `wa_rs::receipt`,
+            // `wa_rs_libsignal`, and `Client/Receipt` too. The matching WARN
+            // lines (`Failed to resolve devices`, `No sender key for group`)
+            // are the ones worth keeping.
+            log::info!(
+                target: "wa_rs::receipt",
+                "wa_rs receipt info line that should be filtered"
+            );
+            log::warn!(
+                target: "wa_rs::send",
+                "wa_rs send warn line that should pass"
+            );
+            log::info!(
+                target: "wa_rs_libsignal",
+                "wa_rs libsignal info line that should be filtered"
+            );
+            log::info!(
+                target: "Client/Receipt",
+                "client receipt info line that should be filtered"
+            );
+            log::warn!(
+                target: "Client/Receipt",
+                "client receipt warn line that should pass"
+            );
+            // Allowed: `hyper=warn` and the wa-rs WARN lines.
             log::warn!(target: "hyper", "hyper warn line that should pass");
-            log::info!(target: "wa_rs::send", "wa_rs info line that should pass");
         });
 
         let captured =
@@ -372,6 +421,18 @@ mod tests {
             !captured.contains("hyper info line"),
             "hyper INFO leaked past the hyper=warn pin: {captured:?}"
         );
+        assert!(
+            !captured.contains("wa_rs receipt info line"),
+            "wa_rs::receipt INFO leaked past the wa_rs=warn pin: {captured:?}"
+        );
+        assert!(
+            !captured.contains("wa_rs libsignal info line"),
+            "wa_rs_libsignal INFO leaked past the wa_rs=warn prefix pin: {captured:?}"
+        );
+        assert!(
+            !captured.contains("client receipt info line"),
+            "Client/Receipt INFO leaked past the Client=warn pin: {captured:?}"
+        );
 
         // Allowed records must reach the formatter, and they must carry the
         // real per-(target, level) `Metadata::target()` — not the anchor's
@@ -382,8 +443,12 @@ mod tests {
             "hyper WARN did not reach the subscriber: {captured:?}"
         );
         assert!(
-            captured.contains("wa_rs info line"),
-            "wa_rs INFO did not reach the subscriber: {captured:?}"
+            captured.contains("wa_rs send warn line"),
+            "wa_rs::send WARN did not reach the subscriber: {captured:?}"
+        );
+        assert!(
+            captured.contains("client receipt warn line"),
+            "Client/Receipt WARN did not reach the subscriber: {captured:?}"
         );
         assert!(
             captured.contains("hyper"),
@@ -392,6 +457,62 @@ mod tests {
         assert!(
             captured.contains("wa_rs::send"),
             "real target wa_rs::send did not reach the formatter: {captured:?}"
+        );
+        assert!(
+            captured.contains("Client/Receipt"),
+            "real target Client/Receipt did not reach the formatter: {captured:?}"
+        );
+    }
+
+    /// `RUST_LOG` overrides the default directives entirely — the documented
+    /// `RUST_LOG=info,wa_rs=debug,Client=debug` diagnosis-session value must
+    /// let the wa-rs `INFO` lines through that the default filter rejects.
+    /// Pin the precedence order in a test that sets `RUST_LOG` under the
+    /// crate-wide env-var lock so a stray `RUST_LOG` in the developer's shell
+    /// cannot make this pass or fail by accident.
+    #[test]
+    fn rust_log_overrides_default_directives() {
+        install_log_bridge();
+
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _log = crate::test_env::EnvGuard::set("RUST_LOG", "info,wa_rs=debug,Client=debug");
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(crate::logging::default_env_filter())
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log::info!(
+                target: "wa_rs::receipt",
+                "wa_rs receipt info line that RUST_LOG should let through"
+            );
+            log::info!(
+                target: "Client/Receipt",
+                "client receipt info line that RUST_LOG should let through"
+            );
+            log::info!(
+                target: "wa_rs_libsignal",
+                "wa_rs libsignal info line that RUST_LOG should let through"
+            );
+        });
+
+        let captured =
+            String::from_utf8(buffer.0.lock().expect("buffer lock").clone()).expect("utf-8 output");
+
+        assert!(
+            captured.contains("wa_rs receipt info line"),
+            "RUST_LOG=wa_rs=debug should let wa_rs::receipt INFO through: {captured:?}"
+        );
+        assert!(
+            captured.contains("client receipt info line"),
+            "RUST_LOG=Client=debug should let Client/Receipt INFO through: {captured:?}"
+        );
+        assert!(
+            captured.contains("wa_rs libsignal info line"),
+            "RUST_LOG=wa_rs=debug should cover wa_rs_libsignal by prefix: {captured:?}"
         );
     }
 }

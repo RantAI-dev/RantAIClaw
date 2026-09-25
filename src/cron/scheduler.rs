@@ -8,6 +8,7 @@ use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -100,6 +101,14 @@ pub async fn run(
     // stays fixed at its boot value.
     let mut working = config;
 
+    // Seed the reload gate from the boot config: the path the daemon loaded
+    // and that path's fingerprint. The first tick is therefore quiet when
+    // nothing has changed since boot; a real edit before the first tick still
+    // reloads because the fingerprint (or, with a workspace marker switched,
+    // the resolved path) has moved.
+    let mut last_loaded_path = working.config_path.clone();
+    let mut last_fingerprint = crate::config::fingerprint::fingerprint_file(&last_loaded_path);
+
     loop {
         interval.tick().await;
         // Keep scheduler liveness fresh even when there are no due jobs, and even
@@ -118,21 +127,15 @@ pub async fn run(
         // Refresh the config half once per poll tick. The scheduler is a
         // long-lived task built at daemon start, so without this an operator
         // tightening autonomy would not reach scheduled jobs until a restart —
-        // exactly the surface where nobody is watching. Cost is one config read
-        // per interval, floored at MIN_POLL_SECONDS.
-        match Config::load_or_init().await {
-            Ok(cfg) => {
-                security.apply_config(&cfg.autonomy);
-                working = cfg;
-            }
-            // Keep the previous config. Never fall back to a permissive default
-            // because a config read failed.
-            Err(e) => tracing::warn!(
-                target: "scheduler",
-                error = %e,
-                "config reload failed; keeping the previously applied config for this tick"
-            ),
-        }
+        // exactly the surface where nobody is watching. Cost is one fingerprint
+        // read on a quiet host, one full load on an edited config.
+        refresh_working_config(
+            &security,
+            &mut working,
+            &mut last_loaded_path,
+            &mut last_fingerprint,
+        )
+        .await;
 
         // One `now` for the whole tick — the poll query and the staleness gate
         // must agree on the current instant.
@@ -390,6 +393,64 @@ async fn execute_and_persist_job(
     let success = persist_job_result(config, job, success, &output, &attempts, channels).await;
 
     (job.id.clone(), success)
+}
+
+/// Reload `working` from disk only when the resolved config path or its
+/// fingerprint has changed since the last load. The scheduler calls this
+/// every poll tick (15 s by default): on a quiet host the resolved path and
+/// its fingerprint match what we already have, so the call becomes a
+/// fingerprint compare that emits one DEBUG line and skips the full
+/// `load_or_init` (migration, decrypt, env-override, profile resolution).
+/// A real edit forces a reload, the `Config::load_or_init` INFO line stays,
+/// and the new autonomy is applied to `security` so the next batch runs
+/// under the freshest policy. A load failure keeps the previous config —
+/// never a permissive default.
+pub(crate) async fn refresh_working_config(
+    security: &Arc<SecurityPolicy>,
+    working: &mut Config,
+    last_loaded_path: &mut PathBuf,
+    last_fingerprint: &mut String,
+) {
+    let resolved_path = match Config::resolve_active_paths().await {
+        Ok((path, _workspace)) => path,
+        Err(e) => {
+            tracing::warn!(
+                target: "scheduler",
+                error = %e,
+                "config reload skipped: could not resolve active config path"
+            );
+            return;
+        }
+    };
+    let fresh_fp = crate::config::fingerprint::fingerprint_file(&resolved_path);
+    if resolved_path == *last_loaded_path && fresh_fp == *last_fingerprint {
+        tracing::debug!(
+            target: "scheduler",
+            path = %resolved_path.display(),
+            "config unchanged; keeping the previously applied config"
+        );
+        return;
+    }
+    match Config::load_or_init().await {
+        Ok(cfg) => {
+            // Use the path the loader actually loaded from — it re-resolves
+            // HOME/env/workspace-marker — so a future compare does not race
+            // against a marker that flipped between the two resolutions.
+            let loaded_path = cfg.config_path.clone();
+            let loaded_fp = crate::config::fingerprint::fingerprint_file(&loaded_path);
+            security.apply_config(&cfg.autonomy);
+            *last_loaded_path = loaded_path;
+            *last_fingerprint = loaded_fp;
+            *working = cfg;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "scheduler",
+                error = %e,
+                "config reload failed; keeping the previously applied config for this tick"
+            );
+        }
+    }
 }
 
 /// The memory scope a job's run gets, which is the whole of what
@@ -2344,5 +2405,215 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    // ── scheduler config-refresh fingerprint gate ───────────────────────────
+    //
+    // On a quiet host `refresh_working_config` is called every poll tick
+    // (15 s by default) and must NOT log a fresh `Config loaded` line each
+    // time — that one INFO line is what was filling the journal. A real edit
+    // forces the load back. The test below pins both halves: a quiet second
+    // tick emits DEBUG and not INFO, and a real edit brings INFO back.
+
+    /// Local copy of the `Buffer` `MakeWriter` used by `src/logging.rs` tests
+    /// for the same purpose. Kept private to this module so the two copies
+    /// can drift only if the in-tree pattern changes too.
+    #[derive(Clone, Default)]
+    struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Buffer {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured(buffer: &Buffer) -> String {
+        String::from_utf8(buffer.0.lock().expect("buffer lock").clone()).expect("utf-8 output")
+    }
+
+    fn clear_buffer(buffer: &Buffer) {
+        buffer.0.lock().expect("buffer lock").clear();
+    }
+
+    /// A second refresh against an untouched config must NOT log `Config
+    /// loaded` at INFO. Pin the no-op path: without the fingerprint gate the
+    /// test would catch a noisy INFO line on every poll tick.
+    #[tokio::test]
+    async fn refresh_working_config_logs_nothing_at_info_on_an_unchanged_file() {
+        // Pin HOME so the v0.5.0 profile-aware fallback resolves into a
+        // tempdir we control instead of the real ~/.rantaiclaw.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+        tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
+        tokio::fs::write(
+            &config_path,
+            "schema_version = 32\ndefault_model = \"baseline\"\n",
+        )
+        .await
+        .unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
+
+        let boot = Config::load_or_init().await.unwrap();
+        let security = std::sync::Arc::new(SecurityPolicy::from_config(
+            &boot.autonomy,
+            &boot.workspace_dir,
+        ));
+
+        // Seed from the boot config: the fingerprint gate must recognise a
+        // file that has not changed since boot as unchanged, so the first
+        // refresh is also the no-op path. A second refresh against the same
+        // file proves the gate is sticky.
+        let mut working = boot;
+        let mut last_loaded_path = working.config_path.clone();
+        let mut last_fingerprint = crate::config::fingerprint::fingerprint_file(&last_loaded_path);
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_target(true)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        refresh_working_config(
+            &security,
+            &mut working,
+            &mut last_loaded_path,
+            &mut last_fingerprint,
+        )
+        .await;
+        let first = captured(&buffer);
+        assert!(
+            !first.contains("Config loaded"),
+            "refresh against an unchanged file must not log Config loaded: {first:?}"
+        );
+        assert!(
+            first.contains("config unchanged"),
+            "refresh against an unchanged file must log the DEBUG unchanged line: {first:?}"
+        );
+
+        // A second refresh with the file untouched must emit no INFO
+        // `Config loaded` either — proves the gate is sticky, not a
+        // first-tick fluke.
+        clear_buffer(&buffer);
+        refresh_working_config(
+            &security,
+            &mut working,
+            &mut last_loaded_path,
+            &mut last_fingerprint,
+        )
+        .await;
+        let second = captured(&buffer);
+        assert!(
+            !second.contains("Config loaded"),
+            "second refresh against an untouched file must not log Config loaded: {second:?}"
+        );
+        assert!(
+            second.contains("config unchanged"),
+            "second refresh against an untouched file must log the DEBUG unchanged line: {second:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_home).await;
+    }
+
+    /// Edit the config file between two refreshes: the second refresh must
+    /// detect the new fingerprint, reload via `load_or_init`, and bring the
+    /// `Config loaded` INFO line back. This is the path that matters when an
+    /// operator tightens autonomy — the reload is the entire reason the
+    /// per-tick refresh exists.
+    #[tokio::test]
+    async fn refresh_working_config_relogs_config_loaded_after_an_edit() {
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+        tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
+        tokio::fs::write(
+            &config_path,
+            "schema_version = 32\ndefault_model = \"baseline\"\n",
+        )
+        .await
+        .unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
+
+        let boot = Config::load_or_init().await.unwrap();
+        let security = std::sync::Arc::new(SecurityPolicy::from_config(
+            &boot.autonomy,
+            &boot.workspace_dir,
+        ));
+
+        let mut working = boot;
+        let mut last_loaded_path = working.config_path.clone();
+        let mut last_fingerprint = crate::config::fingerprint::fingerprint_file(&last_loaded_path);
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_target(true)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // First refresh against the boot file — fingerprint matches the
+        // seed, no INFO `Config loaded`.
+        refresh_working_config(
+            &security,
+            &mut working,
+            &mut last_loaded_path,
+            &mut last_fingerprint,
+        )
+        .await;
+        clear_buffer(&buffer);
+
+        // Edit the file. A different model line is enough to move the
+        // fingerprint; the migration/encrypt path is the production concern,
+        // not the test's.
+        tokio::fs::write(
+            &config_path,
+            "schema_version = 32\ndefault_model = \"tightened\"\n",
+        )
+        .await
+        .unwrap();
+
+        refresh_working_config(
+            &security,
+            &mut working,
+            &mut last_loaded_path,
+            &mut last_fingerprint,
+        )
+        .await;
+        let after_edit = captured(&buffer);
+        assert!(
+            after_edit.contains("Config loaded"),
+            "refresh after an edit must log Config loaded: {after_edit:?}"
+        );
+        assert_eq!(
+            working.default_model.as_deref(),
+            Some("tightened"),
+            "the edit must actually reach `working`: {after_edit:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_home).await;
     }
 }
