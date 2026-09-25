@@ -83,7 +83,12 @@ pub struct WhatsAppWebChannel {
     /// addressed-elsewhere refusal stays in force. Tests fill the cache
     /// directly through `set_bot_identity_for_test` because a live wa-rs
     /// client cannot run inside a unit test.
-    bot_identity: Mutex<Option<String>>,
+    bot_identity: Arc<Mutex<Option<String>>>,
+    /// Cached own-identity LID user part, the address groups often
+    /// @-mention instead of the phone number. Filled in the same
+    /// `refresh_bot_identity` pass as `bot_identity`; `None` until `listen`
+    /// connects. Tests fill it through `set_bot_lid_for_test`.
+    bot_lid: Arc<Mutex<Option<String>>>,
 }
 
 /// What became of an inbound message offered to the dispatch queue.
@@ -111,6 +116,13 @@ const DROP_NOTICE_COOLDOWN: std::time::Duration = std::time::Duration::from_mins
 const DROP_NOTICE: &str =
     "I could not take that message just now — I am still working through the previous one. \
      Please send it again in a moment.";
+
+/// Set once the operator has been told why group messages are being ignored:
+/// neither of the linked account's own identities is known yet. Once per
+/// process, not once per message — a busy group must not flood the journal.
+#[cfg(feature = "whatsapp-web")]
+static GROUP_IDENTITY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl WhatsAppWebChannel {
     /// Whether `chat` may be told about a drop now, recording the notice if so.
@@ -160,7 +172,8 @@ impl WhatsAppWebChannel {
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
             // Lazy: refreshed once `listen` connects to wa-rs.
-            bot_identity: Mutex::new(None),
+            bot_identity: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -794,15 +807,79 @@ impl WhatsAppWebChannel {
         Self::normalize_sender(resolved_pn, sender_user)
     }
 
-    /// Read our own linked-account phone number from the live wa-rs client
-    /// and cache it. Called once after `listen` establishes the connection.
-    /// The push name is not usable here: it usually contains spaces
-    /// ("First Last"), and `addressed_to_this_bot` matches a command against
-    /// its first whitespace-delimited token, so `/new@First Last` would never
-    /// match. WhatsApp's own @-mention also inserts the phone number into the
-    /// message text, not the push name. No number yet (wa-rs still warming
-    /// up, or pairing incomplete) leaves the cache untouched so a later call
-    /// retries.
+    /// Whether a group message is addressed to this bot: it @-mentions the
+    /// linked account's phone-number JID or its LID (groups are often
+    /// LID-addressed, so both are needed), or it quotes a message whose
+    /// participant is the bot — a reply to a bot message. Pure so it is
+    /// unit-testable without a live wa-rs client.
+    ///
+    /// A plain `conversation` text carries no `ContextInfo` anywhere, and
+    /// WhatsApp delivers an @-mention as an extended-text (or image) message
+    /// with `ContextInfo`, so reading those two variants is complete: a group
+    /// message with neither is unaddressed.
+    #[cfg(feature = "whatsapp-web")]
+    fn group_message_addressed(
+        msg: &wa_rs_proto::whatsapp::Message,
+        pn: Option<&str>,
+        lid: Option<&str>,
+    ) -> bool {
+        use wa_rs_core::proto_helpers::MessageExt as _;
+
+        // Mention and participant entries are JID strings; the identity is
+        // the user part before the `@`.
+        let own = |jid: &str| {
+            let user = jid.split('@').next().unwrap_or("");
+            pn.is_some_and(|id| id == user) || lid.is_some_and(|id| id == user)
+        };
+        // The context rides on the inner message behind ephemeral/view-once
+        // wrappers — the same one `text_content` reads.
+        let base = msg.get_base_message();
+        let context = base
+            .extended_text_message
+            .as_ref()
+            .and_then(|m| m.context_info.as_deref())
+            .or_else(|| {
+                base.image_message
+                    .as_ref()
+                    .and_then(|m| m.context_info.as_deref())
+            });
+        let Some(context) = context else {
+            return false;
+        };
+        let mentioned = context.mentioned_jid.iter().any(|jid| own(jid));
+        let replied_to =
+            context.quoted_message.is_some() && context.participant.as_deref().is_some_and(own);
+        mentioned || replied_to
+    }
+
+    /// Remove the linked account's own `@<number>` / `@<lid>` tokens from the
+    /// text handed onward, so the model is not asked about a bare string of
+    /// digits. Other members' mention tokens survive. Text without an own
+    /// token is returned unchanged, so nothing else is normalized.
+    #[cfg(feature = "whatsapp-web")]
+    fn strip_own_mention_tokens(text: &str, pn: Option<&str>, lid: Option<&str>) -> String {
+        let own = [
+            pn.map(|id| format!("@{id}")),
+            lid.map(|id| format!("@{id}")),
+        ];
+        if !own.iter().flatten().any(|tok| text.contains(tok.as_str())) {
+            return text.to_string();
+        }
+        text.split_whitespace()
+            .filter(|tok| !own.iter().flatten().any(|t| *tok == t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Read our own linked-account phone number and LID from the live wa-rs
+    /// client and cache them. Called once after `listen` establishes the
+    /// connection. The push name is not usable here: it usually contains
+    /// spaces ("First Last"), and `addressed_to_this_bot` matches a command
+    /// against its first whitespace-delimited token, so `/new@First Last`
+    /// would never match. WhatsApp's own @-mention also inserts the phone
+    /// number into the message text, not the push name. No number yet (wa-rs
+    /// still warming up, or pairing incomplete) leaves the cache untouched so
+    /// a later call retries.
     #[cfg(feature = "whatsapp-web")]
     async fn refresh_bot_identity(&self) {
         use wa_rs_binary::jid::JidExt as _;
@@ -815,6 +892,12 @@ impl WhatsAppWebChannel {
                     *self.bot_identity.lock() = Some(number);
                 }
             }
+            if let Some(lid) = client.get_lid().await {
+                let id = lid.user().to_string();
+                if !id.is_empty() {
+                    *self.bot_lid.lock() = Some(id);
+                }
+            }
         }
     }
 
@@ -824,6 +907,12 @@ impl WhatsAppWebChannel {
     #[cfg(test)]
     pub(crate) fn set_bot_identity_for_test(&self, name: Option<String>) {
         *self.bot_identity.lock() = name;
+    }
+
+    /// Pin our LID from a test fixture, sibling of `set_bot_identity_for_test`.
+    #[cfg(test)]
+    pub(crate) fn set_bot_lid_for_test(&self, name: Option<String>) {
+        *self.bot_lid.lock() = name;
     }
 }
 
@@ -1028,6 +1117,11 @@ impl Channel for WhatsAppWebChannel {
         let listening = cancel.clone();
         let allowed_numbers = self.allowed_numbers.clone();
         let multimodal = self.multimodal.clone();
+        // The group gate inside the event loop reads these two caches: the
+        // linked account's phone number and LID. Arc clones, because the
+        // handler closure outlives the borrow of `self`.
+        let bot_identity = Arc::clone(&self.bot_identity);
+        let bot_lid = Arc::clone(&self.bot_lid);
         // Last time each chat was told a message was dropped, so a saturated
         // queue produces one apology per chat rather than one per message.
         let drop_notices: Arc<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
@@ -1055,6 +1149,8 @@ impl Channel for WhatsAppWebChannel {
                 let multimodal = multimodal.clone();
                 let session_ended_inner = session_ended.clone();
                 let session_end_inner = Arc::clone(&session_end_reason);
+                let bot_identity = bot_identity.clone();
+                let bot_lid = bot_lid.clone();
                 async move {
                     match event {
                         Event::Message(msg, info) => {
@@ -1098,6 +1194,50 @@ impl Channel for WhatsAppWebChannel {
                             let normalized =
                                 Self::inbound_identity(is_lid, resolved_pn.as_deref(), &sender);
 
+                            // The linked account's own identities, as far as
+                            // wa-rs knows them. Read before the gate below so
+                            // an addressed group message can have its own
+                            // mention token stripped further down.
+                            let own_pn = bot_identity.lock().clone();
+                            let own_lid = bot_lid.lock().clone();
+
+                            // In a group the bot answers only when the message
+                            // is addressed to it: an @-mention of its number
+                            // or its LID, or a reply to one of its own
+                            // messages. DMs are always answered. The gate sits
+                            // before pairing interception and the allowlist so
+                            // an unaddressed group message is dropped silently
+                            // and a busy group stops producing one
+                            // rejected-sender warning per message from people
+                            // outside the allowlist.
+                            if info.source.is_group {
+                                if own_pn.is_none() && own_lid.is_none() {
+                                    if !GROUP_IDENTITY_WARNED.swap(
+                                        true,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    ) {
+                                        tracing::warn!(
+                                            "WhatsApp Web: group messages are ignored until \
+                                             the linked account's identity is known"
+                                        );
+                                    }
+                                    return;
+                                }
+                                if !Self::group_message_addressed(
+                                    &msg,
+                                    own_pn.as_deref(),
+                                    own_lid.as_deref(),
+                                ) {
+                                    // Debug only, with no sender identifier
+                                    // and no body: the group is not being
+                                    // ignored, it is being filtered.
+                                    tracing::debug!(
+                                        "WhatsApp Web: ignoring an unaddressed group message"
+                                    );
+                                    return;
+                                }
+                            }
+
                             // Intercept on-demand store-minted pairing codes
                             // (`/bind`/`/claim`) BEFORE the allowlist gate so an
                             // unknown number can self-onboard without a restart.
@@ -1130,11 +1270,28 @@ impl Channel for WhatsAppWebChannel {
 
                             if is_allowed {
                                 let trimmed = text.trim();
+                                // The bot's own @-mention token rides in the
+                                // text WhatsApp delivers; strip it (other
+                                // members' mentions stay) so the model is not
+                                // asked about a bare string of digits. Group
+                                // only — DMs are unchanged. Stripping runs
+                                // before the content check, so a bare mention
+                                // with no other text is not forwarded as an
+                                // empty prompt.
+                                let trimmed = if info.source.is_group {
+                                    Self::strip_own_mention_tokens(
+                                        trimmed,
+                                        own_pn.as_deref(),
+                                        own_lid.as_deref(),
+                                    )
+                                } else {
+                                    trimmed.to_string()
+                                };
                                 // An image sent with no caption has empty text
                                 // and is still a message. Keying "is there
                                 // anything here" on text alone dropped it.
                                 let image = msg.image_message.as_deref();
-                                if !Self::has_deliverable_content(trimmed, image.is_some()) {
+                                if !Self::has_deliverable_content(&trimmed, image.is_some()) {
                                     tracing::debug!(
                                         "WhatsApp Web: ignoring empty or non-text message from {}",
                                         normalized
@@ -1146,7 +1303,7 @@ impl Channel for WhatsAppWebChannel {
                                 // shared policy. `client.download` is the whole
                                 // of the wa-rs side: `ImageMessage` already
                                 // implements `Downloadable`.
-                                let mut content = trimmed.to_string();
+                                let mut content = trimmed;
                                 if let Some(img) = image {
                                     let claimed = img.mimetype.clone();
                                     let marker = match client.download(img).await {
@@ -3475,5 +3632,340 @@ mod tests {
         ));
         let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
         assert_eq!(as_the_runtime_holds_it.bot_username().await, None);
+    }
+
+    /// `bot_username` keeps reporting the phone number after the LID cache is
+    /// filled too. The LID is an addressing identity for the group gate, not
+    /// a replacement for the bot handle.
+    #[tokio::test]
+    async fn whatsapp_web_bot_username_stays_the_phone_number_when_a_lid_is_cached() {
+        let ch = std::sync::Arc::new(WhatsAppWebChannel::new(
+            "/tmp/wa-test.db".into(),
+            None,
+            None,
+            vec![],
+        ));
+        ch.set_bot_identity_for_test(Some(OWN_PN.to_string()));
+        ch.set_bot_lid_for_test(Some(OWN_LID.to_string()));
+
+        let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
+        assert_eq!(
+            as_the_runtime_holds_it.bot_username().await.as_deref(),
+            Some(OWN_PN),
+            "the LID must not displace the phone number as the bot handle"
+        );
+    }
+
+    // ── group addressing gate ──────────────────────────────────────
+
+    /// Neutral identities for the fixtures: the linked account's phone-number
+    /// user part, its LID user part, and a group member who is nobody here.
+    const OWN_PN: &str = "6280000000000";
+    const OWN_LID: &str = "123456745678000";
+    const OTHER_PN: &str = "6281111111111";
+
+    /// An extended-text message carrying the given `mentioned_jid` entries,
+    /// the form WhatsApp actually delivers an @-mention in.
+    fn mention_message(mentioned_jids: &[&str]) -> wa_rs_proto::whatsapp::Message {
+        wa_rs_proto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("halo".into()),
+                    context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                        mentioned_jid: mentioned_jids.iter().map(|j| j.to_string()).collect(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// An extended-text message quoting another message, the form a reply
+    /// arrives in. `participant` names the quoted message's sender.
+    fn reply_message(participant: &str, quoted: bool) -> wa_rs_proto::whatsapp::Message {
+        wa_rs_proto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("membalas".into()),
+                    context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                        participant: Some(participant.to_string()),
+                        quoted_message: quoted.then(|| {
+                            Box::new(wa_rs_proto::whatsapp::Message {
+                                conversation: Some("pesan bot".into()),
+                                ..Default::default()
+                            })
+                        }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_group_mention_by_phone_number_is_addressed() {
+        let msg = mention_message(&["6280000000000@s.whatsapp.net"]);
+        assert!(WhatsAppWebChannel::group_message_addressed(
+            &msg,
+            Some(OWN_PN),
+            None
+        ));
+    }
+
+    /// Groups are often LID-addressed, so the LID must count as an own
+    /// identity too: a mention that only names the LID is addressed.
+    #[test]
+    fn a_group_mention_by_lid_is_addressed() {
+        let msg = mention_message(&["123456745678000@lid"]);
+        assert!(WhatsAppWebChannel::group_message_addressed(
+            &msg,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    /// An @-mention can ride on an image caption; its `ContextInfo` sits on
+    /// the image variant, and the gate must read it there.
+    #[test]
+    fn a_group_mention_on_an_image_is_addressed() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            image_message: Some(Box::new(wa_rs_proto::whatsapp::message::ImageMessage {
+                mimetype: Some("image/jpeg".into()),
+                caption: Some("lihat ini".into()),
+                context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                    mentioned_jid: vec!["6280000000000@s.whatsapp.net".to_string()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(WhatsAppWebChannel::group_message_addressed(
+            &msg,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    /// A reply to a bot message quotes it with `participant` naming the bot.
+    /// The participant may be the phone-number JID or, in a LID group, the
+    /// LID.
+    #[test]
+    fn a_group_reply_to_a_bot_message_is_addressed() {
+        let by_pn = reply_message(&format!("{OWN_PN}@s.whatsapp.net"), true);
+        assert!(WhatsAppWebChannel::group_message_addressed(
+            &by_pn,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+        let by_lid = reply_message(&format!("{OWN_LID}@lid"), true);
+        assert!(WhatsAppWebChannel::group_message_addressed(
+            &by_lid,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    #[test]
+    fn a_group_mention_of_someone_else_only_is_not_addressed() {
+        let msg = mention_message(&["6281111111111@s.whatsapp.net"]);
+        assert!(!WhatsAppWebChannel::group_message_addressed(
+            &msg,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    #[test]
+    fn a_group_reply_to_someone_else_is_not_addressed() {
+        let msg = reply_message(&format!("{OTHER_PN}@s.whatsapp.net"), true);
+        assert!(!WhatsAppWebChannel::group_message_addressed(
+            &msg,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    /// `participant` alone is not enough: without a quoted message it is not
+    /// a reply, and a bare participant naming the bot must not answer.
+    #[test]
+    fn a_participant_without_a_quoted_message_is_not_a_reply_to_the_bot() {
+        let msg = reply_message(&format!("{OWN_PN}@s.whatsapp.net"), false);
+        assert!(!WhatsAppWebChannel::group_message_addressed(
+            &msg,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    /// A plain `conversation` text carries no `ContextInfo` anywhere, and an
+    /// extended text (a link preview, say) may carry none either. Neither is
+    /// addressed.
+    #[test]
+    fn a_group_message_with_no_context_is_not_addressed() {
+        let plain = wa_rs_proto::whatsapp::Message {
+            conversation: Some("siapa tahu di sini ada yang jawab".into()),
+            ..Default::default()
+        };
+        assert!(!WhatsAppWebChannel::group_message_addressed(
+            &plain,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+        let extended = wa_rs_proto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("tanpa context_info".into()),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(!WhatsAppWebChannel::group_message_addressed(
+            &extended,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    /// With neither own identity known, nothing may count as addressed — the
+    /// alternative is answering everything in the group.
+    #[test]
+    fn a_group_message_with_no_known_own_identity_is_not_addressed() {
+        let msg = mention_message(&["6281111111111@s.whatsapp.net"]);
+        assert!(!WhatsAppWebChannel::group_message_addressed(
+            &msg, None, None
+        ));
+        let self_named = mention_message(&["6280000000000@s.whatsapp.net"]);
+        assert!(!WhatsAppWebChannel::group_message_addressed(
+            &self_named,
+            None,
+            None
+        ));
+    }
+
+    /// The bot's own `@<number>` and `@<lid>` tokens come out of the text;
+    /// other members' mention tokens survive.
+    #[test]
+    fn stripping_removes_own_mention_tokens_and_keeps_other_mentions() {
+        assert_eq!(
+            WhatsAppWebChannel::strip_own_mention_tokens(
+                "@6280000000000 halo @6281111111111",
+                Some(OWN_PN),
+                Some(OWN_LID)
+            ),
+            "halo @6281111111111"
+        );
+    }
+
+    #[test]
+    fn stripping_removes_the_lid_token_too() {
+        assert_eq!(
+            WhatsAppWebChannel::strip_own_mention_tokens(
+                "@123456745678000 halo",
+                Some(OWN_PN),
+                Some(OWN_LID)
+            ),
+            "halo"
+        );
+    }
+
+    /// Text that carries no own token must come back untouched — in
+    /// particular no whitespace is normalized.
+    #[test]
+    fn text_without_own_mention_tokens_is_left_byte_identical() {
+        let text = "halo  dua   spasi";
+        assert_eq!(
+            WhatsAppWebChannel::strip_own_mention_tokens(text, Some(OWN_PN), Some(OWN_LID)),
+            text
+        );
+    }
+
+    /// The gate must run BEFORE pairing interception and BEFORE the allowlist:
+    /// an unaddressed group message from a non-allowlisted sender is dropped
+    /// silently and must not produce a rejected-sender WARN. The wa-rs event
+    /// loop cannot run in a unit test, so the order is pinned by source, the
+    /// way the other handler wiring here is pinned.
+    #[test]
+    fn the_group_gate_runs_before_pairing_interception_and_the_allowlist() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let handler = production
+            .split("Event::Message(msg, info)")
+            .nth(1)
+            .expect("the message arm exists");
+
+        let gate = handler
+            .find("if info.source.is_group {")
+            .expect("the gate must be guarded by is_group, so a DM is never gated");
+        let pairing = handler
+            .find("Self::try_reply_pairing(")
+            .expect("pairing interception exists");
+        let allowlist = handler
+            .find("Self::allow_inbound(")
+            .expect("the allowlist gate exists");
+        assert!(
+            gate < pairing,
+            "the group gate must run before pairing interception"
+        );
+        assert!(
+            gate < allowlist,
+            "the group gate must run before the allowlist, so an unaddressed \
+             group message from a non-allowlisted sender never reaches the \
+             rejected-sender warning"
+        );
+
+        let gate_block = &handler[gate..pairing];
+        assert!(
+            gate_block.contains("group messages are ignored until")
+                && gate_block.contains("the linked account's identity is known"),
+            "with no known own identity the operator must be told why the group went quiet"
+        );
+        assert!(
+            gate_block.contains("Self::group_message_addressed("),
+            "the gate must ask the pure function"
+        );
+        assert!(
+            gate_block.contains("ignoring an unaddressed group message"),
+            "an unaddressed group message is logged, at debug only"
+        );
+        assert!(
+            !gate_block.contains("tracing::warn!(\"WhatsApp Web: ignoring")
+                && !gate_block.contains("{normalized}")
+                && !gate_block.contains("{sender}"),
+            "the unaddressed drop must carry no identifier at warn level"
+        );
+        assert!(
+            handler.contains("Self::strip_own_mention_tokens("),
+            "the handler must strip the bot's own mention tokens from the text"
+        );
+    }
+
+    /// `refresh_bot_identity` fills the LID cache alongside the phone-number
+    /// cache; a live client is needed to drive it, so the wiring is pinned by
+    /// source.
+    #[test]
+    fn refresh_bot_identity_caches_the_lid_alongside_the_phone_number() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let body = production
+            .split("async fn refresh_bot_identity(")
+            .nth(1)
+            .expect("refresh_bot_identity exists")
+            .split("fn set_bot_identity_for_test")
+            .next()
+            .expect("the body ends at the test helper");
+        assert!(
+            body.contains("get_pn()"),
+            "the phone-number cache must stay filled"
+        );
+        assert!(
+            body.contains("get_lid()"),
+            "the LID cache must be filled from the same client"
+        );
     }
 }
