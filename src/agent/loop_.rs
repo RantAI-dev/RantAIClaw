@@ -2406,6 +2406,13 @@ pub async fn run_with_scope(
     // which spawns its own and drops them with the registry — correct there, and
     // the spawn-per-request mistake if a long-lived caller ever passes `None`.
     mcp: Option<Arc<crate::mcp::discover::McpPoolHandle>>,
+    // Suppress every stdout print of reply or model text. The CLI single-shot
+    // path passes `false` (it is meant to be pipeable into another program).
+    // Unattended callers — cron jobs and the daemon heartbeat — pass `true`
+    // because daemon stdout is the systemd journal, and a reminder or
+    // heartbeat reply is private to the operator; it must travel through the
+    // delivery path and the run record, never through `println!`.
+    silent: bool,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let observer: Arc<dyn Observer> = observer
@@ -2770,7 +2777,7 @@ pub async fn run_with_scope(
             provider_name,
             model_name,
             temperature,
-            false,
+            silent,
             Some(&approval_manager),
             surface,
             None, // no origin chat on the CLI/scheduler surface
@@ -2799,7 +2806,14 @@ pub async fn run_with_scope(
             let _ = store.end_session(id);
         }
 
-        println!("{response}");
+        // The daemon's stdout is the systemd journal, so the
+        // single-shot path's `println!` would write every cron / heartbeat
+        // reply verbatim into a journal an operator greps for diagnostics.
+        // `silent=true` callers consume the reply through the Ok return value
+        // (delivery + run record) and must not print it here.
+        if !silent {
+            println!("{response}");
+        }
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         // Brand splash — banner + logo + provider/model summary. Skip when
@@ -2928,7 +2942,7 @@ pub async fn run_with_scope(
                 provider_name,
                 model_name,
                 temperature,
-                false,
+                silent,
                 Some(&approval_manager),
                 "cli",
                 None, // CLI — no origin chat
@@ -2995,6 +3009,7 @@ pub async fn run_with_scope(
 /// Back-compat entry point: run with no conversation scope (global memory),
 /// exactly as before scoping was threaded through. The CLI/daemon callers have
 /// no conversation identity; only cron passes one (via `run_with_scope`).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
     message: Option<String>,
@@ -3003,6 +3018,10 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     surface: &str,
+    // See `run_with_scope`: `true` suppresses every stdout print of reply or
+    // model text. Pass `false` from a CLI single-shot (pipeable); pass `true`
+    // from any unattended caller whose stdout is the systemd journal.
+    silent: bool,
 ) -> Result<String> {
     run_with_scope(
         config,
@@ -3017,6 +3036,7 @@ pub async fn run(
         // A one-shot CLI run owns its process, so it spawns its own servers and
         // drops them with the registry.
         None,
+        silent,
     )
     .await
 }
@@ -4260,6 +4280,101 @@ mod tests {
                 "a refusal at byte {at} pushes a result without auditing it"
             );
         }
+    }
+
+    /// The single-shot branch of `run_with_scope` must print the
+    /// final reply through `println!("{response}")` only when the caller
+    /// passed `silent: false`. Under systemd the daemon's stdout is the
+    /// journal, and the cron scheduler and the heartbeat pass `silent: true`
+    /// so their replies reach the operator through delivery + run record,
+    /// not through `println!`.
+    ///
+    /// Why this is source-pinned rather than a stdout-capture test:
+    ///   * Every existing agent-job test that reaches `run_with_scope` ends
+    ///     on an error path (config load, provider init, approval surface)
+    ///     that returns before the `println!` is reached. Capturing stdout
+    ///     from such a test would be vacuous.
+    ///   * The silence choice is an explicit caller decision: the CLI
+    ///     passes `false`, the scheduler and heartbeat pass `true`. There
+    ///     is no observable behaviour to assert at a runtime seam without
+    ///     a live provider, network, and timer.
+    ///   * The log-scan guard (`channels::tests::no_log_or_print_call_...`)
+    ///     matches only the macro call text, not the enclosing `if`. It
+    ///     can pin the *presence* of `println!("{response}")` (catches a
+    ///     new caller adding one) but it cannot see control flow, so it
+    ///     cannot tell that the existing call is gated.
+    ///
+    /// Precedent accepted in the 2026-09-23 review: Slack's
+    /// `polling_seeds_last_ts_before_the_loop_...` test in
+    /// `channels/slack.rs:1699-1755` and `channels/fault.rs:107-112` — the
+    /// same shape (read own source, scan for an irreducible token sequence,
+    /// fail on removal).
+    ///
+    /// Mutation: delete the `if !silent {` and the matching `}` around the
+    /// `println!("{response}")` so the call is unconditional again — the
+    /// preceding-window check below fails on the missing `if !silent` text.
+    #[test]
+    fn single_shot_reply_print_stays_gated_by_silent() {
+        let src = include_str!("loop_.rs");
+        // Assemble the marker at runtime so it cannot match its own definition.
+        let test_module = format!("\n#[cfg({})]\nmod tests {{", "test");
+        // Sliced so the test module — which now contains this very test,
+        // and therefore the substring `if !silent` — does not get scanned.
+        let (runtime, _) = src
+            .split_once(test_module.as_str())
+            .expect("the test module marker is still in loop_.rs; update this guard");
+
+        // Assemble the call text at runtime so the count assertion does not
+        // match the literal embedded in this test's docstring / comment.
+        // `{{` and `}}` escape literal braces so the format produces
+        // `println!("{response}")` — the exact token sequence used in
+        // production (the `{response}` is the capture-name syntax the
+        // `println!` macro understands).
+        let call = format!("println!(\"{{{}}}\")", "response");
+        let sites: Vec<usize> = runtime.match_indices(&call).map(|(i, _)| i).collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "expected exactly one `println!(\"{{response}}\")` in the production \
+             code of loop_.rs (the single-shot reply print); found {}. A second \
+             call would be an unclassified stdout write — add it to the log-scan \
+             guard's allowlist and document the new caller.",
+            sites.len()
+        );
+
+        let at = sites[0];
+        // 200 bytes is enough to cover any rustfmt reshuffle of the
+        // preceding comment and blank lines, but small enough that the
+        // gate text stays inside it: the comment block above the call is
+        // five lines of indentation + prose, far under 200 bytes, and the
+        // `if !silent {` is the line immediately before the call.
+        let window_start = at.saturating_sub(200);
+        let window = &runtime[window_start..at];
+        assert!(
+            window.contains("if !silent"),
+            "the single-shot `println!(\"{{response}}\")` at byte {at} is not \
+             preceded by an `if !silent` gate; restoring the unconditional \
+             println would write every cron / heartbeat reply to the daemon's \
+             journal verbatim (preceding 200 bytes: {window:?})"
+        );
+
+        // The gate must actually wrap the call: an `else if !silent` would
+        // still contain the text but would not be the intended guard.
+        // A real if-gate ends with `}` after the call. The next non-blank
+        // token after the `;` terminator is therefore `}`.
+        let after = &runtime[at + call.len()..];
+        // Skip the `;` that ends the call statement, then trim whitespace,
+        // then verify the next character is the closing brace of the if-block.
+        let after_semi = after.strip_prefix(';').unwrap_or(after);
+        let after_trim = after_semi.trim_start();
+        assert!(
+            after_trim.starts_with('}'),
+            "the single-shot `println!(\"{{response}}\")` is not the body of \
+             an `if` block: the first non-blank token after the call is {:?}, \
+             not `}}` (the if-gate's closing brace). The `if !silent` guard \
+             must wrap this call directly.",
+            after_trim.chars().take(8).collect::<String>()
+        );
     }
 
     #[tokio::test]

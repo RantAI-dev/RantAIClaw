@@ -461,6 +461,10 @@ async fn run_agent_job(
         memory_scope,
         observer.cloned(),
         mcp.cloned(),
+        // The scheduler runs under the daemon, where stdout is the journal;
+        // the reply reaches the operator through the delivery path and the run
+        // record, never through `println!`.
+        true,
     ))
     .await;
 

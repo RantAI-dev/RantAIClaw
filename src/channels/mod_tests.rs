@@ -452,10 +452,28 @@ fn no_log_or_print_call_carries_message_or_reply_text() {
             "WhatsApp send failed:",
             "the Cloud API's HTTP error body",
         ),
+        // The cron scheduler's reply reaches stdout through this file's
+        // single-shot `println!`. Without this entry, scheduled jobs' replies are
+        // written to the daemon's journal verbatim.
+        (
+            "agent/loop_.rs",
+            "println!(\"{response}\")",
+            "the agent reply; the single-shot branch gates the call with `if !silent`, \
+             so a `silent=true` caller (cron / heartbeat) does not write it to stdout",
+        ),
+        (
+            "agent/loop_.rs",
+            "print!(\"{display_text}\")",
+            "text the model produced alongside tool calls; the surrounding guard already \
+             requires `!silent`, so the scheduler and the heartbeat stay quiet too",
+        ),
     ];
 
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = vec![src_root.join("gateway").join("mod.rs")];
+    let mut files = vec![
+        src_root.join("gateway").join("mod.rs"),
+        src_root.join("agent").join("loop_.rs"),
+    ];
     let mut dirs = vec![src_root.join("channels")];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).expect("read a source directory") {
