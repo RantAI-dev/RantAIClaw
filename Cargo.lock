@@ -5815,6 +5815,7 @@ dependencies = [
  "insta",
  "lettre",
  "libc",
+ "log",
  "lopdf",
  "mail-parser",
  "matrix-sdk",

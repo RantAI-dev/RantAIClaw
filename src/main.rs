@@ -38,7 +38,7 @@ use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::fmt;
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -1573,7 +1573,12 @@ async fn main() -> Result<()> {
     // warn/error during render (the v0.6.x "log spam in wizard footer" bug).
     // Override with `RANTAICLAW_LOG_STDERR=1` for piped/CI runs that want
     // human-readable logs on stderr regardless of TTY detection.
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    //
+    // `install_log_bridge` first so any `log`-facade records (wa-rs,
+    // reqwest, rustls, etc.) forward into the same tracing subscriber the
+    // `tracing::*!` macros emit through. Idempotent — second call is a no-op.
+    rantaiclaw::logging::install_log_bridge();
+    let env_filter = rantaiclaw::logging::default_env_filter();
     let force_stderr = std::env::var_os("RANTAICLAW_LOG_STDERR").is_some();
     let stdout_is_tty = std::io::stdout().is_terminal();
 
