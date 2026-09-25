@@ -1125,8 +1125,10 @@ never probed, because the only real check opens a live socket and `doctor` owns 
   alone.
 - **POST response** `200`: `{ "connected": true, "channel": "slack", "bot_username": null,
   "allowed_users": 2, "warning": "...", "restarts_runtime": false, "note": "..." }`
-- **`warning`**: set when Socket Mode is on and `channel_id` is also set, because the bot then ignores
-  direct messages and every conversation except that one.
+- **`warning`**: set when Socket Mode is on and `channel_id` is also set; the bot then ignores
+  every channel except that one, while direct messages still reach it. Clear `channel_id` to
+  accept every channel. (The helper that produces this string is `socket_mode_channel_filter_caveat`
+  in `src/gateway/config_api.rs`.)
 - **DELETE response** `200`: `{ "disconnected": true, "channel": "slack", "restarts_runtime": true }`
 - **Restarts**: a changed bot token, app token or `channel_id` restarts the runtime; an allowlist-only
   edit does not.

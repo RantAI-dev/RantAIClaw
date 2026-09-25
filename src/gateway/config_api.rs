@@ -1224,19 +1224,21 @@ fn is_valid_slack_app_token(token: &str) -> bool {
 }
 
 /// The caveat F-3 recorded on 2026-09-11: under Socket Mode, a `channel_id`
-/// filter drops direct messages, because a DM does not arrive on that channel.
+/// filter scopes incoming traffic to that channel. Direct messages still
+/// arrive through the Socket Mode event stream and bypass the channel filter,
+/// so this caveat only mentions the channel scoping, not DM dropping.
 ///
 /// Only when both are set. With no app token there is no Socket Mode, and with
-/// no channel filter nothing is dropped.
-fn socket_mode_dm_caveat(
+/// no channel filter nothing is scoped.
+fn socket_mode_channel_filter_caveat(
     app_token: Option<&str>,
     channel_id: Option<&str>,
 ) -> Option<&'static str> {
     let filtering = channel_id.is_some_and(|c| !c.trim().is_empty());
     let socket_mode = app_token.is_some_and(|t| !t.trim().is_empty());
     (socket_mode && filtering).then_some(
-        "Socket Mode is on and channel_id is set: the bot will ignore direct messages and every \
-         conversation except that one. Clear channel_id to accept all of them.",
+        "Socket Mode is on and channel_id is set: the bot ignores every channel except that one. \
+         Direct messages still reach it. Clear channel_id to accept every channel.",
     )
 }
 
@@ -1482,9 +1484,10 @@ async fn connect_slack(
         schedule_daemon_reload();
     }
 
-    // The DM caveat outranks the allowlist warning: it describes messages the
-    // operator will never see, which is the more surprising of the two.
-    let caveat = socket_mode_dm_caveat(
+    // The channel-filter caveat outranks the allowlist warning: it describes
+    // channels whose messages the operator will never see, which is the more
+    // surprising of the two.
+    let caveat = socket_mode_channel_filter_caveat(
         effective_app_token.as_deref(),
         effective_channel_id.as_deref(),
     )
@@ -3175,19 +3178,33 @@ mod tests {
     }
 
     /// F-3 from the 2026-09-11 drive: under Socket Mode a `channel_id` filter
-    /// drops direct messages. Only when both are set, and in the field the
-    /// console already reads for Telegram.
+    /// scopes incoming traffic to that channel. Only when both are set, and in
+    /// the field the console already reads for Telegram. The caveat must say
+    /// direct messages still arrive — the runtime filter does not drop them.
     #[test]
-    fn the_socket_mode_dm_caveat_appears_only_with_both_fields() {
-        assert!(socket_mode_dm_caveat(Some("xapp-1-A"), Some("C1")).is_some());
-        assert!(socket_mode_dm_caveat(Some("xapp-1-A"), None).is_none());
-        assert!(socket_mode_dm_caveat(None, Some("C1")).is_none());
-        assert!(socket_mode_dm_caveat(None, None).is_none());
+    fn the_socket_mode_channel_filter_caveat_appears_only_with_both_fields() {
+        assert!(socket_mode_channel_filter_caveat(Some("xapp-1-A"), Some("C1")).is_some());
+        assert!(socket_mode_channel_filter_caveat(Some("xapp-1-A"), None).is_none());
+        assert!(socket_mode_channel_filter_caveat(None, Some("C1")).is_none());
+        assert!(socket_mode_channel_filter_caveat(None, None).is_none());
 
-        let caveat = socket_mode_dm_caveat(Some("xapp-1-A"), Some("C1")).expect("a caveat");
+        let caveat =
+            socket_mode_channel_filter_caveat(Some("xapp-1-A"), Some("C1")).expect("a caveat");
         assert!(
-            caveat.to_lowercase().contains("direct message"),
-            "the caveat must name what is dropped: {caveat}"
+            caveat.starts_with("Socket Mode is on and channel_id is set:"),
+            "the caveat must start with the literal prefix: {caveat}"
+        );
+        assert!(
+            caveat.contains("ignores every channel except that one"),
+            "the caveat must name what other channels are ignored: {caveat}"
+        );
+        assert!(
+            caveat.contains("Direct messages still reach it"),
+            "the caveat must say DMs still arrive: {caveat}"
+        );
+        assert!(
+            !caveat.to_lowercase().contains("ignore direct messages"),
+            "the caveat must not claim DMs are dropped: {caveat}"
         );
     }
 
