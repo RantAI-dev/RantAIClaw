@@ -264,11 +264,11 @@ impl ProviderCapabilityError {
     pub fn user_facing_message(&self, prefix: &str) -> String {
         match self.capability.as_str() {
             "vision" => format!(
-                "The current model ({}) cannot read images. Send `{}model <id>` to switch to a vision-capable model.",
+                "The current provider ({}) cannot read images. Send `{}model <id>` to switch to a vision-capable model.",
                 self.provider, prefix,
             ),
             other => format!(
-                "The current model ({}) does not support {}. Send `{}model <id>` to switch.",
+                "The current provider ({}) does not support {}. Send `{}model <id>` to switch.",
                 self.provider, other, prefix,
             ),
         }

@@ -177,6 +177,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The vision sentence names the provider, and the user turn is paired.** The capability branch in
+  `src/channels/dispatch.rs` shipped the user-facing sentence and returned without pairing the user
+  turn appended at the start of the turn, so a vision refusal left the conversation holding an
+  unpaired user turn and the next message landed as a second consecutive user turn. The branch now
+  appends `FAILED_TURN_MARKER` the same way the generic error path does, so the next question is not
+  merged onto the failed one. `ProviderCapabilityError::user_facing_message` also swapped "the current
+  model" for "the current provider" — the field carries the provider key, not a model id, and
+  threading a model id through would have widened the struct's surface for a value that is at most
+  one display hop away.
+- **The vision-capability error is a sentence, not a cut-off code.** The previous reply used the
+  generic `⚠️ Error: provider_capability_error provider=… capability=… message=…` format and
+  `sanitize_api_error` truncated it at `MAX_API_ERROR_CHARS` (200), so the user saw the prefix and
+  the only useful clause ("switch to a vision-capable model") was cut off; observed on Lark with
+  MiniMax-M2.5. `ProviderCapabilityError::user_facing_message` now builds a one-sentence reply
+  naming the channel's command prefix and `/model <id>` for the switch, with a vision-specific
+  branch and a generic fallback for other capabilities. `src/channels/dispatch.rs` walks
+  `err.chain()` for the typed error and routes it through the same draft/send path the other
+  failure branches use; the full structured error stays in a `tracing::warn!` record.
+- **Plain-text channels keep a single line break.** The plain renderer in
+  `src/channels/format/plain.rs` pushed a single space for both inline soft breaks and hard breaks,
+  so a two-line reply rendered through `RenderTarget::Plain` arrived as one joined line; observed
+  on Lark with `/model`'s "Current provider: … Current model: …". The renderer now emits `\n` for
+  both break kinds, scoped to inline soft/hard breaks — surrounding renderers for tables, lists, and
+  block quotes do not flow through `inline_text`. The light renderer already did this; plain was
+  the divergent sibling.
 - **The strict delta gate measures each file's changed lines in one coordinate system.** The
   classifier previously concatenated `git diff BASE..HEAD` ranges (HEAD line numbers) with
   `git diff HEAD` ranges (working-tree line numbers) on the same file, so an uncommitted prepend
