@@ -102,32 +102,30 @@ def has_working_tree_changes(path: str) -> bool:
 
 
 for path in files:
-    # Ranges from the committed side (BASE_SHA..HEAD) and from the
-    # working tree (HEAD vs filesystem) share the same coordinate
-    # system: both are line numbers in HEAD. The classifier only
-    # checks whether a warning's span overlaps any range, so a plain
-    # concatenation is enough — no merging needed beyond that. This
-    # is the gate's Option A and keeps a pre-existing warning on an
-    # untouched line in a dirty file out of the blocking set.
-    proc = subprocess.run(
-        ["git", "diff", "--unified=0", base, "HEAD", "--", path],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    committed_ranges = parse_ranges(proc.stdout)
-
-    working_tree_ranges = []
+    # Clippy reports line numbers in the file it actually reads — the
+    # working tree. For a file with uncommitted edits, take ranges from
+    # one diff of BASE against the working tree (`git diff --unified=0
+    # "$base" --`), which covers both the committed changes and the
+    # uncommitted edits in working-tree numbering, so the committed lines
+    # clippy flags land inside the ranges. Files without working-tree
+    # changes keep the BASE..HEAD diff: same unified-diff schema, so
+    # parse_ranges works unchanged either way.
     if has_working_tree_changes(path):
         proc = subprocess.run(
-            ["git", "diff", "--unified=0", "HEAD", "--", path],
+            ["git", "diff", "--unified=0", base, "--", path],
             check=False,
             capture_output=True,
             text=True,
         )
-        working_tree_ranges = parse_ranges(proc.stdout)
+    else:
+        proc = subprocess.run(
+            ["git", "diff", "--unified=0", base, "HEAD", "--", path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
-    changed[path] = committed_ranges + working_tree_ranges
+    changed[path] = parse_ranges(proc.stdout)
 
 print(json.dumps(changed))
 PY

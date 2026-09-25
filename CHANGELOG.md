@@ -177,6 +177,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The strict delta gate measures each file's changed lines in one coordinate system.** The
+  classifier previously concatenated `git diff BASE..HEAD` ranges (HEAD line numbers) with
+  `git diff HEAD` ranges (working-tree line numbers) on the same file, so an uncommitted prepend
+  above a committed warning could shift the warning out of every range and miss it as a new
+  warning. Dirty files now take ranges from one `git diff --unified=0 BASE --` (committed plus
+  uncommitted, all in working-tree numbering — what `cargo clippy` actually reports), so the
+  shifted warning lands inside the range. Clean files keep the `BASE..HEAD` diff; it is the same
+  unified-diff schema, so `parse_ranges` works unchanged either way. CI is unaffected (its tree
+  is clean); the local gate the executor runs before committing is.
 - **First-run wizard dims locked channels under "Under development" heading.** The wizard's channel
   step used to render every channel provisioner as a selectable row, with no visual separation
   between the six usable and the eleven under-development channels; the runtime refused locked
