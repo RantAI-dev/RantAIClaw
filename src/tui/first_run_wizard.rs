@@ -869,20 +869,15 @@ impl FirstRunWizard {
             .position(|i| p.disabled.get(i).copied().unwrap_or(false))
             .unwrap_or(p.options.len());
         for (i, opt) in p.options.iter().enumerate() {
-            // Section heading at the seam. The literal lives here too so
-            // any future heading variant on `ActiveChoose` renders
-            // without a second branch.
-            if heading.is_some() && i == usable_count {
-                option_lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default()),
-                    Span::styled(
-                        "Under development",
-                        Style::default()
-                            .fg(muted)
-                            .add_modifier(Modifier::ITALIC | Modifier::BOLD),
-                    ),
-                ]));
-                option_lines.push(Line::from(""));
+            // Section heading at the seam.
+            if let Some(heading_text) = heading {
+                if i == usable_count {
+                    option_lines.push(Line::from(""));
+                    option_lines.push(Line::from(vec![Span::styled(
+                        format!("       {heading_text}"),
+                        Style::default().fg(muted).add_modifier(Modifier::BOLD),
+                    )]));
+                }
             }
             let is_disabled = p.disabled.get(i).copied().unwrap_or(false);
             // Cursor arrow is suppressed on a disabled row even if the
@@ -919,11 +914,18 @@ impl FirstRunWizard {
                 Style::default().fg(muted)
             };
 
-            option_lines.push(Line::from(vec![
-                Span::styled(format!(" {arrow}  "), arrow_style),
-                Span::styled(format!("{marker}  "), marker_style),
-                Span::styled(opt.clone(), label_style),
-            ]));
+            if is_disabled {
+                option_lines.push(Line::from(vec![
+                    Span::styled("       ", Style::default()),
+                    Span::styled(opt.clone(), label_style),
+                ]));
+            } else {
+                option_lines.push(Line::from(vec![
+                    Span::styled(format!(" {arrow}  "), arrow_style),
+                    Span::styled(format!("{marker}  "), marker_style),
+                    Span::styled(opt.clone(), label_style),
+                ]));
+            }
         }
         if p.selected.is_empty() {
             option_lines.push(Line::from(""));
@@ -1747,6 +1749,133 @@ mod tests {
         assert!(
             !label_row.contains('▸'),
             "cursor arrow must be suppressed on a disabled row; row was: {label_row:?}"
+        );
+    }
+
+    /// The wizard's channel picker renders the `Under development` heading
+    /// as a real section title between usable and locked rows, matching the
+    /// `/setup channels` rhythm: a blank line above the heading, the first
+    /// locked row immediately below it, the heading itself bold-but-not-
+    /// italic muted text, and its label starting in the same column as a
+    /// usable row's label. Locked rows must render without the empty
+    /// arrow + marker prefix that previously left a uniform 7-wide blank
+    /// gap on the left of the label.
+    #[test]
+    fn render_picker_heading_lined_up_with_locked_rows_at_usable_text_column() {
+        let mut w = wizard_with_options_disabled(8, Some("Under development".into()), {
+            let mut v = vec![false; 4];
+            v.extend(vec![true; 4]);
+            v
+        });
+
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+        // 80x30 keeps the full-screen layout (>= 64x16) and grows the
+        // option-list viewport enough that all 10 option lines (8 rows +
+        // heading + blank above heading) render without scroll, so the
+        // assertions can locate the heading and the first locked row in
+        // the same frame.
+        let (width, height) = (80u16, 30u16);
+        let mut term =
+            Terminal::new(TestBackend::new(width, height)).expect("TestBackend allocation");
+        term.draw(|f| w.render_fullscreen(f, Rect::new(0, 0, width, height)))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let heading_y = rows
+            .iter()
+            .position(|r| r.contains("Under development"))
+            .expect("pane must contain the heading text");
+        let usable_label_y = rows
+            .iter()
+            .position(|r| r.contains("Channel 0"))
+            .expect("pane must contain the first usable row label 'Channel 0'");
+        let locked_label_y = rows
+            .iter()
+            .position(|r| r.contains("Channel 4"))
+            .expect("pane must contain the first locked row label 'Channel 4'");
+
+        let row_u16 = |y: usize| -> u16 { u16::try_from(y).expect("row within u16") };
+        let first_col_with_char = |y: usize, ch: char| -> u16 {
+            let x = (0..width)
+                .position(|x| buf[(x, row_u16(y))].symbol() == ch.to_string())
+                .unwrap_or_else(|| panic!("char {ch:?} not found on row {y}"));
+            u16::try_from(x).expect("column within u16")
+        };
+        let heading_text_x = first_col_with_char(heading_y, 'U');
+        let usable_text_x = first_col_with_char(usable_label_y, 'C');
+        let locked_text_x = first_col_with_char(locked_label_y, 'C');
+
+        assert!(
+            heading_y > 0,
+            "heading row must not be the first row of the pane"
+        );
+        // The rail runs vertically along the left of the pane, so the raw
+        // buffer row above the heading is not fully blank — the rail's
+        // connector glyph sits at the heading column band. The blank the
+        // render pushed lives inside the option-list chunk, so check the
+        // cell at the heading's own text column on the row above; that
+        // column belongs to the option list, not the rail.
+        let above_cell = &buf[(heading_text_x, row_u16(heading_y) - 1)];
+        assert!(
+            above_cell.symbol() == " " || above_cell.symbol().is_empty(),
+            "cell directly above the heading at col {heading_text_x} must be blank \
+             (the blank line the renderer pushed above the heading); got {:?}",
+            above_cell.symbol()
+        );
+        let below_cell = &buf[(heading_text_x, row_u16(heading_y) + 1)];
+        assert_eq!(
+            below_cell.symbol(),
+            "C",
+            "first cell below the heading at col {heading_text_x} must be the \
+             first locked row's label ('Channel 4' starts with 'C'); got {:?}",
+            below_cell.symbol()
+        );
+        assert_eq!(
+            heading_y + 1,
+            locked_label_y,
+            "first locked row must sit immediately below the heading with no \
+             blank row between; heading at row {heading_y}, locked at row {locked_label_y}"
+        );
+
+        let heading_cell = &buf[(heading_text_x, row_u16(heading_y))];
+        assert!(
+            !heading_cell.style().add_modifier.contains(Modifier::ITALIC),
+            "heading cell must not carry Modifier::ITALIC; got style {:?}",
+            heading_cell.style()
+        );
+
+        assert_eq!(
+            usable_text_x, heading_text_x,
+            "usable row text column must equal heading text column \
+             (both line up in the same column); usable={usable_text_x}, heading={heading_text_x}"
+        );
+
+        assert_eq!(
+            locked_text_x, heading_text_x,
+            "locked row text column must equal heading text column \
+             (no empty arrow + marker gap that shifts the label right); \
+             locked={locked_text_x}, heading={heading_text_x}"
+        );
+
+        let marker_x = locked_text_x - 3;
+        let arrow_x = locked_text_x - 4;
+        let marker_fg = buf[(marker_x, row_u16(locked_label_y))].style().fg;
+        let arrow_fg = buf[(arrow_x, row_u16(locked_label_y))].style().fg;
+        assert_eq!(
+            marker_fg, arrow_fg,
+            "locked row prefix must be a single styled indent; the old code split \
+             the prefix into a default-style arrow span and a fg=dim marker span, \
+             which would show up as a fg change between cols {arrow_x} ({arrow_fg:?}) \
+             and {marker_x} ({marker_fg:?})"
         );
     }
 }
