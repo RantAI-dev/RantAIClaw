@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/api/v1/channels` carries each channel's setup checklist.** The Slack and Discord rows now
+  include a `setup_checklist` string built from the same `SLACK_SETUP_CHECKLIST` and
+  `DISCORD_SETUP_CHECKLIST` constants the setup wizard renders, so an operator on the console sees
+  the same list the wizard would have shown — the MESSAGE CONTENT intent for Discord and the
+  Socket Mode / scope list for Slack. The field is absent (not `null`, not `""`) on every other
+  row, and a console that does not know the field keeps working. The Discord wizard section now
+  prints the constant the same way the Slack section does, replacing a hand-typed bullet list that
+  could drift from the platform's actual requirements.
 - **`rantaiclaw status` and `rantaiclaw service status` warn when the running daemon's version
   differs from the CLI's.** After `cargo install` the managed daemon kept running the old build
   and nothing said so: `rantaiclaw status` printed only the CLI's version and `rantaiclaw service
