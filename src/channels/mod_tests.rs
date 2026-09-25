@@ -553,13 +553,19 @@ fn no_log_or_print_call_carries_message_or_reply_text() {
 }
 
 /// The WARN sentence every channel produces for an unauthorized sender names
-/// the on-host `channels pair` CLI and the in-chat `/claim` step. The full
-/// identifier only appears in the helper input, which the caller already
-/// passed through `crate::security::redact` — so a journal reader learns how
-/// to grant access but cannot impersonate the sender on a second channel.
+/// both in-chat paths that grant access: `/bind <code>` (guest, mint with
+/// `--no-owner`) and `/claim <code>` (owner, mint without `--no-owner`), plus
+/// the on-host `channels pair` CLI for each. The full identifier only appears
+/// in the helper input, which the caller already passed through
+/// `crate::security::redact` — so a journal reader learns how to grant access
+/// but cannot impersonate the sender on a second channel.
 #[test]
 fn rejected_sender_warn_includes_redacted_identifier_and_pairing_command() {
     let line = rejected_sender_warn("discord", "abcd***");
+    assert!(
+        line.starts_with("discord: ignoring unauthorized sender (abcd***)"),
+        "keeps the fixed prefix an operator greps the journal for: {line}"
+    );
     assert!(
         line.contains("discord"),
         "names the channel CLI key: {line}"
@@ -569,12 +575,20 @@ fn rejected_sender_warn_includes_redacted_identifier_and_pairing_command() {
         "interpolates the redacted identifier: {line}"
     );
     assert!(
-        line.contains("rantaiclaw channels pair --channel discord"),
-        "points at the on-host pairing CLI: {line}"
+        line.contains("--no-owner"),
+        "names the guest-path mint flag: {line}"
+    );
+    assert!(
+        line.contains("/bind"),
+        "names the in-chat guest /bind step: {line}"
     );
     assert!(
         line.contains("/claim"),
-        "points at the in-chat /claim step: {line}"
+        "names the in-chat owner /claim step: {line}"
+    );
+    assert!(
+        line.contains("rantaiclaw channels pair --channel discord"),
+        "points at the on-host pairing CLI: {line}"
     );
 }
 

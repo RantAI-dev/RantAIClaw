@@ -426,8 +426,9 @@ impl Default for ChannelsRegistry {
 /// redacted before it reaches this helper, and stays redacted at WARN; the
 /// caller writes the full value to a DEBUG line that an operator has to opt
 /// into. The WARN sentence names the on-host `channels pair` CLI and the
-/// in-chat `/claim` step that grant access, without naming the sender's
-/// identifier, which a journal reader would otherwise learn.
+/// in-chat `/bind` (guest) and `/claim` (owner) steps that grant access,
+/// without naming the sender's identifier, which a journal reader would
+/// otherwise learn.
 ///
 /// `channel` is the CLI surface name (`whatsapp_web`, `discord`, `slack`,
 /// `lark`) the operator types into `rantaiclaw channels pair --channel`.
@@ -436,7 +437,8 @@ impl Default for ChannelsRegistry {
 pub(crate) fn rejected_sender_warn(channel: &str, redacted_id: &str) -> String {
     format!(
         "{channel}: ignoring unauthorized sender ({redacted_id}); to allow them, mint a code \
-         with `rantaiclaw channels pair --channel {channel}`, then DM the bot `/claim <code>`"
+         with `rantaiclaw channels pair --channel {channel} --no-owner` and have them DM \
+         `/bind <code>`, or mint without `--no-owner` and have them DM `/claim <code>`"
     )
 }
 
