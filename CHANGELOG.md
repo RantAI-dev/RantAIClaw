@@ -174,6 +174,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image path reaches the model, but describing an image was not driven: the deployed provider has no
   vision capability, and the evidence table says so rather than claiming a pass. No support value moved
   for any other channel, no config key was added, and the schema stays at 32.
+- **The first-run wizard's channel picker tidies its "Under development" section.** The heading was
+  italic and sat flush against the locked rows below it, and both the heading and the locked rows
+  started one column short of the usable rows' text. The heading is now bold rather than italic, one
+  blank line separates it from the section above and none from the rows below, and the heading plus
+  the locked rows line up with the usable rows' text column.
 
 ### Fixed
 
