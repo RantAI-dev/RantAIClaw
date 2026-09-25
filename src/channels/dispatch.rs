@@ -985,6 +985,14 @@ pub(crate) async fn process_channel_message(
                     capability = %cap_err.capability,
                     "provider capability error"
                 );
+                // Pair the user turn appended at the start of this turn, so the
+                // next question is not merged onto the failed one. The reply
+                // above goes to the chat; the marker stays in history.
+                history::append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(FAILED_TURN_MARKER),
+                );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
@@ -1422,13 +1430,13 @@ mod tests {
         assert_eq!(found.provider, "MiniMax");
         assert_eq!(found.capability, "vision");
 
-        // The user-facing sentence must name the channel prefix, the model, and the
+        // The user-facing sentence must name the channel prefix, the provider, and the
         // capability so the user can act on it without reading the cut-off error
         // code. Sanity check: it must NOT start with the legacy sanitized form.
         let message = found.user_facing_message("/");
         assert!(
             message.contains("MiniMax"),
-            "sentence must name the model; got: {message}"
+            "sentence must name the provider; got: {message}"
         );
         assert!(
             message.contains("/model"),
@@ -1463,7 +1471,7 @@ mod tests {
         let slack = cap_err.user_facing_message("");
         assert!(
             slack.contains("MiniMax"),
-            "slack message must name the model; got: {slack}"
+            "slack message must name the provider; got: {slack}"
         );
         assert!(
             slack.contains("model "),
