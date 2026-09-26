@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which newer `mail-parser` releases replace with a dedicated `AuthenticationResults`
   variant; the name-based lookup does not depend on which variant the parser
   chose.
+- OpenRouter requests now carry the real project URL in `HTTP-Referer`, and
+  the `Track progress` link, the hardware `git clone` commands and the
+  architecture diagram point at `RantAI-dev/RantAIClaw`.
 
 ### Changed
 
@@ -34,12 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour operators may have relied on**; a fresh install is unaffected
   because `guest_allowed_tools` defaults to empty anyway.
 - Guests no longer see the owner's profile (`USER.md`), notes (`MEMORY.md`), or other chats' memory. A guest who is allowed `memory_recall` only sees the conversation they are in. A guest who is allowed `file_read`/`file_write`/`pdf_read`/`image_info` is still blocked from reading those private files. When `approval_owners` is empty, every sender is a guest; set `approval_owners` to restore ownership. `rantaiclaw doctor` now warns when no owner is configured.
-
-### Fixed
-
-- OpenRouter requests now carry the real project URL in `HTTP-Referer`, and
-  the `Track progress` link, the hardware `git clone` commands and the
-  architecture diagram point at `RantAI-dev/RantAIClaw`.
 
 ## [0.32.0-alpha] — 2026-09-26
 
