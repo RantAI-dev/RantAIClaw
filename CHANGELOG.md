@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour operators may have relied on**; a fresh install is unaffected
   because `guest_allowed_tools` defaults to empty anyway.
 
+### Fixed
+
+- OpenRouter requests now carry the real project URL in `HTTP-Referer`, and
+  the `Track progress` link, the hardware `git clone` commands and the
+  architecture diagram point at `RantAI-dev/RantAIClaw`.
+
 ## [0.32.0-alpha] — 2026-09-26
 
 The channel release. Six channels are usable in this tag (Telegram, Discord, Slack,
