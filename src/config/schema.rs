@@ -2978,7 +2978,7 @@ pub struct TelegramConfig {
     pub interrupt_on_new_message: bool,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub mention_only: bool,
 }
 
@@ -2998,7 +2998,7 @@ pub struct DiscordConfig {
     pub listen_to_bots: bool,
     /// When true, only respond to messages that @-mention the bot.
     /// Other messages in the guild are silently ignored.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub mention_only: bool,
 }
 
@@ -5733,6 +5733,73 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+    }
+
+    /// A channel table without `mention_only` deserialises to `true`: in a
+    /// group the bot answers only when addressed, unless the operator turned
+    /// that off explicitly.
+    #[test]
+    async fn telegram_and_discord_mention_only_default_true_when_key_absent() {
+        let raw = r#"
+default_temperature = 0.7
+
+[channels_config.telegram]
+bot_token = "123:ABC"
+allowed_users = ["*"]
+
+[channels_config.discord]
+bot_token = "discord-bot-token"
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        let telegram = parsed
+            .channels_config
+            .telegram
+            .expect("telegram table parses");
+        assert!(
+            telegram.mention_only,
+            "telegram mention_only must default to true"
+        );
+        let discord = parsed
+            .channels_config
+            .discord
+            .expect("discord table parses");
+        assert!(
+            discord.mention_only,
+            "discord mention_only must default to true"
+        );
+    }
+
+    /// An operator's written `mention_only = false` is a choice, not an
+    /// absence: deserialisation must keep it.
+    #[test]
+    async fn telegram_and_discord_explicit_mention_only_false_is_kept() {
+        let raw = r#"
+default_temperature = 0.7
+
+[channels_config.telegram]
+bot_token = "123:ABC"
+allowed_users = ["*"]
+mention_only = false
+
+[channels_config.discord]
+bot_token = "discord-bot-token"
+mention_only = false
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(
+            !parsed
+                .channels_config
+                .telegram
+                .expect("telegram table parses")
+                .mention_only
+        );
+        assert!(
+            !parsed
+                .channels_config
+                .discord
+                .expect("discord table parses")
+                .mention_only
+        );
     }
 
     #[test]

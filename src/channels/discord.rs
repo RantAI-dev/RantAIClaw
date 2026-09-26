@@ -126,6 +126,29 @@ impl DiscordChannel {
             return DiscordInbound::Ignore;
         }
 
+        // The addressed gate runs before the allowlist: an unaddressed guild
+        // message is nobody's business and must not take the pairing path (or
+        // its WARN). DMs carry no guild_id and are never gated.
+        let is_guild = d.get("guild_id").is_some();
+        let content = d
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if is_guild && self.mention_only {
+            // `referenced_message` arrives on MESSAGE_CREATE for a reply; when
+            // absent the reply rule simply does not match — no API fetch.
+            let replied_to_bot = d
+                .get("referenced_message")
+                .and_then(|r| r.get("author"))
+                .and_then(|a| a.get("id"))
+                .and_then(serde_json::Value::as_str);
+            let addressed =
+                contains_bot_mention(content, bot_user_id) || replied_to_bot == Some(bot_user_id);
+            if !addressed {
+                return DiscordInbound::Ignore;
+            }
+        }
+
         // Sender validation
         if !self.is_user_allowed(author_id) {
             // Carries the raw content (not the mention-stripped form) so the
@@ -151,9 +174,8 @@ impl DiscordChannel {
             }
         }
 
-        let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
         let Some(clean_content) =
-            normalize_incoming_content(content, self.mention_only, bot_user_id)
+            normalize_incoming_content(content, self.mention_only, is_guild, bot_user_id)
         else {
             return DiscordInbound::Ignore;
         };
@@ -414,21 +436,22 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
+/// Normalize what the agent sees. Whether a guild message had to be addressed
+/// was already decided by `classify_inbound`'s gate; this only strips the
+/// bot's own tag from guild messages when `mention_only` is on and leaves DMs
+/// untouched (trim only, the way a DM always read).
 fn normalize_incoming_content(
     content: &str,
     mention_only: bool,
+    is_guild: bool,
     bot_user_id: &str,
 ) -> Option<String> {
     if content.is_empty() {
         return None;
     }
 
-    if mention_only && !contains_bot_mention(content, bot_user_id) {
-        return None;
-    }
-
     let mut normalized = content.to_string();
-    if mention_only {
+    if is_guild && mention_only {
         for tag in mention_tags(bot_user_id) {
             normalized = normalized.replace(&tag, " ");
         }
@@ -1403,14 +1426,95 @@ mod tests {
     fn discord_mention_only_drops_unmentioned_content() {
         let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, true);
         assert!(matches!(
-            ch.classify_inbound(&inbound("U_OK", "hi", None), "U_BOT"),
+            ch.classify_inbound(&inbound("U_OK", "hi", Some("G_GUILD")), "U_BOT"),
             DiscordInbound::Ignore
         ));
-        match ch.classify_inbound(&inbound("U_OK", "<@U_BOT> hi", None), "U_BOT") {
+        match ch.classify_inbound(&inbound("U_OK", "<@U_BOT> hi", Some("G_GUILD")), "U_BOT") {
             // The mention tag is stripped from what the agent sees.
             DiscordInbound::Deliver(msg) => assert_eq!(msg.content, "hi"),
             other => panic!("a mentioned message must be delivered: {other:?}"),
         }
+    }
+
+    /// A guild reply to one of the bot's own messages counts as addressed even
+    /// without a repeated `<@mention>`.
+    #[test]
+    fn discord_mention_only_guild_accepts_reply_to_bot() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, true);
+        let mut d = inbound("U_OK", "what did you mean by that?", Some("G_GUILD"));
+        d["referenced_message"] = serde_json::json!({
+            "id": "MSG_0",
+            "author": { "id": "U_BOT", "username": "rantaiclaw_bot", "bot": true },
+        });
+
+        match ch.classify_inbound(&d, "U_BOT") {
+            DiscordInbound::Deliver(msg) => assert_eq!(msg.content, "what did you mean by that?"),
+            other => panic!("a reply to the bot must be delivered: {other:?}"),
+        }
+    }
+
+    /// A reply to somebody else is not addressed to this bot.
+    #[test]
+    fn discord_mention_only_guild_ignores_reply_to_other_user() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, true);
+        let mut d = inbound("U_OK", "I agree with them", Some("G_GUILD"));
+        d["referenced_message"] = serde_json::json!({
+            "id": "MSG_0",
+            "author": { "id": "U_HUMAN", "username": "rantaiclaw_user" },
+        });
+
+        assert!(matches!(
+            ch.classify_inbound(&d, "U_BOT"),
+            DiscordInbound::Ignore
+        ));
+    }
+
+    /// With `mention_only` off a plain guild message is answered, as before.
+    #[test]
+    fn discord_mention_only_disabled_answers_plain_guild_message() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
+        match ch.classify_inbound(
+            &inbound("U_OK", "anyone up for lunch?", Some("G_GUILD")),
+            "U_BOT",
+        ) {
+            DiscordInbound::Deliver(msg) => assert_eq!(msg.content, "anyone up for lunch?"),
+            other => panic!("an unfiltered guild message must be delivered: {other:?}"),
+        }
+    }
+
+    /// A DM is answered whatever `mention_only` says, and its text is not
+    /// treated as needing a mention: no gate, no tag-strip.
+    #[test]
+    fn discord_mention_only_dm_is_never_gated() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, true);
+        match ch.classify_inbound(&inbound("U_OK", "hello there", None), "U_BOT") {
+            DiscordInbound::Deliver(msg) => assert_eq!(msg.content, "hello there"),
+            other => panic!("a DM without a mention must be delivered: {other:?}"),
+        }
+    }
+
+    /// The addressed gate runs before the allowlist: an unaddressed guild
+    /// message from a sender nobody listed is ignored silently — it must not
+    /// take the unauthorized/pairing path (which logs a WARN).
+    #[test]
+    fn discord_unaddressed_guild_message_from_unlisted_author_is_ignored_silently() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["U_OK".into()], false, true);
+        match ch.classify_inbound(&inbound("U_STRANGER", "hi", Some("G_GUILD")), "U_BOT") {
+            DiscordInbound::Ignore => {}
+            other => {
+                panic!("an unaddressed guild message must be ignored, not unauthorized: {other:?}")
+            }
+        }
+
+        // An addressed message from the same stranger still takes the
+        // pairing path — the gate only silences the unaddressed ones.
+        assert!(matches!(
+            ch.classify_inbound(
+                &inbound("U_STRANGER", "<@U_BOT> hi", Some("G_GUILD")),
+                "U_BOT"
+            ),
+            DiscordInbound::Unauthorized { .. }
+        ));
     }
 
     #[test]
@@ -1575,20 +1679,22 @@ mod tests {
     }
 
     #[test]
-    fn normalize_incoming_content_requires_mention_when_enabled() {
-        let cleaned = normalize_incoming_content("hello there", true, "12345");
-        assert!(cleaned.is_none());
+    fn normalize_incoming_content_leaves_dm_text_untouched() {
+        // The addressed decision lives in `classify_inbound`'s gate; for DMs
+        // (never gated) this trims and nothing else.
+        let cleaned = normalize_incoming_content("hello there", true, false, "12345");
+        assert_eq!(cleaned.as_deref(), Some("hello there"));
     }
 
     #[test]
     fn normalize_incoming_content_strips_mentions_and_trims() {
-        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
+        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, true, "12345");
         assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
     #[test]
     fn normalize_incoming_content_rejects_empty_after_strip() {
-        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+        let cleaned = normalize_incoming_content("<@12345>", true, true, "12345");
         assert!(cleaned.is_none());
     }
 

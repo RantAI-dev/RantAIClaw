@@ -691,12 +691,19 @@ bot_token = "123456:telegram-token"
 allowed_users = ["*"]
 stream_mode = "off"               # optional: off | partial
 draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
-mention_only = false              # optional: require @mention in groups
+mention_only = true               # optional: require @mention (or a reply to the bot) in groups
 interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-chat request
 ```
 
 Telegram notes:
 
+- In a group the bot answers only when it is addressed: the message must @-mention the bot, or be a
+  reply to one of the bot's own messages. Slash commands in a group need the mention too
+  (`/new@<botname>` counts). DMs are always answered. `mention_only` defaults to `true`; set it to
+  `false` to answer every group message.
+- BotFather's privacy mode (on by default for a new bot) independently filters what the bot
+  *receives* in groups: with it on, unaddressed group messages usually never arrive. A group admin
+  bot or one with privacy mode off receives everything, which is what `mention_only` then filters.
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 - Interruption scope is strict: same sender in the same chat. Messages from different chats are processed independently.
 
@@ -708,8 +715,12 @@ bot_token = "discord-bot-token"
 guild_id = "123456789012345678"   # optional
 allowed_users = ["*"]
 listen_to_bots = false
-mention_only = false
+mention_only = true               # default: in a guild, answer only @mentions and replies to the bot
 ```
+
+- In a guild the bot answers only when it is addressed: the message must @-mention the bot, or be a
+  reply to one of the bot's own messages. DMs are never gated by `mention_only` — they are always
+  answered. The setting defaults to `true`; set it to `false` to answer every guild message.
 
 - **Discord shows its native typing indicator** while the agent works, reposted every 8 seconds until
   the turn ends, and cleared on every exit path. It had never appeared before 2026-09-13: the method was

@@ -767,6 +767,9 @@ Notes:
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
+- `mention_only` on `[channels_config.telegram]` and `[channels_config.discord]` defaults to `true`: in a group the bot
+  answers only @mentions and replies to the bot. DMs are always answered. An existing config keeps the value written in
+  it; set `mention_only = false` to answer every group message.
 - While `rantaiclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels.md).
@@ -878,6 +881,17 @@ is refused rather than half-understood.
 
 Migrations only move forward. There is no automatic downgrade, so reverting to a
 binary older than your config's `schema_version` needs a manual edit.
+
+### v33: Telegram and Discord `mention_only` defaults to `true`
+
+Fresh installs and configs without the key now answer in groups only when
+addressed: `mention_only` (on `[channels_config.telegram]` and
+`[channels_config.discord]`) defaults to `true` instead of `false`. An existing
+config keeps the value written in it — the migration changes the version number
+only and never touches the key. Set `mention_only = false` to keep answering
+every group message. See [Channels reference §4](channels.md#4-per-channel-config-examples)
+for the full group rule; note that BotFather's privacy mode also filters what a
+Telegram bot receives in groups, independently of this setting.
 
 ### v32: WhatsApp Web moved to its own table
 

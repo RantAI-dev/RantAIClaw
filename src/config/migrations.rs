@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 32;
+pub const CURRENT_VERSION: u32 = 33;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -430,7 +430,18 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v32(raw);
     }
 
-    // Future migrations (v32, …) inserted here in order.
+    // v32 → v33: the default of `mention_only` flipped to `true` on Telegram
+    // and Discord — in a group the bot answers only when addressed. An
+    // explicit value is the operator's choice and is kept as written; a config
+    // without the key gains the new default through serde, so nothing may be
+    // transformed here (writing the key would freeze today's default into
+    // every file). This arm exists only to burn a version slot so the
+    // schema_drift fingerprint can be accepted with intent (mirrors v1 → v2).
+    if from < 33 {
+        // (no transformation; default-only change, explicit values kept)
+    }
+
+    // Future migrations (v34, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -1130,6 +1141,76 @@ backend = \"markdown\"
         assert!(
             cost.get("prices").is_none(),
             "prices are not invented by a migration"
+        );
+    }
+
+    /// v32 → v33 flips the `mention_only` default to `true` on Telegram and
+    /// Discord. A value an operator wrote is a choice, not an absence, so the
+    /// migration must keep it exactly as written and only stamp the version.
+    #[test]
+    fn v33_keeps_an_explicit_mention_only_false() {
+        let mut raw = parse(
+            r#"
+schema_version = 32
+
+[channels_config.telegram]
+bot_token = "123:ABC"
+allowed_users = ["*"]
+mention_only = false
+
+[channels_config.discord]
+bot_token = "discord-bot-token"
+mention_only = false
+"#,
+        );
+
+        assert!(migrate(&mut raw).expect("migration runs"));
+        assert_eq!(version_of(&raw), Some(i64::from(CURRENT_VERSION)));
+
+        let channels = raw
+            .get("channels_config")
+            .and_then(Value::as_table)
+            .expect("channels table survives");
+        for name in ["telegram", "discord"] {
+            let table = channels
+                .get(name)
+                .and_then(Value::as_table)
+                .unwrap_or_else(|| panic!("{name} table survives"));
+            assert_eq!(
+                table.get("mention_only").and_then(Value::as_bool),
+                Some(false),
+                "{name}: an explicit mention_only = false is the operator's choice"
+            );
+        }
+    }
+
+    /// The migration must not write `mention_only` into a config that never
+    /// had it: absence means "use the (new) default", and baking the key in
+    /// would freeze today's default into every file.
+    #[test]
+    fn v33_does_not_write_mention_only_into_configs_that_lack_it() {
+        let mut raw = parse(
+            r#"
+schema_version = 32
+
+[channels_config.telegram]
+bot_token = "123:ABC"
+allowed_users = ["*"]
+"#,
+        );
+
+        assert!(migrate(&mut raw).expect("migration runs"));
+        assert_eq!(version_of(&raw), Some(i64::from(CURRENT_VERSION)));
+
+        let telegram = raw
+            .get("channels_config")
+            .and_then(Value::as_table)
+            .and_then(|c| c.get("telegram"))
+            .and_then(Value::as_table)
+            .expect("telegram table survives");
+        assert!(
+            telegram.get("mention_only").is_none(),
+            "the migration must not bake the default into the file"
         );
     }
 

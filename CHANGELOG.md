@@ -153,6 +153,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Telegram and Discord answer in groups only when addressed, by default.** `mention_only` on
+  `[channels_config.telegram]` and `[channels_config.discord]` now defaults to `true` (schema
+  version 33): in a group the bot answers @mentions and replies to its own messages, and DMs are
+  always answered. An existing config keeps the value written in it — the migration never touches
+  the key — so an install that relies on answering every group message must set
+  `mention_only = false` explicitly. A reply to a bot message counts as addressed on both channels
+  even without a repeated @mention (Telegram caches the bot's id from the same one-per-process
+  `getMe` it already made; Discord reads `referenced_message` from the event). Discord DMs are no
+  longer gated by `mention_only` — previously the setting silently swallowed unmentioned DMs — and
+  an unaddressed guild message from a sender outside the allowlist is now ignored silently instead
+  of taking the pairing path and logging a rejected-sender WARN. The wizard writes the new default
+  for fresh setups.
 - **wa-rs and wa-rs's `Client/*` targets default to `warn` instead of `info`.** Per-message
   WhatsApp identifiers (LIDs, group JIDs) no longer appear in the routine journal — the
   `info`-level lines from `wa_rs::receipt`, `wa_rs::send`, `wa_rs_libsignal`, `Client/Receipt`,

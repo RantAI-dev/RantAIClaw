@@ -257,6 +257,10 @@ pub struct TelegramChannel {
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
+    /// The bot's numeric id from the same `getMe` that fills `bot_username`.
+    /// Lets the group gate recognize a reply to the bot without any
+    /// per-message API call.
+    bot_id: Mutex<Option<String>>,
     /// Size/type limits for inbound images. Defaults to the shipped
     /// `[multimodal]` defaults; the factory overrides it with the operator's.
     multimodal: crate::config::MultimodalConfig,
@@ -342,6 +346,7 @@ impl TelegramChannel {
             typing_handles: Mutex::new(std::collections::HashMap::new()),
             mention_only,
             bot_username: Mutex::new(None),
+            bot_id: Mutex::new(None),
             multimodal: crate::config::MultimodalConfig::default(),
             api_base: TELEGRAM_API_BASE.to_string(),
         }
@@ -570,7 +575,18 @@ impl TelegramChannel {
             .map_err(|e| anyhow::anyhow!("{}", self.scrub_token(&e)))
     }
 
-    async fn fetch_bot_username(&self) -> anyhow::Result<String> {
+    /// A Telegram id arrives as a JSON number (defensively, a string). The
+    /// gate compares ids as strings so both sides go through this one
+    /// conversion.
+    fn telegram_id_string(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    async fn fetch_bot_username(&self) -> anyhow::Result<(String, Option<String>)> {
         let resp = self.http_client().get(self.api_url("getMe")).send().await?;
 
         if !resp.status().is_success() {
@@ -578,15 +594,20 @@ impl TelegramChannel {
         }
 
         let data: serde_json::Value = resp.json().await?;
-        let username = data
-            .get("result")
-            .and_then(|r| r.get("username"))
+        let result = data.get("result").context("no result in getMe response")?;
+        let username = result
+            .get("username")
             .and_then(|u| u.as_str())
             .context("Bot username not found in response")?;
+        let bot_id = result.get("id").and_then(Self::telegram_id_string);
 
-        Ok(username.to_string())
+        Ok((username.to_string(), bot_id))
     }
 
+    /// Cached read of the bot's username (and, on the same fetch, its numeric
+    /// id). One `getMe` per process: on a miss it fetches, caches both, and
+    /// answers the username; on any error it answers `None` and never
+    /// broadens what an addressed command can do.
     async fn get_bot_username(&self) -> Option<String> {
         {
             let cache = self.bot_username.lock();
@@ -596,7 +617,10 @@ impl TelegramChannel {
         }
 
         match self.fetch_bot_username().await {
-            Ok(username) => {
+            Ok((username, bot_id)) => {
+                if let Some(bot_id) = bot_id {
+                    *self.bot_id.lock() = Some(bot_id);
+                }
                 let mut cache = self.bot_username.lock();
                 *cache = Some(username.clone());
                 Some(username)
@@ -686,6 +710,31 @@ impl TelegramChannel {
             .and_then(|t| t.as_str())
             .map(|t| t == "group" || t == "supergroup")
             .unwrap_or(false)
+    }
+
+    /// A group message is addressed when it @-mentions the bot or replies to
+    /// one of the bot's own messages. With no cached username the mention rule
+    /// cannot match (fail closed, as before); with no cached bot id the reply
+    /// rule simply does not match.
+    fn group_message_is_addressed(&self, message: &serde_json::Value, text: &str) -> bool {
+        let username = self.bot_username.lock().clone();
+        if let Some(ref username) = username {
+            if Self::contains_bot_mention(text, username) {
+                return true;
+            }
+        }
+        let bot_id = self.bot_id.lock().clone();
+        if let Some(bot_id) = bot_id {
+            let replied_to_bot = message
+                .get("reply_to_message")
+                .and_then(|r| r.get("from"))
+                .and_then(|f| f.get("id"))
+                .and_then(Self::telegram_id_string);
+            if replied_to_bot.as_deref() == Some(bot_id.as_str()) {
+                return true;
+            }
+        }
+        false
     }
 
     fn is_user_allowed(&self, username: &str) -> bool {
@@ -1146,15 +1195,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
-            let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                if !Self::contains_bot_mention(&text, bot_username) {
-                    return None;
-                }
-            } else {
-                return None;
-            }
+        if self.mention_only && is_group && !self.group_message_is_addressed(message, &text) {
+            return None;
         }
 
         let chat_id = message
@@ -4291,6 +4333,167 @@ mod tests {
         });
 
         assert!(ch.parse_update_message(&empty_update).is_none());
+    }
+
+    /// A group reply to one of the bot's own messages counts as addressed even
+    /// without a repeated @mention.
+    #[test]
+    fn parse_update_message_mention_only_group_accepts_reply_to_bot() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+            *ch.bot_id.lock() = Some("111222333".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 50,
+                "text": "what did you mean by that?",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                },
+                "reply_to_message": {
+                    "message_id": 49,
+                    "from": {
+                        "id": 111_222_333,
+                        "username": "mybot",
+                        "is_bot": true
+                    }
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .map(|(m, _)| m)
+            .expect("a reply to the bot should parse");
+        assert_eq!(parsed.content, "what did you mean by that?");
+    }
+
+    /// A reply to somebody else is not addressed to this bot.
+    #[test]
+    fn parse_update_message_mention_only_group_ignores_reply_to_other_user() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+            *ch.bot_id.lock() = Some("111222333".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 51,
+                "text": "I agree with bob",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                },
+                "reply_to_message": {
+                    "message_id": 49,
+                    "from": {
+                        "id": 999,
+                        "username": "bob"
+                    }
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    /// A plain group message stays ignored while `mention_only` is on.
+    #[test]
+    fn parse_update_message_mention_only_group_ignores_plain_group_message() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+            *ch.bot_id.lock() = Some("111222333".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 22,
+            "message": {
+                "message_id": 52,
+                "text": "anyone up for lunch?",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    /// With `mention_only` off a plain group message is answered, as before.
+    #[test]
+    fn parse_update_message_mention_only_disabled_answers_plain_group_message() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 23,
+            "message": {
+                "message_id": 53,
+                "text": "anyone up for lunch?",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .map(|(m, _)| m)
+            .expect("with the gate off every group message should parse");
+        assert_eq!(parsed.content, "anyone up for lunch?");
+    }
+
+    /// A DM is answered whatever `mention_only` says.
+    #[test]
+    fn parse_update_message_mention_only_dm_is_never_gated() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        let update = serde_json::json!({
+            "update_id": 24,
+            "message": {
+                "message_id": 54,
+                "text": "hello there",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": 555,
+                    "type": "private"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .map(|(m, _)| m)
+            .expect("a DM without a mention should parse");
+        assert_eq!(parsed.content, "hello there");
     }
 
     #[test]

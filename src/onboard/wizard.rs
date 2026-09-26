@@ -3863,7 +3863,7 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
-                    mention_only: false,
+                    mention_only: true,
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -3965,7 +3965,7 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     guild_id: if guild.is_empty() { None } else { Some(guild) },
                     allowed_users,
                     listen_to_bots: false,
-                    mention_only: false,
+                    mention_only: true,
                 });
             }
             ChannelMenuChoice::Slack => {
