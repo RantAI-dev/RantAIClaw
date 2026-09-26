@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `NOTICE` file and the upstream MIT and Apache-2.0 texts under `licenses/`,
+  restoring the ZeroClaw copyright attribution that was dropped by commit
+  `caa0ef55` (2026-03-17). The RantaiClaw license itself stays AGPL-3.0-only.
+
 ### Changed
 
 - Guests (allowed senders who are not in `channels_config.approval_owners`)

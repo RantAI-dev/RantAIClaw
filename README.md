@@ -398,4 +398,5 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) and
 
 ## License
 
-AGPL-3.0-only. See [`LICENSE`](LICENSE).
+AGPL-3.0-only. See [`LICENSE`](LICENSE). Upstream attribution is recorded in
+[`NOTICE`](NOTICE).
