@@ -66,8 +66,8 @@ sudo apt-get update
 sudo apt-get install -y pkg-config libssl-dev
 
 # Clone rantaiclaw (or scp your project)
-git clone https://github.com/theonlyhennygod/rantaiclaw.git
-cd rantaiclaw
+git clone https://github.com/RantAI-dev/RantAIClaw.git
+cd RantAIClaw
 
 # Build (takes ~15–30 min on Uno Q)
 cargo build --release --features hardware
@@ -199,7 +199,7 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 2 | `ssh arduino@<IP>` |
 | 3 | `curl -sSf https://sh.rustup.rs \| sh -s -- -y && source ~/.cargo/env` |
 | 4 | `sudo apt-get install -y pkg-config libssl-dev` |
-| 5 | `git clone https://github.com/theonlyhennygod/rantaiclaw.git && cd rantaiclaw` |
+| 5 | `git clone https://github.com/RantAI-dev/RantAIClaw.git && cd RantAIClaw` |
 | 6 | `cargo build --release --features hardware` |
 | 7 | `rantaiclaw onboard --api-key KEY --provider openrouter` |
 | 8 | Edit `~/.rantaiclaw/config.toml` (add Telegram bot_token) |

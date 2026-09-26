@@ -9,6 +9,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Project URL advertised to OpenRouter in the `HTTP-Referer` header on every
+/// request. OpenRouter uses it for app attribution, so this must point at the
+/// real repository.
+const PROJECT_URL: &str = "https://github.com/RantAI-dev/RantAIClaw";
+
 pub struct OpenRouterProvider {
     credential: Option<String>,
 }
@@ -278,10 +283,7 @@ impl Provider for OpenRouterProvider {
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/rantaiclaw",
-            )
+            .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
             .json(&request)
             .send()
@@ -328,10 +330,7 @@ impl Provider for OpenRouterProvider {
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/rantaiclaw",
-            )
+            .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
             .json(&request)
             .send()
@@ -376,10 +375,7 @@ impl Provider for OpenRouterProvider {
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/rantaiclaw",
-            )
+            .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
             .json(&native_request)
             .send()
@@ -441,10 +437,7 @@ impl Provider for OpenRouterProvider {
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/rantaiclaw",
-            )
+            .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
             .header("Accept", "text/event-stream")
             .json(&native_request)
@@ -595,10 +588,7 @@ impl Provider for OpenRouterProvider {
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/rantaiclaw",
-            )
+            .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
             .json(&native_request)
             .send()

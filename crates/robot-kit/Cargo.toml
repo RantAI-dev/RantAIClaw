@@ -2,7 +2,7 @@
 name = "rantaiclaw-robot-kit"
 version = "0.1.0"
 edition = "2021"
-authors = ["theonlyhennygod"]
+authors = ["RantAI"]
 license = "MIT"
 description = "Robot control toolkit for RantaiClaw - drive, vision, speech, sensors, safety"
 repository = "https://github.com/RantAI-dev/RantAIClaw"
