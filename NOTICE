@@ -1,0 +1,16 @@
+RantaiClaw
+Copyright 2025-2026 RantAI
+
+Licensed under AGPL-3.0-only. See the LICENSE file for the full text.
+
+RantaiClaw is derived from ZeroClaw (https://github.com/zeroclaw-labs/zeroclaw),
+Copyright (c) 2025 ZeroClaw Labs, originally dual-licensed under MIT or Apache
+License 2.0. The original texts are preserved in the licenses/ directory.
+
+The files have been modified since the fork at commit 47dd5cd4 (2026-03-16).
+
+"ZeroClaw" and "zeroclaw-labs" are names used by ZeroClaw Labs. They appear
+here only to describe the origin of the code, with no endorsement or affiliation
+implied.
+
+Third-party dependencies carry their own licenses; see Cargo.lock for the list.
