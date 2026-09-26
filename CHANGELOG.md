@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which newer `mail-parser` releases replace with a dedicated `AuthenticationResults`
   variant; the name-based lookup does not depend on which variant the parser
   chose.
+- OpenRouter requests now carry the real project URL in `HTTP-Referer`, and
+  the `Track progress` link, the hardware `git clone` commands and the
+  architecture diagram point at `RantAI-dev/RantAIClaw`.
 
 ### Changed
 

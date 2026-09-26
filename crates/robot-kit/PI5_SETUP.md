@@ -171,8 +171,8 @@ sudo usermod -aG dialout $USER
 
 ```bash
 # Clone repo (or copy from USB)
-git clone https://github.com/theonlyhennygod/rantaiclaw
-cd rantaiclaw
+git clone https://github.com/RantAI-dev/RantAIClaw
+cd RantAIClaw
 
 # Build robot kit
 cargo build --release -p rantaiclaw-robot-kit

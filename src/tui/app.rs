@@ -7709,7 +7709,7 @@ pub const STREAM_PREVIEW_LINES: u16 = 0;
 /// scrollable chat pane on top, the composer, and the status bar — with the
 /// composer pinned above the status bar at the very bottom on EVERY terminal
 /// (including Windows conhost, where the old inline viewport floated to the
-/// top). This matches how zeroclaw's `zerocode` and Claude Code work. On exit
+/// top). This matches how Claude Code works. On exit
 /// the alternate screen is left and the original shell screen is restored.
 pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;

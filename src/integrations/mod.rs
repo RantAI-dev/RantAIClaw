@@ -197,7 +197,7 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         _ => {
             if status == IntegrationStatus::ComingSoon {
                 println!("  This integration is planned. Stay tuned!");
-                println!("  Track progress: https://github.com/theonlyhennygod/rantaiclaw");
+                println!("  Track progress: https://github.com/RantAI-dev/RantAIClaw");
             }
             if status == IntegrationStatus::UnderDevelopment {
                 println!("  This channel is built and tested, but not yet opened for use.");

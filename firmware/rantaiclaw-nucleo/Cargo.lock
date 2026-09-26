@@ -834,7 +834,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zeroclaw-nucleo"
+name = "rantaiclaw-nucleo"
 version = "0.1.0"
 dependencies = [
  "cortex-m-rt",

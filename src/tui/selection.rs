@@ -4,7 +4,7 @@
 //! The TUI captures the mouse (wheel scrolling needs it — see
 //! `enter_fullscreen`), which means the terminal's native drag-selection never
 //! fires. This module implements selection *inside* the app instead, the way
-//! Hermes and zeroclaw do: drag highlights whole display lines, Ctrl+C with an
+//! Hermes does: drag highlights whole display lines, Ctrl+C with an
 //! active selection copies via OSC 52.
 //!
 //! Everything here is pure and unit-tested. The anchored unit is a **rendered
