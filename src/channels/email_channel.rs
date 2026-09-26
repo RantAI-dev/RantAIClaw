@@ -413,11 +413,18 @@ impl EmailChannel {
 
         // Every `Authentication-Results` header, not just the first: a sender
         // can add one, and the order they arrive in is not ours to rely on.
+        //
+        // Match by name rather than `HeaderName::Other("Authentication-Results")`.
+        // mail-parser promotes this header to a known variant in newer releases,
+        // and any spelling (`Authentication-Results:`, `AUTHENTICATION-RESULTS:`,
+        // `authentication-results:`) must count. The parser returns the original
+        // case via `Header::name()`, so a single ASCII case-insensitive compare
+        // covers the lot.
         parsed
-            .header_values(mail_parser::HeaderName::Other(
-                "Authentication-Results".into(),
-            ))
-            .filter_map(mail_parser::HeaderValue::as_text)
+            .headers()
+            .iter()
+            .filter(|h| h.name().eq_ignore_ascii_case("authentication-results"))
+            .filter_map(|h| h.value().as_text())
             .any(|raw| authentication_results_pass(raw, trusted, &from_domain))
     }
 
@@ -1820,6 +1827,26 @@ mod tests {
                 "should authenticate: {header}"
             );
         }
+    }
+
+    /// `Authentication-Results` may arrive in any casing — RFC 5322 says header
+    /// names are case-insensitive — so the lookup has to be too. A
+    /// case-sensitive `HeaderName::Other("Authentication-Results")` match
+    /// misses `AUTHENTICATION-RESULTS:` already today, and any future
+    /// mail-parser upgrade that promotes the header to a known variant
+    /// would break even the canonical spelling.
+    #[test]
+    fn an_uppercase_authentication_results_header_authenticates_the_owner() {
+        let ch = owner_channel(false);
+        let raw = b"From: owner@example.com\r\n\
+                    AUTHENTICATION-RESULTS: mx.example.com; dmarc=pass header.from=example.com\r\n\
+                    Subject: hi\r\n\r\nbody\r\n";
+        let parsed = MessageParser::default().parse(raw.as_slice()).unwrap();
+        assert_eq!(
+            ch.sender_identity(&parsed),
+            Some("owner@example.com".to_string()),
+            "header-name lookup must match regardless of casing"
+        );
     }
 
     /// Fail closed: with no verifier configured there is no way to tell the
