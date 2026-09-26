@@ -24,8 +24,9 @@ run arbitrary privileged tools." This is the feature.
     (globs, same matcher as the existing command allowlist) — **out-of-list =
     hard deny**, never escalated to the owner.
 - **Secure default:** empty `approval_owners` ⇒ everyone is a guest; empty
-  `guest_allowed_*` ⇒ guests get only chat + read-only tools + skills. Nobody
-  gets privileged capability until an owner opts them in.
+  `guest_allowed_*` ⇒ guests get only chat, the agent calls no tool on a
+  guest's behalf. Nobody gets privileged capability until an owner opts them
+  in.
 
 This subsumes the sharing case, removes the approval ping-pong for guests, and
 makes a `["*"]` chat allowlist safe (public for safe stuff, private for privileged).
@@ -38,18 +39,20 @@ guest_allowed_tools    = ["file_read", "web_search", "shell"]  # tools a guest m
 guest_allowed_commands = ["kubectl get *", "kubectl describe *", "ls *"]  # shell globs for guests
 ```
 
-- Defaults: `guest_allowed_tools = []` (⇒ a safe built-in read-only set + skills),
-  `guest_allowed_commands = []` (⇒ no shell for guests).
-- Read-only tools (`file_read`, `memory_*`) and skills are always guest-available.
+- Defaults: `guest_allowed_tools = []` (⇒ the agent calls no tool on a guest's
+  behalf), `guest_allowed_commands = []` (⇒ no shell for guests). The owner's
+  `autonomy.auto_approve` list is **not** unioned in; operators who want a
+  guest to be able to read files or recall memory list those tools here.
 
 ## Enforcement point
 
 One place — the shared agent loop, per turn:
 1. Resolve `is_owner = can_approve(approval_owners, sender)` (CLI/console ⇒ owner).
 2. Owner → existing path (full registry + normal `SecurityPolicy`).
-3. Guest → filtered tool registry (`guest_allowed_tools` ∪ safe set ∪ skills) +
-   a guest-scoped `SecurityPolicy` (`allowed_commands = guest_allowed_commands`,
-   out-of-list denied, forbidden-paths still apply).
+3. Guest → filtered tool registry (exactly `guest_allowed_tools`, no union
+   with `auto_approve`) + a guest-scoped `SecurityPolicy`
+   (`allowed_commands = guest_allowed_commands`, out-of-list denied,
+   forbidden-paths still apply).
 
 Because the loop is unified, this lands on **every multi-user channel at once**:
 Telegram, WhatsApp, Discord, Slack, Mattermost, Signal, Matrix, IRC, DingTalk,

@@ -16,24 +16,27 @@ use std::collections::HashSet;
 /// The capability ceiling applied to a single non-owner ("guest") turn.
 #[derive(Debug, Clone)]
 pub struct GuestGate {
-    /// Tools a guest may use: the always-safe set (config `auto_approve`) unioned
-    /// with `channels_config.guest_allowed_tools`.
+    /// Tools a guest may use: exactly `channels_config.guest_allowed_tools`.
+    /// The owner's `autonomy.auto_approve` list is **not** unioned in.
     permitted_tools: HashSet<String>,
     /// Shell-command glob patterns a guest may run (`channels_config.guest_allowed_commands`).
     allowed_commands: Vec<String>,
 }
 
 impl GuestGate {
-    /// Build a gate from the safe (auto-approved) tool set plus the configured
-    /// guest allowances.
-    pub fn new<S>(auto_approve: S, guest_tools: &[String], guest_commands: &[String]) -> Self
-    where
-        S: IntoIterator<Item = String>,
-    {
-        let mut permitted_tools: HashSet<String> = auto_approve.into_iter().collect();
-        permitted_tools.extend(guest_tools.iter().cloned());
+    /// Build a gate from the operator-configured guest allowances only.
+    ///
+    /// `guest_tools` is the exact permitted set: the agent will call **only**
+    /// these tools on a guest's behalf. The owner's `autonomy.auto_approve`
+    /// list is intentionally **not** unioned in: that list governs the owner's
+    /// own approval flow, not what a guest may use. An operator who wants a
+    /// guest to be able to read files or recall memory must list those tools
+    /// in `channels_config.guest_allowed_tools`. Empty `guest_tools` (the
+    /// default) means the agent calls no tool on a guest's behalf; the guest
+    /// can still chat.
+    pub fn new(guest_tools: &[String], guest_commands: &[String]) -> Self {
         Self {
-            permitted_tools,
+            permitted_tools: guest_tools.iter().cloned().collect(),
             allowed_commands: guest_commands.to_vec(),
         }
     }
@@ -192,7 +195,6 @@ mod tests {
 
     fn gate() -> GuestGate {
         GuestGate::new(
-            ["file_read".to_string(), "memory_recall".to_string()],
             &["shell".to_string(), "web_search".to_string()],
             &[
                 "kubectl get *".to_string(),
@@ -217,10 +219,17 @@ mod tests {
 
     #[test]
     fn safe_and_allowed_tools_permitted_others_denied() {
+        // The operator lists exactly `shell` and `web_search` for guests. The
+        // always-safe `file_read` and `memory_recall` (in the owner's
+        // `autonomy.auto_approve` list) must NOT be unioned in: a guest must
+        // only get what `guest_allowed_tools` lists.
         let g = gate();
-        assert!(g.tool_permitted("file_read")); // auto-approve safe set
         assert!(g.tool_permitted("web_search")); // explicit guest tool
         assert!(g.tool_permitted("shell")); // explicit guest tool
+                                            // The always-safe tools are NOT in `guest_allowed_tools` and must stay
+                                            // denied for guests — this is the whole point of plan 449.
+        assert!(!g.tool_permitted("file_read"));
+        assert!(!g.tool_permitted("memory_recall"));
         assert!(!g.tool_permitted("file_write")); // not allowed
         assert!(!g.tool_permitted("ssh"));
     }
@@ -253,7 +262,6 @@ mod tests {
         // Even if an owner mistakenly adds `manage_permissions` to the guest
         // allowlist, the hard owner-only denylist still blocks it.
         let g = GuestGate::new(
-            ["file_read".to_string()],
             &[
                 "manage_permissions".to_string(),
                 "issue_pairing_code".to_string(),
@@ -290,7 +298,6 @@ mod tests {
     fn guest_denied_skill_write_tools_even_when_allowlisted() {
         // Owner explicitly (mis)configured these into guest_allowed_tools.
         let g = GuestGate::new(
-            std::iter::empty::<String>(),
             &[
                 "skills_install".to_string(),
                 "author_skill".to_string(),
@@ -319,7 +326,6 @@ mod tests {
     fn guest_denied_cron_mutation_tools_but_allowed_read_only() {
         // Owner (mis)configured all five cron tools into guest_allowed_tools.
         let g = GuestGate::new(
-            std::iter::empty::<String>(),
             &[
                 "cron_add".to_string(),
                 "cron_update".to_string(),
@@ -368,8 +374,8 @@ mod tests {
             disallowed_reason.contains("/claim"),
             "tool-not-permitted arm must name /claim: {disallowed_reason:?}"
         );
-        // allowed safe tool
-        assert!(g.deny_reason("file_read", &json!({})).is_none());
+        // allowed explicit guest tool
+        assert!(g.deny_reason("web_search", &json!({})).is_none());
         // shell allowed + command allowed
         assert!(g
             .deny_reason("shell", &json!({"command": "kubectl get pods"}))
@@ -382,11 +388,7 @@ mod tests {
 
     #[test]
     fn deny_reason_shell_command_path_names_the_owner_pair_flow() {
-        let g = GuestGate::new(
-            Vec::<String>::new(),
-            &["shell".to_string()],
-            &["ls".to_string()],
-        );
+        let g = GuestGate::new(&["shell".to_string()], &["ls".to_string()]);
         let reason = g
             .deny_reason("shell", &json!({"command": "rm -rf /"}))
             .expect("a non-allowlisted shell command must deny");
@@ -401,6 +403,35 @@ mod tests {
         assert!(
             reason.contains("/claim"),
             "the shell denial must name the /claim reply; got: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn empty_guest_list_permits_nothing() {
+        // The default install: `guest_allowed_tools = []`. The agent calls no
+        // tool on a guest's behalf, including the always-safe `file_read` and
+        // `memory_recall` the owner's `auto_approve` list carries.
+        let g = GuestGate::new(&[], &[]);
+        for tool in ["file_read", "memory_recall", "web_search", "shell"] {
+            assert!(
+                !g.tool_permitted(tool),
+                "{tool} must be denied for a guest with an empty allowlist"
+            );
+        }
+        let reason = g
+            .deny_reason("file_read", &json!({}))
+            .expect("file_read must be denied");
+        assert!(
+            reason.contains("isn't available to non-owner users"),
+            "denial must use the non-owner-available wording: {reason:?}"
+        );
+        assert!(
+            reason.contains("channels pair"),
+            "denial must name the owner-pair flow: {reason:?}"
+        );
+        assert!(
+            reason.contains("/claim"),
+            "denial must name /claim: {reason:?}"
         );
     }
 }

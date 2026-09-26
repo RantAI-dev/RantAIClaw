@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Guests (allowed senders who are not in `channels_config.approval_owners`)
+  no longer inherit `autonomy.auto_approve`. The agent now calls **only** the
+  tools listed in `channels_config.guest_allowed_tools` on a guest's behalf —
+  empty (the default) means the agent calls no tool for a guest, including the
+  read-only `file_read` and `memory_recall` that `auto_approve` previously
+  granted. An operator who wants a guest to be able to read files or recall
+  memory must list those tools in `guest_allowed_tools`. **This narrows
+  behaviour operators may have relied on**; a fresh install is unaffected
+  because `guest_allowed_tools` defaults to empty anyway.
+
 ## [0.32.0-alpha] — 2026-09-26
 
 The channel release. Six channels are usable in this tag (Telegram, Discord, Slack,
