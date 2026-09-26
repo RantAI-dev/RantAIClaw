@@ -167,9 +167,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Telegram and Discord answer in groups only when addressed, by default.** `mention_only` on
   `[channels_config.telegram]` and `[channels_config.discord]` now defaults to `true` (schema
   version 33): in a group the bot answers @mentions and replies to its own messages, and DMs are
-  always answered. An existing config keeps the value written in it — the migration never touches
-  the key — so an install that relies on answering every group message must set
-  `mention_only = false` explicitly. A reply to a bot message counts as addressed on both channels
+  always answered. The migration never touches the key, and every config saved by 0.31.0-alpha or
+  older already says `mention_only = false`, because older versions wrote the key on every save. An
+  upgraded install therefore keeps answering every group message until `mention_only = true` is set
+  under both sections; only a new setup (TUI `/setup`, console, onboard wizard) or a section without
+  the key gets the new default. A reply to a bot message counts as addressed on both channels
   even without a repeated @mention (Telegram caches the bot's id from the same one-per-process
   `getMe` it already made; Discord reads `referenced_message` from the event). Discord DMs are no
   longer gated by `mention_only` — previously the setting silently swallowed unmentioned DMs — and

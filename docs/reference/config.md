@@ -768,8 +768,9 @@ Notes:
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
 - `mention_only` on `[channels_config.telegram]` and `[channels_config.discord]` defaults to `true`: in a group the bot
-  answers only @mentions and replies to the bot. DMs are always answered. An existing config keeps the value written in
-  it; set `mention_only = false` to answer every group message.
+  answers only @mentions and replies to the bot. DMs are always answered. A config saved by 0.31.0-alpha or older says
+  `mention_only = false` and keeps answering every group message after the upgrade; set `mention_only = true` to adopt
+  the rule. Set `mention_only = false` to answer every group message.
 - While `rantaiclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels.md).
@@ -886,10 +887,18 @@ binary older than your config's `schema_version` needs a manual edit.
 
 Fresh installs and configs without the key now answer in groups only when
 addressed: `mention_only` (on `[channels_config.telegram]` and
-`[channels_config.discord]`) defaults to `true` instead of `false`. An existing
-config keeps the value written in it — the migration changes the version number
-only and never touches the key. Set `mention_only = false` to keep answering
-every group message. See [Channels reference §4](channels.md#4-per-channel-config-examples)
+`[channels_config.discord]`) defaults to `true` instead of `false`. The
+migration changes the version number only and never touches the key.
+
+Versions up to 0.31.0-alpha wrote `mention_only = false` on every save, so an
+upgraded config that already has a Telegram or Discord section keeps answering
+every group message. To adopt the group rule there, set `mention_only = true`
+under both sections. RantaiClaw has no switch for it: the console keeps the
+written value when it saves, and `/setup telegram` or `/setup discord` rewrites
+the whole section, token and allowlist included. WhatsApp Web, Slack and Lark
+have no such setting and follow the group rule after the upgrade.
+
+Set `mention_only = false` to keep answering every group message. See [Channels reference §4](channels.md#4-per-channel-config-examples)
 for the full group rule; note that BotFather's privacy mode also filters what a
 Telegram bot receives in groups, independently of this setting.
 

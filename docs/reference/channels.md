@@ -700,7 +700,9 @@ Telegram notes:
 - In a group the bot answers only when it is addressed: the message must @-mention the bot, or be a
   reply to one of the bot's own messages. Slash commands in a group need the mention too
   (`/new@<botname>` counts). DMs are always answered. `mention_only` defaults to `true`; set it to
-  `false` to answer every group message.
+  `false` to answer every group message. A config saved by 0.31.0-alpha or older says `false` and
+  keeps answering every group message after an upgrade; set `true` to adopt this rule (see the v33
+  note in the [Config reference](config.md)).
 - BotFather's privacy mode (on by default for a new bot) independently filters what the bot
   *receives* in groups: with it on, unaddressed group messages usually never arrive. A group admin
   bot or one with privacy mode off receives everything, which is what `mention_only` then filters.
@@ -720,7 +722,9 @@ mention_only = true               # default: in a guild, answer only @mentions a
 
 - In a guild the bot answers only when it is addressed: the message must @-mention the bot, or be a
   reply to one of the bot's own messages. DMs are never gated by `mention_only` — they are always
-  answered. The setting defaults to `true`; set it to `false` to answer every guild message.
+  answered. The setting defaults to `true`; set it to `false` to answer every guild message. A config
+  saved by 0.31.0-alpha or older says `false` and keeps answering every guild message after an
+  upgrade; set `true` to adopt this rule.
 
 - **Discord shows its native typing indicator** while the agent works, reposted every 8 seconds until
   the turn ends, and cleared on every exit path. It had never appeared before 2026-09-13: the method was
