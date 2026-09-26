@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0-alpha] — 2026-09-26
+
+The channel release. Six channels are usable in this tag (Telegram, Discord, Slack,
+WhatsApp Cloud, WhatsApp Web and Lark), five of them can be set up from the web
+console, and every channel still under development is refused by name on every
+surface.
+
+**Does not roll back cleanly to v0.31.0-alpha.** The config schema moves from **31**
+to **33**: v32 gives WhatsApp Web its own table, and v33 flips the Telegram and
+Discord `mention_only` default. A config this binary writes does not load on
+v0.31.0-alpha, which reads schema 31. The sessions store stays at **1**. The cron
+job store gains nullable origin columns on first start.
+
+**WhatsApp Web operators: link one RantaiClaw per WhatsApp account.** Two instances
+linked to one account keep separate histories and allowlists, and while two were
+linked, other group members once saw a reply they could not decrypt (cause not
+confirmed).
+
+**In groups and channels the bot now answers only when it is @-mentioned or replied
+to, on every channel.** On Slack a thread the bot has posted in counts too. DMs are
+always answered, and a command in a group needs the mention as well. Telegram and
+Discord keep `mention_only`, now defaulting to `true`, but every config saved by
+0.31.0-alpha or older already says `mention_only = false` and keeps answering every
+group message until `mention_only = true` is set under `[channels_config.telegram]`
+and `[channels_config.discord]`.
+
+What an operator will actually notice:
+
+- **Lark is supported and has been driven.** It is in the default build, is set up
+  from the console, carries attachments both ways, answers the runtime commands, and
+  `channel doctor` probes it.
+- **Discord, Slack and WhatsApp Web are set up from the console**, connected, edited
+  and disconnected there, with the WhatsApp Web QR shown in the page.
+- **Telegram, Discord, Slack, WhatsApp Web and Lark send attachments**, and a
+  delivery that fails is said in the chat instead of dropped.
+- **Channels keep the conversation.** Telegram and Discord used to forget it after
+  every message. `/model` sticks and now works on Slack and WhatsApp Web too, an
+  unknown slash command gets an answer, and `/new` starts over.
+- **A restart no longer cuts a reply off in silence.** A scheduled job reaches every
+  usable channel, and each chat manages only the jobs it created.
+- **The journal carries no message or reply text**, no pairing code and no full
+  identifier of a rejected sender. wa-rs chatter and the scheduler's unchanged-config
+  refresh are gone from the default level.
+- **`rantaiclaw status` says when the daemon runs an older build** than the installed
+  binary, even at the same version.
+- **The web console needs this runtime.** claw-ui **v0.3.29** sets up Discord, Slack,
+  WhatsApp Web and Lark through routes this release adds; against an older gateway
+  only its Telegram card works.
+
 ### Added
 
 - **`log`-facade records reach the journal.** wa-rs (and any other third-party crate that emits
@@ -153,13 +202,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **claw-ui pinned to v0.3.29.** Carries the console half of this release, and three of its entries need this runtime:
-  the Slack and Discord cards show the platform-side checklist from `setup_checklist`, the Lark card appears once the
-  catalog recognises Lark, and the WhatsApp Web card waits for a restart only when the `connected` frame says
-  `restarts_runtime`. Against an older gateway each one degrades instead of breaking. The console also lists locked
-  channels in their own "Under development" section, shows WhatsApp Web once instead of twice, and labels the Lark
-  allowlist with the `open_id` the runtime matches. `ui install` and `ui update` fetch that tag by default; `--ref`
-  still overrides per invocation.
+- **claw-ui pinned to v0.3.29.** Carries the console half of this release, and the console needs this runtime: its
+  Discord, Slack, WhatsApp Web and Lark setup cards call gateway routes this release adds, so against an older gateway
+  only the Telegram card works. The Slack and Discord cards also show the platform-side checklist from
+  `setup_checklist`, and the WhatsApp Web card waits for a restart only when the `connected` frame says
+  `restarts_runtime`. The console lists locked channels in their own "Under development" section, shows WhatsApp Web
+  once instead of twice, and labels the Lark allowlist with the `open_id` the runtime matches. `ui install` and
+  `ui update` fetch that tag by default; `--ref` still overrides per invocation.
 - **Lark groups: the bot now answers only when it is @-mentioned or replied to.** In a group chat an allowlisted
   member's message used to get a reply whenever it mentioned anyone at all — and in webhook mode, which had no
   addressing gate, every group message got one. Now only messages that @-mention the bot or that reply directly to
@@ -276,6 +325,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The in-chat approval gate can be answered, and a denial says the tool did not run.** A queue
+  holding two `shell` requests could be answered by neither reply form and sat until auto-deny, and on
+  Slack the platform swallowed every reply the prompt suggested. Approvals now resolve by request id,
+  and the prompt prints a form the platform delivers. After two refused `rm` calls the bot used to tell
+  the owner the file was deleted while it was still on disk; a denial now tells the model the tool did
+  not run. Slack also receives over Socket Mode when an app token is set. No approval is loosened, and
+  the approval and shell-allowlist parsers accept exactly the forms they accepted before. (#778)
+- **`/model` and `/models` say the switch applies to the whole conversation.** They replied that it
+  applied "for this sender session", but a route override is keyed by the conversation, so in a group
+  one member's `/model` changes the model for everyone. The reply now says so. (#783)
+- **`rantaiclaw channel doctor` reads WhatsApp Web from its saved session.** It built the channel in
+  the CLI process and asked for a live client that only the daemon's listener creates, so a working
+  WhatsApp Web always read unhealthy. It now checks the saved session file, the same offline probe
+  `rantaiclaw doctor` uses, and says "session present" or names what is missing. (#830)
 - **A fresh TUI `/setup telegram` now defaults to answering groups only when addressed.** The bot-mode picker's
   first option — the one Enter selects — wrote `mention_only = false`, so a new setup still answered every group
   message the bot received while the schema 33 serde default, the gateway and the legacy wizard all write `true`.
@@ -965,6 +1028,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **rustls 0.23.45, for RUSTSEC-2026-0285.** rustls 0.23.43 accepted TLS 1.3 handshake messages sent
+  at the wrong encryption level after a key change in the same record (GHSA-2mjx-qc3c-rqvc, scored
+  `C:L`, no integrity or availability impact). The gateway, the providers and the WhatsApp Web
+  transport all speak TLS through it. `Cargo.lock` only. (#818)
 - **Tool-call audit records now name who asked and whether they were an owner or a guest.** The
   audit's on-disk shape (`audit.log`, JSON lines) used to write `.with_actor(channel, None, None)`
   for every tool call, so a denial on a multi-user chat channel could not say whose call it was or
