@@ -153,6 +153,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **claw-ui pinned to v0.3.29.** Carries the console half of this release, and three of its entries need this runtime:
+  the Slack and Discord cards show the platform-side checklist from `setup_checklist`, the Lark card appears once the
+  catalog recognises Lark, and the WhatsApp Web card waits for a restart only when the `connected` frame says
+  `restarts_runtime`. Against an older gateway each one degrades instead of breaking. The console also lists locked
+  channels in their own "Under development" section, shows WhatsApp Web once instead of twice, and labels the Lark
+  allowlist with the `open_id` the runtime matches. `ui install` and `ui update` fetch that tag by default; `--ref`
+  still overrides per invocation.
 - **Lark groups: the bot now answers only when it is @-mentioned or replied to.** In a group chat an allowlisted
   member's message used to get a reply whenever it mentioned anyone at all — and in webhook mode, which had no
   addressing gate, every group message got one. Now only messages that @-mention the bot or that reply directly to
