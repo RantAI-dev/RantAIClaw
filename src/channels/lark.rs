@@ -3317,7 +3317,9 @@ mod tests {
         .expect("pairing command should be handled");
         assert!(reply.contains("owner"), "reply was: {reply}");
 
-        let config = crate::config::Config::load_or_init().await.unwrap();
+        let config = crate::config::Config::load_from_path(&root.join("config.toml"))
+            .await
+            .unwrap();
         let users = &config.channels_config.lark.as_ref().unwrap().allowed_users;
         assert!(users.contains(&"ou_new".to_string()));
         assert!(config
