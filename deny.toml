@@ -10,6 +10,7 @@ yanked = "deny"
 # Ignore known unmaintained/unsound transitive deps we cannot easily replace.
 # Each entry cites (a) the crate, (b) the upstream chain blocking the upgrade,
 # and (c) why the risk is acceptable for our usage.
+# When you add an id here, add it to .github/workflows/sec-audit.yml too.
 ignore = [
     # SECURITY (2026-08-20 supply-chain incident): arrayref 0.3.9 is YANKED, but
     # EVERY legitimate version (0.3.5–0.3.9) was yanked the same day to force an
