@@ -4553,7 +4553,7 @@ mod tests {
             ran: Arc::clone(&ran),
         })];
         // Guest may use only `file_read`; `do_thing` is not permitted.
-        let gate = crate::approval::GuestGate::new(["file_read".to_string()], &[], &[]);
+        let gate = crate::approval::GuestGate::new(&["file_read".to_string()], &[]);
         let results = execute_tool_calls_collecting(
             std::slice::from_ref(&call),
             &tools,
@@ -4604,7 +4604,7 @@ mod tests {
         })];
         // Guest may use only `file_read`; `do_thing` is not permitted, so the
         // gate hits the `guest_ceiling` denial branch in the executor.
-        let gate = crate::approval::GuestGate::new(["file_read".to_string()], &[], &[]);
+        let gate = crate::approval::GuestGate::new(&["file_read".to_string()], &[]);
         let audit_actor = crate::security::AuditActor::chat("u_42".to_string(), "guest");
         let _ = execute_tool_calls_collecting(
             std::slice::from_ref(&call),

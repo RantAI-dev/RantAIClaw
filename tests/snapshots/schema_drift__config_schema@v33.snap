@@ -849,7 +849,7 @@ expression: pretty
           }
         },
         "guest_allowed_tools": {
-          "description": "Tools a **normal user** (allowed to chat but NOT in `approval_owners`)\nmay have the agent use on their behalf. Owners always get the full\ntoolset; this is the capability ceiling for everyone else.\n\nEmpty (default) ⇒ guests get only the always-safe set (read-only file +\nmemory tools) and skills — no privileged tools. List specific tool names\n(e.g. `\"shell\"`, `\"web_search\"`) to widen what guests may use. Read-only\ntools and skills are always available regardless of this list.",
+          "description": "Tools a **normal user** (allowed to chat but NOT in `approval_owners`)\nmay have the agent use on their behalf. Owners always get the full\ntoolset; this is the capability ceiling for everyone else.\n\nEmpty (default) ⇒ the agent calls no tool on a guest's behalf; the\nguest can still chat. List specific tool names (e.g. `\"shell\"`,\n`\"web_search\"`) to widen what guests may use. The owner's\n`autonomy.auto_approve` list is intentionally **not** unioned in — an\noperator who wants a guest to be able to read files or recall memory\nmust list those tools here.",
           "type": "array",
           "default": [],
           "items": {

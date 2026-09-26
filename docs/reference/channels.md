@@ -1276,10 +1276,12 @@ autonomous_tools = false                # true = skip the approval gate entirely
   `approval_owners = []` (the default) means **nobody** can approve —
   privileged tools stay auto-denied. `"*"` lets any allowed sender approve;
   it is accepted, insecure, and opt-in only (`src/config/schema.rs:2739-2743`).
-- **Guests** are senders on the channel allowlist who are not owners. They get
-  read-only file and memory tools plus skills; `guest_allowed_tools` widens
-  that, and `guest_allowed_commands` is a hard ceiling on shell — a command
-  outside it is denied outright, never escalated to an owner.
+- **Guests** are senders on the channel allowlist who are not owners. The
+  agent calls **only** the tools in `guest_allowed_tools` on a guest's
+  behalf — the owner's `autonomy.auto_approve` list is intentionally **not**
+  inherited. Empty (the default) means the agent calls no tool for a guest;
+  `guest_allowed_commands` is a hard ceiling on shell — a command outside it
+  is denied outright, never escalated to an owner.
 - **If privileged tools are being denied, add an owner.** Do **not** reach for
   `autonomous_tools = true`: that skips the approval gate for everyone on the
   channel, which is a different and much larger decision.

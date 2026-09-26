@@ -4393,11 +4393,7 @@ mod tests {
             channel_approval: approval,
             approval_owners: Arc::new(approval_owners),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            guest_gate: Arc::new(crate::approval::GuestGate::new(
-                Vec::<String>::new(),
-                &[],
-                &[],
-            )),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);

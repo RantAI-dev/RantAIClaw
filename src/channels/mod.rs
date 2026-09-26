@@ -285,6 +285,22 @@ pub(crate) fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
 
+/// Build the per-runtime capability ceiling for non-owner ("guest") senders
+/// from config.
+///
+/// Both production callers (`build_channel_runtime` here and
+/// `runtime_defaults_from_config` in `routing.rs`) build the same gate from
+/// the same two fields: `channels_config.guest_allowed_tools` and
+/// `channels_config.guest_allowed_commands`. `autonomy.auto_approve` is
+/// deliberately **not** consulted — it governs the owner's approval flow, not
+/// what a guest may call. Tests in `src/approval/guest.rs` pin this contract.
+pub(crate) fn guest_gate_from_config(config: &Config) -> crate::approval::GuestGate {
+    crate::approval::GuestGate::new(
+        &config.channels_config.guest_allowed_tools,
+        &config.channels_config.guest_allowed_commands,
+    )
+}
+
 fn channel_message_timeout_budget_secs(
     message_timeout_secs: u64,
     max_tool_iterations: usize,
@@ -1637,14 +1653,13 @@ pub(crate) async fn build_channel_runtime(
         tool_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
             CHANNEL_APPROVAL_DEADLINE,
         ))),
-        // Role ceiling for non-owner senders: safe (auto-approved) tools +
-        // configured guest_allowed_tools, with shell limited to
-        // guest_allowed_commands. Built once (role-based, not per-user).
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            config.autonomy.auto_approve.clone(),
-            &config.channels_config.guest_allowed_tools,
-            &config.channels_config.guest_allowed_commands,
-        )),
+        // Role ceiling for non-owner senders: the configured
+        // `guest_allowed_tools` only (no union with `autonomy.auto_approve`,
+        // which is the owner's approval flow and must not widen what a guest
+        // may use), with shell limited to `guest_allowed_commands`. Built once
+        // (role-based, not per-user) by `guest_gate_from_config` so production
+        // and tests share one entry point.
+        guest_gate: Arc::new(guest_gate_from_config(&config)),
     });
 
     Ok(Some(ChannelRuntime {

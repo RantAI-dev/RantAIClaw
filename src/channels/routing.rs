@@ -9,8 +9,8 @@
 //! widening visibility, which is what happened.
 
 use super::{
-    effective_channel_message_timeout_secs, ChannelRouteSelection, ChannelRuntimeContext,
-    ChannelRuntimeDefaults, CHANNEL_CATALOG, MODEL_CACHE_PREVIEW_LIMIT,
+    effective_channel_message_timeout_secs, guest_gate_from_config, ChannelRouteSelection,
+    ChannelRuntimeContext, ChannelRuntimeDefaults, CHANNEL_CATALOG, MODEL_CACHE_PREVIEW_LIMIT,
 };
 use crate::config::Config;
 use crate::providers::{self, Provider};
@@ -190,11 +190,7 @@ pub(crate) fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDef
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
         approval_owners: Arc::new(config.channels_config.approval_owners.clone()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            config.autonomy.auto_approve.clone(),
-            &config.channels_config.guest_allowed_tools,
-            &config.channels_config.guest_allowed_commands,
-        )),
+        guest_gate: Arc::new(guest_gate_from_config(config)),
         allowed_commands: Arc::new(config.autonomy.allowed_commands.clone()),
         autonomy_level: config.autonomy.level,
         autonomy_preset: crate::approval::policy_writer::preset_for_autonomy(&config.autonomy),

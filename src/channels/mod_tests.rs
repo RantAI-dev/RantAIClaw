@@ -1519,11 +1519,7 @@ fn durable_history_writes_through_and_reloads() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -1618,11 +1614,7 @@ fn compact_sender_history_keeps_recent_truncated_messages() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -2150,11 +2142,7 @@ async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -2222,11 +2210,7 @@ async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_repl
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -2294,11 +2278,7 @@ async fn process_channel_message_executes_tool_calls_with_alias_tags() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -2374,11 +2354,7 @@ async fn process_channel_message_handles_models_command_without_llm_call() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -2476,11 +2452,7 @@ async fn process_channel_message_uses_route_override_provider_and_model() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -2559,11 +2531,7 @@ async fn process_channel_message_prefers_cached_default_provider_instance() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -2614,11 +2582,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
                 api_url: None,
                 reliability: crate::config::ReliabilityConfig::default(),
                 approval_owners: Arc::new(Vec::new()),
-                guest_gate: Arc::new(crate::approval::GuestGate::new(
-                    Vec::<String>::new(),
-                    &[],
-                    &[],
-                )),
+                guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
                 allowed_commands: Arc::new(Vec::new()),
                 autonomy_level: crate::security::AutonomyLevel::Supervised,
                 autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
@@ -2671,11 +2635,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -2769,11 +2729,7 @@ async fn maybe_apply_runtime_config_update_hot_reloads_owners_guest_gate_and_all
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     };
 
     // First apply: seeds the store from the initial config.
@@ -2868,11 +2824,7 @@ fn allowlist_test_ctx(
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     }
 }
 
@@ -3486,11 +3438,7 @@ async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     };
 
     routing::maybe_apply_runtime_config_update(&ctx)
@@ -3616,11 +3564,7 @@ async fn maybe_apply_runtime_config_update_clears_pinned_sender_on_provider_swit
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     };
 
     // Seed the store from the initial config.
@@ -3719,11 +3663,7 @@ async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     };
 
     routing::maybe_apply_runtime_config_update(&ctx)
@@ -3801,11 +3741,7 @@ async fn process_channel_message_respects_configured_max_tool_iterations_above_d
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -3883,11 +3819,7 @@ async fn process_channel_message_reports_configured_max_tool_iterations_limit() 
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -4148,11 +4080,7 @@ async fn channel_error_replies_are_sanitized_before_delivery() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
@@ -5434,11 +5362,7 @@ fn dispatch_ctx(
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     })
 }
 
@@ -6523,11 +6447,7 @@ async fn threading_off_clears_both_the_thread_and_the_quote() {
                 api_url: None,
                 reliability: crate::config::ReliabilityConfig::default(),
                 approval_owners: Arc::new(Vec::new()),
-                guest_gate: Arc::new(crate::approval::GuestGate::new(
-                    Vec::<String>::new(),
-                    &[],
-                    &[],
-                )),
+                guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
                 allowed_commands: Arc::new(Vec::new()),
                 autonomy_level: crate::security::AutonomyLevel::Supervised,
                 autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
@@ -7215,11 +7135,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -7316,11 +7232,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7430,11 +7342,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7518,11 +7426,7 @@ async fn process_channel_message_cancels_scoped_typing_task() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -8078,11 +7982,7 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -8177,11 +8077,7 @@ async fn process_channel_message_enriches_current_turn_without_persisting_contex
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -8274,11 +8170,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -8386,11 +8278,7 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     process_channel_message(
@@ -9325,11 +9213,7 @@ async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() 
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
-        guest_gate: Arc::new(crate::approval::GuestGate::new(
-            Vec::<String>::new(),
-            &[],
-            &[],
-        )),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
 
     let shutdown = CancellationToken::new();
@@ -10637,4 +10521,40 @@ mod channels_registry_tests {
         // The clone sees the swap without any further coordination.
         assert!(clone.get("probe").is_some());
     }
+}
+
+/// The production gate builder reads `guest_allowed_tools` /
+/// `guest_allowed_commands` only. It must **not** widen the set with the
+/// owner's `autonomy.auto_approve` list — that list governs the owner's
+/// approval flow, not what a guest may call.
+///
+/// This is the helper that `build_channel_runtime` and
+/// `runtime_defaults_from_config` both call. A regression that re-adds the
+/// union shows up here.
+#[test]
+fn guest_gate_from_config_does_not_inherit_auto_approve() {
+    let mut config = crate::config::Config::default();
+    // Default install: owner's `auto_approve` is `["file_read", "memory_recall"]`.
+    // The test relies on that default — if it ever changes, this assertion
+    // needs updating, so assert it here.
+    assert_eq!(
+        config.autonomy.auto_approve,
+        vec!["file_read".to_string(), "memory_recall".to_string()],
+        "default `auto_approve` changed; update this test"
+    );
+    // The operator allows guests exactly one tool.
+    config.channels_config.guest_allowed_tools = vec!["web_search".to_string()];
+
+    let gate = super::guest_gate_from_config(&config);
+
+    // The owner's `auto_approve` tools are NOT inherited.
+    assert!(!gate.tool_permitted("file_read"));
+    assert!(!gate.tool_permitted("memory_recall"));
+    // The one tool the operator listed IS permitted.
+    assert!(gate.tool_permitted("web_search"));
+    // Random other tools stay denied.
+    assert!(!gate.tool_permitted("shell"));
+    assert!(!gate.tool_permitted("file_write"));
+    // Owner-only tools stay denied even though they aren't listed either.
+    assert!(!gate.tool_permitted("manage_permissions"));
 }

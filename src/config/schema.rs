@@ -2885,10 +2885,12 @@ pub struct ChannelsConfig {
     /// may have the agent use on their behalf. Owners always get the full
     /// toolset; this is the capability ceiling for everyone else.
     ///
-    /// Empty (default) ⇒ guests get only the always-safe set (read-only file +
-    /// memory tools) and skills — no privileged tools. List specific tool names
-    /// (e.g. `"shell"`, `"web_search"`) to widen what guests may use. Read-only
-    /// tools and skills are always available regardless of this list.
+    /// Empty (default) ⇒ the agent calls no tool on a guest's behalf; the
+    /// guest can still chat. List specific tool names (e.g. `"shell"`,
+    /// `"web_search"`) to widen what guests may use. The owner's
+    /// `autonomy.auto_approve` list is intentionally **not** unioned in — an
+    /// operator who wants a guest to be able to read files or recall memory
+    /// must list those tools here.
     #[serde(default)]
     pub guest_allowed_tools: Vec<String>,
     /// Shell-command glob patterns a **normal user** may have the agent run
