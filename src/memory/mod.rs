@@ -14,13 +14,16 @@ pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
 pub mod vector;
+pub mod view;
 
 #[allow(unused_imports)]
 pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
-pub use context::{build_memory_context, MemoryContext, MemoryContextLimits};
+pub use context::{
+    build_memory_context, build_memory_context_in_view, MemoryContext, MemoryContextLimits,
+};
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -31,6 +34,7 @@ pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
+pub use view::{current_memory_view, recall_in_view, MemoryView, MEMORY_VIEW};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 #[cfg(feature = "memory-postgres")]
