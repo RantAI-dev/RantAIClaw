@@ -555,7 +555,7 @@ Each channel provisioner ports a single block of `src/onboard/wizard.rs::setup_c
 **Prompt schedule:**
 1. `Prompt` (secret) — bot token (BotFather output, format `<digits>:<base64-ish>`).
 2. `Prompt` (text, optional) — allowed chat IDs (comma-separated integers; empty = deny-all).
-3. `Choose` — bot mode. Options: `["Direct messages only", "Group + DMs"]`.
+3. `Choose` — bot mode. Options: `["Respond in groups only when @-mentioned or replied to (DMs always)", "Respond to every group message (DMs always)"]`.
 
 **Validation:**
 - `validate::http::probe_get("https://api.telegram.org/bot<token>/getMe", &[])` — 200 OK with `ok: true` → success; 401 → "invalid token, re-enter"; network → warn.
@@ -570,7 +570,7 @@ Each channel provisioner ports a single block of `src/onboard/wizard.rs::setup_c
 1. `Prompt` (secret) — bot token.
 2. `Prompt` (text, optional) — guild ID (single guild restriction).
 3. `Prompt` (text, optional) — allowed user IDs (comma-separated).
-4. `Choose` — modes: `["Respond to @-mention only", "Respond to all messages", "Respond to all (incl. other bots)"]`.
+4. `Choose` — modes: `["Respond only when @-mentioned or replied to (DMs always)", "Respond to all messages", "Respond to all (incl. other bots)"]`.
 
 **Validation:** `probe_get("https://discord.com/api/v10/users/@me", &[("Authorization", "Bot <token>")])` → 200 with `username` → success.
 

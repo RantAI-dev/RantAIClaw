@@ -267,6 +267,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A fresh TUI `/setup telegram` now defaults to answering groups only when addressed.** The bot-mode picker's
+  first option — the one Enter selects — wrote `mention_only = false`, so a new setup still answered every group
+  message the bot received while the schema 33 serde default, the gateway and the legacy wizard all write `true`.
+  The first option now writes `true` (mention or reply counts as addressed; DMs always pass) and the second writes
+  `false`, matching the rest of setup. Telegram's first label, "Direct messages only", described no actual
+  behaviour — `false` means "answer every group message" — so it and the second label now say what each mode does.
+  Discord already defaulted correctly; its first label now also says that a reply counts, not only an @-mention.
 - **Multi-line provisioner messages keep their line breaks in the TUI setup overlay's RECENT log.** The
   overlay stored each `ProvisionEvent::Message` as one log entry and drew each entry as a single ratatui
   `Line`, and a `\n` inside a `Span` is not a line break — so the Slack setup checklist collapsed into one

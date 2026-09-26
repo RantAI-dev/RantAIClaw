@@ -148,8 +148,9 @@ impl TuiProvisioner for TelegramProvisioner {
                 id: "mention_only".into(),
                 label: "Bot mode".into(),
                 options: vec![
-                    "Direct messages only".to_string(),
-                    "Respond to @-mention in groups (DMs always)".to_string(),
+                    "Respond in groups only when @-mentioned or replied to (DMs always)"
+                        .to_string(),
+                    "Respond to every group message (DMs always)".to_string(),
                 ],
                 multi: false,
             },
@@ -158,7 +159,7 @@ impl TuiProvisioner for TelegramProvisioner {
 
         let mention_only = {
             let sel = recv_selection(&mut responses).await?;
-            sel.first().copied() == Some(1)
+            sel.first().copied() == Some(0)
         };
 
         // Write config
@@ -186,7 +187,90 @@ impl TuiProvisioner for TelegramProvisioner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+    use crate::onboard::provision::smoke::OfflineProbes;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer, Transcript};
+
+    /// Walk Telegram setup with the bot-mode picker answered by `pick`.
+    ///
+    /// Answers before the picker: token, the probe's "save anyway" confirmation,
+    /// and the allowed-users prompt. The probe has no egress here, so it
+    /// resolves `Inconclusive` and option 0 keeps the credential.
+    async fn drive_bot_mode(pick: usize) -> (Transcript, Config) {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _offline = OfflineProbes::engage();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &TelegramProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("00000000:placeholder-bot-token"),
+                Answer::Pick(0), // probe inconclusive -> save anyway
+                Answer::Text(""),
+                Answer::Pick(pick),
+            ],
+        )
+        .await;
+        (t, config)
+    }
+
+    fn bot_mode_options(t: &Transcript) -> Vec<String> {
+        t.events
+            .iter()
+            .find_map(|e| match e {
+                ProvisionEvent::Choose { id, options, .. } if id == "mention_only" => {
+                    Some(options.clone())
+                }
+                _ => None,
+            })
+            .expect("the Telegram flow must offer a bot-mode choice")
+    }
+
+    fn mention_only(config: &Config) -> bool {
+        config
+            .channels_config
+            .telegram
+            .as_ref()
+            .expect("telegram config written")
+            .mention_only
+    }
+
+    /// Enter on the first option must write the addressed default: the picker
+    /// starts at index 0, and the schema 33 default the gateway and the legacy
+    /// wizard write is `true`.
+    #[tokio::test]
+    async fn first_bot_mode_option_writes_mention_only_true() {
+        let (t, config) = drive_bot_mode(0).await;
+        assert!(t.configured(), "expected configured, got {:?}", t.outcome);
+        assert!(
+            mention_only(&config),
+            "the first option must be the addressed default"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_bot_mode_option_writes_mention_only_false() {
+        let (t, config) = drive_bot_mode(1).await;
+        assert!(t.configured(), "expected configured, got {:?}", t.outcome);
+        assert!(!mention_only(&config));
+    }
+
+    /// The old first label ("Direct messages only") described the opposite of
+    /// what `false` does, so pin the offered wording and its order.
+    #[tokio::test]
+    async fn bot_mode_options_name_the_reply_rule() {
+        let (t, _config) = drive_bot_mode(0).await;
+        assert_eq!(
+            bot_mode_options(&t),
+            vec![
+                "Respond in groups only when @-mentioned or replied to (DMs always)".to_string(),
+                "Respond to every group message (DMs always)".to_string(),
+            ]
+        );
+    }
 
     /// The plan's primary case. A provisioner that stops on a missing required
     /// field used to emit `Failed` and then return `Ok(())`, which both drivers
