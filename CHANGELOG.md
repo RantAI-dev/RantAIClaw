@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restoring the ZeroClaw copyright attribution that was dropped by commit
   `caa0ef55` (2026-03-17). The RantaiClaw license itself stays AGPL-3.0-only.
 
+### Fixed
+
+- The email channel finds the `Authentication-Results` header by name, so owner
+  recognition keeps working on any header spelling and survives the next
+  mail-parser upgrade. The previous lookup matched `HeaderName::Other(...)`,
+  which newer `mail-parser` releases replace with a dedicated `AuthenticationResults`
+  variant; the name-based lookup does not depend on which variant the parser
+  chose.
+
 ### Changed
 
 - Guests (allowed senders who are not in `channels_config.approval_owners`)
@@ -24,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory must list those tools in `guest_allowed_tools`. **This narrows
   behaviour operators may have relied on**; a fresh install is unaffected
   because `guest_allowed_tools` defaults to empty anyway.
+- Guests no longer see the owner's profile (`USER.md`), notes (`MEMORY.md`), or other chats' memory. A guest who is allowed `memory_recall` only sees the conversation they are in. A guest who is allowed `file_read`/`file_write`/`pdf_read`/`image_info` is still blocked from reading those private files. When `approval_owners` is empty, every sender is a guest; set `approval_owners` to restore ownership. `rantaiclaw doctor` now warns when no owner is configured.
 
 ### Fixed
 

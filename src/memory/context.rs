@@ -9,7 +9,7 @@
 //! rules to reason about — and one place to fix the next thing that is wrong
 //! with them.
 
-use super::{recall_layered, Memory, MemoryCategory, MemoryEntry};
+use super::{recall_in_view, recall_layered, Memory, MemoryCategory, MemoryEntry, MemoryView};
 use crate::util::truncate_with_ellipsis;
 
 /// How much recalled memory may enter a prompt.
@@ -186,6 +186,78 @@ pub async fn build_memory_context(
             break;
         }
 
+        if included == 0 {
+            context.push_str("[Memory context]\n");
+        }
+        context.push_str(&line);
+        keys.push(entry.key.clone());
+        used_chars += line_chars;
+        included += 1;
+    }
+
+    if included > 0 {
+        context.push('\n');
+    }
+    MemoryContext {
+        block: context,
+        keys,
+    }
+}
+
+/// Recall for this turn under an explicit [`MemoryView`] and render the
+/// `[Memory context]` block.
+///
+/// Identical rendering rules to [`build_memory_context`]; the only change is
+/// the read path. `MemoryView::Only(key)` filters out every entry whose
+/// `session_id` does not exactly match — that drops the shared tier and other
+/// conversations' rows in one step, which is what a non-owner turn needs.
+/// `MemoryView::All` is today's unscoped read.
+pub async fn build_memory_context_in_view(
+    memory: &dyn Memory,
+    user_message: &str,
+    min_relevance_score: f64,
+    view: &MemoryView,
+    limits: MemoryContextLimits,
+) -> MemoryContext {
+    let recall_limit = limits.max_entries.max(1) + 1 + ECHO_OVERFETCH;
+    let mut entries = match recall_in_view(memory, user_message, recall_limit, view).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!("memory recall failed while building context: {e}");
+            return MemoryContext::default();
+        }
+    };
+
+    // Same drop + render path as the layered builder. Keeping them in lockstep
+    // is the point: a guest's prompt block must look identical to an owner's
+    // when both reach the model, only the candidate set differs.
+    entries.retain(|e| !is_echo_of_query(&e.content, user_message));
+
+    let mut context = String::new();
+    let mut keys: Vec<String> = Vec::new();
+    let mut included = 0_usize;
+    let mut used_chars = 0_usize;
+
+    for entry in entries.iter().filter(|e| match e.score {
+        Some(score) => score >= min_relevance_score,
+        None => true,
+    }) {
+        if included >= limits.max_entries {
+            break;
+        }
+        if should_skip(entry, &limits) {
+            continue;
+        }
+        let content = if entry.content.chars().count() > limits.max_entry_chars {
+            truncate_with_ellipsis(&entry.content, limits.max_entry_chars)
+        } else {
+            entry.content.clone()
+        };
+        let line = format!("- {}: {}\n", entry.key, content);
+        let line_chars = line.chars().count();
+        if used_chars + line_chars > limits.max_total_chars {
+            break;
+        }
         if included == 0 {
             context.push_str("[Memory context]\n");
         }

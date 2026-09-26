@@ -66,7 +66,8 @@ pub mod supervisor;
 // The prompt builders are part of this module's external surface (`src/agent`
 // and `src/cron` call them), so they keep their `crate::channels::` path.
 pub use prompt::{
-    build_system_prompt, build_system_prompt_with_mode, channel_supports_announce_delivery,
+    build_guest_system_prompt_with_mode, build_system_prompt, build_system_prompt_with_mode,
+    channel_supports_announce_delivery,
 };
 pub mod qq;
 pub mod qr_terminal;
@@ -476,6 +477,11 @@ pub(crate) struct ChannelRuntimeContext {
     pub(crate) tools_registry: Arc<Vec<Box<dyn Tool>>>,
     pub(crate) observer: Arc<dyn Observer>,
     pub(crate) system_prompt: Arc<String>,
+    /// Built at start-up next to [`system_prompt`]: same builder, with
+    /// `USER.md` and `MEMORY.md` omitted. Used for a guest's first turn, so
+    /// the owner's profile and notes never reach a non-owner sender's
+    /// context. Owners keep using [`system_prompt`].
+    pub(crate) guest_system_prompt: Arc<String>,
     pub(crate) model: Arc<String>,
     pub(crate) temperature: f64,
     pub(crate) auto_save_memory: bool,
@@ -1472,6 +1478,22 @@ pub(crate) async fn build_channel_runtime(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        false,
+    );
+    // Same builder, with `skip_owner_files = true`, for the guest prompt.
+    // Built once at start-up so a guest's first turn does not pay the
+    // workspace-file read again; the runtime keeps both side by side in
+    // [`ChannelRuntimeContext`].
+    let guest_system_prompt = build_system_prompt_with_mode(
+        &workspace,
+        &model,
+        &tool_descs,
+        &skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+        native_tools,
+        config.skills.prompt_injection_mode,
+        true,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
@@ -1610,6 +1632,7 @@ pub(crate) async fn build_channel_runtime(
         tools_registry: Arc::clone(&tools_registry),
         observer,
         system_prompt: Arc::new(system_prompt),
+        guest_system_prompt: Arc::new(guest_system_prompt),
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,

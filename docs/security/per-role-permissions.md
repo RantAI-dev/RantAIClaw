@@ -23,6 +23,10 @@ run arbitrary privileged tools." This is the feature.
   - if `shell` is permitted, commands must match `guest_allowed_commands`
     (globs, same matcher as the existing command allowlist) — **out-of-list =
     hard deny**, never escalated to the owner.
+  - Guests never see the owner's profile (`USER.md`) or notes (`MEMORY.md`) in
+    the system prompt. A guest who is allowed `file_read`, `file_write`,
+    `pdf_read`, or `image_info` is still denied access to `MEMORY.md`,
+    `USER.md`, and anything under `memory/`.
 - **Secure default:** empty `approval_owners` ⇒ everyone is a guest; empty
   `guest_allowed_*` ⇒ guests get only chat, the agent calls no tool on a
   guest's behalf. Nobody gets privileged capability until an owner opts them

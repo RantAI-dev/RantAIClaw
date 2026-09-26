@@ -15,7 +15,7 @@ use super::{
     UNDELIVERED_ATTACHMENT_NOTE, UNDELIVERED_TURN_MARKER,
 };
 use crate::agent::loop_::run_tool_call_loop;
-use crate::memory::Memory;
+use crate::memory::{Memory, MemoryView, MEMORY_VIEW};
 use crate::providers::{self, ChatMessage, ProviderCapabilityError};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -573,6 +573,15 @@ pub(crate) async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
+    // Owner status drives both the prompt (tell the model the sender is an
+    // owner so it doesn't self-refuse owner-only tools) and the capability
+    // ceiling below, and now the memory-context view above. Compute once so
+    // the three never disagree.
+    let sender_is_owner = crate::approval::can_approve_any(
+        &runtime_defaults.approval_owners,
+        msg.sender_identities(),
+    );
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
     history::append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
@@ -588,36 +597,66 @@ pub(crate) async fn process_channel_message(
 
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
+    //
+    // A guest's view is `Only(conv)` — every recalled entry must carry its
+    // own `session_id`; markdown/lucid-remote's no-session entries, the
+    // shared tier, and other chats' auto-save rows are filtered out. Owner
+    // keeps the existing layered read (own conv + shared backfill, no
+    // cross-chat bleed). Same conversation key the rest of dispatch uses.
     if !had_prior_history {
-        let memory_context = build_memory_context(
-            ctx.memory.as_ref(),
-            &msg.content,
-            runtime_defaults.min_relevance_score,
-            Some(conversation_scope.as_str()),
-        )
-        .await;
+        let memory_context = if sender_is_owner {
+            build_memory_context(
+                ctx.memory.as_ref(),
+                &msg.content,
+                runtime_defaults.min_relevance_score,
+                Some(conversation_scope.as_str()),
+            )
+            .await
+        } else {
+            // Same block builder, but the read goes through the view filter
+            // so shared-tier / cross-chat / no-session entries never reach
+            // the prompt. The view key is the conversation scope —
+            // `Only(conv)` — not the bare sender, so two guests in the same
+            // chat cannot see each other's words.
+            let view = MemoryView::Only(conversation_scope.clone());
+            crate::memory::build_memory_context_in_view(
+                ctx.memory.as_ref(),
+                &msg.content,
+                runtime_defaults.min_relevance_score,
+                &view,
+                crate::memory::MemoryContextLimits {
+                    max_entries: MEMORY_CONTEXT_MAX_ENTRIES,
+                    max_entry_chars: MEMORY_CONTEXT_ENTRY_MAX_CHARS,
+                    max_total_chars: MEMORY_CONTEXT_MAX_CHARS,
+                },
+            )
+            .await
+            .block
+        };
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{}", msg.content);
             }
         }
     }
-
-    // Owner status drives both the prompt (tell the model the sender is an
-    // owner so it doesn't self-refuse owner-only tools) and the capability
-    // ceiling below. Compute once so the two never disagree.
-    let sender_is_owner = crate::approval::can_approve_any(
-        &runtime_defaults.approval_owners,
-        msg.sender_identities(),
-    );
     // `ctx.system_prompt` is built once at channel start — it reads bootstrap
     // files and skills off disk, so rebuilding it per message is not free. The
     // approval policy can change under a running daemon, though, and the safety
     // section is pure in-memory work, so re-render just that part against the
     // preset carried on the reloaded defaults. Without this the gate followed a
     // config change while the briefing kept describing the boot-time preset.
+    //
+    // Guests run from `ctx.guest_system_prompt` (same builder, `USER.md` and
+    // `MEMORY.md` omitted). The persona and safety splice below applies to
+    // both — they are persona/safety, not profile/notes — and the rest of
+    // dispatch branches on `sender_is_owner` for memory.
+    let prompt_source = if sender_is_owner {
+        ctx.system_prompt.as_str()
+    } else {
+        ctx.guest_system_prompt.as_str()
+    };
     let base_prompt = crate::agent::prompt::replace_safety_section(
-        ctx.system_prompt.as_str(),
+        prompt_source,
         &crate::agent::prompt::render_safety_section(
             // `SafetySection` matches `Channel { .. }` and never reads the
             // payload, and the real value is only known where the provider is
@@ -781,31 +820,67 @@ pub(crate) async fn process_channel_message(
             // `Tool` and the trait has no originating message, so without this
             // a shell approval registers unscoped and cannot be answered by a
             // bare `ok` from the chat that triggered it.
+            //
+            // Memory view: a guest's tool reads (memory_recall when an
+            // operator allowed it) are scoped to this conversation's own
+            // session id. Owners get no view set, which is exactly today's
+            // behaviour. The outer crate::memory::MEMORY_VIEW task-local is
+            // a sibling of TURN_SCOPE, set the same way per turn.
             crate::security::TURN_SCOPE.scope(
-            (msg.channel.clone(), msg.reply_target.clone()),
-            run_tool_call_loop(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                tool_gate,
-                msg.channel.as_str(),
-                // Origin chat → `cron_add` delivery safety net (announce channels).
-                Some(msg.reply_target.as_str()),
-                chat_relay_backend_ref,
-                guest_gate_ref,
-                &ctx.multimodal,
-                runtime_defaults.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                None,
-                ctx.ledger.as_deref(),
-                &audit_actor,
-            ),
+                (msg.channel.clone(), msg.reply_target.clone()),
+                async {
+                    if sender_is_owner {
+                        run_tool_call_loop(
+                            active_provider.as_ref(),
+                            &mut history,
+                            ctx.tools_registry.as_ref(),
+                            ctx.observer.as_ref(),
+                            route.provider.as_str(),
+                            route.model.as_str(),
+                            runtime_defaults.temperature,
+                            true,
+                            tool_gate,
+                            msg.channel.as_str(),
+                            // Origin chat → `cron_add` delivery safety net (announce channels).
+                            Some(msg.reply_target.as_str()),
+                            chat_relay_backend_ref,
+                            guest_gate_ref,
+                            &ctx.multimodal,
+                            runtime_defaults.max_tool_iterations,
+                            Some(cancellation_token.clone()),
+                            delta_tx,
+                            None,
+                            ctx.ledger.as_deref(),
+                            &audit_actor,
+                        )
+                        .await
+                    } else {
+                        let view = MemoryView::Only(conversation_scope.clone());
+                        MEMORY_VIEW.scope(view, run_tool_call_loop(
+                            active_provider.as_ref(),
+                            &mut history,
+                            ctx.tools_registry.as_ref(),
+                            ctx.observer.as_ref(),
+                            route.provider.as_str(),
+                            route.model.as_str(),
+                            runtime_defaults.temperature,
+                            true,
+                            tool_gate,
+                            msg.channel.as_str(),
+                            // Origin chat → `cron_add` delivery safety net (announce channels).
+                            Some(msg.reply_target.as_str()),
+                            chat_relay_backend_ref,
+                            guest_gate_ref,
+                            &ctx.multimodal,
+                            runtime_defaults.max_tool_iterations,
+                            Some(cancellation_token.clone()),
+                            delta_tx,
+                            None,
+                            ctx.ledger.as_deref(),
+                            &audit_actor,
+                        )).await
+                    }
+                },
             ),
         ) => LlmExecutionResult::Completed(result),
     };

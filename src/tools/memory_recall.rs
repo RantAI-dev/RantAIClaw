@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::memory::Memory;
+use crate::memory::{recall_in_view, Memory, MemoryView};
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
@@ -70,16 +70,33 @@ impl Tool for MemoryRecallTool {
         // one: conversation-local rows first, shared unscoped tier as
         // backfill, other conversations' rows filtered — the same layered
         // read the injection path uses. Unset ⇒ global, as before.
-        let scope = self
-            .scope
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let recalled = match scope.as_deref() {
-            Some(cid) => {
-                crate::memory::recall_layered(self.memory.as_ref(), query, limit, Some(cid)).await
+        //
+        // Plan 450 adds a per-turn override: when the dispatch runs a guest
+        // turn it sets `MEMORY_VIEW = Some(MemoryView::Only(conversation))`,
+        // and that view overrides the tool's own scope slot. A guest must
+        // never reach the unscoped backfill even if the channel happened to
+        // set a different scope earlier in the conversation lifecycle.
+        let recalled = match crate::memory::current_memory_view() {
+            // Only the restricted `Only` view overrides the scope slot. `All`
+            // means "no restriction", so it defers to the tool's own layered
+            // read below, exactly as an unset view does.
+            Some(view @ MemoryView::Only(_)) => {
+                recall_in_view(self.memory.as_ref(), query, limit, &view).await
             }
-            None => self.memory.recall(query, limit, None).await,
+            _ => {
+                let scope = self
+                    .scope
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                match scope.as_deref() {
+                    Some(cid) => {
+                        crate::memory::recall_layered(self.memory.as_ref(), query, limit, Some(cid))
+                            .await
+                    }
+                    None => self.memory.recall(query, limit, None).await,
+                }
+            }
         };
         match recalled {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
@@ -317,5 +334,72 @@ mod tests {
 
         let seen = calls.lock().unwrap().clone();
         assert_eq!(seen, vec![None]);
+    }
+
+    /// Plan 450: when a turn runs inside `MEMORY_VIEW.scope(Only(k), ...)`
+    /// the tool reads through `recall_in_view`, which calls `recall(Some(k))`
+    /// (the exact session key, never the stale scope slot, never the unscoped
+    /// backfill). The view filter in `recall_in_view` then drops anything
+    /// without a matching `session_id`.
+    #[tokio::test]
+    async fn memory_view_only_routes_through_recall_in_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mem: Arc<dyn Memory> = Arc::new(RecallScopeProbe {
+            calls: calls.clone(),
+        });
+        let scope = ConversationScope::default();
+        // A different scope than the view: the view must win.
+        *scope.lock().unwrap() = Some("stale-scope".into());
+
+        let tool = MemoryRecallTool::new(mem, scope);
+        let view = MemoryView::Only("chat:abc".into());
+        MEMORY_VIEW
+            .scope(view, async {
+                tool.execute(json!({"query": "anything"})).await.unwrap();
+            })
+            .await;
+
+        // The view routes through `recall_in_view`, which under the hood
+        // calls `recall(Some("chat:abc"))` — a single read scoped to the
+        // view key, not the tool's stale scope. The probe records exactly
+        // that single argument.
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Some("chat:abc".to_string())],
+            "MEMORY_VIEW = Only must route through recall_in_view (single scoped read with the view key), got {seen:?}"
+        );
+    }
+
+    /// Plan 450: `MEMORY_VIEW = All` does NOT change today's behavior —
+    /// the tool still routes through the scope slot (layered read with the
+    /// tool's stored conversation, then shared unscoped backfill). This
+    /// documents the intent so future readers know the view is "off" unless
+    /// explicitly set to `Only`.
+    #[tokio::test]
+    async fn memory_view_all_falls_back_to_scope() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mem: Arc<dyn Memory> = Arc::new(RecallScopeProbe {
+            calls: calls.clone(),
+        });
+        let scope = ConversationScope::default();
+        *scope.lock().unwrap() = Some("chat:abc".into());
+
+        let tool = MemoryRecallTool::new(mem, scope);
+        let view = MemoryView::All;
+        MEMORY_VIEW
+            .scope(view, async {
+                tool.execute(json!({"query": "anything"})).await.unwrap();
+            })
+            .await;
+
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Some("chat:abc".to_string()), None],
+            "MEMORY_VIEW = All must defer to the scope slot (existing layered read), got {seen:?}"
+        );
     }
 }
