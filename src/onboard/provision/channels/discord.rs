@@ -164,7 +164,7 @@ impl TuiProvisioner for DiscordProvisioner {
                 id: "bot_mode".into(),
                 label: "Bot mode".into(),
                 options: vec![
-                    "Respond to @-mention only".to_string(),
+                    "Respond only when @-mentioned or replied to (DMs always)".to_string(),
                     "Respond to all messages".to_string(),
                     "Respond to all (including other bots)".to_string(),
                 ],
@@ -201,5 +201,99 @@ impl TuiProvisioner for DiscordProvisioner {
         .await?;
 
         Ok(ProvisionOutcome::Configured)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onboard::provision::smoke::OfflineProbes;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer, Transcript};
+
+    /// Walk Discord setup with the bot-mode picker answered by `pick`.
+    ///
+    /// Answers before the picker: token, the probe's "save anyway" confirmation,
+    /// the optional guild id, and the allowed-users prompt. The probe has no
+    /// egress here, so it resolves `Inconclusive` and option 0 keeps the
+    /// credential.
+    async fn drive_bot_mode(pick: usize) -> (Transcript, Config) {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _offline = OfflineProbes::engage();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &DiscordProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("placeholder-discord-bot-token"),
+                Answer::Pick(0),  // probe inconclusive -> save anyway
+                Answer::Text(""), // guild id optional
+                Answer::Text(""),
+                Answer::Pick(pick),
+            ],
+        )
+        .await;
+        (t, config)
+    }
+
+    fn bot_mode_options(t: &Transcript) -> Vec<String> {
+        t.events
+            .iter()
+            .find_map(|e| match e {
+                ProvisionEvent::Choose { id, options, .. } if id == "bot_mode" => {
+                    Some(options.clone())
+                }
+                _ => None,
+            })
+            .expect("the Discord flow must offer a bot-mode choice")
+    }
+
+    fn modes(config: &Config) -> (bool, bool) {
+        let discord = config
+            .channels_config
+            .discord
+            .as_ref()
+            .expect("discord config written");
+        (discord.mention_only, discord.listen_to_bots)
+    }
+
+    /// Each option carries a distinct (mention_only, listen_to_bots) pair, so a
+    /// label or order change that does not move the mapping with it silently
+    /// rewrites the operator's intent. Pin all three.
+    #[tokio::test]
+    async fn first_bot_mode_option_writes_mention_only_true() {
+        let (t, config) = drive_bot_mode(0).await;
+        assert!(t.configured(), "expected configured, got {:?}", t.outcome);
+        assert_eq!(modes(&config), (true, false));
+    }
+
+    #[tokio::test]
+    async fn second_bot_mode_option_writes_mention_only_false() {
+        let (t, config) = drive_bot_mode(1).await;
+        assert!(t.configured(), "expected configured, got {:?}", t.outcome);
+        assert_eq!(modes(&config), (false, false));
+    }
+
+    #[tokio::test]
+    async fn third_bot_mode_option_also_listens_to_bots() {
+        let (t, config) = drive_bot_mode(2).await;
+        assert!(t.configured(), "expected configured, got {:?}", t.outcome);
+        assert_eq!(modes(&config), (false, true));
+    }
+
+    #[tokio::test]
+    async fn bot_mode_options_name_the_reply_rule() {
+        let (t, _config) = drive_bot_mode(0).await;
+        assert_eq!(
+            bot_mode_options(&t),
+            vec![
+                "Respond only when @-mentioned or replied to (DMs always)".to_string(),
+                "Respond to all messages".to_string(),
+                "Respond to all (including other bots)".to_string(),
+            ]
+        );
     }
 }
