@@ -4371,6 +4371,7 @@ mod tests {
             tools_registry: Arc::new(tools),
             observer: Arc::new(crate::observability::NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            guest_system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,

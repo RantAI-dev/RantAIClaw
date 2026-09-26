@@ -86,6 +86,12 @@ pub struct PromptContext<'a> {
     /// machine-readable list of pre-approved shell commands; in Strict
     /// mode the list is short by design; in Manual/Off it's omitted.
     pub allowed_commands: &'a [String],
+    /// Skip `USER.md` and `MEMORY.md` injection. The owner channel surfaces
+    /// build the prompt with both files; the guest prompt omits them, so the
+    /// owner's profile and notes never reach a non-owner sender's context.
+    /// `AGENTS.md`, `SOUL.md`, `TOOLS.md` and `IDENTITY.md` still render — they
+    /// describe the agent, not the operator, and the plan keeps them in.
+    pub skip_owner_files: bool,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -246,8 +252,13 @@ impl PromptSection for IdentitySection {
         }
 
         // Core identity files, always injected (with a not-found marker if
-        // absent) on every surface.
-        for file in ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"] {
+        // absent) on every surface. `USER.md` is skipped under a guest
+        // prompt — the owner's profile is not the guest's to read.
+        let mut files = vec!["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md"];
+        if !ctx.skip_owner_files {
+            files.push("USER.md");
+        }
+        for file in files {
             inject_workspace_file(
                 &mut prompt,
                 ctx.workspace_dir,
@@ -282,12 +293,18 @@ impl PromptSection for IdentitySection {
             );
         }
 
-        inject_workspace_file(
-            &mut prompt,
-            ctx.workspace_dir,
-            "MEMORY.md",
-            ctx.bootstrap_max_chars,
-        );
+        // `MEMORY.md` is the owner's notes — a guest must not see them.
+        // Their conversation-local memory comes through the recall tier
+        // (`memory_recall` + the dispatch memory-context injection); the
+        // shared tier is owner-scoped only.
+        if !ctx.skip_owner_files {
+            inject_workspace_file(
+                &mut prompt,
+                ctx.workspace_dir,
+                "MEMORY.md",
+                ctx.bootstrap_max_chars,
+            );
+        }
 
         Ok(prompt)
     }
@@ -357,6 +374,7 @@ pub fn render_safety_section(
         dispatcher_instructions: "",
         autonomy_preset,
         allowed_commands,
+        skip_owner_files: false,
     };
     SafetySection.build(&ctx).unwrap_or_default()
 }
@@ -845,6 +863,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
 
         let section = IdentitySection;
@@ -877,6 +896,7 @@ mod tests {
             dispatcher_instructions: "instr",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -904,6 +924,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Memory"), "nudge missing: {prompt}");
@@ -930,6 +951,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(
@@ -955,6 +977,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(
@@ -979,6 +1002,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Smart),
             allowed_commands: &["ls *".to_string()],
+            skip_owner_files: false,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1081,6 +1105,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Strict),
             allowed_commands: &[],
+            skip_owner_files: false,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1112,6 +1137,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Strict),
             allowed_commands: &[],
+            skip_owner_files: false,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1146,6 +1172,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Smart),
             allowed_commands: &["ls *".to_string()],
+            skip_owner_files: false,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1177,6 +1204,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Manual),
             allowed_commands: &[],
+            skip_owner_files: false,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(out.contains("Manual (messaging channel)"), "{out}");
@@ -1220,6 +1248,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1266,6 +1295,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1291,6 +1321,7 @@ mod tests {
             dispatcher_instructions: "instr",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -1337,6 +1368,7 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
+            skip_owner_files: false,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1352,5 +1384,173 @@ mod tests {
         assert!(prompt.contains(
             "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
         ));
+    }
+
+    /// Plan 450: a guest prompt must not contain `USER.md` content. The
+    /// owner's profile is private to the owner; the channel runtime calls
+    /// `build_guest_system_prompt_with_mode` which sets
+    /// `skip_owner_files = true`, and the identity section omits the file
+    /// in that branch.
+    #[test]
+    fn guest_prompt_omits_user_md() {
+        let workspace =
+            std::env::temp_dir().join(format!("rantaiclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("USER.md"),
+            "OWNER_PROFILE_CANARY_TOKEN_98271",
+        )
+        .unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            surface: PromptSurface::Channel {
+                native_tools: false,
+            },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
+            skip_owner_files: true,
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(
+            !prompt.contains("OWNER_PROFILE_CANARY_TOKEN_98271"),
+            "guest prompt must not contain USER.md content, got:\n{prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// Plan 450: the owner's `MEMORY.md` is private to the owner. A guest
+    /// prompt must not surface it under any section header. The owner
+    /// prompt does — the test creates a workspace with MEMORY.md, then
+    /// builds both the owner prompt and the guest prompt and asserts only
+    /// the owner copy contains the canary.
+    #[test]
+    fn guest_prompt_omits_memory_md() {
+        let workspace =
+            std::env::temp_dir().join(format!("rantaiclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("MEMORY.md"),
+            "OWNER_MEMORY_CANARY_TOKEN_51297",
+        )
+        .unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let owner_prompt = SystemPromptBuilder::with_defaults()
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                skip_owner_files: false,
+            })
+            .unwrap();
+        let guest_prompt = SystemPromptBuilder::with_defaults()
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                skip_owner_files: true,
+            })
+            .unwrap();
+
+        assert!(
+            owner_prompt.contains("OWNER_MEMORY_CANARY_TOKEN_51297"),
+            "owner prompt should contain MEMORY.md"
+        );
+        assert!(
+            !guest_prompt.contains("OWNER_MEMORY_CANARY_TOKEN_51297"),
+            "guest prompt must not contain MEMORY.md, got:\n{guest_prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// Plan 450: `IdentitySection` directly — assert it omits the
+    /// "USER.md" header when `skip_owner_files` is true, even if the file
+    /// does not exist on disk. The not-found marker is also owner-private.
+    #[test]
+    fn identity_section_marks_user_md_when_owner() {
+        let workspace =
+            std::env::temp_dir().join(format!("rantaiclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let owner = IdentitySection
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                skip_owner_files: false,
+            })
+            .unwrap();
+        let guest = IdentitySection
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                skip_owner_files: true,
+            })
+            .unwrap();
+
+        assert!(
+            owner.contains("USER.md"),
+            "owner identity section should mention USER.md (even as not-found marker)"
+        );
+        assert!(
+            !guest.contains("USER.md"),
+            "guest identity section must not mention USER.md at all, got:\n{guest}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

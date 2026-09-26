@@ -108,6 +108,9 @@ pub fn build_system_prompt(
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
 ) -> String {
+    // Default public surface: include `USER.md` and `MEMORY.md`. Owners and
+    // tests use this entry; the guest-only path goes through
+    // [`build_system_prompt_with_mode`] with `skip_owner_files = true`.
     build_system_prompt_with_mode(
         workspace_dir,
         model_name,
@@ -117,6 +120,33 @@ pub fn build_system_prompt(
         bootstrap_max_chars,
         false,
         crate::config::SkillsPromptInjectionMode::Full,
+        false,
+    )
+}
+
+/// Build the guest-channel system prompt — same builder, but `USER.md` and
+/// `MEMORY.md` are skipped. Used by the channel runtime so a guest's first
+/// turn never sees the owner's profile or notes.
+pub fn build_guest_system_prompt_with_mode(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
+    build_system_prompt_with_mode(
+        workspace_dir,
+        model_name,
+        tools,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        native_tools,
+        skills_prompt_mode,
+        true,
     )
 }
 
@@ -129,6 +159,7 @@ pub fn build_system_prompt_with_mode(
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    skip_owner_files: bool,
 ) -> String {
     // Unified prompt builder: the SAME `SystemPromptBuilder` the TUI/`Agent`
     // path uses, with `surface = Channel` so the surface-specific hint sections
@@ -172,6 +203,7 @@ pub fn build_system_prompt_with_mode(
         dispatcher_instructions: "",
         autonomy_preset,
         allowed_commands: &[],
+        skip_owner_files,
     };
 
     let prompt = SystemPromptBuilder::with_defaults()

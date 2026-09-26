@@ -155,6 +155,25 @@ impl GuestGate {
                 ));
             }
         }
+        // Path-bearing tools (file_read, file_write, pdf_read, image_info)
+        // may still try to read `MEMORY.md`, `USER.md`, or anything under
+        // `memory/` even when they are in `guest_allowed_tools`. The owner's
+        // profile and notes are private to the owner; deny with the same
+        // single sentence regardless of which tool tried. Operates even when
+        // the operator listed the tool for guests — that listing is the
+        // capability grant, not a privacy override.
+        if is_path_tool(tool) {
+            let path = arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if is_private_owner_path(path) {
+                return Some(format!(
+                    "This file is private to the owner. {}",
+                    Self::how_to_become_owner_sentence()
+                ));
+            }
+        }
         None
     }
 
@@ -173,6 +192,37 @@ impl GuestGate {
 /// Tools whose calls carry a shell `command` argument to gate.
 fn is_shell_tool(tool: &str) -> bool {
     matches!(tool, "shell" | "bash" | "run_command")
+}
+
+/// Tools whose calls reach the workspace on a path argument. Plan 450 keeps
+/// a guest from reading the owner's profile (`USER.md`) or notes
+/// (`MEMORY.md`) directly even when the operator lists one of these tools in
+/// `guest_allowed_tools`. The dispatch makes sure `USER.md` and `MEMORY.md`
+/// are skipped in the system prompt's identity section, so a guest should
+/// never see that content in the prompt either — these extra checks stop
+/// a guest's tool call from reopening the path through `file_read`.
+fn is_path_tool(tool: &str) -> bool {
+    matches!(tool, "file_read" | "file_write" | "pdf_read" | "image_info")
+}
+
+/// Last path component (case-insensitive). `MEMORY.md`, `USER.md`, and
+/// `user.md` all match; `./MEMORY.md`, `memory/brain.db`, and
+/// `<workspace>/memory/2026-09-01.md` all match by their `memory` component.
+fn is_private_owner_path(path: &str) -> bool {
+    if path.trim().is_empty() {
+        return false;
+    }
+    let normalized = path.replace('\\', "/");
+    let lowered = normalized.to_ascii_lowercase();
+    // Last component is `MEMORY.md` or `USER.md`, case-insensitive. ".//USER.md"
+    // and "/foo/USER.md" both have `USER.md` as their last segment.
+    let last = lowered.rsplit('/').next().unwrap_or("");
+    if matches!(last, "memory.md" | "user.md") {
+        return true;
+    }
+    // Any `memory` path component catches the day's `memory/brain.db`,
+    // `memory/2026-09-01.md`, etc. The owner keeps those; a guest does not.
+    lowered.split('/').any(|seg| seg == "memory")
 }
 
 /// Anchored glob match supporting `*` (matches any run of characters, incl.
@@ -433,5 +483,94 @@ mod tests {
             reason.contains("/claim"),
             "denial must name /claim: {reason:?}"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Plan 450: private-path rule. The owner's profile (`USER.md`) and
+    // notes (`MEMORY.md`) are owner-private even when the operator
+    // adds the path tools to `guest_allowed_tools`. The dispatch also
+    // skips those files in the guest prompt, so a guest should never
+    // see the content; the rule here closes the bypass where the model
+    // could `file_read` the same path directly.
+    #[test]
+    fn guest_path_tool_blocked_on_memory_md() {
+        let g = GuestGate::new(
+            &[
+                "file_read".to_string(),
+                "file_write".to_string(),
+                "pdf_read".to_string(),
+                "image_info".to_string(),
+            ],
+            &[],
+        );
+        for tool in ["file_read", "file_write", "pdf_read", "image_info"] {
+            // Plain
+            let r = g
+                .deny_reason(tool, &json!({"path": "MEMORY.md"}))
+                .unwrap_or_else(|| panic!("{tool} on MEMORY.md must deny"));
+            assert!(r.contains("private to the owner"), "{tool}: {r}");
+            assert!(r.contains("/claim"), "{tool}: {r}");
+            // Case-insensitive on the filename
+            let r2 = g
+                .deny_reason(tool, &json!({"path": "memory.md"}))
+                .unwrap_or_else(|| panic!("{tool} on memory.md must deny (case-insensitive)"));
+            assert!(r2.contains("private to the owner"), "{tool}: {r2}");
+            // User.md too
+            let r3 = g
+                .deny_reason(tool, &json!({"path": "USER.md"}))
+                .unwrap_or_else(|| panic!("{tool} on USER.md must deny"));
+            assert!(r3.contains("private to the owner"), "{tool}: {r3}");
+            // Anything under `memory/`
+            let r4 = g
+                .deny_reason(tool, &json!({"path": "memory/2026-09-26.md"}))
+                .unwrap_or_else(|| panic!("{tool} on memory/<file> must deny"));
+            assert!(r4.contains("private to the owner"), "{tool}: {r4}");
+            // Nested USER.md
+            let r5 = g
+                .deny_reason(tool, &json!({"path": "/var/lib/rantaiclaw/USER.md"}))
+                .unwrap_or_else(|| panic!("{tool} on nested USER.md must deny"));
+            assert!(r5.contains("private to the owner"), "{tool}: {r5}");
+            // Backslash-normalized too
+            let r6 = g
+                .deny_reason(tool, &json!({"path": "memory\\2026-09-26.md"}))
+                .unwrap_or_else(|| panic!("{tool} on backslash memory path must deny"));
+            assert!(r6.contains("private to the owner"), "{tool}: {r6}");
+        }
+    }
+
+    #[test]
+    fn guest_path_tool_allowed_on_non_private_paths() {
+        let g = GuestGate::new(&["file_read".to_string()], &[]);
+        // Plain files in the workspace stay readable when allowlisted.
+        assert!(g
+            .deny_reason("file_read", &json!({"path": "notes.txt"}))
+            .is_none());
+        // Directories named `something_memory` (not `memory`) are fine.
+        assert!(g
+            .deny_reason("file_read", &json!({"path": "memoryless/foo.md"}))
+            .is_none());
+        // Empty / missing path → no privacy verdict (gate sees no reason to deny).
+        assert!(g.deny_reason("file_read", &json!({})).is_none());
+        // Filename happens to contain `memory` but is not the special path.
+        assert!(g
+            .deny_reason("file_read", &json!({"path": "team_memory.md"}))
+            .is_none());
+    }
+
+    #[test]
+    fn guest_path_rule_applies_to_non_path_tools_too() {
+        // The path rule is keyed on `path_tools` (file_read, file_write,
+        // pdf_read, image_info). A tool that takes a non-path argument
+        // (e.g. `shell`) must keep its existing semantics — the rule does
+        // not silently widen to other tools.
+        let g = GuestGate::new(&["shell".to_string()], &["*".to_string()]);
+        // The wildcard command lets the shell ceiling pass, so the test can
+        // prove the path rule does not fire on shell. shell allowed + a
+        // private-path argument → governed by the shell arm, not the path arm.
+        // No path because the rule doesn't fire on shell and "MEMORY.md" isn't
+        // a command the gate parses.
+        assert!(g
+            .deny_reason("shell", &json!({"command": "MEMORY.md"}))
+            .is_none());
     }
 }

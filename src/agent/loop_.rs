@@ -2691,6 +2691,7 @@ pub async fn run_with_scope(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        false,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -3187,6 +3188,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        false,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -5916,6 +5918,7 @@ Let me check the result."#;
             None, // no bootstrap_max_chars
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
+            false,
         );
 
         // Must contain zero XML protocol artifacts

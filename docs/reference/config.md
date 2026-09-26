@@ -572,6 +572,12 @@ the gateway webhook) keep the tool's read global — a single shared scope
 would race across concurrent turns — and guests cannot invoke it at all
 unless an operator adds `memory_recall` to `guest_allowed_tools`.
 
+On channels, a guest's `memory_recall` reads only rows that belong to the
+active conversation (matching `session_id`). The shared unscoped tier is never
+backfilled into a guest's prompt. Even when the operator lists `memory_recall`
+in `guest_allowed_tools`, a guest cannot see other conversations' memory or the
+owner's notes. An owner's memory read is unchanged.
+
 ### Scores are absolute
 
 `MemoryEntry.score` is absolute relevance in `[0, 1]`: cosine similarity for the

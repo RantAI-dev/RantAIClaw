@@ -1001,6 +1001,10 @@ impl Agent {
             dispatcher_instructions: &instructions,
             autonomy_preset,
             allowed_commands: &allowed_commands,
+            // The interactive TUI / CLI / console / cron surface is the
+            // owner's path; plan 450's guest-scoping is channel-only and
+            // does not apply here.
+            skip_owner_files: false,
         };
         self.prompt_builder.build(&ctx)
     }
