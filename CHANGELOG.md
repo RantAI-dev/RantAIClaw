@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restoring the ZeroClaw copyright attribution that was dropped by commit
   `caa0ef55` (2026-03-17). The RantaiClaw license itself stays AGPL-3.0-only.
 
+### Fixed
+
+- The email channel finds the `Authentication-Results` header by name, so owner
+  recognition keeps working on any header spelling and survives the next
+  mail-parser upgrade. The previous lookup matched `HeaderName::Other(...)`,
+  which newer `mail-parser` releases replace with a dedicated `AuthenticationResults`
+  variant; the name-based lookup does not depend on which variant the parser
+  chose.
+
 ### Changed
 
 - Guests (allowed senders who are not in `channels_config.approval_owners`)
