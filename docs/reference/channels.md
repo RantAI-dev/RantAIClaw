@@ -1104,6 +1104,18 @@ The wizard now includes a dedicated **Lark/Feishu** step with:
 
 Persistent-connection mode also needs the `im.message.receive_v1` event subscribed in the developer console. `im:resource` alone is not enough to read a message's own inbound attachment: that is `im:message:readonly`, a distinct scope a 2026-09-16 drive found missing even though upload already worked.
 
+**Group rule:** in a group chat the bot answers only when the message is addressed to it —
+@-mentioned, or a direct reply to one of the bot's own messages (the reply's `parent_id`
+points at a message the bot sent). Commands in a group need the mention too. Any other
+group message is dropped silently: no reply, no rejected-sender warning, and it is not
+added to the conversation history. The rule applies in both receive modes, and the bot's
+identity is resolved at listener startup on both; while it cannot be resolved, group
+messages are ignored and the journal says so once. Sent-message memory is in-process and
+bounded to the most recent 1,000 ids, so after a daemon restart a reply to an older bot
+message needs a mention again — and in webhook mode replies are matched against the
+messages the receiving instance itself sent, so there the mention carries the gate.
+Direct messages are always answered.
+
 Webhook-mode authenticity (accurate as of plan 124, merged):
 
 - The event endpoint authenticates with the **`token` field in the callback

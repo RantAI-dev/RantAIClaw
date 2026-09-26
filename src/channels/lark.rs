@@ -122,6 +122,15 @@ struct LarkMessage {
     content: String,
     #[serde(default)]
     mentions: Vec<serde_json::Value>,
+    /// The message this one directly replies to. Lark's message resource
+    /// documents it as "Parent message ID; used for replying to message
+    /// scenarios" — <https://open.larksuite.com/document/server-docs/im-v1/message/list>.
+    /// Empty when the message is not a reply. The wire also carries
+    /// `root_id` (the thread root), deliberately not read: a reply deep in
+    /// a thread to someone else is not addressed to the bot even when the
+    /// bot started the thread.
+    #[serde(default)]
+    parent_id: String,
 }
 
 /// Heartbeat timeout for WS connection — must be larger than ping_interval (default 120 s).
@@ -133,6 +142,11 @@ const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(120);
 const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
+/// Cap on the remembered ids of messages the bot has sent (the same bound
+/// Slack's `MAX_THREAD_ROOTS` applies to its thread memory). Past the cap
+/// the oldest id is evicted, so after a restart — or once a message ages
+/// out of memory — a reply to that older bot message needs a mention again.
+const MAX_SENT_MESSAGE_IDS: usize = 1_000;
 
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
@@ -268,6 +282,17 @@ pub struct LarkChannel {
     bot_identity: Arc<RwLock<Option<BotIdentity>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Ids of the messages this instance has sent, oldest first. Lark has no
+    /// "the bot posted here" marker, so the bot's own sends are the record a
+    /// group reply is matched against: a reply whose `parent_id` is one of
+    /// these ids is addressed. The recipient at send time is a chat id, which
+    /// does not say whether the chat is a group, so every send is remembered;
+    /// the gate consults the set only for `chat_type == "group"` messages.
+    /// Bounded by [`MAX_SENT_MESSAGE_IDS`], oldest evicted. In webhook mode
+    /// sends flow through the outer channel instance, so the receiving
+    /// instance's set here stays empty and the mention half of the rule
+    /// carries the gate there.
+    sent_message_ids: Arc<std::sync::RwLock<Vec<String>>>,
     /// The operator's inbound-image caps, applied to a downloaded `image_key`
     /// the same way every other channel applies them. Defaults to
     /// `MultimodalConfig::default()` until `with_multimodal` is called, the
@@ -295,6 +320,7 @@ impl LarkChannel {
             tenant_token: Arc::new(RwLock::new(None)),
             bot_identity: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            sent_message_ids: Arc::new(std::sync::RwLock::new(Vec::new())),
             multimodal: crate::config::MultimodalConfig::default(),
         }
     }
@@ -716,14 +742,30 @@ impl LarkChannel {
                             // Gate before spending a network round trip and a
                             // budget slot, unlike `text`/`post` which only
                             // parse JSON: an unauthorized sender or an
-                            // unmentioned group member must not cost
+                            // unaddressed group member must not cost
                             // anything, the same rule Discord's
-                            // `attachment_markers` follows. `text`/`post`
-                            // decode before this gate too, but that decode is
-                            // free and the pairing intercept below needs it
-                            // decoded first for self-onboarding; an image
-                            // never carries a pairing code, so it has no
-                            // reason to jump the gate.
+                            // `attachment_markers` follows. The group gate
+                            // comes BEFORE the allowlist so an unaddressed
+                            // image from someone outside the allowlist is
+                            // dropped silently — a busy group must not
+                            // produce one rejected-sender warning per
+                            // message, the same rule WhatsApp Web's group
+                            // gate follows. `text`/`post` decode before the
+                            // gate too, but that decode is free and the
+                            // pairing intercept below needs it decoded first
+                            // for self-onboarding; an image never carries a
+                            // pairing code, so it has no reason to jump the
+                            // gate.
+                            if lark_msg.chat_type == "group"
+                                && !self
+                                    .group_message_is_addressed(
+                                        &lark_msg.mentions,
+                                        &lark_msg.parent_id,
+                                    )
+                                    .await
+                            {
+                                continue;
+                            }
                             if !self.is_user_allowed(sender_open_id) {
                                 tracing::warn!(
                                     "{}",
@@ -737,12 +779,6 @@ impl LarkChannel {
                                      {sender_open_id}"
                                 );
                                 continue;
-                            }
-                            if lark_msg.chat_type == "group" {
-                                let me = self.bot_identity.read().await.clone();
-                                if !should_respond_in_group(&lark_msg.mentions, me.as_ref()) {
-                                    continue;
-                                }
                             }
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
                                 Ok(v) => v,
@@ -766,10 +802,13 @@ impl LarkChannel {
                     let text = text.trim().to_string();
                     if text.is_empty() { continue; }
 
-                    // Group-chat: only respond when explicitly @-mentioned
-                    let me = self.bot_identity.read().await.clone();
+                    // Group-chat: only respond when the message is addressed
+                    // to the bot — an @-mention, or a reply to a message the
+                    // bot itself sent.
                     if lark_msg.chat_type == "group"
-                        && !should_respond_in_group(&lark_msg.mentions, me.as_ref())
+                        && !self
+                            .group_message_is_addressed(&lark_msg.mentions, &lark_msg.parent_id)
+                            .await
                     {
                         continue;
                     }
@@ -888,9 +927,10 @@ impl LarkChannel {
         Ok(identity)
     }
 
-    /// Resolve and cache the bot identity, warning — but not failing — when the
-    /// lookup does not work. See [`should_respond_in_group`] for why this
-    /// degrades permissively rather than going silent.
+    /// Resolve and cache the bot identity, warning — but not failing — when
+    /// the lookup does not work. See [`should_respond_in_group`] for why an
+    /// unresolved identity means group messages are ignored rather than
+    /// answered on a guess.
     async fn ensure_bot_identity(&self) {
         if self.bot_identity.read().await.is_some() {
             return;
@@ -906,9 +946,9 @@ impl LarkChannel {
             }
             Err(e) => {
                 tracing::warn!(
-                    "Lark: could not resolve the bot's own identity ({e}). Group mention \
-                     matching falls back to responding whenever anyone is mentioned — \
-                     noisier than intended, but the channel keeps working."
+                    "Lark: could not resolve the bot's own identity ({e}). Group messages are \
+                     ignored until it can be resolved — restart the daemon once the platform is \
+                     reachable. Direct messages are unaffected."
                 );
             }
         }
@@ -925,6 +965,54 @@ impl LarkChannel {
         if let Ok(mut users) = self.allowed_users.write() {
             if !users.iter().any(|u| u == identity) {
                 users.push(identity.to_string());
+            }
+        }
+    }
+
+    /// The group addressing gate, shared by the websocket text path, the
+    /// websocket image path and the webhook path: does this group message
+    /// address the bot — an @-mention of it, or a reply to a message it
+    /// sent? DMs are never gated, so the caller checks `chat_type` first.
+    ///
+    /// When the bot's own identity is unknown the message is ignored, and
+    /// the journal says so once per process rather than once per message.
+    async fn group_message_is_addressed(
+        &self,
+        mentions: &[serde_json::Value],
+        parent_id: &str,
+    ) -> bool {
+        let me = self.bot_identity.read().await.clone();
+        if me.is_none() {
+            if !GROUP_IDENTITY_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "Lark: group messages are ignored until the bot's own identity is known"
+                );
+            }
+            return false;
+        }
+        let sent = self
+            .sent_message_ids
+            .read()
+            .map(|ids| ids.clone())
+            .unwrap_or_default();
+        should_respond_in_group(mentions, me.as_ref(), Some(parent_id), &sent)
+    }
+
+    /// Record the id of a message this instance just sent, evicting the
+    /// oldest past [`MAX_SENT_MESSAGE_IDS`]. A response that carries no
+    /// `message_id` records nothing — there is nothing a reply could point
+    /// at. Same shape as Slack's `remember_thread_root`.
+    fn remember_sent_message_id(&self, body: &serde_json::Value) {
+        let Some(id) = extract_sent_message_id(body) else {
+            return;
+        };
+        if let Ok(mut ids) = self.sent_message_ids.write() {
+            if let Some(seen) = ids.iter().position(|recorded| recorded == &id) {
+                ids.remove(seen);
+            }
+            ids.push(id);
+            while ids.len() > MAX_SENT_MESSAGE_IDS {
+                ids.remove(0);
             }
         }
     }
@@ -1219,6 +1307,35 @@ impl LarkChannel {
             return messages;
         }
 
+        // Group messages follow the same addressing rule as the websocket
+        // path — an @-mention of the bot, or a reply to a message it sent.
+        // `parent_id` per Lark's message resource, "Parent message ID; used
+        // for replying to message scenarios"
+        // (https://open.larksuite.com/document/server-docs/im-v1/message/list).
+        // The allowlist stays ahead of the gate here: that ordering is this
+        // path's existing contract. Note the reply half can only match ids
+        // this instance itself sent — webhook mode's sends flow through the
+        // outer channel instance, so the mention half carries the gate (see
+        // the `sent_message_ids` field comment).
+        let chat_type = event
+            .pointer("/message/chat_type")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if chat_type == "group" {
+            let parent_id = event
+                .pointer("/message/parent_id")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let mentions = event
+                .pointer("/message/mentions")
+                .and_then(|m| m.as_array())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[]);
+            if !self.group_message_is_addressed(mentions, parent_id).await {
+                return messages;
+            }
+        }
+
         // Extract message content (text and post supported)
         let msg_type = event
             .pointer("/message/message_type")
@@ -1353,10 +1470,12 @@ impl LarkChannel {
             }
 
             ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+            self.remember_sent_message_id(&retry_response);
             return Ok(());
         }
 
         ensure_lark_send_success(status, &response, "without token refresh")?;
+        self.remember_sent_message_id(&response);
         Ok(())
     }
 
@@ -1531,14 +1650,18 @@ impl LarkChannel {
             let new_token = self.get_tenant_access_token().await?;
             let (retry_status, retry_response) =
                 self.send_text_once(&url, &new_token, &body).await?;
-            return ensure_lark_send_success(
+            ensure_lark_send_success(
                 retry_status,
                 &retry_response,
                 "sending an attachment reference after token refresh",
-            );
+            )?;
+            self.remember_sent_message_id(&retry_response);
+            return Ok(());
         }
 
-        ensure_lark_send_success(status, &response, "sending an attachment reference")
+        ensure_lark_send_success(status, &response, "sending an attachment reference")?;
+        self.remember_sent_message_id(&response);
+        Ok(())
     }
 }
 
@@ -1549,6 +1672,17 @@ fn extract_upload_key(body: &serde_json::Value, key_field: &str) -> anyhow::Resu
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("Lark upload response carried no {key_field}"))
+}
+
+/// Pull the id of the just-sent message out of a send response body, so the
+/// group gate can later match a reply's `parent_id` against it. A free
+/// function so it is reachable from a test without a network call — same
+/// shape as `extract_upload_key`.
+fn extract_sent_message_id(body: &serde_json::Value) -> Option<String> {
+    body.pointer("/data/message_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 #[async_trait]
@@ -1775,18 +1909,25 @@ impl LarkChannel {
             );
         }
 
+        // The group addressing gate matches mentions against the bot's own
+        // identity, so resolve it on this receiving instance the way
+        // `listen_ws` does at startup. Failure warns and continues: DMs keep
+        // working and the gate already degrades to ignoring group messages.
+        let channel = Arc::new(LarkChannel::new(
+            self.app_id.clone(),
+            self.app_secret.clone(),
+            self.verification_token.clone(),
+            None,
+            self.allowed_users
+                .read()
+                .map(|u| u.clone())
+                .unwrap_or_default(),
+        ));
+        channel.ensure_bot_identity().await;
+
         let state = AppState {
             verification_token: self.verification_token.clone(),
-            channel: Arc::new(LarkChannel::new(
-                self.app_id.clone(),
-                self.app_secret.clone(),
-                self.verification_token.clone(),
-                None,
-                self.allowed_users
-                    .read()
-                    .map(|u| u.clone())
-                    .unwrap_or_default(),
-            )),
+            channel,
             tx,
         };
 
@@ -2026,7 +2167,14 @@ pub(crate) struct BotIdentity {
     pub name: String,
 }
 
-/// In group chats, only respond when **the bot** is explicitly @-mentioned.
+/// Warned once per process when the bot's own identity is unknown and group
+/// messages therefore cannot be matched — the same once-only shape WhatsApp
+/// Web's `GROUP_IDENTITY_WARNED` and Slack's `BOT_USER_ID_WARNED` use.
+static GROUP_IDENTITY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// In group chats, only respond when the message is **addressed to the bot**:
+/// an @-mention of it, or a reply to a message the bot itself sent.
 ///
 /// This used to be `!mentions.is_empty()`, so the bot answered whenever anyone
 /// at all was mentioned — in an active group that is close to answering
@@ -2036,17 +2184,29 @@ pub(crate) struct BotIdentity {
 /// and its display `name`. Lark populates the id for app mentions and the name
 /// for both, and neither is reliable alone.
 ///
-/// `identity` is `None` when the bot-info lookup failed at startup. That falls
-/// back to the old permissive behaviour on purpose: the alternative — treating
-/// an unknown identity as "never mentioned" — silences the channel completely
-/// on a transient API error, which reads as a broken bot rather than a
-/// degraded one. The caller warns when it happens.
-fn should_respond_in_group(mentions: &[serde_json::Value], identity: Option<&BotIdentity>) -> bool {
+/// The reply half reads `parent_id`, which Lark's message resource documents
+/// as "Parent message ID; used for replying to message scenarios"
+/// (<https://open.larksuite.com/document/server-docs/im-v1/message/list>) — the
+/// directly-replied message, which is what "addressed to the bot" means here.
+/// The wire also carries `root_id`, the thread root, deliberately unused: a
+/// reply deep in a thread to someone else is not addressed to the bot even
+/// when the bot started the thread.
+///
+/// `identity` is `None` when the bot-info lookup failed at startup. Group
+/// messages are then ignored — the caller warns once — rather than answered on
+/// a guess: the old fallback answered any message mentioning *anyone*, which
+/// reads as a broken bot rather than a degraded one.
+fn should_respond_in_group(
+    mentions: &[serde_json::Value],
+    identity: Option<&BotIdentity>,
+    parent_id: Option<&str>,
+    sent_message_ids: &[String],
+) -> bool {
     let Some(me) = identity else {
-        return !mentions.is_empty();
+        return false;
     };
 
-    mentions.iter().any(|m| {
+    let mentioned = mentions.iter().any(|m| {
         let id_match = !me.open_id.is_empty()
             && m.pointer("/id/open_id")
                 .and_then(|v| v.as_str())
@@ -2058,7 +2218,12 @@ fn should_respond_in_group(mentions: &[serde_json::Value], identity: Option<&Bot
                 .is_some_and(|v| v.eq_ignore_ascii_case(&me.name));
 
         id_match || name_match
-    })
+    });
+
+    let replied_to_bot = parent_id
+        .is_some_and(|parent| !parent.is_empty() && sent_message_ids.iter().any(|id| id == parent));
+
+    mentioned || replied_to_bot
 }
 
 #[cfg(test)]
@@ -2170,18 +2335,22 @@ mod mention_gate_tests {
         serde_json::json!({ "key": "@_user_1", "id": { "open_id": open_id }, "name": name })
     }
 
+    fn sent_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
     /// The defect: the gate was `!mentions.is_empty()`, so mentioning any
     /// colleague in a busy group made the bot answer.
     #[test]
     fn someone_elses_mention_does_not_wake_the_bot() {
         let others = vec![mention("ou_someone_else", "Another Person")];
-        assert!(!should_respond_in_group(&others, Some(&me())));
+        assert!(!should_respond_in_group(&others, Some(&me()), None, &[]));
     }
 
     #[test]
     fn the_bots_own_open_id_wakes_it() {
         let m = vec![mention("ou_rantaiclaw_bot", "")];
-        assert!(should_respond_in_group(&m, Some(&me())));
+        assert!(should_respond_in_group(&m, Some(&me()), None, &[]));
     }
 
     /// Lark populates the id for app mentions and the name for both, so
@@ -2190,7 +2359,7 @@ mod mention_gate_tests {
     fn the_bots_display_name_also_wakes_it() {
         let m = vec![mention("", "rantaiclawagent")];
         assert!(
-            should_respond_in_group(&m, Some(&me())),
+            should_respond_in_group(&m, Some(&me()), None, &[]),
             "name match must be case-insensitive"
         );
     }
@@ -2201,21 +2370,70 @@ mod mention_gate_tests {
             mention("ou_someone_else", "Another Person"),
             mention("ou_rantaiclaw_bot", "RantaiClawAgent"),
         ];
-        assert!(should_respond_in_group(&m, Some(&me())));
+        assert!(should_respond_in_group(&m, Some(&me()), None, &[]));
     }
 
     #[test]
     fn no_mentions_never_wakes_it() {
-        assert!(!should_respond_in_group(&[], Some(&me())));
+        assert!(!should_respond_in_group(&[], Some(&me()), None, &[]));
     }
 
-    /// When the identity lookup failed we keep the old permissive behaviour
-    /// rather than going silent — a degraded bot beats one that looks broken.
+    /// A group member who replies to a message the bot itself sent, without
+    /// typing an @-mention, is answered: the reply's `parent_id` points at
+    /// the bot's message.
     #[test]
-    fn an_unknown_identity_falls_back_to_permissive() {
+    fn a_reply_to_a_message_the_bot_sent_is_addressed() {
+        let mine = sent_ids(&["om_bot_1", "om_bot_2"]);
+        assert!(should_respond_in_group(
+            &[],
+            Some(&me()),
+            Some("om_bot_2"),
+            &mine
+        ));
+    }
+
+    /// The reply must land on the bot's own message; replying to a
+    /// colleague's message is ordinary conversation, not being addressed.
+    /// An empty memory behaves the same way — nothing remembered, nothing
+    /// counts as a reply to the bot.
+    #[test]
+    fn a_reply_to_someone_elses_message_is_not_addressed() {
+        let mine = sent_ids(&["om_bot_1"]);
+        assert!(!should_respond_in_group(
+            &[],
+            Some(&me()),
+            Some("om_other_1"),
+            &mine
+        ));
+        assert!(!should_respond_in_group(
+            &[],
+            Some(&me()),
+            Some("om_other_1"),
+            &[]
+        ));
+    }
+
+    /// An absent or empty `parent_id` is not a reply at all.
+    #[test]
+    fn a_missing_parent_id_is_not_treated_as_a_reply() {
+        let mine = sent_ids(&["om_bot_1"]);
+        assert!(!should_respond_in_group(&[], Some(&me()), Some(""), &mine));
+        assert!(!should_respond_in_group(&[], Some(&me()), None, &mine));
+    }
+
+    /// When the identity lookup failed the gate stays closed rather than
+    /// guessing: the old fallback answered any message that mentioned
+    /// *anyone*, which in an active group is close to answering everything.
+    /// The caller warns once (pinned by source in `mod tests`).
+    #[test]
+    fn an_unknown_identity_is_ignored_even_when_someone_is_mentioned() {
         let others = vec![mention("ou_someone_else", "Another Person")];
-        assert!(should_respond_in_group(&others, None));
-        assert!(!should_respond_in_group(&[], None));
+        assert!(!should_respond_in_group(&others, None, None, &[]));
+        assert!(!should_respond_in_group(&[], None, None, &[]));
+        // Even a mention carrying the bot's own open_id cannot be trusted
+        // when there is no identity to compare it against.
+        let maybe_me = vec![mention("ou_rantaiclaw_bot", "")];
+        assert!(!should_respond_in_group(&maybe_me, None, None, &[]));
     }
 }
 
@@ -3150,6 +3368,236 @@ mod tests {
         assert_eq!(
             redact_url_query("not a url"),
             "<unparseable endpoint, redacted>"
+        );
+    }
+
+    // ─── Group addressing gate ───────────────────────────────────────────
+
+    /// A channel whose allowlist admits the fixture sender, so the group
+    /// gate — not the allowlist — is what decides the outcome.
+    fn allowed_channel() -> LarkChannel {
+        LarkChannel::new(
+            "cli_test_app_id".into(),
+            "test_app_secret".into(),
+            "test_verification_token".into(),
+            None,
+            vec!["ou_rantaiclaw_user".into()],
+        )
+    }
+
+    /// Resolve the bot identity directly, the way a listener start does, so
+    /// the gate has something to match mentions against without a network
+    /// call. Fixture ids only.
+    async fn seed_bot_identity(ch: &LarkChannel) {
+        *ch.bot_identity.write().await = Some(BotIdentity {
+            open_id: "ou_rantaiclaw_bot".into(),
+            name: "RantaiClawAgent".into(),
+        });
+    }
+
+    /// An inbound callback payload shaped the way `parse_event_payload`
+    /// reads one. Neutral fixture ids throughout; no live values.
+    fn webhook_payload(
+        chat_type: &str,
+        parent_id: &str,
+        mentions: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_rantaiclaw_user" } },
+                "message": {
+                    "message_id": "om_inbound_1",
+                    "chat_id": "oc_rantaiclaw_chat",
+                    "chat_type": chat_type,
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "parent_id": parent_id,
+                    "mentions": mentions,
+                }
+            }
+        })
+    }
+
+    /// In webhook mode a group message that does not address the bot is
+    /// ignored, the same rule the websocket path applies. Before the gate
+    /// existed the webhook answered every group message an allowlisted
+    /// member sent — mentioning anyone at all included.
+    #[tokio::test]
+    async fn a_webhook_group_message_that_does_not_address_the_bot_is_ignored() {
+        let ch = allowed_channel();
+        seed_bot_identity(&ch).await;
+
+        let plain = webhook_payload("group", "", serde_json::json!([]));
+        assert!(
+            ch.parse_event_payload(&plain).await.is_empty(),
+            "an unaddressed group message must be ignored, not answered"
+        );
+
+        let other_mention = webhook_payload(
+            "group",
+            "",
+            serde_json::json!([
+                { "key": "@_user_1", "id": { "open_id": "ou_someone_else" }, "name": "Another Person" }
+            ]),
+        );
+        assert!(
+            ch.parse_event_payload(&other_mention).await.is_empty(),
+            "mentioning a colleague is not addressing the bot"
+        );
+    }
+
+    /// Direct messages are never gated — the rule is group-only, on both
+    /// receive paths, and a DM must not depend on the bot's identity being
+    /// known either (deliberately not seeded here).
+    #[tokio::test]
+    async fn a_webhook_dm_is_never_gated() {
+        let ch = allowed_channel();
+        let plain = webhook_payload("p2p", "", serde_json::json!([]));
+        let messages = ch.parse_event_payload(&plain).await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "a DM must be answered without any addressing"
+        );
+    }
+
+    /// The websocket image arm's ordering cannot be driven without a live
+    /// WS event, and the WARN it must not produce has no subscriber in
+    /// tests, so the order is pinned by source, the way `mod_tests.rs`
+    /// pins gate wiring: within the `"image"` arm the group gate must come
+    /// before the allowlist, so an unaddressed image from a sender outside
+    /// the allowlist is dropped before the rejected-sender warning can fire.
+    #[test]
+    fn the_image_path_gates_the_group_before_the_allowlist() {
+        let src = include_str!("lark.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let after_image = production
+            .split("\"image\" =>")
+            .nth(1)
+            .expect("the websocket image arm exists");
+        let arm = &after_image[..after_image
+            .find("_ => {")
+            .expect("the catch-all arm closes the image arm")];
+        let gate = arm
+            .find("group_message_is_addressed")
+            .expect("the image path must run the group addressing gate");
+        let allowlist = arm
+            .find("is_user_allowed")
+            .expect("the allowlist must still run in the image path");
+        assert!(
+            gate < allowlist,
+            "the group gate must precede the allowlist in the image path: an \
+             unaddressed image from a non-allowlisted sender is dropped \
+             silently, not answered with a rejected-sender warning"
+        );
+    }
+
+    /// A send response's `data.message_id` cannot be captured without a
+    /// live workspace, so the wiring is pinned by source, the way Slack
+    /// pins its thread-root recording: every outbound path that produces a
+    /// sent message must remember its id, or a group reply to that message
+    /// stops counting as addressed.
+    #[test]
+    fn every_send_path_remembers_its_message_id() {
+        let src = include_str!("lark.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        for signature in ["async fn send_text_message(", "async fn send_key_message("] {
+            let body = production
+                .split(signature)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{signature} exists"));
+            let end = body.find("\n    async fn ").unwrap_or(body.len());
+            assert!(
+                body[..end].contains("self.remember_sent_message_id("),
+                "{signature} must remember the id of the message it sent"
+            );
+        }
+    }
+
+    /// A group reply to a message the bot itself sent is addressed, mention
+    /// or no mention: the reply's `parent_id` points at the bot's message.
+    #[tokio::test]
+    async fn a_webhook_group_reply_to_a_bot_message_is_delivered() {
+        let ch = allowed_channel();
+        seed_bot_identity(&ch).await;
+        ch.sent_message_ids.write().unwrap().push("om_bot_1".into());
+
+        let payload = webhook_payload("group", "om_bot_1", serde_json::json!([]));
+        assert_eq!(
+            ch.parse_event_payload(&payload).await.len(),
+            1,
+            "a reply to the bot's own message counts as addressed"
+        );
+    }
+
+    /// Replying to somebody else's message is ordinary conversation.
+    #[tokio::test]
+    async fn a_webhook_group_reply_to_someone_else_is_ignored() {
+        let ch = allowed_channel();
+        seed_bot_identity(&ch).await;
+        ch.sent_message_ids.write().unwrap().push("om_bot_1".into());
+
+        let payload = webhook_payload("group", "om_other_1", serde_json::json!([]));
+        assert!(ch.parse_event_payload(&payload).await.is_empty());
+    }
+
+    /// The mention half of the rule, end to end through the webhook parser:
+    /// a group message that @-mentions the bot is answered.
+    #[tokio::test]
+    async fn a_webhook_group_message_mentioning_the_bot_is_delivered() {
+        let ch = allowed_channel();
+        seed_bot_identity(&ch).await;
+
+        let payload = webhook_payload(
+            "group",
+            "",
+            serde_json::json!([
+                { "key": "@_user_1", "id": { "open_id": "ou_rantaiclaw_bot" }, "name": "RantaiClawAgent" }
+            ]),
+        );
+        assert_eq!(ch.parse_event_payload(&payload).await.len(), 1);
+    }
+
+    /// The sent-id memory is bounded: past the cap the oldest id is evicted,
+    /// so a long-lived process cannot grow it without limit.
+    #[test]
+    fn sent_id_memory_evicts_the_oldest_past_the_cap() {
+        let ch = make_channel();
+        for i in 0..=MAX_SENT_MESSAGE_IDS {
+            ch.remember_sent_message_id(&serde_json::json!({
+                "data": { "message_id": format!("om_{i}") }
+            }));
+        }
+        let ids = ch.sent_message_ids.read().unwrap();
+        assert_eq!(ids.len(), MAX_SENT_MESSAGE_IDS, "the cap holds");
+        assert!(!ids.contains(&"om_0".to_string()), "the oldest is evicted");
+        assert!(ids.contains(&"om_1".to_string()));
+        let newest = format!("om_{}", MAX_SENT_MESSAGE_IDS);
+        assert!(ids.contains(&newest));
+    }
+
+    /// The once-per-process warning cannot be observed without a tracing
+    /// subscriber, so the wiring is pinned by source, the way Slack pins
+    /// its equivalent: the swap and the operator-facing text must sit in
+    /// the shared gate's unknown-identity branch.
+    #[test]
+    fn the_unknown_group_identity_warning_fires_once_per_process() {
+        let src = include_str!("lark.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let gate = production
+            .split("async fn group_message_is_addressed")
+            .nth(1)
+            .expect("the shared group gate exists");
+        let end = gate.find("\n    fn ").unwrap_or(gate.len());
+        let branch = &gate[..end];
+        assert!(
+            branch.contains("GROUP_IDENTITY_WARNED.swap("),
+            "the warning must fire once per process, not once per message"
+        );
+        assert!(
+            branch.contains("group messages are ignored until the bot's own identity is known"),
+            "the operator must be told why the channel went quiet"
         );
     }
 }

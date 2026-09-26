@@ -153,6 +153,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Lark groups: the bot now answers only when it is @-mentioned or replied to.** In a group chat an allowlisted
+  member's message used to get a reply whenever it mentioned anyone at all — and in webhook mode, which had no
+  addressing gate, every group message got one. Now only messages that @-mention the bot or that reply directly to
+  one of the bot's own messages are answered; commands need the mention too. The bot's identity is resolved at
+  listener startup on both receive paths, and while it cannot be resolved group messages are ignored and the
+  journal says so once, instead of the old fallback that answered any mention of anyone. Unaddressed group
+  messages are dropped without a reply or a rejected-sender warning — including an unaddressed inbound image from
+  a sender outside the allowlist, which used to log one. Sent-message memory is in-process and bounded to the
+  most recent 1,000 ids, so after a daemon restart a reply to an older bot message needs a mention again; in
+  webhook mode replies are matched against the messages the receiving instance itself sent, so there the mention
+  carries the gate. Direct messages are unchanged.
 - **Telegram and Discord answer in groups only when addressed, by default.** `mention_only` on
   `[channels_config.telegram]` and `[channels_config.discord]` now defaults to `true` (schema
   version 33): in a group the bot answers @mentions and replies to its own messages, and DMs are
