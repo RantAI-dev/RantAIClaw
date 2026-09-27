@@ -495,10 +495,9 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
             {
                 StatusKind::Ok
             }
-            AutoStartState::Starting { .. } => StatusKind::Info,
+            AutoStartState::Starting { .. } | AutoStartState::NotDispatched => StatusKind::Info,
             AutoStartState::Terminated { .. } => StatusKind::Warn,
             AutoStartState::Failed { .. } => StatusKind::Fail,
-            AutoStartState::NotDispatched => StatusKind::Info,
         };
         for (name, configured, support, verification) in &rows {
             if *configured {

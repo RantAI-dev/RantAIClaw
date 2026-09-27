@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(out.health[0].name, "broken");
         match &out.health[0].status {
             McpHealthStatus::Failed(msg) => assert!(msg.contains("connect")),
-            _ => panic!("expected Failed status"),
+            McpHealthStatus::Healthy => panic!("expected Failed status"),
         }
     }
 }

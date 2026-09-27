@@ -1183,10 +1183,7 @@ impl FirstRunWizard {
         let body = match self.phase {
             WizardPhase::Welcome => "Press Enter to begin.\nEsc to exit.",
             WizardPhase::RunningProvisioner { .. } => "Provisioner overlay active. Ctrl+B back.",
-            WizardPhase::PickChannels => {
-                "↑/↓ Space toggle · Enter confirm · Ctrl+B back · Esc skip"
-            }
-            WizardPhase::PickIntegrations => {
+            WizardPhase::PickChannels | WizardPhase::PickIntegrations => {
                 "↑/↓ Space toggle · Enter confirm · Ctrl+B back · Esc skip"
             }
             WizardPhase::Complete => "Configuration saved. Press Enter to close.",

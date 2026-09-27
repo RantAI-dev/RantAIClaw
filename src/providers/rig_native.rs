@@ -698,7 +698,7 @@ where
             StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
                 full_text.push_str(&reasoning);
             }
-            other => {
+            other @ StreamedAssistantContent::Final(_) => {
                 tracing::debug!(
                     target: "rig_native",
                     canonical,

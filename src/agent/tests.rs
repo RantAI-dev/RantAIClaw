@@ -849,7 +849,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
         ConversationMessage::AssistantToolCalls { text, .. } => {
             text.as_deref().is_some_and(|t| t.contains("Let me check"))
         }
-        _ => false,
+        ConversationMessage::ToolResults(_) => false,
     });
     assert!(has_intermediate, "Intermediate text should be in history");
 }
