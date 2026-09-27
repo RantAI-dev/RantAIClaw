@@ -575,13 +575,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Point Config::load_or_init at our tempdir, then materialize a full
-        // default config and inject a telegram section (so we don't have to
-        // hand-write every required field).
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        // Pin `Config::load_or_init` (called inside `try_handle_pairing`) to this
+        // tempdir for the rest of the test, so a concurrent test that also
+        // touches `RANTAICLAW_CONFIG_DIR` cannot overwrite the file we read
+        // back. Bound to named locals so a panic between `set` and the trailing
+        // restore does not leak the override into the next test sharing
+        // `ENV_LOCK`.
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        // Seed at an explicit path so the read-back below is guaranteed to see
+        // the file we wrote, regardless of profile resolution (`load_or_init`
+        // is profile-aware and could otherwise write under
+        // `<root>/profiles/<active>/...`).
         {
-            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            let mut seed = crate::config::Config::default();
+            seed.config_path = root.join("config.toml");
+            seed.workspace_dir = root.join("workspace");
             seed.channels_config.telegram = Some(telegram_config());
             seed.save().await.unwrap();
         }
@@ -602,7 +612,9 @@ mod tests {
         assert!(reply.contains("owner"), "reply was: {reply}");
 
         // Re-load and confirm persistence.
-        let config = crate::config::Config::load_or_init().await.unwrap();
+        let config = crate::config::Config::load_from_path(&root.join("config.toml"))
+            .await
+            .unwrap();
         let users = &config
             .channels_config
             .telegram
@@ -615,7 +627,5 @@ mod tests {
             .channels_config
             .approval_owners
             .contains(&"999".to_string()));
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }
