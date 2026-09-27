@@ -275,7 +275,7 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
         });
 
         match config.save().await {
-            Ok(_) => {
+            Ok(()) => {
                 events
                     .send(ProvisionEvent::Message {
                         severity: Severity::Success,

@@ -92,6 +92,10 @@ impl PolicyPreset {
     /// Also accepts `"full"` as an alias for `Off` so users who reach
     /// for the autonomy-level vocabulary (`AutonomyLevel::Full`) land on
     /// the preset that disables gating.
+    #[allow(
+        clippy::match_same_arms,
+        reason = "each arm documents one preset and its legacy L-number alias; the repetition is the docs"
+    )]
     pub fn from_str_ci(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "manual" => Ok(Self::Manual),

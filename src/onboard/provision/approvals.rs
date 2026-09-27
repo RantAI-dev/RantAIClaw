@@ -93,6 +93,10 @@ impl TuiProvisioner for ApprovalsProvisioner {
         let sel = recv_selection(&mut responses).await?;
         let idx = sel.first().copied().unwrap_or(1);
 
+        #[allow(
+            clippy::match_same_arms,
+            reason = "arms are the menu contract; the wildcard is the out-of-range default, which coincides with option 1"
+        )]
         let preset = match idx {
             0 => PolicyPreset::Manual,
             1 => PolicyPreset::Smart,

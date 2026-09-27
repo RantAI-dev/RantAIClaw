@@ -418,6 +418,10 @@ impl TuiProvisioner for ProviderProvisioner {
                         )
                         .await?;
                         let choice = recv_selection(&mut responses).await?;
+                        #[allow(
+                            clippy::match_same_arms,
+                            reason = "Some(0) and Some(_) both re-prompt but document different cases: empty key vs unknown index"
+                        )]
                         match choice.first().copied() {
                             Some(0) => continue, // re-prompt for the key
                             Some(1) => break,    // keep the rejected key

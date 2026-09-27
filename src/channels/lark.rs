@@ -619,9 +619,8 @@ impl LarkChannel {
                             match ws_msg {
                                 WsMsg::Binary(b) => b,
                                 WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                                WsMsg::Pong(_) => continue,
+                                WsMsg::Text(_) | WsMsg::Frame(_) | WsMsg::Pong(_) => continue,
                                 WsMsg::Close(_) => { tracing::info!("Lark: WS closed — reconnecting"); break; }
-                                _ => continue,
                             }
                         }
                         None => { tracing::info!("Lark: WS closed — reconnecting"); break; }
