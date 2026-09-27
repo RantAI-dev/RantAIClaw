@@ -8,8 +8,8 @@
 #   label        Optional label for step summary (e.g. target triple)
 #
 # Thresholds:
-#   >35MB  — hard error (safeguard)
-#   >30MB  — warning (advisory: this target is close to the cap)
+#   >40MB  — hard error (safeguard)
+#   >35MB  — warning (advisory: this target is close to the cap)
 #    5MB   — the aspiration, reported but NOT warned on. See below.
 #
 # Why 5MB stopped being a warning
@@ -29,11 +29,14 @@
 #   armv7-unknown-linux-gnueabihf  26,862,132 B   25.62 MiB
 #   aarch64-apple-darwin           21,476,752 B   20.48 MiB
 #
-# So the 30MB advisory fires on exactly ONE of the six, which makes it a signal
-# rather than wolf-crying: x86_64-linux has **0.52 MiB of headroom** to the hard
-# cap. Anyone raising the floor again should start from that number, and should
-# know it is one target's problem and not the platform's — the same build is
-# 14 MiB clear of the cap on aarch64-darwin.
+# So the 35MB advisory fires on exactly ONE of the six, which makes it a signal
+# rather than wolf-crying: x86_64-linux measured 36,220,208 B on main at
+# 973fa579 — **0.46 MiB under the advisory** (36,700,160 − 36,220,208 =
+# 479,952 B) and **5.46 MiB under the hard cap** (41,943,040 − 36,220,208 =
+# 5,722,832 B). Anyone raising the floor again should start from that number,
+# and should know it is one target's problem and not the platform's — the
+# same build is 19.5 MiB clear of the 40MB cap on aarch64-darwin (40 MiB −
+# 20.48 MiB).
 #
 # Floor history:
 #   v0.6.39 → rig-core multi-provider adapter became default streaming
@@ -48,6 +51,14 @@
 #             30→35, advisory 25→30. A knowledge base is core to the
 #             agent's usefulness out of the box; gating `rantaiclaw kb`
 #             behind a build flag meant shipped binaries had no KB at all.
+#   v0.32.0-alpha → channel-lark joined the default build (#822).
+#             Safeguard 35→40, advisory 30→35. x86_64-linux measured
+#             36,159,376 B at v0.30.0-alpha and 36,647,952 B on main at
+#             936cf43f — the old 35 MiB cap left about 50 KB of headroom,
+#             so dependency updates could no longer merge at all. #903
+#             then retired the lucid and markdown memory backends and
+#             main measured 36,220,208 B at 973fa579, back under the new
+#             35 MiB advisory.
 #
 # This gate measures the SHIPPED profile, `release-fast` — opt-level=z,
 # lto=fat, strip=true, panic=abort, and codegen-units=**8**. It previously
@@ -79,15 +90,15 @@ if [ -n "$LABEL" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   echo "- Size: ${SIZE_MB}MB ($SIZE bytes)" >> "$GITHUB_STEP_SUMMARY"
 fi
 
-if [ "$SIZE" -gt 36700160 ]; then
-  echo "::error::Binary exceeds 35MB safeguard (${SIZE_MB}MB)"
+if [ "$SIZE" -gt 41943040 ]; then
+  echo "::error::Binary exceeds 40MB safeguard (${SIZE_MB}MB)"
   exit 1
-elif [ "$SIZE" -gt 31457280 ]; then
-  echo "::warning::Binary exceeds 30MB advisory target (${SIZE_MB}MB)"
+elif [ "$SIZE" -gt 36700160 ]; then
+  echo "::warning::Binary exceeds 35MB advisory target (${SIZE_MB}MB)"
 elif [ "$SIZE" -gt 5242880 ]; then
   # Reported, not warned. See the threshold notes at the top: this fired on
   # every target of every release and taught readers to skip the size step.
-  echo "Above the 5MB aspiration (${SIZE_MB}MB); under the 30MB advisory."
+  echo "Above the 5MB aspiration (${SIZE_MB}MB); under the 35MB advisory."
 else
   echo "Binary size within target."
 fi
