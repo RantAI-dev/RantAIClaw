@@ -81,7 +81,6 @@ pub mod task_update_status;
 pub mod traits;
 pub mod web_search_tool;
 
-pub use author_skill::AuthorSkillTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;

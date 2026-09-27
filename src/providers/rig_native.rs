@@ -53,7 +53,7 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use rig_core::client::{CompletionClient, ProviderClient};
+use rig_core::client::CompletionClient;
 use rig_core::completion::message::{AssistantContent, ToolFunction};
 use rig_core::completion::{
     CompletionModel, CompletionRequest, Message as RigMessage, ToolDefinition,

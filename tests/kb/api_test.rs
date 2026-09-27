@@ -1200,7 +1200,7 @@ async fn kb_routes_report_disabled_when_turned_off() {
     std::env::set_var("KB_EMBEDDING_API_KEY", "test-embedding-key");
     api::clear_kb_ctx().await;
 
-    let mut state = build_state(false, &[]);
+    let state = build_state(false, &[]);
     {
         let mut cfg = state.config.lock();
         cfg.knowledge.enabled = false;

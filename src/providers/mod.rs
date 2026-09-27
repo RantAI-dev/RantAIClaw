@@ -1817,7 +1817,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn routed_provider_does_not_inherit_the_primary_key() {
