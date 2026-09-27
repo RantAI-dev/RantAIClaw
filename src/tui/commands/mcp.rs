@@ -10,6 +10,7 @@
 //!    server here means handshake or `tools/list` failed at boot.
 
 use anyhow::Result;
+use std::fmt::Write as _;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
@@ -42,11 +43,12 @@ impl CommandHandler for McpCommand {
         }
 
         let mut out = String::new();
-        out.push_str(&format!(
-            "MCP servers ({} configured, {} live):\n",
+        let _ = writeln!(
+            out,
+            "MCP servers ({} configured, {} live):",
             configured.len(),
             live.len()
-        ));
+        );
         out.push('\n');
 
         // Sort for stable rendering.
@@ -63,13 +65,14 @@ impl CommandHandler for McpCommand {
                 (false, true) => "?",  // live but not in config (rare; surfaces config drift)
                 (false, false) => " ", // shouldn't happen
             };
-            out.push_str(&format!(
-                "{marker} {name} — {} tool{}\n",
+            let _ = writeln!(
+                out,
+                "{marker} {name} — {} tool{}",
                 live_tools.len(),
                 if live_tools.len() == 1 { "" } else { "s" }
-            ));
+            );
             for tool_name in live_tools {
-                out.push_str(&format!("    · {tool_name}\n"));
+                let _ = writeln!(out, "    · {tool_name}");
             }
             if is_configured && live_tools.is_empty() {
                 out.push_str(

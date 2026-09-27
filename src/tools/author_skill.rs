@@ -35,6 +35,7 @@ use serde_json::json;
 
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
+use std::fmt::Write as _;
 
 /// Maximum slug length. Keeps directory names sane and predictable.
 const MAX_SLUG_LEN: usize = 64;
@@ -118,8 +119,8 @@ fn render_skill_md(
 
     // ── Frontmatter (machine-readable metadata) ──────────────────────────
     out.push_str("---\n");
-    out.push_str(&format!("name: {}\n", collapse_ws(name)));
-    out.push_str(&format!("description: {}\n", collapse_ws(description)));
+    let _ = writeln!(out, "name: {}", collapse_ws(name));
+    let _ = writeln!(out, "description: {}", collapse_ws(description));
     out.push_str("version: 0.1.0\n");
     if !tags.is_empty() {
         let clean: Vec<String> = tags
@@ -136,7 +137,7 @@ fn render_skill_md(
     out.push_str("---\n\n");
 
     // ── Body (becomes the agent-facing prompt) ───────────────────────────
-    out.push_str(&format!("# {}\n\n", name.trim()));
+    let _ = write!(out, "# {}\n\n", name.trim());
 
     out.push_str("## Description\n");
     out.push_str(description.trim());
@@ -147,7 +148,7 @@ fn render_skill_md(
         out.push_str("Use the agent's built-in tools as needed for this task.\n\n");
     } else {
         for tool in tools {
-            out.push_str(&format!("- name: {}\n  kind: builtin\n", tool.trim()));
+            let _ = writeln!(out, "- name: {}\n  kind: builtin", tool.trim());
         }
         out.push('\n');
     }
@@ -159,7 +160,7 @@ fn render_skill_md(
         instructions.iter().map(|s| s.trim().to_string()).collect()
     };
     for step in &effective {
-        out.push_str(&format!("- {step}\n"));
+        let _ = writeln!(out, "- {step}");
     }
 
     out
