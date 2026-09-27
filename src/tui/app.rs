@@ -10440,6 +10440,11 @@ mod autonomy_keybinding_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+        // Config::default() reads HOME via UserDirs and writes save() there; pin
+        // config_path to the tempdir so the test does not migrate the developer's
+        // real ~/.rantaiclaw. See plan 465.
+        app.config.config_path = dir.path().join("config.toml");
+        app.config.workspace_dir = dir.path().to_path_buf();
 
         assert_eq!(preset_on_disk(dir.path()), None, "nothing written yet");
         press_shift_tab(&mut app).await;
@@ -10565,6 +10570,11 @@ mod autonomy_keybinding_tests {
 
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+        // Config::default() reads HOME via UserDirs and writes save() there; pin
+        // config_path to the tempdir so the test does not migrate the developer's
+        // real ~/.rantaiclaw. See plan 465.
+        app.config.config_path = dir.path().join("config.toml");
+        app.config.workspace_dir = dir.path().to_path_buf();
 
         press_shift_tab(&mut app).await;
         assert_eq!(

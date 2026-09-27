@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Library tests can no longer silently read or write the developer's real
+  `~/.rantaiclaw`. `resolve_runtime_config_dirs` now refuses, in `cfg(test)`
+  builds, to fall back to a path derived from `$HOME` when neither
+  `RANTAICLAW_CONFIG_DIR` nor `RANTAICLAW_WORKSPACE` is set, with a diagnostic
+  that names the override and the `RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1`
+  opt-out for the small set of tests that exercise default resolution. Release
+  behaviour is unchanged — the guard is compiled out of non-test builds.
 - The email channel finds the `Authentication-Results` header by name, so owner
   recognition keeps working on any header spelling and survives the next
   mail-parser upgrade. The previous lookup matched `HeaderName::Other(...)`,

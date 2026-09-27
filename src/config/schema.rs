@@ -3797,6 +3797,25 @@ async fn resolve_runtime_config_dirs(
         }
     }
 
+    // Test-only guard: refuse to fall back to a path derived from the
+    // developer's real `$HOME` (or XDG) so a missing override fails the test
+    // instead of silently migrating the operator's config. See plan 465.
+    // Compiled out of release builds; behaviour above this point is unchanged.
+    #[cfg(test)]
+    {
+        if std::env::var_os("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            anyhow::bail!(
+                "test config isolation: neither RANTAICLAW_CONFIG_DIR nor RANTAICLAW_WORKSPACE \
+                 is set, so this test would read and write the developer's real \
+                 ~/.rantaiclaw. Set RANTAICLAW_CONFIG_DIR to a tempdir (see \
+                 crate::test_env::EnvGuard) or, if this test really must exercise \
+                 default resolution, set RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1."
+            );
+        }
+    }
+
     if let Some((rantaiclaw_dir, workspace_dir)) =
         load_persisted_workspace_dirs(default_rantaiclaw_dir).await?
     {
@@ -7733,6 +7752,11 @@ level = "full"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
+        // `apply_env_overrides` honours CONFIG_DIR precedence over WORKSPACE
+        // (`apply_env_overrides_inner`), so unset the former too — otherwise a
+        // test runner with RANTAICLAW_CONFIG_DIR exported would shadow the
+        // override under test.
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_workspace =
             crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", "/custom/workspace");
         config.apply_env_overrides();
@@ -7746,6 +7770,10 @@ level = "full"
         let default_workspace_dir = default_config_dir.join("workspace");
         let workspace_dir = default_config_dir.join("profile-a");
 
+        // Unset so a parent-shell `RANTAICLAW_CONFIG_DIR` does not shadow the
+        // WORKSPACE branch under test (`resolve_runtime_config_dirs` checks
+        // CONFIG_DIR first). Mirrors the PR #904 lark pairing pattern.
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -7803,7 +7831,13 @@ level = "full"
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
+        // Marker-driven resolution is the first non-env branch. The test is
+        // the one place we explicitly exercise the default-resolution path
+        // without setting CONFIG_DIR or WORKSPACE, so opt out of the test
+        // isolation guard for this one call.
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
         let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         fs::create_dir_all(&default_config_dir).await.unwrap();
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
@@ -7863,7 +7897,11 @@ level = "full"
         let default_config_dir = temp_home.join(".rantaiclaw");
         let default_workspace_dir = default_config_dir.join("workspace");
 
+        // This test is the canonical exercise of the default-resolution
+        // branch — opt out of the test isolation guard for this one call.
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
         let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -8038,6 +8076,9 @@ level = "full"
         .unwrap();
 
         let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        // Unset CONFIG_DIR so the parent-shell export doesn't shadow the
+        // WORKSPACE branch under test (CONFIG_DIR wins first in the resolver).
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -8073,6 +8114,8 @@ level = "full"
         let workspace_dir = temp_home.join("profile-a");
 
         let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        // Unset CONFIG_DIR so a parent-shell export doesn't shadow WORKSPACE.
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -8093,6 +8136,7 @@ level = "full"
         let legacy_config_path = temp_home.join(".rantaiclaw").join("config.toml");
 
         let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -8124,6 +8168,7 @@ default_model = "legacy-model"
         .unwrap();
 
         let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -8151,6 +8196,12 @@ default_model = "legacy-model"
         .unwrap();
 
         let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        // Marker-driven resolution — opt out of the test isolation guard so
+        // this test can exercise the default-resolution branch (HOME +
+        // active_workspace.toml). HOME stays pinned to a tempdir so no real
+        // ~/.rantaiclaw is touched.
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
         persist_active_workspace_config_dir(&custom_config_dir)
@@ -8183,6 +8234,7 @@ default_model = "legacy-model"
         .unwrap();
 
         let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         persist_active_workspace_config_dir(&marker_config_dir)
             .await
             .unwrap();
@@ -8230,6 +8282,63 @@ default_model = "legacy-model"
         let _g_provider = crate::test_env::EnvGuard::set("RANTAICLAW_PROVIDER", "");
         config.apply_env_overrides();
         assert_eq!(config.default_provider, original_provider);
+    }
+
+    /// The test isolation guard (plan 465) refuses to fall back to a path
+    /// derived from the developer's real `$HOME` — without an explicit
+    /// override, a test would read and write the operator's real
+    /// `~/.rantaiclaw`. Calling `load_or_init` with both env vars unset
+    /// must surface the guard's diagnostic instead of silently migrating.
+    #[test]
+    async fn test_isolation_guard_refuses_load_or_init_without_an_override() {
+        let _env_guard = env_override_lock().await;
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+
+        let err = Config::load_or_init().await.expect_err(
+            "missing override must surface the isolation guard, not silently load the real config",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("test config isolation"),
+            "expected the isolation guard message, got: {msg}"
+        );
+        assert!(
+            msg.contains("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1"),
+            "the message must name the opt-out so an agent in a hurry can find it: {msg}"
+        );
+    }
+
+    /// The opt-out (`RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1`) is what the
+    /// default-resolution tests use to assert the shape of the default path
+    /// without an explicit override. It must produce the same answer as the
+    /// pre-guard fallback, so the guard changes the failure mode but not the
+    /// successful one.
+    #[test]
+    async fn test_isolation_guard_opt_out_allows_default_resolution() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_home).await.unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+
+        // `load_or_init` runs through the same resolver; the guard admits it
+        // because the opt-out is set, and the default-resolution branch lands
+        // on the active profile under our pinned temp home.
+        let config = Config::load_or_init()
+            .await
+            .expect("opt-out must admit default resolution so the existing default-layout tests keep working");
+        assert!(
+            config.config_path.starts_with(&temp_home),
+            "the resolved config_path must be inside the pinned temp home: {:?}",
+            config.config_path
+        );
+
+        let _ = fs::remove_dir_all(temp_home).await;
     }
 
     #[test]
