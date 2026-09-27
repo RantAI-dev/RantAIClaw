@@ -2690,6 +2690,17 @@ mod tests {
     /// mutations: neither can make this pass while still shipping.
     #[tokio::test]
     async fn lark_send_attachment_surfaces_a_missing_file_as_an_error() {
+        // `send_attachment` resolves the workspace through `Config`, which reads
+        // process-global env vars. Hold `ENV_LOCK` so a sibling lark test cannot
+        // clobber them mid-test, and pin `RANTAICLAW_CONFIG_DIR` at a fresh
+        // tempdir so the test never resolves (or fresh-inits) the runner's real
+        // `$HOME` — the isolation guard in `resolve_runtime_config_dirs` would
+        // otherwise fail this before it reached the missing-file check.
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", dir.path());
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
         let ch = make_channel();
         let attachment = crate::channels::media::OutboundAttachment {
             kind: AttachmentKind::Document,
