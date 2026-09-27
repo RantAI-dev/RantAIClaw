@@ -3108,7 +3108,7 @@ impl TuiApp {
                 self.first_run_wizard = Some(super::FirstRunWizard::new(self.profile.clone()));
             }
             CmdResult::OpenClawhubInstallPicker { initial_query } => {
-                self.open_clawhub_install_picker(initial_query).await;
+                self.open_clawhub_install_picker(initial_query);
             }
             CmdResult::OpenSkillInEditor {
                 slug,
@@ -3620,7 +3620,7 @@ impl TuiApp {
     /// Open the ClawHub install picker. Empty query → top-by-stars listing.
     /// Search fires only on Enter while focused on the search bar (per
     /// tester request — keystroke-fire churned the network too aggressively).
-    async fn open_clawhub_install_picker(&mut self, initial_query: Option<String>) {
+    fn open_clawhub_install_picker(&mut self, initial_query: Option<String>) {
         self.open_clawhub_install_picker_sync(initial_query);
     }
 

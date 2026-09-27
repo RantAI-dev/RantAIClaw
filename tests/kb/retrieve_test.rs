@@ -685,18 +685,6 @@ mod query_expansion_tests {
 
     use super::{test_cfg, ENV_LOCK};
 
-    struct EnvGuard(Vec<&'static str>);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for k in &self.0 {
-                // SAFETY: serialized via ENV_LOCK above.
-                unsafe {
-                    std::env::remove_var(k);
-                }
-            }
-        }
-    }
-
     /// Tests still touch `OPENROUTER_API_KEY` (which lives outside `KbConfig`),
     /// so we keep the env-clearing helper and `ENV_LOCK`. The chat URL is no
     /// longer env-resolved — it's set directly on `cfg.openrouter_chat_url`.
@@ -889,17 +877,6 @@ mod contextual_tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{test_cfg, ENV_LOCK};
-
-    struct EnvGuard(Vec<&'static str>);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for k in &self.0 {
-                unsafe {
-                    std::env::remove_var(k);
-                }
-            }
-        }
-    }
 
     /// Only `OPENROUTER_API_KEY` is env-resolved now; the chat URL is per-cfg.
     fn clear_env() {

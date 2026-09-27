@@ -86,8 +86,6 @@ impl TuiProvisioner for ProxyProvisioner {
             _ => (false, ProxyScope::Rantaiclaw),
         };
 
-        let mut http_proxy = None;
-        let mut https_proxy = None;
         let all_proxy = None;
 
         if enabled {
@@ -103,7 +101,7 @@ impl TuiProvisioner for ProxyProvisioner {
             .await?;
 
             let v = recv_text(&mut responses).await?;
-            http_proxy = if v.trim().is_empty() {
+            let http_proxy = if v.trim().is_empty() {
                 None
             } else {
                 Some(v.trim().to_string())
@@ -121,7 +119,7 @@ impl TuiProvisioner for ProxyProvisioner {
             .await?;
 
             let v = recv_text(&mut responses).await?;
-            https_proxy = if v.trim().is_empty() {
+            let https_proxy = if v.trim().is_empty() {
                 http_proxy.clone()
             } else {
                 Some(v.trim().to_string())

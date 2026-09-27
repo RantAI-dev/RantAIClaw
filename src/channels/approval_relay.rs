@@ -49,7 +49,6 @@
 //! agent and should reply to the user with the returned string.
 //! `None` means the message is normal chat traffic.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::approval::{

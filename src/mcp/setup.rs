@@ -220,7 +220,6 @@ pub async fn validate_mcp_startup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn register_mcp_writes_correct_block() {

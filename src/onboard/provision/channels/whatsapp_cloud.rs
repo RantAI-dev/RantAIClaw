@@ -223,8 +223,9 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
             .collect();
         allowlist::warn_on_reach(&events, &allowed_numbers, "Allowed phone numbers").await?;
 
-        // Write config (preserve any existing web-mode fields)
-        let existing = config.channels_config.whatsapp.clone();
+        // Write the Cloud fields and leave `[channels_config.whatsapp_web]`
+        // untouched: the Web keys moved to their own section in schema v32
+        // (see comment below), so there is nothing to carry forward here.
         config.channels_config.whatsapp = Some(WhatsAppConfig {
             access_token: Some(access_token.trim().to_string()),
             phone_number_id: Some(phone_number_id.trim().to_string()),
