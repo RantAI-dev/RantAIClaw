@@ -188,6 +188,7 @@ impl Channel for CapturingChannel {
             timestamp: 1700000000,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))

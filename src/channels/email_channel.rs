@@ -1020,6 +1020,7 @@ impl EmailChannel {
                 timestamp: email.timestamp,
                 thread_ts: None,
                 reply_anchor: None,
+                is_direct: false,
             };
 
             if tx.send(msg).await.is_err() {

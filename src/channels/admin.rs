@@ -11,9 +11,9 @@
 use super::factory;
 use super::traits::Channel;
 use super::{
-    channel_is_configured, channel_is_usable, channel_roster_note, ChannelSupport,
-    ChannelVerification, CHANNEL_CATALOG, NON_CHANNEL_CATALOG_KEYS, OPENRC_RESTART_ARGS,
-    OPENRC_STATUS_ARGS, SYSTEMD_STATUS_ARGS,
+    channel_is_configured, channel_is_usable, channel_roster_note, dm_detection_for,
+    ChannelSupport, ChannelVerification, CHANNEL_CATALOG, NON_CHANNEL_CATALOG_KEYS,
+    OPENRC_RESTART_ARGS, OPENRC_STATUS_ARGS, SYSTEMD_STATUS_ARGS,
 };
 use crate::config::Config;
 use crate::doctor::checks::channels::{probe_whatsapp_web, ProbeWebResult};
@@ -671,6 +671,19 @@ async fn channel_doctor_state(
     }
 }
 
+/// The fixed suffix `doctor_channels` appends to each row, naming whether
+/// the channel can tell a DM from a group chat. Pulled out as a helper so a
+/// test can pin the wording against `dm_detection_for` without capturing
+/// stdout (the print path is exercised by the existing doctor tests at
+/// `integration`-style scope).
+fn dm_detail_suffix(key: &str) -> &'static str {
+    if dm_detection_for(key) {
+        " · DMs recognised"
+    } else {
+        " · DMs treated as group chats"
+    }
+}
+
 /// Run health checks for configured channels.
 /// Every catalog channel whose table is configured but is locked, so the
 /// factory deliberately did not build it. Pulled out of [`doctor_channels`]
@@ -718,19 +731,25 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     for (key, name, channel) in channels {
         let (state, detail) = channel_doctor_state(key, channel.as_ref(), &config).await;
+        // The DM status is per-channel metadata, independent of the live
+        // health verdict. Append it so a one-glance read of the line tells
+        // the operator both whether the channel is reachable AND whether
+        // it can tell a DM from a group. The wording is fixed in
+        // `dm_detail_suffix`, pinned by the test next to it.
+        let dm_suffix = dm_detail_suffix(key);
 
         match state {
             ChannelHealthState::Healthy => {
                 healthy += 1;
-                println!("  ✅ {name:<9} {detail}");
+                println!("  ✅ {name:<9} {detail}{dm_suffix}");
             }
             ChannelHealthState::Unhealthy => {
                 unhealthy += 1;
-                println!("  ❌ {name:<9} {detail}");
+                println!("  ❌ {name:<9} {detail}{dm_suffix}");
             }
             ChannelHealthState::Timeout => {
                 timeout += 1;
-                println!("  ⏱️  {name:<9} {detail}");
+                println!("  ⏱️  {name:<9} {detail}{dm_suffix}");
             }
         }
     }
@@ -901,5 +920,40 @@ mod doctor_channels_tests {
             channel_doctor_state("not-whatsapp-web", &AlwaysHealthy, &Config::default()).await;
         assert_eq!(state, ChannelHealthState::Healthy);
         assert_eq!(detail, "healthy");
+    }
+
+    /// Each row of `rantaiclaw channel doctor` ends with a DM clause naming
+    /// whether the platform signal exists. The wording is fixed so the same
+    /// operator who reads this morning's report can read tomorrow's and
+    /// match on it. `dm_detection_for` is the single source of truth used
+    /// by the catalog row, so the two cannot disagree.
+    #[test]
+    fn dm_detail_suffix_tracks_dm_detection_for() {
+        for key in ["telegram", "whatsapp_web", "discord", "lark", "slack"] {
+            assert_eq!(
+                dm_detail_suffix(key),
+                " · DMs recognised",
+                "{key} advertises DM recognition on the channel-doctor row"
+            );
+        }
+        for key in [
+            "mattermost",
+            "imessage",
+            "matrix",
+            "signal",
+            "whatsapp",
+            "linq",
+            "nextcloud_talk",
+            "email",
+            "irc",
+            "dingtalk",
+            "qq",
+        ] {
+            assert_eq!(
+                dm_detail_suffix(key),
+                " · DMs treated as group chats",
+                "{key} does not recognise DMs and the row must say so"
+            );
+        }
     }
 }

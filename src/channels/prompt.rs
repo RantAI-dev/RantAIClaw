@@ -55,6 +55,7 @@ pub(crate) fn build_channel_system_prompt(
     channel_name: &str,
     reply_target: &str,
     is_owner: bool,
+    is_direct: bool,
     delivery_instructions: Option<&str>,
 ) -> String {
     let mut prompt = if let Some(instructions) = delivery_instructions {
@@ -73,6 +74,19 @@ pub(crate) fn build_channel_system_prompt(
         }
         prompt.push_str(&cron);
     }
+
+    let chat_kind_line = match (is_direct, is_owner) {
+        (true, true) => "This conversation is a direct message with the bot's owner.",
+        (true, false) => "This conversation is a direct message with a guest, not an owner.",
+        (false, true) => "This conversation is a group chat; the current sender is an owner.",
+        (false, false) => {
+            "This conversation is a group chat; the current sender is a guest, not an owner."
+        }
+    };
+    if !prompt.is_empty() {
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(chat_kind_line);
 
     if is_owner {
         if !prompt.is_empty() {

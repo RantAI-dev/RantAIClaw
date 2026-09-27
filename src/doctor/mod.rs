@@ -163,6 +163,7 @@ pub async fn run_all_detailed(ctx: DoctorContext, brief: bool) -> DoctorRun {
         Box::new(checks::policy::ApprovalOwnersCheck),
         Box::new(checks::provider::ProviderPingCheck::default()),
         Box::new(checks::channels::ChannelsAuthCheck),
+        Box::new(checks::channels::ChannelsDmDetectionCheck),
         Box::new(checks::mcp::McpStartupCheck),
         Box::new(checks::daemon::DaemonRegistrationCheck),
         Box::new(checks::system_deps::SystemDepsCheck),

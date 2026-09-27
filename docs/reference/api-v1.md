@@ -897,17 +897,20 @@ is created first.
       {
         "key": "telegram", "label": "Telegram",
         "support": "supported", "maturity": "supported",
-        "verification": "driven", "configured": true
+        "verification": "driven", "configured": true,
+        "dm_detection": true
       },
       {
         "key": "discord", "label": "Discord",
         "support": "supported", "maturity": "supported",
-        "verification": "not_driven", "configured": false
+        "verification": "not_driven", "configured": false,
+        "dm_detection": true
       },
       {
         "key": "irc", "label": "IRC",
         "support": "under_development", "maturity": "under_development",
-        "verification": "not_driven", "configured": false
+        "verification": "not_driven", "configured": false,
+        "dm_detection": false
       }
     ]
   }
@@ -934,6 +937,14 @@ is created first.
   the entries of `channels` with `"configured": true`, and a test asserts the
   two cannot disagree. This is read-only — none of it reports health or
   connection status.
+
+  `dm_detection` is a boolean (`true` for Telegram, WhatsApp Web, Discord,
+  Lark and Slack; `false` for every other catalog row) naming whether the
+  platform exposes the one-to-one chat signal the runtime uses to set
+  `ChannelMessage.is_direct`. Three readers (`rantaiclaw channel doctor`,
+  the `channels.dm_detection` check in `rantaiclaw doctor`, and this row)
+  all go through one helper, so the three surfaces cannot disagree. The
+  full signal table lives in [`channels.md` §0a](channels.md#0a-dm-detection).
 
   **Previously documented gap, now closed**: this endpoint used to check a
   hardcoded list of seven channels, so a configured Matrix, Linq, IRC or Lark

@@ -791,6 +791,16 @@ pub(crate) struct ChannelCatalogEntry {
     /// would say the same thing, but the contract is the simpler shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_checklist: Option<String>,
+    /// Whether the platform exposes a one-to-one chat signal the runtime
+    /// uses to set `ChannelMessage.is_direct`. `true` for the five channels
+    /// with a documented DM signal (Telegram `chat.type == "private"`,
+    /// WhatsApp Web JID on `s.whatsapp.net` / `lid`, Discord without
+    /// `guild_id`, Lark `chat_type == "p2p"`, Slack `channel_type == "im"`),
+    /// `false` for every other row — those treat all messages as group
+    /// chats, the safer default when the platform does not explicitly mark
+    /// a DM. Always serialised: a console reads the same row regardless of
+    /// which side of the boundary the channel falls on.
+    pub dm_detection: bool,
 }
 
 /// The whole catalog, in catalog order, with each row's configured state.
@@ -806,6 +816,7 @@ pub(crate) fn channel_catalog_entries(config: &Config) -> Vec<ChannelCatalogEntr
             configured: channel_is_configured(key, config),
             has_credentials: channel_has_credentials(key, config),
             setup_checklist: setup_checklist_for(key),
+            dm_detection: dm_detection_for(key),
         })
         .collect()
 }
@@ -821,6 +832,26 @@ fn setup_checklist_for(key: &str) -> Option<String> {
         "discord" => Some(crate::channels::discord::DISCORD_SETUP_CHECKLIST.to_string()),
         _ => None,
     }
+}
+
+/// Whether this channel's platform exposes a DM signal the runtime reads to
+/// set `ChannelMessage.is_direct`. One function for the catalog row, the
+/// `rantaiclaw channel doctor` per-row print, and the `rantaiclaw doctor`
+/// `channels.dm_detection` check — three readers, one list, so the three
+/// surfaces cannot disagree.
+///
+/// Five platforms have such a signal today: Telegram `chat.type == "private"`,
+/// WhatsApp Web chat JID on `s.whatsapp.net` or `lid`, Discord without
+/// `guild_id`, Lark `chat_type == "p2p"`, Slack `channel_type == "im"`. Every
+/// other channel treats all messages as group chats — the safer default when
+/// the platform did not explicitly mark a DM. Slack polling cannot see DMs
+/// because its payloads carry no `channel_type`, but the platform does have
+/// the signal on Socket Mode, so the channel still counts as DM-aware here.
+fn dm_detection_for(key: &str) -> bool {
+    matches!(
+        key,
+        "telegram" | "whatsapp_web" | "discord" | "lark" | "slack"
+    )
 }
 
 /// The `note` column `channel list` and `status` print for one roster row.

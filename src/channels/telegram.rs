@@ -1199,6 +1199,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
+        // True only when Telegram marks this chat as a one-to-one (`"private"`).
+        // `"group"`, `"supergroup"` and `"channel"` are not DMs; missing or
+        // unexpected values stay false so the prompt's group-vs-DM wording never
+        // flips on a chat we cannot identify with certainty.
+        let is_direct = message
+            .get("chat")
+            .and_then(|c| c.get("type"))
+            .and_then(|t| t.as_str())
+            .map(|t| t == "private")
+            .unwrap_or(false);
+
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -1256,6 +1267,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     Some(message_id.to_string())
                 },
                 sender_aliases,
+                is_direct,
             },
             photo_file_id,
         ))
@@ -4512,6 +4524,55 @@ mod tests {
             "chat": { "type": "private" }
         });
         assert!(!TelegramChannel::is_group_message(&private_msg));
+    }
+
+    /// Telegram's platform-level DM signal is `chat.type == "private"`. Group,
+    /// supergroup, channel and missing-type payloads must all surface as a
+    /// group conversation (the safer default when the platform did not say so
+    /// explicitly). The drive in plan 453 is the prompt's DM-vs-group line.
+    #[test]
+    fn telegram_parse_update_message_marks_direct_only_for_chat_type_private() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+
+        let cases = [("private", true), ("group", false), ("supergroup", false)];
+        for (chat_type, expected) in cases {
+            let update = serde_json::json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 1,
+                    "text": "hi",
+                    "from": { "id": 555 },
+                    "chat": { "id": 1, "type": chat_type }
+                }
+            });
+            let parsed = ch
+                .parse_update_message(&update)
+                .map(|(m, _)| m)
+                .unwrap_or_else(|| panic!("chat type `{chat_type}` must parse"));
+            assert_eq!(
+                parsed.is_direct, expected,
+                "chat type `{chat_type}` must yield is_direct={expected}"
+            );
+        }
+
+        // A missing `type` is not a DM by our rule: "kalau ragu, anggap grup".
+        let no_type = serde_json::json!({
+            "update_id": 2,
+            "message": {
+                "message_id": 2,
+                "text": "hi",
+                "from": { "id": 555 },
+                "chat": { "id": 1 }
+            }
+        });
+        let parsed = ch
+            .parse_update_message(&no_type)
+            .map(|(m, _)| m)
+            .expect("a chat with no `type` still parses");
+        assert!(
+            !parsed.is_direct,
+            "missing `chat.type` is not a DM, it stays group"
+        );
     }
 
     #[test]

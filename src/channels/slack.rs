@@ -207,6 +207,10 @@ impl SlackChannel {
                 .as_secs(),
             thread_ts: Self::inbound_thread_ts(msg, ts),
             reply_anchor: None,
+            // Socket Mode carries `channel_type`; polling (`conversations.history`)
+            // payloads do not, so they naturally stay false. Only `"im"` is a
+            // direct message — `"channel"`, `"group"`, and `"mpim"` are not.
+            is_direct: channel_type == Some("im"),
         })
     }
 
@@ -1755,6 +1759,65 @@ mod tests {
         ));
     }
 
+    /// Slack's platform-level DM signal is `channel_type == "im"`. `channel`,
+    /// `group`, `mpim` and a missing value (the polling transport) all surface
+    /// as a group conversation. The drive is the same Telegram/Discord plan
+    /// line: "kalau ragu, anggap grup".
+    #[test]
+    fn slack_classify_inbound_marks_direct_only_for_channel_type_im() {
+        let ch = channel(&["*"]);
+
+        let im = ch.classify_inbound(&msg_from("U_OK", Some("im"), "hi"), "U_BOT", "", "D0DM");
+        match im {
+            SlackInbound::Deliver(m) => assert!(
+                m.is_direct,
+                "`channel_type: im` is the DM signal, got is_direct={}",
+                m.is_direct
+            ),
+            other => panic!("a DM must be delivered: {other:?}"),
+        }
+
+        // The non-DM forms trip the addressed gate, so the text must carry a
+        // bot mention for `Deliver` to be reachable.
+        for (form, label) in [
+            (Some("channel"), "channel"),
+            (Some("group"), "private channel"),
+            (Some("mpim"), "group DM"),
+        ] {
+            let m = ch.classify_inbound(
+                &msg_from("U_OK", form, "<@U_BOT> hi"),
+                "U_BOT",
+                "",
+                "C_CHAN",
+            );
+            match m {
+                SlackInbound::Deliver(m) => assert!(
+                    !m.is_direct,
+                    "`channel_type: {label}` is not a DM, got is_direct={}",
+                    m.is_direct
+                ),
+                other => panic!("`channel_type: {label}` must be delivered here: {other:?}"),
+            }
+        }
+
+        // Polling's `conversations.history` payload carries no `channel_type`
+        // at all — every polled message must therefore surface as a group.
+        let polled = ch.classify_inbound(
+            &msg_from("U_OK", None, "<@U_BOT> hi"),
+            "U_BOT",
+            "",
+            "C_CHAN",
+        );
+        match polled {
+            SlackInbound::Deliver(m) => assert!(
+                !m.is_direct,
+                "polling payloads without `channel_type` are groups, got is_direct={}",
+                m.is_direct
+            ),
+            other => panic!("a polled message must be delivered: {other:?}"),
+        }
+    }
+
     /// The drive that started this: in `#all-rantai-claw` a plain "hello"
     /// got a reply nobody asked for. Now it is dropped.
     #[test]
@@ -2224,11 +2287,19 @@ mod tests {
     fn socket_mode_accepts_a_direct_message() {
         let env = envelope(serde_json::json!({
             "type": "message", "user": "U1", "text": "hai",
-            "ts": "1.1", "channel": "D0PRIVATE"
+            "ts": "1.1", "channel": "D0PRIVATE", "channel_type": "im"
         }));
         let got = SlackChannel::socket_event_message(&env, None).expect("a DM is a message");
         assert_eq!(got.get("channel").unwrap(), "D0PRIVATE");
         assert_eq!(got.get("text").unwrap(), "hai");
+        // The fixture describes a DM, so the platform's DM signal must ride
+        // along — otherwise `is_direct` falls through to `false` and the
+        // prompt reads as a group chat for a one-to-one conversation.
+        assert_eq!(
+            got.get("channel_type").and_then(|v| v.as_str()),
+            Some("im"),
+            "a Socket Mode DM fixture must carry `channel_type: \"im\"`"
+        );
     }
 
     /// The other half: the approval prompt is posted into a thread, and a reply
