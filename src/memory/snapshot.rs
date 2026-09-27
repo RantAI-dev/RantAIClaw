@@ -94,8 +94,8 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
 pub const MEMORY_FILE: &str = "MEMORY.md";
 
 /// Markers delimiting the region of `MEMORY.md` the runtime owns.
-const PROJECTION_BEGIN: &str = "<!-- rantaiclaw:memory:begin -->";
-const PROJECTION_END: &str = "<!-- rantaiclaw:memory:end -->";
+pub(crate) const PROJECTION_BEGIN: &str = "<!-- rantaiclaw:memory:begin -->";
+pub(crate) const PROJECTION_END: &str = "<!-- rantaiclaw:memory:end -->";
 
 /// Ceiling on the generated block.
 ///
@@ -177,7 +177,7 @@ pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
 /// Best-effort, like the projection everywhere else: a failure here must not
 /// fail the write that already succeeded.
 pub fn refresh_projection(memory: &dyn Memory, workspace_dir: &Path) {
-    if !matches!(memory.name(), "sqlite" | "lucid") {
+    if !matches!(memory.name(), "sqlite") {
         return;
     }
     if let Err(e) = project_core_memories(workspace_dir) {
@@ -766,31 +766,6 @@ Rule 3: Protect the user.
         let out = memory_md(tmp.path());
         assert!(out.contains(PROJECTION_BEGIN), "nothing projected:\n{out}");
         assert!(out.contains("- user_lang: prefers Bahasa Indonesia"));
-    }
-
-    /// `MarkdownMemory` owns `MEMORY.md` — it *is* the store. Projecting there
-    /// would splice a generated block into the operator's own file and duplicate
-    /// every entry.
-    #[tokio::test]
-    async fn refresh_is_a_no_op_on_markdown() {
-        let tmp = TempDir::new().unwrap();
-        let mem = crate::memory::MarkdownMemory::new(tmp.path());
-        mem.store(
-            "user_lang",
-            "prefers Bahasa Indonesia",
-            crate::memory::MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
-        let before = memory_md(tmp.path());
-        assert!(before.contains("user_lang"), "control: the store wrote it");
-
-        refresh_projection(&mem, tmp.path());
-
-        let after = memory_md(tmp.path());
-        assert_eq!(before, after, "the backend's own file was rewritten");
-        assert!(!after.contains(PROJECTION_BEGIN));
     }
 
     #[tokio::test]

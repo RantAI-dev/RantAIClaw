@@ -254,7 +254,7 @@ enum Commands {
         /// Model ID override (used in quick mode)
         #[arg(long)]
         model: Option<String>,
-        /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
+        /// Memory backend (sqlite, postgres, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
     },

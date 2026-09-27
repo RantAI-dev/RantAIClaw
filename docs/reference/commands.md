@@ -104,9 +104,9 @@ Single-topic examples:
 - `rantaiclaw onboard --interactive`
 - `rantaiclaw onboard --channels-only`
 - `rantaiclaw onboard --force`
-- `rantaiclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
-- `rantaiclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
-- `rantaiclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
+- `rantaiclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|postgres|none>`
+- `rantaiclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|postgres|none>`
+- `rantaiclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|postgres|none> --force`
 
 `onboard` safety behavior:
 

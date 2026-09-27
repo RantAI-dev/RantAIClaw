@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour operators may have relied on**; a fresh install is unaffected
   because `guest_allowed_tools` defaults to empty anyway.
 - Guests no longer see the owner's profile (`USER.md`), notes (`MEMORY.md`), or other chats' memory. A guest who is allowed `memory_recall` only sees the conversation they are in. A guest who is allowed `file_read`/`file_write`/`pdf_read`/`image_info` is still blocked from reading those private files. When `approval_owners` is empty, every sender is a guest; set `approval_owners` to restore ownership. `rantaiclaw doctor` now warns when no owner is configured.
+- The `lucid` and `markdown` memory backends are retired. `[memory] backend` now accepts `sqlite`, `postgres`, or `none`; an unrecognised value is a startup error as before. Existing configs that name `lucid` or `markdown` migrate automatically to `sqlite` on load (config schema **33 → 34**). A fresh install defaults to `sqlite`, as it did before. Postgres remains feature-gated under `--features memory-postgres`; plan 452 owns its onboarding polish.
+- The first load on a config that previously used `markdown` imports `MEMORY.md` and the daily note files into `sqlite` exactly once. The source files are moved into `memory/migrations/markdown-<timestamp>/` so an operator can restore them by hand if needed; the agent then reads from the database. The `lucid` CLI import (`rantaiclaw migrate`) keeps its own copy of the data — that path is unchanged.
+- A config written by this version does not load on **0.32.0-alpha**, which only knows schema 33. Restore the previous config from `config.toml.bak` (kept next to `config.toml` by the migrator) to go back; the schema-34 fields are simply unknown to 0.32.0-alpha and would be ignored on read.
 
 ## [0.32.0-alpha] — 2026-09-26
 

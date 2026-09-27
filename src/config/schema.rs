@@ -4420,6 +4420,12 @@ impl Config {
             // so subsequent loads skip the work.
             let mut raw: toml::Value = toml::from_str(&contents)
                 .with_context(|| format!("Failed to parse {} as TOML", config_path.display()))?;
+            // Capture the pre-migration memory backend so the v34 markdown
+            // import can be triggered after migration stamps the new version.
+            // `migrate_v34` rewrites `markdown` → `sqlite`; reading the value
+            // before the call is the only point at which we know it was the
+            // retired backend.
+            let markdown_pre_migration = raw_memory_or_storage_was_markdown(&raw);
             let migrated = crate::config::migrations::migrate(&mut raw)
                 .context("Failed to migrate config schema")?;
             // A credential that ended up in `api_url` sits on disk in plaintext
@@ -4496,6 +4502,25 @@ impl Config {
             // Runs AFTER migration, so keys a past migration legitimately
             // removed are already gone and never warned about.
             warn_on_unknown_top_level_config_keys(&raw, &config_path);
+            // The v33 → v34 bump retires the `markdown` memory backend. If
+            // the operator's pre-migration config said `markdown` (on either
+            // `[memory].backend` or `[storage.provider.config].provider`,
+            // which overrides at runtime) and the bump ran on this load,
+            // import the markdown notes into the new sqlite store before
+            // the parsed config moves on. Gated on `migrated` so re-running
+            // `load_or_init` on an already-current config never re-imports.
+            if migrated && markdown_pre_migration {
+                if let Err(e) = import_markdown_memory_into_sqlite(&workspace_dir) {
+                    tracing::warn!(
+                        error = %e,
+                        workspace = %workspace_dir.display(),
+                        "markdown memory import failed; the config still loads as sqlite, \
+                         but the original markdown notes were not migrated. Inspect the \
+                         backup under memory/migrations/markdown-*/ and retry with \
+                         `rantaiclaw migrate openclaw --source <backup dir>`."
+                    );
+                }
+            }
             let mut config: Config = raw.try_into().with_context(|| {
                 format!(
                     "Failed to deserialise (post-migration) config at {}",
@@ -5308,6 +5333,213 @@ async fn sync_directory(path: &Path) -> Result<()> {
         let _ = path;
         Ok(())
     }
+}
+
+/// Did `[memory].backend` OR `[storage.provider.config].provider` (the
+/// storage override wins at runtime) carry the retired `markdown` name
+/// before the migration ran? Used by `load_or_init` to gate the one-time
+/// markdown import after `migrate_v34` stamps the new schema version.
+fn raw_memory_or_storage_was_markdown(raw: &toml::Value) -> bool {
+    let is_markdown = |s: &str| s.trim().eq_ignore_ascii_case("markdown");
+    if raw
+        .get("memory")
+        .and_then(|m| m.get("backend"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(is_markdown)
+    {
+        return true;
+    }
+    raw.get("storage")
+        .and_then(|s| s.get("provider"))
+        .and_then(|p| p.get("config"))
+        .and_then(|c| c.get("provider"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(is_markdown)
+}
+
+/// One-time markdown → sqlite import for a config that used the retired
+/// `markdown` backend.
+///
+/// Triggered from `Config::load_or_init` after `migrate_v34` rewrites the
+/// backend name to `sqlite`. Steps, in order, and the failure semantics for
+/// each:
+///
+///   1. **Back up** `MEMORY.md` + `memory/*.md` under
+///      `memory/migrations/markdown-<timestamp>/`. Failure here aborts the
+///      import — copying before writing means we always have the originals
+///      even if a later step panics.
+///
+///   2. **Read** entries with `read_openclaw_markdown_entries`. Skip lines
+///      the wizard scaffolded (`src/onboard/wizard.rs:5544-5563`) and bare
+///      `---` separators — they are placeholder prose the operator did not
+///      write, and importing them would put wizard boilerplate into the
+///      prompt.
+///
+///   3. **Insert** every entry with `INSERT OR IGNORE` on `memories.key`, so
+///      a pre-existing key in `brain.db` keeps its current value. The
+///      markdown files are the OLD store; whatever is already in sqlite
+///      wins.
+///
+///   4. **Project** core memories into `MEMORY.md`. The markdown file held
+///      `- **key**: value` lines next to whatever else the wizard scaffold
+///      left in the file; the projection replaces the marked block with
+///      one generated from `brain.db`. Outside the markers the operator's
+///      prose survives.
+///
+/// Any failure past step 1 leaves `MEMORY.md` untouched and surfaces a
+/// `WARN` with the backup path + retry command. The config still moves to
+/// `sqlite`, because the markdown backend no longer exists.
+fn import_markdown_memory_into_sqlite(workspace_dir: &Path) -> Result<()> {
+    use crate::memory::snapshot as snap;
+    use crate::migration::read_openclaw_markdown_entries;
+
+    let backup_dir = crate::migration::backup_markdown_memory(workspace_dir)
+        .context("back up markdown memory files before import")?;
+    let Some(backup_path) = backup_dir else {
+        // Nothing to import (no MEMORY.md and no daily files). The config
+        // still moved to sqlite; nothing further to do.
+        return Ok(());
+    };
+
+    let raw_entries =
+        read_openclaw_markdown_entries(workspace_dir).context("read markdown entries")?;
+    let entries: Vec<_> = raw_entries
+        .into_iter()
+        .filter(|e| !is_template_scaffold_line(&e.content))
+        .collect();
+
+    // Open (creating) brain.db through the same path the backend would.
+    // The connection must outlive the inserts; SqliteMemory::init_schema
+    // builds the FTS5 schema and the trigger pair `memories` keeps in sync
+    // with `memories_fts`. Using the backend's own schema (not a duplicate
+    // here) is the same reason hydrate_from_snapshot does it.
+    let db_dir = workspace_dir.join("memory");
+    std::fs::create_dir_all(&db_dir).context("create memory directory")?;
+    let db_path = db_dir.join("brain.db");
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("open {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+        .context("set sqlite pragmas")?;
+    crate::memory::SqliteMemory::init_schema(&conn).context("initialise sqlite schema")?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut imported = 0_usize;
+    let mut skipped_existing = 0_usize;
+    for entry in &entries {
+        if entry.content.trim().is_empty() {
+            continue;
+        }
+        let category = category_str(&entry.category);
+        let id = uuid::Uuid::new_v4().to_string();
+        let changed = conn
+            .execute(
+                "INSERT OR IGNORE INTO memories \
+                 (id, key, content, category, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, entry.key, entry.content, category, now, now],
+            )
+            .with_context(|| format!("insert markdown key '{}'", entry.key))?;
+        if changed > 0 {
+            imported += 1;
+        } else {
+            skipped_existing += 1;
+        }
+    }
+
+    // Re-project core memories into MEMORY.md.
+    //
+    // `project_core_memories` is the wrong tool for this path. It either
+    // splices an existing projection block or appends one — both leave the
+    // wizard's `- **key**:` lines next to the projection, and the operator's
+    // own structured lines were just imported into `brain.db`. The whole
+    // markdown layout is the OLD store; what `MEMORY.md` should hold now is
+    // the projection, full stop. Project first, then overwrite the file with
+    // only the projection block.
+    let _projected = snap::project_core_memories(workspace_dir)
+        .context("project core memories into MEMORY.md")?;
+    rewrite_memory_md_to_projection_only(workspace_dir)
+        .context("rewrite MEMORY.md to projection-only")?;
+
+    tracing::info!(
+        imported,
+        skipped_existing,
+        backup = %backup_path.display(),
+        "imported markdown memory entries into sqlite (backup at {0}; \
+         retry with `rantaiclaw migrate openclaw --source {0}`)",
+        backup_path.display()
+    );
+
+    Ok(())
+}
+
+/// True for a content line that came from the wizard's `MEMORY.md` template
+/// (or a bare markdown separator). The wizard writes those lines so the
+/// operator has a scaffolded file; importing them would put wizard prose
+/// into `brain.db` and surface it in the prompt. Filtered at the call site
+/// (not inside `read_openclaw_markdown_entries`) so the reader stays
+/// general-purpose for the OpenClaw migration path.
+fn is_template_scaffold_line(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed == "---" {
+        return true;
+    }
+    // Exact prefixes from `src/onboard/wizard.rs:5544-5563`, after the
+    // reader strips its leading `- ` bullet.
+    const SCAFFOLD_PREFIXES: &[&str] = &[
+        "Daily files (`memory/",
+        "This file captures what's WORTH KEEPING",
+        "This file is auto-injected",
+        "Keep it concise",
+        "ONLY loaded in main session",
+        "NEVER loaded in group chats",
+        "(Add important facts",
+        "(Record decisions",
+        "(Document mistakes",
+        "(Track unfinished",
+    ];
+    SCAFFOLD_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// Map the in-process memory category to the on-disk sqlite string.
+fn category_str(category: &crate::memory::MemoryCategory) -> &'static str {
+    use crate::memory::MemoryCategory;
+    match category {
+        MemoryCategory::Core => "core",
+        MemoryCategory::Daily => "daily",
+        MemoryCategory::Conversation => "conversation",
+        MemoryCategory::Custom(_) => "custom",
+    }
+}
+
+/// After the markdown → sqlite import, write `MEMORY.md` to contain only the
+/// projection block.
+///
+/// `project_core_memories` either splices an existing block or appends a new
+/// one — both leave the wizard scaffold (`- Daily files (...)`,
+/// `## Key Facts`, etc.) and the operator's own structured `- **key**:` lines
+/// next to the projection. Every `- **key**:` line is now also a row in
+/// `brain.db`, so leaving them in `MEMORY.md` would surface the same fact
+/// twice in the system prompt. The backup directory holds the original; this
+/// pass replaces the file with the projection only.
+fn rewrite_memory_md_to_projection_only(workspace_dir: &Path) -> Result<()> {
+    use crate::memory::snapshot::{PROJECTION_BEGIN, PROJECTION_END};
+
+    let path = workspace_dir.join("MEMORY.md");
+    let current = std::fs::read_to_string(&path).context("read MEMORY.md after projection")?;
+    let start = current
+        .find(PROJECTION_BEGIN)
+        .context("projection begin marker missing after project_core_memories")?;
+    let end = current
+        .find(PROJECTION_END)
+        .filter(|end| *end > start)
+        .context("projection end marker missing or out of order after project_core_memories")?
+        + PROJECTION_END.len();
+
+    let block_only = current[start..end].to_string();
+    std::fs::write(&path, block_only).context("write MEMORY.md to projection only")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8874,6 +9106,235 @@ default_model = "legacy-model"
         assert!(
             mode & 0o004 != 0,
             "Test setup: file should be world-readable (mode {mode:o})"
+        );
+    }
+
+    // ── v34: markdown memory import ──────────────────────────
+    //
+    // The import runs from `Config::load_or_init`, gated on the migration
+    // running AND the pre-migration config naming `markdown`. These tests
+    // drive the helper directly with a controlled workspace, so they are
+    // independent of the env-driven path resolution the load tests rely on.
+
+    /// Build a workspace containing the wizard's `MEMORY.md` scaffold, one
+    /// structured entry, one unstructured note, plus a daily file.
+    fn markdown_workspace(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+
+        // Full wizard template (wizard.rs:5544-5563) so the scaffold filter
+        // is exercised against the exact lines the wizard writes today.
+        std::fs::write(
+            workspace.join("MEMORY.md"),
+            "\
+# MEMORY.md — Long-Term Memory
+
+*Your curated memories. The distilled essence, not raw logs.*
+
+## How This Works
+- Daily files (`memory/YYYY-MM-DD.md`) capture raw events (on-demand via tools)
+- This file captures what's WORTH KEEPING long-term
+- This file is auto-injected into your system prompt each session
+- Keep it concise — every character here costs tokens
+
+## Security
+- ONLY loaded in main session (direct chat with your human)
+- NEVER loaded in group chats or shared contexts
+
+---
+
+## Key Facts
+(Add important facts about your human here)
+
+## Decisions & Preferences
+(Record decisions and preferences here)
+
+## Lessons Learned
+(Document mistakes and insights here)
+
+## Open Loops
+(Track unfinished tasks and follow-ups here)
+
+- **user_lang**: prefers Rust
+- A standalone prose note about project X.
+",
+        )
+        .unwrap();
+
+        std::fs::write(
+            workspace.join("memory").join("2026-09-01.md"),
+            "\
+# 2026-09-01
+
+- **morning_mood**: curious
+- just woke up
+",
+        )
+        .unwrap();
+
+        workspace
+    }
+
+    /// The wizard's scaffold and `---` separators do NOT become entries;
+    /// the operator's structured and unstructured lines DO. The daily file
+    /// contributes its own entries. A backup directory is created next to
+    /// `MEMORY.md` with the originals.
+    #[tokio::test]
+    async fn markdown_import_moves_entries_into_brain_db_and_skips_scaffold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = markdown_workspace(&tmp);
+
+        super::import_markdown_memory_into_sqlite(&workspace).unwrap();
+
+        let db_path = workspace.join("memory").join("brain.db");
+        assert!(db_path.exists(), "brain.db must be created");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT key, category FROM memories ORDER BY category, key")
+            .unwrap();
+        let entries: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"user_lang"), "structured entry survives");
+        assert!(
+            keys.iter()
+                .any(|k| k.starts_with("openclaw_openclaw_core_")),
+            "unstructured prose becomes an entry"
+        );
+        assert!(
+            keys.contains(&"morning_mood"),
+            "daily file entries are imported"
+        );
+        // The scaffold lines must not survive as entries. We seeded several
+        // placeholders (`Daily files`, `(Add important facts...`, etc.) —
+        // even after the key naming, none of them should appear as a row.
+        for k in &keys {
+            assert!(
+                !k.contains("Daily files"),
+                "scaffold content must not become a key: {k}"
+            );
+            assert!(
+                !k.contains("Add important facts"),
+                "placeholder prose must not become a key: {k}"
+            );
+            assert!(
+                !k.contains("Record decisions"),
+                "placeholder prose must not become a key: {k}"
+            );
+        }
+        // The unstructured prose's content must be present in the entry set.
+        let conn_for_content = rusqlite::Connection::open(&db_path).unwrap();
+        let mut content_stmt = conn_for_content
+            .prepare("SELECT content FROM memories WHERE category = 'core'")
+            .unwrap();
+        let core_contents: Vec<String> = content_stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        drop(content_stmt);
+        assert!(
+            core_contents
+                .iter()
+                .any(|c| c.contains("standalone prose note")),
+            "the unstructured prose is in brain.db as a core entry: {core_contents:?}"
+        );
+
+        // Backup directory holds the originals, NOT the projection.
+        let backup_root = workspace
+            .join("memory")
+            .join("migrations")
+            .read_dir()
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("markdown-"))
+            .expect("a markdown- backup directory must be created");
+        let backup_dir = backup_root.path();
+        assert!(backup_dir.join("MEMORY.md").exists());
+        assert!(backup_dir.join("2026-09-01.md").exists());
+        let backup_memory = std::fs::read_to_string(backup_dir.join("MEMORY.md")).unwrap();
+        assert!(
+            backup_memory.contains("**user_lang**"),
+            "the backup must hold the operator's pre-projection MEMORY.md"
+        );
+    }
+
+    /// After import, the new `MEMORY.md` carries the sqlite projection only:
+    /// the marked block holds every imported core entry, and there is NO
+    /// `- **key**:` line outside the markers (the wizard scaffold bullets and
+    /// the operator's structured lines were both rewritten by the projection).
+    #[tokio::test]
+    async fn markdown_import_rewrites_memory_md_to_projection_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = markdown_workspace(&tmp);
+
+        super::import_markdown_memory_into_sqlite(&workspace).unwrap();
+
+        let after = std::fs::read_to_string(workspace.join("MEMORY.md")).unwrap();
+        assert!(after.contains(crate::memory::snapshot::PROJECTION_BEGIN));
+        assert!(after.contains(crate::memory::snapshot::PROJECTION_END));
+        assert!(
+            after.contains("- user_lang: prefers Rust"),
+            "the structured entry is now in the projection block"
+        );
+
+        // No `- **key**:` line outside the projection block. The wizard
+        // scaffold (`- **key**:` lines from the template, plus prose like
+        // `(Add important facts...)`) is no longer present.
+        let projection_start = after
+            .find(crate::memory::snapshot::PROJECTION_BEGIN)
+            .expect("projection begin marker");
+        let projection_end = after
+            .find(crate::memory::snapshot::PROJECTION_END)
+            .expect("projection end marker")
+            + crate::memory::snapshot::PROJECTION_END.len();
+        let outside = format!("{}{}", &after[..projection_start], &after[projection_end..]);
+        assert!(
+            !outside.contains("- **"),
+            "no `- **key**:` line survives outside the projection block:\n{outside}"
+        );
+    }
+
+    /// A pre-existing key in `brain.db` keeps its value when the import sees
+    /// the same key in the markdown file. The markdown value is the OLD
+    /// store; whatever the operator already had on sqlite wins.
+    #[tokio::test]
+    async fn markdown_import_keeps_an_existing_brain_db_value() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = markdown_workspace(&tmp);
+
+        // Seed brain.db with a different content under the same key. The
+        // import must use INSERT OR IGNORE so this row wins.
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::memory::SqliteMemory::init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, key, content, category, created_at, updated_at) \
+             VALUES ('id-existing', 'user_lang', 'sqlite value wins', 'core', 't', 't')",
+            rusqlite::params![],
+        )
+        .unwrap();
+        drop(conn);
+
+        super::import_markdown_memory_into_sqlite(&workspace).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE key = 'user_lang'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            content, "sqlite value wins",
+            "a pre-existing brain.db row must keep its value"
         );
     }
 }

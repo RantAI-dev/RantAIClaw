@@ -2012,7 +2012,7 @@ async fn memory_create(
 
 /// Re-project `MEMORY.md` after a memory write through the API.
 ///
-/// The prompt injects that file, and on sqlite/lucid it is a projection of the
+/// The prompt injects that file, and on sqlite it is a projection of the
 /// store rather than the store itself. Only backend construction rewrites it
 /// otherwise — and the gateway is long-lived, so without this a memory deleted
 /// from the web console kept reaching the model for every session started in the

@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 33;
+pub const CURRENT_VERSION: u32 = 34;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -441,7 +441,20 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; default-only change, explicit values kept)
     }
 
-    // Future migrations (v34, …) inserted here in order.
+    // v33 → v34: the `lucid` and `markdown` memory backends are retired. Both
+    // resolve to `sqlite` now (`sqlite` already owns the `brain.db` file, and
+    // markdown notes are imported by `Config::load_or_init` after this arm
+    // stamps the new version). Only the four wizard defaults for markdown
+    // (`hygiene_enabled = false`, `archive_after_days = 0`, `purge_after_days
+    // = 0`, `embedding_cache_size = 0`) are stripped — an operator who
+    // customised any of them keeps their value, because `sqlite` is a
+    // different backend with its own semantics and the safe choice on
+    // upgrade is "respect what they wrote".
+    if from < 34 {
+        migrate_v34(raw);
+    }
+
+    // Future migrations (v35, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -539,6 +552,98 @@ fn migrate_v32(raw: &mut Value) {
     }
 
     channels.insert("whatsapp_web".to_string(), Value::Table(web));
+}
+
+/// v33 → v34: `lucid` and `markdown` are retired.
+///
+/// Rewrite the backend name on both `[memory].backend` and
+/// `[storage.provider.config].provider` (the latter overrides `memory.backend`
+/// at runtime), then strip the four wizard defaults that ONLY hold for the
+/// markdown profile (`hygiene_enabled = false`, `archive_after_days = 0`,
+/// `purge_after_days = 0`, `embedding_cache_size = 0`). An operator who
+/// customised any of those keys keeps their value: a migration cannot guess
+/// what they meant, and the safe choice on a backend swap is to leave their
+/// explicit choice alone.
+///
+/// Comparison is trimmed and lowercased, matching the runtime reader at
+/// `src/memory/mod.rs:75-87`. A config that was already `sqlite` or `none`
+/// comes through byte-identical (only the stamp moves).
+///
+/// The markdown import itself is a one-time side effect in
+/// `Config::load_or_init`, gated on `migrated` — this module stays pure
+/// `toml::Value`, like every other arm.
+fn migrate_v34(raw: &mut Value) {
+    const MARKDOWN_WIZARD_DEFAULTS: [&str; 4] = [
+        "hygiene_enabled",
+        "archive_after_days",
+        "purge_after_days",
+        "embedding_cache_size",
+    ];
+
+    let Some(root) = raw.as_table_mut() else {
+        return;
+    };
+
+    // 1. Rewrite [memory].backend if it was lucid/markdown.
+    let memory_was_markdown =
+        if let Some(memory) = root.get_mut("memory").and_then(Value::as_table_mut) {
+            rewrite_retired_backend(memory.get_mut("backend"))
+        } else {
+            false
+        };
+
+    // 2. Rewrite [storage.provider.config].provider if it was lucid/markdown.
+    if let Some(storage) = root.get_mut("storage").and_then(Value::as_table_mut) {
+        if let Some(provider) = storage
+            .get_mut("provider")
+            .and_then(Value::as_table_mut)
+            .and_then(|p| p.get_mut("config").and_then(Value::as_table_mut))
+        {
+            rewrite_retired_backend(provider.get_mut("provider"));
+        }
+    }
+
+    // 3. Only when the config was markdown AND all four wizard keys still hold
+    //    the markdown defaults, strip them so sqlite's own defaults apply. An
+    //    operator who changed any of them keeps their value (e.g. a custom
+    //    `purge_after_days`); an operator who switched backends earlier (lucid,
+    //    which set `hygiene_enabled = true`) keeps theirs too.
+    if memory_was_markdown {
+        if let Some(memory) = root.get_mut("memory").and_then(Value::as_table_mut) {
+            let all_default = MARKDOWN_WIZARD_DEFAULTS.iter().all(|key| {
+                matches!(
+                    memory.get(*key),
+                    Some(Value::Boolean(false) | Value::Integer(0))
+                )
+            });
+            if all_default {
+                for key in MARKDOWN_WIZARD_DEFAULTS {
+                    memory.remove(key);
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite a single backend field if it was `lucid` or `markdown`.
+///
+/// Returns `true` when the field held one of those values (so the caller knows
+/// the config was markdown-shaped and can apply the markdown-only cleanup),
+/// `false` otherwise (untouched).
+fn rewrite_retired_backend(field: Option<&mut Value>) -> bool {
+    let Some(value) = field else {
+        return false;
+    };
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    let lowered = text.trim().to_ascii_lowercase();
+    if matches!(lowered.as_str(), "lucid" | "markdown") {
+        *value = Value::String("sqlite".to_string());
+        true
+    } else {
+        false
+    }
 }
 
 fn migrate_v31(raw: &mut Value) {
@@ -1507,5 +1612,198 @@ allowed_users = ["*"]
             Some(false),
             "an explicit enabled value must win over the derivation"
         );
+    }
+
+    // ── v34: retire lucid + markdown ──────────────────────────
+    //
+    // The retired-name mappings at runtime (lucid/markdown → sqlite with a
+    // one-time WARN) live in `src/memory/mod.rs`; this file is the pure
+    // on-disk half: rewrite the name AND strip the four wizard defaults that
+    // only held for the markdown profile, so sqlite's own defaults apply.
+
+    /// The retired backend on `[memory].backend` becomes `sqlite`.
+    #[test]
+    fn v34_rewrites_lucid_memory_backend_to_sqlite() {
+        let mut v = parse("schema_version = 33\n[memory]\nbackend = \"lucid\"\n");
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(34));
+        assert_eq!(
+            v.get("memory")
+                .and_then(|m| m.get("backend"))
+                .and_then(Value::as_str),
+            Some("sqlite"),
+            "the retired backend name must be rewritten on disk"
+        );
+    }
+
+    /// The markdown backend with all four wizard defaults gets them stripped —
+    /// sqlite's own defaults then apply, instead of a config that says
+    /// `hygiene_enabled = false` to a backend whose own default is `true`.
+    #[test]
+    fn v34_strips_markdown_wizard_defaults_when_all_match() {
+        let mut v = parse(
+            "schema_version = 33\n\
+             [memory]\nbackend = \"markdown\"\n\
+             hygiene_enabled = false\n\
+             archive_after_days = 0\n\
+             purge_after_days = 0\n\
+             embedding_cache_size = 0\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(34));
+
+        let memory = v
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory table survives");
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite"),
+            "the backend name is rewritten"
+        );
+        for key in [
+            "hygiene_enabled",
+            "archive_after_days",
+            "purge_after_days",
+            "embedding_cache_size",
+        ] {
+            assert!(
+                memory.get(key).is_none(),
+                "{key} must be stripped so sqlite's default applies: {memory:?}"
+            );
+        }
+    }
+
+    /// An operator who customised any of the four wizard keys keeps their
+    /// value — the migration cannot guess what they meant, and the safe
+    /// choice on a backend swap is "respect what they wrote".
+    #[test]
+    fn v34_keeps_a_custom_markdown_purge_window() {
+        let mut v = parse(
+            "schema_version = 33\n\
+             [memory]\nbackend = \"markdown\"\n\
+             hygiene_enabled = false\n\
+             archive_after_days = 0\n\
+             purge_after_days = 14\n\
+             embedding_cache_size = 0\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(34));
+
+        let memory = v
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory table survives");
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite"),
+            "the backend name is rewritten"
+        );
+        assert_eq!(
+            memory.get("purge_after_days").and_then(Value::as_integer),
+            Some(14),
+            "the operator's explicit value must survive"
+        );
+    }
+
+    /// A `markdown` config that had `hygiene_enabled = true` (operator chose
+    /// it) is NOT in the wizard-defaults shape, so the cleanup does not run.
+    #[test]
+    fn v34_keeps_a_custom_markdown_hygiene_enabled() {
+        let mut v = parse(
+            "schema_version = 33\n\
+             [memory]\nbackend = \"markdown\"\n\
+             hygiene_enabled = true\n\
+             archive_after_days = 0\n\
+             purge_after_days = 0\n\
+             embedding_cache_size = 0\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+
+        let memory = v
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory table survives");
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite")
+        );
+        assert_eq!(
+            memory.get("hygiene_enabled").and_then(Value::as_bool),
+            Some(true),
+            "an operator-set hygiene_enabled must survive"
+        );
+    }
+
+    /// `[storage.provider.config].provider` overrides `[memory].backend` at
+    /// runtime, so the migration must rewrite it too.
+    #[test]
+    fn v34_rewrites_markdown_storage_provider_override() {
+        let mut v = parse(
+            "schema_version = 33\n\
+             [memory]\nbackend = \"sqlite\"\n\
+             [storage.provider.config]\n\
+             provider = \"markdown\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+
+        let provider = v
+            .get("storage")
+            .and_then(|s| s.get("provider"))
+            .and_then(|p| p.get("config"))
+            .and_then(|c| c.get("provider"))
+            .and_then(Value::as_str);
+        assert_eq!(
+            provider,
+            Some("sqlite"),
+            "the storage-provider override must be rewritten"
+        );
+    }
+
+    /// Whitespace and case do not defeat the rewrite — `Lucid`, `MARKDOWN`,
+    /// ` lucid ` all resolve to `sqlite`.
+    #[test]
+    fn v34_rewrites_retired_names_case_and_whitespace_insensitive() {
+        for raw_name in [" Lucid ", "MARKDOWN", "lucid"] {
+            let mut v = parse(&format!(
+                "schema_version = 33\n[memory]\nbackend = \"{raw_name}\"\n"
+            ));
+            assert!(migrate(&mut v).expect("migration runs"));
+            assert_eq!(
+                v.get("memory")
+                    .and_then(|m| m.get("backend"))
+                    .and_then(Value::as_str),
+                Some("sqlite"),
+                "name {raw_name:?} must rewrite to sqlite"
+            );
+        }
+    }
+
+    /// `sqlite` and `none` come through byte-identical — the migration only
+    /// stamps the new version. Confirms the active backends do not get
+    /// accidentally touched.
+    #[test]
+    fn v34_leaves_sqlite_and_none_alone() {
+        for backend in ["sqlite", "none"] {
+            let mut v = parse(&format!(
+                "schema_version = 33\n[memory]\nbackend = \"{backend}\"\n\
+                 hygiene_enabled = false\n\
+                 archive_after_days = 0\n\
+                 purge_after_days = 0\n\
+                 embedding_cache_size = 0\n"
+            ));
+            assert!(migrate(&mut v).expect("migration runs"));
+            let memory = v.get("memory").and_then(Value::as_table).expect("memory");
+            assert_eq!(
+                memory.get("backend").and_then(Value::as_str),
+                Some(backend),
+                "{backend} must not be rewritten"
+            );
+            assert_eq!(
+                memory.get("hygiene_enabled").and_then(Value::as_bool),
+                Some(false),
+                "an unrelated backend's keys must not be stripped"
+            );
+        }
     }
 }

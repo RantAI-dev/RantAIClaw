@@ -300,7 +300,7 @@ for streaming and tool calling. The hand-rolled implementations remain available
 - `src/kb/` — the Knowledge Base subsystem for org-level documents: extraction,
   chunking, embedding, reranking, retrieval and store, backed by `sqlite-vec`
   (feature `kb`, on by default; `kb-office` adds docx/xlsx/pptx).
-- `src/memory/` — agent memory with pluggable backends (markdown · sqlite · postgres),
+- `src/memory/` — agent memory with pluggable backends (sqlite · postgres),
   embeddings and vector merge.
 - `src/rag/` — hardware datasheet retrieval: keyword by default, semantic optional, plus
   explicit pin-alias tables (`red_led: 13`). For pin lookup an alias table beats any

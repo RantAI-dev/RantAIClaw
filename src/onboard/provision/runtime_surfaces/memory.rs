@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 pub const MEMORY_NAME: &str = "memory";
-pub const MEMORY_DESC: &str = "Memory backend — sqlite, lucid, postgres, markdown, or none";
+pub const MEMORY_DESC: &str = "Memory backend — sqlite, postgres, or none";
 
 #[derive(Debug, Clone)]
 pub struct MemoryProvisioner;
@@ -71,9 +71,7 @@ impl TuiProvisioner for MemoryProvisioner {
                 label: "Memory backend".into(),
                 options: vec![
                     "sqlite (default, embedded)".to_string(),
-                    "lucid (high-performance)".to_string(),
                     "postgres (server)".to_string(),
-                    "markdown (file-based)".to_string(),
                     "none (no memory)".to_string(),
                 ],
                 multi: false,
@@ -84,9 +82,7 @@ impl TuiProvisioner for MemoryProvisioner {
         let sel = recv_selection(&mut responses).await?;
         let backend = match sel.first().copied().unwrap_or(0) {
             0 => "sqlite",
-            1 => "lucid",
-            2 => "postgres",
-            3 => "markdown",
+            1 => "postgres",
             _ => "none",
         }
         .to_string();
@@ -159,41 +155,6 @@ impl TuiProvisioner for MemoryProvisioner {
                 },
             )
             .await?;
-        } else if backend == "markdown" {
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "dir".into(),
-                    label: "Markdown directory (Enter for default <profile>/memory/)".into(),
-                    default: Some("<profile>/memory/".into()),
-                    secret: false,
-                },
-            )
-            .await?;
-            let _dir = recv_text(&mut responses).await?;
-        } else if backend == "lucid" {
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "server".into(),
-                    label: "Lucid server URL".into(),
-                    default: None,
-                    secret: false,
-                },
-            )
-            .await?;
-            let _server = recv_text(&mut responses).await?;
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "api_key".into(),
-                    label: "Lucid API key (Enter to skip)".into(),
-                    default: None,
-                    secret: true,
-                },
-            )
-            .await?;
-            let _key = recv_text(&mut responses).await?;
         }
 
         config.memory = memory_cfg;

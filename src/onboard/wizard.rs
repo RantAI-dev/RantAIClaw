@@ -548,12 +548,34 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `rantaiclaw onboard` or `rantaiclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
+/// Use `rantaiclaw onboard` or `rantaiclaw onboard --api-key sk-... --provider openrouter --memory sqlite|none`.
 /// Use `rantaiclaw onboard --interactive` for the full wizard.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
         .get(choice)
         .map_or(default_memory_backend_key(), |backend| backend.key)
+}
+
+/// Validate the `--memory` value passed to quick setup. The `lucid` and
+/// `markdown` backends were retired in v0.32.0-alpha; their data lives in
+/// sqlite (lucid) or has already been imported (markdown), so callers must
+/// use `--memory sqlite` instead. `none` is the only other selectable
+/// value; `postgres` is intentionally accepted to keep quick setup usable
+/// for operators who already manage a Postgres profile (plan 452 removes
+/// it from setup surfaces). Unknown names still error here so a typo does
+/// not silently fall through to the default.
+fn validate_memory_backend_for_quick_setup(memory_backend: &str) -> Result<String> {
+    let normalized = memory_backend.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "sqlite" | "none" | "postgres" => Ok(normalized),
+        "lucid" => {
+            bail!("memory backend 'lucid' was retired in v0.32.0-alpha; use --memory sqlite")
+        }
+        "markdown" => {
+            bail!("memory backend 'markdown' was retired in v0.32.0-alpha; use --memory sqlite")
+        }
+        other => bail!("unknown memory backend '{other}'; valid values: sqlite, none"),
+    }
 }
 
 fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
@@ -637,8 +659,9 @@ async fn run_quick_setup_with_home(
         .map(str::to_string)
         .unwrap_or_else(|| default_model_for_provider(&provider_name));
     let memory_backend_name = memory_backend
-        .unwrap_or(default_memory_backend_key())
-        .to_string();
+        .map(validate_memory_backend_for_quick_setup)
+        .transpose()?
+        .unwrap_or_else(|| default_memory_backend_key().to_string());
 
     // Create memory config based on backend choice
     let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
@@ -7485,23 +7508,18 @@ mod tests {
     #[test]
     fn backend_key_from_choice_maps_supported_backends() {
         assert_eq!(backend_key_from_choice(0), "sqlite");
-        assert_eq!(backend_key_from_choice(1), "lucid");
-        assert_eq!(backend_key_from_choice(2), "markdown");
-        assert_eq!(backend_key_from_choice(3), "none");
+        assert_eq!(backend_key_from_choice(1), "none");
         assert_eq!(backend_key_from_choice(999), "sqlite");
     }
 
     #[test]
-    fn memory_backend_profile_marks_lucid_as_optional_sqlite_backed() {
-        let lucid = memory_backend_profile("lucid");
-        assert!(lucid.auto_save_default);
-        assert!(lucid.uses_sqlite_hygiene);
-        assert!(lucid.sqlite_based);
-        assert!(lucid.optional_dependency);
-
-        let markdown = memory_backend_profile("markdown");
-        assert!(markdown.auto_save_default);
-        assert!(!markdown.uses_sqlite_hygiene);
+    fn memory_backend_profile_marks_sqlite_and_none() {
+        let sqlite = memory_backend_profile("sqlite");
+        assert_eq!(sqlite.key, "sqlite");
+        assert!(sqlite.auto_save_default);
+        assert!(sqlite.uses_sqlite_hygiene);
+        assert!(sqlite.sqlite_based);
+        assert!(!sqlite.optional_dependency);
 
         let none = memory_backend_profile("none");
         assert!(!none.auto_save_default);
@@ -7513,9 +7531,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_config_defaults_for_lucid_enable_sqlite_hygiene() {
-        let config = memory_config_defaults_for_backend("lucid");
-        assert_eq!(config.backend, "lucid");
+    fn memory_config_defaults_for_sqlite_enable_sqlite_hygiene() {
+        let config = memory_config_defaults_for_backend("sqlite");
+        assert_eq!(config.backend, "sqlite");
         assert!(config.auto_save);
         assert!(config.hygiene_enabled);
         assert_eq!(config.archive_after_days, 7);
@@ -7532,6 +7550,70 @@ mod tests {
         assert_eq!(config.archive_after_days, 0);
         assert_eq!(config.purge_after_days, 0);
         assert_eq!(config.embedding_cache_size, 0);
+    }
+
+    #[test]
+    fn validate_memory_backend_rejects_retired_lucid() {
+        let err = validate_memory_backend_for_quick_setup("lucid")
+            .expect_err("lucid must error in quick setup");
+        let text = err.to_string();
+        assert!(
+            text.contains("lucid"),
+            "message must name the value: {text}"
+        );
+        assert!(
+            text.contains("retired in v0.32.0-alpha"),
+            "message must say it was retired: {text}"
+        );
+        assert!(
+            text.contains("--memory sqlite"),
+            "message must point callers to sqlite: {text}"
+        );
+    }
+
+    #[test]
+    fn validate_memory_backend_rejects_retired_markdown() {
+        let err = validate_memory_backend_for_quick_setup("markdown")
+            .expect_err("markdown must error in quick setup");
+        let text = err.to_string();
+        assert!(
+            text.contains("markdown"),
+            "message must name the value: {text}"
+        );
+        assert!(
+            text.contains("retired in v0.32.0-alpha"),
+            "message must say it was retired: {text}"
+        );
+        assert!(
+            text.contains("--memory sqlite"),
+            "message must point callers to sqlite: {text}"
+        );
+    }
+
+    #[test]
+    fn validate_memory_backend_accepts_known_values() {
+        assert_eq!(
+            validate_memory_backend_for_quick_setup("sqlite").unwrap(),
+            "sqlite"
+        );
+        assert_eq!(
+            validate_memory_backend_for_quick_setup("none").unwrap(),
+            "none"
+        );
+        assert_eq!(
+            validate_memory_backend_for_quick_setup("SQLITE").unwrap(),
+            "sqlite"
+        );
+        assert_eq!(
+            validate_memory_backend_for_quick_setup("  None  ").unwrap(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn validate_memory_backend_rejects_unknown() {
+        let err = validate_memory_backend_for_quick_setup("redis").expect_err("unknown must error");
+        assert!(err.to_string().contains("redis"));
     }
 
     #[test]
