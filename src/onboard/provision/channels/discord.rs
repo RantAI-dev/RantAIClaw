@@ -175,6 +175,10 @@ impl TuiProvisioner for DiscordProvisioner {
 
         let (mention_only, listen_to_bots) = {
             let sel = recv_selection(&mut responses).await?;
+            #[allow(
+                clippy::match_same_arms,
+                reason = "arms are the menu contract; the wildcard is the default selection"
+            )]
             match sel.first().copied() {
                 Some(0) => (true, false),
                 Some(1) => (false, false),

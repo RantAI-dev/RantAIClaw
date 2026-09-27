@@ -1012,15 +1012,15 @@ impl TuiApp {
         // everything else.
         if self.pending_approval.is_some() && key.modifiers.is_empty() {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                KeyCode::Char('y' | 'Y') => {
                     self.resolve_pending_approval(crate::security::Decision::Session);
                     return Ok(EventResult::Continue);
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
+                KeyCode::Char('a' | 'A') => {
                     self.resolve_pending_approval(crate::security::Decision::Persist);
                     return Ok(EventResult::Continue);
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                     self.resolve_pending_approval(crate::security::Decision::Deny);
                     return Ok(EventResult::Continue);
                 }
@@ -1432,7 +1432,7 @@ impl TuiApp {
                 self.overlay = None;
             }
             // Tab cycles tabs in the overlay.
-            KeyCode::Tab if self.overlay.is_some() => {
+            KeyCode::Tab | KeyCode::Right if self.overlay.is_some() => {
                 if let Some(o) = self.overlay.as_mut() {
                     if !o.tabs.is_empty() {
                         o.active_tab = (o.active_tab + 1) % o.tabs.len();
@@ -1448,13 +1448,6 @@ impl TuiApp {
                         } else {
                             o.active_tab - 1
                         };
-                    }
-                }
-            }
-            KeyCode::Right if self.overlay.is_some() => {
-                if let Some(o) = self.overlay.as_mut() {
-                    if !o.tabs.is_empty() {
-                        o.active_tab = (o.active_tab + 1) % o.tabs.len();
                     }
                 }
             }

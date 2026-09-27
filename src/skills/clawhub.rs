@@ -865,8 +865,7 @@ fn sanitize_relative_path(raw: &str) -> Result<std::path::PathBuf> {
     }
     for comp in path.components() {
         match comp {
-            std::path::Component::Normal(_) => {}
-            std::path::Component::CurDir => {}
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
             _ => anyhow::bail!("forbidden component {comp:?}"),
         }
     }
