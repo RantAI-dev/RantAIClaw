@@ -254,10 +254,7 @@ async fn handle_reindex(config: &Config) -> Result<()> {
         &config.memory.backend,
         Some(&config.storage.provider.config),
     );
-    if !matches!(
-        classify_memory_backend(&backend),
-        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-    ) {
+    if !matches!(classify_memory_backend(&backend), MemoryBackendKind::Sqlite) {
         bail!("memory backend '{backend}' does not store embeddings; nothing to reindex");
     }
 

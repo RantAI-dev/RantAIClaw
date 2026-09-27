@@ -599,10 +599,10 @@ pub(crate) async fn process_channel_message(
     // history. Follow-up turns already include context from previous messages.
     //
     // A guest's view is `Only(conv)` — every recalled entry must carry its
-    // own `session_id`; markdown/lucid-remote's no-session entries, the
-    // shared tier, and other chats' auto-save rows are filtered out. Owner
-    // keeps the existing layered read (own conv + shared backfill, no
-    // cross-chat bleed). Same conversation key the rest of dispatch uses.
+    // own `session_id`. The shared tier and other chats' auto-save rows are
+    // filtered out. Owner keeps the existing layered read (own conv + shared
+    // backfill, no cross-chat bleed). Same conversation key the rest of
+    // dispatch uses.
     if !had_prior_history {
         let memory_context = if sender_is_owner {
             build_memory_context(

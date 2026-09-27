@@ -4,8 +4,6 @@ pub mod cli;
 pub mod context;
 pub mod embeddings;
 pub mod hygiene;
-pub mod lucid;
-pub mod markdown;
 pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
@@ -24,8 +22,6 @@ pub use backend::{
 pub use context::{
     build_memory_context, build_memory_context_in_view, MemoryContext, MemoryContextLimits,
 };
-pub use lucid::LucidMemory;
-pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
@@ -44,7 +40,6 @@ use std::sync::Arc;
 
 fn create_memory_with_builders<F, G>(
     backend_name: &str,
-    workspace_dir: &Path,
     mut sqlite_builder: F,
     mut postgres_builder: G,
     unknown_context: &str,
@@ -55,22 +50,16 @@ where
 {
     match classify_memory_backend(backend_name) {
         MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
-        MemoryBackendKind::Lucid => {
-            let local = sqlite_builder()?;
-            Ok(Box::new(LucidMemory::new(workspace_dir, local)))
-        }
         MemoryBackendKind::Postgres => postgres_builder(),
-        MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
-            // Falling back to markdown here meant a typo in `backend` silently
-            // ran a different store with different semantics — one whose
-            // `forget` used to do nothing — while a warning scrolled past. The
-            // backend is a config contract; an unrecognised value is a
-            // configuration error, not a default.
+            // An unrecognised `backend` value is a configuration error. Falling
+            // back to a default backend used to silently run a different store
+            // with different semantics — for example a `forget` that did
+            // nothing — while a warning scrolled past.
             anyhow::bail!(
                 "unknown memory backend '{backend_name}'{unknown_context}; \
-                 expected one of: sqlite, lucid, markdown, postgres, none"
+                 expected one of: sqlite, postgres, none"
             )
         }
     }
@@ -80,14 +69,40 @@ pub fn effective_memory_backend_name(
     memory_backend: &str,
     storage_provider: Option<&StorageProviderConfig>,
 ) -> String {
-    if let Some(override_provider) = storage_provider
+    let resolved = if let Some(override_provider) = storage_provider
         .map(|cfg| cfg.provider.trim())
         .filter(|provider| !provider.is_empty())
     {
-        return override_provider.to_ascii_lowercase();
+        override_provider.to_ascii_lowercase()
+    } else {
+        memory_backend.trim().to_ascii_lowercase()
+    };
+
+    if matches!(resolved.as_str(), "lucid" | "markdown") {
+        warn_retired_backend_once();
+        return "sqlite".to_string();
     }
 
-    memory_backend.trim().to_ascii_lowercase()
+    resolved
+}
+
+/// One-time WARN that the memory backend has been retired.
+///
+/// Both `lucid` and `markdown` were retired in v0.32.0-alpha in favour of
+/// `sqlite`. A leftover `RANTAICLAW_STORAGE_PROVIDER` env var or a config
+/// this binary never touched before would otherwise stop the daemon with no
+/// actionable error. The WARN is one-shot to keep the log from filling with
+/// the same line every turn.
+static RETIRED_BACKEND_WARN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn warn_retired_backend_once() {
+    if RETIRED_BACKEND_WARN.set(()).is_ok() {
+        tracing::warn!(
+            "memory backends 'lucid' and 'markdown' were retired in v0.32.0-alpha; \
+             resolving to 'sqlite'. Set memory.backend = \"sqlite\" in config.toml \
+             to silence this message."
+        );
+    }
 }
 
 /// Build a per-turn auto-save key.
@@ -289,10 +304,7 @@ pub fn create_memory_with_storage_and_routes(
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
     if config.snapshot_enabled
         && config.snapshot_on_hygiene
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
+        && matches!(backend_kind, MemoryBackendKind::Sqlite)
     {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
             tracing::warn!("memory snapshot skipped: {e}");
@@ -302,10 +314,7 @@ pub fn create_memory_with_storage_and_routes(
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
     if config.auto_hydrate
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
+        && matches!(backend_kind, MemoryBackendKind::Sqlite)
         && snapshot::should_hydrate(workspace_dir)
     {
         tracing::info!("🧬 Cold boot detected — hydrating from MEMORY_SNAPSHOT.md");
@@ -381,7 +390,6 @@ pub fn create_memory_with_storage_and_routes(
 
     let memory = create_memory_with_builders(
         &backend_name,
-        workspace_dir,
         || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
         || build_postgres_memory(storage_provider),
         "",
@@ -397,10 +405,7 @@ pub fn create_memory_with_storage_and_routes(
     // The prompt is built once per session, so a memory stored mid-session lands
     // in the file now and in the prompt next session. Within-session freshness is
     // the recall tier's job; it runs every turn.
-    if matches!(
-        backend_kind,
-        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-    ) {
+    if matches!(backend_kind, MemoryBackendKind::Sqlite) {
         if let Err(e) = snapshot::project_core_memories(workspace_dir) {
             tracing::warn!("memory projection skipped: {e}");
         }
@@ -452,23 +457,18 @@ fn create_memory_without_embeddings(
     purpose: &str,
 ) -> anyhow::Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
-        anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown to {purpose}"
-        );
+        anyhow::bail!("memory backend 'none' disables persistence; choose sqlite to {purpose}");
     }
 
     if matches!(
         classify_memory_backend(backend),
         MemoryBackendKind::Postgres
     ) {
-        anyhow::bail!(
-            "backend 'postgres' is not supported here; use sqlite or markdown to {purpose}"
-        );
+        anyhow::bail!("backend 'postgres' is not supported here; use sqlite to {purpose}");
     }
 
     create_memory_with_builders(
         backend,
-        workspace_dir,
         || SqliteMemory::new(workspace_dir),
         || anyhow::bail!("postgres backend is not available in this context"),
         "",
@@ -824,28 +824,6 @@ mod tests {
     }
 
     #[test]
-    fn factory_markdown() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "markdown");
-    }
-
-    #[test]
-    fn factory_lucid() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "lucid".into(),
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "lucid");
-    }
-
-    #[test]
     fn factory_none_uses_noop_memory() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
@@ -878,13 +856,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_factory_lucid() {
-        let tmp = TempDir::new().unwrap();
-        let mem = create_memory_for_migration("lucid", tmp.path()).unwrap();
-        assert_eq!(mem.name(), "lucid");
-    }
-
-    #[test]
     fn migration_factory_none_is_rejected() {
         let tmp = TempDir::new().unwrap();
         let error = create_memory_for_migration("none", tmp.path())
@@ -903,6 +874,66 @@ mod tests {
         assert_eq!(
             effective_memory_backend_name("sqlite", Some(&storage)),
             "postgres"
+        );
+    }
+
+    /// The `lucid` backend was retired in v0.32.0-alpha. A leftover config or
+    /// `RANTAICLAW_STORAGE_PROVIDER=lucid` env var must not stop the daemon:
+    /// resolve to `sqlite` so the backend the operator already has on disk
+    /// keeps working.
+    #[test]
+    fn effective_backend_name_retired_lucid_resolves_to_sqlite() {
+        assert_eq!(effective_memory_backend_name("lucid", None), "sqlite");
+    }
+
+    /// The `markdown` backend was retired in v0.32.0-alpha too. Migration
+    /// already rewrote a config that said `markdown`; this handles the env
+    /// var path the migration cannot reach.
+    #[test]
+    fn effective_backend_name_retired_markdown_resolves_to_sqlite() {
+        assert_eq!(effective_memory_backend_name("markdown", None), "sqlite");
+    }
+
+    /// The storage provider override wins over `[memory].backend` at runtime,
+    /// and a retired value in the override field resolves the same way.
+    #[test]
+    fn effective_backend_name_retired_storage_override_resolves_to_sqlite() {
+        let storage = StorageProviderConfig {
+            provider: "markdown".into(),
+            ..StorageProviderConfig::default()
+        };
+        assert_eq!(
+            effective_memory_backend_name("sqlite", Some(&storage)),
+            "sqlite",
+        );
+    }
+
+    /// A name that was never a backend must still error — the retire mapping
+    /// is a soft transition for two specific values, not a free pass for any
+    /// typo. Catches the regression where someone removes the Unknown arm.
+    #[test]
+    fn effective_backend_name_unknown_still_resolves_as_unknown() {
+        // The mapping returns the trimmed/lowercased input verbatim; the
+        // factory classifies it. We assert the factory still errors.
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "redis".into(),
+            ..MemoryConfig::default()
+        };
+        let err = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("unknown backend must still error");
+        assert!(
+            err.to_string().contains("redis"),
+            "the error names the bad value: {err}"
+        );
+        assert!(
+            err.to_string().contains("sqlite") && err.to_string().contains("none"),
+            "the error lists the only valid values: {err}"
+        );
+        assert!(
+            !err.to_string().contains("lucid") && !err.to_string().contains("markdown"),
+            "the error must not name retired backends: {err}"
         );
     }
 

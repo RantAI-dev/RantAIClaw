@@ -526,7 +526,7 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `postgres`, `none`. An unrecognised value is a startup error, not a fallback |
+| `backend` | `sqlite` | `sqlite`, `postgres`, `none`. An unrecognised value is a startup error, not a fallback |
 | `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded). Auto-saved turns are stored under the `conversation` category: retained, searchable via `memory_recall`, but **never auto-injected into prompts** |
 | `min_relevance_score` | `0.4` | drop recalled entries scoring below this. See _Scores are relative_ below |
 | `embedding_provider` | `none` | `none`, `openai`, `openrouter`, `minimax`, or `custom:<base-url>` |
@@ -592,9 +592,6 @@ is rejected **whole**, and a query with no relevant memory injects nothing.
 rescaled to `1.0`, so the floor could trim the tail but never say "nothing here
 is relevant", and something was injected on nearly every turn.)
 
-One documented approximation: the `lucid` backend's *remote* results carry
-rank-derived scores — the service reports order, not relevance.
-
 Keyword-only recall (the default, `embedding_provider = "none"`) is exact-term
 matching: a query that shares no words with a stored fact returns nothing, and
 paraphrased or cross-language questions will miss. Configure an
@@ -623,7 +620,7 @@ embedding provider was unavailable. Nothing re-embeds on its own.
 
 ### `MEMORY.md`
 
-On the `sqlite` and `lucid` backends, core memories are projected into a delimited
+On the `sqlite` backend, core memories are projected into a delimited
 block of `MEMORY.md`, which the system prompt injects. Content **outside** the
 markers is yours and is preserved; content inside is generated and is replaced on
 each run. The database is authoritative — edit memories through the agent or

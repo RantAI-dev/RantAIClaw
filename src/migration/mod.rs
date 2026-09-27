@@ -74,10 +74,10 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct SourceEntry {
-    key: String,
-    content: String,
-    category: MemoryCategory,
+pub(crate) struct SourceEntry {
+    pub(crate) key: String,
+    pub(crate) content: String,
+    pub(crate) category: MemoryCategory,
 }
 
 #[derive(Debug, Default)]
@@ -270,7 +270,7 @@ fn read_openclaw_sqlite_entries(db_path: &Path) -> Result<Vec<SourceEntry>> {
     Ok(entries)
 }
 
-fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceEntry>> {
+pub(crate) fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceEntry>> {
     let mut all = Vec::new();
 
     let core_path = source_workspace.join("MEMORY.md");
@@ -474,6 +474,57 @@ fn backup_target_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
                 continue;
             };
             fs::copy(&path, daily_backup.join(name))?;
+            copied_any = true;
+        }
+    }
+
+    if copied_any {
+        Ok(Some(backup_root))
+    } else {
+        let _ = fs::remove_dir_all(&backup_root);
+        Ok(None)
+    }
+}
+
+/// Back up the markdown memory files before the v34 import rewrites `MEMORY.md`.
+///
+/// `backup_target_memory` (the OpenClaw path) also copies `brain.db`. The
+/// v34 import is for an operator whose config was `markdown` — there is no
+/// `brain.db` to copy, and copying one would race against the new sqlite
+/// handle that is about to be opened in the same workspace. Copy
+/// `MEMORY.md` and every `*.md` in `memory/` (non-recursive, so
+/// `memory/archive/` is left alone) under a `markdown-<timestamp>` directory
+/// the operator can find later.
+pub(crate) fn backup_markdown_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let backup_root = workspace_dir
+        .join("memory")
+        .join("migrations")
+        .join(format!("markdown-{timestamp}"));
+
+    fs::create_dir_all(&backup_root)?;
+
+    let memory_md = workspace_dir.join("MEMORY.md");
+    let mut copied_any = false;
+    if memory_md.exists() {
+        if let Some(name) = memory_md.file_name() {
+            fs::copy(&memory_md, backup_root.join(name))?;
+            copied_any = true;
+        }
+    }
+
+    let daily_dir = workspace_dir.join("memory");
+    if daily_dir.exists() {
+        for file in fs::read_dir(&daily_dir)? {
+            let file = file?;
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            fs::copy(&path, backup_root.join(name))?;
             copied_any = true;
         }
     }

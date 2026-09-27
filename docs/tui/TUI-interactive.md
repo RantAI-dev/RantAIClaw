@@ -795,13 +795,11 @@ These have no legacy `SetupSection` — design from `Config` schema. Each is a s
 ## Task D1: `MemoryProvisioner`
 
 **Prompt schedule:**
-1. `Choose` (single-select) — backend: `["sqlite (default, embedded)", "lucid (high-performance)", "postgres (server)", "markdown (file-based)", "none (no memory)"]`.
+1. `Choose` (single-select) — backend: `["sqlite (default, embedded)", "postgres (server)", "none (no memory)"]`.
 2. If sqlite: `Prompt` — db path. Default: `<profile>/memory.db`.
 3. If postgres: `Prompt` — DSN (e.g. `postgres://user:pass@host:5432/db`). `Prompt` (secret) — password if not in DSN.
-4. If markdown: `Prompt` — directory path. Default: `<profile>/memory/`.
-5. If lucid: `Prompt` — server URL. `Prompt` (secret) — API key.
 
-**Validation:** sqlite/markdown → `assert_path_writable`. postgres → connect via `tokio_postgres`. lucid → `probe_get` against server.
+**Validation:** sqlite → `assert_path_writable`. postgres → connect via `tokio_postgres`.
 
 **Config writes:** `config.memory = MemoryConfig { backend, ... }`.
 

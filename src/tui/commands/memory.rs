@@ -252,7 +252,7 @@ fn add_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
 
 /// Re-project `MEMORY.md` after a `/memory` write.
 ///
-/// The prompt injects that file, and on sqlite/lucid it is a projection of the
+/// The prompt injects that file, and on sqlite it is a projection of the
 /// store rather than the store itself. Only backend construction rewrites it
 /// otherwise — and the TUI is long-lived, so without this a memory removed here
 /// kept reaching the model for the rest of the session, and one added here did

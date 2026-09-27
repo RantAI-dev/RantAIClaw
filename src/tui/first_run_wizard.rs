@@ -66,7 +66,7 @@ const REQUIRED_PROVISIONERS: &[&str] = &["provider", "approvals", "login", "pers
 const INTEGRATION_OPTIONS: &[(&str, &str)] = &[
     ("mcp", "MCP servers (curated tool plugins)"),
     ("web-search", "Web search backend"),
-    ("memory", "Memory backend (sqlite / postgres / markdown)"),
+    ("memory", "Memory backend (sqlite / postgres / none)"),
 ];
 
 /// Abstract steps shown in the left rail. Stays fixed across the
