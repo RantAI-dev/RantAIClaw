@@ -239,6 +239,47 @@ cli = true
 
 Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).
 
+---
+
+## 0a. DM detection
+
+Some platforms expose a one-to-one chat signal the runtime uses to set
+`ChannelMessage.is_direct`; every other channel treats every message as a
+group chat — the safer default when the platform did not explicitly mark a
+DM.
+
+| Channel | Signal |
+|---|---|
+| Telegram | `chat.type == "private"` |
+| WhatsApp Web | chat JID on server `s.whatsapp.net` or `lid` |
+| Discord | no `guild_id` on the inbound payload |
+| Lark | `chat_type == "p2p"` |
+| Slack | `channel_type == "im"` (Socket Mode only) |
+
+Every other catalog row (Matrix, Mattermost, IRC, DingTalk, QQ, iMessage,
+Email, Linq, Nextcloud Talk, WhatsApp Cloud, Signal) leaves the flag
+`false` and the per-turn prompt reads as a group conversation.
+
+Slack polling cannot see DMs: the platform does not put `channel_type`
+on polling payloads, so those messages always arrive as `is_direct =
+false` even though Socket Mode sees the same channel as DM-aware.
+
+Three operator surfaces read this list and cannot disagree:
+
+- the `dm_detection` field on `/api/v1/channels` ([API reference](api-v1.md#get-apiv1channels)),
+- the trailing clause on each line of `rantaiclaw channel doctor`
+  ("DMs recognised" or "DMs treated as group chats"),
+- the `channels.dm_detection` check in `rantaiclaw doctor`.
+
+All channel settings live under `channels_config` in `~/.rantaiclaw/config.toml`.
+
+```toml
+[channels_config]
+cli = true
+```
+
+Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).
+
 ## In-Chat Runtime Model Switching
 
 When running `rantaiclaw channel start` (or daemon mode), the four tier channels (Telegram, Discord, Slack and WhatsApp Web) support runtime switching, scoped to the conversation:

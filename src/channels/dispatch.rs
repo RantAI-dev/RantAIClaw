@@ -691,6 +691,7 @@ pub(crate) async fn process_channel_message(
         &msg.channel,
         &msg.reply_target,
         sender_is_owner,
+        msg.is_direct,
         delivery_instructions.as_deref(),
     );
     let mut history = vec![ChatMessage::system(system_prompt)];

@@ -26,6 +26,14 @@ pub struct ChannelMessage {
     /// alongside `sender`, matching the per-channel chat allowlist which already
     /// considers every form. Empty for channels with a single identity form.
     pub sender_aliases: Vec<String>,
+    /// True only when the platform says this is a one-to-one chat with the
+    /// bot; false means a group or unknown. Set per channel from a platform-
+    /// level signal (Telegram `chat.type == "private"`, WhatsApp Web server is
+    /// `s.whatsapp.net` or `lid`, Discord without `guild_id`, Lark
+    /// `chat_type == "p2p"`, Slack `channel_type == "im"`, the local CLI). Every
+    /// other channel leaves this false: a group is the safer default when the
+    /// platform did not explicitly mark the chat as a DM.
+    pub is_direct: bool,
 }
 
 impl ChannelMessage {
@@ -337,6 +345,7 @@ mod tests {
                 timestamp: 123,
                 thread_ts: None,
                 reply_anchor: None,
+                is_direct: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -366,6 +375,7 @@ mod tests {
             timestamp: 999,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         };
 
         let cloned = message.clone();

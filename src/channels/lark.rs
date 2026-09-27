@@ -862,6 +862,9 @@ impl LarkChannel {
                             .as_secs(),
                         thread_ts: None,
                         reply_anchor: None,
+                        // Lark's `chat_type` is `"p2p"` for a one-to-one chat
+                        // with the bot; `"group"` and `"channel"` are not DMs.
+                        is_direct: lark_msg.chat_type == "p2p",
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1430,6 +1433,8 @@ impl LarkChannel {
             timestamp,
             thread_ts: None,
             reply_anchor: None,
+            // Mirror the websocket path: only `"p2p"` is a one-to-one chat.
+            is_direct: chat_type == "p2p",
         });
 
         messages
@@ -3493,6 +3498,82 @@ mod tests {
             messages.len(),
             1,
             "a DM must be answered without any addressing"
+        );
+    }
+
+    /// Lark's platform-level DM signal is `chat_type == "p2p"`. Group and
+    /// channel conversations surface as groups; missing or unexpected
+    /// values fall through to the safer "anggap grup" default. The drive is
+    /// the same Telegram/Discord prompt line.
+    #[tokio::test]
+    async fn lark_webhook_marks_direct_only_for_chat_type_p2p() {
+        let ch = allowed_channel();
+
+        let p2p = ch
+            .parse_event_payload(&webhook_payload("p2p", "", serde_json::json!([])))
+            .await;
+        assert_eq!(p2p.len(), 1, "a p2p webhook delivers one message");
+        assert!(
+            p2p[0].is_direct,
+            "`chat_type: p2p` is the DM signal, got is_direct={}",
+            p2p[0].is_direct
+        );
+
+        // A `group` webhook addressed to the bot still goes through; it must
+        // not be flagged as a DM.
+        seed_bot_identity(&ch).await;
+        let group_msg = serde_json::json!({
+            "key": "@_user_1", "id": { "open_id": "ou_rantaiclaw_bot" }, "name": "RantaiClawAgent"
+        });
+        let group = ch
+            .parse_event_payload(&webhook_payload(
+                "group",
+                "",
+                serde_json::json!([group_msg]),
+            ))
+            .await;
+        assert_eq!(
+            group.len(),
+            1,
+            "an addressed group webhook delivers one message"
+        );
+        assert!(
+            !group[0].is_direct,
+            "`chat_type: group` is not a DM, got is_direct={}",
+            group[0].is_direct
+        );
+    }
+
+    /// The websocket path cannot be exercised without a live event loop, so
+    /// the `is_direct` wiring is pinned by source: the `ChannelMessage`
+    /// literal the WS path builds must carry `chat_type == "p2p"` as the DM
+    /// signal. A copy that hand-wrote `false`, or one that read a different
+    /// field, would compile and pass any visual test and still ship the bug.
+    #[test]
+    fn lark_websocket_path_marks_direct_only_for_chat_type_p2p() {
+        let src = include_str!("lark.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+
+        // Pin the field name to "p2p" — the same constant the webhook path
+        // and the docs use, so a typo ("p2pp", "p_to_p") would fail this
+        // string-match guard before it failed a runtime test.
+        assert!(
+            production.contains("is_direct: lark_msg.chat_type == \"p2p\""),
+            "the websocket path must set `is_direct: lark_msg.chat_type == \"p2p\"`"
+        );
+
+        // A `false` literal in the same ChannelMessage literal would silently
+        // re-introduce the "always group" default. Guard against it directly:
+        // the line that sets the flag must compare against "p2p", not be a
+        // bare `false`.
+        let ws_literal = production
+            .split("ChannelMessage {")
+            .find(|snippet| snippet.contains("is_direct"))
+            .expect("the websocket ChannelMessage literal sets `is_direct`");
+        assert!(
+            !ws_literal.contains("is_direct: false"),
+            "the websocket ChannelMessage literal must derive `is_direct` from `chat_type`, \
+             not hard-code `false`"
         );
     }
 

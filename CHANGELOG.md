@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ChannelMessage.is_direct` is now surfaced to the model: `build_channel_system_prompt`
+  appends one of four fixed lines naming whether the conversation is a DM or a
+  group, and whether the sender is an owner or a guest. The line is rebuilt every
+  turn from the message; it is not stored in history.
+- `/api/v1/channels` carries a new `dm_detection` boolean on every catalog row,
+  mirroring the per-key helper the catalog, `rantaiclaw channel doctor` (each
+  row's trailing "DMs recognised" / "DMs treated as group chats" clause), and
+  the new `channels.dm_detection` info check in `rantaiclaw doctor` all read.
+  Five platforms are DM-aware today: Telegram (`chat.type == "private"`),
+  WhatsApp Web (chat JID on `s.whatsapp.net` or `lid`), Discord (no `guild_id`),
+  Lark (`chat_type == "p2p"`), Slack (`channel_type == "im"` on Socket Mode).
+  Slack polling cannot see DMs and stays `false` on that path.
 - A `NOTICE` file and the upstream MIT and Apache-2.0 texts under `licenses/`,
   restoring the ZeroClaw copyright attribution that was dropped by commit
   `caa0ef55` (2026-03-17). The RantaiClaw license itself stays AGPL-3.0-only.

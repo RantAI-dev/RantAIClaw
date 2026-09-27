@@ -76,6 +76,9 @@ impl Channel for CliChannel {
                     .as_secs(),
                 thread_ts: None,
                 reply_anchor: None,
+                // The local terminal is a DM by construction: only the
+                // operator can type into it, and no one else can read it.
+                is_direct: true,
             };
 
             if tx.send(msg).await.is_err() {
@@ -156,6 +159,7 @@ mod tests {
             timestamp: 1_234_567_890,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
@@ -177,6 +181,7 @@ mod tests {
             timestamp: 0,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         };
         let cloned = msg.clone();
         assert_eq!(cloned.id, msg.id);

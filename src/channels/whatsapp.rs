@@ -488,6 +488,7 @@ impl WhatsAppChannel {
                         timestamp,
                         thread_ts: None,
                         reply_anchor: None,
+                        is_direct: false,
                     });
                 }
             }

@@ -427,6 +427,7 @@ impl SignalChannel {
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         })
     }
 }

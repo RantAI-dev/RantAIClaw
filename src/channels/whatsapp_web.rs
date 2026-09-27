@@ -675,7 +675,17 @@ impl WhatsAppWebChannel {
         reply_target: String,
         content: String,
         message_ts: i64,
+        chat_jid: &Jid,
     ) -> ChannelMessage {
+        use wa_rs_binary::jid::{JidExt as _, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER};
+        // A direct chat is one with a phone-number (`s.whatsapp.net`) or LID
+        // (`lid`) server — the two wa-rs uses for 1:1 conversations. Groups
+        // (`g.us`), broadcasts (`broadcast`), and newsletters (`newsletter`)
+        // explicitly fall through to `false`. `!info.source.is_group` is not
+        // equivalent: wa-rs marks every broadcast as a group and treats a
+        // newsletter as a DM.
+        let is_direct =
+            chat_jid.server() == DEFAULT_USER_SERVER || chat_jid.server() == HIDDEN_USER_SERVER;
         ChannelMessage {
             sender_aliases: Vec::new(),
             // The platform id, not a fresh UUID: a redelivery has to be
@@ -692,6 +702,7 @@ impl WhatsAppWebChannel {
             timestamp: Self::inbound_timestamp(message_ts),
             thread_ts: None,
             reply_anchor: None,
+            is_direct,
         }
     }
 
@@ -1345,6 +1356,7 @@ impl Channel for WhatsAppWebChannel {
                                     reply_target,
                                     content.clone(),
                                     info.timestamp.timestamp(),
+                                    &chat_jid,
                                 );
                                 // `try_send`, not `send`: a busy agent must not
                                 // park the wa-rs protocol loop, which also
@@ -3471,6 +3483,107 @@ mod tests {
         );
         assert!(!target.is_lid());
         assert_eq!(target.user(), "123456789");
+    }
+
+    /// WhatsApp Web's platform-level DM signal is the chat JID's server.
+    /// wa-rs uses `s.whatsapp.net` (PN) and `lid` for one-to-one chats;
+    /// groups (`g.us`), broadcasts (`broadcast`), and newsletters
+    /// (`newsletter`) all surface as groups. The drive in plan 453 is the
+    /// prompt's DM-vs-group line — `!is_group` is **not** equivalent (wa-rs
+    /// marks every broadcast as a group and treats a newsletter as a DM),
+    /// so the assertion is on the JID's server, not on `is_group`.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn whatsapp_web_inbound_channel_message_marks_direct_only_for_pn_or_lid() {
+        use wa_rs_binary::jid::JidExt as _;
+
+        // A phone-number JID is a one-to-one chat — the canonical DM signal.
+        let pn_msg = WhatsAppWebChannel::inbound_channel_message(
+            "3EB0PN",
+            "+15550001111".into(),
+            "15550001111@s.whatsapp.net".into(),
+            "hi".into(),
+            1_700_000_000,
+            &wa_rs_binary::jid::Jid::pn("15550001111"),
+        );
+        assert!(
+            pn_msg.is_direct,
+            "`s.whatsapp.net` is the DM signal, got is_direct={}",
+            pn_msg.is_direct
+        );
+
+        // A LID-addressed chat is also one-to-one — the privacy-preserving
+        // form, but the conversation is still between two people.
+        let lid_jid = wa_rs_binary::jid::Jid::lid("200000000000001");
+        assert_eq!(lid_jid.server(), "lid");
+        let lid_msg = WhatsAppWebChannel::inbound_channel_message(
+            "3EB0LID",
+            "+15550001111".into(),
+            "200000000000001@lid".into(),
+            "hi".into(),
+            1_700_000_001,
+            &lid_jid,
+        );
+        assert!(
+            lid_msg.is_direct,
+            "`lid` is the LID DM signal, got is_direct={}",
+            lid_msg.is_direct
+        );
+
+        // Groups: the canonical group server.
+        let group_jid = wa_rs_binary::jid::Jid::group("123456789");
+        assert_eq!(group_jid.server(), "g.us");
+        let group_msg = WhatsAppWebChannel::inbound_channel_message(
+            "3EB0GRP",
+            "+15550001111".into(),
+            "123456789@g.us".into(),
+            "hi".into(),
+            1_700_000_002,
+            &group_jid,
+        );
+        assert!(
+            !group_msg.is_direct,
+            "`g.us` is a group, got is_direct={}",
+            group_msg.is_direct
+        );
+
+        // Broadcasts: a broadcast list is not a one-to-one conversation —
+        // the flag must stay false. This is the case the plan names where
+        // `!info.source.is_group` would be wrong, because the wa-rs
+        // `MessageInfo.source.is_group` field is `true` for broadcasts (it
+        // uses a coarser rule than `Jid::is_group`, which only covers
+        // `g.us`); either rule still has to agree with our prompt, which
+        // says broadcasts are groups.
+        let broadcast_jid = wa_rs_binary::jid::Jid::new("12025550101", "broadcast");
+        let broadcast_msg = WhatsAppWebChannel::inbound_channel_message(
+            "3EB0BCAST",
+            "+15550001111".into(),
+            "12025550101@broadcast".into(),
+            "hi".into(),
+            1_700_000_003,
+            &broadcast_jid,
+        );
+        assert!(
+            !broadcast_msg.is_direct,
+            "a broadcast list is not a DM, got is_direct={}",
+            broadcast_msg.is_direct
+        );
+
+        // Status broadcasts: a special broadcast server. Not a DM.
+        let status_jid = wa_rs_binary::jid::Jid::new("status", "broadcast");
+        let status_msg = WhatsAppWebChannel::inbound_channel_message(
+            "3EB0STATUS",
+            "+15550001111".into(),
+            "status@broadcast".into(),
+            "hi".into(),
+            1_700_000_004,
+            &status_jid,
+        );
+        assert!(
+            !status_msg.is_direct,
+            "a status broadcast is not a DM, got is_direct={}",
+            status_msg.is_direct
+        );
     }
 
     #[test]

@@ -89,11 +89,12 @@ fn delivery_instructions_default_is_none() {
         "telegram",
         "1",
         false,
+        false,
         Some(instructions.as_str()),
     );
     assert!(with.starts_with("BASE\n\n"));
     assert!(with.contains("[DOCUMENT:"));
-    let without = prompt::build_channel_system_prompt("BASE", "irc", "#room", false, None);
+    let without = prompt::build_channel_system_prompt("BASE", "irc", "#room", false, false, None);
     assert!(!without.contains("[DOCUMENT:"));
 }
 
@@ -1250,9 +1251,10 @@ use tempfile::TempDir;
 /// not. The base prompt is preserved either way.
 #[test]
 fn channel_system_prompt_marks_owner_turns_only() {
-    let owner = prompt::build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", true, None);
+    let owner =
+        prompt::build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", true, false, None);
     let guest =
-        prompt::build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", false, None);
+        prompt::build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", false, false, None);
 
     assert!(
         owner.to_lowercase().contains("verified owner"),
@@ -1267,7 +1269,8 @@ fn channel_system_prompt_marks_owner_turns_only() {
 
 #[test]
 fn cron_delivery_instruction_present_for_announce_channels() {
-    let p = prompt::build_channel_system_prompt("BASE", "telegram", "123456789", false, None);
+    let p =
+        prompt::build_channel_system_prompt("BASE", "telegram", "123456789", false, false, None);
     assert!(p.contains("BASE"));
     assert!(
         p.contains("cron_add"),
@@ -1283,7 +1286,7 @@ fn cron_delivery_instruction_present_for_announce_channels() {
 #[test]
 fn no_cron_delivery_instruction_for_unsupported_channel() {
     // A channel the scheduler can't deliver to must NOT promise delivery.
-    let p = prompt::build_channel_system_prompt("BASE", "irc", "#room", false, None);
+    let p = prompt::build_channel_system_prompt("BASE", "irc", "#room", false, false, None);
     assert!(
         !p.contains("route the output back"),
         "irc has no announce delivery"
@@ -1292,6 +1295,69 @@ fn no_cron_delivery_instruction_for_unsupported_channel() {
         !p.contains("\"mode\": \"announce\""),
         "irc must not get a delivery template"
     );
+}
+
+/// The DM-vs-group and owner-vs-guest axes produce one of four fixed lines,
+/// in fixed wording, exactly once — the runtime rebuilds this prompt every
+/// turn so a stale cached copy would mislead the model. `is_direct` is
+/// per-turn state from `ChannelMessage.is_direct`, not stored on the prompt.
+#[test]
+fn channel_system_prompt_marks_dm_and_owner_in_all_four_combinations() {
+    // Signature is `(base, channel, reply_target, is_owner, is_direct, delivery)`.
+    let direct_owner =
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, true, None);
+    let direct_guest =
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", false, true, None);
+    let group_owner =
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, false, None);
+    let group_guest =
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", false, false, None);
+
+    // Exact lines as the plan names them; not a paraphrase.
+    assert!(
+        direct_owner.contains("This conversation is a direct message with the bot's owner."),
+        "direct + owner line missing: {direct_owner}"
+    );
+    assert!(
+        direct_guest.contains("This conversation is a direct message with a guest, not an owner."),
+        "direct + guest line missing: {direct_guest}"
+    );
+    assert!(
+        group_owner.contains("This conversation is a group chat; the current sender is an owner."),
+        "group + owner line missing: {group_owner}"
+    );
+    assert!(
+        group_guest.contains(
+            "This conversation is a group chat; the current sender is a guest, not an owner."
+        ),
+        "group + guest line missing: {group_guest}"
+    );
+
+    // Exactly once: a duplication here would come from a wiring bug, and the
+    // model would either be told the conversation is two different things or
+    // see one of them twice in a row. The exact wording makes a substring
+    // count safe.
+    for (label, prompt) in [
+        ("direct+owner", &direct_owner),
+        ("direct+guest", &direct_guest),
+        ("group+owner", &group_owner),
+        ("group+guest", &group_guest),
+    ] {
+        assert_eq!(
+            prompt.matches("This conversation is a").count(),
+            1,
+            "{label}: exactly one `This conversation is a …` line, got {}",
+            prompt.matches("This conversation is a").count()
+        );
+    }
+
+    // CHANNEL_OWNER_CONTEXT is unchanged and only fires for owners. The
+    // direct/group axis is independent — an owner in a group still gets the
+    // owner context, and a guest in a DM still does not.
+    assert!(direct_owner.contains("verified OWNER"));
+    assert!(!direct_guest.contains("verified OWNER"));
+    assert!(group_owner.contains("verified OWNER"));
+    assert!(!group_guest.contains("verified OWNER"));
 }
 
 /// Build a saveable `Config` whose Telegram allowlist is `users`, backed by
@@ -2160,6 +2226,7 @@ async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -2229,6 +2296,7 @@ async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_repl
             timestamp: 3,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -2298,6 +2366,7 @@ async fn process_channel_message_executes_tool_calls_with_alias_tags() {
             timestamp: 2,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -2375,6 +2444,7 @@ async fn process_channel_message_handles_models_command_without_llm_call() {
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -2474,6 +2544,7 @@ async fn process_channel_message_uses_route_override_provider_and_model() {
             timestamp: 2,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -2554,6 +2625,7 @@ async fn process_channel_message_prefers_cached_default_provider_instance() {
             timestamp: 3,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -2659,6 +2731,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
             timestamp: 4,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -3010,6 +3083,7 @@ async fn a_revoked_sender_is_dropped_by_dispatch_after_the_refresh() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     };
 
     // Revoke, then deliver: the message must be dropped, nothing sent.
@@ -3771,6 +3845,7 @@ async fn process_channel_message_respects_configured_max_tool_iterations_above_d
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -3850,6 +3925,7 @@ async fn process_channel_message_reports_configured_max_tool_iterations_limit() 
             timestamp: 2,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -4111,6 +4187,7 @@ async fn channel_error_replies_are_sanitized_before_delivery() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     })
     .await
     .unwrap();
@@ -4751,12 +4828,14 @@ fn each_whatsapp_transport_finds_only_its_own_allowlist() {
     // to find the Web table under its own `channel`.
     #[cfg(feature = "whatsapp-web")]
     {
+        use wa_rs_binary::jid::Jid;
         let inbound = crate::channels::whatsapp_web::WhatsAppWebChannel::inbound_channel_message(
             "3EB0ALLOWLIST",
             "+15550001111".into(),
             "15550001111@s.whatsapp.net".into(),
             "hello".into(),
             0,
+            &Jid::pn("15550001111"),
         );
         assert_eq!(
             both.get(&inbound.channel),
@@ -5070,6 +5149,7 @@ fn dm_and_group_history_do_not_merge() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     });
     let group = conversation_history_key(&traits::ChannelMessage {
         sender_aliases: Vec::new(),
@@ -5081,6 +5161,7 @@ fn dm_and_group_history_do_not_merge() {
         timestamp: 2,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     });
 
     assert_ne!(
@@ -5103,6 +5184,7 @@ fn threads_resolve_to_their_own_conversation() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     };
     let parent = conversation_history_key(&base);
     let threaded = conversation_history_key(&traits::ChannelMessage {
@@ -5128,6 +5210,7 @@ fn route_override_key_follows_the_conversation_not_the_person() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     });
     let chat_b = conversation_history_key(&traits::ChannelMessage {
         sender_aliases: Vec::new(),
@@ -5139,6 +5222,7 @@ fn route_override_key_follows_the_conversation_not_the_person() {
         timestamp: 2,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     });
 
     assert_ne!(
@@ -5149,12 +5233,19 @@ fn route_override_key_follows_the_conversation_not_the_person() {
 
 /// One Telegram update, as the Bot API delivers it: a message in `chat`,
 /// optionally inside a forum topic.
+///
+/// The chat id picks the chat type: positive is a one-to-one chat (Telegram's
+/// `private`), negative is a group or supergroup. Without `chat.type` set the
+/// parser's `is_direct` falls through to `false` and a fixture described as a
+/// DM is treated as a group, which the plan 453 catalog and prompt would then
+/// disagree with.
 fn telegram_update(message_id: i64, chat: i64, topic: Option<i64>) -> serde_json::Value {
+    let chat_type = if chat > 0 { "private" } else { "supergroup" };
     let mut message = serde_json::json!({
         "message_id": message_id,
         "text": "hi",
         "from": { "id": 555 },
-        "chat": { "id": chat },
+        "chat": { "id": chat, "type": chat_type },
     });
     if let Some(topic) = topic {
         message["message_thread_id"] = serde_json::json!(topic);
@@ -5252,6 +5343,7 @@ fn every_tier_channel_keeps_one_conversation_across_consecutive_messages() {
     #[cfg(feature = "whatsapp-web")]
     {
         use crate::channels::whatsapp_web::WhatsAppWebChannel;
+        use wa_rs_binary::jid::Jid;
         let chat = "15550001111@s.whatsapp.net";
         let first = WhatsAppWebChannel::inbound_channel_message(
             "3EB0A1",
@@ -5259,6 +5351,7 @@ fn every_tier_channel_keeps_one_conversation_across_consecutive_messages() {
             chat.into(),
             "hi".into(),
             1_700_000_000,
+            &Jid::pn("15550001111"),
         );
         let next = WhatsAppWebChannel::inbound_channel_message(
             "3EB0A2",
@@ -5266,6 +5359,7 @@ fn every_tier_channel_keeps_one_conversation_across_consecutive_messages() {
             chat.into(),
             "and then".into(),
             1_700_000_005,
+            &Jid::pn("15550001111"),
         );
         assert_eq!(
             conversation_history_key(&first),
@@ -5493,6 +5587,7 @@ fn drain_message(chat: &str) -> traits::ChannelMessage {
         thread_ts: Some(format!("thread-{chat}")),
         reply_anchor: Some(format!("anchor-{chat}")),
         sender_aliases: Vec::new(),
+        is_direct: false,
     }
 }
 
@@ -6089,6 +6184,7 @@ async fn a_vision_refusal_pairs_the_user_turn_in_history() {
         thread_ts: Some("thread-chat-1".into()),
         reply_anchor: Some("anchor-chat-1".into()),
         sender_aliases: Vec::new(),
+        is_direct: false,
     };
 
     process_channel_message(Arc::clone(&ctx), msg.clone(), CancellationToken::new()).await;
@@ -6682,20 +6778,28 @@ fn tier_message(channel: &str, id: u32, text: &str) -> traits::ChannelMessage {
                 "text": format!("<@U_BOT> {text}"),
                 "ts": format!("1700000{id:03}.000200"),
                 "thread_ts": SLACK_THREAD_ROOT,
+                // The tier fixture is a DM (channel name and conversation are
+                // both `slack`, and Slack carries the same prompt on DMs and
+                // channels), so the platform's DM signal must be present —
+                // otherwise `is_direct` falls through to `false` and the
+                // prompt says "group chat" for a conversation that isn't one.
+                "channel_type": "im",
             });
-            match slack.classify_inbound(&payload, "U_BOT", "", "C_CHAN") {
+            match slack.classify_inbound(&payload, "U_BOT", "", "D0DM") {
                 crate::channels::slack::SlackInbound::Deliver(msg) => msg,
                 other => panic!("the message must be delivered: {other:?}"),
             }
         }
         #[cfg(feature = "whatsapp-web")]
         "whatsapp_web" => {
+            use wa_rs_binary::jid::Jid;
             crate::channels::whatsapp_web::WhatsAppWebChannel::inbound_channel_message(
                 &format!("3EB0{id}"),
                 "+15550001111".into(),
                 "15550001111@s.whatsapp.net".into(),
                 text.into(),
                 1_700_000_000,
+                &Jid::pn("15550001111"),
             )
         }
         other => panic!("not a tier channel with a parser here: {other}"),
@@ -7168,6 +7272,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     })
     .await
     .unwrap();
@@ -7181,6 +7286,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         timestamp: 2,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     })
     .await
     .unwrap();
@@ -7267,6 +7373,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         })
         .await
         .unwrap();
@@ -7281,6 +7388,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
             timestamp: 2,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         })
         .await
         .unwrap();
@@ -7378,6 +7486,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         })
         .await
         .unwrap();
@@ -7392,6 +7501,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
             timestamp: 2,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         })
         .await
         .unwrap();
@@ -7463,6 +7573,7 @@ async fn process_channel_message_cancels_scoped_typing_task() {
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -7844,6 +7955,7 @@ fn conversation_memory_key_uses_message_id() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     };
 
     assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -7861,6 +7973,7 @@ fn conversation_memory_key_is_unique_per_message() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     };
     let msg2 = traits::ChannelMessage {
         sender_aliases: Vec::new(),
@@ -7872,6 +7985,7 @@ fn conversation_memory_key_is_unique_per_message() {
         timestamp: 2,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     };
 
     assert_ne!(
@@ -7895,6 +8009,7 @@ async fn autosave_keys_preserve_multiple_conversation_facts() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     };
     let msg2 = traits::ChannelMessage {
         sender_aliases: Vec::new(),
@@ -7906,6 +8021,7 @@ async fn autosave_keys_preserve_multiple_conversation_facts() {
         timestamp: 2,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     };
 
     mem.store(
@@ -8021,6 +8137,7 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -8038,6 +8155,7 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
             timestamp: 2,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -8117,6 +8235,7 @@ async fn process_channel_message_enriches_current_turn_without_persisting_contex
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -8211,6 +8330,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -8320,6 +8440,7 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
+            is_direct: false,
         },
         CancellationToken::new(),
     )
@@ -9126,6 +9247,7 @@ fn memory_scope_does_not_merge_a_dm_into_a_group() {
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
+        is_direct: false,
     };
     let group = traits::ChannelMessage {
         reply_target: "-1009999".into(),
@@ -9170,6 +9292,7 @@ async fn the_bus_reports_closed_before_a_runtime_publishes_and_after_it_clears()
         thread_ts: None,
         reply_anchor: None,
         sender_aliases: Vec::new(),
+        is_direct: false,
     };
 
     assert_eq!(
@@ -9518,6 +9641,87 @@ fn api_catalog_entries_carry_setup_checklists() {
     assert!(
         telegram_map.get("setup_checklist").is_none(),
         "telegram's JSON has no `setup_checklist` key — the contract is absent, not null, not \"\""
+    );
+}
+
+/// Each catalog row carries its `dm_detection` flag. The five channels with a
+/// platform-level DM signal — Telegram, WhatsApp Web, Discord, Lark, Slack —
+/// are `true`. Every other row is `false`. The list lives in `dm_detection_for`
+/// so the catalog, the catalog-derived `/api/v1/channels` endpoint, and the
+/// `rantaiclaw channel doctor` rendering cannot drift apart.
+#[test]
+fn api_catalog_entries_carry_dm_detection() {
+    let config = config_with_every_channel();
+    let entries = crate::channels::channel_catalog_entries(&config);
+
+    let with_dm = ["telegram", "whatsapp_web", "discord", "lark", "slack"];
+    let without_dm = [
+        "mattermost",
+        "webhook",
+        "imessage",
+        "matrix",
+        "signal",
+        "whatsapp",
+        "linq",
+        "nextcloud_talk",
+        "email",
+        "irc",
+        "dingtalk",
+        "qq",
+    ];
+
+    for key in with_dm {
+        let entry = entries
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("{key} is in the catalog"));
+        assert!(
+            entry.dm_detection,
+            "{key} must carry dm_detection=true — the platform has a DM signal"
+        );
+    }
+
+    for key in without_dm {
+        let entry = entries
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("{key} is in the catalog"));
+        assert!(
+            !entry.dm_detection,
+            "{key} must carry dm_detection=false — defer, never silently guess"
+        );
+    }
+
+    // Wire-level pin: the field is always serialised, so a console can rely
+    // on its presence on every row. (A `serde(skip_serializing_if = "...")`
+    // would re-introduce the absence/null ambiguity that bit
+    // `setup_checklist`.)
+    let telegram = entries
+        .iter()
+        .find(|e| e.key == "telegram")
+        .expect("telegram is in the catalog");
+    let telegram_value = serde_json::to_value(telegram).expect("serialize telegram row");
+    let telegram_map = telegram_value
+        .as_object()
+        .expect("telegram row serializes to an object");
+    assert_eq!(
+        telegram_map.get("dm_detection"),
+        Some(&serde_json::Value::Bool(true)),
+        "telegram's JSON carries `dm_detection: true`"
+    );
+
+    let irc = entries
+        .iter()
+        .find(|e| e.key == "irc")
+        .expect("irc is in the catalog");
+    let irc_value = serde_json::to_value(irc).expect("serialize irc row");
+    let irc_map = irc_value
+        .as_object()
+        .expect("irc row serializes to an object");
+    assert_eq!(
+        irc_map.get("dm_detection"),
+        Some(&serde_json::Value::Bool(false)),
+        "irc's JSON carries `dm_detection: false`"
     );
 }
 

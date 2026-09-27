@@ -481,6 +481,7 @@ impl MattermostChannel {
             timestamp: (create_at / 1000) as u64,
             thread_ts,
             reply_anchor: None,
+            is_direct: false,
         })
     }
 }

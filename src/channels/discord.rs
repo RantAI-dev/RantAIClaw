@@ -214,6 +214,10 @@ impl DiscordChannel {
             } else {
                 Some(message_id.to_string())
             },
+            // DMs arrive without a `guild_id`. Guild messages carry one — it
+            // is the per-server channel grouping — so `!is_guild` is exactly
+            // the platform's own one-to-one signal.
+            is_direct: !is_guild,
         })
     }
 
@@ -2099,5 +2103,34 @@ mod tests {
         ));
         let as_the_runtime_holds_it: std::sync::Arc<dyn Channel> = ch.clone();
         assert_eq!(as_the_runtime_holds_it.bot_username().await, None);
+    }
+
+    /// Discord's platform-level DM signal is the absence of `guild_id`: a DM
+    /// arrives without one, a guild message always carries it. The plan's
+    /// rule is "kalau ragu, anggap grup", so the flag must flip exactly on
+    /// the absence.
+    #[test]
+    fn discord_classify_inbound_marks_direct_only_when_guild_id_is_absent() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
+
+        let dm = ch.classify_inbound(&inbound("U_OK", "hi", None), "U_BOT");
+        match dm {
+            DiscordInbound::Deliver(msg) => assert!(
+                msg.is_direct,
+                "no `guild_id` is the platform's DM signal, got is_direct={}",
+                msg.is_direct
+            ),
+            other => panic!("a DM must be delivered: {other:?}"),
+        }
+
+        let guild = ch.classify_inbound(&inbound("U_OK", "hi", Some("G_GUILD")), "U_BOT");
+        match guild {
+            DiscordInbound::Deliver(msg) => assert!(
+                !msg.is_direct,
+                "a guild message is a group, got is_direct={}",
+                msg.is_direct
+            ),
+            other => panic!("a guild message must be delivered: {other:?}"),
+        }
     }
 }

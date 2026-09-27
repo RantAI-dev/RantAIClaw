@@ -506,6 +506,7 @@ impl Channel for DingTalkChannel {
                             .as_secs(),
                         thread_ts: None,
                         reply_anchor: None,
+                        is_direct: false,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

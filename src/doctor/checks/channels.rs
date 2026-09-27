@@ -113,6 +113,63 @@ impl DoctorCheck for ChannelsAuthCheck {
     }
 }
 
+/// `rantaiclaw doctor` check that names, for the operator, which configured
+/// channels can tell a DM from a group and which treat every message as a
+/// group chat. Companion to the `dm_detection` field on
+/// `/api/v1/channels` — three readers (`channel_catalog_entries`,
+/// `rantaiclaw channel doctor`, this check) all go through the same
+/// `dm_detection_for` helper, so the three surfaces cannot disagree.
+///
+/// Severity is `Info`: the absence of DM detection is a known limitation
+/// of the platforms that ship without the signal (Matrix, Mattermost, IRC,
+/// etc.), not a configuration error. Raising it would change `doctor`'s
+/// exit code for every operator whose config deliberately lives with the
+/// group-only default.
+pub struct ChannelsDmDetectionCheck;
+
+#[async_trait]
+impl DoctorCheck for ChannelsDmDetectionCheck {
+    fn name(&self) -> &'static str {
+        "channels.dm_detection"
+    }
+    fn category(&self) -> &'static str {
+        "config"
+    }
+
+    async fn run(&self, ctx: &DoctorContext) -> CheckResult {
+        // Same iterator the catalog uses: configured-only, in catalog order,
+        // so the message reads the same way the `channel list` does.
+        let entries = crate::channels::channel_catalog_entries(&ctx.config);
+
+        let recognised: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.configured && e.dm_detection)
+            .map(|e| e.key)
+            .collect();
+        let treated_as_group: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.configured && !e.dm_detection)
+            .map(|e| e.key)
+            .collect();
+
+        let message = match (recognised.is_empty(), treated_as_group.is_empty()) {
+            (true, true) => "no channels configured".to_string(),
+            (false, true) => format!("DMs recognised: {}", recognised.join(", ")),
+            (true, false) => format!(
+                "DMs treated as group chats: {}",
+                treated_as_group.join(", ")
+            ),
+            (false, false) => format!(
+                "DMs recognised: {} · DMs treated as group chats: {}",
+                recognised.join(", "),
+                treated_as_group.join(", ")
+            ),
+        };
+
+        CheckResult::info(self.name(), message).with_category(self.category())
+    }
+}
+
 fn summarize(name: &'static str, category: &'static str, summary: &ChannelSummary) -> CheckResult {
     match summary.severity {
         Severity::Ok => CheckResult::ok(name, summary.message.clone()).with_category(category),
@@ -848,5 +905,76 @@ mod tests {
             PROBED_KEYS.contains(&"lark"),
             "lark must be probed now that it can run in the default build"
         );
+    }
+
+    fn run_dm_check(cfg: Config) -> CheckResult {
+        let check = ChannelsDmDetectionCheck;
+        let ctx = DoctorContext {
+            profile: crate::profile::Profile {
+                name: "test".to_string(),
+                root: std::path::PathBuf::from("/tmp"),
+            },
+            config: cfg,
+            offline: true,
+        };
+        futures::executor::block_on(check.run(&ctx))
+    }
+
+    /// Telegram is DM-aware and IRC is not — the message must name both,
+    /// grouped by which side of the boundary they fall on. This is the
+    /// rendered answer the owner asked for in plan 453 (the
+    /// `memory-langkah-04-deteksi-dm.png` snapshot).
+    #[test]
+    fn dm_detection_check_names_telegram_as_aware_and_irc_as_treated_as_group() {
+        let mut cfg = Config::default();
+        cfg.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "abc:123".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        cfg.channels_config.irc = Some(crate::config::schema::IrcConfig {
+            server: "irc.example.org".into(),
+            port: 6697,
+            nickname: "bot".into(),
+            username: None,
+            channels: vec!["#rantaiclaw".into()],
+            allowed_users: vec![],
+            server_password: None,
+            nickserv_password: None,
+            sasl_password: None,
+            verify_tls: None,
+            allow_insecure_tls_with_password: false,
+        });
+
+        let result = run_dm_check(cfg);
+        assert_eq!(
+            result.severity,
+            Severity::Info,
+            "DM detection is informational, not a failure: {}",
+            result.message
+        );
+        assert_eq!(result.name, "channels.dm_detection");
+        assert!(
+            result.message.contains("telegram"),
+            "Telegram must be named as DM-aware, got: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("irc"),
+            "IRC must be named as treated-as-group, got: {}",
+            result.message
+        );
+    }
+
+    /// A config with no channels at all still gets a real answer — the
+    /// parallel to `inspect_channels`'s "no channels configured" branch.
+    #[test]
+    fn dm_detection_check_with_no_channels_returns_info() {
+        let result = run_dm_check(Config::default());
+        assert_eq!(result.severity, Severity::Info);
+        assert!(!result.message.is_empty(), "empty message");
     }
 }
