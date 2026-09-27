@@ -14,6 +14,7 @@ pub use query_expansion::expand_query;
 pub use rrf::{reciprocal_rank_fusion, RrfOptions};
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::kb::embed::EmbeddingProvider;
@@ -519,7 +520,7 @@ fn format_document_inventory(titles: &[String], max_listed: usize) -> String {
         out.push('\n');
     }
     if total > max_listed {
-        out.push_str(&format!("- … and {} more\n", total - max_listed));
+        let _ = writeln!(out, "- … and {} more", total - max_listed);
     }
     out
 }

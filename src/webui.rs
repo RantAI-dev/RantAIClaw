@@ -8,6 +8,7 @@
 //! extract) and `node` (to run the standalone server) are required.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -1437,9 +1438,9 @@ fn start(
     // Record PIDs so `ui stop` can tear everything down.
     let mut state = String::new();
     if let Some(g) = gateway_pid {
-        state.push_str(&format!("gateway={g}\n"));
+        let _ = writeln!(state, "gateway={g}");
     }
-    state.push_str(&format!("ui={ui_pid}\n"));
+    let _ = writeln!(state, "ui={ui_pid}");
     std::fs::write(run_file(&dir), state).ok();
 
     let ready = wait_for_port(connect_host(&host), port, 60);

@@ -3027,7 +3027,8 @@ impl TuiApp {
                 // user can scroll back through long output natively. We
                 // flatten the active tab plus a header line.
                 let mut out = String::new();
-                out.push_str(&format!("{}\n", content.title));
+                use std::fmt::Write as _;
+                let _ = writeln!(out, "{}", content.title);
                 for (i, tab) in content.tabs.iter().enumerate() {
                     if content.tabs.len() > 1 {
                         let marker = if i == content.active_tab {
@@ -3035,7 +3036,7 @@ impl TuiApp {
                         } else {
                             "  "
                         };
-                        out.push_str(&format!("\n{}{}\n", marker, tab.label));
+                        let _ = writeln!(out, "\n{}{}", marker, tab.label);
                     }
                     for line in &tab.body {
                         out.push_str(line);

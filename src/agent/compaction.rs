@@ -12,6 +12,8 @@
 //! tools-disabled provider call pattern (same shape as
 //! `force_final_summary` in `loop_.rs`) — no new networking surface.
 
+use std::fmt::Write as _;
+
 use crate::providers::{ChatMessage, ConversationMessage, ToolCall};
 
 /// System prompt that ships with every compaction request. Kept here
@@ -181,7 +183,7 @@ pub(crate) fn flatten_for_summary(history: &[ConversationMessage]) -> Vec<ChatMe
                 let mut s = String::from("[tool results]\n");
                 for r in results {
                     let preview = preview(&r.content, 400);
-                    s.push_str(&format!("- ({}): {preview}\n", r.tool_call_id));
+                    let _ = writeln!(s, "- ({}): {}", r.tool_call_id, preview);
                 }
                 Some(ChatMessage::user(s.trim_end().to_string()))
             }

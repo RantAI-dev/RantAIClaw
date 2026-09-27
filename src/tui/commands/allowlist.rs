@@ -197,24 +197,26 @@ impl CommandHandler for AllowlistCommand {
                 config_allowed.join(", ")
             }
         );
-        out.push_str(&format!(
-            "Runtime allowlist ({}): {}\n",
+        let _ = writeln!(
+            out,
+            "Runtime allowlist ({}): {}",
             runtime.len(),
             if runtime.is_empty() {
                 "(none)".to_string()
             } else {
                 runtime.join(", ")
             }
-        ));
+        );
         if pending.is_empty() {
             out.push_str("Pending approvals: (none)");
         } else {
             out.push_str("Pending approvals:\n");
             for req in pending {
-                out.push_str(&format!(
-                    "  - {} (full: `{}`) — /allow {} | /allow {} --persist | /deny {}\n",
+                let _ = writeln!(
+                    out,
+                    "  - {} (full: `{}`) — /allow {} | /allow {} --persist | /deny {}",
                     req.basename, req.full_command, req.basename, req.basename, req.basename,
-                ));
+                );
             }
         }
         Ok(CommandResult::Message(out))

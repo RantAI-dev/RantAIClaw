@@ -227,7 +227,7 @@ fn render_inventory_lines(inv: &Inventory<'_>, budget: usize) -> Vec<String> {
 
     let mut header = format!("{title_style}{}{r}", inv.title);
     if let Some(sub) = inv.subtitle {
-        header.push_str(&format!(" {sub_style}· {sub}{r}"));
+        let _ = write!(header, " {sub_style}· {sub}{r}");
     }
     lines.push(header);
 
