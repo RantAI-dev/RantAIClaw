@@ -4,8 +4,6 @@ use super::{
     MemoryBackendKind,
 };
 use crate::config::Config;
-#[cfg(feature = "memory-postgres")]
-use anyhow::Context;
 use anyhow::{bail, Result};
 use console::style;
 
@@ -39,39 +37,13 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
 ///
 /// CLI commands (list/get/stats/clear) never use vector search, so we skip
 /// embedding provider initialisation for local backends by using the
-/// migration factory.  Postgres still needs its full connection config.
+/// migration factory.
 fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
-    let backend = effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
+    let backend = effective_memory_backend_name(&config.memory.backend);
 
     match classify_memory_backend(&backend) {
         MemoryBackendKind::None => {
             bail!("Memory backend is 'none' (disabled). No entries to manage.");
-        }
-        MemoryBackendKind::Postgres => {
-            #[cfg(not(feature = "memory-postgres"))]
-            bail!("memory backend 'postgres' requires the 'memory-postgres' feature to be enabled at compile time");
-            #[cfg(feature = "memory-postgres")]
-            {
-                let sp = &config.storage.provider.config;
-                let db_url = sp
-                    .db_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .context(
-                        "memory backend 'postgres' requires db_url in [storage.provider.config]",
-                    )?;
-                let mem = super::PostgresMemory::new(
-                    db_url,
-                    &sp.schema,
-                    &sp.table,
-                    sp.connect_timeout_secs,
-                )?;
-                Ok(Box::new(mem))
-            }
         }
         _ => create_memory_for_cli(&backend, &config.workspace_dir),
     }
@@ -250,10 +222,7 @@ async fn handle_recall(config: &Config, query: &str, limit: usize) -> Result<()>
 /// vector search skips the latter because a vector of another dimensionality is
 /// not comparable, so switching models silently emptied it.
 async fn handle_reindex(config: &Config) -> Result<()> {
-    let backend = effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
+    let backend = effective_memory_backend_name(&config.memory.backend);
     if !matches!(classify_memory_backend(&backend), MemoryBackendKind::Sqlite) {
         bail!("memory backend '{backend}' does not store embeddings; nothing to reindex");
     }

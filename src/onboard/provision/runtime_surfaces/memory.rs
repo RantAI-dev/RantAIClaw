@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 pub const MEMORY_NAME: &str = "memory";
-pub const MEMORY_DESC: &str = "Memory backend — sqlite, postgres, or none";
+pub const MEMORY_DESC: &str = "Memory backend — sqlite or none";
 
 #[derive(Debug, Clone)]
 pub struct MemoryProvisioner;
@@ -63,7 +63,10 @@ impl TuiProvisioner for MemoryProvisioner {
         )
         .await?;
 
-        // Backend selection
+        // Backend selection — `postgres` was retired in v0.32.0-alpha together
+        // with the `[storage]` section (plan 452). Only `sqlite` and `none`
+        // are offered here; an operator who had a Postgres profile must
+        // migrate the notes themselves or run against a sqlite store.
         send(
             &events,
             ProvisionEvent::Choose {
@@ -71,7 +74,6 @@ impl TuiProvisioner for MemoryProvisioner {
                 label: "Memory backend".into(),
                 options: vec![
                     "sqlite (default, embedded)".to_string(),
-                    "postgres (server)".to_string(),
                     "none (no memory)".to_string(),
                 ],
                 multi: false,
@@ -82,7 +84,6 @@ impl TuiProvisioner for MemoryProvisioner {
         let sel = recv_selection(&mut responses).await?;
         let backend = match sel.first().copied().unwrap_or(0) {
             0 => "sqlite",
-            1 => "postgres",
             _ => "none",
         }
         .to_string();
@@ -107,7 +108,7 @@ impl TuiProvisioner for MemoryProvisioner {
             sqlite_open_timeout_secs: None,
         };
 
-        // Backend-specific prompts
+        // Backend-specific prompts — only sqlite asks for the db path.
         if backend == "sqlite" {
             send(
                 &events,
@@ -121,40 +122,6 @@ impl TuiProvisioner for MemoryProvisioner {
             .await?;
             let _path = recv_text(&mut responses).await?;
             // Path is informational — actual path resolved at runtime
-        } else if backend == "postgres" {
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "dsn".into(),
-                    label: "Postgres DSN (e.g. postgres://user:pass@host:5432/db)".into(),
-                    default: None,
-                    secret: false,
-                },
-            )
-            .await?;
-            let dsn = recv_text(&mut responses).await?;
-            if dsn.trim().is_empty() {
-                send(
-                    &events,
-                    ProvisionEvent::Failed {
-                        error: "Postgres DSN is required.".into(),
-                    },
-                )
-                .await?;
-                return Ok(ProvisionOutcome::Aborted(
-                    "Postgres DSN is required.".into(),
-                ));
-            }
-            // DSN stored in storage provider config — note for now
-            send(
-                &events,
-                ProvisionEvent::Message {
-                    severity: Severity::Info,
-                    text: "DSN noted (configure in [storage.provider.config] for full integration)"
-                        .to_string(),
-                },
-            )
-            .await?;
         }
 
         config.memory = memory_cfg;

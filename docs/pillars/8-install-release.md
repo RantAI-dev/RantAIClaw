@@ -102,7 +102,7 @@ a claim, not a status; where a row could not be settled by reading, it says so._
 | Multi-target build matrix | Stable (v0.5.1) |
 | Verify-artifacts gate before publish | Stable |
 | Weekly verification-only run | Stable |
-| `--all-features` build | Still omitted from CI, but **no longer because of matrix-sdk** — 0.18 type-checks at the default recursion limit and `channel-matrix` has its own job. What `--all-features` would add now is the hardware/probe/postgres set (`rppal`, `probe-rs` + ~50 deps, `tokio-postgres`); that is a build-cost question, not a compile failure (`.github/workflows/ci-run.yml:236-239`) |
+| `--all-features` build | Still omitted from CI, but **no longer because of matrix-sdk** — 0.18 type-checks at the default recursion limit and `channel-matrix` has its own job. What `--all-features` would add now is the hardware/probe set (`rppal`, `probe-rs` + ~50 deps); that is a build-cost question, not a compile failure (`.github/workflows/ci-run.yml:236-239`) |
 
 ## Architecture
 

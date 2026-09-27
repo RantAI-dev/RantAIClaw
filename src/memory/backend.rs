@@ -1,7 +1,6 @@
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MemoryBackendKind {
     Sqlite,
-    Postgres,
     None,
     Unknown,
 }
@@ -24,15 +23,6 @@ const SQLITE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     uses_sqlite_hygiene: true,
     sqlite_based: true,
     optional_dependency: false,
-};
-
-const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
-    key: "postgres",
-    label: "PostgreSQL — remote durable storage via [storage.provider.config]",
-    auto_save_default: true,
-    uses_sqlite_hygiene: false,
-    sqlite_based: false,
-    optional_dependency: true,
 };
 
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
@@ -66,7 +56,6 @@ pub fn default_memory_backend_key() -> &'static str {
 pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
     match backend {
         "sqlite" => MemoryBackendKind::Sqlite,
-        "postgres" => MemoryBackendKind::Postgres,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
     }
@@ -75,7 +64,6 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
 pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
     match classify_memory_backend(backend) {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
-        MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
     }
@@ -88,11 +76,18 @@ mod tests {
     #[test]
     fn classify_known_backends() {
         assert_eq!(classify_memory_backend("sqlite"), MemoryBackendKind::Sqlite);
+        assert_eq!(classify_memory_backend("none"), MemoryBackendKind::None);
+    }
+
+    /// `postgres` is a retired name and resolves to `sqlite` via the runtime
+    /// mapping in `effective_memory_backend_name` before the factory ever
+    /// classifies it, so the classifier itself must report it as `Unknown`.
+    #[test]
+    fn classify_postgres_is_unknown_at_this_layer() {
         assert_eq!(
             classify_memory_backend("postgres"),
-            MemoryBackendKind::Postgres
+            MemoryBackendKind::Unknown
         );
-        assert_eq!(classify_memory_backend("none"), MemoryBackendKind::None);
     }
 
     #[test]

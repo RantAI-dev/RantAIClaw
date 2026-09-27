@@ -18,9 +18,8 @@ pub use schema::{
     NextcloudTalkConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
     ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, RuntimeConfig,
     SchedulerConfig, SecretsConfig, SecurityConfig, SkillApiKey, SkillEntryConfig, SkillsConfig,
-    SkillsInstallConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
-    StorageProviderConfig, StorageProviderSection, StreamMode, TasksConfig, TelegramConfig,
-    TunnelConfig, UiConfig, WebSearchConfig, WebhookConfig, WhatsAppWebConfig,
+    SkillsInstallConfig, SkillsPromptInjectionMode, SlackConfig, StreamMode, TasksConfig,
+    TelegramConfig, TunnelConfig, UiConfig, WebSearchConfig, WebhookConfig, WhatsAppWebConfig,
 };
 
 #[cfg(test)]

@@ -5,8 +5,6 @@ pub mod context;
 pub mod embeddings;
 pub mod hygiene;
 pub mod none;
-#[cfg(feature = "memory-postgres")]
-pub mod postgres;
 pub mod sanitize;
 pub mod snapshot;
 pub mod sqlite;
@@ -23,8 +21,6 @@ pub use context::{
     build_memory_context, build_memory_context_in_view, MemoryContext, MemoryContextLimits,
 };
 pub use none::NoneMemory;
-#[cfg(feature = "memory-postgres")]
-pub use postgres::PostgresMemory;
 pub use sanitize::{sanitize_memory_content, SanitizedMemory};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
@@ -32,25 +28,20 @@ pub use traits::Memory;
 pub use traits::{MemoryCategory, MemoryEntry};
 pub use view::{current_memory_view, recall_in_view, MemoryView, MEMORY_VIEW};
 
-use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
-#[cfg(feature = "memory-postgres")]
-use anyhow::Context;
+use crate::config::{EmbeddingRouteConfig, MemoryConfig};
 use std::path::Path;
 use std::sync::Arc;
 
-fn create_memory_with_builders<F, G>(
+fn create_memory_with_builders<F>(
     backend_name: &str,
     mut sqlite_builder: F,
-    mut postgres_builder: G,
     unknown_context: &str,
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
-    G: FnMut() -> anyhow::Result<Box<dyn Memory>>,
 {
     match classify_memory_backend(backend_name) {
         MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
-        MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
             // An unrecognised `backend` value is a configuration error. Falling
@@ -59,26 +50,16 @@ where
             // nothing — while a warning scrolled past.
             anyhow::bail!(
                 "unknown memory backend '{backend_name}'{unknown_context}; \
-                 expected one of: sqlite, postgres, none"
+                 expected one of: sqlite, none"
             )
         }
     }
 }
 
-pub fn effective_memory_backend_name(
-    memory_backend: &str,
-    storage_provider: Option<&StorageProviderConfig>,
-) -> String {
-    let resolved = if let Some(override_provider) = storage_provider
-        .map(|cfg| cfg.provider.trim())
-        .filter(|provider| !provider.is_empty())
-    {
-        override_provider.to_ascii_lowercase()
-    } else {
-        memory_backend.trim().to_ascii_lowercase()
-    };
+pub fn effective_memory_backend_name(memory_backend: &str) -> String {
+    let resolved = memory_backend.trim().to_ascii_lowercase();
 
-    if matches!(resolved.as_str(), "lucid" | "markdown") {
+    if matches!(resolved.as_str(), "lucid" | "markdown" | "postgres") {
         warn_retired_backend_once();
         return "sqlite".to_string();
     }
@@ -88,17 +69,16 @@ pub fn effective_memory_backend_name(
 
 /// One-time WARN that the memory backend has been retired.
 ///
-/// Both `lucid` and `markdown` were retired in v0.32.0-alpha in favour of
-/// `sqlite`. A leftover `RANTAICLAW_STORAGE_PROVIDER` env var or a config
-/// this binary never touched before would otherwise stop the daemon with no
-/// actionable error. The WARN is one-shot to keep the log from filling with
-/// the same line every turn.
+/// `lucid`, `markdown`, and `postgres` were all retired in v0.32.0-alpha in
+/// favour of `sqlite`. A config this binary never touched before would
+/// otherwise stop the daemon with no actionable error. The WARN is one-shot
+/// to keep the log from filling with the same line every turn.
 static RETIRED_BACKEND_WARN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 fn warn_retired_backend_once() {
     if RETIRED_BACKEND_WARN.set(()).is_ok() {
         tracing::warn!(
-            "memory backends 'lucid' and 'markdown' were retired in v0.32.0-alpha; \
+            "memory backends 'lucid', 'markdown' and 'postgres' were retired in v0.32.0-alpha; \
              resolving to 'sqlite'. Set memory.backend = \"sqlite\" in config.toml \
              to silence this message."
         );
@@ -271,28 +251,32 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], None, workspace_dir, api_key)
+    create_memory_with_storage_and_routes(config, &[], workspace_dir, api_key)
 }
 
-/// Factory: create memory with optional storage-provider override.
+/// Factory: create memory with no embedding routes.
+///
+/// The `[storage]` section used to carry a per-config backend override
+/// (`storage.provider.config.provider`); plan 452 retired the section together
+/// with `postgres`, so the override is gone and the backend name now comes
+/// from `memory.backend` only. Kept as a thin wrapper so call sites that
+/// previously used the override path do not have to switch to `create_memory`.
 pub fn create_memory_with_storage(
     config: &MemoryConfig,
-    storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key)
+    create_memory_with_storage_and_routes(config, &[], workspace_dir, api_key)
 }
 
-/// Factory: create memory with optional storage-provider override and embedding routes.
+/// Factory: create memory with embedding routes.
 pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
-    storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
+    let backend_name = effective_memory_backend_name(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
 
@@ -355,43 +339,9 @@ pub fn create_memory_with_storage_and_routes(
         Ok(mem)
     }
 
-    #[cfg(feature = "memory-postgres")]
-    fn build_postgres_memory(
-        storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<Box<dyn Memory>> {
-        let storage_provider = storage_provider
-            .context("memory backend 'postgres' requires [storage.provider.config] settings")?;
-        let db_url = storage_provider
-            .db_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context(
-                "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
-            )?;
-
-        let memory = PostgresMemory::new(
-            db_url,
-            &storage_provider.schema,
-            &storage_provider.table,
-            storage_provider.connect_timeout_secs,
-        )?;
-        Ok(Box::new(memory))
-    }
-
-    #[cfg(not(feature = "memory-postgres"))]
-    fn build_postgres_memory(
-        _storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<Box<dyn Memory>> {
-        anyhow::bail!(
-            "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
-        );
-    }
-
     let memory = create_memory_with_builders(
         &backend_name,
         || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
-        || build_postgres_memory(storage_provider),
         "",
     )?;
 
@@ -460,19 +410,7 @@ fn create_memory_without_embeddings(
         anyhow::bail!("memory backend 'none' disables persistence; choose sqlite to {purpose}");
     }
 
-    if matches!(
-        classify_memory_backend(backend),
-        MemoryBackendKind::Postgres
-    ) {
-        anyhow::bail!("backend 'postgres' is not supported here; use sqlite to {purpose}");
-    }
-
-    create_memory_with_builders(
-        backend,
-        || SqliteMemory::new(workspace_dir),
-        || anyhow::bail!("postgres backend is not available in this context"),
-        "",
-    )
+    create_memory_with_builders(backend, || SqliteMemory::new(workspace_dir), "")
 }
 
 pub fn create_memory_for_migration(
@@ -571,7 +509,7 @@ pub async fn recall_layered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EmbeddingRouteConfig, StorageProviderConfig};
+    use crate::config::EmbeddingRouteConfig;
     use tempfile::TempDir;
 
     /// Records what actually reached the backend.
@@ -864,52 +802,34 @@ mod tests {
         assert!(error.to_string().contains("disables persistence"));
     }
 
-    #[test]
-    fn effective_backend_name_prefers_storage_override() {
-        let storage = StorageProviderConfig {
-            provider: "postgres".into(),
-            ..StorageProviderConfig::default()
-        };
-
-        assert_eq!(
-            effective_memory_backend_name("sqlite", Some(&storage)),
-            "postgres"
-        );
-    }
-
-    /// The `lucid` backend was retired in v0.32.0-alpha. A leftover config or
-    /// `RANTAICLAW_STORAGE_PROVIDER=lucid` env var must not stop the daemon:
-    /// resolve to `sqlite` so the backend the operator already has on disk
-    /// keeps working.
+    /// The `lucid` backend was retired in v0.32.0-alpha. A leftover config that
+    /// still names `lucid` must not stop the daemon: resolve to `sqlite` so
+    /// the backend the operator already has on disk keeps working.
     #[test]
     fn effective_backend_name_retired_lucid_resolves_to_sqlite() {
-        assert_eq!(effective_memory_backend_name("lucid", None), "sqlite");
+        assert_eq!(effective_memory_backend_name("lucid"), "sqlite");
     }
 
     /// The `markdown` backend was retired in v0.32.0-alpha too. Migration
-    /// already rewrote a config that said `markdown`; this handles the env
-    /// var path the migration cannot reach.
+    /// already rewrote a config that said `markdown`; this is the runtime
+    /// fallback for any value that slips past it.
     #[test]
     fn effective_backend_name_retired_markdown_resolves_to_sqlite() {
-        assert_eq!(effective_memory_backend_name("markdown", None), "sqlite");
+        assert_eq!(effective_memory_backend_name("markdown"), "sqlite");
     }
 
-    /// The storage provider override wins over `[memory].backend` at runtime,
-    /// and a retired value in the override field resolves the same way.
+    /// The `postgres` backend was retired in v0.32.0-alpha together with the
+    /// `[storage]` section it was the only user of. A leftover config that
+    /// still names `postgres` must not stop the daemon: resolve to `sqlite`
+    /// so the local store keeps working without reaching for a database the
+    /// binary no longer ships the driver for.
     #[test]
-    fn effective_backend_name_retired_storage_override_resolves_to_sqlite() {
-        let storage = StorageProviderConfig {
-            provider: "markdown".into(),
-            ..StorageProviderConfig::default()
-        };
-        assert_eq!(
-            effective_memory_backend_name("sqlite", Some(&storage)),
-            "sqlite",
-        );
+    fn effective_backend_name_retired_postgres_resolves_to_sqlite() {
+        assert_eq!(effective_memory_backend_name("postgres"), "sqlite");
     }
 
     /// A name that was never a backend must still error — the retire mapping
-    /// is a soft transition for two specific values, not a free pass for any
+    /// is a soft transition for three specific values, not a free pass for any
     /// typo. Catches the regression where someone removes the Unknown arm.
     #[test]
     fn effective_backend_name_unknown_still_resolves_as_unknown() {
@@ -935,30 +855,6 @@ mod tests {
             !err.to_string().contains("lucid") && !err.to_string().contains("markdown"),
             "the error must not name retired backends: {err}"
         );
-    }
-
-    #[test]
-    fn factory_postgres_without_db_url_is_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "postgres".into(),
-            ..MemoryConfig::default()
-        };
-
-        let storage = StorageProviderConfig {
-            provider: "postgres".into(),
-            db_url: None,
-            ..StorageProviderConfig::default()
-        };
-
-        let error = create_memory_with_storage(&cfg, Some(&storage), tmp.path(), None)
-            .err()
-            .expect("postgres without db_url should be rejected");
-        if cfg!(feature = "memory-postgres") {
-            assert!(error.to_string().contains("db_url"));
-        } else {
-            assert!(error.to_string().contains("memory-postgres"));
-        }
     }
 
     #[test]

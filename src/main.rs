@@ -254,7 +254,7 @@ enum Commands {
         /// Model ID override (used in quick mode)
         #[arg(long)]
         model: Option<String>,
-        /// Memory backend (sqlite, postgres, none) - used in quick mode, default: sqlite
+        /// Memory backend (sqlite, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
     },
@@ -1989,10 +1989,8 @@ async fn main() -> Result<()> {
                     "disabled".to_string()
                 },
             );
-            let effective_memory_backend = memory::effective_memory_backend_name(
-                &config.memory.backend,
-                Some(&config.storage.provider.config),
-            );
+            let effective_memory_backend =
+                memory::effective_memory_backend_name(&config.memory.backend);
             cli_style::field(
                 "Memory",
                 W,

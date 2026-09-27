@@ -5,8 +5,7 @@ use crate::config::schema::{
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, KnowledgeConfig, LarkConfig, MatrixConfig, MemoryConfig,
-    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
-    WebhookConfig,
+    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -410,7 +409,6 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         tasks: crate::config::TasksConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
-        storage: StorageConfig::default(),
         tunnel: tunnel_config,
         gateway: crate::config::GatewayConfig {
             login: login_config,
@@ -556,18 +554,23 @@ fn backend_key_from_choice(choice: usize) -> &'static str {
         .map_or(default_memory_backend_key(), |backend| backend.key)
 }
 
-/// Validate the `--memory` value passed to quick setup. The `lucid` and
-/// `markdown` backends were retired in v0.32.0-alpha; their data lives in
-/// sqlite (lucid) or has already been imported (markdown), so callers must
-/// use `--memory sqlite` instead. `none` is the only other selectable
-/// value; `postgres` is intentionally accepted to keep quick setup usable
-/// for operators who already manage a Postgres profile (plan 452 removes
-/// it from setup surfaces). Unknown names still error here so a typo does
-/// not silently fall through to the default.
+/// Validate the `--memory` value passed to quick setup. `postgres` was
+/// retired in v0.32.0-alpha together with the `[storage]` section; callers
+/// must use `--memory sqlite` instead. The `lucid` and `markdown` backends
+/// were retired earlier and resolve to sqlite already, but quick setup
+/// still names them explicitly so a muscle-memory `--memory lucid` does
+/// not silently fall through to the default. Unknown names still error
+/// here so a typo does not silently become sqlite.
 fn validate_memory_backend_for_quick_setup(memory_backend: &str) -> Result<String> {
     let normalized = memory_backend.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "sqlite" | "none" | "postgres" => Ok(normalized),
+        "sqlite" | "none" => Ok(normalized),
+        "postgres" => {
+            bail!(
+                "memory backend 'postgres' was retired in v0.32.0-alpha; \
+                 use --memory sqlite"
+            )
+        }
         "lucid" => {
             bail!("memory backend 'lucid' was retired in v0.32.0-alpha; use --memory sqlite")
         }
@@ -696,7 +699,6 @@ async fn run_quick_setup_with_home(
         tasks: crate::config::TasksConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,
-        storage: StorageConfig::default(),
         tunnel: crate::config::TunnelConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: ComposioConfig::default(),
@@ -7607,6 +7609,25 @@ mod tests {
         assert_eq!(
             validate_memory_backend_for_quick_setup("  None  ").unwrap(),
             "none"
+        );
+    }
+
+    #[test]
+    fn validate_memory_backend_rejects_retired_postgres() {
+        let err = validate_memory_backend_for_quick_setup("postgres")
+            .expect_err("postgres must error in quick setup");
+        let text = err.to_string();
+        assert!(
+            text.contains("postgres"),
+            "message must name the value: {text}"
+        );
+        assert!(
+            text.contains("retired in v0.32.0-alpha"),
+            "message must say it was retired: {text}"
+        );
+        assert!(
+            text.contains("--memory sqlite"),
+            "message must point callers to sqlite: {text}"
         );
     }
 
