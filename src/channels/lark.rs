@@ -2498,6 +2498,17 @@ mod tests {
     /// the task was reaped. Port 0 so the test binds whatever is free.
     #[tokio::test]
     async fn the_webhook_listener_stops_when_the_token_is_cancelled() {
+        // Hold `ENV_LOCK` across the spawned listen task too: `listen_http`
+        // calls `Config::load_or_init()` (which reads `RANTAICLAW_CONFIG_DIR`)
+        // without it, so without this lock a sibling test that sets the var
+        // can race in and have this listener write a lark-less default into
+        // that test's config file. Pin the var at a fresh tempdir for the
+        // same reason, so we never fresh-init the runner's real `$HOME`.
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", dir.path());
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
         let mut channel = LarkChannel::new(
             "cli_test_app_id".into(),
             "test_app_secret".into(),
@@ -3283,10 +3294,23 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        // Pin `Config::load_or_init` (called inside `try_handle_pairing`) to this
+        // tempdir for the rest of the test, so a concurrent test that also
+        // touches `RANTAICLAW_CONFIG_DIR` cannot overwrite the file we read
+        // back. Bound to named locals so a panic between `set` and the trailing
+        // restore does not leak the override into the next test sharing
+        // `ENV_LOCK`.
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        // Seed at an explicit path so the read-back at the bottom of this test
+        // is guaranteed to see the file we wrote, regardless of profile
+        // resolution (`load_or_init` is profile-aware and could otherwise write
+        // under `<root>/profiles/<active>/...`).
         {
-            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            let mut seed = crate::config::Config::default();
+            seed.config_path = root.join("config.toml");
+            seed.workspace_dir = root.join("workspace");
             seed.channels_config.lark = Some(crate::config::schema::LarkConfig {
                 app_id: "id".into(),
                 app_secret: "secret".into(),
@@ -3326,8 +3350,6 @@ mod tests {
             .channels_config
             .approval_owners
             .contains(&"ou_new".to_string()));
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     /// `redact_url_query` keeps scheme, host and path, and drops the query
