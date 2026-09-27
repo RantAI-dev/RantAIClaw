@@ -151,10 +151,6 @@ pub struct Config {
     #[serde(default)]
     pub memory: MemoryConfig,
 
-    /// Persistent storage provider configuration (`[storage]`).
-    #[serde(default)]
-    pub storage: StorageConfig,
-
     /// Tunnel configuration for exposing the gateway publicly (`[tunnel]`).
     #[serde(default)]
     pub tunnel: TunnelConfig,
@@ -1994,72 +1990,6 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
 }
 // ── Memory ───────────────────────────────────────────────────
 
-/// Persistent storage configuration (`[storage]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
-pub struct StorageConfig {
-    /// Storage provider settings (e.g. sqlite, postgres).
-    #[serde(default)]
-    pub provider: StorageProviderSection,
-}
-
-/// Wrapper for the storage provider configuration section.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
-pub struct StorageProviderSection {
-    /// Storage provider backend settings.
-    #[serde(default)]
-    pub config: StorageProviderConfig,
-}
-
-/// Storage provider backend configuration (e.g. postgres connection details).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct StorageProviderConfig {
-    /// Storage engine key (e.g. "postgres", "sqlite").
-    #[serde(default)]
-    pub provider: String,
-
-    /// Connection URL for remote providers.
-    /// Accepts legacy aliases: dbURL, database_url, databaseUrl.
-    #[serde(
-        default,
-        alias = "dbURL",
-        alias = "database_url",
-        alias = "databaseUrl"
-    )]
-    pub db_url: Option<String>,
-
-    /// Database schema for SQL backends.
-    #[serde(default = "default_storage_schema")]
-    pub schema: String,
-
-    /// Table name for memory entries.
-    #[serde(default = "default_storage_table")]
-    pub table: String,
-
-    /// Optional connection timeout in seconds for remote providers.
-    #[serde(default)]
-    pub connect_timeout_secs: Option<u64>,
-}
-
-fn default_storage_schema() -> String {
-    "public".into()
-}
-
-fn default_storage_table() -> String {
-    "memories".into()
-}
-
-impl Default for StorageProviderConfig {
-    fn default() -> Self {
-        Self {
-            provider: String::new(),
-            db_url: None,
-            schema: default_storage_schema(),
-            table: default_storage_table(),
-            connect_timeout_secs: None,
-        }
-    }
-}
-
 /// Memory backend configuration (`[memory]` section).
 ///
 /// Controls conversation memory storage, embeddings, hybrid search, response caching,
@@ -2070,9 +2000,7 @@ impl Default for StorageProviderConfig {
 // remaining fields from `impl Default` instead of failing with "missing field".
 #[serde(default)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "postgres" | "markdown" | "none" (`none` = explicit no-op memory)
-    ///
-    /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
+    /// "sqlite" | "none" (`none` = explicit no-op memory)
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
@@ -3604,7 +3532,6 @@ impl Default for Config {
             tasks: TasksConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
-            storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
@@ -3936,7 +3863,6 @@ pub(crate) fn encrypt_config_secrets_in_raw(raw: &mut toml::Value, rantaiclaw_di
         &["composio", "api_key"],
         &["browser", "computer_use", "api_key"],
         &["web_search", "brave_api_key"],
-        &["storage", "provider", "config", "db_url"],
         &["channels_config", "telegram", "bot_token"],
     ] {
         changed += encrypt_raw_at_path(raw, path, &store);
@@ -4108,12 +4034,6 @@ pub(crate) fn decrypt_config_secrets(
         store,
         &mut config.web_search.brave_api_key,
         "config.web_search.brave_api_key",
-    )?;
-
-    decrypt_optional_secret(
-        store,
-        &mut config.storage.provider.config.db_url,
-        "config.storage.provider.config.db_url",
     )?;
 
     for agent in config.agents.values_mut() {
@@ -4426,6 +4346,11 @@ impl Config {
             // before the call is the only point at which we know it was the
             // retired backend.
             let markdown_pre_migration = raw_memory_or_storage_was_markdown(&raw);
+            // Same trick for the v35 postgres warning: `migrate_v35` rewrites
+            // `postgres` → `sqlite` (and strips `[storage]`), so the value
+            // here is the only signal we have to tell the operator that their
+            // notes stayed in Postgres and the local sqlite store starts empty.
+            let postgres_pre_migration = raw_memory_backend_was_postgres(&raw);
             let migrated = crate::config::migrations::migrate(&mut raw)
                 .context("Failed to migrate config schema")?;
             // A credential that ended up in `api_url` sits on disk in plaintext
@@ -4520,6 +4445,22 @@ impl Config {
                          `rantaiclaw migrate openclaw --source <backup dir>`."
                     );
                 }
+            }
+            // The v34 → v35 bump retires the `postgres` memory backend and
+            // the entire `[storage]` section. `migrate_v35` rewrites the
+            // backend name on disk and strips the storage table (including
+            // any encrypted `db_url`); the operator's notes stay in Postgres,
+            // the local sqlite store starts empty. Gated on `migrated` so
+            // re-running on an already-current config never re-warns. The
+            // message intentionally does NOT include the URL or any storage
+            // field — the secret is gone from the on-disk surface as soon as
+            // migration stamps, and echoing it here would defeat the
+            // redaction that `src/gateway/config_api.rs` already performs.
+            if migrated && postgres_pre_migration {
+                tracing::warn!(
+                    "postgres memory was retired; your notes stay in Postgres and \
+                     the local sqlite store starts empty"
+                );
             }
             let mut config: Config = raw.try_into().with_context(|| {
                 format!(
@@ -4980,30 +4921,6 @@ impl Config {
             }
         }
 
-        // Storage provider key (optional backend override): RANTAICLAW_STORAGE_PROVIDER
-        if let Ok(provider) = std::env::var("RANTAICLAW_STORAGE_PROVIDER") {
-            let provider = provider.trim();
-            if !provider.is_empty() {
-                self.storage.provider.config.provider = provider.to_string();
-            }
-        }
-
-        // Storage connection URL (for remote backends): RANTAICLAW_STORAGE_DB_URL
-        if let Ok(db_url) = std::env::var("RANTAICLAW_STORAGE_DB_URL") {
-            let db_url = db_url.trim();
-            if !db_url.is_empty() {
-                self.storage.provider.config.db_url = Some(db_url.to_string());
-            }
-        }
-
-        // Storage connect timeout: RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS") {
-            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
-                if timeout_secs > 0 {
-                    self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
-                }
-            }
-        }
         // Proxy enabled flag: RANTAICLAW_PROXY_ENABLED
         let explicit_proxy_enabled = std::env::var("RANTAICLAW_PROXY_ENABLED")
             .ok()
@@ -5145,12 +5062,6 @@ impl Config {
             &store,
             &mut config_to_save.web_search.brave_api_key,
             "config.web_search.brave_api_key",
-        )?;
-
-        encrypt_optional_secret(
-            &store,
-            &mut config_to_save.storage.provider.config.db_url,
-            "config.storage.provider.config.db_url",
         )?;
 
         for agent in config_to_save.agents.values_mut() {
@@ -5355,6 +5266,21 @@ fn raw_memory_or_storage_was_markdown(raw: &toml::Value) -> bool {
         .and_then(|c| c.get("provider"))
         .and_then(toml::Value::as_str)
         .is_some_and(is_markdown)
+}
+
+/// Did `[memory].backend` carry the retired `postgres` name before the
+/// migration ran? Used by `load_or_init` to gate the one-time WARN after
+/// `migrate_v35` stamps the new schema version. The `[storage]` section
+/// also carries `provider = "postgres"` on the same configs, but the WARN
+/// is keyed off the memory-side name so it lands on the exact same shape
+/// that plan 452 retires (a config that set `[storage]` without ever
+/// touching `[memory].backend` was never wired to anything and is silently
+/// dropped by the strip).
+fn raw_memory_backend_was_postgres(raw: &toml::Value) -> bool {
+    raw.get("memory")
+        .and_then(|m| m.get("backend"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("postgres"))
 }
 
 /// One-time markdown → sqlite import for a config that used the retired
@@ -5804,16 +5730,6 @@ default_temperature = 0.7
     }
 
     #[test]
-    async fn storage_provider_config_defaults() {
-        let storage = StorageConfig::default();
-        assert!(storage.provider.config.provider.is_empty());
-        assert!(storage.provider.config.db_url.is_none());
-        assert_eq!(storage.provider.config.schema, "public");
-        assert_eq!(storage.provider.config.table, "memories");
-        assert!(storage.provider.config.connect_timeout_secs.is_none());
-    }
-
-    #[test]
     async fn channels_config_default() {
         let c = ChannelsConfig::default();
         assert!(c.cli);
@@ -5905,7 +5821,6 @@ default_temperature = 0.7
                 guest_allowed_commands: Vec::new(),
             },
             memory: MemoryConfig::default(),
-            storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
@@ -6037,33 +5952,6 @@ mention_only = false
     }
 
     #[test]
-    async fn storage_provider_dburl_alias_deserializes() {
-        let raw = r#"
-default_temperature = 0.7
-
-[storage.provider.config]
-provider = "postgres"
-dbURL = "postgres://postgres:postgres@localhost:5432/rantaiclaw"
-schema = "public"
-table = "memories"
-connect_timeout_secs = 12
-"#;
-
-        let parsed: Config = toml::from_str(raw).unwrap();
-        assert_eq!(parsed.storage.provider.config.provider, "postgres");
-        assert_eq!(
-            parsed.storage.provider.config.db_url.as_deref(),
-            Some("postgres://postgres:postgres@localhost:5432/rantaiclaw")
-        );
-        assert_eq!(parsed.storage.provider.config.schema, "public");
-        assert_eq!(parsed.storage.provider.config.table, "memories");
-        assert_eq!(
-            parsed.storage.provider.config.connect_timeout_secs,
-            Some(12)
-        );
-    }
-
-    #[test]
     async fn runtime_reasoning_enabled_deserializes() {
         let raw = r#"
 default_temperature = 0.7
@@ -6148,7 +6036,6 @@ tool_dispatcher = "xml"
             tasks: TasksConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
-            storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
@@ -6203,7 +6090,6 @@ tool_dispatcher = "xml"
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
-        config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
 
         config.agents.insert(
             "worker".into(),
@@ -6263,13 +6149,6 @@ tool_dispatcher = "xml"
         let worker_encrypted = worker.api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(worker_encrypted));
         assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
-
-        let storage_db_url = stored.storage.provider.config.db_url.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(storage_db_url));
-        assert_eq!(
-            store.decrypt(storage_db_url).unwrap(),
-            "postgres://user:pw@host/db"
-        );
 
         let _ = fs::remove_dir_all(&dir).await;
     }
@@ -8030,7 +7909,6 @@ level = "full"
         config.composio.api_key = Some("plain-composio".into());
         config.browser.computer_use.api_key = Some("plain-computer-use".into());
         config.web_search.brave_api_key = Some("plain-brave".into());
-        config.storage.provider.config.db_url = Some("plain-db-url".into());
         config
             .provider_api_keys
             .insert("openrouter".into(), "plain-provider".into());
@@ -8070,7 +7948,6 @@ level = "full"
             "plain-composio",
             "plain-computer-use",
             "plain-brave",
-            "plain-db-url",
             "plain-provider",
             "plain-bot-token",
             "plain-mcp-env",
@@ -8115,10 +7992,6 @@ level = "full"
         assert_eq!(
             restored.web_search.brave_api_key.as_deref(),
             Some("plain-brave")
-        );
-        assert_eq!(
-            restored.storage.provider.config.db_url.as_deref(),
-            Some("plain-db-url")
         );
         assert_eq!(restored.provider_api_keys["openrouter"], "plain-provider");
         assert_eq!(
@@ -8513,31 +8386,6 @@ default_model = "legacy-model"
 
         assert_eq!(config.web_search.max_results, original_max_results);
         assert_eq!(config.web_search.timeout_secs, original_timeout);
-    }
-
-    #[test]
-    async fn env_override_storage_provider_config() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        let _g_storage_provider =
-            crate::test_env::EnvGuard::set("RANTAICLAW_STORAGE_PROVIDER", "postgres");
-        let _g_storage_db_url =
-            crate::test_env::EnvGuard::set("RANTAICLAW_STORAGE_DB_URL", "postgres://example/db");
-        let _g_storage_timeout =
-            crate::test_env::EnvGuard::set("RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.storage.provider.config.provider, "postgres");
-        assert_eq!(
-            config.storage.provider.config.db_url.as_deref(),
-            Some("postgres://example/db")
-        );
-        assert_eq!(
-            config.storage.provider.config.connect_timeout_secs,
-            Some(15)
-        );
     }
 
     #[test]

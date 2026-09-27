@@ -7,7 +7,7 @@ State that survives restarts. Multi-profile workspace layout, pluggable memory b
 ## What this pillar covers
 
 - Multi-profile storage (`~/.rantaiclaw/profiles/<name>/`)
-- Memory backends: sqlite (default) · postgres (feature-gated)
+- Memory backends: sqlite (default)
 - Embeddings + vector merge for retrieval
 - Session auto-titling from first user message
 - Profile lifecycle: list / create / use / clone / delete / current
@@ -19,7 +19,7 @@ State that survives restarts. Multi-profile workspace layout, pluggable memory b
 | | RantaiClaw | OpenClaw | Hermes-agent |
 |---|---|---|---|
 | Multi-profile layout | ✅ | ❌ (single layout) | TBD |
-| Pluggable backends | sqlite · postgres | TBD | TBD |
+| Pluggable backends | sqlite | TBD | TBD |
 | Embeddings + vector merge | ✅ | TBD | TBD |
 | Session auto-titling | ✅ | TBD | TBD |
 | Daemon handoff on profile switch | ✅ sentinel-file flow | TBD | TBD |
@@ -36,7 +36,6 @@ unverified rather than current._
 |---|---|
 | Profile system | Stable (v0.5.0 Wave 1) |
 | SQLite backend | Stable |
-| Postgres backend | Feature-gated (`--features memory-postgres`) |
 | Embeddings + vector merge | Stable |
 | Session auto-titling | Stable |
 | Daemon handoff on profile switch | Stable (v0.5.0 Wave 4B) |
@@ -64,7 +63,7 @@ unverified rather than current._
 src/memory/
 ├── traits.rs               ← Memory trait
 ├── mod.rs                  ← factory
-├── sqlite.rs / postgres.rs
+├── sqlite.rs
 ├── embeddings.rs
 └── chunker.rs              ← shared chunker (also used by RAG)
 
@@ -96,10 +95,10 @@ rantaiclaw memory clear --category daily
 ```toml
 # Precedence: --profile flag > RANTAICLAW_PROFILE env > active_profile file > "default"
 [memory]
-backend = "sqlite"   # sqlite | postgres
+backend = "sqlite"   # sqlite | none
 embeddings = true
 ```
 
 ## Roadmap
 
-- [v0.6.0 — Product Completeness Beta](https://app.clickup.com/t/86exgu406) — Setup: Memory validates backend picker (sqlite / postgres). Resilience: Profile + sessions confirms active profile + history resume; Resilience: Settings confirms `config.toml` / `autonomy.toml` / `persona.toml` / `.secret_key` reload identically.
+- [v0.6.0 — Product Completeness Beta](https://app.clickup.com/t/86exgu406) — Setup: Memory validates backend picker (sqlite / none). Resilience: Profile + sessions confirms active profile + history resume; Resilience: Settings confirms `config.toml` / `autonomy.toml` / `persona.toml` / `.secret_key` reload identically.

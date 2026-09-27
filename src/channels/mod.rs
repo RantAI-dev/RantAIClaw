@@ -1339,7 +1339,6 @@ pub(crate) async fn build_channel_runtime(
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
-        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
@@ -1525,10 +1524,7 @@ pub(crate) async fn build_channel_runtime(
         return Ok(None);
     }
 
-    let effective_backend = memory::effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
+    let effective_backend = memory::effective_memory_backend_name(&config.memory.backend);
     tracing::info!(
         "RantaiClaw Channel Server: model={} memory={} (auto-save={}) channels={}",
         model,

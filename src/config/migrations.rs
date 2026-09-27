@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 34;
+pub const CURRENT_VERSION: u32 = 35;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -454,7 +454,19 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v34(raw);
     }
 
-    // Future migrations (v35, …) inserted here in order.
+    // v34 → v35: the `postgres` memory backend and the `[storage]` section are
+    // retired. `memory.backend = "postgres"` becomes `"sqlite"`, and the entire
+    // `[storage]` table is stripped (including any encrypted `db_url` it may
+    // have carried — the secret is no longer reachable by any runtime path).
+    // The v34 markdown gate already stops reading `[storage.provider.config]`
+    // at runtime, so removing the table here is purely a tidy of what was
+    // never read; the migration completes the cleanup so a stale operator
+    // config never re-introduces the dead section.
+    if from < 35 {
+        migrate_v35(raw);
+    }
+
+    // Future migrations (v36, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -552,6 +564,53 @@ fn migrate_v32(raw: &mut Value) {
     }
 
     channels.insert("whatsapp_web".to_string(), Value::Table(web));
+}
+
+/// v34 → v35: `postgres` is retired and the entire `[storage]` section goes
+/// away with it.
+///
+/// Two changes, both narrow:
+///
+///   1. `[memory].backend = "postgres"` becomes `"sqlite"`. Comparison is
+///      trimmed and lowercased, matching the runtime reader. A config already
+///      on `sqlite` or `none` is left byte-identical (the strip below still
+///      runs — see step 2 — because `[storage]` had no relation to the active
+///      backend).
+///
+///   2. The `[storage]` table is removed in its entirety. It served memory
+///      creation only and no reader remains, so leaving it on disk would keep
+///      advertising a section nothing reads. The strip is unconditional: an
+///      operator who customised `[storage]` for a backend nothing else reaches
+///      is the case this migration cleans up.
+///
+/// The Postgres data is NOT imported; the operator's existing notes stay in
+/// their Postgres database and the local sqlite store starts empty. The
+/// one-time WARN that points this out lives in `Config::load_or_init`, gated on
+/// the migration (`:4348`).
+///
+/// This module stays a pure `toml::Value` transform — no env reads, no disk
+/// I/O — like every other `migrate_vN` arm.
+fn migrate_v35(raw: &mut Value) {
+    let Some(root) = raw.as_table_mut() else {
+        return;
+    };
+
+    // 1. Rewrite [memory].backend if it was `postgres`.
+    if let Some(memory) = root.get_mut("memory").and_then(Value::as_table_mut) {
+        if let Some(field) = memory.get_mut("backend") {
+            if let Some(text) = field.as_str() {
+                if text.trim().eq_ignore_ascii_case("postgres") {
+                    *field = Value::String("sqlite".to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Strip the entire [storage] table. This includes an encrypted `db_url`
+    //    that nothing reads after the runtime mapping retired — the secret is
+    //    gone from the on-disk surface as soon as the migration stamps, and a
+    //    later `Config::load_or_init` write-back persists the cleaned form.
+    root.remove("storage");
 }
 
 /// v33 → v34: `lucid` and `markdown` are retired.
@@ -1626,7 +1685,7 @@ allowed_users = ["*"]
     fn v34_rewrites_lucid_memory_backend_to_sqlite() {
         let mut v = parse("schema_version = 33\n[memory]\nbackend = \"lucid\"\n");
         assert!(migrate(&mut v).expect("migration runs"));
-        assert_eq!(version_of(&v), Some(34));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         assert_eq!(
             v.get("memory")
                 .and_then(|m| m.get("backend"))
@@ -1650,7 +1709,7 @@ allowed_users = ["*"]
              embedding_cache_size = 0\n",
         );
         assert!(migrate(&mut v).expect("migration runs"));
-        assert_eq!(version_of(&v), Some(34));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
 
         let memory = v
             .get("memory")
@@ -1688,7 +1747,7 @@ allowed_users = ["*"]
              embedding_cache_size = 0\n",
         );
         assert!(migrate(&mut v).expect("migration runs"));
-        assert_eq!(version_of(&v), Some(34));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
 
         let memory = v
             .get("memory")
@@ -1736,7 +1795,10 @@ allowed_users = ["*"]
     }
 
     /// `[storage.provider.config].provider` overrides `[memory].backend` at
-    /// runtime, so the migration must rewrite it too.
+    /// runtime, so the migration must rewrite it too. After v35 the entire
+    /// `[storage]` table is stripped, so this test runs `migrate_v34` in
+    /// isolation — the chain-level effect is covered by
+    /// `v35_strips_storage_section_with_db_url`.
     #[test]
     fn v34_rewrites_markdown_storage_provider_override() {
         let mut v = parse(
@@ -1745,7 +1807,7 @@ allowed_users = ["*"]
              [storage.provider.config]\n\
              provider = \"markdown\"\n",
         );
-        assert!(migrate(&mut v).expect("migration runs"));
+        migrate_v34(&mut v);
 
         let provider = v
             .get("storage")
@@ -1805,5 +1867,172 @@ allowed_users = ["*"]
                 "an unrelated backend's keys must not be stripped"
             );
         }
+    }
+
+    // ── v35: retire postgres + the [storage] section ────────────────────────
+    //
+    // The runtime mapping in `effective_memory_backend_name` already routes
+    // `postgres` → `sqlite`; this arm is the on-disk half — rewrite the name
+    // so a stamped config carries the post-retirement shape — and strip the
+    // entire `[storage]` table that nothing reads anymore.
+
+    /// `memory.backend = "postgres"` is rewritten to `"sqlite"`.
+    #[test]
+    fn v35_rewrites_postgres_memory_backend_to_sqlite() {
+        let mut v = parse("schema_version = 34\n[memory]\nbackend = \"postgres\"\n");
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        assert_eq!(
+            v.get("memory")
+                .and_then(|m| m.get("backend"))
+                .and_then(Value::as_str),
+            Some("sqlite"),
+            "the retired postgres backend name must be rewritten on disk"
+        );
+    }
+
+    /// Whitespace and case do not defeat the rewrite — ` Postgres `, `POSTGRES`,
+    /// `postgres` all resolve to `sqlite`.
+    #[test]
+    fn v35_rewrites_postgres_case_and_whitespace_insensitive() {
+        for raw_name in [" Postgres ", "POSTGRES", "postgres"] {
+            let mut v = parse(&format!(
+                "schema_version = 34\n[memory]\nbackend = \"{raw_name}\"\n"
+            ));
+            assert!(migrate(&mut v).expect("migration runs"));
+            assert_eq!(
+                v.get("memory")
+                    .and_then(|m| m.get("backend"))
+                    .and_then(Value::as_str),
+                Some("sqlite"),
+                "name {raw_name:?} must rewrite to sqlite"
+            );
+        }
+    }
+
+    /// `[storage]` carrying the legacy `db_url` (encrypted or plaintext) is
+    /// stripped in its entirety — including the credential. The secret is no
+    /// longer reachable by any runtime path, and a later `Config::load_or_init`
+    /// write-back persists the cleaned form.
+    #[test]
+    fn v35_strips_storage_section_with_db_url() {
+        let mut v = parse(
+            "schema_version = 34\n\
+             [memory]\nbackend = \"sqlite\"\n\
+             [storage]\n\
+             db_url = \"enc2:deadbeef\"\n\
+             schema = \"public\"\n\
+             table = \"memories\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        assert!(
+            v.get("storage").is_none(),
+            "the entire [storage] section must be removed: {v:?}"
+        );
+        // memory survives untouched (it is not what this arm touches)
+        let memory = v.get("memory").and_then(Value::as_table).expect("memory");
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite")
+        );
+    }
+
+    /// A config without `[storage]` is untouched apart from the version stamp.
+    /// The strip is unconditional, so the absence is the post-condition and the
+    /// migration must not invent an empty table.
+    #[test]
+    fn v35_leaves_a_config_without_storage_untouched() {
+        let mut v = parse(
+            "schema_version = 34\n[memory]\nbackend = \"sqlite\"\n\
+             [agent]\nmax_tool_iterations = 25\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        assert!(
+            v.get("storage").is_none(),
+            "no [storage] table may be invented: {v:?}"
+        );
+        // agent table preserved byte-identical (only the stamp moves)
+        let agent = v.get("agent").and_then(Value::as_table).expect("agent");
+        assert_eq!(
+            agent.get("max_tool_iterations").and_then(Value::as_integer),
+            Some(25),
+            "an unrelated table must not be touched"
+        );
+    }
+
+    /// A `[storage]` whose `provider` is `sqlite` is still stripped — the
+    /// section is retired entirely, irrespective of what the operator wrote in
+    /// it. The `memory.backend` value is left as the operator set it.
+    #[test]
+    fn v35_strips_storage_with_sqlite_provider_and_keeps_backend() {
+        let mut v = parse(
+            "schema_version = 34\n\
+             [memory]\nbackend = \"sqlite\"\n\
+             [storage.provider.config]\n\
+             provider = \"sqlite\"\n\
+             db_path = \"/tmp/foo.db\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        assert!(
+            v.get("storage").is_none(),
+            "[storage] must be removed even when its provider is sqlite: {v:?}"
+        );
+        let memory = v.get("memory").and_then(Value::as_table).expect("memory");
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite"),
+            "memory.backend must not be rewritten when it was already sqlite"
+        );
+    }
+
+    /// A config that was already on `none` (the other active backend) is
+    /// untouched on the memory side, and `[storage]` (if any) is still
+    /// stripped.
+    #[test]
+    fn v35_leaves_none_alone_and_strips_storage() {
+        let mut v = parse(
+            "schema_version = 34\n\
+             [memory]\nbackend = \"none\"\n\
+             [storage]\n\
+             db_url = \"enc2:deadbeef\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        let memory = v.get("memory").and_then(Value::as_table).expect("memory");
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("none"),
+            "none must not be rewritten"
+        );
+        assert!(
+            v.get("storage").is_none(),
+            "the [storage] strip is unconditional — it runs even when the \
+             memory backend was never postgres: {v:?}"
+        );
+    }
+
+    /// After v35, the migrated config must still deserialise into `Config`.
+    /// The `Config` struct dropped its `[storage]` and `Postgres` backend in
+    /// chunks A/B, so a v34-shaped config that was carrying both should come
+    /// out as a current `Config` after migration.
+    #[test]
+    fn v35_migrated_config_deserialises_into_current_config() {
+        let mut v = parse(
+            "schema_version = 34\n\
+             [memory]\nbackend = \"postgres\"\n\
+             [storage]\n\
+             db_url = \"enc2:abc\"\n\
+             schema = \"public\"\n\
+             table = \"memories\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        let cfg: Result<crate::config::Config, _> = v.try_into();
+        assert!(
+            cfg.is_ok(),
+            "post-v35 config must deserialise into Config: {:?}",
+            cfg.err()
+        );
     }
 }

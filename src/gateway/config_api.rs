@@ -197,7 +197,6 @@ pub(crate) fn redact_secrets_in_json(v: &mut serde_json::Value) {
             || k == "api_keys"          // reliability key list
             || k == "provider_api_keys" // per-provider key map
             || k.contains("credential")
-            || k == "db_url"
     }
     match v {
         serde_json::Value::Object(map) => {
@@ -236,7 +235,6 @@ pub(crate) fn redact_config_secrets(cfg: &mut crate::config::Config) {
     cfg.composio.api_key = None;
     cfg.browser.computer_use.api_key = None;
     cfg.web_search.brave_api_key = None;
-    cfg.storage.provider.config.db_url = None;
     for agent in cfg.agents.values_mut() {
         agent.api_key = None;
     }

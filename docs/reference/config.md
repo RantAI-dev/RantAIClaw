@@ -526,7 +526,7 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `backend` | `sqlite` | `sqlite`, `postgres`, `none`. An unrecognised value is a startup error, not a fallback |
+| `backend` | `sqlite` | `sqlite`, `none`. An unrecognised value is a startup error, not a fallback |
 | `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded). Auto-saved turns are stored under the `conversation` category: retained, searchable via `memory_recall`, but **never auto-injected into prompts** |
 | `min_relevance_score` | `0.4` | drop recalled entries scoring below this. See _Scores are relative_ below |
 | `embedding_provider` | `none` | `none`, `openai`, `openrouter`, `minimax`, or `custom:<base-url>` |
@@ -581,10 +581,10 @@ owner's notes. An owner's memory read is unchanged.
 ### Scores are absolute
 
 `MemoryEntry.score` is absolute relevance in `[0, 1]`: cosine similarity for the
-vector signal, query coverage (the fraction of the query's terms the row
-contains) for the keyword paths, and a match-tier fraction on postgres. BM25
-still orders keyword hits, but its corpus-dependent magnitude is not the score.
-Hybrid recall averages over the signals a document actually has.
+vector signal, and query coverage (the fraction of the query's terms the row
+contains) for the keyword paths. BM25 still orders keyword hits, but its
+corpus-dependent magnitude is not the score. Hybrid recall averages over the
+signals a document actually has.
 
 So `min_relevance_score` is a real floor: a result set where every hit is weak
 is rejected **whole**, and a query with no relevant memory injects nothing.

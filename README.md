@@ -300,8 +300,8 @@ for streaming and tool calling. The hand-rolled implementations remain available
 - `src/kb/` — the Knowledge Base subsystem for org-level documents: extraction,
   chunking, embedding, reranking, retrieval and store, backed by `sqlite-vec`
   (feature `kb`, on by default; `kb-office` adds docx/xlsx/pptx).
-- `src/memory/` — agent memory with pluggable backends (sqlite · postgres),
-  embeddings and vector merge.
+- `src/memory/` — agent memory with pluggable backends (sqlite), embeddings and
+  vector merge.
 - `src/rag/` — hardware datasheet retrieval: keyword by default, semantic optional, plus
   explicit pin-alias tables (`red_led: 13`). For pin lookup an alias table beats any
   embedding; not every retrieval problem is a vector problem.
@@ -374,8 +374,8 @@ hardware you do not control, including aarch64 on-prem boxes.
 `default = ["tui", "whatsapp-web", "remote-install", "kb"]`
 
 Notable optional features: `hardware` (USB/serial boards), `peripheral-rpi`,
-`channel-matrix`, `channel-lark`, `memory-postgres`, `observability-otel`,
-`browser-native`, `probe` (probe-rs for Nucleo memory read), `rag-pdf`, `kb-office`,
+`channel-matrix`, `channel-lark`, `observability-otel`, `browser-native`,
+`probe` (probe-rs for Nucleo memory read), `rag-pdf`, `kb-office`,
 `legacy-providers`.
 
 The Landlock crate compiles in automatically on Linux with no feature flag, but see
