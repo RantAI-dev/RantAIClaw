@@ -51,7 +51,7 @@ jobs:
                   token: ${{ secrets.GITHUB_TOKEN }}
                   # This list must stay identical to deny.toml's `ignore` array. Edit both
                   # together. deny.toml carries the justifications and review dates.
-                  ignore: RUSTSEC-2023-0071,RUSTSEC-2025-0141,RUSTSEC-2026-0153,RUSTSEC-2026-0154,RUSTSEC-2026-0159,RUSTSEC-2026-0173,RUSTSEC-2026-0192,RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0247,RUSTSEC-2026-0292
+                  ignore: RUSTSEC-2023-0071,RUSTSEC-2024-0388,RUSTSEC-2025-0141,RUSTSEC-2025-0167,RUSTSEC-2026-0153,RUSTSEC-2026-0154,RUSTSEC-2026-0159,RUSTSEC-2026-0173,RUSTSEC-2026-0192,RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0247,RUSTSEC-2026-0292
 
     deny:
         name: License & Supply Chain

@@ -31,6 +31,14 @@ ignore = [
     # replacement without a major parent bump. REMOVE once chacha20poly1305/russh
     # move to a non-yanked chacha20 (or 0.10.0 is un-yanked).
     "chacha20@0.10.0",
+    # bitmaps v3.2.1 — unsound `Bitmap::try_from(&[u8])`, no patched version.
+    # Reached only through the opt-in `channel-matrix` feature via matrix-sdk 0.18
+    # → imbl 6.1.0 → bitmaps (verified: `cargo tree -i bitmaps` with default
+    # features matches nothing); no patched upstream exists.
+    #
+    # REVIEW BY 2026-11-15 with the RUSTSEC-2026-0247 / imbl-sized-chunks block
+    # below — same root (bitmaps via imbl via matrix-sdk), same decision.
+    "RUSTSEC-2025-0167",
     # bitmaps v3.2.1 via matrix-sdk 0.16 → imbl / imbl-sized-chunks — the
     # crate is declared unmaintained (notice only, no vulnerability). It
     # implements fixed-size bitmap ops with no I/O and no untrusted-input
@@ -90,6 +98,17 @@ ignore = [
     # REVIEW BY 2026-11-15 with the other imbl/matrix-sdk entries. Revisit on a
     # matrix-sdk release that updates imbl past 6.1.0.
     "RUSTSEC-2026-0292",
+    # derivative v2.2.0 — unmaintained, no maintained replacement; 2.2.0 is the
+    # final release. Reaches Cargo.lock only through the matrix-sdk →
+    # matrix_indexed_db_futures → wasm_evt_listener → derivative chain, which
+    # only resolves when matrix-sdk builds its IndexedDB store; with our
+    # `channel-matrix` features (`e2e-encryption`, `markdown`) the indexeddb
+    # half is off, and `cargo tree -i derivative --all-features` prints nothing
+    # on native targets — so no default or native build contains it. Dropping
+    # it needs an upstream matrix-sdk ecosystem change, not a lockfile bump.
+    #
+    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
+    "RUSTSEC-2024-0388",
     # ttf-parser v0.25 via lopdf 0.42 → pdf-extract (KB PDF text extraction) —
     # font parser flagged unmaintained; parse-only path over operator-supplied
     # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.

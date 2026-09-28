@@ -73,6 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The first load on a config that previously used `markdown` imports `MEMORY.md` and the daily note files into `sqlite` exactly once. The source files are moved into `memory/migrations/markdown-<timestamp>/` so an operator can restore them by hand if needed; the agent then reads from the database. The `lucid` CLI import (`rantaiclaw migrate`) keeps its own copy of the data — that path is unchanged.
 - A config written by this version does not load on **0.32.0-alpha**, which only knows schema 33. Restore the previous config from `config.toml.bak` (kept next to `config.toml` by the migrator) to go back; the schema-34 fields are simply unknown to 0.32.0-alpha and would be ignored on read.
 
+### Security
+
+- **event-listener 5.4.2, for RUSTSEC-2026-0221.** event-listener 5.4.1 implemented `Send` and `Sync`
+  unconditionally for `StackSlot<'_, T>`, the stack-allocated listener created by the `listener!`
+  macro, so a `!Send` tag set via `Event::with_tag` could cross thread boundaries through
+  `StackSlot::wait` and trigger a data race in safe code. 5.4.2 fixes the auto-trait bounds.
+  Reached via `async-lock` ← `moka` ← `wa-rs`, so the default build (WhatsApp Web) is affected.
+  `Cargo.lock` only.
+
 ## [0.32.0-alpha] — 2026-09-26
 
 The channel release. Six channels are usable in this tag (Telegram, Discord, Slack,
