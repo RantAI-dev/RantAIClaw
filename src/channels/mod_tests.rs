@@ -8471,6 +8471,122 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
     );
 }
 
+/// A no-op stand-in for the real Lark channel: `process_channel_message` only
+/// needs `channels_by_name` to have an entry named `"lark"`, and neither
+/// `send` nor `listen` is exercised in this test.
+struct LarkStubChannel;
+
+#[async_trait::async_trait]
+impl Channel for LarkStubChannel {
+    fn name(&self) -> &str {
+        "lark"
+    }
+
+    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A Lark chat id in `approval_owners` must not make every member of that
+/// chat an owner. The message comes from the real Lark webhook parser (not a
+/// hand-built `ChannelMessage`), so a regression that puts the chat id back
+/// into `sender_aliases` inside the parser is caught here — not just by
+/// `lark.rs`'s own parser tests.
+#[tokio::test]
+async fn lark_chat_id_in_approval_owners_does_not_make_a_member_an_owner() {
+    let lark = crate::channels::lark::LarkChannel::new(
+        "cli_test_app_id".to_string(),
+        "test_app_secret".to_string(),
+        "test_verification_token".to_string(),
+        None,
+        vec!["*".to_string()],
+    );
+
+    let payload = serde_json::json!({
+        "header": { "event_type": "im.message.receive_v1" },
+        "event": {
+            "sender": { "sender_id": { "open_id": "ou_member" } },
+            "message": {
+                "message_id": "om_1",
+                "chat_id": "oc_chat123",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": "{\"text\":\"hello\"}",
+                "create_time": "1000"
+            }
+        }
+    });
+    let mut msgs = lark.parse_event_payload(&payload).await;
+    assert_eq!(msgs.len(), 1, "the payload should parse to one message");
+    let msg = msgs.remove(0);
+    assert_eq!(msg.sender, "ou_member");
+    assert_eq!(msg.channel, "lark");
+
+    let channel: Arc<dyn Channel> = Arc::new(LarkStubChannel);
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        // The defect: an operator pastes the *chat* id here, expecting it to
+        // mean "everyone in this chat". It must mean nobody, since no real
+        // sender is ever a chat id.
+        approval_owners: Arc::new(vec!["oc_chat123".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 1);
+    let system_turn = calls[0][0].1.clone();
+    assert!(
+        system_turn.starts_with("GUEST_SYSTEM_PROMPT"),
+        "a Lark chat id in approval_owners must not make its member an owner: {system_turn}"
+    );
+}
+
 #[test]
 fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
     let history = vec![
