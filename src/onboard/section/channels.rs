@@ -64,7 +64,7 @@ impl SetupSection for ChannelsSection {
 /// [`crate::approval::permissions`] editor (so the wizard, the CLI, and the
 /// chat tool stay consistent). All prompts are optional and default to "no" —
 /// declining leaves the secure defaults (no owner ⇒ owner-claim guidance is
-/// printed by the caller; empty guest lists ⇒ guests get only read-only tools).
+/// printed by the caller; empty guest lists ⇒ guests get skills only, no tools).
 fn prompt_owners_and_guest_ceiling(ctx: &mut SetupContext) -> Result<()> {
     use crate::approval::permissions::{apply, Op, Target};
     use dialoguer::{theme::ColorfulTheme, Confirm, Input};
@@ -106,7 +106,7 @@ fn prompt_owners_and_guest_ceiling(ctx: &mut SetupContext) -> Result<()> {
         .interact()?;
     if set_guest_now {
         eprintln!(
-            "   Guests always get skills + read-only tools. Add extra tool names to widen\n   \
+            "   Guests get skills and no tools by default. Add tool names to widen\n   \
              that (comma-separated, e.g. `shell, web_search`). Blank to skip."
         );
         let tools: String = Input::with_theme(&theme)

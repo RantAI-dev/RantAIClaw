@@ -28,8 +28,8 @@ There are two roles on every multi-user channel:
   toolset** and may approve tool calls. The local CLI/console operator is always
   an owner.
 - **Guest** — anyone else who is allowed to chat. Guests run under a **capability
-  ceiling**: they may use skills + read-only tools always, plus any tools an
-  owner has added to the guest tool allowlist, and (for `shell`) only the
+  ceiling**: they always get skills, plus only the tools an owner has added to
+  the guest tool allowlist (none by default), and (for `shell`) only the
   specific command globs an owner has allowlisted. Anything outside the ceiling
   is denied outright — never escalated to an owner.
 

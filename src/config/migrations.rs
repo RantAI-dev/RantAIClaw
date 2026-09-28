@@ -130,7 +130,8 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
     // (Vec<String>, default empty) were added — the per-role capability ceiling
     // for non-owner ("normal") users. Additive fields with serde defaults:
     // configs that lack them deserialise fine and gain the defaults (`[]`,
-    // secure — guests get only read-only tools + skills) on next write, so there
+    // secure — guests get skill instructions and only the tools listed in
+    // `guest_allowed_tools`, empty by default) on next write, so there
     // is nothing to transform. Burns a version slot so schema_drift is accepted
     // with intent (mirrors v3 → v4).
     if from < 5 {

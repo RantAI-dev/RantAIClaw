@@ -133,7 +133,7 @@ impl Tool for ManagePermissionsTool {
         };
 
         if action == "show" {
-            let rendered = permissions::render(&config, &config.autonomy.auto_approve);
+            let rendered = permissions::render(&config);
             return Ok(ToolResult {
                 success: true,
                 output: rendered,

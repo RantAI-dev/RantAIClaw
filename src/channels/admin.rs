@@ -698,9 +698,10 @@ async fn channel_doctor_state(
 
 /// The fixed suffix `doctor_channels` appends to each row, naming whether
 /// the channel can tell a DM from a group chat. Pulled out as a helper so a
-/// test can pin the wording against `dm_detection_for` without capturing
-/// stdout (the print path is exercised by the existing doctor tests at
-/// `integration`-style scope).
+/// test (`dm_detail_suffix_tracks_dm_detection_for`) can pin the wording
+/// against `dm_detection_for` without capturing stdout. The print path
+/// itself, where `doctor_channels` writes this suffix to the row, is not
+/// covered by a test.
 fn dm_detail_suffix(key: &str) -> &'static str {
     if dm_detection_for(key) {
         " · DMs recognised"

@@ -2565,10 +2565,7 @@ async fn handle_permissions_command(
     // `Show` just renders; `Add`/`Remove` mutate then persist.
     let (op, target_str, value) = match permissions_command {
         PermissionsCommands::Show => {
-            print!(
-                "{}",
-                permissions::render(&config, &config.autonomy.auto_approve)
-            );
+            print!("{}", permissions::render(&config));
             return Ok(());
         }
         PermissionsCommands::Add { target, value } => (Op::Add, target, value),

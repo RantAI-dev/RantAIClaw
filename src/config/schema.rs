@@ -5317,9 +5317,9 @@ fn raw_memory_or_storage_was_markdown(raw: &toml::Value) -> bool {
 /// `migrate_v35` stamps the new schema version. The `[storage]` section
 /// also carries `provider = "postgres"` on the same configs, but the WARN
 /// is keyed off the memory-side name so it lands on the exact same shape
-/// that plan 452 retires (a config that set `[storage]` without ever
-/// touching `[memory].backend` was never wired to anything and is silently
-/// dropped by the strip).
+/// that the `[storage]`-section retirement covers (a config that set
+/// `[storage]` without ever touching `[memory].backend` was never wired
+/// to anything and is silently dropped by the strip).
 fn raw_memory_backend_was_postgres(raw: &toml::Value) -> bool {
     raw.get("memory")
         .and_then(|m| m.get("backend"))

@@ -1761,8 +1761,8 @@ mod tests {
 
     /// Slack's platform-level DM signal is `channel_type == "im"`. `channel`,
     /// `group`, `mpim` and a missing value (the polling transport) all surface
-    /// as a group conversation. The drive is the same Telegram/Discord plan
-    /// line: "kalau ragu, anggap grup".
+    /// as a group conversation, the same rule Telegram and Discord follow:
+    /// treat unknown chats as groups.
     #[test]
     fn slack_classify_inbound_marks_direct_only_for_channel_type_im() {
         let ch = channel(&["*"]);

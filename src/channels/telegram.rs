@@ -4537,7 +4537,7 @@ mod tests {
     /// Telegram's platform-level DM signal is `chat.type == "private"`. Group,
     /// supergroup, channel and missing-type payloads must all surface as a
     /// group conversation (the safer default when the platform did not say so
-    /// explicitly). The drive in plan 453 is the prompt's DM-vs-group line.
+    /// explicitly), because the prompt's DM-vs-group line depends on it.
     #[test]
     fn telegram_parse_update_message_marks_direct_only_for_chat_type_private() {
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
@@ -4563,7 +4563,7 @@ mod tests {
             );
         }
 
-        // A missing `type` is not a DM by our rule: "kalau ragu, anggap grup".
+        // A missing `type` is not a DM by our rule: treat unknown chats as groups.
         let no_type = serde_json::json!({
             "update_id": 2,
             "message": {

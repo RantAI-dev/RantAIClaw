@@ -71,7 +71,7 @@ impl Tool for MemoryRecallTool {
         // backfill, other conversations' rows filtered — the same layered
         // read the injection path uses. Unset ⇒ global, as before.
         //
-        // Plan 450 adds a per-turn override: when the dispatch runs a guest
+        // A per-turn override: when the dispatch runs a guest
         // turn it sets `MEMORY_VIEW = Some(MemoryView::Only(conversation))`,
         // and that view overrides the tool's own scope slot. A guest must
         // never reach the unscoped backfill even if the channel happened to
@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(seen, vec![None]);
     }
 
-    /// Plan 450: when a turn runs inside `MEMORY_VIEW.scope(Only(k), ...)`
+    /// When a turn runs inside `MEMORY_VIEW.scope(Only(k), ...)`
     /// the tool reads through `recall_in_view`, which calls `recall(Some(k))`
     /// (the exact session key, never the stale scope slot, never the unscoped
     /// backfill). The view filter in `recall_in_view` then drops anything
@@ -372,7 +372,7 @@ mod tests {
         );
     }
 
-    /// Plan 450: `MEMORY_VIEW = All` does NOT change today's behavior —
+    /// `MEMORY_VIEW = All` does NOT change today's behavior —
     /// the tool still routes through the scope slot (layered read with the
     /// tool's stored conversation, then shared unscoped backfill). This
     /// documents the intent so future readers know the view is "off" unless

@@ -228,19 +228,6 @@ manually-dispatched workflow.
 
 ---
 
-## 1. Configuration Namespace
-
-All channel settings live under `channels_config` in `~/.rantaiclaw/config.toml`.
-
-```toml
-[channels_config]
-cli = true
-```
-
-Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).
-
----
-
 ## 0a. DM detection
 
 Some platforms expose a one-to-one chat signal the runtime uses to set
@@ -271,6 +258,10 @@ Three operator surfaces read this list and cannot disagree:
   ("DMs recognised" or "DMs treated as group chats"),
 - the `channels.dm_detection` check in `rantaiclaw doctor`.
 
+---
+
+## 1. Configuration Namespace
+
 All channel settings live under `channels_config` in `~/.rantaiclaw/config.toml`.
 
 ```toml
@@ -279,6 +270,8 @@ cli = true
 ```
 
 Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).
+
+---
 
 ## In-Chat Runtime Model Switching
 
