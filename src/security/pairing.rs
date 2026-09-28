@@ -57,7 +57,9 @@ impl PairingGuard {
     /// pairing code is generated and returned via `pairing_code()`.
     ///
     /// Existing tokens are accepted in both forms:
-    /// - Plaintext (`zc_...`): hashed on load for backward compatibility
+    /// - Plaintext: hashed on load for backward compatibility. Tokens
+    ///   issued before the `rc_` prefix change started with `zc_`; new
+    ///   ones start with `rc_`. Both forms are accepted.
     /// - Already hashed (64-char hex): stored as-is
     pub fn new(require_pairing: bool, existing_tokens: &[String]) -> Self {
         let tokens: HashSet<String> = existing_tokens
@@ -345,7 +347,7 @@ fn generate_code() -> String {
 /// 64-character token, providing 256 bits of entropy.
 fn generate_token() -> String {
     let bytes: [u8; 32] = rand::random();
-    format!("zc_{}", hex::encode(bytes))
+    format!("rc_{}", hex::encode(bytes))
 }
 
 /// SHA-256 hash a bearer token for storage. Returns lowercase hex.
@@ -426,7 +428,7 @@ mod tests {
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "test_client").await.unwrap();
         assert!(token.is_some());
-        assert!(token.unwrap().starts_with("zc_"));
+        assert!(token.unwrap().starts_with("rc_"));
         assert!(guard.is_paired());
     }
 
@@ -482,7 +484,7 @@ mod tests {
         for t in &tokens {
             assert_eq!(t.len(), 64, "Token should be a SHA-256 hash");
             assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
-            assert!(!t.starts_with("zc_"), "Token should not be plaintext");
+            assert!(!t.starts_with("rc_"), "Token should not be plaintext");
         }
     }
 
@@ -601,8 +603,38 @@ mod tests {
     async fn generate_token_has_prefix_and_hex_payload() {
         let token = generate_token();
         let payload = token
-            .strip_prefix("zc_")
-            .expect("Generated token should include zc_ prefix");
+            .strip_prefix("rc_")
+            .expect("Generated token should include rc_ prefix");
+
+        assert_eq!(payload.len(), 64, "Token payload should be 32 bytes in hex");
+        assert!(
+            payload
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+            "Token payload should be lowercase hex"
+        );
+    }
+
+    #[test]
+    async fn zprefix_token_still_authenticates_after_prefix_change() {
+        // A token issued before the rc_ prefix change (starts with `zc_`)
+        // must keep authenticating after the change: storage keys are
+        // SHA-256 hashes, which are prefix-agnostic. The plaintext is a
+        // realistic full-length token (not a short literal), and the
+        // pre-hashed storage form is exactly 64 lowercase hex chars.
+        let plaintext = format!("zc_{}", "a".repeat(64));
+        let stored_hash = hash_token(&plaintext);
+        assert_eq!(stored_hash.len(), 64);
+        let guard = PairingGuard::new(true, &[stored_hash]);
+        assert!(guard.is_authenticated(&plaintext));
+    }
+
+    #[test]
+    async fn generate_token_starts_with_rc_and_carries_hex_payload() {
+        let token = generate_token();
+        let payload = token
+            .strip_prefix("rc_")
+            .expect("Generated token should include rc_ prefix");
 
         assert_eq!(payload.len(), 64, "Token payload should be 32 bytes in hex");
         assert!(
@@ -691,6 +723,8 @@ mod tests {
     #[test]
     async fn sync_tokens_adds_tokens_present_only_in_config() {
         // Another process (CLI pairing) may have written a token to the file.
+        // `zc_` literals throughout this module are intentional: tokens issued
+        // before the `rc_` prefix change must keep authenticating after it.
         let guard = PairingGuard::new(true, &[]);
         let outside = "zc_a_token_issued_elsewhere";
         assert!(!guard.is_authenticated(outside));

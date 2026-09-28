@@ -80,6 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Gateway pairing tokens now start with `rc_`. Tokens issued before this change (`zc_…`) keep authenticating: storage is keyed by SHA-256, prefix-agnostic.
 - Guests (allowed senders who are not in `channels_config.approval_owners`)
   no longer inherit `autonomy.auto_approve`. The agent now calls **only** the
   tools listed in `channels_config.guest_allowed_tools` on a guest's behalf —
