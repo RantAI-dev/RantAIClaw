@@ -347,8 +347,7 @@ rather than a hardcoded prompt string.
   opening a port.
 - **Remote** — keys, registry and sessions for driving an agent from elsewhere.
 - **Profiles** — `~/.rantaiclaw/profiles/<name>/` with its own config, workspace,
-  memory, audit log, persona and skills; daemon handoff on switch; import from
-  OpenClaw / ZeroClaw via `rantaiclaw migrate`.
+  memory, audit log, persona and skills; daemon handoff on switch.
 
 ## Interactive TUI
 

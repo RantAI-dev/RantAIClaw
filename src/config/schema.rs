@@ -4460,8 +4460,7 @@ impl Config {
                         workspace = %workspace_dir.display(),
                         "markdown memory import failed; the config still loads as sqlite, \
                          but the original markdown notes were not migrated. Inspect the \
-                         backup under memory/migrations/markdown-*/ and retry with \
-                         `rantaiclaw migrate openclaw --source <backup dir>`."
+                         backup under memory/migrations/markdown-*/ and restore by hand."
                     );
                 }
             }
@@ -5409,8 +5408,7 @@ fn import_markdown_memory_into_sqlite(workspace_dir: &Path) -> Result<()> {
         imported,
         skipped_existing,
         backup = %backup_path.display(),
-        "imported markdown memory entries into sqlite (backup at {0}; \
-         retry with `rantaiclaw migrate openclaw --source {0}`)",
+        "imported markdown memory entries into sqlite (backup at {0})",
         backup_path.display()
     );
 

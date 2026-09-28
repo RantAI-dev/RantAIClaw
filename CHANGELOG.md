@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `postgres`, `tokio-postgres-rustls` and `rustls-native-certs` deps. A default
   build no longer pulls the `tokio-postgres` family; `--features` is the
   release-engineering knob operators tune, not a memory-backend picker.
+- `rantaiclaw migrate` is removed. Both `migrate --from <openclaw|zeroclaw|auto>`
+  (profile import) and `migrate openclaw [--source] [--dry-run]` (memory import)
+  are gone, because the importer still wrote a config shape that has since
+  drifted thirty schema versions out of date and silently dropped settings the
+  operator expected to migrate. Existing RantaiClaw installs are unaffected —
+  their own layout migration (`maybe_migrate_legacy_layout`) lives in a
+  separate path and is unchanged.
 
 ### Changed
 
