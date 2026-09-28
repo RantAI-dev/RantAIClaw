@@ -7,9 +7,10 @@
 //! Five hand-written persona markdown templates ship in-binary via
 //! `include_str!`. Each one carries five substitution placeholders
 //! (`{{name}}`, `{{timezone}}`, `{{role}}`, `{{tone}}`, `{{avoid}}`) plus
-//! one `{{#if avoid}}...{{/if}}` block guard. The renderer is pure
-//! substring replacement — no templating engine — so the binary stays
-//! lean and snapshot tests are trivially deterministic.
+//! two block guards, `{{#if avoid}}...{{/if}}` and
+//! `{{#if timezone}}...{{/if}}`. The renderer is pure substring
+//! replacement — no templating engine — so the binary stays lean and
+//! snapshot tests are trivially deterministic.
 //!
 //! `PersonaSection` is wired into the orchestrator prompt builder, so a
 //! configured persona shapes the agent's voice on every surface: TUI,
@@ -164,6 +165,23 @@ impl PersonaToml {
             template_for(self.preset),
             &self.name,
             &self.timezone,
+            &self.role,
+            &self.tone,
+            self.avoid.as_deref(),
+        )
+    }
+
+    /// Render the persona body for a guest turn: the owner's name is
+    /// replaced by "the owner of this bot" and the timezone is omitted, so
+    /// neither reaches a non-owner sender. Role, tone and avoid are
+    /// unchanged. The literal replacement name is passed explicitly rather
+    /// than an empty string, since the renderer maps an empty name to
+    /// "you".
+    pub fn render_for_guest(&self) -> String {
+        renderer::render(
+            template_for(self.preset),
+            "the owner of this bot",
+            "",
             &self.role,
             &self.tone,
             self.avoid.as_deref(),

@@ -3,7 +3,6 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Maximum file size we will read and base64-encode (5 MB).
@@ -156,8 +155,6 @@ impl Tool for ImageInfoTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let path = Path::new(path_str);
-
         // Restrict reads to workspace directory to prevent arbitrary file exfiltration
         if !self.security.is_path_allowed(path_str) {
             return Ok(ToolResult {
@@ -169,15 +166,36 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        if !path.exists() {
+        // Resolve against the workspace, like the other path-bearing tools —
+        // `Path::join` leaves an already-absolute `path_str` unchanged, so a
+        // relative path still resolves against the workspace. Canonicalising
+        // here (rather than only checking `path.exists()`) is what lets the
+        // guest-view check below compare against the file's real, resolved
+        // name and location instead of the string the caller asked for.
+        let full_path = self.security.workspace_dir.join(path_str);
+        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("File not found: {path_str}")),
+                });
+            }
+        };
+
+        if let Some(denial) =
+            crate::tools::guest_private_path_denial(&resolved_path, &self.security.workspace_dir)
+                .await
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("File not found: {path_str}")),
+                error: Some(denial),
             });
         }
 
-        let metadata = tokio::fs::metadata(path)
+        let metadata = tokio::fs::metadata(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
 
@@ -193,7 +211,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(path)
+        let bytes = tokio::fs::read(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
 
@@ -461,6 +479,96 @@ mod tests {
         assert!(!result.output.contains("data:"));
 
         // Clean up
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A relative path must resolve against the workspace directory, not the
+    /// process's current working directory. `test_security()` pins the
+    /// workspace to `std::env::temp_dir()`, which is never the test binary's
+    /// CWD, so this only passes when `execute` actually joins `path_str`
+    /// onto `workspace_dir` before resolving it.
+    #[tokio::test]
+    async fn execute_resolves_relative_path_against_the_workspace_not_the_process_cwd() {
+        let dir = std::env::temp_dir().join("rantaiclaw_image_info_relative_workspace");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("pic.png"), b"\x89PNG\r\n\x1a\n")
+            .await
+            .unwrap();
+
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(dir.clone())
+                .with_workspace_only(false)
+                .with_forbidden_paths(vec![]),
+        );
+        let tool = ImageInfoTool::new(security);
+        let result = tool.execute(json!({"path": "pic.png"})).await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("Format: png"), "{}", result.output);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ── guest memory-view path rule ──────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_denies_symlink_to_user_md_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join("rantaiclaw_image_info_guest_symlink");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("USER.md"), "owner profile")
+            .await
+            .unwrap();
+        symlink(dir.join("USER.md"), dir.join("notes.png")).unwrap();
+
+        let tool = ImageInfoTool::new(test_security());
+        let path_str = dir.join("notes.png").to_string_lossy().to_string();
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": path_str})).await.unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("private to the owner"),
+            "{:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_allows_symlink_to_user_md_without_guest_view() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join("rantaiclaw_image_info_no_view_symlink");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("USER.md"), "owner profile")
+            .await
+            .unwrap();
+        symlink(dir.join("USER.md"), dir.join("notes.png")).unwrap();
+
+        let tool = ImageInfoTool::new(test_security());
+        let path_str = dir.join("notes.png").to_string_lossy().to_string();
+        let result = tool.execute(json!({"path": path_str})).await.unwrap();
+
+        assert!(result.success, "control: {:?}", result.error);
+
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

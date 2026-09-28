@@ -26,8 +26,17 @@ pub(super) async fn resolve_unique_entry(
         return Err(format!("'{selector_name}' must not be empty"));
     }
 
+    // Under a guest's conversation-scoped turn, only that conversation's rows
+    // are candidates: listing the whole store would let a guest probe
+    // substrings across every conversation, and the ambiguity error below
+    // would name keys the guest has no business seeing.
+    let session_filter = match crate::memory::current_memory_view() {
+        Some(crate::memory::MemoryView::Only(key)) => Some(key),
+        _ => None,
+    };
+
     let entries = memory
-        .list(None, None)
+        .list(None, session_filter.as_deref())
         .await
         .map_err(|e| format!("Failed to read memory: {e}"))?;
 
@@ -542,6 +551,50 @@ mod tests {
             mem.get("c").await.unwrap().is_none(),
             "nothing may be stored"
         );
+    }
+
+    /// Under a guest's conversation-scoped view, `replaces` must not match
+    /// another conversation's row, and the ambiguity/no-match error must not
+    /// name a key the guest has no business seeing.
+    #[tokio::test]
+    async fn store_with_replaces_outside_guest_view_reports_no_match() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "other_conv_fact",
+            "the deploy runbook lives in another chat",
+            MemoryCategory::Core,
+            Some("chat:other"),
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({
+                    "key": "new_key",
+                    "content": "something else",
+                    "replaces": "deploy runbook",
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("nothing to replace"), "{error}");
+        assert!(
+            !error.contains("other_conv_fact"),
+            "must not name a key from outside the view: {error}"
+        );
+        assert!(
+            mem.get("other_conv_fact").await.unwrap().is_some(),
+            "the other conversation's row must survive"
+        );
+        assert!(mem.get("new_key").await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -129,6 +129,17 @@ impl Tool for FileWriteTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
+        if let Some(denial) =
+            crate::tools::guest_private_path_denial(&resolved_target, &self.security.workspace_dir)
+                .await
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(denial),
+            });
+        }
+
         // If the target already exists and is a symlink, refuse to follow it
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
             if meta.file_type().is_symlink() {
@@ -455,6 +466,80 @@ mod tests {
         assert_eq!(content, "original", "original file must not be modified");
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    // ── guest memory-view path rule ──────────────────────
+
+    #[tokio::test]
+    async fn file_write_denies_writing_into_memory_dir_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_write_guest_memory_dir");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "memory/x.md", "content": "leak"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("private to the owner"),
+            "{:?}",
+            result.error
+        );
+        assert!(!dir.join("memory/x.md").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_writing_into_memory_dir_without_guest_view() {
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_write_no_view_memory_dir");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "memory/x.md", "content": "fine"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "control: {:?}", result.error);
+        assert!(dir.join("memory/x.md").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_ordinary_file_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_write_guest_ordinary");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "notes.txt", "content": "fine"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(result.success, "{:?}", result.error);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

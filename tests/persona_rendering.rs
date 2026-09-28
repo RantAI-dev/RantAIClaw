@@ -246,6 +246,90 @@ fn renders_without_a_blank_name_gap() {
 }
 
 #[test]
+fn guest_render_omits_owner_name_and_timezone_in_every_preset() {
+    for &p in PresetId::ALL {
+        let persona = PersonaToml {
+            preset: p,
+            name: "Owner Name".into(),
+            timezone: "Asia/Jakarta".into(),
+            role: ROLE.into(),
+            tone: TONE.into(),
+            avoid: None,
+            always_on_kbs: Vec::new(),
+        };
+
+        let owner_body = persona.render();
+        assert!(
+            owner_body.contains("Owner Name"),
+            "preset {p:?} owner render should contain the owner's name"
+        );
+        assert!(
+            owner_body.contains("Asia/Jakarta"),
+            "preset {p:?} owner render should contain the owner's timezone"
+        );
+
+        let guest_body = persona.render_for_guest();
+        assert!(
+            !guest_body.contains("Owner Name"),
+            "preset {p:?} guest render leaked the owner's name: {guest_body}"
+        );
+        assert!(
+            !guest_body.contains("Asia/Jakarta"),
+            "preset {p:?} guest render leaked the owner's timezone: {guest_body}"
+        );
+        assert!(
+            !guest_body.contains("{{"),
+            "preset {p:?} leaked a placeholder"
+        );
+    }
+}
+
+/// The executive-assistant preset's scheduling bullet mentions `{{timezone}}`
+/// outside the line-3 `{{#if timezone}}` guard. An empty timezone (every
+/// guest render, and any owner who has not set one) used to substitute the
+/// placeholder with an empty string, leaving "relative to ." rather than
+/// dropping the whole timezone-dependent sentence.
+#[test]
+fn empty_timezone_drops_the_scheduling_bullet_in_executive_assistant() {
+    let out = persona::renderer::render(
+        template_for(PresetId::ExecutiveAssistant),
+        NAME,
+        "",
+        "calendar and inbox triage",
+        TONE,
+        None,
+    );
+    assert!(
+        !out.contains("relative to ."),
+        "must not leave a dangling timezone phrase: {out}"
+    );
+    assert!(
+        !out.contains("scheduling-adjacent"),
+        "the whole timezone-dependent bullet must be dropped without a timezone: {out}"
+    );
+    assert!(!out.contains("{{"), "no leftover placeholders: {out}");
+}
+
+/// Control: a non-empty timezone keeps the bullet, worded exactly as before —
+/// this is what the `executive_assistant_no_avoid` snapshot (rendered with a
+/// timezone) already locks in byte-for-byte.
+#[test]
+fn nonempty_timezone_keeps_the_scheduling_bullet_in_executive_assistant() {
+    let out = persona::renderer::render(
+        template_for(PresetId::ExecutiveAssistant),
+        NAME,
+        TZ,
+        "calendar and inbox triage",
+        TONE,
+        None,
+    );
+    assert!(
+        out.contains("relative to Asia/Jakarta"),
+        "a configured timezone must keep the scheduling bullet: {out}"
+    );
+}
+
+#[test]
 fn placeholder_in_a_field_value_is_not_re_expanded() {
     // A value that itself contains a `{{role}}` token must survive verbatim —
     // sequential replaces used to expand it with the later role substitution.

@@ -1,11 +1,12 @@
-//! Persona template renderer — substring substitution + `{{#if avoid}}` block guard.
+//! Persona template renderer — substring substitution + `{{#if <var>}}` block guards.
 //!
 //! This is intentionally not a templating engine. The 5 bundled persona
 //! markdown templates have a fixed, hand-curated set of placeholders
-//! (`{{name}}`, `{{timezone}}`, `{{role}}`, `{{tone}}`, `{{avoid}}`) plus a
-//! single `{{#if avoid}}...{{/if}}` block guard. A pure-string approach is
-//! easier to audit, has no run-time dependency surface, and produces
-//! deterministic output that round-trips through snapshot tests.
+//! (`{{name}}`, `{{timezone}}`, `{{role}}`, `{{tone}}`, `{{avoid}}`) plus two
+//! block guards, `{{#if avoid}}...{{/if}}` and `{{#if timezone}}...{{/if}}`.
+//! A pure-string approach is easier to audit, has no run-time dependency
+//! surface, and produces deterministic output that round-trips through
+//! snapshot tests.
 //!
 //! See `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
 //! §"Section 3 — persona (NEW)".
@@ -23,18 +24,19 @@ pub fn render(
     tone: &str,
     avoid: Option<&str>,
 ) -> String {
-    // First decide whether the avoid block should survive.
+    // First decide whether each conditional block should survive.
     let keep_avoid = avoid.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let keep_timezone = !timezone.trim().is_empty();
 
-    let stripped = if keep_avoid {
-        // Keep the inner content, drop just the guard markers.
-        template
-            .replace("{{#if avoid}}\n", "")
-            .replace("{{#if avoid}}", "")
-            .replace("{{/if}}\n", "")
-            .replace("{{/if}}", "")
+    let stripped = if keep_timezone {
+        keep_if_block(template, "timezone")
     } else {
-        strip_avoid_block(template)
+        strip_if_block(template, "timezone")
+    };
+    let stripped = if keep_avoid {
+        keep_if_block(&stripped, "avoid")
+    } else {
+        strip_if_block(&stripped, "avoid")
     };
 
     // A single left-to-right pass resolves each `{{key}}` exactly once, so a
@@ -83,17 +85,28 @@ fn substitute_placeholders<'a>(template: &str, lookup: impl Fn(&str) -> Option<&
     out
 }
 
-/// Remove `{{#if avoid}}...{{/if}}` (and its trailing blank line, if any) from
-/// the template. Operates on raw source text — no regex dependency.
-fn strip_avoid_block(template: &str) -> String {
-    const OPEN: &str = "{{#if avoid}}";
+/// The opening marker for a `{{#if <var>}}...{{/if}}` block guard.
+fn if_open_tag(var: &str) -> String {
+    let mut s = String::from("{{#if ");
+    s.push_str(var);
+    s.push_str("}}");
+    s
+}
+
+/// Remove `{{#if <var>}}...{{/if}}` (and its trailing blank line, if any) from
+/// the template, dropping the block's contents along with the markers.
+/// Operates on raw source text — no regex dependency. Only the block guarded
+/// by `var` is touched; another variable's `{{#if ...}}...{{/if}}` block
+/// elsewhere in the template is left alone.
+fn strip_if_block(template: &str, var: &str) -> String {
+    let open = if_open_tag(var);
     const CLOSE: &str = "{{/if}}";
 
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
-    while let Some(open_idx) = rest.find(OPEN) {
+    while let Some(open_idx) = rest.find(open.as_str()) {
         out.push_str(&rest[..open_idx]);
-        let after_open = &rest[open_idx + OPEN.len()..];
+        let after_open = &rest[open_idx + open.len()..];
         if let Some(close_idx) = after_open.find(CLOSE) {
             // Drop the block contents entirely.
             let after_close = &after_open[close_idx + CLOSE.len()..];
@@ -109,7 +122,39 @@ fn strip_avoid_block(template: &str) -> String {
         } else {
             // Unterminated guard — leave the opener in place; consumers will
             // see the literal markers and that's loud enough to debug.
-            out.push_str(OPEN);
+            out.push_str(&open);
+            rest = after_open;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Keep a `{{#if <var>}}...{{/if}}` block's contents, removing only that
+/// variable's own opening and closing markers. Another variable's block
+/// guard elsewhere in the template — its own `{{#if ...}}` and the
+/// `{{/if}}` that closes it — is left untouched, so this never strips a
+/// sibling block's closer.
+fn keep_if_block(template: &str, var: &str) -> String {
+    let open = if_open_tag(var);
+    const CLOSE: &str = "{{/if}}";
+
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open_idx) = rest.find(open.as_str()) {
+        out.push_str(&rest[..open_idx]);
+        let after_open = &rest[open_idx + open.len()..];
+        // Drop the opening marker itself (plus one trailing newline, if
+        // any) — the content up to this variable's own closer survives.
+        let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
+        if let Some(close_idx) = after_open.find(CLOSE) {
+            out.push_str(&after_open[..close_idx]);
+            let after_close = &after_open[close_idx + CLOSE.len()..];
+            let after_close = after_close.strip_prefix('\n').unwrap_or(after_close);
+            rest = after_close;
+        } else {
+            // Unterminated guard — leave the opener in place.
+            out.push_str(&open);
             rest = after_open;
         }
     }
@@ -156,5 +201,29 @@ mod tests {
         let tpl = "{{name}}/{{timezone}}/{{role}}/{{tone}}";
         let out = render(tpl, "Shiro", "Asia/Jakarta", "build", "neutral", None);
         assert_eq!(out, "Shiro/Asia/Jakarta/build/neutral");
+    }
+
+    const TZ_SAMPLE: &str = "for {{name}}{{#if timezone}} (timezone: {{timezone}}){{/if}}.";
+
+    #[test]
+    fn empty_timezone_strips_timezone_block() {
+        let out = render(TZ_SAMPLE, "Shiro", "", "build", "neutral", None);
+        assert_eq!(out, "for Shiro.");
+    }
+
+    #[test]
+    fn nonempty_timezone_keeps_timezone_block() {
+        let out = render(TZ_SAMPLE, "Shiro", "Asia/Jakarta", "build", "neutral", None);
+        assert_eq!(out, "for Shiro (timezone: Asia/Jakarta).");
+    }
+
+    /// Stripping the timezone block must not touch a sibling `{{#if avoid}}`
+    /// block elsewhere in the template, and vice versa — each variable's
+    /// guard is scoped to its own opener/closer pair.
+    #[test]
+    fn stripping_timezone_block_leaves_a_kept_avoid_block_intact() {
+        let tpl = "for {{name}}{{#if timezone}} (timezone: {{timezone}}){{/if}}.\n\n{{#if avoid}}\nAvoid: {{avoid}}\n{{/if}}\n";
+        let out = render(tpl, "Shiro", "", "build", "neutral", Some("small talk"));
+        assert_eq!(out, "for Shiro.\n\nAvoid: small talk\n");
     }
 }

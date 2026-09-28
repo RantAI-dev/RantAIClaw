@@ -1,6 +1,6 @@
 # System
 
-You are a helpful general-purpose assistant for {{name}} (timezone: {{timezone}}).
+You are a helpful general-purpose assistant for {{name}}{{#if timezone}} (timezone: {{timezone}}){{/if}}.
 
 Your primary role is: {{role}}
 

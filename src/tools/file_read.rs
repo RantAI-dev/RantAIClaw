@@ -114,6 +114,17 @@ impl Tool for FileReadTool {
             });
         }
 
+        if let Some(denial) =
+            crate::tools::guest_private_path_denial(&resolved_path, &self.security.workspace_dir)
+                .await
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(denial),
+            });
+        }
+
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
@@ -540,6 +551,122 @@ mod tests {
         assert!(result
             .output
             .contains("[No lines in range, file has 2 lines]"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ── guest memory-view path rule ──────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_read_denies_symlink_to_user_md_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_guest_symlink");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("USER.md"), "owner profile")
+            .await
+            .unwrap();
+        symlink(dir.join("USER.md"), dir.join("notes.txt")).unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "notes.txt"})).await.unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("private to the owner"),
+            "{:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_read_allows_symlink_to_user_md_without_guest_view() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_no_view_symlink");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("USER.md"), "owner profile")
+            .await
+            .unwrap();
+        symlink(dir.join("USER.md"), dir.join("notes.txt")).unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "notes.txt"})).await.unwrap();
+
+        assert!(result.success, "control: {:?}", result.error);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The plan's editor-backup case (`USER.md~`), exercised through the tool
+    /// in a real tempdir — not only the pure `is_private_owner_path_resolved`
+    /// unit test in `approval::guest`.
+    #[tokio::test]
+    async fn file_read_denies_editor_backup_of_user_md_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_guest_backup");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("USER.md~"), "owner profile backup")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "USER.md~"})).await.unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("private to the owner"),
+            "{:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_allows_ordinary_file_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_guest_ordinary");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("README.md"), "hello")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "README.md"})).await.unwrap()
+            })
+            .await;
+
+        assert!(result.success, "{:?}", result.error);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

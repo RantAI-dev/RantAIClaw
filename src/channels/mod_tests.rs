@@ -8954,6 +8954,115 @@ async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_with_no_probe_vi
     );
 }
 
+/// The per-message persona splice in dispatch must use the guest render for
+/// a non-owner sender, so the owner's configured name and timezone never
+/// reach a guest's system prompt. This drives a guest turn against a
+/// `persona.toml` that sets both, and checks neither shows up in the
+/// resulting system prompt.
+#[tokio::test]
+async fn guest_channel_turn_uses_guest_persona_without_owner_name_or_timezone() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let _profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-persona-dispatch");
+
+    let profile = crate::profile::ProfileManager::active().unwrap();
+    crate::persona::write_persona_toml(
+        &profile,
+        &crate::persona::PersonaToml {
+            preset: crate::persona::PresetId::Default,
+            name: "Owner Name".to_string(),
+            timezone: "Asia/Jakarta".to_string(),
+            role: "general productivity and helpful assistance".to_string(),
+            tone: "neutral".to_string(),
+            avoid: None,
+            always_on_kbs: Vec::new(),
+        },
+    )
+    .unwrap();
+
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    // Fixture prompts carry a `## Persona` placeholder so the dispatch splice
+    // (`replace_persona_section`) has a section to swap out.
+    let prompt_fixture = "SYSTEM_PROMPT\n\n## Persona\n\nPLACEHOLDER\n";
+
+    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new(prompt_fixture.to_string()),
+        guest_system_prompt: Arc::new(prompt_fixture.to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        runtime_ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "guest-persona-1".to_string(),
+            sender: "rantaiclaw_guest".to_string(),
+            reply_target: "chat-guest-persona".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let system_prompt = calls[0][0].1.clone();
+    assert!(
+        system_prompt.contains("the owner of this bot"),
+        "the guest persona render should replace the owner's name: {system_prompt}"
+    );
+    assert!(
+        !system_prompt.contains("Owner Name"),
+        "guest persona must not carry the owner's name: {system_prompt}"
+    );
+    assert!(
+        !system_prompt.contains("Asia/Jakarta"),
+        "guest persona must not carry the owner's timezone: {system_prompt}"
+    );
+}
+
 /// `sender_is_owner` and `is_direct` are two independent booleans threaded
 /// into `build_channel_system_prompt` from the same dispatch call site. An
 /// owner speaking in a group chat is the combination that catches them being

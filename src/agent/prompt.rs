@@ -160,15 +160,37 @@ impl SystemPromptBuilder {
 /// (`crate::channels::build_system_prompt_with_mode`), so every surface speaks
 /// in the same configured voice instead of only the TUI honoring `personality`.
 pub fn render_persona_section() -> String {
-    let profile = match crate::profile::ProfileManager::active() {
-        Ok(p) => p,
-        Err(_) => return String::new(),
+    let persona = match load_active_persona() {
+        Some(p) => p,
+        None => return String::new(),
     };
-    let persona = match crate::persona::read_persona_toml(&profile) {
-        Ok(Some(p)) => p,
-        _ => return String::new(),
+    wrap_persona_section(&persona.render())
+}
+
+/// Same as [`render_persona_section`], but for a guest turn: the owner's
+/// name is replaced by "the owner of this bot" and the timezone is
+/// omitted, so neither reaches a non-owner sender. Role, tone and avoid
+/// render the same as the owner's persona. Used by the channel dispatch
+/// per-message persona splice (`replace_persona_section`) for turns from a
+/// non-owner sender.
+pub fn render_guest_persona_section() -> String {
+    let persona = match load_active_persona() {
+        Some(p) => p,
+        None => return String::new(),
     };
-    let rendered = persona.render();
+    wrap_persona_section(&persona.render_for_guest())
+}
+
+/// Load the active profile's `persona.toml`, or `None` when no profile is
+/// active or no persona is configured yet (fresh installs, headless tests).
+fn load_active_persona() -> Option<crate::persona::PersonaToml> {
+    let profile = crate::profile::ProfileManager::active().ok()?;
+    crate::persona::read_persona_toml(&profile).ok().flatten()
+}
+
+/// Wrap a rendered persona body in the `## Persona` section header, or
+/// return an empty string when the body is blank.
+fn wrap_persona_section(rendered: &str) -> String {
     if rendered.trim().is_empty() {
         return String::new();
     }
@@ -205,8 +227,19 @@ impl PromptSection for PersonaSection {
     /// reader the CLI uses. Fall through to an empty section when no
     /// persona is configured (fresh installs, headless tests, profile
     /// without a `persona/` dir) — silent rather than noisy.
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(render_persona_section())
+    ///
+    /// `ctx.skip_owner_files` renders the guest persona here too: the
+    /// channel dispatch's per-message splice (`replace_persona_section`)
+    /// overwrites this section on every turn anyway, but the guest prompt
+    /// built once at channel start-up (`guest_system_prompt`) is this
+    /// section's output until the first splice runs, so it must not carry
+    /// the owner's name or timezone even briefly.
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(if ctx.skip_owner_files {
+            render_guest_persona_section()
+        } else {
+            render_persona_section()
+        })
     }
 }
 
@@ -281,9 +314,12 @@ impl PromptSection for IdentitySection {
 
         // BOOTSTRAP.md is a first-run ritual: on channels inject it only when
         // present (no noisy not-found marker); on the agent surface keep the
-        // marker so the absence is visible.
-        if matches!(ctx.surface, PromptSurface::Agent)
-            || ctx.workspace_dir.join("BOOTSTRAP.md").exists()
+        // marker so the absence is visible. The setup wizard writes the
+        // owner's name and timezone into this file, so a guest prompt must
+        // skip it the same way it skips USER.md and MEMORY.md.
+        if !ctx.skip_owner_files
+            && (matches!(ctx.surface, PromptSurface::Agent)
+                || ctx.workspace_dir.join("BOOTSTRAP.md").exists())
         {
             inject_workspace_file(
                 &mut prompt,
@@ -1494,6 +1530,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
     }
 
+    /// `PersonaSection` itself must render the guest persona when
+    /// `skip_owner_files` is set. The dispatch per-turn splice
+    /// (`replace_persona_section`, tested in `channels::mod_tests`) fixes this
+    /// up on every channel turn anyway, but the guest prompt built once at
+    /// channel start-up (`guest_system_prompt`) is this section's own output
+    /// until the first splice runs, so it must not carry the owner's name or
+    /// timezone even briefly.
+    #[test]
+    fn persona_section_skips_owner_name_and_timezone_under_skip_owner_files() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let home = std::env::temp_dir().join(format!(
+            "rantaiclaw_prompt_test_home_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = crate::test_env::HomeGuard::set(&home);
+        let _profile_env =
+            crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-prompt-persona-guest");
+
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        crate::persona::write_persona_toml(
+            &profile,
+            &crate::persona::PersonaToml {
+                preset: crate::persona::PresetId::Default,
+                name: "Owner Name".to_string(),
+                timezone: "Asia/Jakarta".to_string(),
+                role: "general productivity and helpful assistance".to_string(),
+                tone: "neutral".to_string(),
+                avoid: None,
+                always_on_kbs: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let workspace =
+            std::env::temp_dir().join(format!("rantaiclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let owner_prompt = SystemPromptBuilder::with_defaults()
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                skip_owner_files: false,
+            })
+            .unwrap();
+        let guest_prompt = SystemPromptBuilder::with_defaults()
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                skip_owner_files: true,
+            })
+            .unwrap();
+
+        assert!(
+            owner_prompt.contains("Owner Name") && owner_prompt.contains("Asia/Jakarta"),
+            "control: the owner prompt must carry the persona's name and timezone:\n{owner_prompt}"
+        );
+        assert!(
+            !guest_prompt.contains("Owner Name"),
+            "guest prompt must not name the owner, got:\n{guest_prompt}"
+        );
+        assert!(
+            !guest_prompt.contains("Asia/Jakarta"),
+            "guest prompt must not carry the owner's timezone, got:\n{guest_prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Plan 450: `IdentitySection` directly — assert it omits the
     /// "USER.md" header when `skip_owner_files` is true, even if the file
     /// does not exist on disk. The not-found marker is also owner-private.
@@ -1548,6 +1677,70 @@ mod tests {
         assert!(
             !guest.contains("USER.md"),
             "guest identity section must not mention USER.md at all, got:\n{guest}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// The setup wizard writes the owner's name and timezone into
+    /// `BOOTSTRAP.md`. A guest prompt must not carry that file; the owner
+    /// prompt still does when the file exists on disk.
+    #[test]
+    fn guest_prompt_omits_bootstrap_md() {
+        let workspace =
+            std::env::temp_dir().join(format!("rantaiclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("BOOTSTRAP.md"),
+            "Your human's name is **Owner Name** (timezone: Asia/Jakarta)",
+        )
+        .unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let owner_prompt = SystemPromptBuilder::with_defaults()
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                skip_owner_files: false,
+            })
+            .unwrap();
+        let guest_prompt = SystemPromptBuilder::with_defaults()
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                skip_owner_files: true,
+            })
+            .unwrap();
+
+        assert!(
+            owner_prompt.contains("### BOOTSTRAP.md"),
+            "owner prompt should contain BOOTSTRAP.md, got:\n{owner_prompt}"
+        );
+        assert!(
+            !guest_prompt.contains("### BOOTSTRAP.md"),
+            "guest prompt must not contain BOOTSTRAP.md, got:\n{guest_prompt}"
         );
 
         let _ = std::fs::remove_dir_all(workspace);

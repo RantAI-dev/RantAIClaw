@@ -99,7 +99,40 @@ impl Tool for MemoryForgetTool {
         }
 
         let key: String = match selector {
-            Selector::Key(k) => k.to_string(),
+            Selector::Key(k) => {
+                // Under a guest's conversation-scoped turn, a key addressed
+                // directly must still belong to that conversation — `Selector::Contains`
+                // gets this for free from `resolve_unique_entry`'s own view filter, but
+                // `key` skips that lookup, so the check is repeated here. Answering
+                // "not found" for a key outside the view (the same message a genuinely
+                // missing key gets) avoids confirming to the guest that the key exists.
+                if let Some(crate::memory::MemoryView::Only(view_key)) =
+                    crate::memory::current_memory_view()
+                {
+                    match self.memory.get(k).await {
+                        Ok(Some(entry))
+                            if entry.session_id.as_deref() == Some(view_key.as_str()) => {}
+                        Ok(_) => {
+                            return Ok(ToolResult {
+                                success: true,
+                                output: format!("No memory found with key: {k}"),
+                                error: None,
+                            });
+                        }
+                        // A backend error resolving the guard is a failure, not "not
+                        // found" — conflating the two would tell the caller the key
+                        // does not exist when the store simply could not be read.
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Failed to forget memory: {e}")),
+                            });
+                        }
+                    }
+                }
+                k.to_string()
+            }
             Selector::Contains(needle) => {
                 match super::memory_store::resolve_unique_entry(
                     self.memory.as_ref(),
@@ -194,6 +227,152 @@ mod tests {
         let result = tool.execute(json!({"key": "nope"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No memory found"));
+    }
+
+    // ── guest memory-view scoping ────────────────────────
+
+    /// Under a guest's conversation-scoped view, forgetting a key that
+    /// belongs to a different conversation must answer the same "not found"
+    /// message a genuinely missing key gets, and must not touch the row.
+    #[tokio::test]
+    async fn forget_by_key_outside_guest_view_reports_not_found_and_keeps_the_row() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "other_conv_fact",
+            "someone else's auto-save",
+            MemoryCategory::Core,
+            Some("chat:other"),
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"key": "other_conv_fact"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("No memory found"),
+            "{}",
+            result.output
+        );
+        assert!(
+            mem.get("other_conv_fact").await.unwrap().is_some(),
+            "the other conversation's row must survive"
+        );
+    }
+
+    /// A backend error while resolving the guest-view guard must surface as a
+    /// failure, not be swallowed into "No memory found" — that would tell a
+    /// caller the key does not exist when the store simply could not be read.
+    #[tokio::test]
+    async fn forget_by_key_under_guest_view_reports_a_backend_error() {
+        use crate::memory::{MemoryCategory, MemoryEntry, MemoryView, MEMORY_VIEW};
+
+        struct FailingGetMemory;
+
+        #[async_trait]
+        impl Memory for FailingGetMemory {
+            fn name(&self) -> &str {
+                "failing-get"
+            }
+            async fn store(
+                &self,
+                _key: &str,
+                _content: &str,
+                _category: MemoryCategory,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _query: &str,
+                _limit: usize,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(Vec::new())
+            }
+            async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+                Err(anyhow::anyhow!("database is locked"))
+            }
+            async fn list(
+                &self,
+                _category: Option<&MemoryCategory>,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(Vec::new())
+            }
+            async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let tool = MemoryForgetTool::new(
+            Arc::new(FailingGetMemory),
+            test_security(),
+            tmp.path().to_path_buf(),
+        );
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"key": "some_key"})).await.unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to forget memory"),
+            "{:?}",
+            result.error
+        );
+    }
+
+    /// Control: a key that does belong to the guest's own conversation is
+    /// still forgettable under the view.
+    #[tokio::test]
+    async fn forget_by_key_inside_guest_view_succeeds() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "this_conv_fact",
+            "the guest's own note",
+            MemoryCategory::Core,
+            Some("chat:guest"),
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"key": "this_conv_fact"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("Forgot"), "{}", result.output);
+        assert!(mem.get("this_conv_fact").await.unwrap().is_none());
     }
 
     #[tokio::test]
