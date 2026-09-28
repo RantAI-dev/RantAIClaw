@@ -163,14 +163,14 @@ mod tests {
 
     #[test]
     fn format_elapsed_minutes_and_seconds() {
-        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_elapsed(Duration::from_mins(1)), "1m 0s");
         assert_eq!(format_elapsed(Duration::from_secs(65)), "1m 5s");
         assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m 59s");
     }
 
     #[test]
     fn format_elapsed_hours_and_minutes() {
-        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h 0m");
+        assert_eq!(format_elapsed(Duration::from_hours(1)), "1h 0m");
         assert_eq!(format_elapsed(Duration::from_secs(3725)), "1h 2m");
     }
 

@@ -22,7 +22,7 @@ use console::style;
 use dialoguer::{Confirm, Input, Password, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::IsTerminal;
@@ -385,7 +385,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         schema_version: crate::config::migrations::CURRENT_VERSION,
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        provider_api_keys: Default::default(),
+        provider_api_keys: HashMap::default(),
         api_key: if api_key.is_empty() {
             None
         } else {
@@ -675,7 +675,7 @@ async fn run_quick_setup_with_home(
         schema_version: crate::config::migrations::CURRENT_VERSION,
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        provider_api_keys: Default::default(),
+        provider_api_keys: HashMap::default(),
         api_key: credential_override.map(|c| {
             let mut s = String::with_capacity(c.len());
             s.push_str(c);

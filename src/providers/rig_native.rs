@@ -91,11 +91,15 @@ pub struct RigProvider {
     canonical_name: &'static str,
 }
 
+#[allow(
+    clippy::missing_fields_in_debug,
+    reason = "`inner: RigClient` carries the upstream rig HTTP client which embeds an `Arc<HeaderMap>` that may contain provider auth headers; printing it would risk logging a credential"
+)]
 impl std::fmt::Debug for RigProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RigProvider")
             .field("provider", &self.canonical_name)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

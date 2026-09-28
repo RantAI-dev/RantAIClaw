@@ -40,6 +40,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
+/// `(category, session_id)` tuple recorded by `RecordingMemory` for each
+/// `store` call. Extracted to a type alias to keep `RecordingMemory::stored`
+/// readable.
+type StoredMemoryRecord = (String, Option<String>);
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Test Helpers — Mock Provider, Mock Tool, Mock Memory
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1050,7 +1055,7 @@ async fn xml_dispatcher_multi_turn_preserves_structured_tool_history() {
 /// Memory mock that records the `session_id` each `store` was called with, so a
 /// test can assert turn memory is written under the agent's conversation scope.
 struct RecordingMemory {
-    stored: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    stored: Arc<Mutex<Vec<StoredMemoryRecord>>>,
 }
 
 #[async_trait]

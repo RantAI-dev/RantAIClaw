@@ -667,7 +667,7 @@ async fn store_intelligence_cross_document_merge() {
     store
         .store_intelligence(
             "docA",
-            &[acme_a.clone()],
+            std::slice::from_ref(&acme_a),
             &[EntityMention {
                 id: "mA".into(),
                 entity_id: acme_a.id.clone(),

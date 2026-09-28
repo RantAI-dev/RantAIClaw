@@ -280,16 +280,15 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
                     }
                     eprintln!("↺ rolled back to {}", current);
                     bail!("update aborted: new binary failed first-launch verify");
-                } else {
-                    bail!(
-                        "first-launch verify failed and no .old backup exists \
-                         (snapshot at {}). Restore from snapshot or reinstall.",
-                        snapshot_summary
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<missing>".into())
-                    );
                 }
+                bail!(
+                    "first-launch verify failed and no .old backup exists \
+                     (snapshot at {}). Restore from snapshot or reinstall.",
+                    snapshot_summary
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<missing>".into())
+                );
             }
         }
 
@@ -929,20 +928,20 @@ fn compare_pre(a: &str, b: &str) -> i32 {
     let parts_a: Vec<&str> = a.split('.').collect();
     let parts_b: Vec<&str> = b.split('.').collect();
     for i in 0..parts_a.len().max(parts_b.len()) {
-        let x = parts_a.get(i).copied().unwrap_or("");
-        let y = parts_b.get(i).copied().unwrap_or("");
+        let left = parts_a.get(i).copied().unwrap_or("");
+        let right = parts_b.get(i).copied().unwrap_or("");
         // Numeric identifiers compare numerically; alphanumerics
         // lexicographically; numeric < alphanumeric (semver §11).
-        let xn = x.parse::<u64>().ok();
-        let yn = y.parse::<u64>().ok();
-        let c = match (xn, yn) {
-            (Some(xv), Some(yv)) => xv.cmp(&yv) as i32,
+        let left_num = left.parse::<u64>().ok();
+        let right_num = right.parse::<u64>().ok();
+        let cmp = match (left_num, right_num) {
+            (Some(lv), Some(rv)) => lv.cmp(&rv) as i32,
             (Some(_), None) => -1,
             (None, Some(_)) => 1,
-            (None, None) => x.cmp(y) as i32,
+            (None, None) => left.cmp(right) as i32,
         };
-        if c != 0 {
-            return c;
+        if cmp != 0 {
+            return cmp;
         }
     }
     0

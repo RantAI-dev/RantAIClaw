@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 use crate::lifecycle::binary_path::{BinaryInfo, InstallKind};
 use crate::profile::{paths, sentinel, ProfileManager};
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "all five booleans are independent CLI flags (`--all`, `--purge`, `--keep-secrets`, `--yes`, `--dry-run`); grouping them under a sub-struct would add indirection without clarifying any decision the field already makes"
+)]
 #[derive(Debug, Clone)]
 pub struct UninstallOpts {
     /// Remove every profile + the global root, not just the active profile.

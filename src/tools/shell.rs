@@ -780,7 +780,7 @@ mod tests {
             .expect("backgrounded command should return a result");
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_millis(2000),
+            elapsed < Duration::from_secs(2),
             "shell blocked on a backgrounded child for {elapsed:?} (expected prompt return)"
         );
         assert!(result.success, "error: {:?}", result.error);

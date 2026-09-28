@@ -217,7 +217,7 @@ fn headless_mcp_setup_registers_no_servers() {
     let (config_path, _) = baseline_config(&home);
 
     // Exit code is not asserted here — this test is about what reaches disk.
-    cmd(&home)
+    let _ = cmd(&home)
         .args(["setup", "--non-interactive", "mcp"])
         .assert();
 

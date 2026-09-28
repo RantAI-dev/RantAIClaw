@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use super::{CommandHandler, CommandResult};
@@ -18,7 +19,7 @@ where
 {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| anyhow::anyhow!("memory command must run inside a tokio runtime"))?;
-    Ok(tokio::task::block_in_place(|| handle.block_on(future))?)
+    tokio::task::block_in_place(|| handle.block_on(future))
 }
 
 /// Matches counted out by `/memory recall` when `--limit` is absent.
@@ -131,12 +132,7 @@ fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         return Ok(no_backend_message());
     };
     let category = parse_category(rest);
-    let entries = run_blocking(async {
-        memory
-            .list(category.as_ref(), None)
-            .await
-            .map_err(anyhow::Error::from)
-    })?;
+    let entries = run_blocking(async { memory.list(category.as_ref(), None).await })?;
     if entries.is_empty() {
         return Ok(CommandResult::Message(format!(
             "(no entries{} found)",
@@ -169,11 +165,12 @@ fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     );
     for entry in entries.iter().take(50) {
         let preview = truncate_preview(&entry.content, 80);
-        out.push_str(&format!(
-            "  [{category}] {key}  ·  {preview}\n",
+        let _ = writeln!(
+            out,
+            "  [{category}] {key}  ·  {preview}",
             category = entry.category,
             key = entry.key,
-        ));
+        );
     }
     if listed > 50 {
         use std::fmt::Write as _;
@@ -196,7 +193,7 @@ fn get_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     let Some(memory) = ensure_backend(ctx) else {
         return Ok(no_backend_message());
     };
-    let entry = run_blocking(async { memory.get(key).await.map_err(anyhow::Error::from) })?;
+    let entry = run_blocking(async { memory.get(key).await })?;
     match entry {
         Some(e) => Ok(CommandResult::Message(format!(
             "{key}\n  category: {category}\n  stored:   {ts}\n\n{content}",
@@ -242,7 +239,6 @@ fn add_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         store_handle
             .store(&key_owned, &content_owned, stored_category, None)
             .await
-            .map_err(anyhow::Error::from)
     })?;
     refresh_projection(ctx, memory.as_ref());
     Ok(CommandResult::Message(format!(
@@ -303,19 +299,14 @@ fn recall_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         return Ok(no_backend_message());
     };
     let query_owned = query.to_string();
-    let entries = run_blocking(async move {
-        memory
-            .recall(&query_owned, limit, None)
-            .await
-            .map_err(anyhow::Error::from)
-    })?;
+    let entries = run_blocking(async move { memory.recall(&query_owned, limit, None).await })?;
     if entries.is_empty() {
         return Ok(CommandResult::Message(format!(
             "No memory entries matched '{query}'."
         )));
     }
     let mut out = String::new();
-    out.push_str(&format!("{} match(es) for '{}':\n", entries.len(), query));
+    let _ = writeln!(out, "{} match(es) for '{}':", entries.len(), query);
     for entry in entries {
         let preview = truncate_preview(&entry.content, 120);
         // Same shape the `memory_recall` tool reports to the agent. Relevance

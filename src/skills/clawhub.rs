@@ -1114,7 +1114,7 @@ mod tests {
         let s: ClawHubSkill = serde_json::from_str(json).expect("live shape parses");
         assert_eq!(s.slug, "self-improving-agent");
         assert_eq!(s.stats.stars, 3393);
-        assert_eq!(s.stats.downloads, 415412);
+        assert_eq!(s.stats.downloads, 415_412);
         // tags is now a Value, not a Vec — the `latest` key is preserved
         // instead of silently emptied.
         assert_eq!(

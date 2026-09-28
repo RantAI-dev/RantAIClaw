@@ -208,6 +208,10 @@ impl McpPoolHandle {
 
 /// Spawn every server in `servers`, list its tools, build the
 /// agent-side registry slice. Skips silently when the map is empty.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "private helper with one internal caller; generalising over hasher types is speculative abstraction (CLAUDE.md §3.2)"
+)]
 pub async fn discover_mcp_tools(servers: &HashMap<String, McpServerConfig>) -> McpDiscovery {
     let mut out = McpDiscovery::default();
     if servers.is_empty() {

@@ -21,7 +21,7 @@ pub use context::{
     build_memory_context, build_memory_context_in_view, MemoryContext, MemoryContextLimits,
 };
 pub use none::NoneMemory;
-pub use sanitize::{sanitize_memory_content, SanitizedMemory};
+pub use sanitize::sanitize_memory_content;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]

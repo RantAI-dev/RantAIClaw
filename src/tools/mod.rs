@@ -694,7 +694,7 @@ mod tests {
         config.skills.entries.insert("disabled".into(), entry);
 
         let env = compose_skill_env(&config);
-        assert!(env.get("DISABLED_KEY").is_none());
+        assert!(!env.contains_key("DISABLED_KEY"));
     }
 
     #[test]

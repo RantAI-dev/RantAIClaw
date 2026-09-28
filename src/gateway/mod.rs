@@ -828,7 +828,7 @@ pub fn build_gateway_router(
         // deadline auto-denies an unanswered modal so a paused turn never
         // hangs forever (secure default, mirrors the channel relay).
         web_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_mins(5),
         ))),
         // Connected on the first turn that needs it, then reused; rebuilt when
         // a hot-reloaded config changes `mcp_servers`.
@@ -3135,7 +3135,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -3188,7 +3188,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -3351,7 +3351,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_sweep_removes_stale_entries() {
-        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 100);
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_mins(1), 100);
         // Add entries for multiple IPs
         assert!(limiter.allow("ip-1"));
         assert!(limiter.allow("ip-2"));
@@ -3385,7 +3385,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_zero_limit_always_allows() {
-        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60), 10);
+        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_mins(1), 10);
         for _ in 0..100 {
             assert!(limiter.allow("any-key"));
         }
@@ -3402,7 +3402,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_bounded_cardinality_evicts_oldest_key() {
-        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 2);
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_mins(1), 2);
         assert!(limiter.allow("ip-1"));
         assert!(limiter.allow("ip-2"));
         assert!(limiter.allow("ip-3"));
@@ -3415,7 +3415,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_bounded_cardinality_evicts_oldest_key() {
-        let store = IdempotencyStore::new(Duration::from_secs(300), 2);
+        let store = IdempotencyStore::new(Duration::from_mins(5), 2);
         assert_eq!(store.begin("k1"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(store.begin("k2"), BeginOutcome::Started);
@@ -3801,7 +3801,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -3869,7 +3869,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -3949,7 +3949,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -4001,7 +4001,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -4058,7 +4058,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -4920,7 +4920,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -4979,7 +4979,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -5041,7 +5041,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -5615,7 +5615,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_allows_different_keys() {
-        let store = IdempotencyStore::new(Duration::from_secs(60), 100);
+        let store = IdempotencyStore::new(Duration::from_mins(1), 100);
         assert_eq!(store.begin("key-a"), BeginOutcome::Started);
         assert_eq!(store.begin("key-b"), BeginOutcome::Started);
         assert_eq!(store.begin("key-c"), BeginOutcome::Started);
@@ -5624,14 +5624,14 @@ mod tests {
 
     #[test]
     fn idempotency_store_max_keys_clamped_to_one() {
-        let store = IdempotencyStore::new(Duration::from_secs(60), 0);
+        let store = IdempotencyStore::new(Duration::from_mins(1), 0);
         assert_eq!(store.begin("only-key"), BeginOutcome::Started);
         assert_eq!(store.begin("only-key"), BeginOutcome::InProgress);
     }
 
     #[test]
     fn idempotency_store_rapid_duplicate_rejected() {
-        let store = IdempotencyStore::new(Duration::from_secs(300), 100);
+        let store = IdempotencyStore::new(Duration::from_mins(5), 100);
         assert_eq!(store.begin("rapid"), BeginOutcome::Started);
         assert_eq!(store.begin("rapid"), BeginOutcome::InProgress);
     }
@@ -5646,7 +5646,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_eviction_preserves_newest() {
-        let store = IdempotencyStore::new(Duration::from_secs(300), 1);
+        let store = IdempotencyStore::new(Duration::from_mins(5), 1);
         assert_eq!(store.begin("old-key"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(store.begin("new-key"), BeginOutcome::Started);

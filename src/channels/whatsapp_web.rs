@@ -995,65 +995,68 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        let client = self.client.lock().clone();
-        let Some(client) = client else {
-            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
-        };
+        Box::pin(async {
+            let client = self.client.lock().clone();
+            let Some(client) = client else {
+                anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+            };
 
-        // Gate EVERY recipient form. This used to run only for non-JID
-        // recipients, and `resolve_reply_target` always yields a JID — so every
-        // agent-driven reply bypassed the allowlist entirely.
-        if let RecipientDecision::Deny(reason) =
-            Self::allow_recipient(&message.recipient, &self.allowed_numbers)
-        {
-            // Was `return Ok(())`: the agent recorded a delivered reply that
-            // was never transmitted.
-            anyhow::bail!(
-                "WhatsApp Web refused to send to {}: {reason}",
-                message.recipient
+            // Gate EVERY recipient form. This used to run only for non-JID
+            // recipients, and `resolve_reply_target` always yields a JID — so every
+            // agent-driven reply bypassed the allowlist entirely.
+            if let RecipientDecision::Deny(reason) =
+                Self::allow_recipient(&message.recipient, &self.allowed_numbers)
+            {
+                // Was `return Ok(())`: the agent recorded a delivered reply that
+                // was never transmitted.
+                anyhow::bail!(
+                    "WhatsApp Web refused to send to {}: {reason}",
+                    message.recipient
+                );
+            }
+
+            let to = self.recipient_to_jid(&message.recipient)?;
+
+            // Attachments come out of the text before rendering, or the markers
+            // reach the reader as literal `[IMAGE:…]`.
+            let (text, attachments) =
+                crate::channels::media::parse_attachment_markers(&message.content);
+            if !attachments.is_empty() {
+                if !text.is_empty() {
+                    let rendered =
+                        crate::channels::format::render_to_string(&text, &self.render_target());
+                    Box::pin(client.send_message(
+                        to.clone(),
+                        wa_rs_proto::whatsapp::Message {
+                            conversation: Some(rendered),
+                            ..Default::default()
+                        },
+                    ))
+                    .await?;
+                }
+                for attachment in &attachments {
+                    Box::pin(self.send_attachment(&client, to.clone(), attachment)).await?;
+                }
+                return Ok(());
+            }
+
+            // `rendered`, not `outgoing`: `outgoing` is the wa-rs Message struct.
+            let rendered =
+                crate::channels::format::render_to_string(&message.content, &self.render_target());
+            let outgoing = wa_rs_proto::whatsapp::Message {
+                conversation: Some(rendered),
+                ..Default::default()
+            };
+
+            let message_id = Box::pin(client.send_message(to, outgoing)).await?;
+            tracing::debug!(
+                "WhatsApp Web: sent message to {} (id: {})",
+                message.recipient,
+                message_id
             );
-        }
-
-        let to = self.recipient_to_jid(&message.recipient)?;
-
-        // Attachments come out of the text before rendering, or the markers
-        // reach the reader as literal `[IMAGE:…]`.
-        let (text, attachments) =
-            crate::channels::media::parse_attachment_markers(&message.content);
-        if !attachments.is_empty() {
-            if !text.is_empty() {
-                let rendered =
-                    crate::channels::format::render_to_string(&text, &self.render_target());
-                Box::pin(client.send_message(
-                    to.clone(),
-                    wa_rs_proto::whatsapp::Message {
-                        conversation: Some(rendered),
-                        ..Default::default()
-                    },
-                ))
-                .await?;
-            }
-            for attachment in &attachments {
-                Box::pin(self.send_attachment(&client, to.clone(), attachment)).await?;
-            }
-            return Ok(());
-        }
-
-        // `rendered`, not `outgoing`: `outgoing` is the wa-rs Message struct.
-        let rendered =
-            crate::channels::format::render_to_string(&message.content, &self.render_target());
-        let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(rendered),
-            ..Default::default()
-        };
-
-        let message_id = client.send_message(to, outgoing).await?;
-        tracing::debug!(
-            "WhatsApp Web: sent message to {} (id: {})",
-            message.recipient,
-            message_id
-        );
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn listen(
@@ -1110,7 +1113,7 @@ impl Channel for WhatsAppWebChannel {
             tracing::info!(
                 "WhatsApp Web: no existing session, new device will be created during pairing"
             );
-        };
+        }
 
         // Create transport factory
         let mut transport_factory = TokioWebSocketTransportFactory::new();

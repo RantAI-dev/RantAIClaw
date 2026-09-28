@@ -140,13 +140,13 @@ mod tests {
         assert!(should_relock(
             false,
             true,
-            Duration::from_secs(900),
-            Duration::from_secs(900)
+            Duration::from_mins(15),
+            Duration::from_mins(15)
         ));
         assert!(should_relock(
             false,
             true,
-            Duration::from_secs(900),
+            Duration::from_mins(15),
             Duration::from_secs(901)
         ));
     }
@@ -156,7 +156,7 @@ mod tests {
         assert!(!should_relock(
             false,
             true,
-            Duration::from_secs(900),
+            Duration::from_mins(15),
             Duration::from_secs(899)
         ));
     }
@@ -167,7 +167,7 @@ mod tests {
             false,
             true,
             Duration::ZERO,
-            Duration::from_secs(86_400)
+            Duration::from_hours(24)
         ));
     }
 
@@ -176,8 +176,8 @@ mod tests {
         assert!(!should_relock(
             false,
             false,
-            Duration::from_secs(900),
-            Duration::from_secs(3600)
+            Duration::from_mins(15),
+            Duration::from_hours(1)
         ));
     }
 
@@ -186,8 +186,8 @@ mod tests {
         assert!(!should_relock(
             true,
             true,
-            Duration::from_secs(900),
-            Duration::from_secs(3600)
+            Duration::from_mins(15),
+            Duration::from_hours(1)
         ));
     }
 

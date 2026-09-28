@@ -135,11 +135,11 @@ struct LarkMessage {
 
 /// Heartbeat timeout for WS connection — must be larger than ping_interval (default 120 s).
 /// If no binary frame (pong or event) is received within this window, reconnect.
-const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(300);
+const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Refresh tenant token this many seconds before the announced expiry.
-const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(120);
+const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_mins(2);
 /// Fallback tenant token TTL when `expire`/`expires_in` is absent.
-const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
+const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_hours(2);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 /// Cap on the remembered ids of messages the bot has sent (the same bound
@@ -599,7 +599,7 @@ impl LarkChannel {
                         break;
                     }
                     // GC stale fragments > 5 min
-                    let cutoff = Instant::now().checked_sub(Duration::from_secs(300)).unwrap_or(Instant::now());
+                    let cutoff = Instant::now().checked_sub(Duration::from_mins(5)).unwrap_or(Instant::now());
                     frag_cache.retain(|_, (_, ts)| *ts > cutoff);
                 }
 
@@ -713,7 +713,7 @@ impl LarkChannel {
                         let now = Instant::now();
                         let mut seen = self.ws_seen_ids.write().await;
                         // GC
-                        seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(30 * 60));
+                        seen.retain(|_, t| now.duration_since(*t) < Duration::from_mins(30));
                         if seen.contains_key(&lark_msg.message_id) {
                             tracing::debug!("Lark WS: dup {}", lark_msg.message_id);
                             continue;
@@ -2559,7 +2559,7 @@ mod tests {
         let mut cached = ch.tenant_token.write().await;
         *cached = Some(CachedTenantToken {
             value: token.to_string(),
-            refresh_after: Instant::now() + Duration::from_secs(600),
+            refresh_after: Instant::now() + Duration::from_mins(10),
         });
     }
 
@@ -2811,7 +2811,7 @@ mod tests {
         let regular = next_token_refresh_deadline(now, 7200);
         let short_ttl = next_token_refresh_deadline(now, 60);
 
-        assert_eq!(regular.duration_since(now), Duration::from_secs(7080));
+        assert_eq!(regular.duration_since(now), Duration::from_mins(118));
         assert_eq!(short_ttl.duration_since(now), Duration::from_secs(1));
     }
 

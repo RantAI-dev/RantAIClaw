@@ -706,7 +706,7 @@ mod tests {
         let _home = crate::test_env::HomeGuard::set(home.path());
 
         let gateway = tokio::spawn(tokio::time::sleep(Duration::from_secs(5)));
-        let channels = tokio::spawn(tokio::time::sleep(Duration::from_secs(60)));
+        let channels = tokio::spawn(tokio::time::sleep(Duration::from_mins(1)));
 
         let started = tokio::time::Instant::now();
         drain_and_cleanup(gateway, Some(channels), Vec::new(), &[], "drain-test").await;

@@ -2118,7 +2118,6 @@ impl TuiApp {
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                         // Missed some; user can /allowlist to see what's still pending.
-                        continue;
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
                         self.pending_approvals_rx = None;
@@ -2380,7 +2379,7 @@ impl TuiApp {
                     }
                 }
             });
-            let outcome = futures::FutureExt::catch_unwind(body).await;
+            let outcome = Box::pin(futures::FutureExt::catch_unwind(body)).await;
             if outcome.is_err() {
                 crate::channels::auto_start_state::mark_failed(
                     "the channel runtime panicked; channels are not running".to_string(),
@@ -5647,7 +5646,7 @@ fn commit_lines_to_scrollback(
         // Estimate how many wrapped rows this line takes at `width`.
         // Use Paragraph::line_count for accuracy.
         let single = Paragraph::new(vec![line.clone()]).wrap(Wrap { trim: false });
-        let row_count = single.line_count(width).max(1) as u16;
+        let row_count = u16::try_from(single.line_count(width).max(1)).unwrap_or(u16::MAX);
 
         // If a single line is taller than the chunk limit (extreme cases
         // like a 300-col line on a tall narrow terminal), cap it — we'd
@@ -7005,10 +7004,9 @@ fn render_splash_lines(ctx: &TuiContext, area_width: u16, area_height: u16) -> V
     let right_width = if side_by_side {
         avail
             .saturating_sub(MASCOT_WIDTH + 2)
-            .min(MAX_RIGHT_WIDTH)
-            .max(MIN_RIGHT_WIDTH)
+            .clamp(MIN_RIGHT_WIDTH, MAX_RIGHT_WIDTH)
     } else {
-        avail.min(MAX_RIGHT_WIDTH).max(20)
+        avail.clamp(20, MAX_RIGHT_WIDTH)
     };
     let inner_wrap = right_width.saturating_sub(2).max(16);
 
@@ -10591,5 +10589,20 @@ mod autonomy_keybinding_tests {
             Some(PolicyPreset::Manual),
             "the keybinding cycle must skip Off — it disables the approval gate"
         );
+    }
+}
+
+#[cfg(test)]
+mod scrollback_cast_tests {
+    /// Mirror the saturating `usize -> u16` conversion used in
+    /// `commit_lines_to_scrollback`. A `usize::MAX` row count must clamp to
+    /// `u16::MAX` rather than wrap, otherwise the subsequent
+    /// `row_count.min(max_chunk)` comparison would lose information for
+    /// extreme-but-valid inputs.
+    #[test]
+    fn usize_max_row_count_clamps_to_u16_max() {
+        let row_count = usize::MAX;
+        let clamped = u16::try_from(row_count).unwrap_or(u16::MAX);
+        assert_eq!(clamped, u16::MAX);
     }
 }

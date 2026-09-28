@@ -178,7 +178,6 @@ fn sample_doc(id: &str, title: &str) -> Document {
 /// the TOON/JSON output the test asserts on. Each test also sets a fresh
 /// `HOME` to keep the binary's profile bootstrap out of the developer's
 /// real `~/.rantaiclaw/`.
-
 /// Plan 107: the KB data subcommands gate on `[knowledge].enabled`, and a
 /// fresh sandbox HOME yields a default (disabled) config. Each spawn writes
 /// an activated config into the sandbox so the e2e tests exercise the data
