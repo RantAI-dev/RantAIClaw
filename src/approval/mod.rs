@@ -240,6 +240,28 @@ impl ApprovalManager {
 
 // ── Owner authority gate ─────────────────────────────────────────
 
+/// Shared wording for an empty `approval_owners`: with no owner configured,
+/// [`can_approve`] denies every sender, so every chat is treated as a guest,
+/// including the operator's own, until someone claims ownership. Read by both
+/// `channels::admin::warn_on_risky_approval_owners` (the startup log) and
+/// `doctor::checks::policy::ApprovalOwnersCheck` (the `rantaiclaw doctor`
+/// finding), so the two surfaces describe the same condition in the same
+/// words instead of drifting apart.
+pub const APPROVAL_OWNERS_EMPTY_MESSAGE: &str = "approval_owners is empty: every sender is \
+treated as a guest, including you. Guests don't see MEMORY.md, USER.md or other chats' notes, \
+and cannot approve commands.";
+
+/// Shared hint for the same condition: how to actually get an owner
+/// configured. Read by both `doctor::checks::policy::ApprovalOwnersCheck`
+/// (as a doctor hint) and `channels::admin::warn_on_risky_approval_owners`
+/// (folded into the startup warning), so the two surfaces give the same
+/// instructions instead of drifting apart. `/claim` alone is not enough: it
+/// takes a pairing code minted by `rantaiclaw channels pair`, not a bare
+/// command (see `channels::pairing::parse_pairing_command`).
+pub const APPROVAL_OWNERS_EMPTY_HINT: &str = "set [channels_config] approval_owners in \
+config.toml, or run `rantaiclaw channels pair --channel <channel>` on the host and then \
+`/claim <code>` in your chat";
+
 /// Whether `sender` is authorized to **approve** a tool call on a channel.
 ///
 /// The owner list (`[channels_config] approval_owners`) is a separate,

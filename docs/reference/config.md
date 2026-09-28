@@ -561,8 +561,8 @@ prompts.
 Memory reads and writes are scoped per conversation: each channel chat and each
 TUI session recalls its own rows first, then backfills from shared (unscoped)
 memory only. Entries another conversation stored never surface in this one's
-prompt. Unscoped entries — what `memory_store` writes — are the shared tier and
-remain visible everywhere.
+prompt. Unscoped entries — what `memory_store` writes — are the shared tier:
+visible to owners, while a guest sees only its own conversation's notes.
 
 The explicit `memory_recall` tool follows the same scope on interactive
 surfaces (TUI, `agent run`, the console API): it reads the active

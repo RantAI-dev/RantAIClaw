@@ -42,19 +42,6 @@ pub enum MemoryView {
     Only(String),
 }
 
-impl MemoryView {
-    /// Run `future` with this view installed on the current task. Task-local:
-    /// every `.await` inside the future reads `current_memory_view()` and gets
-    /// `Some(self.clone())`. Outer reads (e.g. before this future is spawned)
-    /// are unchanged.
-    pub async fn scope<F>(self, future: F) -> F::Output
-    where
-        F: std::future::Future,
-    {
-        MEMORY_VIEW.scope(self, future).await
-    }
-}
-
 /// The view the current task runs under, or `None` when no view is set.
 ///
 /// Outside any `MEMORY_VIEW.scope(...)` block this returns `None`, which every
@@ -263,7 +250,7 @@ mod tests {
     }
 
     /// The task-local semantics. Reads inside the scope see the view; reads
-    /// outside do not. `MEMORY_VIEW::scope` is the only door.
+    /// outside do not. `MEMORY_VIEW.scope(..)` is the only door.
     #[tokio::test]
     async fn scope_sets_the_view_for_inner_tasks_only() {
         let mem = ScopeRecordingMemory::default();
@@ -282,8 +269,8 @@ mod tests {
         }
         .await;
 
-        let inner_result = MemoryView::Only("conv1".into())
-            .scope(async {
+        let inner_result = MEMORY_VIEW
+            .scope(MemoryView::Only("conv1".into()), async {
                 let view = current_memory_view();
                 assert_eq!(
                     view,

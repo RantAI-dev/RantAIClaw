@@ -403,15 +403,24 @@ pub(crate) fn warn_on_risky_approval_owners(owners: &[String]) {
     // promote themselves to owner. The user almost always wants at least
     // their own chat id in there. Warn once at startup so a misconfigured
     // daemon doesn't silently strand approvals. The doctor surface covers
-    // the same case with a check; the warning is the noisy sibling for
-    // operators who aren't running `rantaiclaw doctor`.
+    // the same case with a check, sharing this wording via
+    // [`crate::approval::APPROVAL_OWNERS_EMPTY_MESSAGE`] so the two never say
+    // different things about the same condition; this warning is the noisy
+    // sibling for operators who aren't running `rantaiclaw doctor`.
     if owners.iter().all(|o| o.trim().is_empty()) {
-        tracing::warn!(
-            "approval_owners is empty: no remote sender can ever approve shell commands. \
-             Add at least one explicit sender id (for example, your Telegram user id) \
-             so approvals from your chat have an owner."
-        );
+        tracing::warn!("{}", approval_owners_empty_warning());
     }
+}
+
+/// The empty-list branch of [`warn_on_risky_approval_owners`], as a pure
+/// function so a test can assert on the exact wording rather than only that
+/// the caller does not panic.
+fn approval_owners_empty_warning() -> String {
+    format!(
+        "{} To fix it, {}.",
+        crate::approval::APPROVAL_OWNERS_EMPTY_MESSAGE,
+        crate::approval::APPROVAL_OWNERS_EMPTY_HINT
+    )
 }
 
 #[cfg(test)]
@@ -434,6 +443,22 @@ mod approval_owners_warning_tests {
         capture_warnings(&[]);
         capture_warnings(&[String::new()]);
         capture_warnings(&["   ".into()]);
+    }
+
+    /// Pins the wording of the empty-owners warning: it must say every sender
+    /// becomes a guest and name `/claim`, matching the doctor finding for the
+    /// same condition (`crate::approval::APPROVAL_OWNERS_EMPTY_MESSAGE`).
+    #[test]
+    fn empty_owners_warning_names_guest_and_claim() {
+        let text = approval_owners_empty_warning();
+        assert!(
+            text.starts_with(crate::approval::APPROVAL_OWNERS_EMPTY_MESSAGE),
+            "{text}"
+        );
+        assert!(
+            text.contains(crate::approval::APPROVAL_OWNERS_EMPTY_HINT),
+            "{text}"
+        );
     }
 
     #[test]

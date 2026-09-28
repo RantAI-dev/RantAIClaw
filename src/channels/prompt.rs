@@ -138,32 +138,6 @@ pub fn build_system_prompt(
     )
 }
 
-/// Build the guest-channel system prompt — same builder, but `USER.md` and
-/// `MEMORY.md` are skipped. Used by the channel runtime so a guest's first
-/// turn never sees the owner's profile or notes.
-pub fn build_guest_system_prompt_with_mode(
-    workspace_dir: &std::path::Path,
-    model_name: &str,
-    tools: &[(&str, &str)],
-    skills: &[crate::skills::Skill],
-    identity_config: Option<&crate::config::IdentityConfig>,
-    bootstrap_max_chars: Option<usize>,
-    native_tools: bool,
-    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
-) -> String {
-    build_system_prompt_with_mode(
-        workspace_dir,
-        model_name,
-        tools,
-        skills,
-        identity_config,
-        bootstrap_max_chars,
-        native_tools,
-        skills_prompt_mode,
-        true,
-    )
-}
-
 pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
