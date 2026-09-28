@@ -1,4 +1,3 @@
-#![cfg(feature = "kb")]
 //! Knowledge Base provisioner — implements [`TuiProvisioner`] for in-TUI KB setup.
 //!
 //! Configures the Knowledge Base credentials the agent uses to search ingested
