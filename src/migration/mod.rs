@@ -3,8 +3,8 @@
 //! Two functions remain here because they are load-bearing for
 //! `src/config/schema.rs::import_markdown_memory_into_sqlite`, which fires the
 //! one-time markdown → sqlite import when a config that still names the
-//! retired `markdown` backend is loaded under the current schema. The full
-//! OpenClaw / ZeroClaw import path (`pub mod openclaw`) was removed together
+//! retired `markdown` backend is loaded under the current schema. The
+//! legacy external-import path (`pub mod openclaw`) was removed together
 //! with the `rantaiclaw migrate` command — do not reintroduce that command
 //! without also reintroducing this module's former siblings.
 //!
