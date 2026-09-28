@@ -8587,6 +8587,455 @@ async fn lark_chat_id_in_approval_owners_does_not_make_a_member_an_owner() {
     );
 }
 
+/// Shared recorder for [`MemoryViewProbeTool`]: cloned into the tool so a test
+/// keeps a handle to read back what the tool saw after dispatch returns.
+#[derive(Clone, Default)]
+struct MemoryViewRecorder(Arc<std::sync::Mutex<Vec<Option<crate::memory::MemoryView>>>>);
+
+impl MemoryViewRecorder {
+    fn snapshot(&self) -> Vec<Option<crate::memory::MemoryView>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// A test-only tool that does nothing but record the `MemoryView` the current
+/// task runs under (`crate::memory::current_memory_view()`) each time it
+/// executes. Lets a dispatch-level test see what a tool call actually runs
+/// under, not just what the injected `[Memory context]` block held.
+struct MemoryViewProbeTool {
+    recorder: MemoryViewRecorder,
+}
+
+#[async_trait::async_trait]
+impl Tool for MemoryViewProbeTool {
+    fn name(&self) -> &str {
+        "memory_view_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Test-only probe: records the current memory view"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.recorder
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(crate::memory::current_memory_view());
+        Ok(ToolResult {
+            success: true,
+            output: "probed".to_string(),
+            error: None,
+        })
+    }
+}
+
+/// Records every history snapshot handed to it (the system prompt lives at
+/// index 0 of each), and drives exactly one round through `memory_view_probe`
+/// before giving a final answer — so a dispatch-level test can see both the
+/// prompt a turn started from and what the probe saw while the tool loop ran.
+#[derive(Default)]
+struct PromptAndProbeProvider {
+    calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for PromptAndProbeProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("fallback".to_string())
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let snapshot = messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect::<Vec<_>>();
+        let has_tool_results = messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("[Tool results]"));
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(snapshot);
+        if has_tool_results {
+            Ok("Probed the memory view for this turn.".to_string())
+        } else {
+            Ok(r#"<tool_call>
+{"name":"memory_view_probe","arguments":{}}
+</tool_call>"#
+                .to_string())
+        }
+    }
+}
+
+/// A guest's channel turn: the prompt it runs from, the `[Memory context]` it
+/// is allowed to see, and the memory view its own tool calls run under, must
+/// all come from the guest path, never the owner's. Drives the real
+/// dispatcher against a real SQLite store (session-id filtering is exercised
+/// at the SQL level, not stubbed) and a provider that both records the
+/// prompt and forces one round through the probe tool.
+#[tokio::test]
+async fn guest_channel_turn_uses_guest_prompt_scoped_memory_and_probe_view() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+    let msg = traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "guest-msg-1".to_string(),
+        sender: "rantaiclaw_guest".to_string(),
+        reply_target: "chat-guest".to_string(),
+        content: "what is the zorblatt status".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: false,
+    };
+    let guest_conv_key = dispatch::conversation_memory_scope(&msg);
+
+    mem.store(
+        "shared_zorblatt",
+        "The zorblatt status is fine for everyone",
+        MemoryCategory::Core,
+        None,
+    )
+    .await
+    .unwrap();
+    mem.store(
+        "guest_zorblatt",
+        "The zorblatt status for this guest chat is green",
+        MemoryCategory::Core,
+        Some(&guest_conv_key),
+    )
+    .await
+    .unwrap();
+    mem.store(
+        "other_zorblatt",
+        "The zorblatt status for another chat is red",
+        MemoryCategory::Core,
+        Some("other-chat-key"),
+    )
+    .await
+    .unwrap();
+
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let recorder = MemoryViewRecorder::default();
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(mem),
+        tools_registry: Arc::new(vec![Box::new(MemoryViewProbeTool {
+            recorder: recorder.clone(),
+        }) as Box<dyn Tool>]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(tmp.path().to_path_buf()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(
+            &["memory_view_probe".to_string()],
+            &[],
+        )),
+    });
+
+    process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2, "one tool round, then the final answer");
+
+    let system_prompt = calls[0][0].1.clone();
+    assert!(
+        system_prompt.starts_with("GUEST_SYSTEM_PROMPT"),
+        "a guest turn must start from the guest prompt: {system_prompt}"
+    );
+    assert!(
+        system_prompt.contains(
+            "This conversation is a group chat; the current sender is a guest, not an owner."
+        ),
+        "guest group chat-kind line missing: {system_prompt}"
+    );
+
+    let user_turn = calls[0]
+        .iter()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.clone())
+        .expect("a user turn should reach the provider");
+    assert!(
+        user_turn.contains("guest chat is green"),
+        "the guest's own conversation entry never reached the prompt:\n{user_turn}"
+    );
+    assert!(
+        !user_turn.contains("fine for everyone"),
+        "a guest must not see the shared-tier entry:\n{user_turn}"
+    );
+    assert!(
+        !user_turn.contains("another chat is red"),
+        "a guest must not see another conversation's entry:\n{user_turn}"
+    );
+
+    let seen = recorder.snapshot();
+    assert_eq!(
+        seen,
+        vec![Some(crate::memory::MemoryView::Only(
+            guest_conv_key.clone()
+        ))],
+        "the probe tool must run under this guest's own conversation scope: {seen:?}"
+    );
+}
+
+/// An owner's channel turn keeps today's behaviour: the owner prompt, the
+/// layered memory read (own conversation plus the shared tier), and no
+/// `MemoryView` set around its tool calls at all.
+#[tokio::test]
+async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_with_no_probe_view() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+    mem.store(
+        "shared_zorblatt",
+        "The zorblatt status is fine for everyone",
+        MemoryCategory::Core,
+        None,
+    )
+    .await
+    .unwrap();
+    mem.store(
+        "guest_zorblatt",
+        "The zorblatt status for this guest chat is green",
+        MemoryCategory::Core,
+        Some("some-other-guest-key"),
+    )
+    .await
+    .unwrap();
+
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let recorder = MemoryViewRecorder::default();
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(mem),
+        tools_registry: Arc::new(vec![Box::new(MemoryViewProbeTool {
+            recorder: recorder.clone(),
+        }) as Box<dyn Tool>]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(tmp.path().to_path_buf()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(
+            &["memory_view_probe".to_string()],
+            &[],
+        )),
+    });
+
+    process_channel_message(
+        runtime_ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "owner-msg-1".to_string(),
+            sender: "rantaiclaw_owner".to_string(),
+            reply_target: "chat-owner".to_string(),
+            content: "what is the zorblatt status".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2, "one tool round, then the final answer");
+
+    let system_prompt = calls[0][0].1.clone();
+    assert!(
+        system_prompt.starts_with("OWNER_SYSTEM_PROMPT"),
+        "an owner turn must start from the owner prompt: {system_prompt}"
+    );
+    assert!(
+        system_prompt.contains("This conversation is a direct message with the bot's owner."),
+        "owner direct-message chat-kind line missing: {system_prompt}"
+    );
+
+    let user_turn = calls[0]
+        .iter()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.clone())
+        .expect("a user turn should reach the provider");
+    assert!(
+        user_turn.contains("fine for everyone"),
+        "an owner must still see the shared-tier entry:\n{user_turn}"
+    );
+
+    let seen = recorder.snapshot();
+    assert_eq!(
+        seen,
+        vec![None],
+        "an owner's tool calls must run with no memory view set: {seen:?}"
+    );
+}
+
+/// `sender_is_owner` and `is_direct` are two independent booleans threaded
+/// into `build_channel_system_prompt` from the same dispatch call site. An
+/// owner speaking in a group chat is the combination that catches them being
+/// swapped there: swapped, this turn would read back exactly like a guest's
+/// direct message instead.
+#[tokio::test]
+async fn owner_group_channel_turn_keeps_owner_and_direct_flags_in_their_own_slots() {
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        runtime_ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "owner-group-1".to_string(),
+            sender: "rantaiclaw_owner".to_string(),
+            reply_target: "chat-owner-group".to_string(),
+            content: "hello team".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let system_prompt = calls[0][0].1.clone();
+    assert!(
+        system_prompt
+            .contains("This conversation is a group chat; the current sender is an owner."),
+        "an owner's group-chat line must not read as a guest's direct message: {system_prompt}"
+    );
+    assert!(
+        !system_prompt.contains("direct message with a guest"),
+        "owner+group must not be reported as guest+direct: {system_prompt}"
+    );
+}
+
 #[test]
 fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
     let history = vec![
@@ -10905,4 +11354,47 @@ fn guest_gate_from_config_does_not_inherit_auto_approve() {
     assert!(!gate.tool_permitted("file_write"));
     // Owner-only tools stay denied even though they aren't listed either.
     assert!(!gate.tool_permitted("manage_permissions"));
+}
+
+/// A guest allowed tools on a provider without native tool calling still
+/// needs the `<tool_call>` syntax explained, or the model has no way to call
+/// a tool at all. This used to be appended only to the owner prompt.
+#[test]
+fn guest_prompt_gets_the_tool_use_protocol_when_the_provider_lacks_native_tools() {
+    let mut system_prompt = "OWNER BASE".to_string();
+    let mut guest_system_prompt = "GUEST BASE".to_string();
+    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![];
+
+    super::append_tool_instructions_when_not_native(
+        &mut system_prompt,
+        &mut guest_system_prompt,
+        false,
+        &tools_registry,
+    );
+
+    assert!(system_prompt.contains("## Tool Use Protocol"));
+    assert!(
+        guest_system_prompt.contains("## Tool Use Protocol"),
+        "guest prompt must also get the tool-use protocol on a non-native provider: {guest_system_prompt}"
+    );
+}
+
+/// A provider with native tool calling needs neither prompt touched: the
+/// tool-call syntax comes from the API's own tool-calling feature, not the
+/// prompt text.
+#[test]
+fn native_tools_provider_gets_no_tool_use_protocol_appended_to_either_prompt() {
+    let mut system_prompt = "OWNER BASE".to_string();
+    let mut guest_system_prompt = "GUEST BASE".to_string();
+    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![];
+
+    super::append_tool_instructions_when_not_native(
+        &mut system_prompt,
+        &mut guest_system_prompt,
+        true,
+        &tools_registry,
+    );
+
+    assert_eq!(system_prompt, "OWNER BASE");
+    assert_eq!(guest_system_prompt, "GUEST BASE");
 }

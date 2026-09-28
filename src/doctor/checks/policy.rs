@@ -163,7 +163,7 @@ mod tests {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Plan 450: `approval_owners` empty-list check.
+// `approval_owners` empty-list check.
 //
 // An empty `approval_owners` means no remote sender can ever promote
 // themselves to owner — every chat is a guest, every approval is denied,
@@ -176,31 +176,18 @@ pub struct ApprovalOwnersCheck;
 pub enum ApprovalOwnersDiagnosis {
     NonEmpty { count: usize },
     Empty,
-    Unparseable(String),
 }
 
-pub fn diagnose_approval_owners(raw: &str) -> ApprovalOwnersDiagnosis {
-    // Empty or whitespace-only strings are "empty" — the warn-path treats
-    // them the same as `[]`. A malformed TOML surface is informative, not
-    // fatal: doctor is a tool that helps operators find issues, and a typo'd
-    // `approval_owners` entry is exactly the kind of thing it should flag.
-    if raw.trim().is_empty() {
-        return ApprovalOwnersDiagnosis::Empty;
-    }
-    let parsed: toml::Table = match raw.parse() {
-        Ok(v) => v,
-        Err(e) => return ApprovalOwnersDiagnosis::Unparseable(e.to_string()),
-    };
-    let entries = parsed
-        .get("approval_owners")
-        .and_then(toml::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if entries.is_empty() {
-        return ApprovalOwnersDiagnosis::Empty;
-    }
-    ApprovalOwnersDiagnosis::NonEmpty {
-        count: entries.len(),
+/// Classify an already-loaded `[channels_config].approval_owners` list.
+/// Entries that are empty or whitespace-only count as no owner at all — the
+/// warn-path treats them the same as `[]`.
+pub fn diagnose_approval_owners(owners: &[String]) -> ApprovalOwnersDiagnosis {
+    if owners.iter().all(|o| o.trim().is_empty()) {
+        ApprovalOwnersDiagnosis::Empty
+    } else {
+        ApprovalOwnersDiagnosis::NonEmpty {
+            count: owners.len(),
+        }
     }
 }
 
@@ -213,38 +200,26 @@ impl DoctorCheck for ApprovalOwnersCheck {
         "config"
     }
     async fn run(&self, ctx: &DoctorContext) -> CheckResult {
-        let file = ctx.profile.root.join("config.toml");
-        let raw = match std::fs::read_to_string(&file) {
-            Ok(s) => s,
-            Err(_) => {
-                // No config at all is a separate finding
-                // (`config.schema`). Skip with `info` rather than fail here so
-                // a fresh install does not get two warnings for one root
-                // cause.
-                return CheckResult::info(
-                    self.name(),
-                    "no config.toml to inspect (see config.schema check)",
-                )
-                .with_category(self.category());
-            }
-        };
-        match diagnose_approval_owners(&raw) {
-            ApprovalOwnersDiagnosis::Empty => CheckResult::warn(
+        // Nothing can reach the agent as a remote sender yet, so there is
+        // nothing an owner list would gate — matches the notion of
+        // "configured" the channel catalog and daemon startup already use.
+        if !crate::channels::any_catalog_channel_configured(&ctx.config) {
+            return CheckResult::info(
                 self.name(),
-                "approval_owners is empty: no remote sender can ever approve shell commands",
+                "no channel is configured yet (see the channels check)",
             )
-            .with_category(self.category())
-            .with_hint("add at least one explicit sender id to [approval_owners] in config.toml"),
+            .with_category(self.category());
+        }
+        match diagnose_approval_owners(&ctx.config.channels_config.approval_owners) {
+            ApprovalOwnersDiagnosis::Empty => {
+                CheckResult::warn(self.name(), crate::approval::APPROVAL_OWNERS_EMPTY_MESSAGE)
+                    .with_category(self.category())
+                    .with_hint(crate::approval::APPROVAL_OWNERS_EMPTY_HINT)
+            }
             ApprovalOwnersDiagnosis::NonEmpty { count } => {
                 CheckResult::ok(self.name(), format!("approval_owners has {count} entries"))
                     .with_category(self.category())
             }
-            ApprovalOwnersDiagnosis::Unparseable(e) => CheckResult::warn(
-                self.name(),
-                format!("config.toml is malformed around approval_owners: {e}"),
-            )
-            .with_category(self.category())
-            .with_hint("fix the [approval_owners] section, see docs/reference/config.md"),
         }
     }
 }
@@ -252,32 +227,47 @@ impl DoctorCheck for ApprovalOwnersCheck {
 #[cfg(test)]
 mod approval_owners_tests {
     use super::*;
+    use crate::config::Config;
+    use crate::doctor::Severity;
 
-    #[test]
-    fn diagnose_empty_for_empty_string() {
-        assert_eq!(diagnose_approval_owners(""), ApprovalOwnersDiagnosis::Empty);
+    fn config_with_telegram(owners: Vec<String>) -> Config {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "abc:123".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.channels_config.approval_owners = owners;
+        config
+    }
+
+    fn run_check(config: Config) -> CheckResult {
+        let ctx = DoctorContext {
+            profile: crate::profile::Profile {
+                name: "test".to_string(),
+                root: std::path::PathBuf::from("/tmp"),
+            },
+            config,
+            offline: true,
+        };
+        futures::executor::block_on(ApprovalOwnersCheck.run(&ctx))
     }
 
     #[test]
-    fn diagnose_empty_for_whitespace_only() {
+    fn diagnose_empty_for_no_owners() {
         assert_eq!(
-            diagnose_approval_owners("   \n  \t\n"),
+            diagnose_approval_owners(&[]),
             ApprovalOwnersDiagnosis::Empty
         );
     }
 
     #[test]
-    fn diagnose_empty_when_owners_array_missing() {
+    fn diagnose_empty_for_whitespace_only_owners() {
         assert_eq!(
-            diagnose_approval_owners("[other]\nfoo = 1\n"),
-            ApprovalOwnersDiagnosis::Empty
-        );
-    }
-
-    #[test]
-    fn diagnose_empty_when_owners_array_empty() {
-        assert_eq!(
-            diagnose_approval_owners("approval_owners = []\n"),
+            diagnose_approval_owners(&["   ".to_string(), "\t\n".to_string()]),
             ApprovalOwnersDiagnosis::Empty
         );
     }
@@ -285,16 +275,37 @@ mod approval_owners_tests {
     #[test]
     fn diagnose_non_empty_with_count() {
         assert_eq!(
-            diagnose_approval_owners("approval_owners = [\"alice\", \"bob\"]\n"),
+            diagnose_approval_owners(&["alice".to_string(), "bob".to_string()]),
             ApprovalOwnersDiagnosis::NonEmpty { count: 2 }
         );
     }
 
+    /// Pins the bug this check used to have: it parsed a top-level
+    /// `approval_owners` out of raw TOML instead of the real
+    /// `[channels_config].approval_owners`, so a configured owner list was
+    /// never seen and `rantaiclaw doctor` warned even when owners were set.
     #[test]
-    fn diagnose_unparseable_for_bad_toml() {
-        assert!(matches!(
-            diagnose_approval_owners("approval_owners = [unterminated string"),
-            ApprovalOwnersDiagnosis::Unparseable(_)
-        ));
+    fn run_reports_ok_when_channels_config_approval_owners_is_set() {
+        let result = run_check(config_with_telegram(vec!["alice".to_string()]));
+        assert_eq!(result.severity, Severity::Ok, "{}", result.message);
+        assert!(result.message.contains("1 entries"), "{}", result.message);
+    }
+
+    #[test]
+    fn run_warns_with_the_shared_message_when_a_channel_is_configured_and_owners_is_empty() {
+        let result = run_check(config_with_telegram(vec![]));
+        assert_eq!(result.severity, Severity::Warn, "{}", result.message);
+        assert_eq!(
+            result.message,
+            crate::approval::APPROVAL_OWNERS_EMPTY_MESSAGE
+        );
+        let hint = result.hint.expect("warn should carry a hint");
+        assert_eq!(hint, crate::approval::APPROVAL_OWNERS_EMPTY_HINT);
+    }
+
+    #[test]
+    fn run_skips_when_no_channel_is_configured() {
+        let result = run_check(Config::default());
+        assert_eq!(result.severity, Severity::Info, "{}", result.message);
     }
 }

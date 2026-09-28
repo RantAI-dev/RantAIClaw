@@ -1386,11 +1386,10 @@ mod tests {
         ));
     }
 
-    /// Plan 450: a guest prompt must not contain `USER.md` content. The
-    /// owner's profile is private to the owner; the channel runtime calls
-    /// `build_guest_system_prompt_with_mode` which sets
-    /// `skip_owner_files = true`, and the identity section omits the file
-    /// in that branch.
+    /// A guest prompt must not contain `USER.md` content. The owner's
+    /// profile is private to the owner; the channel runtime builds the guest
+    /// prompt via `build_system_prompt_with_mode(..., skip_owner_files =
+    /// true)`, and the identity section omits the file in that branch.
     #[test]
     fn guest_prompt_omits_user_md() {
         let workspace =

@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Lark chat id (`oc_…`) in `approval_owners` no longer makes every member of
   that chat an owner. Lark no longer aliases the sender to the chat id; list
   each owner's `ou_…` id instead.
+- `rantaiclaw doctor` reads `approval_owners` from `[channels_config]`, where
+  it actually lives, instead of a top-level key that does not exist — it used
+  to warn the list was empty even when owners were set. The check now reports
+  `info`, not a warning, when no channel is configured yet, and the finding
+  that config.toml was malformed around `approval_owners` is gone, because the
+  check reads the already-loaded config. The doctor finding and the startup
+  warning for an empty list now say the same thing: every sender is treated
+  as a guest, including the operator, until someone pairs and runs `/claim
+  <code>`. A guest on a provider without native tool calling now also gets
+  the `## Tool Use Protocol` section in its system prompt, which previously
+  reached only the owner prompt.
 
 ### Removed
 

@@ -66,8 +66,7 @@ pub mod supervisor;
 // The prompt builders are part of this module's external surface (`src/agent`
 // and `src/cron` call them), so they keep their `crate::channels::` path.
 pub use prompt::{
-    build_guest_system_prompt_with_mode, build_system_prompt, build_system_prompt_with_mode,
-    channel_supports_announce_delivery,
+    build_system_prompt, build_system_prompt_with_mode, channel_supports_announce_delivery,
 };
 pub mod qq;
 pub mod qr_terminal;
@@ -1256,6 +1255,26 @@ pub(crate) struct ChannelRuntime {
     pub(crate) max_backoff_secs: u64,
 }
 
+/// Append the tool-use protocol to both the owner and guest system prompts
+/// when the provider lacks native tool calling. Extracted out of
+/// [`build_channel_runtime`] so the guest side of this can be tested without
+/// building a real provider, workspace or channel runtime: a guest allowed
+/// tools on a non-native provider needs the same "## Tool Use Protocol"
+/// section the owner prompt gets, or the model never learns the
+/// `<tool_call>` syntax on that guest's first turn.
+fn append_tool_instructions_when_not_native(
+    system_prompt: &mut String,
+    guest_system_prompt: &mut String,
+    native_tools: bool,
+    tools_registry: &[Box<dyn Tool>],
+) {
+    if !native_tools {
+        let instructions = build_tool_instructions(tools_registry);
+        system_prompt.push_str(&instructions);
+        guest_system_prompt.push_str(&instructions);
+    }
+}
+
 /// Build the one runtime context for this process.
 pub(crate) async fn build_channel_runtime(
     config: &Config,
@@ -1514,7 +1533,7 @@ pub(crate) async fn build_channel_runtime(
     // Built once at start-up so a guest's first turn does not pay the
     // workspace-file read again; the runtime keeps both side by side in
     // [`ChannelRuntimeContext`].
-    let guest_system_prompt = build_system_prompt_with_mode(
+    let mut guest_system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
         &tool_descs,
@@ -1525,9 +1544,12 @@ pub(crate) async fn build_channel_runtime(
         config.skills.prompt_injection_mode,
         true,
     );
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
-    }
+    append_tool_instructions_when_not_native(
+        &mut system_prompt,
+        &mut guest_system_prompt,
+        native_tools,
+        tools_registry.as_ref(),
+    );
 
     if !skills.is_empty() {
         tracing::info!(
