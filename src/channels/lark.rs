@@ -847,7 +847,7 @@ impl LarkChannel {
                         // (pasting the chat id into `approval_owners`) silently
                         // promoted every member of that group to owner.
                         // `reply_target` stays the chat: that part was right.
-                        sender_aliases: vec![lark_msg.chat_id.clone()],
+                        sender_aliases: Vec::new(),
                         // Carry the platform id: a UUID minted here makes a
                         // redelivery undetectable. Lark's own `ws_seen_ids`
                         // dedup exists because of exactly that.
@@ -1415,10 +1415,8 @@ impl LarkChannel {
             .unwrap_or(open_id);
 
         messages.push(ChannelMessage {
-            // The person, not the room — see the websocket path for why. The
-            // chat id stays reachable as an alias for anything that matched on
-            // the old value.
-            sender_aliases: vec![chat_id.to_string()],
+            // The person, not the room — see the websocket path for why.
+            sender_aliases: Vec::new(),
             // Carry the platform id: a UUID minted here makes a redelivery
             // undetectable, and Lark retries a callback it considers unacked.
             id: if message_id.is_empty() {
@@ -2946,8 +2944,8 @@ mod tests {
             "the reply still goes to the chat"
         );
         assert!(
-            msgs[0].sender_aliases.contains(&"oc_chat123".to_string()),
-            "the chat id stays reachable as an alias: {:?}",
+            msgs[0].sender_aliases.is_empty(),
+            "Lark has no other alias, so the field stays empty: {:?}",
             msgs[0].sender_aliases
         );
     }
@@ -3574,6 +3572,29 @@ mod tests {
             !ws_literal.contains("is_direct: false"),
             "the websocket ChannelMessage literal must derive `is_direct` from `chat_type`, \
              not hard-code `false`"
+        );
+    }
+
+    /// The websocket path cannot be exercised without a live event loop
+    /// either, so this is pinned by source the same way: the `ChannelMessage`
+    /// literal it builds must not alias the sender to the chat id, or an
+    /// `oc_…` chat id in `approval_owners` matches every member of that chat.
+    #[test]
+    fn lark_websocket_path_does_not_alias_the_sender_to_the_chat_id() {
+        let src = include_str!("lark.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let ws_literal = production
+            .split("ChannelMessage {")
+            .find(|snippet| snippet.contains("is_direct"))
+            .expect("the websocket ChannelMessage literal sets `is_direct`");
+
+        assert!(
+            ws_literal.contains("sender_aliases: Vec::new()"),
+            "the websocket ChannelMessage literal must not alias the sender to the chat id"
+        );
+        assert!(
+            !ws_literal.contains("sender_aliases: vec![lark_msg.chat_id"),
+            "the chat id must not be an alias, or the owner gate matches a whole room"
         );
     }
 

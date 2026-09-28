@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenRouter requests now carry the real project URL in `HTTP-Referer`, and
   the `Track progress` link, the hardware `git clone` commands and the
   architecture diagram point at `RantAI-dev/RantAIClaw`.
+- A Lark chat id (`oc_…`) in `approval_owners` no longer makes every member of
+  that chat an owner. Lark no longer aliases the sender to the chat id; list
+  each owner's `ou_…` id instead.
 
 ### Removed
 
