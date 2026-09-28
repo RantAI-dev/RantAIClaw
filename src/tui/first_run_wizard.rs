@@ -110,17 +110,15 @@ impl FirstRunWizard {
     /// so the redo replays cleanly and flow continues with what's left.
     /// Required-provisioner config writes are overwritten by the redo, which
     /// is exactly the desired effect for "previous page was wrong".
+    /// The replay adds nothing to `history`, so a further Back keeps walking
+    /// toward the start instead of stopping at the replay's own bookkeeping.
     ///
     /// When the popped entry is a Picker, restore it and clear the queue so
     /// the user's re-selection starts from a clean slate — otherwise stale
     /// items from the previous picker selection would replay before the new
     /// ones.
-    #[allow(
-        clippy::never_loop,
-        reason = "known Back-navigation bug — every match arm `return`s on the first iteration; fixing the loop-vs-return shape is its own change"
-    )]
     pub fn back(&mut self) -> bool {
-        while let Some(prev) = self.history.pop() {
+        if let Some(prev) = self.history.pop() {
             match prev {
                 WizardPhase::RunningProvisioner { name: prior } => {
                     // Capture currently-running provisioner (if any) so it
@@ -137,7 +135,12 @@ impl FirstRunWizard {
                     // from a non-empty queue without falling into the
                     // "queue empty, pick next phase" branch.
                     self.phase = WizardPhase::Welcome;
+                    let history_len = self.history.len();
                     self.advance_to_next_in_queue_or_picker();
+                    // The advance records the sentinel as a step the user
+                    // visited. Drop it so the next Back reaches the real
+                    // previous step.
+                    self.history.truncate(history_len);
                     return true;
                 }
                 phase => {
@@ -1433,6 +1436,65 @@ mod tests {
             w.queue.is_empty(),
             "stale picker selections must be cleared on restore"
         );
+    }
+
+    /// Walk Welcome, provider, approvals, login through the real advance
+    /// path. Required provisioners after `login` are still queued.
+    fn wizard_running_login() -> FirstRunWizard {
+        let mut w = FirstRunWizard::new(test_profile());
+        w.start_provisioners();
+        w.advance_to_next_in_queue_or_picker();
+        w.advance_to_next_in_queue_or_picker();
+        assert!(matches!(
+            &w.phase,
+            WizardPhase::RunningProvisioner { name } if name == "login"
+        ));
+        w
+    }
+
+    #[test]
+    fn second_back_returns_to_the_step_before_the_previous_one() {
+        let mut w = wizard_running_login();
+
+        // Back from login re-runs approvals.
+        assert!(w.back());
+        assert!(matches!(
+            &w.phase,
+            WizardPhase::RunningProvisioner { name } if name == "approvals"
+        ));
+
+        // A second Back re-runs provider, not the Welcome screen.
+        assert!(w.back());
+        assert!(
+            matches!(
+                &w.phase,
+                WizardPhase::RunningProvisioner { name } if name == "provider"
+            ),
+            "second back must land on provider, got {:?}",
+            w.phase
+        );
+        assert_eq!(
+            w.queue,
+            vec!["approvals", "login", "persona", "skills"],
+            "the steps after provider must stay queued, in order"
+        );
+    }
+
+    #[test]
+    fn back_reaches_welcome_only_after_the_first_provisioner() {
+        let mut w = wizard_running_login();
+
+        assert!(w.back());
+        assert!(w.back());
+        assert!(
+            matches!(&w.phase, WizardPhase::RunningProvisioner { .. }),
+            "welcome must not appear before the first provisioner is revisited"
+        );
+
+        // The third Back reaches Welcome, the earliest restorable point.
+        assert!(w.back());
+        assert!(matches!(w.phase, WizardPhase::Welcome));
+        assert!(!w.back(), "nothing is left to go back to after Welcome");
     }
 
     // ── locked channel rows are dimmed and skipped ──────
