@@ -86,7 +86,7 @@ log = "0.4"
 prometheus = { version = "0.14", default-features = false }
 
 # Base64 encoding (screenshots, image data)
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # URL encoding for web search

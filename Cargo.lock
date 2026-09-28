@@ -5629,7 +5629,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "calamine",
  "chacha20poly1305",
  "chrono",
@@ -5730,7 +5730,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "directories",
  "reqwest 0.12.28",
