@@ -2621,6 +2621,15 @@ mod tests {
     /// exercises that no network reply is sent on the fall-through.
     #[tokio::test]
     async fn store_pairing_falls_through_when_no_store_code() {
+        // `try_handle_store_pairing` resolves the active profile root
+        // (`crate::channels::pairing::profile_root`) and probes the pairing
+        // store there even on a miss, which opens/creates its advisory lock
+        // file. Pin HOME so that lands in a tempdir, not the real
+        // `~/.rantaiclaw/profiles/default/`.
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+
         let ch = TelegramChannel::new("t".into(), vec![], false);
         let handled = ch
             .try_handle_store_pairing("/bind ABCD-EFGH", "123", &["999".to_string()])

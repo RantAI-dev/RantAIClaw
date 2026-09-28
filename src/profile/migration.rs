@@ -28,10 +28,38 @@ use fs2::FileExt;
 
 use crate::profile::paths;
 
+/// Test-only guard: skip the legacy-layout migration unless `HOME` is under
+/// `std::env::temp_dir()` (or the opt-out is set). `needs_migration` and
+/// `perform_migration` below resolve `HOME` through `paths::rantaiclaw_root()`,
+/// so a test that never pins `HOME` would otherwise move the developer's real
+/// `~/.rantaiclaw` flat layout into `profiles/default/`. Compiled out of
+/// release builds; production always migrates.
+#[cfg(test)]
+fn home_is_test_safe() -> bool {
+    if crate::test_env::allow_real_config_dir() {
+        return true;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        // `directories::UserDirs` (via `dirs-sys`) falls back to a
+        // `getpwuid_r` lookup when `HOME` is unset, so `paths::rantaiclaw_root()`
+        // still resolves to the real system user's home directory rather than
+        // erroring out. An unset HOME is therefore unsafe, not exempt.
+        return false;
+    };
+    crate::test_env::is_under_temp_dir(&PathBuf::from(home))
+}
+
 /// Public entry point. Call this once at the very top of `Config::load_or_init`
 /// (and any other config-reading entry that bypasses it). Returns `Ok(true)`
 /// iff the migration actually fired this call; `Ok(false)` otherwise.
 pub fn maybe_migrate_legacy_layout() -> Result<bool> {
+    #[cfg(test)]
+    {
+        if !home_is_test_safe() {
+            return Ok(false);
+        }
+    }
+
     if !needs_migration() {
         return Ok(false);
     }
@@ -345,4 +373,100 @@ fn remove_recursive(p: &Path) -> Result<()> {
         fs::remove_file(p)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `directories::UserDirs::new()` (reached via `paths::rantaiclaw_root()`
+    /// deeper in this module) falls back to a `getpwuid_r` lookup when `HOME`
+    /// is unset, resolving to the real system user's home directory — not a
+    /// safe default. The guard must refuse an unset `HOME`, not admit it.
+    #[test]
+    fn home_is_test_safe_refuses_an_unset_home() {
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let _g_home = crate::test_env::EnvGuard::unset("HOME");
+        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+
+        assert!(
+            !home_is_test_safe(),
+            "an unset HOME must not be treated as safe"
+        );
+    }
+
+    /// A directory that is deliberately NOT under `std::env::temp_dir()` — a
+    /// throwaway spot inside this crate's own `target/`, so a guard that
+    /// fails to fire only ever touches build output, never the developer's
+    /// real `$HOME`.
+    fn non_temp_dir_scratch_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "rantaiclaw_test_legacy_guard_{}",
+                uuid::Uuid::new_v4()
+            ))
+    }
+
+    /// Write a v0.4.x flat layout (`config.toml`, no `profiles/`, no
+    /// `active_profile`) under `home/.rantaiclaw`, satisfying
+    /// [`needs_migration`]'s predicate.
+    fn seed_legacy_layout(home: &Path) {
+        let root = home.join(".rantaiclaw");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.toml"), "schema_version = 1\n").unwrap();
+    }
+
+    /// Without a `HOME` pin, the guard must refuse to touch a legacy layout
+    /// at all — not even the read-only `needs_migration` check — because
+    /// `HOME` here is a scratch dir outside `std::env::temp_dir()`, standing
+    /// in for the developer's real, unpinned `$HOME`.
+    #[test]
+    fn maybe_migrate_legacy_layout_skips_when_home_is_not_under_temp_dir() {
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let fake_home = non_temp_dir_scratch_dir();
+        seed_legacy_layout(&fake_home);
+        assert!(
+            !fake_home.starts_with(std::env::temp_dir()),
+            "test setup bug: the scratch dir must not itself be under temp_dir"
+        );
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &fake_home);
+        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+
+        let migrated = maybe_migrate_legacy_layout().unwrap();
+
+        assert!(!migrated, "the guard must report no migration happened");
+        assert!(
+            !fake_home.join(".rantaiclaw").join("profiles").exists(),
+            "the guard must refuse the migration outright, not just report false"
+        );
+
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    /// Pinning `HOME` to an actual tempdir is the documented way to opt into
+    /// exercising a real migration; the guard must not block it.
+    #[test]
+    fn maybe_migrate_legacy_layout_runs_when_home_is_under_temp_dir() {
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        seed_legacy_layout(&temp_home);
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+
+        let migrated = maybe_migrate_legacy_layout().unwrap();
+
+        assert!(
+            migrated,
+            "a legacy layout under a pinned temp HOME must migrate"
+        );
+        assert!(temp_home
+            .join(".rantaiclaw")
+            .join("profiles")
+            .join("default")
+            .exists());
+
+        let _ = fs::remove_dir_all(&temp_home);
+    }
 }

@@ -5867,11 +5867,17 @@ pub(super) mod test_support {
 
     /// A `TuiApp` in `Ready` state whose profile lives under `profile_root`.
     pub(crate) fn app_with_profile_root(ctx: TuiContext, profile_root: PathBuf) -> TuiApp {
+        // `Config::default()` points `config_path` at the developer's real
+        // `$HOME/.rantaiclaw/config.toml`. A test that calls `save()` on this
+        // app would write there, so point it at the same profile root the
+        // caller already gives us (a tempdir for every test that writes).
+        let mut config = crate::config::Config::default();
+        config.config_path = profile_root.join("config.toml");
         TuiApp {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
-            config: crate::config::Config::default(),
+            config,
             profile: crate::profile::Profile {
                 name: "default".to_string(),
                 root: profile_root,
@@ -10431,10 +10437,9 @@ mod autonomy_keybinding_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
-        // Config::default() reads HOME via UserDirs and writes save() there; pin
-        // config_path to the tempdir so the test does not migrate the developer's
-        // real ~/.rantaiclaw. See plan 465.
-        app.config.config_path = dir.path().join("config.toml");
+        // `app_with_profile_root` already points `config_path` at the tempdir;
+        // `workspace_dir` still needs pinning explicitly since the
+        // constructor leaves it at `Config::default()`'s real-`$HOME` value.
         app.config.workspace_dir = dir.path().to_path_buf();
 
         assert_eq!(preset_on_disk(dir.path()), None, "nothing written yet");
@@ -10561,10 +10566,9 @@ mod autonomy_keybinding_tests {
 
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
-        // Config::default() reads HOME via UserDirs and writes save() there; pin
-        // config_path to the tempdir so the test does not migrate the developer's
-        // real ~/.rantaiclaw. See plan 465.
-        app.config.config_path = dir.path().join("config.toml");
+        // `app_with_profile_root` already points `config_path` at the tempdir;
+        // `workspace_dir` still needs pinning explicitly since the
+        // constructor leaves it at `Config::default()`'s real-`$HOME` value.
         app.config.workspace_dir = dir.path().to_path_buf();
 
         press_shift_tab(&mut app).await;
