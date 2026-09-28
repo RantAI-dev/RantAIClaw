@@ -13,7 +13,7 @@
 //! renderers read the latest snapshot at display time.
 
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default)]
 pub enum AutoStartState {
@@ -80,13 +80,6 @@ pub fn snapshot() -> AutoStartState {
 pub fn looks_running() -> bool {
     matches!(snapshot(), AutoStartState::Starting { since_unix }
         if now_unix().saturating_sub(since_unix) >= 5)
-}
-
-// Suppress dead-code warnings for the `Instant` import in case future
-// instrumentation wants to use it for span timing without re-importing.
-#[allow(dead_code)]
-fn _instant_witness() -> Instant {
-    Instant::now()
 }
 
 #[cfg(test)]
