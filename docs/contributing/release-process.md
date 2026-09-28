@@ -269,6 +269,8 @@ quiet during a release.
 
 Monitor `Pub Release` in publish mode.
 
+The next release is the first to run `softprops/action-gh-release` v3 (bumped from 2.5.0 in #752; the action only executes on a release tag, so no CI run before the release exercises it) — watch the `Pub Release` job closely and have the revert ready.
+
 Expected publish outputs:
 
 - release archives
