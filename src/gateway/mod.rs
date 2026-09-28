@@ -3625,7 +3625,7 @@ mod tests {
         // The minted code is consumed and a usable bearer token is issued.
         let token =
             try_consume_gateway_store_code(&state, &code).expect("store code should issue a token");
-        assert!(token.starts_with("zc_"), "token shape: {token}");
+        assert!(token.starts_with("rc_"), "token shape: {token}");
         assert!(
             state.pairing.is_authenticated(&token),
             "issued token must authenticate against the guard"
