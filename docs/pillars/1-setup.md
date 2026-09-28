@@ -10,7 +10,7 @@ The first thing a user sees. RantaiClaw's setup story is **fullscreen TUI wizard
 - Section drill-down (`rantaiclaw setup <section>`)
 - Non-interactive bootstrap (`rantaiclaw setup --non-interactive`)
 - `rantaiclaw doctor` diagnostics (text / json / brief)
-- Profile creation, scaffolding, and migration from OpenClaw / ZeroClaw
+- Profile creation, scaffolding, and per-section re-runs
 
 ## Vs OpenClaw / Hermes-agent
 
@@ -22,7 +22,6 @@ The first thing a user sees. RantaiClaw's setup story is **fullscreen TUI wizard
 | Policy-aware (Manual / Smart / Strict / Off presets) | ✅ | ❌ | TBD |
 | Diagnostic suite | `doctor` (text/json/brief) | Partial | TBD |
 | Setup time, fresh box → working agent | < 5 min | ~5-15 min | TBD |
-| Migration import (OpenClaw / ZeroClaw) | ✅ `rantaiclaw migrate` | n/a | n/a |
 
 ## Current state by maturity
 
@@ -38,7 +37,6 @@ unverified rather than current._
 | `setup` sections (provider / approvals / channels / persona / skills / mcp / login) | Implemented |
 | `doctor` text / json / brief | Implemented · stable |
 | Hot-reload after wizard | Implemented · needs validation |
-| OpenClaw / ZeroClaw migration | Implemented · needs validation |
 | Wizard splash + brand polish | Implemented · stable |
 
 ## Architecture
@@ -72,7 +70,6 @@ rantaiclaw setup --non-interactive  # CI / scripted bootstrap
 rantaiclaw doctor                 # full diagnostic
 rantaiclaw doctor --brief         # one-line health
 rantaiclaw doctor --json          # machine-readable
-rantaiclaw migrate --from openclaw  # import legacy install
 ```
 
 ## Roadmap

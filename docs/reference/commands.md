@@ -36,7 +36,6 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `channel` | Manage channels and channel health checks |
 | `integrations` | Browse and inspect integrations |
 | `skills` | List/install/remove skills |
-| `migrate` | Import from external runtimes (currently OpenClaw) |
 | `config` | Show the active config (redacted) or export its JSON schema |
 | `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware (present in every build; real USB access needs `--features hardware`) |
@@ -346,10 +345,6 @@ re-embeds on its own. It refuses backends that store no embeddings.
 
 `list` reports the true entry count. The backend caps a single listing at 1,000
 rows, and the output says when it is showing a subset.
-
-### `migrate`
-
-- `rantaiclaw migrate openclaw [--source <path>] [--dry-run]`
 
 ### `config`
 

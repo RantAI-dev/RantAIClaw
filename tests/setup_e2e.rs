@@ -344,21 +344,34 @@ fn setup_unknown_topic_errors_and_lists_valid_topics() {
     }
 }
 
+/// `rantaiclaw migrate` was removed. The CLI no longer accepts the subcommand,
+/// so clap exits non-zero and surfaces an "unrecognized subcommand" error. This
+/// pins the removal so a future PR cannot quietly reintroduce the command.
 #[test]
-fn migrate_help_shows_from_flag_with_openclaw_zeroclaw_auto() {
+fn migrate_subcommand_is_removed_and_fails_as_unknown() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = TempDir::new().expect("tempdir");
 
-    cmd(&home)
-        .args(["migrate", "--help"])
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("--from")
-                .and(predicate::str::contains("openclaw"))
-                .and(predicate::str::contains("zeroclaw"))
-                .and(predicate::str::contains("auto")),
-        );
+    let assert = cmd(&home).arg("migrate").assert().failure().stderr(
+        predicate::str::contains("migrate").and(
+            predicate::str::contains("unrecognized subcommand")
+                .or(predicate::str::contains("unknown subcommand"))
+                .or(predicate::str::contains("unexpected argument")),
+        ),
+    );
+
+    // The exit status is non-zero, captured above by `.failure()`. Confirm
+    // the status code clap chooses for an unknown subcommand — historically 2
+    // (usage error), as opposed to a runtime failure that would be 1. This
+    // catches a future change that wires `migrate` back as a real command
+    // but routes it through a runtime panic (exit 101).
+    let output = assert.get_output();
+    let exit_code = output.status.code();
+    assert_eq!(
+        exit_code,
+        Some(2),
+        "clap usage errors should exit with status 2; got {exit_code:?}"
+    );
 }
 
 #[test]

@@ -12,7 +12,6 @@ State that survives restarts. Multi-profile workspace layout, pluggable memory b
 - Session auto-titling from first user message
 - Profile lifecycle: list / create / use / clone / delete / current
 - Daemon handoff on profile switch (drain + relaunch)
-- Migration import from OpenClaw / ZeroClaw
 
 ## Vs OpenClaw / Hermes-agent
 
@@ -23,8 +22,6 @@ State that survives restarts. Multi-profile workspace layout, pluggable memory b
 | Embeddings + vector merge | ✅ | TBD | TBD |
 | Session auto-titling | ✅ | TBD | TBD |
 | Daemon handoff on profile switch | ✅ sentinel-file flow | TBD | TBD |
-| OpenClaw import | ✅ `rantaiclaw migrate` | n/a | n/a |
-| ZeroClaw import | ✅ | n/a | n/a |
 
 ## Current state by maturity
 
@@ -39,7 +36,6 @@ unverified rather than current._
 | Embeddings + vector merge | Stable |
 | Session auto-titling | Stable |
 | Daemon handoff on profile switch | Stable (v0.5.0 Wave 4B) |
-| OpenClaw / ZeroClaw migration | Stable (v0.5.0 Wave 4C) |
 | Compat-symlinks for v0.4.x flat layout | Stable for ≥1 release per v0.5.0 |
 
 ## Architecture
