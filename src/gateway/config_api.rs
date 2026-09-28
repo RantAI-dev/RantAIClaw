@@ -197,6 +197,9 @@ pub(crate) fn redact_secrets_in_json(v: &mut serde_json::Value) {
             || k == "api_keys"          // reliability key list
             || k == "provider_api_keys" // per-provider key map
             || k.contains("credential")
+            || k == "db_url" // generic: any JSON key named db_url in any
+                             // case, e.g. a skill env var DB_URL — not
+                             // tied to any specific config section
     }
     match v {
         serde_json::Value::Object(map) => {
@@ -2789,6 +2792,34 @@ mod tests {
             .and_then(|e| e.api_key.as_ref())
             .and_then(|k| k.value.as_ref())
             .is_none());
+    }
+
+    #[test]
+    fn config_api_redacts_skill_env_db_url() {
+        // A skill's `env` map can carry a `DB_URL` connection string. Only
+        // `redact_secrets_in_json` protects this map (it isn't a typed
+        // secret field `redact_config_secrets` knows about), so it must
+        // still clear a key named `db_url` in any case.
+        let mut cfg = Config::default();
+        cfg.skills.entries.insert(
+            "x".into(),
+            crate::config::SkillEntryConfig {
+                env: std::collections::HashMap::from([(
+                    "DB_URL".into(),
+                    "postgres://user:pw@host/db".into(),
+                )]),
+                ..Default::default()
+            },
+        );
+        let mut val = serde_json::to_value(&cfg).unwrap();
+        redact_secrets_in_json(&mut val);
+        let json = val.to_string();
+        assert!(!json.contains("user:pw"), "leaked in:\n{json}");
+        assert_eq!(
+            val["skills"]["entries"]["x"]["env"]["DB_URL"],
+            serde_json::Value::String(String::new()),
+            "DB_URL was not redacted to an empty string in:\n{json}"
+        );
     }
 
     #[test]
