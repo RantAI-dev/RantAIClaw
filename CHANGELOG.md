@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pressing Back twice in the first-run setup wizard returns to the step before, instead of jumping to the welcome screen.
 - Stopping the daemon while the Lark webhook listener is starting no longer waits for the Lark API to answer. The listener now honours cancellation during its config read, its bot-identity lookup and its port bind.
 - Library tests can no longer silently read or write the developer's real
   `~/.rantaiclaw`. `resolve_runtime_config_dirs` now refuses, in `cfg(test)`
