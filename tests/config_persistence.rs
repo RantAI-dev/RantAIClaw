@@ -6,6 +6,8 @@
 //! Tests Config::load_or_init() with isolated temp directories, env var overrides,
 //! and config file round-trips to verify workspace discovery and persistence.
 
+mod common;
+
 use rantaiclaw::config::{AgentConfig, Config, MemoryConfig};
 use std::fs;
 
@@ -265,12 +267,16 @@ fn knowledge_section_defaults_to_none_and_survives_missing() {
 
 #[tokio::test]
 async fn knowledge_keys_encrypt_at_rest_and_decrypt_on_load() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+    // `common::ConfigDirGuard` both pins `RANTAICLAW_CONFIG_DIR` to a fresh
+    // temp dir and serializes against any sibling test in this binary that
+    // does the same — this test used to set/remove the var unguarded, which
+    // races a sibling and, without the pin, resolves against the real
+    // `~/.rantaiclaw`.
+    let guard = common::ConfigDirGuard::acquire().await;
     let mut cfg = rantaiclaw::config::Config::load_or_init().await.unwrap();
     cfg.knowledge.embedding_api_key = Some("sk-embed-plain".into());
     cfg.save().await.unwrap();
-    let raw = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+    let raw = std::fs::read_to_string(guard.path().join("config.toml")).unwrap();
     assert!(
         !raw.contains("sk-embed-plain"),
         "key must not be plaintext on disk"
@@ -280,7 +286,6 @@ async fn knowledge_keys_encrypt_at_rest_and_decrypt_on_load() {
         reloaded.knowledge.embedding_api_key.as_deref(),
         Some("sk-embed-plain")
     );
-    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
 }
 
 #[test]

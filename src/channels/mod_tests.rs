@@ -9567,6 +9567,14 @@ impl Channel for LiveListenerDeadPlatformChannel {
 /// one caller — a one-shot CLI command.
 #[tokio::test]
 async fn a_channel_whose_platform_stops_answering_is_reported_unhealthy() {
+    // `spawn_supervised_listener_with_health_interval` claims an advisory
+    // lock under the XDG data dir (`acquire_channel_lock`), which resolves
+    // from `HOME` when `XDG_DATA_HOME` is unset — pin it to a tempdir so this
+    // never creates `~/.local/share/rantaiclaw/locks/...` on the real machine.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
+
     let probes = Arc::new(AtomicUsize::new(0));
     let channel_name = format!("test-supervised-deadplatform-{}", uuid::Uuid::new_v4());
     let component = format!("channel:{channel_name}");
@@ -9615,6 +9623,12 @@ async fn a_channel_whose_platform_stops_answering_is_reported_unhealthy() {
 
 #[tokio::test]
 async fn supervised_listener_marks_error_and_restarts_on_failures() {
+    // See the sibling comment above: pin HOME so the channel-lock claim
+    // stays out of the real `~/.local/share/rantaiclaw/locks/`.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
+
     let calls = Arc::new(AtomicUsize::new(0));
     // UUID-suffixed like its two neighbours. `crate::health` is a process-wide
     // registry, so a fixed component name collides with any other test that
@@ -9648,6 +9662,12 @@ async fn supervised_listener_marks_error_and_restarts_on_failures() {
 
 #[tokio::test]
 async fn supervised_listener_refreshes_health_while_running() {
+    // See the sibling comment above: pin HOME so the channel-lock claim
+    // stays out of the real `~/.local/share/rantaiclaw/locks/`.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
+
     let calls = Arc::new(AtomicUsize::new(0));
     let channel_name = format!("test-supervised-heartbeat-{}", uuid::Uuid::new_v4());
     let component_name = format!("channel:{channel_name}");
@@ -9692,6 +9712,13 @@ async fn supervised_listener_refreshes_health_while_running() {
 
 #[tokio::test(start_paused = true)]
 async fn supervised_listener_stops_on_shutdown_cancellation() {
+    // See the sibling comment on `a_channel_whose_platform_stops_answering_is_reported_unhealthy`:
+    // pin HOME so the channel-lock claim stays out of the real
+    // `~/.local/share/rantaiclaw/locks/`.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
+
     // Regression guard for the in-place channel restart path: cancelling
     // the shutdown token must stop the listener even while the message
     // bus is still open (rx alive) AND the channel ignores the token —

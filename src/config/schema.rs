@@ -3799,13 +3799,11 @@ async fn resolve_runtime_config_dirs(
 
     // Test-only guard: refuse to fall back to a path derived from the
     // developer's real `$HOME` (or XDG) so a missing override fails the test
-    // instead of silently migrating the operator's config. See plan 465.
+    // instead of silently migrating the operator's config.
     // Compiled out of release builds; behaviour above this point is unchanged.
     #[cfg(test)]
     {
-        if std::env::var_os("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR").as_deref()
-            != Some(std::ffi::OsStr::new("1"))
-        {
+        if !crate::test_env::allow_real_config_dir() {
             anyhow::bail!(
                 "test config isolation: neither RANTAICLAW_CONFIG_DIR nor RANTAICLAW_WORKSPACE \
                  is set, so this test would read and write the developer's real \
@@ -3843,6 +3841,16 @@ async fn resolve_runtime_config_dirs(
         default_workspace_dir.to_path_buf(),
         ConfigResolutionSource::DefaultConfigDir,
     ))
+}
+
+/// Test-only guard for [`Config::save`]: refuse to write anywhere other than
+/// under `std::env::temp_dir()`, so a test with a stray `Config::default()`
+/// (which points `config_path` at the developer's real `$HOME/.rantaiclaw`)
+/// cannot write the operator's real config. Mirrors the guard in
+/// `resolve_runtime_config_dirs`, including the same opt-out.
+#[cfg(test)]
+fn config_path_is_test_safe(config_path: &Path) -> bool {
+    crate::test_env::allow_real_config_dir() || crate::test_env::is_under_temp_dir(config_path)
 }
 
 /// Encrypt every plaintext credential in a raw (not yet deserialised) config,
@@ -5042,6 +5050,24 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
+        // Test-only guard: refuse to write anywhere but a tempdir, so a test
+        // that never overrode `config_path` (it defaults to the developer's
+        // real `$HOME/.rantaiclaw/config.toml`) cannot write the operator's
+        // real config. Compiled out of release builds.
+        #[cfg(test)]
+        {
+            if !config_path_is_test_safe(&self.config_path) {
+                anyhow::bail!(
+                    "test config isolation: config_path {} is not under a tempdir, so \
+                     this test would write the developer's real config. Point \
+                     config_path at a tempdir (see crate::test_env::EnvGuard) or, if \
+                     this test really must write the real path, set \
+                     RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1.",
+                    self.config_path.display()
+                );
+            }
+        }
+
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Before anything else: the file must describe the operator's config,
@@ -7829,6 +7855,15 @@ level = "full"
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
+        // Pin HOME to a tempdir before opting out of the isolation guard: if
+        // the guard were ever removed and this test's marker lookup fell
+        // through to HOME-derived resolution, it would land in this tempdir
+        // instead of the developer's real ~/.rantaiclaw.
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_home).await.unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+
         // Marker-driven resolution is the first non-env branch. The test is
         // the one place we explicitly exercise the default-resolution path
         // without setting CONFIG_DIR or WORKSPACE, so opt out of the test
@@ -7854,6 +7889,7 @@ level = "full"
         assert_eq!(resolved_workspace_dir, marker_config_dir.join("workspace"));
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+        let _ = fs::remove_dir_all(temp_home).await;
     }
 
     #[test]
@@ -8282,14 +8318,22 @@ default_model = "legacy-model"
         assert_eq!(config.default_provider, original_provider);
     }
 
-    /// The test isolation guard (plan 465) refuses to fall back to a path
-    /// derived from the developer's real `$HOME` — without an explicit
-    /// override, a test would read and write the operator's real
-    /// `~/.rantaiclaw`. Calling `load_or_init` with both env vars unset
-    /// must surface the guard's diagnostic instead of silently migrating.
+    /// The test isolation guard refuses to fall back to a path derived from
+    /// the developer's real `$HOME` — without an explicit override, a test
+    /// would read and write the operator's real `~/.rantaiclaw`. Calling
+    /// `load_or_init` with both env vars unset must surface the guard's
+    /// diagnostic instead of silently migrating.
     #[test]
     async fn test_isolation_guard_refuses_load_or_init_without_an_override() {
         let _env_guard = env_override_lock().await;
+        // Pin HOME to a tempdir before unsetting the overrides: if the guard
+        // this test exercises were ever removed, `load_or_init` would fall
+        // through to HOME-derived resolution and this test must still land
+        // in a tempdir, never the developer's real ~/.rantaiclaw.
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_home).await.unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
         let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
         let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
@@ -8306,6 +8350,7 @@ default_model = "legacy-model"
             msg.contains("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1"),
             "the message must name the opt-out so an agent in a hurry can find it: {msg}"
         );
+        let _ = fs::remove_dir_all(temp_home).await;
     }
 
     /// The opt-out (`RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1`) is what the
@@ -8337,6 +8382,77 @@ default_model = "legacy-model"
         );
 
         let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    /// A directory that is deliberately NOT under `std::env::temp_dir()` — a
+    /// throwaway spot inside this crate's own `target/`, so a `save()` that
+    /// slips past the write-site guard only ever writes build output, never
+    /// the developer's real `$HOME`.
+    fn non_temp_dir_scratch_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "rantaiclaw_test_save_guard_{}",
+                uuid::Uuid::new_v4()
+            ))
+            .join("config.toml")
+    }
+
+    /// The write-site guard (in [`Config::save`]) refuses to write anywhere
+    /// but a tempdir. A `config_path` outside `std::env::temp_dir()` (as
+    /// `Config::default()`'s real-`$HOME`-derived path would be) must fail
+    /// before any disk I/O, not silently overwrite the operator's config.
+    #[test]
+    async fn save_refuses_to_write_outside_a_tempdir() {
+        let _env_guard = env_override_lock().await;
+        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+
+        let unsafe_path = non_temp_dir_scratch_path();
+        assert!(
+            !unsafe_path.starts_with(std::env::temp_dir()),
+            "test setup bug: a checkout under the OS temp dir would make this path \
+             temp-dir-safe and defeat the assertion below"
+        );
+        let mut config = Config::default();
+        config.config_path = unsafe_path.clone();
+
+        let err = config
+            .save()
+            .await
+            .expect_err("a config_path outside a tempdir must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("test config isolation"),
+            "expected the write-site isolation guard message, got: {msg}"
+        );
+        assert!(
+            msg.contains("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1"),
+            "the message must name the opt-out so an agent in a hurry can find it: {msg}"
+        );
+        assert!(
+            !unsafe_path.exists(),
+            "the guard must refuse before any write, not write then complain"
+        );
+    }
+
+    /// The opt-out lets `save()` proceed past the write-site guard even
+    /// outside a tempdir — the same escape hatch the resolver guard uses.
+    #[test]
+    async fn save_with_the_opt_out_writes_outside_a_tempdir() {
+        let _env_guard = env_override_lock().await;
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+
+        let unsafe_path = non_temp_dir_scratch_path();
+        let mut config = Config::default();
+        config.config_path = unsafe_path.clone();
+
+        config
+            .save()
+            .await
+            .expect("the opt-out must allow save() outside a tempdir");
+        assert!(unsafe_path.exists());
+
+        let _ = fs::remove_dir_all(unsafe_path.parent().unwrap()).await;
     }
 
     #[test]

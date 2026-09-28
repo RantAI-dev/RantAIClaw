@@ -403,6 +403,15 @@ mod tests {
     /// covers.
     #[test]
     fn pair_still_mints_for_a_usable_channel_and_the_gateway() {
+        // Unlike its sibling tests above, this one actually reaches the
+        // success path: `mint_and_render` resolves `ProfileManager::active()`
+        // and mints into its pairing store. Pin HOME so that lands in a
+        // tempdir, not the real `~/.rantaiclaw/profiles/default/`.
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
         let mut ctx = test_context();
         assert!(matches!(
             PairCommand.execute("telegram", &mut ctx).unwrap(),
@@ -412,5 +421,7 @@ mod tests {
             PairCommand.execute("gateway", &mut ctx).unwrap(),
             CommandResult::SensitiveMessage { .. }
         ));
+
+        restore_home(prev_home);
     }
 }

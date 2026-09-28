@@ -32,8 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builds, to fall back to a path derived from `$HOME` when neither
   `RANTAICLAW_CONFIG_DIR` nor `RANTAICLAW_WORKSPACE` is set, with a diagnostic
   that names the override and the `RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1`
-  opt-out for the small set of tests that exercise default resolution. Release
-  behaviour is unchanged — the guard is compiled out of non-test builds.
+  opt-out for the small set of tests that exercise default resolution. The
+  same `cfg(test)` guard now also covers `Config::save` (refuses to write
+  outside a temp directory) and the legacy-layout migration (refuses to run
+  against a `$HOME` outside a temp directory), both with the same opt-out,
+  and the integration test that reached `Config::save` through
+  `Config::load_or_init` (`tests/config_persistence.rs`) now pins its own
+  `RANTAICLAW_CONFIG_DIR` to a temp directory behind a process-wide lock
+  (`tests/common/mod.rs`) instead of setting it unguarded — the library guard
+  above does not apply to `tests/` binaries, which link the crate without
+  `cfg(test)`. Release behaviour is unchanged.
 - The email channel finds the `Authentication-Results` header by name, so owner
   recognition keeps working on any header spelling and survives the next
   mail-parser upgrade. The previous lookup matched `HeaderName::Other(...)`,
