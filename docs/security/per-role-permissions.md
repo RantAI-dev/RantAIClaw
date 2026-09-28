@@ -60,8 +60,10 @@ guest_allowed_commands = ["kubectl get *", "kubectl describe *", "ls *"]  # shel
 One place — the shared agent loop, per turn:
 1. Resolve `is_owner = can_approve(approval_owners, sender)` (CLI/console ⇒ owner).
 2. Owner → existing path (full registry + normal `SecurityPolicy`).
-3. Guest → filtered tool registry (exactly `guest_allowed_tools`, no union
-   with `auto_approve`) + a guest-scoped `SecurityPolicy`
+3. Guest → full registry still runs, but a `GuestGate` checks each call before
+   execution and denies outright (`GuestGate::deny_reason`) any tool outside
+   `guest_allowed_tools` or any shell command outside `guest_allowed_commands`
+   (no union with `auto_approve`), plus a guest-scoped `SecurityPolicy`
    (`allowed_commands = guest_allowed_commands`, out-of-list denied,
    forbidden-paths still apply).
 

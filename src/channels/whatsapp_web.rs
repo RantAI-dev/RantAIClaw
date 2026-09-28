@@ -3491,8 +3491,9 @@ mod tests {
     /// WhatsApp Web's platform-level DM signal is the chat JID's server.
     /// wa-rs uses `s.whatsapp.net` (PN) and `lid` for one-to-one chats;
     /// groups (`g.us`), broadcasts (`broadcast`), and newsletters
-    /// (`newsletter`) all surface as groups. The drive in plan 453 is the
-    /// prompt's DM-vs-group line — `!is_group` is **not** equivalent (wa-rs
+    /// (`newsletter`) all surface as groups, because none of them is a
+    /// one-to-one conversation, and the prompt's DM-vs-group line depends
+    /// on getting that right. `!is_group` is **not** equivalent (wa-rs
     /// marks every broadcast as a group and treats a newsletter as a DM),
     /// so the assertion is on the JID's server, not on `is_group`.
     #[cfg(feature = "whatsapp-web")]
@@ -3551,12 +3552,12 @@ mod tests {
         );
 
         // Broadcasts: a broadcast list is not a one-to-one conversation —
-        // the flag must stay false. This is the case the plan names where
-        // `!info.source.is_group` would be wrong, because the wa-rs
-        // `MessageInfo.source.is_group` field is `true` for broadcasts (it
-        // uses a coarser rule than `Jid::is_group`, which only covers
-        // `g.us`); either rule still has to agree with our prompt, which
-        // says broadcasts are groups.
+        // the flag must stay false. The wa-rs `MessageInfo.source.is_group`
+        // field is also `true` for broadcasts (a coarser rule than
+        // `Jid::is_group`, which only covers `g.us`), so it agrees with our
+        // own JID-server check here; broadcasts are not the case where
+        // `!info.source.is_group` would go wrong (newsletters are — see
+        // below).
         let broadcast_jid = wa_rs_binary::jid::Jid::new("12025550101", "broadcast");
         let broadcast_msg = WhatsAppWebChannel::inbound_channel_message(
             "3EB0BCAST",
@@ -3586,6 +3587,25 @@ mod tests {
             !status_msg.is_direct,
             "a status broadcast is not a DM, got is_direct={}",
             status_msg.is_direct
+        );
+
+        // Newsletters: this is the case where `!info.source.is_group` would
+        // be wrong — wa-rs's `MessageInfo.source.is_group` field is `false`
+        // for a newsletter, which would misread it as a DM. Our own
+        // JID-server check must still keep it out of the direct set.
+        let newsletter_jid = wa_rs_binary::jid::Jid::new("120363012345678901", "newsletter");
+        let newsletter_msg = WhatsAppWebChannel::inbound_channel_message(
+            "3EB0NEWS",
+            "+15550001111".into(),
+            "120363012345678901@newsletter".into(),
+            "hi".into(),
+            1_700_000_005,
+            &newsletter_jid,
+        );
+        assert!(
+            !newsletter_msg.is_direct,
+            "a newsletter is not a DM, got is_direct={}",
+            newsletter_msg.is_direct
         );
     }
 

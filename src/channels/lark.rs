@@ -3501,8 +3501,8 @@ mod tests {
 
     /// Lark's platform-level DM signal is `chat_type == "p2p"`. Group and
     /// channel conversations surface as groups; missing or unexpected
-    /// values fall through to the safer "anggap grup" default. The drive is
-    /// the same Telegram/Discord prompt line.
+    /// values fall through to the safer default of treating unknown chats
+    /// as groups, the same rule Telegram and Discord follow.
     #[tokio::test]
     async fn lark_webhook_marks_direct_only_for_chat_type_p2p() {
         let ch = allowed_channel();

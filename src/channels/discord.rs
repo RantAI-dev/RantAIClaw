@@ -2106,8 +2106,8 @@ mod tests {
     }
 
     /// Discord's platform-level DM signal is the absence of `guild_id`: a DM
-    /// arrives without one, a guild message always carries it. The plan's
-    /// rule is "kalau ragu, anggap grup", so the flag must flip exactly on
+    /// arrives without one, a guild message always carries it. The rule is
+    /// to treat unknown chats as groups, so the flag must flip exactly on
     /// the absence.
     #[test]
     fn discord_classify_inbound_marks_direct_only_when_guild_id_is_absent() {

@@ -226,11 +226,7 @@ fn is_numeric_identity(entry: &str) -> bool {
 }
 
 /// Render the current per-role permission state as a multi-line summary.
-///
-/// `safe_tools` is the always-available read-only set (the autonomy
-/// `auto_approve` list) so the reader sees the *effective* guest tool ceiling,
-/// not just the additive allowlist.
-pub fn render(config: &Config, safe_tools: &[String]) -> String {
+pub fn render(config: &Config) -> String {
     use std::fmt::Write as _;
 
     let cc = &config.channels_config;
@@ -300,15 +296,24 @@ pub fn render(config: &Config, safe_tools: &[String]) -> String {
         }
     }
 
-    // Guest tool ceiling.
+    // Guest tool ceiling. In the default Full injection mode, a LOCAL
+    // skill's own instructions are inlined straight into the prompt with no
+    // tool call. A REMOTE skill (open-skills/ClawHub) is never inlined, and
+    // Compact mode inlines nothing for any skill, so loading either needs a
+    // tool (e.g. `file_read`) that this gate still checks. A skill's own
+    // `[[tools]]` and the `skills_list`/`skill_view`/`skills_search` meta
+    // tools are ordinary tools too, checked by name in
+    // `GuestGate::tool_permitted` — so
+    // `guest_allowed_tools` is still the guest's entire tool-execution
+    // ceiling; the owner's `auto_approve` list does not reach guests at all.
     out.push_str("\nNon-owner (guest) tools:\n");
-    out.push_str("  always: skills + read-only [");
-    out.push_str(&safe_tools.join(", "));
-    out.push_str("]\n");
+    out.push_str(
+        "  always: skill instructions in the prompt (a skill's own tools still need guest_allowed_tools)\n",
+    );
     if cc.guest_allowed_tools.is_empty() {
-        out.push_str("  extra : (none)\n");
+        out.push_str("  tools : no tools (chat only)\n");
     } else {
-        let _ = writeln!(out, "  extra : {}", cc.guest_allowed_tools.join(", "));
+        let _ = writeln!(out, "  tools : {}", cc.guest_allowed_tools.join(", "));
     }
 
     // Guest command ceiling.
@@ -337,14 +342,14 @@ mod tests {
         let mut c = cfg();
         c.channels_config.approval_owners = vec!["1360247715".to_string()];
 
-        let out = render(&c, &[]);
+        let out = render(&c);
         assert!(
             !out.contains("autonomous_tools"),
             "silent when the flag is off: {out}"
         );
 
         c.channels_config.autonomous_tools = true;
-        let out = render(&c, &[]);
+        let out = render(&c);
         assert!(out.contains("autonomous_tools = true"), "{out}");
         assert!(
             out.contains("approval gate is OFF"),
@@ -373,7 +378,7 @@ mod tests {
         c.channels_config.approval_owners =
             vec!["1360247715".to_string(), "rantaiclaw_user".to_string()];
 
-        let out = render(&c, &[]);
+        let out = render(&c);
         assert!(
             out.contains("rantaiclaw_user"),
             "the transferable entry must be named: {out}"
@@ -382,13 +387,13 @@ mod tests {
 
         // Numeric-only: no warning at all.
         c.channels_config.approval_owners = vec!["1360247715".to_string()];
-        let out = render(&c, &[]);
+        let out = render(&c);
         assert!(!out.contains("not numeric ids"), "{out}");
 
         // No Telegram configured: the warning is Telegram-specific.
         c.channels_config.telegram = None;
         c.channels_config.approval_owners = vec!["rantaiclaw_user".to_string()];
-        let out = render(&c, &[]);
+        let out = render(&c);
         assert!(!out.contains("not numeric ids"), "{out}");
     }
 
@@ -492,13 +497,32 @@ mod tests {
         apply(&mut c, Target::AllowCommand, Op::Add, "kubectl");
         apply(&mut c, Target::GuestTool, Op::Add, "web_search");
         apply(&mut c, Target::GuestCommand, Op::Add, "ls *");
-        let s = render(&c, &["file_read".to_string()]);
+        let s = render(&c);
         assert!(s.contains("alice"));
         assert!(s.contains("kubectl"));
         assert!(s.contains("Owner shell commands")); // autonomy allowlist section
         assert!(s.contains("web_search"));
         assert!(s.contains("ls *"));
-        assert!(s.contains("file_read")); // safe set surfaced
+    }
+
+    /// A guest's tool ceiling is exactly `guest_allowed_tools`: the owner's
+    /// `autonomy.auto_approve` list must never leak into the guest summary.
+    #[test]
+    fn render_lists_guest_tools_and_never_auto_approve() {
+        let mut c = cfg();
+        c.autonomy.auto_approve = vec!["file_read".to_string()];
+        c.channels_config.guest_allowed_tools = vec!["web_search".to_string()];
+        let s = render(&c);
+        assert!(s.contains("web_search"));
+        assert!(!s.contains("file_read"));
+    }
+
+    /// An empty `guest_allowed_tools` reads as "chat only", not a blank list.
+    #[test]
+    fn render_shows_chat_only_when_guest_allowed_tools_is_empty() {
+        let c = cfg();
+        let s = render(&c);
+        assert!(s.contains("no tools (chat only)"));
     }
 
     #[test]

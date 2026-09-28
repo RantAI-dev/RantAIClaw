@@ -1464,7 +1464,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
     }
 
-    /// Plan 450: the owner's `MEMORY.md` is private to the owner. A guest
+    /// The owner's `MEMORY.md` is private to the owner. A guest
     /// prompt must not surface it under any section header. The owner
     /// prompt does — the test creates a workspace with MEMORY.md, then
     /// builds both the owner prompt and the guest prompt and asserts only
@@ -1623,7 +1623,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Plan 450: `IdentitySection` directly — assert it omits the
+    /// Tests `IdentitySection` directly — assert it omits the
     /// "USER.md" header when `skip_owner_files` is true, even if the file
     /// does not exist on disk. The not-found marker is also owner-private.
     #[test]

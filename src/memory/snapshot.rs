@@ -173,7 +173,7 @@ pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
 /// construction and asks for less at the call site: `MarkdownMemory` owns
 /// `MEMORY.md` directly and projecting there would write it twice, while
 /// `none` has no `brain.db` to project from. (`postgres` was retired in
-/// v0.32.0-alpha together with the `[storage]` section, see plan 452.)
+/// v0.32.0-alpha together with the `[storage]` section.)
 ///
 /// Best-effort, like the projection everywhere else: a failure here must not
 /// fail the write that already succeeded.

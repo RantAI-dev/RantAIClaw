@@ -6,10 +6,8 @@
 //! retired `markdown` backend is loaded under the current schema. The
 //! legacy external-import path (`pub mod openclaw`) was removed together
 //! with the `rantaiclaw migrate` command — do not reintroduce that command
-//! without also reintroducing this module's former siblings.
-//!
-//! See plan 469 (the `migrate` command removal) and plan 451 (the markdown
-//! backend retirement, which made this glue necessary).
+//! without also reintroducing this module's former siblings. The markdown
+//! backend retirement is what made this glue necessary.
 
 use anyhow::Result;
 use std::fs;

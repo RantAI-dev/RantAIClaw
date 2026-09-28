@@ -44,10 +44,7 @@ impl CommandHandler for PermissionsCommand {
         // No arg → render current state.
         if args.is_empty() {
             return match load_config() {
-                Ok(config) => Ok(CommandResult::Message(permissions::render(
-                    &config,
-                    &config.autonomy.auto_approve,
-                ))),
+                Ok(config) => Ok(CommandResult::Message(permissions::render(&config))),
                 Err(e) => Ok(CommandResult::Message(format!(
                     "✗ Could not load config: {e}"
                 ))),

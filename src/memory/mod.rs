@@ -257,7 +257,7 @@ pub fn create_memory(
 /// Factory: create memory with no embedding routes.
 ///
 /// The `[storage]` section used to carry a per-config backend override
-/// (`storage.provider.config.provider`); plan 452 retired the section together
+/// (`storage.provider.config.provider`); that section was retired together
 /// with `postgres`, so the override is gone and the backend name now comes
 /// from `memory.backend` only. Kept as a thin wrapper so call sites that
 /// previously used the override path do not have to switch to `create_memory`.

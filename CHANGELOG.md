@@ -96,8 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only `file_read` and `memory_recall` that `auto_approve` previously
   granted. An operator who wants a guest to be able to read files or recall
   memory must list those tools in `guest_allowed_tools`. **This narrows
-  behaviour operators may have relied on**; a fresh install is unaffected
-  because `guest_allowed_tools` defaults to empty anyway.
+  behaviour every install relies on**, including a fresh one: the default
+  `autonomy.auto_approve` (`file_read`, `memory_recall`) no longer reaches
+  guests, since `guest_allowed_tools` defaults to empty.
+- `permissions show`, the `manage_permissions` tool, and the TUI `/permissions`
+  summary now list a guest's tools from `guest_allowed_tools` (or "no tools
+  (chat only)" when it is empty), instead of claiming guests always get the
+  read-only `auto_approve` tools.
 - Guests no longer see the owner's profile (`USER.md`), notes (`MEMORY.md`), or other chats' memory. A guest who is allowed `memory_recall` only sees the conversation they are in. A guest who is allowed `file_read`/`file_write`/`pdf_read`/`image_info` is still blocked from reading those private files. When `approval_owners` is empty, every sender is a guest; set `approval_owners` to restore ownership. `rantaiclaw doctor` now warns when no owner is configured. A guest's prompt no longer carries `BOOTSTRAP.md` or the owner's name and timezone. `file_read`, `file_write`, `pdf_read`, and `image_info` now also refuse the owner's private files after resolving the path, so a symlink, an editor copy (`USER.md~`), or `MEMORY_SNAPSHOT.md` no longer gets through, and neither does anything under the workspace `memory/` directory. Under a guest turn, `memory_store`'s `replaces` and `memory_forget` only see the guest's own conversation's notes; they cannot probe or delete another conversation's notes by substring or key.
 - `image_info` now resolves a relative path against the workspace, matching `file_read`; it previously resolved against the process's working directory.
 - A persona with an empty timezone no longer renders `(timezone: )`, and the executive-assistant preset drops its timezone-scheduling line when no timezone is set.

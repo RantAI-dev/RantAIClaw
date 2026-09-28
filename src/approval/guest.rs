@@ -195,7 +195,7 @@ fn is_shell_tool(tool: &str) -> bool {
     matches!(tool, "shell" | "bash" | "run_command")
 }
 
-/// Tools whose calls reach the workspace on a path argument. Plan 450 keeps
+/// Tools whose calls reach the workspace on a path argument. This keeps
 /// a guest from reading the owner's profile (`USER.md`) or notes
 /// (`MEMORY.md`) directly even when the operator lists one of these tools in
 /// `guest_allowed_tools`. The dispatch makes sure `USER.md` and `MEMORY.md`
@@ -314,7 +314,7 @@ mod tests {
         assert!(g.tool_permitted("web_search")); // explicit guest tool
         assert!(g.tool_permitted("shell")); // explicit guest tool
                                             // The always-safe tools are NOT in `guest_allowed_tools` and must stay
-                                            // denied for guests — this is the whole point of plan 449.
+                                            // denied for guests — this is the whole point of the guest ceiling.
         assert!(!g.tool_permitted("file_read"));
         assert!(!g.tool_permitted("memory_recall"));
         assert!(!g.tool_permitted("file_write")); // not allowed
@@ -523,7 +523,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────
-    // Plan 450: private-path rule. The owner's profile (`USER.md`) and
+    // Private-path rule. The owner's profile (`USER.md`) and
     // notes (`MEMORY.md`) are owner-private even when the operator
     // adds the path tools to `guest_allowed_tools`. The dispatch also
     // skips those files in the guest prompt, so a guest should never

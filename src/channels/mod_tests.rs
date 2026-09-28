@@ -5237,8 +5237,8 @@ fn route_override_key_follows_the_conversation_not_the_person() {
 /// The chat id picks the chat type: positive is a one-to-one chat (Telegram's
 /// `private`), negative is a group or supergroup. Without `chat.type` set the
 /// parser's `is_direct` falls through to `false` and a fixture described as a
-/// DM is treated as a group, which the plan 453 catalog and prompt would then
-/// disagree with.
+/// DM is treated as a group, which the DM-detection catalog and prompt would
+/// then disagree with.
 fn telegram_update(message_id: i64, chat: i64, topic: Option<i64>) -> serde_json::Value {
     let chat_type = if chat > 0 { "private" } else { "supergroup" };
     let mut message = serde_json::json!({
