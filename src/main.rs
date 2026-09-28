@@ -114,7 +114,7 @@ pub use rantaiclaw::{HardwareCommands, PeripheralCommands};
 /// `RantaiClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
 #[command(name = "rantaiclaw")]
-#[command(author = "theonlyhennygod")]
+#[command(author = "RantAI")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 #[command(subcommand_required = false)]
