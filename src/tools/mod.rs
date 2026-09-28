@@ -30,6 +30,42 @@ the workspace directory; [autonomy].workspace_only and [autonomy].forbidden_path
 in config.toml control this. Move the file into the workspace, or have an operator \
 relax those settings.";
 
+/// Denial message for a **canonicalised** path a guest's conversation-scoped
+/// turn (`MemoryView::Only`) may not reach, or `None` when the turn carries no
+/// such view or the path is not private.
+///
+/// `approval::guest::is_private_owner_path` runs on the string a caller asked
+/// for, before a file tool resolves it — a symlink, an editor backup name
+/// (`USER.md~`), or the snapshot file's real path can slip past that string
+/// rule while still pointing at the same private content. `file_read`,
+/// `file_write`, `pdf_read` and `image_info` all call this once they have a
+/// resolved path, closing that bypass. Owner turns and turns without a view
+/// never reach this: `current_memory_view()` is `None` or `All` for them.
+pub(crate) async fn guest_private_path_denial(
+    resolved_path: &std::path::Path,
+    workspace_dir: &std::path::Path,
+) -> Option<String> {
+    match crate::memory::current_memory_view() {
+        Some(crate::memory::MemoryView::Only(_)) => {}
+        _ => return None,
+    }
+    // The workspace itself may be reached through a symlink (a temp dir on
+    // some platforms), so canonicalise it too — otherwise `strip_prefix`
+    // inside `is_private_owner_path_resolved` fails and every path is let
+    // through.
+    let canonical_workspace = tokio::fs::canonicalize(workspace_dir)
+        .await
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    if crate::approval::guest::is_private_owner_path_resolved(resolved_path, &canonical_workspace) {
+        Some(
+            "This file is private to the owner and is not reachable from this conversation."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 pub mod author_skill;
 pub mod browser;
 pub mod browser_open;

@@ -673,11 +673,15 @@ pub(crate) async fn process_channel_message(
     // Re-render the persona section too, from `persona.toml` fresh, so a
     // `PUT /api/v1/personality` reaches an already-running channel listener
     // without a restart — the same per-message in-memory splice the safety
-    // section uses (`ctx.system_prompt` is built once at channel start).
-    let base_prompt = crate::agent::prompt::replace_persona_section(
-        &base_prompt,
-        &crate::agent::prompt::render_persona_section(),
-    );
+    // section uses (`ctx.system_prompt` is built once at channel start). A
+    // guest turn gets the guest render: the owner's name and timezone must
+    // not reach a non-owner sender.
+    let persona_section = if sender_is_owner {
+        crate::agent::prompt::render_persona_section()
+    } else {
+        crate::agent::prompt::render_guest_persona_section()
+    };
+    let base_prompt = crate::agent::prompt::replace_persona_section(&base_prompt, &persona_section);
     // The channel declares its own media support. A channel that cannot deliver
     // an attachment must not be told it can, or the model emits markers that
     // reach the user as literal text. Bound here rather than inline because the

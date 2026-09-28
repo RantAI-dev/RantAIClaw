@@ -12,6 +12,7 @@
 //! restriction" (owner, CLI, or console-authenticated user).
 
 use std::collections::HashSet;
+use std::path::Path;
 
 /// The capability ceiling applied to a single non-owner ("guest") turn.
 #[derive(Debug, Clone)]
@@ -214,15 +215,51 @@ fn is_private_owner_path(path: &str) -> bool {
     }
     let normalized = path.replace('\\', "/");
     let lowered = normalized.to_ascii_lowercase();
-    // Last component is `MEMORY.md` or `USER.md`, case-insensitive. ".//USER.md"
-    // and "/foo/USER.md" both have `USER.md` as their last segment.
+    // Last component is `MEMORY.md`, `USER.md`, `BOOTSTRAP.md`, or
+    // `MEMORY_SNAPSHOT.md`, case-insensitive. ".//USER.md" and
+    // "/foo/USER.md" both have `USER.md` as their last segment.
     let last = lowered.rsplit('/').next().unwrap_or("");
-    if matches!(last, "memory.md" | "user.md") {
+    if matches!(
+        last,
+        "memory.md" | "user.md" | "bootstrap.md" | "memory_snapshot.md"
+    ) {
         return true;
     }
     // Any `memory` path component catches the day's `memory/brain.db`,
     // `memory/2026-09-01.md`, etc. The owner keeps those; a guest does not.
     lowered.split('/').any(|seg| seg == "memory")
+}
+
+/// True when a **canonicalised** path must be denied under a guest's
+/// conversation-scoped memory view (`MemoryView::Only`).
+///
+/// [`is_private_owner_path`] runs on the string the model asked for, before a
+/// file tool resolves it — a symlink, an editor backup name (`USER.md~`), or
+/// the snapshot file's real path can slip past that string rule while still
+/// pointing at the same private content. This is the second check, run after
+/// canonicalisation, so those bypasses are still caught.
+///
+/// `canonical_workspace` must itself be canonicalised (a temp-dir workspace
+/// is often reached through a symlink), or `strip_prefix` fails and every
+/// path is quietly let through.
+pub fn is_private_owner_path_resolved(resolved: &Path, canonical_workspace: &Path) -> bool {
+    if let Ok(rel) = resolved.strip_prefix(canonical_workspace) {
+        if rel
+            .components()
+            .next()
+            .is_some_and(|c| c.as_os_str() == "memory")
+        {
+            return true;
+        }
+    }
+
+    let Some(name) = resolved.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lowered = name.to_ascii_lowercase();
+    let stripped = lowered.strip_prefix('.').unwrap_or(&lowered);
+    const PRIVATE_STEMS: &[&str] = &["memory.md", "user.md", "bootstrap.md", "memory_snapshot.md"];
+    PRIVATE_STEMS.iter().any(|stem| stripped.starts_with(stem))
 }
 
 /// Anchored glob match supporting `*` (matches any run of characters, incl.
@@ -539,6 +576,19 @@ mod tests {
     }
 
     #[test]
+    fn guest_path_tool_blocked_on_bootstrap_and_snapshot() {
+        let g = GuestGate::new(&["file_read".to_string()], &[]);
+        let r = g
+            .deny_reason("file_read", &json!({"path": "BOOTSTRAP.md"}))
+            .unwrap_or_else(|| panic!("file_read on BOOTSTRAP.md must deny"));
+        assert!(r.contains("private to the owner"), "{r}");
+        let r2 = g
+            .deny_reason("file_read", &json!({"path": "MEMORY_SNAPSHOT.md"}))
+            .unwrap_or_else(|| panic!("file_read on MEMORY_SNAPSHOT.md must deny"));
+        assert!(r2.contains("private to the owner"), "{r2}");
+    }
+
+    #[test]
     fn guest_path_tool_allowed_on_non_private_paths() {
         let g = GuestGate::new(&["file_read".to_string()], &[]);
         // Plain files in the workspace stay readable when allowlisted.
@@ -555,6 +605,54 @@ mod tests {
         assert!(g
             .deny_reason("file_read", &json!({"path": "team_memory.md"}))
             .is_none());
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // The post-canonicalisation check. `is_private_owner_path` matches the
+    // string a caller asked for; this one matches the real, resolved path
+    // a symlink or editor-backup name points at.
+    #[test]
+    fn resolved_path_denies_files_under_the_memory_dir() {
+        let workspace = Path::new("/ws");
+        assert!(is_private_owner_path_resolved(
+            &workspace.join("memory/2026-09-26.md"),
+            workspace
+        ));
+    }
+
+    #[test]
+    fn resolved_path_denies_private_stems_case_insensitively() {
+        let workspace = Path::new("/ws");
+        for name in ["USER.md", "memory.md", "BOOTSTRAP.md", "MEMORY_SNAPSHOT.md"] {
+            assert!(
+                is_private_owner_path_resolved(&workspace.join(name), workspace),
+                "{name} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_path_denies_editor_backup_and_swap_names() {
+        let workspace = Path::new("/ws");
+        for name in ["USER.md~", ".USER.md.swp", "USER.md.bak"] {
+            assert!(
+                is_private_owner_path_resolved(&workspace.join(name), workspace),
+                "{name} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_path_allows_ordinary_files() {
+        let workspace = Path::new("/ws");
+        assert!(!is_private_owner_path_resolved(
+            &workspace.join("README.md"),
+            workspace
+        ));
+        assert!(!is_private_owner_path_resolved(
+            &workspace.join("notes.txt"),
+            workspace
+        ));
     }
 
     #[test]

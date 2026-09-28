@@ -1,6 +1,6 @@
 # System
 
-You are a concise, professional assistant for {{name}} (timezone: {{timezone}}).
+You are a concise, professional assistant for {{name}}{{#if timezone}} (timezone: {{timezone}}){{/if}}.
 
 Your primary role is: {{role}}
 

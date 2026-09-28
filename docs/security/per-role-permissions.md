@@ -24,9 +24,16 @@ run arbitrary privileged tools." This is the feature.
     (globs, same matcher as the existing command allowlist) — **out-of-list =
     hard deny**, never escalated to the owner.
   - Guests never see the owner's profile (`USER.md`) or notes (`MEMORY.md`) in
-    the system prompt. A guest who is allowed `file_read`, `file_write`,
+    the system prompt, and a guest's persona carries neither the owner's name
+    nor the owner's timezone. A guest who is allowed `file_read`, `file_write`,
     `pdf_read`, or `image_info` is still denied access to `MEMORY.md`,
-    `USER.md`, and anything under `memory/`.
+    `USER.md`, `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, and anything under
+    `memory/`; the check runs again after the path is resolved, so a symlink
+    or an editor copy of a private file is denied too. A guest's
+    `memory_store` `replaces` and `memory_forget` stay inside that guest's own
+    conversation. This guest path rule covers only RantaiClaw's own tools; an
+    MCP filesystem tool reaches a guest only when an operator grants it, and
+    is not subject to this rule.
 - **Secure default:** empty `approval_owners` ⇒ everyone is a guest; empty
   `guest_allowed_*` ⇒ guests get only chat, the agent calls no tool on a
   guest's behalf. Nobody gets privileged capability until an owner opts them
