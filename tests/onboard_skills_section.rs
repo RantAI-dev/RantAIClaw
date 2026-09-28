@@ -414,7 +414,7 @@ async fn clawhub_install_one_writes_real_skill_body() {
     let content = std::fs::read(&installed).expect("SKILL.md must exist");
     assert_eq!(content, body, "installed SKILL.md must match upstream body");
     assert!(
-        !String::from_utf8_lossy(&content).starts_with("# demo skill\n\nReal") == false,
+        String::from_utf8_lossy(&content).starts_with("# demo skill\n\nReal"),
         "content {:?}",
         String::from_utf8_lossy(&content)
     );

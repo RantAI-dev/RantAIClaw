@@ -198,8 +198,7 @@ impl<'a> Inventory<'a> {
 /// `…+N` if items had to be dropped. Mirrors Hermes' `truncLine` helper.
 fn truncate_items(items: &[&str], budget: usize) -> String {
     let mut out = String::new();
-    let mut shown = 0usize;
-    for item in items {
+    for (shown, item) in items.iter().enumerate() {
         let next = if out.is_empty() {
             item.to_string()
         } else {
@@ -213,7 +212,6 @@ fn truncate_items(items: &[&str], budget: usize) -> String {
             };
         }
         out = next;
-        shown += 1;
     }
     out
 }

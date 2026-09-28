@@ -1393,7 +1393,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "tui")]
         {
             use rantaiclaw::tui::{run_tui, TuiConfig};
-            return run_tui(TuiConfig::default()).await;
+            return Box::pin(run_tui(TuiConfig::default())).await;
         }
         #[cfg(not(feature = "tui"))]
         {
@@ -1520,7 +1520,7 @@ async fn main() -> Result<()> {
 
     let log_file = if stdout_is_tty && !force_stderr {
         let log_dir = rantaiclaw::profile::paths::rantaiclaw_root().join("logs");
-        std::fs::create_dir_all(&log_dir).ok().and_then(|_| {
+        std::fs::create_dir_all(&log_dir).ok().and_then(|()| {
             let date = chrono::Utc::now().format("%Y-%m-%d");
             std::fs::OpenOptions::new()
                 .create(true)
@@ -1673,7 +1673,7 @@ async fn main() -> Result<()> {
                 setup_provisioner: Some(topic.unwrap_or_default()),
                 ..Default::default()
             };
-            run_tui(tui_config).await?;
+            Box::pin(run_tui(tui_config)).await?;
             return Ok(());
         }
         #[cfg(not(feature = "tui"))]
@@ -1738,7 +1738,7 @@ async fn main() -> Result<()> {
         }?;
         // Auto-start channels if user said yes during wizard
         if std::env::var("RANTAICLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
-            run_channels_until_signal(config).await?;
+            Box::pin(run_channels_until_signal(config)).await?;
         }
         return Ok(());
     }
@@ -1843,7 +1843,7 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        }) => agent::run(
+        }) => Box::pin(agent::run(
             config,
             message,
             provider,
@@ -1852,7 +1852,7 @@ async fn main() -> Result<()> {
             peripheral,
             "cli",
             false,
-        )
+        ))
         .await
         .map(|_| ()),
 
@@ -2179,7 +2179,7 @@ async fn main() -> Result<()> {
         },
 
         Some(Commands::Channel { channel_command }) => match channel_command {
-            ChannelCommands::Start => run_channels_until_signal(config).await,
+            ChannelCommands::Start => Box::pin(run_channels_until_signal(config)).await,
             ChannelCommands::Run => {
                 // Friendly banner so users arriving from the TUI's wizard
                 // know exactly what they ran and how to stop it. The actual
@@ -2196,7 +2196,7 @@ async fn main() -> Result<()> {
                 println!("   Tip: to keep polling after closing this terminal:");
                 println!("        nohup rantaiclaw channels run > rantaiclaw-channels.log 2>&1 &");
                 println!("        (or `systemd-run --user --unit=rantaiclaw-channels rantaiclaw channels run`)");
-                run_channels_until_signal(config).await
+                Box::pin(run_channels_until_signal(config)).await
             }
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
@@ -2204,7 +2204,7 @@ async fn main() -> Result<()> {
 
         Some(Commands::Permissions {
             permissions_command,
-        }) => handle_permissions_command(permissions_command, config).await,
+        }) => Box::pin(handle_permissions_command(permissions_command, config)).await,
 
         Some(Commands::Integrations {
             integration_command,
@@ -2262,7 +2262,7 @@ async fn main() -> Result<()> {
                     } else {
                         Some(tui_config.model.clone())
                     };
-                    let response = agent::loop_::run(
+                    let response = Box::pin(agent::loop_::run(
                         config.clone(),
                         Some(msg),
                         None,
@@ -2273,7 +2273,7 @@ async fn main() -> Result<()> {
                         // The caller owns the print for this surface, so the
                         // loop must not print the reply too.
                         true,
-                    )
+                    ))
                     .await?;
                     if !response.is_empty() {
                         println!("{response}");
@@ -2281,7 +2281,7 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                run_tui(tui_config).await?;
+                Box::pin(run_tui(tui_config)).await?;
             }
             #[cfg(not(feature = "tui"))]
             {
@@ -2675,7 +2675,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             let code = match auth::openai_oauth::receive_loopback_code(
                 &pkce.state,
-                std::time::Duration::from_secs(180),
+                std::time::Duration::from_mins(3),
             )
             .await
             {
@@ -3315,54 +3315,50 @@ async fn run_provisioner_headless(
     let timed = {
         let prov_future = provisioner.run(config, profile, io);
         tokio::pin!(prov_future);
-        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        tokio::time::timeout(std::time::Duration::from_mins(2), async {
             tokio::join!(prov_future, render_loop)
         })
         .await
     };
 
-    let mut needs_daemon_reload = false;
-    match timed {
-        Ok((prov_result, _)) => {
-            match prov_result {
-                // An installer or CI job can only tell success from failure by
-                // exit code, so a provisioner that did not configure anything
-                // must not return `Ok`. The caller saves the config after this
-                // returns, so failing here is also what makes "nothing saved"
-                // true rather than merely printed.
-                Err(e) => {
-                    eprintln!("\n❌ provisioner error: {e}");
-                    return Err(e.context(format!("`setup {prov_name}` failed")));
-                }
-                // Nothing was configured, so nothing gets installed — the skill
-                // would otherwise be left behind as a false "channel is set up"
-                // signal for a provisioner that bailed on a missing field.
-                Ok(onboard::provision::ProvisionOutcome::Aborted(reason)) => {
-                    eprintln!("\n⏹️  provisioner stopped, nothing saved: {reason}");
-                    anyhow::bail!("`setup {prov_name}` configured nothing: {reason}");
-                }
-                // A configured multi-user channel is the point at which the
-                // owner needs to be able to manage permissions from chat.
-                Ok(onboard::provision::ProvisionOutcome::Configured) => {
-                    if let Some(reason) = unusable_provider_after_headless_setup(&prov_name, config)
-                    {
-                        eprintln!("\n❌ {reason}");
-                        anyhow::bail!("{reason}");
-                    }
-                    let finalize =
-                        onboard::provision::finalize_channel(provisioner_category, profile, config);
-                    if let Some(guidance) = finalize.owner_guidance {
-                        eprintln!("\n🔐 {guidance}");
-                    }
-                    needs_daemon_reload = finalize.needs_daemon_reload;
-                }
+    let needs_daemon_reload = match timed {
+        Ok((prov_result, ())) => match prov_result {
+            // An installer or CI job can only tell success from failure by
+            // exit code, so a provisioner that did not configure anything
+            // must not return `Ok`. The caller saves the config after this
+            // returns, so failing here is also what makes "nothing saved"
+            // true rather than merely printed.
+            Err(e) => {
+                eprintln!("\n❌ provisioner error: {e}");
+                return Err(e.context(format!("`setup {prov_name}` failed")));
             }
-        }
+            // Nothing was configured, so nothing gets installed — the skill
+            // would otherwise be left behind as a false "channel is set up"
+            // signal for a provisioner that bailed on a missing field.
+            Ok(onboard::provision::ProvisionOutcome::Aborted(reason)) => {
+                eprintln!("\n⏹️  provisioner stopped, nothing saved: {reason}");
+                anyhow::bail!("`setup {prov_name}` configured nothing: {reason}");
+            }
+            // A configured multi-user channel is the point at which the
+            // owner needs to be able to manage permissions from chat.
+            Ok(onboard::provision::ProvisionOutcome::Configured) => {
+                if let Some(reason) = unusable_provider_after_headless_setup(&prov_name, config) {
+                    eprintln!("\n❌ {reason}");
+                    anyhow::bail!("{reason}");
+                }
+                let finalize =
+                    onboard::provision::finalize_channel(provisioner_category, profile, config);
+                if let Some(guidance) = finalize.owner_guidance {
+                    eprintln!("\n🔐 {guidance}");
+                }
+                finalize.needs_daemon_reload
+            }
+        },
         Err(_) => {
             eprintln!("\nTimeout waiting for provisioning. The pairing session is still active — run again to retry.");
             anyhow::bail!("`setup {prov_name}` timed out after 120s");
         }
-    }
+    };
 
     Ok(needs_daemon_reload)
 }

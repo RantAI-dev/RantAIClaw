@@ -88,7 +88,6 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
 ///
 /// Fails closed: an unresolvable target (missing file, canonicalize error) is
 /// not sendable.
-
 fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {

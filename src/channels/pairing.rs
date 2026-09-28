@@ -18,6 +18,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Which per-channel allowlist field a successful pairing appends to.
+#[allow(
+    clippy::enum_variant_names,
+    reason = "variants mirror the per-channel config field names (`allowed_users`, `allowed_numbers`, `allowed_from`, `allowed_senders`, `allowed_contacts`); dropping the prefix loses the call-site -> field mapping"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllowlistField {
     /// `allowed_users` — telegram/discord/slack/mattermost/matrix/irc/lark/
@@ -70,10 +74,9 @@ pub fn parse_pairing_command(text: &str) -> Option<PairingCommand> {
     let trimmed = text.trim();
     let (owner, rest) = if let Some(rest) = trimmed.strip_prefix("/claim") {
         (true, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("/bind") {
-        (false, rest)
     } else {
-        return None;
+        let rest = trimmed.strip_prefix("/bind")?;
+        (false, rest)
     };
     // Require whitespace between the verb and the code so `/claimfoo` (a single
     // token) isn't mistaken for a command. An exact `/claim` / `/bind` with no

@@ -115,6 +115,10 @@ impl FirstRunWizard {
     /// the user's re-selection starts from a clean slate — otherwise stale
     /// items from the previous picker selection would replay before the new
     /// ones.
+    #[allow(
+        clippy::never_loop,
+        reason = "known Back-navigation bug — every match arm `return`s on the first iteration; fixing the loop-vs-return shape is its own change"
+    )]
     pub fn back(&mut self) -> bool {
         while let Some(prev) = self.history.pop() {
             match prev {

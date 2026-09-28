@@ -1165,7 +1165,7 @@ pub(crate) fn configured_channel_count(config: &Config) -> usize {
 /// Canonical channel roster: `(display label, configured?)` for every channel
 /// type in a stable order, derived from [`CHANNEL_CATALOG`] rather than
 /// maintained beside it.
-
+///
 /// Build and run the channel runtime until every listener exits or
 /// `shutdown` is cancelled.
 ///

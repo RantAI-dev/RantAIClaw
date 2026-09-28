@@ -377,7 +377,11 @@ impl SetupOverlayState {
         let raw_choose_h: u16 = self
             .choose
             .as_ref()
-            .map(|c| (c.options.len() as u16).saturating_add(4)) // section + headline + rule + spacer
+            .map(|c| {
+                u16::try_from(c.options.len())
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(4)
+            }) // section + headline + rule + spacer
             .unwrap_or(0);
         let fixed_chrome: u16 = 2 + 1 + 1 + 1 + 3 + 1 + 1; // see comment above
         let max_interactive_h = outer.height.saturating_sub(fixed_chrome);
@@ -746,7 +750,7 @@ impl SetupOverlayState {
             }
         }
 
-        self.last_content_height = content_lines.len() as u16;
+        self.last_content_height = u16::try_from(content_lines.len()).unwrap_or(u16::MAX);
         self.last_viewport_height = chunks[2].height;
         let max_scroll = self
             .last_content_height
@@ -1329,5 +1333,19 @@ mod tests {
         .min()
         .unwrap_or(after.len());
         Some(&after[..end])
+    }
+}
+
+#[cfg(test)]
+mod saturating_cast_tests {
+    /// Mirrors the saturating `usize -> u16` conversions the overlay uses for
+    /// option-list and content heights. A `usize::MAX` input must clamp to
+    /// `u16::MAX` rather than wrap, otherwise `saturating_sub` on the wrapped
+    /// value would wrongly report "space available".
+    #[test]
+    fn usize_max_content_height_clamps_to_u16_max() {
+        let content_len = usize::MAX;
+        let clamped = u16::try_from(content_len).unwrap_or(u16::MAX);
+        assert_eq!(clamped, u16::MAX);
     }
 }

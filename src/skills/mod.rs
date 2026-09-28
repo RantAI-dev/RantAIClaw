@@ -105,7 +105,7 @@ impl Skill {
 /// * `npm`    — `npm install -g <pkg>` (or pnpm/yarn per `nodeManager`).
 /// * `uv`     — `uv tool install <pkg>` (Python tools).
 /// * `go`     — `go install <module>`. If `go` itself is missing AND
-///              brew is available, the runner bootstraps Go via brew.
+///   brew is available, the runner bootstraps Go via brew.
 /// * `download` — fetch URL, optionally extract, drop in `targetDir`.
 ///
 /// Per ClawHub convention, each recipe MAY have an `os: ["linux"|"darwin"|...]`
@@ -170,7 +170,7 @@ impl SkillInstallRecipe {
 
 /// OpenClaw / ClawHub-format declared dependencies for a skill. Mirrors the
 /// `metadata.clawdbot.requires` shape used by ClawHub-published skills:
-///   metadata: {"clawdbot":{"requires":{"bins":["curl","gh"]},"os":["linux","darwin"]}}
+///   metadata: {`clawdbot`:`{requires:{bins:["curl","gh"]},os:["linux","darwin"]}`}
 /// plus the YAML-block `env:` style used by skills like `freeride`:
 ///   env:
 ///     - name: OPENROUTER_API_KEY
@@ -1088,10 +1088,13 @@ fn parse_skill_metadata(
                                 .get("archive")
                                 .and_then(|v| v.as_str())
                                 .map(String::from);
+                            // Saturating u64 -> usize: on 64-bit targets the cast
+                            // cannot truncate, so the only fallback that can fire is
+                            // an absurd u64 that overflows even a 64-bit usize.
                             recipe.strip_components = entry
                                 .get("stripComponents")
                                 .and_then(|v| v.as_u64())
-                                .map(|n| n as usize);
+                                .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
                             recipe.target_dir = entry
                                 .get("targetDir")
                                 .and_then(|v| v.as_str())

@@ -82,6 +82,13 @@ pub fn looks_running() -> bool {
         if now_unix().saturating_sub(since_unix) >= 5)
 }
 
+// Suppress dead-code warnings for the `Instant` import in case future
+// instrumentation wants to use it for span timing without re-importing.
+#[allow(dead_code)]
+fn _instant_witness() -> Instant {
+    Instant::now()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,11 +119,4 @@ mod tests {
         mark_terminated();
         assert!(matches!(snapshot(), AutoStartState::Terminated { .. }));
     }
-}
-
-// Suppress dead-code warnings for the `Instant` import in case future
-// instrumentation wants to use it for span timing without re-importing.
-#[allow(dead_code)]
-fn _instant_witness() -> Instant {
-    Instant::now()
 }

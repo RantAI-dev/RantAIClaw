@@ -828,7 +828,7 @@ fn set_schema_version(raw: &mut Value, version: u32) -> Result<()> {
         .context("config.toml root is not a table; cannot stamp schema_version")?;
     table.insert(
         SCHEMA_VERSION_KEY.to_string(),
-        Value::Integer(version as i64),
+        Value::Integer(i64::from(version)),
     );
     Ok(())
 }
@@ -932,7 +932,7 @@ backend = \"markdown\"
             !migrated,
             "current-version config should not be transformed"
         );
-        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
     }
 
     #[test]
@@ -1061,7 +1061,7 @@ backend = \"markdown\"
         // migrate() always stamps to CURRENT_VERSION (the chain can't stop at an
         // intermediate version); the v2→v3 step is the additive autonomous_tools
         // field, which must not be injected by the migration.
-        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let cc = v.get("channels_config").unwrap().as_table().unwrap();
         assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
         assert!(
@@ -1079,7 +1079,7 @@ backend = \"markdown\"
         let mut v = parse("schema_version = 7\n[autonomy]\nlevel = \"full\"\n");
         let migrated = migrate(&mut v).unwrap();
         assert!(migrated, "v7 bump should be reported as transformed");
-        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let autonomy = v.get("autonomy").unwrap().as_table().unwrap();
         assert_eq!(
             autonomy.get("level").unwrap().as_str(),
@@ -1114,7 +1114,7 @@ backend = \"markdown\"
         let mut v = parse("schema_version = 3\n[channels_config]\ncli = true\n");
         let migrated = migrate(&mut v).unwrap();
         assert!(migrated, "v3 bump should be reported as transformed");
-        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let cc = v.get("channels_config").unwrap().as_table().unwrap();
         assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
         assert!(
@@ -1164,7 +1164,7 @@ backend = \"markdown\"
         assert!(version_of(&v).is_none());
         let migrated = migrate(&mut v).unwrap();
         assert!(migrated, "pre-framework config should be transformed");
-        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         // Existing content must survive verbatim.
         let other = v.get("other").unwrap().as_table().unwrap();
         assert_eq!(other.get("foo").unwrap().as_str(), Some("bar"));
@@ -1177,7 +1177,7 @@ backend = \"markdown\"
         assert!(first);
         let second = migrate(&mut v).unwrap();
         assert!(!second, "second pass must be a no-op");
-        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
     }
 
     #[test]

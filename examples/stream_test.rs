@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
                     first_chunk_at = Some(elapsed);
                 }
                 chunks_seen += 1;
-                eprintln!("[{elapsed:>5}ms] Chunk({:?}) len={}", &s, s.len());
+                eprintln!("[{elapsed:>5}ms] Chunk({:?}) len={}", s, s.len());
             }
             AgentEvent::Done {
                 final_text,

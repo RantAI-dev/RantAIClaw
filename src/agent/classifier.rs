@@ -14,7 +14,7 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
     let len = message.len();
 
     let mut rules: Vec<_> = config.rules.iter().collect();
-    rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
     for rule in rules {
         // Length constraints

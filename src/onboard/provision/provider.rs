@@ -423,12 +423,12 @@ impl TuiProvisioner for ProviderProvisioner {
                             reason = "Some(0) and Some(_) both re-prompt but document different cases: empty key vs unknown index"
                         )]
                         match choice.first().copied() {
-                            Some(0) => continue, // re-prompt for the key
-                            Some(1) => break,    // keep the rejected key
+                            Some(1) => break, // keep the rejected key
                             Some(2) | None => {
                                 anyhow::bail!("setup aborted by user after invalid API key");
                             }
-                            Some(_) => continue, // unknown index — safest is to re-prompt
+                            // Some(0) or unknown index — fall through and re-prompt.
+                            Some(_) => {}
                         }
                     }
                     Err(e) => {

@@ -504,7 +504,7 @@ impl InfoPanel {
                 }
             }
         }
-        max.min(28).max(10)
+        max.clamp(10, 28)
     }
 }
 

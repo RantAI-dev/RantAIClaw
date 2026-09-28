@@ -5607,7 +5607,7 @@ async fn a_turn_still_running_at_the_drain_deadline_gets_one_restart_notice() {
     let ctx = dispatch_ctx(
         vec![channel],
         Arc::new(SlowProvider {
-            delay: Duration::from_secs(600),
+            delay: Duration::from_mins(10),
         }),
         routing::RuntimeConfigSlot::default(),
     );
@@ -5650,7 +5650,7 @@ async fn a_turn_stopped_by_the_drain_is_recorded_as_interrupted() {
     let ctx = dispatch_ctx(
         vec![channel],
         Arc::new(SlowProvider {
-            delay: Duration::from_secs(600),
+            delay: Duration::from_mins(10),
         }),
         routing::RuntimeConfigSlot::default(),
     );
@@ -5749,7 +5749,7 @@ async fn a_turn_the_drain_reached_before_it_began_records_nothing() {
     let ctx = dispatch_ctx(
         vec![channel],
         Arc::new(SlowProvider {
-            delay: Duration::from_secs(600),
+            delay: Duration::from_mins(10),
         }),
         routing::RuntimeConfigSlot::default(),
     );
@@ -5784,7 +5784,7 @@ async fn messages_not_started_when_the_token_fires_get_the_restart_notice() {
     let ctx = dispatch_ctx(
         vec![channel],
         Arc::new(SlowProvider {
-            delay: Duration::from_secs(600),
+            delay: Duration::from_mins(10),
         }),
         routing::RuntimeConfigSlot::default(),
     );
@@ -5877,7 +5877,7 @@ async fn the_runtime_closes_channels_only_after_dispatch_has_finished() {
     let ctx = dispatch_ctx(
         vec![Arc::clone(&channel)],
         Arc::new(SlowProvider {
-            delay: Duration::from_secs(600),
+            delay: Duration::from_mins(10),
         }),
         routing::RuntimeConfigSlot::default(),
     );
@@ -5926,7 +5926,7 @@ impl Provider for CallCountingProvider {
         _temperature: f64,
     ) -> anyhow::Result<String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_secs(600)).await;
+        tokio::time::sleep(Duration::from_mins(10)).await;
         Ok(format!("echo: {message}"))
     }
 }
@@ -5990,7 +5990,7 @@ async fn a_conversation_gets_one_restart_notice_however_many_messages_it_had() {
     let ctx = dispatch_ctx(
         vec![channel],
         Arc::new(SlowProvider {
-            delay: Duration::from_secs(600),
+            delay: Duration::from_mins(10),
         }),
         routing::RuntimeConfigSlot::default(),
     );

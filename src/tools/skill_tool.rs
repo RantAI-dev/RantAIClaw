@@ -343,7 +343,7 @@ mod tests {
             ],
             prompts: vec![],
             location: None,
-            requires: Default::default(),
+            requires: crate::skills::SkillRequires::default(),
             install_recipes: Vec::new(),
             remote: false,
             origin: None,
