@@ -278,7 +278,8 @@ pub struct LarkChannel {
     /// Cached tenant access token
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Who this bot is, resolved once per listener start. `None` until
-    /// resolved, or permanently if the lookup failed.
+    /// resolved, or permanently if the lookup failed. In webhook mode the
+    /// receiving instance shares this cache (see `webhook_receiver`).
     bot_identity: Arc<RwLock<Option<BotIdentity>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
@@ -1771,6 +1772,24 @@ impl Channel for LarkChannel {
 }
 
 impl LarkChannel {
+    /// The instance that receives webhook callbacks. It shares this channel's
+    /// bot-identity cache, so an identity already resolved here is not fetched
+    /// again and one resolved by the receiver is visible here.
+    fn webhook_receiver(&self) -> Arc<LarkChannel> {
+        let mut receiver = LarkChannel::new(
+            self.app_id.clone(),
+            self.app_secret.clone(),
+            self.verification_token.clone(),
+            None,
+            self.allowed_users
+                .read()
+                .map(|u| u.clone())
+                .unwrap_or_default(),
+        );
+        receiver.bot_identity = Arc::clone(&self.bot_identity);
+        Arc::new(receiver)
+    }
+
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
     pub async fn listen_http(
@@ -1866,7 +1885,16 @@ impl LarkChannel {
             anyhow::anyhow!("Lark webhook mode requires `port` to be set in [channels_config.lark]")
         })?;
 
-        if let Ok(cfg) = crate::config::Config::load_or_init().await {
+        let Some(loaded) =
+            run_until_cancelled(&cancel, Box::pin(crate::config::Config::load_or_init())).await
+        else {
+            return Ok(());
+        };
+        // The one config read of this startup. Its `allow_public_bind` also
+        // decides the bind address below; a failed load keeps loopback.
+        let mut allow_public = false;
+        if let Ok(cfg) = loaded {
+            allow_public = cfg.gateway.allow_public_bind;
             let chat_shaped =
                 Self::warn_on_chat_shaped_owners(&cfg.channels_config.approval_owners);
             if !chat_shaped.is_empty() {
@@ -1912,20 +1940,19 @@ impl LarkChannel {
         }
 
         // The group addressing gate matches mentions against the bot's own
-        // identity, so resolve it on this receiving instance the way
-        // `listen_ws` does at startup. Failure warns and continues: DMs keep
-        // working and the gate already degrades to ignoring group messages.
-        let channel = Arc::new(LarkChannel::new(
-            self.app_id.clone(),
-            self.app_secret.clone(),
-            self.verification_token.clone(),
-            None,
-            self.allowed_users
-                .read()
-                .map(|u| u.clone())
-                .unwrap_or_default(),
-        ));
-        channel.ensure_bot_identity().await;
+        // identity, so resolve it the way `listen_ws` does at startup. The
+        // receiving instance shares the outer channel's identity cache, so an
+        // identity that is already resolved skips the fetch. Failure warns and
+        // continues: DMs keep working and the gate already degrades to ignoring
+        // group messages. Cancellation ends the fetch too, so a stop during
+        // startup does not wait for the Lark API.
+        let channel = self.webhook_receiver();
+        if run_until_cancelled(&cancel, channel.ensure_bot_identity())
+            .await
+            .is_none()
+        {
+            return Ok(());
+        }
 
         let state = AppState {
             verification_token: self.verification_token.clone(),
@@ -1951,11 +1978,6 @@ impl LarkChannel {
         // the same gate `run_gateway` applies. This endpoint used to bind
         // 0.0.0.0 unconditionally, so every interface served an endpoint that
         // authenticated nothing.
-        let allow_public = crate::config::Config::load_or_init()
-            .await
-            .map(|c| c.gateway.allow_public_bind)
-            .unwrap_or(false);
-
         let ip = if allow_public {
             std::net::Ipv4Addr::UNSPECIFIED
         } else {
@@ -1971,7 +1993,11 @@ impl LarkChannel {
         }
         tracing::info!("Lark event callback server listening on {addr}");
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let Some(bound) = run_until_cancelled(&cancel, tokio::net::TcpListener::bind(addr)).await
+        else {
+            return Ok(());
+        };
+        let listener = bound?;
         // Graceful shutdown is this mode's protocol teardown: in-flight event
         // callbacks finish and the port is released, instead of the future being
         // dropped mid-request and the socket lingering.
@@ -1980,6 +2006,22 @@ impl LarkChannel {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Run `fut`, giving up with `None` as soon as `cancel` fires.
+///
+/// `biased` and the cancellation branch first are load-bearing: without them
+/// `select!` picks a ready branch at random, so a token that is already
+/// cancelled could still lose to a step that completes at once.
+async fn run_until_cancelled<F: std::future::Future>(
+    cancel: &tokio_util::sync::CancellationToken,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        out = fut => Some(out),
     }
 }
 
@@ -2519,6 +2561,9 @@ mod tests {
             vec!["ou_testuser123".into()],
         );
         channel.receive_mode = crate::config::schema::LarkReceiveMode::Webhook;
+        // Seed the identity the receiving instance shares, so startup makes no
+        // request to the Lark API.
+        seed_bot_identity(&channel).await;
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -2539,6 +2584,48 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "a cancelled listener finished for a reason that is not a fault: {outcome:?}"
+        );
+    }
+
+    /// A startup step that never finishes (a stalled Lark API call, say) must
+    /// not keep the listener from stopping. Tests the helper `listen_http`
+    /// wraps each pre-serve await in, because the channel has no base-URL
+    /// override to point a real fetch at a silent server.
+    #[tokio::test]
+    async fn a_stalled_startup_step_stops_when_the_token_is_cancelled() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancel.cancel();
+            }
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_until_cancelled(&cancel, std::future::pending::<()>()),
+        )
+        .await
+        .expect("a cancelled token must end a startup step that never finishes");
+        assert!(outcome.is_none(), "cancellation wins over a pending step");
+    }
+
+    /// The webhook receiver resolves group mentions against the bot identity,
+    /// so it must start from the identity the outer channel already holds
+    /// instead of fetching its own from the Lark API.
+    #[tokio::test]
+    async fn the_webhook_receiver_reuses_the_seeded_bot_identity() {
+        let ch = make_channel();
+        seed_bot_identity(&ch).await;
+
+        let receiver = ch.webhook_receiver();
+
+        let held = receiver.bot_identity.read().await.clone();
+        assert_eq!(
+            held.map(|id| id.open_id).as_deref(),
+            Some("ou_rantaiclaw_bot"),
+            "the receiver must hold the seeded identity"
         );
     }
 
