@@ -876,8 +876,10 @@ pub(crate) async fn process_channel_message(
     // preset carried on the reloaded defaults. Without this the gate followed a
     // config change while the briefing kept describing the boot-time preset.
     //
-    // Guests run from `ctx.guest_system_prompt` (same builder, `USER.md` and
-    // `MEMORY.md` omitted). The persona and safety splice below applies to
+    // Guests run from `ctx.guest_system_prompt` (same builder, without the
+    // owner files `USER.md`, `MEMORY.md` and `TOOLS.md`, the host name, the
+    // absolute workspace path or the host timezone). The persona and safety
+    // splice below applies to
     // both — they are persona/safety, not profile/notes — and the rest of
     // dispatch branches on `sender_is_owner` for memory.
     let prompt_source = if sender_is_owner {
