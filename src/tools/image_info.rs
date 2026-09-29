@@ -184,6 +184,19 @@ impl Tool for ImageInfoTool {
             }
         };
 
+        // A workspace symlink can point outside; the string check above never
+        // sees where it lands.
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Resolved path escapes workspace: {}",
+                    resolved_path.display()
+                )),
+            });
+        }
+
         if let Some(denial) =
             crate::tools::guest_private_path_denial(&resolved_path, &self.security.workspace_dir)
                 .await
@@ -570,6 +583,68 @@ mod tests {
         assert!(result.success, "control: {:?}", result.error);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A workspace symlink that points outside must not return the target's
+    /// bytes, with or without a guest view. `file_read`, `file_write` and
+    /// `pdf_read` refuse a resolved path outside the workspace; this tool did
+    /// not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_refuses_a_symlink_that_resolves_outside_the_workspace() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("a.png"), b"\x89PNG\r\n\x1a\n")
+            .await
+            .unwrap();
+        symlink(outside.join("a.png"), workspace.join("img.png")).unwrap();
+        tokio::fs::write(workspace.join("own.png"), b"\x89PNG\r\n\x1a\n")
+            .await
+            .unwrap();
+
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(workspace.clone())
+                .with_workspace_only(false)
+                .with_forbidden_paths(vec![]),
+        );
+        let tool = ImageInfoTool::new(security);
+
+        let plain = tool
+            .execute(json!({"path": "img.png", "include_base64": true}))
+            .await
+            .unwrap();
+        assert!(!plain.success, "{}", plain.output);
+        assert!(!plain.output.contains("base64"), "{}", plain.output);
+        assert!(
+            plain
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("escapes workspace"),
+            "{:?}",
+            plain.error
+        );
+
+        let guest = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "img.png", "include_base64": true}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(!guest.success, "{}", guest.output);
+        assert!(!guest.output.contains("base64"), "{}", guest.output);
+
+        let control = tool.execute(json!({"path": "own.png"})).await.unwrap();
+        assert!(control.success, "control: {:?}", control.error);
     }
 
     #[tokio::test]

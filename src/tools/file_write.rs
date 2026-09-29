@@ -16,6 +16,55 @@ impl FileWriteTool {
     }
 }
 
+impl FileWriteTool {
+    /// Why a write into `resolved_parent` must be refused, or `None` when it may
+    /// go ahead. `resolved_parent` is canonical, or a canonical directory plus
+    /// names that do not exist yet.
+    async fn refusal_for(
+        &self,
+        resolved_parent: &std::path::Path,
+        file_name: &std::ffi::OsStr,
+    ) -> Option<String> {
+        if !self.security.is_resolved_path_allowed(resolved_parent) {
+            return Some(format!(
+                "Resolved path escapes workspace: {}",
+                resolved_parent.display()
+            ));
+        }
+
+        let resolved_target = resolved_parent.join(file_name);
+        if let Some(denial) =
+            crate::tools::guest_private_path_denial(&resolved_target, &self.security.workspace_dir)
+                .await
+        {
+            return Some(denial);
+        }
+        crate::tools::guest_prompt_file_write_denial(&resolved_target, &self.security.workspace_dir)
+            .await
+    }
+}
+
+/// Split `parent` into its nearest ancestor that exists on disk and the names
+/// below it that do not. A symlink counts as existing, even a dangling one, so
+/// the caller resolves it rather than treating its name as a new directory.
+async fn nearest_existing_ancestor(
+    parent: &std::path::Path,
+) -> (std::path::PathBuf, Vec<std::ffi::OsString>) {
+    let mut existing = parent.to_path_buf();
+    let mut missing = Vec::new();
+    while tokio::fs::symlink_metadata(&existing).await.is_err() {
+        let Some(name) = existing.file_name().map(std::ffi::OsString::from) else {
+            break;
+        };
+        missing.push(name);
+        if !existing.pop() {
+            break;
+        }
+    }
+    missing.reverse();
+    (existing, missing)
+}
+
 #[async_trait]
 impl Tool for FileWriteTool {
     fn name(&self) -> &str {
@@ -93,6 +142,41 @@ impl Tool for FileWriteTool {
             });
         };
 
+        let Some(file_name) = full_path.file_name() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Invalid path: missing file name".into()),
+            });
+        };
+
+        // Check where the write would land BEFORE creating anything, so a write
+        // that a later check refuses leaves no directories behind (not even
+        // outside the workspace, through a symlink in the path). Directories
+        // that do not exist yet cannot be symlinks, so the nearest existing
+        // ancestor, resolved, plus the missing names is where the file ends up.
+        let (existing, missing) = nearest_existing_ancestor(parent).await;
+        let resolved_existing = match tokio::fs::canonicalize(&existing).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to resolve file path: {e}")),
+                });
+            }
+        };
+        let would_be_parent = missing
+            .iter()
+            .fold(resolved_existing, |dir, name| dir.join(name));
+        if let Some(error) = self.refusal_for(&would_be_parent, file_name).await {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
         // Ensure parent directory exists
         tokio::fs::create_dir_all(parent).await?;
 
@@ -108,37 +192,17 @@ impl Tool for FileWriteTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+        // Same checks again on the real result, in case the tree changed
+        // between the check above and the creation.
+        if let Some(error) = self.refusal_for(&resolved_parent, file_name).await {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Resolved path escapes workspace: {}",
-                    resolved_parent.display()
-                )),
+                error: Some(error),
             });
         }
-
-        let Some(file_name) = full_path.file_name() else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Invalid path: missing file name".into()),
-            });
-        };
 
         let resolved_target = resolved_parent.join(file_name);
-
-        if let Some(denial) =
-            crate::tools::guest_private_path_denial(&resolved_target, &self.security.workspace_dir)
-                .await
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(denial),
-            });
-        }
 
         // If the target already exists and is a symlink, refuse to follow it
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
@@ -540,6 +604,167 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ── refused writes create nothing ────────────────────────
+
+    /// The checks run on the nearest existing ancestor before any directory is
+    /// created, so a refused write leaves no trace, even outside the workspace
+    /// through a symlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_refused_by_containment_creates_no_directories() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        symlink(&outside, workspace.join("out")).unwrap();
+
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let guest = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "out/sub/f.txt", "content": "x"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(!guest.success);
+        assert!(
+            guest
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("escapes workspace"),
+            "{:?}",
+            guest.error
+        );
+        assert!(
+            !outside.join("sub").exists(),
+            "a refused write must not create directories outside the workspace"
+        );
+
+        let owner = tool
+            .execute(json!({"path": "out/deeper/sub/f.txt", "content": "x"}))
+            .await
+            .unwrap();
+        assert!(!owner.success);
+        assert!(!outside.join("deeper").exists());
+    }
+
+    #[tokio::test]
+    async fn file_write_refused_for_a_guest_creates_no_directories() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
+
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "memory/deep/x.md", "content": "x"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            !workspace.path().join("memory").exists(),
+            "a refused write must not leave its directories behind"
+        );
+    }
+
+    // ── guests do not write the owner's prompt files ─────────
+
+    #[tokio::test]
+    async fn file_write_denies_skill_files_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
+
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "skills/x/SKILL.md", "content": "planted"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("owner's prompt"),
+            "{:?}",
+            result.error
+        );
+        assert!(
+            !workspace.path().join("skills/x").exists(),
+            "the refused write must not create the skill directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_denies_prompt_files_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
+
+        for name in [
+            "AGENTS.md",
+            "SOUL.md",
+            "TOOLS.md",
+            "IDENTITY.md",
+            "HEARTBEAT.md",
+        ] {
+            let result = MEMORY_VIEW
+                .scope(MemoryView::Only("chat:guest".into()), async {
+                    tool.execute(json!({"path": name, "content": "planted"}))
+                        .await
+                        .unwrap()
+                })
+                .await;
+            assert!(!result.success, "{name} must be refused");
+            assert!(!workspace.path().join(name).exists(), "{name} was written");
+        }
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_notes_and_owner_prompt_files() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
+
+        let guest = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "notes/a.txt", "content": "fine"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(guest.success, "{:?}", guest.error);
+        assert!(workspace.path().join("notes/a.txt").exists());
+
+        // Control: without a guest view the same files are the owner's to write.
+        let agents = tool
+            .execute(json!({"path": "AGENTS.md", "content": "owner rules"}))
+            .await
+            .unwrap();
+        assert!(agents.success, "{:?}", agents.error);
+        let skill = tool
+            .execute(json!({"path": "skills/x/SKILL.md", "content": "owner skill"}))
+            .await
+            .unwrap();
+        assert!(skill.success, "{:?}", skill.error);
+        assert!(workspace.path().join("skills/x/SKILL.md").exists());
     }
 
     #[tokio::test]

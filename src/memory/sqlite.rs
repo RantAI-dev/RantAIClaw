@@ -701,7 +701,14 @@ impl Memory for SqliteMemory {
             let id = Uuid::new_v4().to_string();
             let emb_dims = emb_dims.map(|d| i64::try_from(d).unwrap_or(i64::MAX));
 
-            conn.execute(
+            // A key belongs to the place it was first stored in: the update
+            // applies only when the stored row's `session_id` equals the new one
+            // (`IS` treats two NULLs as equal), and it never rewrites the column.
+            // `memories.key` is unique across the whole table, so without this a
+            // write from one conversation could overwrite another place's row, or
+            // pull a scoped row into the shared place that owner prompts read.
+            // When the guard refuses, sqlite reports 0 rows changed.
+            let changed = conn.execute(
                 "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, embedding_model, embedding_dims)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(key) DO UPDATE SET
@@ -710,8 +717,8 @@ impl Memory for SqliteMemory {
                     embedding = excluded.embedding,
                     embedding_model = excluded.embedding_model,
                     embedding_dims = excluded.embedding_dims,
-                    updated_at = excluded.updated_at,
-                    session_id = excluded.session_id",
+                    updated_at = excluded.updated_at
+                 WHERE memories.session_id IS excluded.session_id",
                 params![
                     id,
                     key,
@@ -725,6 +732,9 @@ impl Memory for SqliteMemory {
                     emb_dims
                 ],
             )?;
+            if changed == 0 {
+                return Err(super::traits::KeyInUse { key }.into());
+            }
             Ok(())
         })
         .await?
@@ -2566,6 +2576,74 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "k1");
         assert_eq!(results[0].session_id.as_deref(), Some("sess-a"));
+    }
+
+    /// A key belongs to the place it was first stored in. A write from another
+    /// place must not overwrite the row or move it, because a row that moves to
+    /// the shared place reaches every owner prompt.
+    #[tokio::test]
+    async fn store_refuses_a_key_held_by_another_place() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k", "scoped original", MemoryCategory::Core, Some("a"))
+            .await
+            .unwrap();
+
+        let err = mem
+            .store("k", "shared overwrite", MemoryCategory::Core, None)
+            .await
+            .expect_err("a write from another place must be refused");
+        assert!(err.to_string().contains("already in use"), "{err}");
+
+        let other = mem
+            .store("k", "other overwrite", MemoryCategory::Core, Some("b"))
+            .await;
+        assert!(other.is_err(), "another scoped place is refused too");
+
+        let row = mem.get("k").await.unwrap().unwrap();
+        assert_eq!(row.content, "scoped original");
+        assert_eq!(row.session_id.as_deref(), Some("a"));
+    }
+
+    /// The other direction: a scoped write cannot take over a shared row.
+    #[tokio::test]
+    async fn store_refuses_a_shared_key_from_a_scoped_place() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k", "shared original", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        mem.store("k", "scoped overwrite", MemoryCategory::Core, Some("a"))
+            .await
+            .expect_err("a scoped write must not take over a shared row");
+
+        let row = mem.get("k").await.unwrap().unwrap();
+        assert_eq!(row.content, "shared original");
+        assert_eq!(row.session_id, None);
+    }
+
+    #[tokio::test]
+    async fn store_updates_a_key_within_its_own_place() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k", "first", MemoryCategory::Core, Some("a"))
+            .await
+            .unwrap();
+        mem.store("k", "second", MemoryCategory::Core, Some("a"))
+            .await
+            .unwrap();
+        mem.store("s", "first", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("s", "second", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let scoped = mem.get("k").await.unwrap().unwrap();
+        assert_eq!(scoped.content, "second");
+        assert_eq!(scoped.session_id.as_deref(), Some("a"));
+        let shared = mem.get("s").await.unwrap().unwrap();
+        assert_eq!(shared.content, "second");
+        assert_eq!(shared.session_id, None);
+        assert_eq!(mem.count().await.unwrap(), 2);
     }
 
     #[tokio::test]

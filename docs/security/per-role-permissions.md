@@ -31,9 +31,23 @@ run arbitrary privileged tools." This is the feature.
     `memory/`; the check runs again after the path is resolved, so a symlink
     or an editor copy of a private file is denied too. A guest's
     `memory_store` `replaces` and `memory_forget` stay inside that guest's own
-    conversation. This guest path rule covers only RantaiClaw's own tools; an
-    MCP filesystem tool reaches a guest only when an operator grants it, and
-    is not subject to this rule.
+    conversation.
+  - A guest's `memory_store` writes into that guest's own conversation, never
+    the shared tier the owner's `MEMORY.md` and prompt read. A key keeps the
+    place it was first stored in: storing an existing key from another place
+    fails and changes nothing, and the guest sees only "This key is already in
+    use". That leaves a guest able to tell that a key exists.
+  - A guest's `file_write` refuses the files that feed the owner's prompt:
+    anything under `skills/`, and `AGENTS.md`, `SOUL.md`, `TOOLS.md`,
+    `IDENTITY.md` and `HEARTBEAT.md` at the workspace root. Reading them is
+    unchanged. `file_write` also checks the target before it creates any
+    directory, so a refused write leaves nothing behind. `image_info` refuses a
+    path that resolves outside the workspace, as `file_read` does.
+  - These guest rules cover only the four file tools (`file_read`,
+    `file_write`, `pdf_read`, `image_info`) and the memory tools
+    (`memory_store`, `memory_recall`, `memory_forget`). `glob_search` and
+    `shell` are not subject to them, and an MCP filesystem tool reaches a guest
+    only when an operator grants it.
 - **Attachments follow `file_read`.** A guest's reply carries an attachment only
   when `guest_allowed_tools` includes `file_read`, and then only a local file a
   guest `file_read` could return. The runtime filters the reply before it is

@@ -23,7 +23,7 @@ pub use context::{
 pub use none::NoneMemory;
 pub use sanitize::sanitize_memory_content;
 pub use sqlite::SqliteMemory;
-pub use traits::Memory;
+pub use traits::{KeyInUse, Memory};
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 pub use view::{current_memory_view, recall_in_view, MemoryView, MEMORY_VIEW};

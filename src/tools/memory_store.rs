@@ -190,15 +190,30 @@ impl Tool for MemoryStoreTool {
             None => None,
         };
 
+        // A guest's turn writes into that guest's own conversation. Storing with
+        // no session would put the note in the shared place, which the owner's
+        // `MEMORY.md` projection and prompt read.
+        let place = match crate::memory::current_memory_view() {
+            Some(crate::memory::MemoryView::Only(key)) => Some(key),
+            _ => None,
+        };
+
         if let Err(e) = self
             .memory
-            .store(key, content, category.clone(), None)
+            .store(key, content, category.clone(), place.as_deref())
             .await
         {
+            // The text does not say where the key lives, so a guest learns only
+            // that the key is taken.
+            let error = if e.downcast_ref::<crate::memory::KeyInUse>().is_some() {
+                "This key is already in use; store the note under a different key.".to_string()
+            } else {
+                format!("Failed to store memory: {e}")
+            };
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to store memory: {e}")),
+                error: Some(error),
             });
         }
 
@@ -595,6 +610,63 @@ mod tests {
             "the other conversation's row must survive"
         );
         assert!(mem.get("new_key").await.unwrap().is_none());
+    }
+
+    /// A guest's note lands in that guest's conversation, never in the shared
+    /// place that the owner's `MEMORY.md` and prompt read.
+    #[tokio::test]
+    async fn store_under_a_guest_view_writes_to_that_conversation() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"key": "guest_note", "content": "a guest fact"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(result.success, "{:?}", result.error);
+        let row = mem.get("guest_note").await.unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("chat:guest"));
+    }
+
+    /// A guest that guesses the key of a shared core note must not overwrite it,
+    /// and the refusal must not say where the key lives.
+    #[tokio::test]
+    async fn store_under_a_guest_view_cannot_overwrite_a_shared_row() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "operator_pref",
+            "the operator prefers Rust",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"key": "operator_pref", "content": "planted text"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("This key is already in use; store the note under a different key.")
+        );
+        let row = mem.get("operator_pref").await.unwrap().unwrap();
+        assert_eq!(row.content, "the operator prefers Rust");
+        assert_eq!(row.session_id, None);
     }
 
     #[tokio::test]

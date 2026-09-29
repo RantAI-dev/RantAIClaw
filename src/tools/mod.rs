@@ -30,6 +30,26 @@ the workspace directory; [autonomy].workspace_only and [autonomy].forbidden_path
 in config.toml control this. Move the file into the workspace, or have an operator \
 relax those settings.";
 
+/// The canonical workspace when this turn runs under a guest's
+/// conversation-scoped memory view (`MemoryView::Only`), or `None` for owner
+/// turns and turns without a view.
+///
+/// The workspace itself may be reached through a symlink (a temp dir on some
+/// platforms), so it is canonicalised here. Without that, `strip_prefix` in the
+/// guest path rules fails and their `memory/` and `skills/` directory rules are
+/// skipped; the file-name rules still apply.
+async fn guest_view_workspace(workspace_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    match crate::memory::current_memory_view() {
+        Some(crate::memory::MemoryView::Only(_)) => {}
+        _ => return None,
+    }
+    Some(
+        tokio::fs::canonicalize(workspace_dir)
+            .await
+            .unwrap_or_else(|_| workspace_dir.to_path_buf()),
+    )
+}
+
 /// Denial message for a **canonicalised** path a guest's conversation-scoped
 /// turn (`MemoryView::Only`) may not reach, or `None` when the turn carries no
 /// such view or the path is not private.
@@ -45,20 +65,30 @@ pub(crate) async fn guest_private_path_denial(
     resolved_path: &std::path::Path,
     workspace_dir: &std::path::Path,
 ) -> Option<String> {
-    match crate::memory::current_memory_view() {
-        Some(crate::memory::MemoryView::Only(_)) => {}
-        _ => return None,
-    }
-    // The workspace itself may be reached through a symlink (a temp dir on
-    // some platforms), so canonicalise it too — otherwise `strip_prefix`
-    // inside `is_private_owner_path_resolved` fails and every path is let
-    // through.
-    let canonical_workspace = tokio::fs::canonicalize(workspace_dir)
-        .await
-        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let canonical_workspace = guest_view_workspace(workspace_dir).await?;
     if crate::approval::guest::is_private_owner_path_resolved(resolved_path, &canonical_workspace) {
         Some(
             "This file is private to the owner and is not reachable from this conversation."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Denial message for a **canonicalised** write target that feeds the owner's
+/// prompt (`skills/` and the workspace-root prompt files), or `None` when the
+/// turn carries no guest view or the path is not one of them.
+///
+/// Only `file_write` calls this. Reading these files stays allowed.
+pub(crate) async fn guest_prompt_file_write_denial(
+    resolved_path: &std::path::Path,
+    workspace_dir: &std::path::Path,
+) -> Option<String> {
+    let canonical_workspace = guest_view_workspace(workspace_dir).await?;
+    if crate::approval::guest::is_owner_prompt_path_resolved(resolved_path, &canonical_workspace) {
+        Some(
+            "This file feeds the owner's prompt and cannot be written from this conversation."
                 .to_string(),
         )
     } else {
