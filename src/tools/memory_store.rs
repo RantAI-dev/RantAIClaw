@@ -190,9 +190,9 @@ impl Tool for MemoryStoreTool {
             None => None,
         };
 
-        // A guest's turn writes into that guest's own conversation. Storing with
-        // no session would put the note in the shared place, which the owner's
-        // `MEMORY.md` projection and prompt read.
+        // A guest's turn stores the note in that guest's own conversation, so it
+        // cannot overwrite or move a note stored in another place. The
+        // `MEMORY.md` projection still includes core notes from every place.
         let place = match crate::memory::current_memory_view() {
             Some(crate::memory::MemoryView::Only(key)) => Some(key),
             _ => None,
@@ -612,8 +612,8 @@ mod tests {
         assert!(mem.get("new_key").await.unwrap().is_none());
     }
 
-    /// A guest's note lands in that guest's conversation, never in the shared
-    /// place that the owner's `MEMORY.md` and prompt read.
+    /// A guest's note is stored under that guest's conversation, not in the
+    /// shared place.
     #[tokio::test]
     async fn store_under_a_guest_view_writes_to_that_conversation() {
         use crate::memory::{MemoryView, MEMORY_VIEW};

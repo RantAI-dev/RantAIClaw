@@ -584,6 +584,8 @@ stores with the guest's conversation as the session, and its `replaces` and
 it was first stored in, for every writer: storing an existing key from another
 place (shared or another conversation) fails without changing the row, so a
 guest cannot overwrite the owner's notes or pull a row into the shared tier.
+A guest's own core note still appears in the owner's `MEMORY.md` until the
+projection filters by place.
 `file_write` under a guest turn refuses `skills/` and the workspace-root
 `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md` and `HEARTBEAT.md`, which load
 into owner prompts. These rules cover only the four file tools and the memory
