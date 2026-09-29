@@ -157,12 +157,14 @@ impl GuestGate {
             }
         }
         // Path-bearing tools (file_read, file_write, pdf_read, image_info)
-        // may still try to read `MEMORY.md`, `USER.md`, or anything under
-        // `memory/` even when they are in `guest_allowed_tools`. The owner's
-        // profile and notes are private to the owner; deny with the same
-        // single sentence regardless of which tool tried. Operates even when
-        // the operator listed the tool for guests — that listing is the
-        // capability grant, not a privacy override.
+        // may still try to reach `MEMORY.md`, `USER.md`, `BOOTSTRAP.md`,
+        // `MEMORY_SNAPSHOT.md`, or anything under `memory/` even when they are
+        // in `guest_allowed_tools`. The owner's profile and notes are private
+        // to the owner; deny with the same single sentence regardless of which
+        // tool tried. Operates even when the operator listed the tool for
+        // guests — that listing is the capability grant, not a privacy
+        // override. Writes to the owner's prompt files and `skills/` are
+        // refused later, on the resolved path, inside `file_write`.
         if is_path_tool(tool) {
             let path = arguments
                 .get("path")
@@ -196,19 +198,20 @@ fn is_shell_tool(tool: &str) -> bool {
 }
 
 /// Tools whose calls reach the workspace on a path argument. This keeps
-/// a guest from reading the owner's profile (`USER.md`) or notes
-/// (`MEMORY.md`) directly even when the operator lists one of these tools in
-/// `guest_allowed_tools`. The dispatch makes sure `USER.md` and `MEMORY.md`
-/// are skipped in the system prompt's identity section, so a guest should
-/// never see that content in the prompt either — these extra checks stop
-/// a guest's tool call from reopening the path through `file_read`.
+/// a guest from reaching the owner's private files (`USER.md`, `MEMORY.md`,
+/// `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md` and `memory/`) directly even when the
+/// operator lists one of these tools in `guest_allowed_tools`. The dispatch
+/// skips those files in the system prompt's identity section, so a guest
+/// should never see that content in the prompt either — these extra checks
+/// stop a guest's tool call from reopening the path through `file_read`.
 fn is_path_tool(tool: &str) -> bool {
     matches!(tool, "file_read" | "file_write" | "pdf_read" | "image_info")
 }
 
-/// Last path component (case-insensitive). `MEMORY.md`, `USER.md`, and
-/// `user.md` all match; `./MEMORY.md`, `memory/brain.db`, and
-/// `<workspace>/memory/2026-09-01.md` all match by their `memory` component.
+/// Last path component (case-insensitive). `MEMORY.md`, `USER.md`,
+/// `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, and `user.md` all match;
+/// `./MEMORY.md`, `memory/brain.db`, and `<workspace>/memory/2026-09-01.md`
+/// all match by their `memory` component.
 pub(crate) fn is_private_owner_path(path: &str) -> bool {
     if path.trim().is_empty() {
         return false;
@@ -240,8 +243,9 @@ pub(crate) fn is_private_owner_path(path: &str) -> bool {
 /// canonicalisation, so those bypasses are still caught.
 ///
 /// `canonical_workspace` must itself be canonicalised (a temp-dir workspace
-/// is often reached through a symlink), or `strip_prefix` fails and every
-/// path is quietly let through.
+/// is often reached through a symlink), or `strip_prefix` fails and the
+/// `memory/` directory rule is quietly skipped. The file-name rule does not
+/// depend on the workspace and still applies.
 pub fn is_private_owner_path_resolved(resolved: &Path, canonical_workspace: &Path) -> bool {
     if let Ok(rel) = resolved.strip_prefix(canonical_workspace) {
         if rel
@@ -260,6 +264,46 @@ pub fn is_private_owner_path_resolved(resolved: &Path, canonical_workspace: &Pat
     let stripped = lowered.strip_prefix('.').unwrap_or(&lowered);
     const PRIVATE_STEMS: &[&str] = &["memory.md", "user.md", "bootstrap.md", "memory_snapshot.md"];
     PRIVATE_STEMS.iter().any(|stem| stripped.starts_with(stem))
+}
+
+/// Workspace-root files the system prompt injects into the owner's turns.
+const OWNER_PROMPT_FILES: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "HEARTBEAT.md",
+];
+
+/// True when a **canonicalised** path is one whose content later reaches the
+/// owner's prompt, so a guest's turn must not **write** it: anything under
+/// `<workspace>/skills/` (skills load into owner prompts by default) and the
+/// prompt files at the workspace root (`AGENTS.md`, `SOUL.md`, `TOOLS.md`,
+/// `IDENTITY.md`, `HEARTBEAT.md`).
+///
+/// This is a write-only rule. Reading these files stays allowed, unlike the
+/// files [`is_private_owner_path_resolved`] hides. `author_skill` is owner-only
+/// for the same reason; this closes the file path to the same place.
+///
+/// Names compare case-insensitively so a case-insensitive filesystem cannot
+/// reach `agents.md` through the same file. `canonical_workspace` must be
+/// canonicalised, as for [`is_private_owner_path_resolved`]. A path outside it
+/// is not judged here: the workspace containment check refuses it.
+pub fn is_owner_prompt_path_resolved(resolved: &Path, canonical_workspace: &Path) -> bool {
+    let Ok(rel) = resolved.strip_prefix(canonical_workspace) else {
+        return false;
+    };
+    let mut parts = rel.components();
+    let Some(first) = parts.next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    if first.eq_ignore_ascii_case("skills") {
+        return true;
+    }
+    parts.next().is_none()
+        && OWNER_PROMPT_FILES
+            .iter()
+            .any(|name| first.eq_ignore_ascii_case(name))
 }
 
 /// Anchored glob match supporting `*` (matches any run of characters, incl.
@@ -652,6 +696,51 @@ mod tests {
         assert!(!is_private_owner_path_resolved(
             &workspace.join("notes.txt"),
             workspace
+        ));
+    }
+
+    #[test]
+    fn owner_prompt_rule_covers_skills_and_root_prompt_files() {
+        let ws = Path::new("/ws");
+        for rel in [
+            "skills/x/SKILL.md",
+            "skills/x/tools/run.sh",
+            "Skills/x/SKILL.md",
+            "skills",
+            "AGENTS.md",
+            "SOUL.md",
+            "TOOLS.md",
+            "IDENTITY.md",
+            "HEARTBEAT.md",
+            "agents.md",
+        ] {
+            assert!(
+                is_owner_prompt_path_resolved(&ws.join(rel), ws),
+                "{rel} must be a guest-unwritable prompt path"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_prompt_rule_leaves_other_paths_alone() {
+        let ws = Path::new("/ws");
+        for rel in [
+            "notes/a.txt",
+            "README.md",
+            "docs/AGENTS.md",
+            "notes/skills/x.md",
+            "skills_backup/x.md",
+            "AGENTS.md.txt",
+        ] {
+            assert!(
+                !is_owner_prompt_path_resolved(&ws.join(rel), ws),
+                "{rel} must stay writable"
+            );
+        }
+        // Outside the workspace: containment refuses it, not this rule.
+        assert!(!is_owner_prompt_path_resolved(
+            Path::new("/elsewhere/AGENTS.md"),
+            ws
         ));
     }
 

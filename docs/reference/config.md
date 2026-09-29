@@ -578,6 +578,19 @@ backfilled into a guest's prompt. Even when the operator lists `memory_recall`
 in `guest_allowed_tools`, a guest cannot see other conversations' memory or the
 owner's notes. An owner's memory read is unchanged.
 
+A guest's writes stay in its own place too. `memory_store` under a guest turn
+stores with the guest's conversation as the session, and its `replaces` and
+`memory_forget` see only that conversation's rows. A memory key keeps the place
+it was first stored in, for every writer: storing an existing key from another
+place (shared or another conversation) fails without changing the row, so a
+guest cannot overwrite the owner's notes or pull a row into the shared tier.
+A guest's own core note still appears in the owner's `MEMORY.md` until the
+projection filters by place.
+`file_write` under a guest turn refuses `skills/` and the workspace-root
+`AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md` and `HEARTBEAT.md`, which load
+into owner prompts. These rules cover only the four file tools and the memory
+tools; `glob_search`, `shell` and MCP filesystem tools are not subject to them.
+
 ### Scores are absolute
 
 `MemoryEntry.score` is absolute relevance in `[0, 1]`: cosine similarity for the

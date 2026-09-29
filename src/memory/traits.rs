@@ -53,13 +53,29 @@ impl std::fmt::Display for MemoryCategory {
     }
 }
 
+/// [`Memory::store`] refused a key that already belongs to another place.
+///
+/// A key is fixed to the place it was first stored in, so a write from a
+/// different place fails instead of overwriting the row or moving it. Callers
+/// that show the failure to a guest downcast to this type to avoid naming the
+/// place the key lives in.
+#[derive(Debug, thiserror::Error)]
+#[error("key '{key}' is already in use in another memory place")]
+pub struct KeyInUse {
+    pub key: String,
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
     /// Backend name
     fn name(&self) -> &str;
 
-    /// Store a memory entry, optionally scoped to a session
+    /// Store a memory entry, optionally scoped to a session.
+    ///
+    /// A key keeps the place it was first stored in. Storing an existing key
+    /// from a different `session_id` (including `None` against a scoped row, or
+    /// the reverse) fails with [`KeyInUse`] and changes nothing.
     async fn store(
         &self,
         key: &str,
