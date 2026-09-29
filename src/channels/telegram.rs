@@ -88,7 +88,7 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
 ///
 /// Fails closed: an unresolvable target (missing file, canonicalize error) is
 /// not sendable.
-fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
+pub(crate) fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
@@ -120,7 +120,7 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
 /// and `escape_html` turns a literal `<` into `&lt;`, so an unstripped tag
 /// cannot produce a parse error. Leaked tool-call XML is still ugly, which is
 /// why the function stays.
-fn strip_tool_call_tags(message: &str) -> String {
+pub(crate) fn strip_tool_call_tags(message: &str) -> String {
     const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
         "<function_calls>",
         "<function_call>",

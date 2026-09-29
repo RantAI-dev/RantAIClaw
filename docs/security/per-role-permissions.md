@@ -34,6 +34,17 @@ run arbitrary privileged tools." This is the feature.
     conversation. This guest path rule covers only RantaiClaw's own tools; an
     MCP filesystem tool reaches a guest only when an operator grants it, and
     is not subject to this rule.
+- **Attachments follow `file_read`.** A guest's reply carries an attachment only
+  when `guest_allowed_tools` includes `file_read`, and then only a local file a
+  guest `file_read` could return. The runtime filters the reply before it is
+  sent, since an attachment marker needs no tool call. It withholds a URL, a
+  file under `memory/`, `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and
+  `MEMORY_SNAPSHOT.md` (also through a symlink), and any SQLite database
+  under any name or its journal files (`-wal`, `-shm`, `-journal`). A reply
+  that is only a file path, which Telegram uploads without a marker, is judged
+  the same way. A refused attachment is replaced by one closing line in the reply.
+  The guest's prompt offers attachments only under the same grant, without the
+  absolute workspace path. Owner replies are not filtered.
 - **Secure default:** empty `approval_owners` ⇒ everyone is a guest; empty
   `guest_allowed_*` ⇒ guests get only chat, the agent calls no tool on a
   guest's behalf. Nobody gets privileged capability until an owner opts them
