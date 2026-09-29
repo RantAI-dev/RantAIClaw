@@ -2673,7 +2673,9 @@ mod tests {
     /// transport was not. This asserts the gateway's instance carries them.
     #[test]
     fn the_gateways_whatsapp_channel_carries_the_operators_multimodal_caps() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
         let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
         // Deliberately not the default, so an instance built without the
         // operator's config is distinguishable from one built with it.
         config.multimodal.max_images = 7;
@@ -2728,7 +2730,9 @@ mod tests {
     /// the channel runtime would, and the served endpoint must show it.
     #[tokio::test]
     async fn metrics_reflect_work_recorded_through_the_injected_observer() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
         let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
         config.observability.backend = "prometheus".into();
 
         let observer: std::sync::Arc<dyn crate::observability::Observer> =
@@ -2763,7 +2767,9 @@ mod tests {
     /// above would still pass if `/metrics` served some process-wide singleton.
     #[tokio::test]
     async fn metrics_do_not_reflect_a_registry_the_gateway_was_not_given() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
         let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
         config.observability.backend = "prometheus".into();
 
         let (_state, app) =

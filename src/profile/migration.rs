@@ -28,15 +28,14 @@ use fs2::FileExt;
 
 use crate::profile::paths;
 
-/// Test-only guard: skip the legacy-layout migration unless `HOME` is under
-/// `std::env::temp_dir()` (or the opt-out is set). `needs_migration` and
-/// `perform_migration` below resolve `HOME` through `paths::rantaiclaw_root()`,
-/// so a test that never pins `HOME` would otherwise move the developer's real
-/// `~/.rantaiclaw` flat layout into `profiles/default/`. Compiled out of
-/// release builds; production always migrates.
-#[cfg(test)]
+/// Debug-build guard: skip the legacy-layout migration unless `HOME` is under
+/// `std::env::temp_dir()` (or the opt-out is set). A run that never pins `HOME`
+/// would otherwise move the developer's real flat layout into
+/// `profiles/default/`; it also fires for `cargo run` and spawned debug
+/// binaries. Compiled out of release builds; production always migrates.
+#[cfg(any(test, debug_assertions))]
 fn home_is_test_safe() -> bool {
-    if crate::test_env::allow_real_config_dir() {
+    if crate::profile::dev_guard::allow_real_config_dir() {
         return true;
     }
     let Some(home) = std::env::var_os("HOME") else {
@@ -46,14 +45,14 @@ fn home_is_test_safe() -> bool {
         // erroring out. An unset HOME is therefore unsafe, not exempt.
         return false;
     };
-    crate::test_env::is_under_temp_dir(&PathBuf::from(home))
+    crate::profile::dev_guard::is_under_temp_dir(&PathBuf::from(home))
 }
 
 /// Public entry point. Call this once at the very top of `Config::load_or_init`
 /// (and any other config-reading entry that bypasses it). Returns `Ok(true)`
 /// iff the migration actually fired this call; `Ok(false)` otherwise.
 pub fn maybe_migrate_legacy_layout() -> Result<bool> {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     {
         if !home_is_test_safe() {
             return Ok(false);
@@ -102,7 +101,22 @@ pub fn maybe_migrate_legacy_layout() -> Result<bool> {
 /// The pre-profile global data dir (`~/.local/share/rantaiclaw/` on Linux)
 /// where `sessions.db` and `kb.db` leaked before the per-profile fix. `None`
 /// only when the platform has no resolvable data dir (no HOME).
+#[cfg(any(test, debug_assertions))]
 fn global_data_dir() -> Option<PathBuf> {
+    // A debug build must not move a database out of the developer's real data
+    // dir into a profile, so a data dir outside the temp dir counts as none.
+    platform_data_dir().filter(|d| {
+        crate::profile::dev_guard::allow_real_config_dir()
+            || crate::profile::dev_guard::is_under_temp_dir(d)
+    })
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn global_data_dir() -> Option<PathBuf> {
+    platform_data_dir()
+}
+
+fn platform_data_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "rantaiclaw").map(|d| d.data_dir().to_path_buf())
 }
 
@@ -393,6 +407,46 @@ mod tests {
             !home_is_test_safe(),
             "an unset HOME must not be treated as safe"
         );
+    }
+
+    /// The global data dir is where `sessions.db` and `kb.db` leaked before the
+    /// per-profile fix. With `HOME` outside the temp dir it is the developer's
+    /// real data dir, so a debug build must report none and migrate nothing.
+    #[test]
+    fn global_data_dir_is_none_when_home_is_not_under_temp_dir() {
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let fake_home = non_temp_dir_scratch_dir();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &fake_home);
+        let _g_xdg = crate::test_env::EnvGuard::unset("XDG_DATA_HOME");
+        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+
+        assert_eq!(global_data_dir(), None);
+    }
+
+    #[test]
+    fn global_data_dir_follows_a_home_under_the_temp_dir() {
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let temp_home = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", temp_home.path());
+        let _g_xdg = crate::test_env::EnvGuard::unset("XDG_DATA_HOME");
+        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+
+        let dir = global_data_dir().expect("a temp home has a data dir");
+
+        assert!(dir.starts_with(temp_home.path()), "{dir:?}");
+    }
+
+    #[test]
+    fn global_data_dir_follows_home_when_the_opt_out_is_set() {
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let fake_home = non_temp_dir_scratch_dir();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &fake_home);
+        let _g_xdg = crate::test_env::EnvGuard::unset("XDG_DATA_HOME");
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+
+        let dir = global_data_dir().expect("the opt-out keeps the platform data dir");
+
+        assert!(dir.starts_with(&fake_home), "{dir:?}");
     }
 
     /// A directory that is deliberately NOT under `std::env::temp_dir()` — a

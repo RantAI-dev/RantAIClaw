@@ -100,7 +100,7 @@ impl OpenAiCodexProvider {
 fn default_rantaiclaw_dir() -> PathBuf {
     directories::UserDirs::new().map_or_else(
         || PathBuf::from(".rantaiclaw"),
-        |dirs| dirs.home_dir().join(".rantaiclaw"),
+        |dirs| crate::profile::paths::root_for_home(dirs.home_dir()),
     )
 }
 

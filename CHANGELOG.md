@@ -94,6 +94,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Developer-facing: a debug build, including `cargo run`, no longer reads or
+  writes the real `~/.rantaiclaw` for profiles, config, workspace, the setup
+  wizard and the global `sessions.db` and `kb.db` migrations. When `HOME` is
+  outside the temp dir it uses a per-process temporary root and says so once on
+  stderr, unless `RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1` is set. `Config::save`
+  refuses a path outside the temp dir in every debug build. Only the OpenRC
+  service installer still reads the invoking user's home. Release builds are
+  unchanged.
 - Gateway pairing tokens now start with `rc_`. Tokens issued before this change (`zc_…`) keep authenticating: storage is keyed by SHA-256, prefix-agnostic.
 - Guests (allowed senders who are not in `channels_config.approval_owners`)
   no longer inherit `autonomy.auto_approve`. The agent now calls **only** the

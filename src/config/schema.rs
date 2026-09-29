@@ -3500,7 +3500,7 @@ impl Default for Config {
     fn default() -> Self {
         let home =
             UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let rantaiclaw_dir = home.join(".rantaiclaw");
+        let rantaiclaw_dir = crate::profile::paths::root_for_home(&home);
 
         Self {
             env_overrides: None,
@@ -3582,7 +3582,7 @@ fn default_config_dir() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    Ok(home.join(".rantaiclaw"))
+    Ok(crate::profile::paths::root_for_home(&home))
 }
 
 fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
@@ -3797,19 +3797,28 @@ async fn resolve_runtime_config_dirs(
         }
     }
 
-    // Test-only guard: refuse to fall back to a path derived from the
-    // developer's real `$HOME` (or XDG) so a missing override fails the test
-    // instead of silently migrating the operator's config.
+    // Debug-build guard: refuse to fall back to a path derived from the
+    // developer's real `$HOME` (or XDG) so a missing override fails loudly
+    // instead of silently migrating the operator's config. A unit test must
+    // always pin an override. Any other debug build (`cargo run`, an
+    // integration test, a spawned binary) is refused only when the default dir
+    // is outside the temp dir. That cannot happen today: every caller passes
+    // `default_config_dir()`, which the root redirect already moved under the
+    // temp dir. The second half of the condition is a backstop in case a
+    // future caller bypasses the redirect.
     // Compiled out of release builds; behaviour above this point is unchanged.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     {
-        if !crate::test_env::allow_real_config_dir() {
+        if !crate::profile::dev_guard::allow_real_config_dir()
+            && (cfg!(test) || !crate::profile::dev_guard::is_under_temp_dir(default_rantaiclaw_dir))
+        {
             anyhow::bail!(
                 "test config isolation: neither RANTAICLAW_CONFIG_DIR nor RANTAICLAW_WORKSPACE \
                  is set, so this test would read and write the developer's real \
                  ~/.rantaiclaw. Set RANTAICLAW_CONFIG_DIR to a tempdir (see \
                  crate::test_env::EnvGuard) or, if this test really must exercise \
-                 default resolution, set RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1."
+                 default resolution, set RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1. \
+                 This guard also fires for `cargo run` and spawned debug binaries."
             );
         }
     }
@@ -3843,14 +3852,15 @@ async fn resolve_runtime_config_dirs(
     ))
 }
 
-/// Test-only guard for [`Config::save`]: refuse to write anywhere other than
-/// under `std::env::temp_dir()`, so a test with a stray `Config::default()`
-/// (which points `config_path` at the developer's real `$HOME/.rantaiclaw`)
-/// cannot write the operator's real config. Mirrors the guard in
-/// `resolve_runtime_config_dirs`, including the same opt-out.
-#[cfg(test)]
+/// Debug-build guard for [`Config::save`]: refuse to write anywhere other than
+/// under `std::env::temp_dir()`, so a stray `config_path` pointing at the
+/// developer's real `$HOME/.rantaiclaw` cannot write the operator's real
+/// config. Mirrors the guard in `resolve_runtime_config_dirs`, including the
+/// same opt-out.
+#[cfg(any(test, debug_assertions))]
 fn config_path_is_test_safe(config_path: &Path) -> bool {
-    crate::test_env::allow_real_config_dir() || crate::test_env::is_under_temp_dir(config_path)
+    crate::profile::dev_guard::allow_real_config_dir()
+        || crate::profile::dev_guard::is_under_temp_dir(config_path)
 }
 
 /// Encrypt every plaintext credential in a raw (not yet deserialised) config,
@@ -5110,11 +5120,11 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
-        // Test-only guard: refuse to write anywhere but a tempdir, so a test
+        // Debug-build guard: refuse to write anywhere but a tempdir, so a run
         // that never overrode `config_path` (it defaults to the developer's
         // real `$HOME/.rantaiclaw/config.toml`) cannot write the operator's
         // real config. Compiled out of release builds.
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         {
             if !config_path_is_test_safe(&self.config_path) {
                 anyhow::bail!(
@@ -5122,7 +5132,8 @@ impl Config {
                      this test would write the developer's real config. Point \
                      config_path at a tempdir (see crate::test_env::EnvGuard) or, if \
                      this test really must write the real path, set \
-                     RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1.",
+                     RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1. This guard also \
+                     fires for `cargo run` and spawned debug binaries.",
                     self.config_path.display()
                 );
             }

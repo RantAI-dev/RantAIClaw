@@ -15,6 +15,8 @@
 //!   3. The literal string `"default"`.
 
 pub mod commands;
+#[cfg(any(test, debug_assertions))]
+pub mod dev_guard;
 pub mod migration;
 pub mod paths;
 pub mod sentinel;
