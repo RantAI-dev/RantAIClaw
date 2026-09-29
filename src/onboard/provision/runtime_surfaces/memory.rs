@@ -63,8 +63,8 @@ impl TuiProvisioner for MemoryProvisioner {
         )
         .await?;
 
-        // Backend selection — `postgres` was retired in v0.32.0-alpha together
-        // with the `[storage]` section. Only `sqlite` and `none`
+        // Backend selection — `postgres` was retired together with the
+        // `[storage]` section. Only `sqlite` and `none`
         // are offered here; an operator who had a Postgres profile must
         // migrate the notes themselves or run against a sqlite store.
         send(

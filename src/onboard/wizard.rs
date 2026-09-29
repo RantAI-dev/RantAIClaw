@@ -555,27 +555,24 @@ fn backend_key_from_choice(choice: usize) -> &'static str {
 }
 
 /// Validate the `--memory` value passed to quick setup. `postgres` was
-/// retired in v0.32.0-alpha together with the `[storage]` section; callers
-/// must use `--memory sqlite` instead. The `lucid` and `markdown` backends
-/// were retired earlier and resolve to sqlite already, but quick setup
-/// still names them explicitly so a muscle-memory `--memory lucid` does
-/// not silently fall through to the default. Unknown names still error
-/// here so a typo does not silently become sqlite.
+/// retired together with the `[storage]` section; callers must use
+/// `--memory sqlite` instead. The `lucid` and `markdown` backends were
+/// retired too and resolve to sqlite already, but quick setup still names
+/// them explicitly so a muscle-memory `--memory lucid` does not silently
+/// fall through to the default. Unknown names still error here so a typo
+/// does not silently become sqlite.
 fn validate_memory_backend_for_quick_setup(memory_backend: &str) -> Result<String> {
     let normalized = memory_backend.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "sqlite" | "none" => Ok(normalized),
         "postgres" => {
-            bail!(
-                "memory backend 'postgres' was retired in v0.32.0-alpha; \
-                 use --memory sqlite"
-            )
+            bail!("memory backend 'postgres' was retired; use --memory sqlite")
         }
         "lucid" => {
-            bail!("memory backend 'lucid' was retired in v0.32.0-alpha; use --memory sqlite")
+            bail!("memory backend 'lucid' was retired; use --memory sqlite")
         }
         "markdown" => {
-            bail!("memory backend 'markdown' was retired in v0.32.0-alpha; use --memory sqlite")
+            bail!("memory backend 'markdown' was retired; use --memory sqlite")
         }
         other => bail!("unknown memory backend '{other}'; valid values: sqlite, none"),
     }
@@ -5566,26 +5563,10 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          you're you now.\n"
     );
 
-    let memory = "\
-         # MEMORY.md — Long-Term Memory\n\n\
-         *Your curated memories. The distilled essence, not raw logs.*\n\n\
-         ## How This Works\n\
-         - Daily files (`memory/YYYY-MM-DD.md`) capture raw events (on-demand via tools)\n\
-         - This file captures what's WORTH KEEPING long-term\n\
-         - This file is auto-injected into your system prompt each session\n\
-         - Keep it concise — every character here costs tokens\n\n\
-         ## Security\n\
-         - ONLY loaded in main session (direct chat with your human)\n\
-         - NEVER loaded in group chats or shared contexts\n\n\
-         ---\n\n\
-         ## Key Facts\n\
-         (Add important facts about your human here)\n\n\
-         ## Decisions & Preferences\n\
-         (Record decisions and preferences here)\n\n\
-         ## Lessons Learned\n\
-         (Document mistakes and insights here)\n\n\
-         ## Open Loops\n\
-         (Track unfinished tasks and follow-ups here)\n";
+    // Shared with the markdown importer's scaffold filter (both live in
+    // `crate::memory`), so a new install and a re-import agree byte-for-byte
+    // on what counts as wizard scaffold.
+    let memory = crate::memory::MEMORY_MD_TEMPLATE;
 
     let files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
@@ -6531,6 +6512,44 @@ mod tests {
         assert!(
             memory.contains("auto-injected"),
             "MEMORY.md should mention it's auto-injected"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_md_matches_the_wizard_template_byte_for_byte() {
+        // Independent literal (not the shared constant the wizard writes
+        // from) so this catches a mistake made while moving that template
+        // into `crate::memory::MEMORY_MD_TEMPLATE`: new installs must keep
+        // getting exactly this file.
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(tmp.path(), &ctx).unwrap();
+
+        let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
+            .await
+            .unwrap();
+        assert_eq!(
+            memory,
+            "# MEMORY.md — Long-Term Memory\n\n\
+             *Your curated memories. The distilled essence, not raw logs.*\n\n\
+             ## How This Works\n\
+             - Daily files (`memory/YYYY-MM-DD.md`) capture raw events (on-demand via tools)\n\
+             - This file captures what's WORTH KEEPING long-term\n\
+             - This file is auto-injected into your system prompt each session\n\
+             - Keep it concise — every character here costs tokens\n\n\
+             ## Security\n\
+             - ONLY loaded in main session (direct chat with your human)\n\
+             - NEVER loaded in group chats or shared contexts\n\n\
+             ---\n\n\
+             ## Key Facts\n\
+             (Add important facts about your human here)\n\n\
+             ## Decisions & Preferences\n\
+             (Record decisions and preferences here)\n\n\
+             ## Lessons Learned\n\
+             (Document mistakes and insights here)\n\n\
+             ## Open Loops\n\
+             (Track unfinished tasks and follow-ups here)\n",
+            "the wizard must keep writing exactly this template after moving it into a shared constant"
         );
     }
 
@@ -7564,7 +7583,7 @@ mod tests {
             "message must name the value: {text}"
         );
         assert!(
-            text.contains("retired in v0.32.0-alpha"),
+            text.contains("was retired"),
             "message must say it was retired: {text}"
         );
         assert!(
@@ -7583,7 +7602,7 @@ mod tests {
             "message must name the value: {text}"
         );
         assert!(
-            text.contains("retired in v0.32.0-alpha"),
+            text.contains("was retired"),
             "message must say it was retired: {text}"
         );
         assert!(
@@ -7622,7 +7641,7 @@ mod tests {
             "message must name the value: {text}"
         );
         assert!(
-            text.contains("retired in v0.32.0-alpha"),
+            text.contains("was retired"),
             "message must say it was retired: {text}"
         );
         assert!(

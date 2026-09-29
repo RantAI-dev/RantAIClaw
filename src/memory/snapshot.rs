@@ -172,8 +172,8 @@ pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
 /// Gated on the backend rather than on config, which is the same decision by
 /// construction and asks for less at the call site: `MarkdownMemory` owns
 /// `MEMORY.md` directly and projecting there would write it twice, while
-/// `none` has no `brain.db` to project from. (`postgres` was retired in
-/// v0.32.0-alpha together with the `[storage]` section.)
+/// `none` has no `brain.db` to project from. (`postgres` was retired
+/// together with the `[storage]` section.)
 ///
 /// Best-effort, like the projection everywhere else: a failure here must not
 /// fail the write that already succeeded.
