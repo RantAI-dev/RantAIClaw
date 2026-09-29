@@ -256,6 +256,12 @@ pub(crate) fn redact_config_secrets(cfg: &mut crate::config::Config) {
         if let Some(api_key) = entry.api_key.as_mut() {
             api_key.value = None;
         }
+        // A skill's `env` holds operator-named variables (`DATABASE_URL`,
+        // `PGPASSWORD`, `SENTRY_DSN`) the key-name walk cannot recognise, so
+        // blank every value and keep the keys, as for MCP server env below.
+        for value in entry.env.values_mut() {
+            value.clear();
+        }
     }
     // `api_url` can carry a credential (a pasted key, or a `user:pass@` / `?key=`
     // URL). `secrets_view` already withholds such a value; `get_config` must apply
@@ -2796,10 +2802,10 @@ mod tests {
 
     #[test]
     fn config_api_redacts_skill_env_db_url() {
-        // A skill's `env` map can carry a `DB_URL` connection string. Only
-        // `redact_secrets_in_json` protects this map (it isn't a typed
-        // secret field `redact_config_secrets` knows about), so it must
-        // still clear a key named `db_url` in any case.
+        // A skill's `env` map can carry a `DB_URL` connection string.
+        // `redact_config_secrets` blanks every skill env value. This test
+        // runs only the key-name walk, so the `db_url` rule still has to
+        // cover a `DB_URL` key on its own.
         let mut cfg = Config::default();
         cfg.skills.entries.insert(
             "x".into(),
@@ -2820,6 +2826,41 @@ mod tests {
             serde_json::Value::String(String::new()),
             "DB_URL was not redacted to an empty string in:\n{json}"
         );
+    }
+
+    #[test]
+    fn config_api_blanks_every_skill_env_value_and_keeps_keys() {
+        // The key-name walk cannot see operator-named variables such as
+        // `DATABASE_URL`, `PGPASSWORD` or `SENTRY_DSN`. The typed redactor
+        // must blank every skill env value, and the pair both surfaces run
+        // (`get_config`, `config show`) must leave the keys visible.
+        let mut cfg = Config::default();
+        cfg.skills.entries.insert(
+            "x".into(),
+            crate::config::SkillEntryConfig {
+                env: std::collections::HashMap::from([
+                    ("DATABASE_URL".into(), "postgres://u:neutral-pw@h/db".into()),
+                    ("PLAIN".into(), "1".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        redact_config_secrets(&mut cfg);
+        let mut val = serde_json::to_value(&cfg).unwrap();
+        redact_secrets_in_json(&mut val);
+        let json = val.to_string();
+        assert!(!json.contains("neutral-pw"), "leaked in:\n{json}");
+        let env = val["skills"]["entries"]["x"]["env"]
+            .as_object()
+            .unwrap_or_else(|| panic!("skill env missing in:\n{json}"));
+        assert_eq!(env.len(), 2, "keys must stay visible in:\n{json}");
+        for key in ["DATABASE_URL", "PLAIN"] {
+            assert_eq!(
+                env.get(key),
+                Some(&serde_json::Value::String(String::new())),
+                "{key} was not blanked in:\n{json}"
+            );
+        }
     }
 
     #[test]

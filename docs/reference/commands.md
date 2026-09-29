@@ -353,7 +353,7 @@ rows, and the output says when it is showing a subset.
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
 
-`config show` prints the **active** configuration as JSON with all secrets redacted (provider/API keys, channel tokens, tunnel tokens, the gateway login hash, paired tokens, etc.).
+`config show` prints the **active** configuration as JSON with all secrets redacted (provider/API keys, channel tokens, tunnel tokens, the gateway login hash, paired tokens, etc.). Every value in an MCP server `env` map and in a skill `env` map (`[skills.entries.<name>.env]`) is shown as an empty string, because the variable names are the operator's own (`DATABASE_URL`, `PGPASSWORD`); the names stay visible.
 
 ### `completions`
 

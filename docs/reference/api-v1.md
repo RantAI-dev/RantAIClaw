@@ -1045,7 +1045,9 @@ These are the routes the web console writes settings through. All are bearer-gat
 - **Request**: none.
 - **Response** `200`: the whole active config as JSON, **redacted**. A key is blanked when its
   name ends in `_token`, or is exactly `token` or `paired_tokens`. Redaction is by key name,
-  so a secret stored under a name outside that set is returned in full.
+  so a secret stored under a name outside that set is returned in full. Besides the key-name
+  rule, every value in an MCP server `env` and in a skill `env` is returned as an empty
+  string, and the variable names stay.
 - **Status codes**: `200`, `401`, `500`.
 
 ### PUT /api/v1/config/model
