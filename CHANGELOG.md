@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Pressing Back twice in the first-run setup wizard returns to the step before, instead of jumping to the welcome screen.
+- Going Back from the first setup step and starting again no longer skips that step.
 - Stopping the daemon while the Lark webhook listener is starting no longer waits for the Lark API to answer. The listener now honours cancellation during its config read, its bot-identity lookup and its port bind.
 - In webhook mode, an international Lark app now talks to the Lark API instead of Feishu, so the bot recognises its own mentions in groups, and the webhook receiver keeps the configured inbound image limits. The Lark WebSocket listener also stops when cancelled during startup, instead of waiting for the bot-identity lookup, endpoint request or connection handshake to finish.
 - Library tests can no longer silently read or write the developer's real

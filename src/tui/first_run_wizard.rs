@@ -54,11 +54,12 @@ pub struct FirstRunWizard {
     last_choose_viewport: u16,
     pub profile: Profile,
     /// Phase history for the back button. Each completed phase transition
-    /// pushes the previous phase here; `back()` pops one and restores it.
-    /// v0.6.4 covers the safe cases (PickChannels ↔ PickIntegrations and
-    /// PickChannels → previous required provisioner). RunningProvisioner
-    /// rewind is forward-only for now — the running task can't be
-    /// surgically rewound without leaking partial state.
+    /// pushes the previous phase here. `back()` pops one entry and acts on
+    /// what it finds. A provisioner runs again, with the provisioner running
+    /// now (if any) queued behind it. `Welcome` is restored with the running
+    /// provisioner queued again at the front. A picker is restored and the
+    /// queue is cleared, including the provisioner that was running. See
+    /// `back()`.
     pub history: Vec<WizardPhase>,
 }
 
@@ -151,6 +152,11 @@ impl FirstRunWizard {
                         // Clear leftover picker-selection queue so the
                         // user's re-selection isn't shadowed by old picks.
                         self.queue.clear();
+                    } else if let WizardPhase::RunningProvisioner { name } = &self.phase {
+                        // Back from the first provisioner restores Welcome.
+                        // Queue the running step again so starting from
+                        // Welcome runs it instead of skipping it.
+                        self.queue.insert(0, name.clone());
                     }
                     self.phase = phase;
                     return true;
@@ -1495,6 +1501,37 @@ mod tests {
         assert!(w.back());
         assert!(matches!(w.phase, WizardPhase::Welcome));
         assert!(!w.back(), "nothing is left to go back to after Welcome");
+    }
+
+    #[test]
+    fn back_from_the_first_step_then_start_runs_it_again() {
+        let mut w = FirstRunWizard::new(test_profile());
+        let original_queue = w.queue.clone();
+        let first = original_queue[0].clone();
+
+        w.start_provisioners();
+        assert!(matches!(
+            &w.phase,
+            WizardPhase::RunningProvisioner { name } if *name == first
+        ));
+
+        assert!(w.back());
+        assert!(matches!(w.phase, WizardPhase::Welcome));
+
+        w.start_provisioners();
+        assert!(
+            matches!(
+                &w.phase,
+                WizardPhase::RunningProvisioner { name } if *name == first
+            ),
+            "starting again must run {first} again, got {:?}",
+            w.phase
+        );
+        assert_eq!(
+            w.queue,
+            original_queue[1..].to_vec(),
+            "the steps after the first must stay queued, in order"
+        );
     }
 
     // ── locked channel rows are dimmed and skipped ──────
