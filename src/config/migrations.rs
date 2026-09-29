@@ -644,10 +644,17 @@ fn migrate_v34(raw: &mut Value) {
         return;
     };
 
-    // 1. Rewrite [memory].backend if it was lucid/markdown.
+    // 1. Rewrite [memory].backend if it was lucid/markdown. The four-key
+    //    cleanup below must fire only for `markdown`, not `lucid`, so the
+    //    original text is checked before `rewrite_retired_backend` mutates it.
     let memory_was_markdown =
         if let Some(memory) = root.get_mut("memory").and_then(Value::as_table_mut) {
-            rewrite_retired_backend(memory.get_mut("backend"))
+            let was_markdown = memory
+                .get("backend")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("markdown"));
+            rewrite_retired_backend(memory.get_mut("backend"));
+            was_markdown
         } else {
             false
         };
@@ -1793,6 +1800,44 @@ allowed_users = ["*"]
             Some(true),
             "an operator-set hygiene_enabled must survive"
         );
+    }
+
+    /// A `lucid` config in the exact shape the markdown wizard-defaults check
+    /// looks for must NOT get the four-key cleanup: that cleanup is scoped to
+    /// `markdown` only, by the owner's decision.
+    #[test]
+    fn v34_keeps_lucid_wizard_defaults() {
+        let mut v = parse(
+            "schema_version = 33\n\
+             [memory]\nbackend = \"lucid\"\n\
+             hygiene_enabled = false\n\
+             archive_after_days = 0\n\
+             purge_after_days = 0\n\
+             embedding_cache_size = 0\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+
+        let memory = v
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory table survives");
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite"),
+            "the backend name is rewritten"
+        );
+        for key in [
+            "hygiene_enabled",
+            "archive_after_days",
+            "purge_after_days",
+            "embedding_cache_size",
+        ] {
+            assert!(
+                memory.get(key).is_some(),
+                "{key} must survive for a lucid config: {memory:?}"
+            );
+        }
     }
 
     /// `[storage.provider.config].provider` overrides `[memory].backend` at

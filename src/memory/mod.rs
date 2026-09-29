@@ -32,6 +32,33 @@ use crate::config::{EmbeddingRouteConfig, MemoryConfig};
 use std::path::Path;
 use std::sync::Arc;
 
+/// The `MEMORY.md` scaffold the onboarding wizard writes for a new workspace.
+///
+/// Shared with the markdown → sqlite importer, which skips a line only when
+/// it matches one of these exactly (after trim): a prefix match let real
+/// operator lines that happened to start with the same words get dropped as
+/// scaffold, and missed lines that used no bullet prefix at all.
+pub(crate) const MEMORY_MD_TEMPLATE: &str = "\
+    # MEMORY.md — Long-Term Memory\n\n\
+    *Your curated memories. The distilled essence, not raw logs.*\n\n\
+    ## How This Works\n\
+    - Daily files (`memory/YYYY-MM-DD.md`) capture raw events (on-demand via tools)\n\
+    - This file captures what's WORTH KEEPING long-term\n\
+    - This file is auto-injected into your system prompt each session\n\
+    - Keep it concise — every character here costs tokens\n\n\
+    ## Security\n\
+    - ONLY loaded in main session (direct chat with your human)\n\
+    - NEVER loaded in group chats or shared contexts\n\n\
+    ---\n\n\
+    ## Key Facts\n\
+    (Add important facts about your human here)\n\n\
+    ## Decisions & Preferences\n\
+    (Record decisions and preferences here)\n\n\
+    ## Lessons Learned\n\
+    (Document mistakes and insights here)\n\n\
+    ## Open Loops\n\
+    (Track unfinished tasks and follow-ups here)\n";
+
 fn create_memory_with_builders<F>(
     backend_name: &str,
     mut sqlite_builder: F,
@@ -69,8 +96,8 @@ pub fn effective_memory_backend_name(memory_backend: &str) -> String {
 
 /// One-time WARN that the memory backend has been retired.
 ///
-/// `lucid`, `markdown`, and `postgres` were all retired in v0.32.0-alpha in
-/// favour of `sqlite`. A config this binary never touched before would
+/// `lucid`, `markdown`, and `postgres` were all retired in favour of
+/// `sqlite`. A config this binary never touched before would
 /// otherwise stop the daemon with no actionable error. The WARN is one-shot
 /// to keep the log from filling with the same line every turn.
 static RETIRED_BACKEND_WARN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -78,8 +105,8 @@ static RETIRED_BACKEND_WARN: std::sync::OnceLock<()> = std::sync::OnceLock::new(
 fn warn_retired_backend_once() {
     if RETIRED_BACKEND_WARN.set(()).is_ok() {
         tracing::warn!(
-            "memory backends 'lucid', 'markdown' and 'postgres' were retired in v0.32.0-alpha; \
-             resolving to 'sqlite'. Set memory.backend = \"sqlite\" in config.toml \
+            "memory backends 'lucid', 'markdown' and 'postgres' were retired; use sqlite. \
+             Resolving to 'sqlite'. Set memory.backend = \"sqlite\" in config.toml \
              to silence this message."
         );
     }
@@ -802,7 +829,7 @@ mod tests {
         assert!(error.to_string().contains("disables persistence"));
     }
 
-    /// The `lucid` backend was retired in v0.32.0-alpha. A leftover config that
+    /// The `lucid` backend was retired; use sqlite. A leftover config that
     /// still names `lucid` must not stop the daemon: resolve to `sqlite` so
     /// the backend the operator already has on disk keeps working.
     #[test]
@@ -810,7 +837,7 @@ mod tests {
         assert_eq!(effective_memory_backend_name("lucid"), "sqlite");
     }
 
-    /// The `markdown` backend was retired in v0.32.0-alpha too. Migration
+    /// The `markdown` backend was retired too; use sqlite. Migration
     /// already rewrote a config that said `markdown`; this is the runtime
     /// fallback for any value that slips past it.
     #[test]
@@ -818,7 +845,7 @@ mod tests {
         assert_eq!(effective_memory_backend_name("markdown"), "sqlite");
     }
 
-    /// The `postgres` backend was retired in v0.32.0-alpha together with the
+    /// The `postgres` backend was retired; use sqlite. It went together with the
     /// `[storage]` section it was the only user of. A leftover config that
     /// still names `postgres` must not stop the daemon: resolve to `sqlite`
     /// so the local store keeps working without reaching for a database the

@@ -12,20 +12,14 @@ const STATE_FILE: &str = "memory_hygiene_state.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct HygieneReport {
-    archived_memory_files: u64,
     archived_session_files: u64,
-    purged_memory_archives: u64,
     purged_session_archives: u64,
     pruned_conversation_rows: u64,
 }
 
 impl HygieneReport {
     fn total_actions(&self) -> u64 {
-        self.archived_memory_files
-            + self.archived_session_files
-            + self.purged_memory_archives
-            + self.purged_session_archives
-            + self.pruned_conversation_rows
+        self.archived_session_files + self.purged_session_archives + self.pruned_conversation_rows
     }
 }
 
@@ -48,12 +42,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
     }
 
     let report = HygieneReport {
-        archived_memory_files: archive_daily_memory_files(
-            workspace_dir,
-            config.archive_after_days,
-        )?,
         archived_session_files: archive_session_files(workspace_dir, config.archive_after_days)?,
-        purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,
         purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,
         pruned_conversation_rows: prune_conversation_rows(
             workspace_dir,
@@ -65,10 +54,8 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
 
     if report.total_actions() > 0 {
         tracing::info!(
-            "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation_rows={}",
-            report.archived_memory_files,
+            "memory hygiene complete: archived_sessions={} purged_sessions={} pruned_conversation_rows={}",
             report.archived_session_files,
-            report.purged_memory_archives,
             report.purged_session_archives,
             report.pruned_conversation_rows,
         );
@@ -120,50 +107,6 @@ fn state_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("state").join(STATE_FILE)
 }
 
-fn archive_daily_memory_files(workspace_dir: &Path, archive_after_days: u32) -> Result<u64> {
-    if archive_after_days == 0 {
-        return Ok(0);
-    }
-
-    let memory_dir = workspace_dir.join("memory");
-    if !memory_dir.is_dir() {
-        return Ok(0);
-    }
-
-    let archive_dir = memory_dir.join("archive");
-    fs::create_dir_all(&archive_dir)?;
-
-    let cutoff = Local::now().date_naive() - Duration::days(i64::from(archive_after_days));
-    let mut moved = 0_u64;
-
-    for entry in fs::read_dir(&memory_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-
-        let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
-            continue;
-        };
-
-        let Some(file_date) = memory_date_from_filename(filename) else {
-            continue;
-        };
-
-        if file_date < cutoff {
-            move_to_archive(&path, &archive_dir)?;
-            moved += 1;
-        }
-    }
-
-    Ok(moved)
-}
-
 fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Result<u64> {
     if archive_after_days == 0 {
         return Ok(0);
@@ -210,44 +153,6 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
     }
 
     Ok(moved)
-}
-
-fn purge_memory_archives(workspace_dir: &Path, purge_after_days: u32) -> Result<u64> {
-    if purge_after_days == 0 {
-        return Ok(0);
-    }
-
-    let archive_dir = workspace_dir.join("memory").join("archive");
-    if !archive_dir.is_dir() {
-        return Ok(0);
-    }
-
-    let cutoff = Local::now().date_naive() - Duration::days(i64::from(purge_after_days));
-    let mut removed = 0_u64;
-
-    for entry in fs::read_dir(&archive_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            continue;
-        }
-
-        let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
-            continue;
-        };
-
-        let Some(file_date) = memory_date_from_filename(filename) else {
-            continue;
-        };
-
-        if file_date < cutoff {
-            fs::remove_file(&path)?;
-            removed += 1;
-        }
-    }
-
-    Ok(removed)
 }
 
 fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result<u64> {
@@ -329,12 +234,6 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     Ok(u64::try_from(affected).unwrap_or(0))
 }
 
-fn memory_date_from_filename(filename: &str) -> Option<NaiveDate> {
-    let stem = filename.strip_suffix(".md")?;
-    let date_part = stem.split('_').next().unwrap_or(stem);
-    NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
-}
-
 fn date_prefix(filename: &str) -> Option<NaiveDate> {
     if filename.len() < 10 {
         return None;
@@ -398,33 +297,27 @@ mod tests {
     }
 
     #[test]
-    fn archives_old_daily_memory_files() {
+    fn leaves_daily_memory_files_in_place_regardless_of_age() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path();
         fs::create_dir_all(workspace.join("memory")).unwrap();
 
-        let old = (Local::now().date_naive() - Duration::days(10))
+        let old = (Local::now().date_naive() - Duration::days(40))
             .format("%Y-%m-%d")
             .to_string();
-        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
-
         let old_file = workspace.join("memory").join(format!("{old}.md"));
-        let today_file = workspace.join("memory").join(format!("{today}.md"));
         fs::write(&old_file, "old note").unwrap();
-        fs::write(&today_file, "fresh note").unwrap();
 
         run_if_due(&default_cfg(), workspace).unwrap();
 
-        assert!(!old_file.exists(), "old daily file should be archived");
         assert!(
-            workspace
-                .join("memory")
-                .join("archive")
-                .join(format!("{old}.md"))
-                .exists(),
-            "old daily file should exist in memory/archive"
+            old_file.exists(),
+            "hygiene must not touch daily memory files"
         );
-        assert!(today_file.exists(), "today file should remain in place");
+        assert!(
+            !workspace.join("memory").join("archive").exists(),
+            "hygiene must not create a memory archive directory"
+        );
     }
 
     #[test]
@@ -457,12 +350,12 @@ mod tests {
     fn skips_second_run_within_cadence_window() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path();
-        fs::create_dir_all(workspace.join("memory")).unwrap();
+        fs::create_dir_all(workspace.join("sessions")).unwrap();
 
         let old_a = (Local::now().date_naive() - Duration::days(10))
             .format("%Y-%m-%d")
             .to_string();
-        let file_a = workspace.join("memory").join(format!("{old_a}.md"));
+        let file_a = workspace.join("sessions").join(format!("{old_a}-a.log"));
         fs::write(&file_a, "first").unwrap();
 
         run_if_due(&default_cfg(), workspace).unwrap();
@@ -471,7 +364,7 @@ mod tests {
         let old_b = (Local::now().date_naive() - Duration::days(9))
             .format("%Y-%m-%d")
             .to_string();
-        let file_b = workspace.join("memory").join(format!("{old_b}.md"));
+        let file_b = workspace.join("sessions").join(format!("{old_b}-b.log"));
         fs::write(&file_b, "second").unwrap();
 
         // Should skip because cadence gate prevents a second immediate run.
@@ -480,31 +373,6 @@ mod tests {
             file_b.exists(),
             "second file should remain because run is throttled"
         );
-    }
-
-    #[test]
-    fn purges_old_memory_archives() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path();
-        let archive_dir = workspace.join("memory").join("archive");
-        fs::create_dir_all(&archive_dir).unwrap();
-
-        let old = (Local::now().date_naive() - Duration::days(40))
-            .format("%Y-%m-%d")
-            .to_string();
-        let keep = (Local::now().date_naive() - Duration::days(5))
-            .format("%Y-%m-%d")
-            .to_string();
-
-        let old_file = archive_dir.join(format!("{old}.md"));
-        let keep_file = archive_dir.join(format!("{keep}.md"));
-        fs::write(&old_file, "expired").unwrap();
-        fs::write(&keep_file, "recent").unwrap();
-
-        run_if_due(&default_cfg(), workspace).unwrap();
-
-        assert!(!old_file.exists(), "old archived file should be purged");
-        assert!(keep_file.exists(), "recent archived file should remain");
     }
 
     #[tokio::test]
