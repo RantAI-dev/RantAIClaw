@@ -12030,6 +12030,56 @@ async fn guest_reply_rebuilt_around_a_hidden_marker_keeps_only_what_passed() {
     }
 }
 
+/// Removing a refused marker joins the text on both sides of it. A marker the
+/// original reply had inside a code span is never judged, and the joined text
+/// must not turn that span into live text. Here two separate backtick runs
+/// become one run, which closes the span, so the rebuilt reply would upload
+/// the database on every channel.
+#[tokio::test]
+async fn guest_reply_rebuild_does_not_expose_a_marker_from_a_code_span() {
+    let ws = attachment_workspace();
+    let reply = "`x`[IMAGE:https://example.com/a.png]` [DOCUMENT:memory/brain.db]";
+    for platform in ["telegram", "test-channel"] {
+        let turn = run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &[], reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{platform}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert_eq!(
+            markers_in_either_view(text),
+            Vec::new(),
+            "{platform}: a marker reached the channel: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{platform}: {text}"
+        );
+    }
+}
+
+/// Removing a refused marker can also join the halves of a tool-call tag, and
+/// Telegram's single removal then leaves a live marker the original reply had
+/// only inside a code span.
+#[tokio::test]
+async fn guest_reply_rebuild_does_not_join_a_tool_tag_around_a_code_span_marker() {
+    let ws = attachment_workspace();
+    let reply = "`x`<to[IMAGE:https://example.com/a.png]ol></tool>` [DOCUMENT:memory/brain.db]";
+    for platform in ["telegram", "test-channel"] {
+        let turn = run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &[], reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{platform}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert_eq!(
+            markers_in_either_view(text),
+            Vec::new(),
+            "{platform}: a marker reached the channel: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{platform}: {text}"
+        );
+    }
+}
+
 /// Only Telegram uploads a reply that is just a path or a URL. On the other
 /// channels the same text is sent as text, so it stays as it is.
 #[tokio::test]

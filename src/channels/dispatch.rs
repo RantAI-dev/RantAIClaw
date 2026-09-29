@@ -345,17 +345,94 @@ const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 ///
 /// When nothing was refused the reply comes back as it was. Otherwise the reply
 /// is rebuilt from its text with every tool-call block removed, the attachments
-/// that passed, and one closing line saying an attachment was withheld. With no
-/// tool-call tag left in it, the rebuilt reply reads the same in both ways. The
-/// log line carries the count, never a path.
+/// that passed, and one closing line saying an attachment was withheld. Removing
+/// a marker joins the text on both sides of it, which can change how a code span
+/// or a tool-call tag reads, so the rebuilt reply is judged again in every way
+/// the original was. If that finds a refused marker, or a marker that is not one
+/// of the kept attachments, the reply is only the closing line. The log line
+/// carries the count, never a path.
 pub(crate) async fn withhold_guest_attachments(
     reply: &str,
     channel: &str,
     workspace: &std::path::Path,
     file_read_permitted: bool,
 ) -> String {
-    // What Telegram parses: tool-call blocks removed once, exactly as its `send`
-    // does. Removing until none is left would show less than Telegram sees.
+    let judged = judge_guest_reply(reply, channel, workspace, file_read_permitted).await;
+    if judged.refused == 0 {
+        return reply.to_string();
+    }
+
+    tracing::info!(
+        channel,
+        refused = judged.refused,
+        "withheld attachments from a guest reply"
+    );
+
+    // Rebuild from the reply with every tool-call block gone, so no channel can
+    // read a different set of markers out of it than the one kept here.
+    let mut without_tags = reply.to_string();
+    loop {
+        let stripped = super::telegram::strip_tool_call_tags(&without_tags);
+        if stripped == without_tags {
+            break;
+        }
+        without_tags = stripped;
+    }
+    let (cleaned, candidates) = media::parse_attachment_markers(&without_tags);
+
+    // A reply that was only a refused path has no other text to keep.
+    let mut rebuilt = if judged.path_only_refused {
+        String::new()
+    } else {
+        cleaned
+    };
+    let mut kept: Vec<media::OutboundAttachment> = Vec::new();
+    for attachment in candidates {
+        if guest_may_receive(&attachment, channel, workspace, file_read_permitted).await {
+            if !rebuilt.is_empty() {
+                rebuilt.push('\n');
+            }
+            rebuilt.push_str(&attachment.to_marker());
+            kept.push(attachment);
+        }
+    }
+    if !rebuilt.is_empty() {
+        rebuilt.push('\n');
+    }
+    rebuilt.push_str(GUEST_ATTACHMENT_WITHHELD_LINE);
+
+    // The joined text may read differently from the original. Fail closed.
+    let rejudged = judge_guest_reply(&rebuilt, channel, workspace, file_read_permitted).await;
+    if rejudged.refused > 0 || rejudged.attachments.iter().any(|a| !kept.contains(a)) {
+        return GUEST_ATTACHMENT_WITHHELD_LINE.to_string();
+    }
+    rebuilt
+}
+
+/// What a guest's reply carries, read the ways the channels read it.
+struct GuestReplyJudgement {
+    /// Every marker found in either reading, without repeats.
+    attachments: Vec<media::OutboundAttachment>,
+    /// How many of the attachments a guest may not receive, plus one for a
+    /// refused Telegram path-only reply.
+    refused: usize,
+    /// The reply is only the path of a file a guest may not receive, and
+    /// Telegram would upload it without a marker.
+    path_only_refused: bool,
+}
+
+/// Read a guest's reply the way each kind of channel reads it and judge every
+/// attachment found.
+///
+/// Discord, Slack, WhatsApp Web and Lark parse the text as it is. Telegram
+/// removes tool-call blocks once, exactly as its `send` does, and parses what is
+/// left. Removing until none is left would show less than Telegram sees.
+async fn judge_guest_reply(
+    reply: &str,
+    channel: &str,
+    workspace: &std::path::Path,
+    file_read_permitted: bool,
+) -> GuestReplyJudgement {
     let telegram_view = super::telegram::strip_tool_call_tags(reply);
 
     let mut attachments: Vec<media::OutboundAttachment> = Vec::new();
@@ -387,43 +464,12 @@ pub(crate) async fn withhold_guest_attachments(
             }
         }
     }
-    if refused == 0 {
-        return reply.to_string();
-    }
 
-    tracing::info!(channel, refused, "withheld attachments from a guest reply");
-
-    // Rebuild from the reply with every tool-call block gone, so no channel can
-    // read a different set of markers out of it than the one kept here.
-    let mut without_tags = reply.to_string();
-    loop {
-        let stripped = super::telegram::strip_tool_call_tags(&without_tags);
-        if stripped == without_tags {
-            break;
-        }
-        without_tags = stripped;
+    GuestReplyJudgement {
+        attachments,
+        refused,
+        path_only_refused,
     }
-    let (cleaned, candidates) = media::parse_attachment_markers(&without_tags);
-
-    // A reply that was only a refused path has no other text to keep.
-    let mut rebuilt = if path_only_refused {
-        String::new()
-    } else {
-        cleaned
-    };
-    for attachment in &candidates {
-        if guest_may_receive(attachment, channel, workspace, file_read_permitted).await {
-            if !rebuilt.is_empty() {
-                rebuilt.push('\n');
-            }
-            rebuilt.push_str(&attachment.to_marker());
-        }
-    }
-    if !rebuilt.is_empty() {
-        rebuilt.push('\n');
-    }
-    rebuilt.push_str(GUEST_ATTACHMENT_WITHHELD_LINE);
-    rebuilt
 }
 
 /// Whether a guest's reply may carry this attachment. See
