@@ -2802,10 +2802,10 @@ mod tests {
 
     #[test]
     fn config_api_redacts_skill_env_db_url() {
-        // A skill's `env` map can carry a `DB_URL` connection string. Only
-        // `redact_secrets_in_json` protects this map (it isn't a typed
-        // secret field `redact_config_secrets` knows about), so it must
-        // still clear a key named `db_url` in any case.
+        // A skill's `env` map can carry a `DB_URL` connection string.
+        // `redact_config_secrets` blanks every skill env value. This test
+        // runs only the key-name walk, so the `db_url` rule still has to
+        // cover a `DB_URL` key on its own.
         let mut cfg = Config::default();
         cfg.skills.entries.insert(
             "x".into(),
