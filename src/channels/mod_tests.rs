@@ -11608,10 +11608,28 @@ async fn run_attachment_turn(
     guest_tools: &[&str],
     reply: &str,
 ) -> AttachmentTurn {
+    run_attachment_turn_on("telegram", workspace, sender, guest_tools, reply).await
+}
+
+/// [`run_attachment_turn`] on the channel named `platform`: `"telegram"` gets the
+/// Telegram-shaped recorder, any other name a plain recorder that reads the
+/// reply the way Discord, Slack, WhatsApp Web and Lark do.
+async fn run_attachment_turn_on(
+    platform: &str,
+    workspace: &std::path::Path,
+    sender: &str,
+    guest_tools: &[&str],
+    reply: &str,
+) -> AttachmentTurn {
     let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
 
-    let channel_impl = Arc::new(TelegramRecordingChannel::default());
-    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let telegram_impl = Arc::new(TelegramRecordingChannel::default());
+    let plain_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = if platform == "telegram" {
+        telegram_impl.clone()
+    } else {
+        plain_impl.clone()
+    };
     let provider_impl = Arc::new(ReplyAndPromptProvider {
         reply: reply.to_string(),
         system_prompts: std::sync::Mutex::new(Vec::new()),
@@ -11635,7 +11653,11 @@ async fn run_attachment_turn(
         sender: sender.to_string(),
         reply_target: "chat-attachment".to_string(),
         content: "please send me the file".to_string(),
-        channel: "telegram".to_string(),
+        channel: if platform == "telegram" {
+            "telegram".to_string()
+        } else {
+            plain_impl.name().to_string()
+        },
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
@@ -11643,10 +11665,12 @@ async fn run_attachment_turn(
     };
     process_channel_message(ctx, msg, CancellationToken::new()).await;
 
-    let sent = channel_impl
-        .sent_messages
-        .lock()
-        .await
+    let recorded = if platform == "telegram" {
+        telegram_impl.sent_messages.lock().await.clone()
+    } else {
+        plain_impl.sent_messages.lock().await.clone()
+    };
+    let sent = recorded
         .iter()
         .map(|line| {
             line.split_once(':')
@@ -11738,6 +11762,11 @@ async fn guest_reply_unclosed_marker_for_the_owner_database_is_withheld() {
 #[tokio::test]
 async fn guest_reply_url_marker_is_withheld_with_or_without_file_read() {
     let ws = attachment_workspace();
+    // A relative target is joined to the workspace, so this URL also names a
+    // real file there. A guest with `file_write` can create it. The marker must
+    // still not pass, because the channel would fetch the URL.
+    std::fs::create_dir_all(ws.path().join("https:/example.com")).unwrap();
+    std::fs::write(ws.path().join("https:/example.com/a.png"), b"png").unwrap();
     for tools in [&[][..], &["file_read"][..]] {
         let turn = run_attachment_turn(
             ws.path(),
@@ -11899,6 +11928,155 @@ async fn guest_reply_marker_split_by_a_tool_call_block_is_withheld() {
     assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
     let text = &turn.sent[0];
     assert!(!text.contains("brain.db"), "the marker survived: {text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// What each kind of channel reads out of a sent reply: Discord, Slack, WhatsApp
+/// Web and Lark parse the text as it is, Telegram parses it after removing
+/// tool-call blocks once. Neither may find a marker in a withheld reply.
+fn markers_in_either_view(text: &str) -> Vec<media::OutboundAttachment> {
+    let (_, mut markers) = media::parse_attachment_markers(text);
+    let once = crate::channels::telegram::strip_tool_call_tags(text);
+    let (_, in_telegram_view) = media::parse_attachment_markers(&once);
+    markers.extend(in_telegram_view);
+    markers
+}
+
+/// A tool-call opener with no closer makes Telegram drop everything after it,
+/// so a marker behind one is invisible there. Every other channel parses the raw
+/// text and uploads the file, so the filter has to judge the raw text too.
+#[tokio::test]
+async fn guest_reply_marker_hidden_from_telegram_by_a_tool_tag_is_withheld_everywhere() {
+    let ws = attachment_workspace();
+    for platform in ["telegram", "test-channel"] {
+        for reply in [
+            "<tool>[DOCUMENT:memory/brain.db]",
+            "<tool>[DOCUMENT:memory/brain.db]</tool>",
+            "<function_calls>[DOCUMENT:memory/brain.db]",
+        ] {
+            let turn = run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &[], reply).await;
+
+            assert_eq!(turn.sent.len(), 1, "{platform} {reply}: {:?}", turn.sent);
+            let text = &turn.sent[0];
+            assert_eq!(
+                markers_in_either_view(text),
+                Vec::new(),
+                "{platform} {reply}: a marker reached the channel: {text}"
+            );
+            assert!(
+                text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+                "{platform} {reply}: {text}"
+            );
+        }
+    }
+}
+
+/// Telegram removes tool-call blocks once, not until none is left. Here one
+/// removal turns the reply into `<tool>[DOCUMENT:memory/brain.db]</tool>` and
+/// Telegram uploads the file. Removing to the end would hide the marker, and the
+/// raw text has none, so the filter has to read the reply once, as Telegram does.
+#[tokio::test]
+async fn guest_reply_marker_revealed_by_one_tool_tag_removal_is_withheld() {
+    let ws = attachment_workspace();
+    let reply = "<too<tool>x</tool>l>[DOC<tool>y</tool>UMENT:memory/brain.db]</tool>";
+    let once = crate::channels::telegram::strip_tool_call_tags(reply);
+    assert_eq!(once, "<tool>[DOCUMENT:memory/brain.db]</tool>", "fixture");
+    assert_eq!(media::parse_attachment_markers(reply).1, Vec::new());
+
+    for platform in ["telegram", "test-channel"] {
+        let turn = run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &[], reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{platform}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert_eq!(
+            markers_in_either_view(text),
+            Vec::new(),
+            "{platform}: a marker reached the channel: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{platform}: {text}"
+        );
+    }
+}
+
+/// The rebuilt reply keeps what passed and, read either way, carries nothing
+/// else. The refused marker sits behind a tool-call opener that Telegram cuts at.
+#[tokio::test]
+async fn guest_reply_rebuilt_around_a_hidden_marker_keeps_only_what_passed() {
+    let ws = attachment_workspace();
+    let reply = "Menu [DOCUMENT:notes/menu.txt] <tool>[DOCUMENT:memory/brain.db]";
+    for platform in ["telegram", "test-channel"] {
+        let turn =
+            run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &["file_read"], reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{platform}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        let expected = vec![media::OutboundAttachment {
+            kind: media::AttachmentKind::Document,
+            target: "notes/menu.txt".to_string(),
+        }];
+        assert_eq!(media::parse_attachment_markers(text).1, expected, "{text}");
+        assert_eq!(
+            media::parse_attachment_markers(&crate::channels::telegram::strip_tool_call_tags(text))
+                .1,
+            expected,
+            "{text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{platform}: {text}"
+        );
+    }
+}
+
+/// Only Telegram uploads a reply that is just a path or a URL. On the other
+/// channels the same text is sent as text, so it stays as it is.
+#[tokio::test]
+async fn guest_path_only_reply_is_judged_on_telegram_only() {
+    let ws = attachment_workspace();
+    let user_md = ws.path().join("USER.md").display().to_string();
+    for reply in ["https://example.com/menu.pdf".to_string(), user_md.clone()] {
+        for tools in [&[][..], &["file_read"][..]] {
+            let turn =
+                run_attachment_turn_on("test-channel", ws.path(), GUEST_SENDER, tools, &reply)
+                    .await;
+            assert_eq!(turn.sent, vec![reply.clone()], "{tools:?}");
+        }
+    }
+
+    let turn = run_attachment_turn_on(
+        "telegram",
+        ws.path(),
+        GUEST_SENDER,
+        &["file_read"],
+        "https://example.com/menu.pdf",
+    )
+    .await;
+    assert_eq!(turn.sent, vec![GUEST_ATTACHMENT_WITHHELD_LINE.to_string()]);
+}
+
+/// A marker the guest may receive, placed inside a tool-call block, is a marker
+/// for the channels that read the raw text. Telegram removes the block and is
+/// left with a reply that is only an owner file's path, which it uploads. The
+/// marker found elsewhere must not stop the path-only check.
+#[tokio::test]
+async fn guest_reply_path_only_after_tool_block_removal_is_withheld_on_telegram() {
+    let ws = attachment_workspace();
+    let user_md = ws.path().join("USER.md").display().to_string();
+    let reply = format!("{user_md}<tool>[DOCUMENT:notes/menu.txt]</tool>");
+    let once = crate::channels::telegram::strip_tool_call_tags(&reply);
+    assert_eq!(once, user_md, "fixture");
+
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], &reply).await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    let telegram_view = crate::channels::telegram::strip_tool_call_tags(text);
+    assert!(
+        crate::channels::telegram::parse_path_only_attachment(&telegram_view).is_none(),
+        "Telegram would upload the owner file: {text}"
+    );
     assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
 }
 

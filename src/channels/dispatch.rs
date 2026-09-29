@@ -326,66 +326,65 @@ const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 /// call, so `GuestGate` never sees it. Without this filter a guest could ask for
 /// `[DOCUMENT:memory/brain.db]` and receive every note and every chat's history.
 ///
-/// The reply is read with the same parser the channels use, so a marker the
-/// parser recovers from an unclosed bracket is caught too. A URL never passes:
-/// the runtime fetches it on the channels that upload bytes, which lets a guest
-/// aim the bot at an internal address. A local path passes only when the
-/// operator lets guests use `file_read` **and** the file is one a guest
-/// `file_read` could return: inside the workspace, not a private owner path by
-/// its name or after symlinks resolve, and not a SQLite database under any name
-/// or one of its journal files.
+/// The reply is read with the same parser the channels use, in both ways the
+/// channels read it, so a marker the parser recovers from an unclosed bracket is
+/// caught too. Discord, Slack, WhatsApp Web and Lark parse the text as it is.
+/// Telegram removes tool-call blocks once and parses what is left. A marker
+/// visible in either reading is judged, so a tool-call tag cannot hide one from
+/// the filter and still leave it visible to a channel. A URL never passes: the
+/// runtime fetches it on the channels that upload bytes, which lets a guest aim
+/// the bot at an internal address. A local path passes only when the operator
+/// lets guests use `file_read` **and** the file is one a guest `file_read` could
+/// return: inside the workspace, not a private owner path by its name or after
+/// symlinks resolve, and not a SQLite database under any name or one of its
+/// journal files.
 ///
-/// A reply that is only the path of an existing file, which Telegram uploads
-/// without a marker, is judged the same way.
+/// On Telegram, a reply that is only the path of an existing file, or a URL, is
+/// uploaded without a marker. It is judged the same way. Other channels send
+/// that text as it is.
 ///
-/// When nothing was refused the reply comes back as it was. Otherwise the
-/// reply is rebuilt from its text, the attachments that passed, and one closing
-/// line saying an attachment was withheld. The log line carries the count, never
-/// a path.
+/// When nothing was refused the reply comes back as it was. Otherwise the reply
+/// is rebuilt from its text with every tool-call block removed, the attachments
+/// that passed, and one closing line saying an attachment was withheld. With no
+/// tool-call tag left in it, the rebuilt reply reads the same in both ways. The
+/// log line carries the count, never a path.
 pub(crate) async fn withhold_guest_attachments(
     reply: &str,
     channel: &str,
     workspace: &std::path::Path,
     file_read_permitted: bool,
 ) -> String {
-    // Telegram removes tool-call blocks before it reads markers, so a marker
-    // split by one is only a marker after the removal. Read the reply the way
-    // that channel will, until nothing more comes out.
-    let mut visible = reply.to_string();
-    loop {
-        let stripped = super::telegram::strip_tool_call_tags(&visible);
-        if stripped == visible {
-            break;
-        }
-        visible = stripped;
-    }
+    // What Telegram parses: tool-call blocks removed once, exactly as its `send`
+    // does. Removing until none is left would show less than Telegram sees.
+    let telegram_view = super::telegram::strip_tool_call_tags(reply);
 
-    let (cleaned, attachments) = media::parse_attachment_markers(&visible);
-    if attachments.is_empty() {
-        // Telegram also uploads a reply that is nothing but the path of an
-        // existing file, with no marker. That form is judged by Telegram's own
-        // rule, on every channel: elsewhere the path would only be sent as text,
-        // and withholding a bare refused path there costs nothing.
-        if let Some(attachment) = super::telegram::parse_path_only_attachment(&visible) {
-            if !guest_may_receive(&attachment, channel, workspace, file_read_permitted).await {
-                tracing::info!(
-                    channel,
-                    refused = 1usize,
-                    "withheld attachments from a guest reply"
-                );
-                return GUEST_ATTACHMENT_WITHHELD_LINE.to_string();
+    let mut attachments: Vec<media::OutboundAttachment> = Vec::new();
+    for view in [reply, telegram_view.as_str()] {
+        for attachment in media::parse_attachment_markers(view).1 {
+            if !attachments.contains(&attachment) {
+                attachments.push(attachment);
             }
         }
-        return reply.to_string();
     }
 
-    let mut kept = Vec::new();
     let mut refused = 0usize;
-    for attachment in attachments {
-        if guest_may_receive(&attachment, channel, workspace, file_read_permitted).await {
-            kept.push(attachment);
-        } else {
+    for attachment in &attachments {
+        if !guest_may_receive(attachment, channel, workspace, file_read_permitted).await {
             refused += 1;
+        }
+    }
+
+    // Telegram also uploads a reply that is nothing but the path of an existing
+    // file, when it finds no marker in what is left after the removal. A marker
+    // found in the raw text does not change that. The other channels send such
+    // text as it is.
+    let mut path_only_refused = false;
+    if channel == "telegram" && media::parse_attachment_markers(&telegram_view).1.is_empty() {
+        if let Some(attachment) = super::telegram::parse_path_only_attachment(&telegram_view) {
+            if !guest_may_receive(&attachment, channel, workspace, file_read_permitted).await {
+                path_only_refused = true;
+                refused += 1;
+            }
         }
     }
     if refused == 0 {
@@ -394,12 +393,31 @@ pub(crate) async fn withhold_guest_attachments(
 
     tracing::info!(channel, refused, "withheld attachments from a guest reply");
 
-    let mut rebuilt = cleaned;
-    for attachment in &kept {
-        if !rebuilt.is_empty() {
-            rebuilt.push('\n');
+    // Rebuild from the reply with every tool-call block gone, so no channel can
+    // read a different set of markers out of it than the one kept here.
+    let mut without_tags = reply.to_string();
+    loop {
+        let stripped = super::telegram::strip_tool_call_tags(&without_tags);
+        if stripped == without_tags {
+            break;
         }
-        rebuilt.push_str(&attachment.to_marker());
+        without_tags = stripped;
+    }
+    let (cleaned, candidates) = media::parse_attachment_markers(&without_tags);
+
+    // A reply that was only a refused path has no other text to keep.
+    let mut rebuilt = if path_only_refused {
+        String::new()
+    } else {
+        cleaned
+    };
+    for attachment in &candidates {
+        if guest_may_receive(attachment, channel, workspace, file_read_permitted).await {
+            if !rebuilt.is_empty() {
+                rebuilt.push('\n');
+            }
+            rebuilt.push_str(&attachment.to_marker());
+        }
     }
     if !rebuilt.is_empty() {
         rebuilt.push('\n');
