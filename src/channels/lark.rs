@@ -520,10 +520,20 @@ impl LarkChannel {
         cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         // Resolve who we are before the first group message arrives, so the
-        // mention gate has something to compare against.
-        self.ensure_bot_identity().await;
+        // mention gate has something to compare against. This step and the
+        // two after it stop when `cancel` fires, so a stalled Lark API cannot
+        // hold up shutdown.
+        if run_until_cancelled(&cancel, self.ensure_bot_identity())
+            .await
+            .is_none()
+        {
+            return Ok(());
+        }
 
-        let (wss_url, client_config) = self.get_ws_endpoint().await?;
+        let Some(endpoint) = run_until_cancelled(&cancel, self.get_ws_endpoint()).await else {
+            return Ok(());
+        };
+        let (wss_url, client_config) = endpoint?;
         let service_id = wss_url
             .split('?')
             .nth(1)
@@ -537,7 +547,15 @@ impl LarkChannel {
         let safe_url = redact_url_query(&wss_url);
         tracing::info!("Lark: connecting to {safe_url}");
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url).await?;
+        let Some(connected) = run_until_cancelled(
+            &cancel,
+            Box::pin(tokio_tungstenite::connect_async(&wss_url)),
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        let (ws_stream, _) = connected?;
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("Lark: WS connected (service_id={service_id})");
 
@@ -1786,6 +1804,10 @@ impl LarkChannel {
                 .map(|u| u.clone())
                 .unwrap_or_default(),
         );
+        receiver.use_feishu = self.use_feishu;
+        receiver.receive_mode = self.receive_mode.clone();
+        receiver.encrypt_key = self.encrypt_key.clone();
+        receiver.multimodal = self.multimodal.clone();
         receiver.bot_identity = Arc::clone(&self.bot_identity);
         Arc::new(receiver)
     }
@@ -2626,6 +2648,50 @@ mod tests {
             held.map(|id| id.open_id).as_deref(),
             Some("ou_rantaiclaw_bot"),
             "the receiver must hold the seeded identity"
+        );
+    }
+
+    /// An international Lark app must not have its callbacks served by a
+    /// receiver that talks to Feishu: the identity fetch, the acknowledgement
+    /// reaction and attachment reads all go through `api_base()`.
+    #[test]
+    fn the_webhook_receiver_keeps_the_configured_host() {
+        let mut ch = make_channel();
+        ch.use_feishu = false;
+        ch.receive_mode = crate::config::schema::LarkReceiveMode::Webhook;
+        ch.encrypt_key = Some("rantaiclaw_encrypt_key".into());
+        ch.multimodal = crate::config::MultimodalConfig {
+            max_images: 7,
+            max_image_size_mb: 11,
+            allow_remote_fetch: true,
+            runtime_workspace: Some(std::path::PathBuf::from("/rantaiclaw_workspace")),
+        };
+
+        let receiver = ch.webhook_receiver();
+
+        assert!(
+            !receiver.use_feishu,
+            "the receiver must not switch to Feishu"
+        );
+        assert_eq!(receiver.api_base(), LARK_BASE_URL);
+        assert_eq!(receiver.receive_mode, ch.receive_mode);
+        assert_eq!(receiver.encrypt_key, ch.encrypt_key);
+        assert_eq!(receiver.multimodal.max_images, ch.multimodal.max_images);
+        assert_eq!(
+            receiver.multimodal.max_image_size_mb,
+            ch.multimodal.max_image_size_mb
+        );
+        assert_eq!(
+            receiver.multimodal.allow_remote_fetch,
+            ch.multimodal.allow_remote_fetch
+        );
+        assert_eq!(
+            receiver.multimodal.runtime_workspace,
+            ch.multimodal.runtime_workspace
+        );
+        assert!(
+            Arc::ptr_eq(&receiver.bot_identity, &ch.bot_identity),
+            "the receiver must keep sharing the identity cache"
         );
     }
 
