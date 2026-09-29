@@ -284,6 +284,35 @@ fn guest_render_omits_owner_name_and_timezone_in_every_preset() {
     }
 }
 
+/// A guest reads the persona as the bot's brief for the person in the chat, so
+/// a line such as "mirror <name>'s energy" must name that person as "the user".
+/// Substituting a description of the owner ("the owner of this bot") tells a
+/// guest that the person they are talking to is somebody else.
+#[test]
+fn guest_render_addresses_the_person_in_the_chat_in_every_preset() {
+    for &p in PresetId::ALL {
+        let persona = PersonaToml {
+            preset: p,
+            name: "Owner Name".into(),
+            timezone: "Asia/Jakarta".into(),
+            role: ROLE.into(),
+            tone: TONE.into(),
+            avoid: None,
+            always_on_kbs: Vec::new(),
+        };
+
+        let guest_body = persona.render_for_guest();
+        assert!(
+            !guest_body.contains("the owner of this bot"),
+            "preset {p:?} guest render still describes the person in the chat as the owner: {guest_body}"
+        );
+        assert!(
+            guest_body.contains("for the user"),
+            "preset {p:?} guest render should address the person in the chat as the user: {guest_body}"
+        );
+    }
+}
+
 /// The executive-assistant preset's scheduling bullet mentions `{{timezone}}`
 /// outside the line-3 `{{#if timezone}}` guard. An empty timezone (every
 /// guest render, and any owner who has not set one) used to substitute the

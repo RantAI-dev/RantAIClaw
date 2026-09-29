@@ -310,10 +310,24 @@ pub fn render(config: &Config) -> String {
     out.push_str(
         "  always: skill instructions in the prompt (a skill's own tools still need guest_allowed_tools)\n",
     );
-    if cc.guest_allowed_tools.is_empty() {
+    // `GuestGate` refuses an owner-only tool whatever the list says, so an
+    // entry like that is shown as refused, not as something guests can call.
+    let (refused_tools, usable_tools): (Vec<&str>, Vec<&str>) = cc
+        .guest_allowed_tools
+        .iter()
+        .map(String::as_str)
+        .partition(|tool| crate::approval::GuestGate::OWNER_ONLY_TOOLS.contains(tool));
+    if usable_tools.is_empty() {
         out.push_str("  tools : no tools (chat only)\n");
     } else {
-        let _ = writeln!(out, "  tools : {}", cc.guest_allowed_tools.join(", "));
+        let _ = writeln!(out, "  tools : {}", usable_tools.join(", "));
+    }
+    if !refused_tools.is_empty() {
+        let _ = writeln!(
+            out,
+            "  refused (owner-only, guests can never use them): {}",
+            refused_tools.join(", ")
+        );
     }
 
     // Guest command ceiling.
@@ -515,6 +529,47 @@ mod tests {
         let s = render(&c);
         assert!(s.contains("web_search"));
         assert!(!s.contains("file_read"));
+    }
+
+    /// `GuestGate` refuses an owner-only tool whatever `guest_allowed_tools`
+    /// says, so the summary must not list it as a tool guests can use.
+    #[test]
+    fn render_marks_an_owner_only_guest_tool_as_refused() {
+        let mut c = cfg();
+        c.channels_config.guest_allowed_tools =
+            vec!["web_search".to_string(), "delegate".to_string()];
+        let s = render(&c);
+
+        let tools_line = s
+            .lines()
+            .find(|l| l.trim_start().starts_with("tools :"))
+            .unwrap_or_else(|| panic!("no guest tools line in:\n{s}"));
+        assert!(tools_line.contains("web_search"), "{s}");
+        assert!(
+            !tools_line.contains("delegate"),
+            "an owner-only tool is listed as available to guests:\n{s}"
+        );
+        let refused_line = s
+            .lines()
+            .find(|l| l.contains("refused") && l.contains("delegate"))
+            .unwrap_or_else(|| panic!("delegate is not marked as refused in:\n{s}"));
+        assert!(refused_line.contains("owner-only"), "{s}");
+    }
+
+    /// When every entry is owner-only there is nothing left to call, so the
+    /// guest line reads "chat only" beside the refused note.
+    #[test]
+    fn render_shows_chat_only_when_every_guest_tool_is_owner_only() {
+        let mut c = cfg();
+        c.channels_config.guest_allowed_tools = vec!["delegate".to_string()];
+        let s = render(&c);
+
+        assert!(s.contains("no tools (chat only)"), "{s}");
+        assert!(
+            s.lines()
+                .any(|l| l.contains("refused") && l.contains("delegate")),
+            "{s}"
+        );
     }
 
     /// An empty `guest_allowed_tools` reads as "chat only", not a blank list.

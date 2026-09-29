@@ -1040,12 +1040,25 @@ pub(crate) async fn process_channel_message(
         .map(|b| b as &dyn crate::approval::ApprovalBackend);
 
     // Per-role capability ceiling: owners (senders in approval_owners) get the
-    // full toolset; everyone else runs under the guest gate (safe tools +
-    // guest_allowed_tools, shell limited to guest_allowed_commands).
+    // full toolset; everyone else runs under the guest gate
+    // (`guest_allowed_tools` only, minus the owner-only tools, with shell
+    // limited to `guest_allowed_commands`).
     let guest_gate_ref = if sender_is_owner {
         None
     } else {
         Some(runtime_defaults.guest_gate.as_ref())
+    };
+    // The registry a guest's loop runs on is the entries that gate permits, so
+    // a native provider is sent specs for those tools only. Built per turn
+    // from the reloaded gate, so an operator edit to `guest_allowed_tools`
+    // applies to the next message. The gate still checks every call.
+    let guest_turn_tools = if sender_is_owner {
+        Vec::new()
+    } else {
+        crate::tools::guest_registry::permitted_tools(
+            &ctx.tools_registry,
+            &runtime_defaults.guest_gate,
+        )
     };
 
     let timeout_budget_secs = channel_message_timeout_budget_secs(
@@ -1105,7 +1118,7 @@ pub(crate) async fn process_channel_message(
                         MEMORY_VIEW.scope(view, run_tool_call_loop(
                             active_provider.as_ref(),
                             &mut history,
-                            ctx.tools_registry.as_ref(),
+                            &guest_turn_tools,
                             ctx.observer.as_ref(),
                             route.provider.as_str(),
                             route.model.as_str(),

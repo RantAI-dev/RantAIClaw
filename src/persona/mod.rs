@@ -172,15 +172,16 @@ impl PersonaToml {
     }
 
     /// Render the persona body for a guest turn: the owner's name is
-    /// replaced by "the owner of this bot" and the timezone is omitted, so
-    /// neither reaches a non-owner sender. Role, tone and avoid are
-    /// unchanged. The literal replacement name is passed explicitly rather
-    /// than an empty string, since the renderer maps an empty name to
-    /// "you".
+    /// replaced by "the user" and the timezone is omitted, so neither reaches
+    /// a non-owner sender. The templates use the name for the person in the
+    /// chat ("mirror {{name}}'s energy"), and for a guest that person is the
+    /// user, not the owner. Role, tone and avoid are unchanged. The literal
+    /// replacement name is passed explicitly rather than an empty string,
+    /// since the renderer maps an empty name to "you".
     pub fn render_for_guest(&self) -> String {
         renderer::render(
             template_for(self.preset),
-            "the owner of this bot",
+            "the user",
             "",
             &self.role,
             &self.tone,

@@ -7951,6 +7951,85 @@ fn prompt_workspace_path() {
     assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
 }
 
+/// Builds the channel system prompt for `skip_owner_files` (a guest turn) or
+/// not (an owner turn) over the workspace `ws`, with no skills and no tools.
+fn channel_prompt_for(ws: &TempDir, guest: bool) -> String {
+    build_system_prompt_with_mode(
+        ws.path(),
+        "model",
+        &[],
+        &[],
+        None,
+        None,
+        false,
+        crate::config::SkillsPromptInjectionMode::Full,
+        guest,
+    )
+}
+
+/// A guest prompt describes the guest's turn, not the host: no absolute
+/// workspace path (it carries the OS user name), no host name, no timezone
+/// of the machine, and no `TOOLS.md` (its scaffold asks the owner for SSH
+/// hosts and device nicknames).
+#[test]
+fn guest_prompt_carries_no_host_or_workspace_details() {
+    let ws = make_workspace();
+    std::fs::write(
+        ws.path().join("TOOLS.md"),
+        "# Tools\nSSH host: box-a.internal.example",
+    )
+    .unwrap();
+    let path = ws.path().display().to_string();
+
+    let guest = channel_prompt_for(&ws, true);
+
+    assert!(
+        !guest.contains(&path),
+        "the absolute workspace path reached a guest prompt:\n{guest}"
+    );
+    assert!(
+        guest.contains("File paths are relative to the bot's workspace."),
+        "the guest workspace section is missing:\n{guest}"
+    );
+    assert!(
+        !guest.contains("Host:"),
+        "the host line reached a guest prompt:\n{guest}"
+    );
+    assert!(
+        guest.contains("Timezone: UTC"),
+        "a guest prompt must state UTC, not the host zone:\n{guest}"
+    );
+    assert!(
+        !guest.contains("### TOOLS.md") && !guest.contains("box-a.internal.example"),
+        "TOOLS.md reached a guest prompt:\n{guest}"
+    );
+    // The files that describe the bot stay.
+    assert!(guest.contains("### AGENTS.md"), "{guest}");
+    assert!(guest.contains("### SOUL.md"), "{guest}");
+    assert!(guest.contains("### IDENTITY.md"), "{guest}");
+}
+
+/// Control for the test above: the owner prompt keeps all four, byte for
+/// byte what it had before the guest prompt was narrowed.
+#[test]
+fn owner_prompt_keeps_host_workspace_and_tools_file() {
+    let ws = make_workspace();
+    let path = ws.path().display().to_string();
+
+    let owner = channel_prompt_for(&ws, false);
+
+    assert!(
+        owner.contains(&format!("Working directory: `{path}`")),
+        "{owner}"
+    );
+    assert!(owner.contains("Host: "), "{owner}");
+    assert!(
+        owner.contains(&format!("Timezone: {}", chrono::Local::now().format("%Z"))),
+        "{owner}"
+    );
+    assert!(owner.contains("### TOOLS.md"), "{owner}");
+}
+
 #[test]
 fn conversation_memory_key_uses_message_id() {
     let msg = traits::ChannelMessage {
@@ -9059,7 +9138,7 @@ async fn guest_channel_turn_uses_guest_persona_without_owner_name_or_timezone() 
         .unwrap_or_else(|e| e.into_inner());
     let system_prompt = calls[0][0].1.clone();
     assert!(
-        system_prompt.contains("the owner of this bot"),
+        system_prompt.contains("assistant for the user"),
         "the guest persona render should replace the owner's name: {system_prompt}"
     );
     assert!(
@@ -10587,6 +10666,117 @@ done
     );
 }
 
+/// The owner and guest prompts of the runtime `build_channel_runtime` builds
+/// for a provider without native tool calling (`openai-codex` takes the trait
+/// default), with `guest_tools` as the operator's `guest_allowed_tools`.
+/// Returns `(owner_prompt, guest_prompt, workspace_path)`.
+///
+/// `HOME` and the config directory point at temp directories for the whole
+/// build, so nothing reaches the operator's real profile.
+async fn non_native_runtime_prompts(guest_tools: &[&str]) -> (String, String, String) {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let home = TempDir::new().expect("temp home");
+    let config_dir = TempDir::new().expect("temp config dir");
+    let workspace = TempDir::new().expect("temp workspace");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    config.config_path = config_dir.path().join("config.toml");
+    config.default_provider = Some("openai-codex".to_string());
+    config.channels_config.telegram = Some(crate::config::TelegramConfig {
+        bot_token: "111111111:not-a-real-token".into(),
+        allowed_users: vec!["*".into()],
+        stream_mode: crate::config::StreamMode::default(),
+        draft_update_interval_ms: 1000,
+        interrupt_on_new_message: false,
+        mention_only: false,
+    });
+    config.channels_config.guest_allowed_tools =
+        guest_tools.iter().map(|t| (*t).to_string()).collect();
+
+    let runtime = build_channel_runtime(&config, None)
+        .await
+        .expect("the runtime builds")
+        .expect("a configured channel means a runtime");
+    assert!(
+        !runtime.ctx.provider.supports_native_tools(),
+        "the fixture must run on a provider without native tool calling"
+    );
+
+    (
+        runtime.ctx.system_prompt.to_string(),
+        runtime.ctx.guest_system_prompt.to_string(),
+        workspace.path().display().to_string(),
+    )
+}
+
+/// The part of `prompt` from the tool-use protocol on.
+fn tool_protocol_block(prompt: &str) -> &str {
+    prompt
+        .split_once("## Tool Use Protocol")
+        .map_or("", |(_, block)| block)
+}
+
+/// The runtime's two prompts as built at start-up. A guest allowed one tool on
+/// a provider without native tool calling gets the tool-use protocol for that
+/// tool, not for the whole registry, and none of the host details the owner
+/// prompt carries.
+#[tokio::test]
+async fn built_runtime_guest_prompt_lists_only_the_permitted_tools_in_the_protocol() {
+    let (owner, guest, workspace_path) = non_native_runtime_prompts(&["file_read"]).await;
+
+    assert!(owner.contains("## Tool Use Protocol"), "{owner}");
+    assert!(
+        guest.contains("## Tool Use Protocol"),
+        "a guest with a tool needs the protocol on a non-native provider:\n{guest}"
+    );
+
+    let owner_block = tool_protocol_block(&owner);
+    assert!(owner_block.contains("**shell**"), "{owner_block}");
+    let guest_block = tool_protocol_block(&guest);
+    assert!(guest_block.contains("**file_read**"), "{guest_block}");
+    for hidden in ["**shell**", "**file_write**", "**memory_store**"] {
+        assert!(
+            !guest_block.contains(hidden),
+            "the guest protocol lists {hidden}, which the gate refuses:\n{guest_block}"
+        );
+    }
+    assert!(
+        !guest.contains("**shell**"),
+        "the guest prompt describes shell, which the gate refuses:\n{guest}"
+    );
+
+    assert!(
+        !guest.contains(&workspace_path),
+        "the absolute workspace path reached the guest prompt:\n{guest}"
+    );
+    assert!(!guest.contains("Host:"), "{guest}");
+    assert!(guest.contains("Timezone: UTC"), "{guest}");
+    assert!(!guest.contains("### TOOLS.md"), "{guest}");
+    assert!(
+        owner.contains(&format!("Working directory: `{workspace_path}`")),
+        "control: the owner prompt keeps the workspace path:\n{owner}"
+    );
+}
+
+/// A guest with no allowed tool is not told how to call one.
+#[tokio::test]
+async fn built_runtime_guest_prompt_has_no_tool_protocol_when_no_tool_is_allowed() {
+    let (owner, guest, _workspace_path) = non_native_runtime_prompts(&[]).await;
+
+    assert!(owner.contains("## Tool Use Protocol"), "{owner}");
+    assert!(
+        !guest.contains("## Tool Use Protocol"),
+        "a chat-only guest was given the tool-use protocol:\n{guest}"
+    );
+    assert!(
+        !guest.contains("**shell**"),
+        "a chat-only guest was shown shell:\n{guest}"
+    );
+}
+
 /// Every tier channel that can receive an image must charge the shared media
 /// budget on its inbound path.
 ///
@@ -11503,25 +11693,57 @@ fn guest_gate_from_config_does_not_inherit_auto_approve() {
 
 /// A guest allowed tools on a provider without native tool calling still
 /// needs the `<tool_call>` syntax explained, or the model has no way to call
-/// a tool at all. This used to be appended only to the owner prompt.
+/// a tool at all. This used to be appended only to the owner prompt. The
+/// guest's block lists only the tools the guest may call.
 #[test]
 fn guest_prompt_gets_the_tool_use_protocol_when_the_provider_lacks_native_tools() {
     let mut system_prompt = "OWNER BASE".to_string();
     let mut guest_system_prompt = "GUEST BASE".to_string();
-    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![];
+    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![
+        Box::new(NamedStubTool("shell")),
+        Box::new(NamedStubTool("web_search_tool")),
+    ];
+    let guest_tools: Vec<Box<dyn crate::tools::Tool>> =
+        vec![Box::new(NamedStubTool("web_search_tool"))];
 
     super::append_tool_instructions_when_not_native(
         &mut system_prompt,
         &mut guest_system_prompt,
         false,
         &tools_registry,
+        &guest_tools,
     );
 
     assert!(system_prompt.contains("## Tool Use Protocol"));
+    assert!(system_prompt.contains("**shell**"));
     assert!(
         guest_system_prompt.contains("## Tool Use Protocol"),
         "guest prompt must also get the tool-use protocol on a non-native provider: {guest_system_prompt}"
     );
+    assert!(guest_system_prompt.contains("**web_search_tool**"));
+    assert!(
+        !guest_system_prompt.contains("**shell**"),
+        "the guest protocol lists a tool the guest may not call: {guest_system_prompt}"
+    );
+}
+
+/// A guest that may call nothing is not taught how to call anything.
+#[test]
+fn guest_prompt_gets_no_tool_use_protocol_when_the_guest_may_call_no_tool() {
+    let mut system_prompt = "OWNER BASE".to_string();
+    let mut guest_system_prompt = "GUEST BASE".to_string();
+    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(NamedStubTool("shell"))];
+
+    super::append_tool_instructions_when_not_native(
+        &mut system_prompt,
+        &mut guest_system_prompt,
+        false,
+        &tools_registry,
+        &[],
+    );
+
+    assert!(system_prompt.contains("## Tool Use Protocol"));
+    assert_eq!(guest_system_prompt, "GUEST BASE");
 }
 
 /// A provider with native tool calling needs neither prompt touched: the
@@ -11532,12 +11754,15 @@ fn native_tools_provider_gets_no_tool_use_protocol_appended_to_either_prompt() {
     let mut system_prompt = "OWNER BASE".to_string();
     let mut guest_system_prompt = "GUEST BASE".to_string();
     let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![];
+    let guest_tools: Vec<Box<dyn crate::tools::Tool>> =
+        vec![Box::new(NamedStubTool("web_search_tool"))];
 
     super::append_tool_instructions_when_not_native(
         &mut system_prompt,
         &mut guest_system_prompt,
         true,
         &tools_registry,
+        &guest_tools,
     );
 
     assert_eq!(system_prompt, "OWNER BASE");
@@ -12263,5 +12488,261 @@ async fn owner_prompt_keeps_the_attachment_instructions() {
             )),
         "{}",
         turn.system_prompt
+    );
+}
+
+// ── the tools a turn is shown ────────────────────────────────────────────
+
+/// A tool that does nothing. Only its name matters to the tests around which
+/// tools a turn is handed.
+struct NamedStubTool(&'static str);
+
+#[async_trait::async_trait]
+impl Tool for NamedStubTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn description(&self) -> &str {
+        "stub tool"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        Ok(ToolResult {
+            success: true,
+            output: "stub ran".to_string(),
+            error: None,
+        })
+    }
+}
+
+/// A provider with native tool calling that keeps the tool names each request
+/// carried (`None` when the request carried no tool specs at all).
+#[derive(Default)]
+struct NativeSpecRecorder {
+    requests: std::sync::Mutex<Vec<Option<Vec<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for NativeSpecRecorder {
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("ok".to_string())
+    }
+
+    async fn chat(
+        &self,
+        request: crate::providers::ChatRequest<'_>,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<crate::providers::ChatResponse> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                request
+                    .tools
+                    .map(|specs| specs.iter().map(|s| s.name.clone()).collect()),
+            );
+        Ok(crate::providers::ChatResponse {
+            usage: None,
+            text: Some("ok".to_string()),
+            tool_calls: Vec::new(),
+        })
+    }
+}
+
+/// Runs one turn from `sender` against a registry of stub tools named
+/// `registry`, with `guest_tools` as the operator's `guest_allowed_tools`, on
+/// a provider with native tool calling. Returns the tool names each provider
+/// request carried.
+async fn native_specs_seen_by(
+    sender: &str,
+    registry: &[&'static str],
+    guest_tools: &[&str],
+) -> Vec<Option<Vec<String>>> {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+
+    let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+    let provider_impl = Arc::new(NativeSpecRecorder::default());
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.tools_registry = Arc::new(
+            registry
+                .iter()
+                .map(|name| Box::new(NamedStubTool(name)) as Box<dyn Tool>)
+                .collect(),
+        );
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        let tools: Vec<String> = guest_tools.iter().map(|t| (*t).to_string()).collect();
+        inner.guest_gate = Arc::new(crate::approval::GuestGate::new(&tools, &[]));
+    }
+
+    process_channel_message(
+        ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "spec-msg-1".to_string(),
+            sender: sender.to_string(),
+            reply_target: "chat-spec".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let mut requests = provider_impl
+        .requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *requests)
+}
+
+/// A native provider is handed a spec per tool in the loop's registry, so a
+/// guest turn must run on the tools the guest may use and no others.
+#[tokio::test]
+async fn guest_turn_hands_a_native_provider_only_the_permitted_tool_specs() {
+    let seen = native_specs_seen_by(
+        GUEST_SENDER,
+        &["shell", "web_search_tool", "delegate"],
+        &["web_search_tool"],
+    )
+    .await;
+
+    assert_eq!(
+        seen,
+        vec![Some(vec!["web_search_tool".to_string()])],
+        "a guest's request must carry the permitted tool only"
+    );
+}
+
+/// An owner-only tool in `guest_allowed_tools` is still refused by the gate,
+/// so the guest is not offered it either.
+#[tokio::test]
+async fn guest_turn_is_not_offered_an_owner_only_tool_the_operator_listed() {
+    let seen = native_specs_seen_by(
+        GUEST_SENDER,
+        &["web_search_tool", "delegate"],
+        &["web_search_tool", "delegate"],
+    )
+    .await;
+
+    assert_eq!(seen, vec![Some(vec!["web_search_tool".to_string()])]);
+}
+
+/// A guest with no allowed tools is shown no tool specs, not the registry
+/// with every call refused at execution.
+#[tokio::test]
+async fn guest_turn_with_no_allowed_tools_carries_no_tool_specs() {
+    let seen = native_specs_seen_by(GUEST_SENDER, &["shell", "web_search_tool"], &[]).await;
+
+    assert_eq!(seen, vec![None], "the request must carry no tool specs");
+}
+
+/// Control: an owner turn on the same registry keeps every tool.
+#[tokio::test]
+async fn owner_turn_keeps_every_tool_spec() {
+    let seen = native_specs_seen_by(
+        OWNER_SENDER,
+        &["shell", "web_search_tool", "delegate"],
+        &["web_search_tool"],
+    )
+    .await;
+
+    assert_eq!(
+        seen,
+        vec![Some(vec![
+            "shell".to_string(),
+            "web_search_tool".to_string(),
+            "delegate".to_string()
+        ])]
+    );
+}
+
+/// The guest gate still answers every call, including one for a tool that was
+/// left out of the guest's list: the refusal names the ceiling, not an
+/// unknown tool.
+#[tokio::test]
+async fn guest_call_to_a_tool_outside_its_list_is_refused_by_the_gate() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+
+    let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.tools_registry = Arc::new(vec![
+            Box::new(NamedStubTool("memory_view_probe")) as Box<dyn Tool>,
+            Box::new(NamedStubTool("web_search_tool")) as Box<dyn Tool>,
+        ]);
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        inner.guest_gate = Arc::new(crate::approval::GuestGate::new(
+            &["web_search_tool".to_string()],
+            &[],
+        ));
+    }
+
+    process_channel_message(
+        ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "gate-msg-1".to_string(),
+            sender: GUEST_SENDER.to_string(),
+            reply_target: "chat-gate".to_string(),
+            content: "probe".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2, "one tool round, then the final answer");
+    let tool_results = calls[1]
+        .iter()
+        .find(|(role, content)| role == "user" && content.contains("[Tool results]"))
+        .map(|(_, content)| content.clone())
+        .expect("the second request carries the tool results");
+    assert!(
+        tool_results.contains("isn't available to non-owner users"),
+        "the gate's refusal is missing:\n{tool_results}"
+    );
+    assert!(
+        !tool_results.contains("Unknown tool"),
+        "the call fell through to the unknown-tool path:\n{tool_results}"
     );
 }

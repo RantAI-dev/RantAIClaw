@@ -112,6 +112,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+pub(crate) mod guest_registry;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
