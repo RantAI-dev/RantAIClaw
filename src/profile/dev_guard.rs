@@ -1,8 +1,11 @@
 //! Debug-build isolation of the operator's real config tree.
 //!
-//! Compiled only under `cfg(any(test, debug_assertions))`, so a release build
-//! carries none of it. Unit tests, integration tests, `cargo run` and a binary
-//! a test spawns are all debug builds and share these guards.
+//! The helpers are always compiled, because the binary crate built as a test
+//! harness (`cargo bench`, `cargo test --release`) reaches this module through
+//! the library, which is built without `cfg(test)` there. Every caller stays
+//! gated under `cfg(any(test, debug_assertions))`, so a release build never
+//! runs any of it. Unit tests, integration tests, `cargo run` and a binary a
+//! test spawns are all debug builds and share these guards.
 
 use std::path::{Path, PathBuf};
 
