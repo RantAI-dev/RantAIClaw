@@ -120,6 +120,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **SSH tools on russh 0.60.3, for RUSTSEC-2026-0153 and RUSTSEC-2026-0154.** The `remote-install`
+  tools moved from russh 0.45 to 0.60.3, which fixes both advisories (unchecked allocation from a
+  peer-supplied frame length in the SSH agent code, in `russh` and `russh-cryptovec`). Their ignores
+  are gone from `deny.toml` and `sec-audit.yml`. RUSTSEC-2023-0071 (`rsa` Marvin timing) stays
+  ignored because `rsa` has no patched release, and now comes from russh 0.60. RUSTSEC-2026-0159 was
+  listed with the russh advisories by mistake. It is a `matrix-sdk-crypto` advisory patched in 0.16.1,
+  the lockfile has 0.18.0, so that ignore is gone too. The `russh-keys` dependency is removed,
+  because russh 0.60 has its own key code and the old crate uses an incompatible key type.
+  `ssh_known_hosts.json` entries keep their format, so no host asks to be trusted again and a changed
+  host key is still refused. The client offers the same key exchange, host key and cipher algorithms as
+  before. It does not turn on the new 0.60 defaults (`ssh-rsa` with SHA-1, `ecdsa-sha2-nistp384`, more
+  key exchanges), and the SHA-1 MACs that 0.60 drops are no longer offered.
 - **event-listener 5.4.2, for RUSTSEC-2026-0221.** event-listener 5.4.1 implemented `Send` and `Sync`
   unconditionally for `StackSlot<'_, T>`, the stack-allocated listener created by the `listener!`
   macro, so a `!Send` tag set via `Event::with_tag` could cross thread boundaries through

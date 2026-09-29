@@ -65,19 +65,13 @@ ignore = [
     # Revisit on a docx-rs release that moves to quick-xml >= 0.41.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
-    # The four below enter via the russh SSH stack (russh 0.45 / russh-cryptovec
-    # / rsa), pulled only by the opt-in `remote-install` ssh/pty tools. They are
-    # client-side crypto advisories against hosts the operator explicitly targets
-    # (TOFU known-hosts), not a multi-tenant key-extraction surface. No fixed
-    # upstream release for the 2026 advisories yet; revisit on a russh bump.
-    # rsa Marvin timing sidechannel via russh-keys — no constant-time rsa release.
+    # rsa 0.10.0-rc.16 (Marvin timing sidechannel), pulled only by russh 0.60 in the
+    # default-on `remote-install` ssh/pty tools, so every default build carries it.
+    # It is a client-side advisory against hosts the operator explicitly targets
+    # (TOFU known-hosts), not a multi-tenant key-extraction surface. The advisory
+    # lists no patched version, and the newest rsa (0.10.0-rc.18) is still affected.
+    # Revisit when rsa publishes a fix.
     "RUSTSEC-2023-0071",
-    # russh-cryptovec: unchecked CryptoVec allocation/growth.
-    "RUSTSEC-2026-0153",
-    # russh: unbounded 32-bit allocation.
-    "RUSTSEC-2026-0154",
-    # russh: sender-binding gaps in channel messages.
-    "RUSTSEC-2026-0159",
     # proc-macro-error2 v2.0.1 via matrix-sdk → aquamarine (doc-comment macro) —
     # build-time only, no runtime surface, no safe upgrade published upstream.
     #
