@@ -271,6 +271,8 @@ Monitor `Pub Release` in publish mode.
 
 The next release is the first to run `softprops/action-gh-release` v3 (bumped from 2.5.0 in #752; the action only executes on a release tag, so no CI run before the release exercises it) — watch the `Pub Release` job closely and have the revert ready.
 
+The next `Pub Release` run is also the first on `actions/upload-artifact` v7 and `actions/download-artifact` v8 (bumped from v6 and v7 in #936 and #930). The weekly scheduled verification run, or a manual dispatch with `publish_release=false`, exercises the upload in the `Build <target>` jobs and the download in `Verify Artifact Set`; only the download in the `Publish Release` job waits for a release tag. `Pub Docker Img` already passed both on `main`. Confirm a verification run is green before tagging, and have the revert ready.
+
 Expected publish outputs:
 
 - release archives
