@@ -783,6 +783,49 @@ mod tests {
         }
     }
 
+    /// A reply rebuilt from attachments that passed a check has to parse back
+    /// into the same attachments, whichever kind and however odd the target.
+    #[test]
+    fn an_attachment_marker_round_trips_through_the_parser() {
+        for kind in [
+            AttachmentKind::Image,
+            AttachmentKind::Document,
+            AttachmentKind::Video,
+            AttachmentKind::Audio,
+            AttachmentKind::Voice,
+        ] {
+            for target in [
+                "notes/menu.txt",
+                "/w/a b.txt",
+                "https://example.com/a.png?x=1:2",
+            ] {
+                let attachment = OutboundAttachment {
+                    kind,
+                    target: target.to_string(),
+                };
+                let (text, parsed) = parse_attachment_markers(&attachment.to_marker());
+
+                assert_eq!(parsed, vec![attachment], "{kind:?} {target}");
+                assert_eq!(text, "");
+            }
+        }
+    }
+
+    /// A guest is not told the owner's directory layout, and is not offered a
+    /// URL marker the runtime would fetch itself.
+    #[test]
+    fn the_guest_instruction_names_no_workspace_path_and_offers_no_url() {
+        let text = guest_delivery_instructions_for("Telegram");
+
+        assert!(text.contains("Telegram"), "{text}");
+        assert!(text.contains("relative to the workspace"), "{text}");
+        assert!(!text.contains("path-or-url"), "{text}");
+        assert!(!text.contains("http"), "{text}");
+        for marker in ["[IMAGE:", "[DOCUMENT:", "[VIDEO:", "[AUDIO:", "[VOICE:"] {
+            assert!(text.contains(marker), "missing {marker}: {text}");
+        }
+    }
+
     /// Plan 356, finding F-13: a Slack reply ended `[DOCUMENT:/abs/path` with no
     /// bracket, and the reader saw the raw marker. When the file is really
     /// there, the person gets the file the model meant.
@@ -1046,6 +1089,17 @@ impl AttachmentKind {
             _ => None,
         }
     }
+
+    /// The tag [`Self::from_marker`] reads back, in the spelling the prompts use.
+    fn marker_tag(self) -> &'static str {
+        match self {
+            Self::Image => "IMAGE",
+            Self::Document => "DOCUMENT",
+            Self::Video => "VIDEO",
+            Self::Audio => "AUDIO",
+            Self::Voice => "VOICE",
+        }
+    }
 }
 
 /// One attachment the model asked for: a kind and a path or URL.
@@ -1053,6 +1107,16 @@ impl AttachmentKind {
 pub struct OutboundAttachment {
     pub kind: AttachmentKind,
     pub target: String,
+}
+
+impl OutboundAttachment {
+    /// The marker text that [`parse_attachment_markers`] reads back into this
+    /// attachment, so a reply can be rebuilt from the attachments that passed a
+    /// check.
+    #[must_use]
+    pub fn to_marker(&self) -> String {
+        format!("[{}:{}]", self.kind.marker_tag(), self.target)
+    }
 }
 
 /// Is this target a remote URL rather than a local path?
@@ -1349,6 +1413,31 @@ pub fn delivery_instructions_for(platform: &str, workspace: &std::path::Path) ->
          the workspace is refused and the file is not sent, so do not guess a home-relative or \
          bare name.\n\n\
          The file has to exist before the marker is sent. Write it first, then attach it.\n\n\
+         Keep normal user-facing text outside markers, put the markers at the end of the reply, \
+         and never wrap a marker in code fences."
+    )
+}
+
+/// What a guest is told about attaching files, for a guest the operator lets
+/// use `file_read`.
+///
+/// A guest with no `file_read` grant is told nothing: dispatch passes no
+/// attachment text at all. This variant differs from
+/// [`delivery_instructions_for`] in three ways. It does not print the absolute
+/// workspace path, since that is the owner's directory layout. It offers no URL
+/// markers, which the runtime would fetch itself and which a guest turn never
+/// delivers. And it says the runtime withholds what a guest could not read, so
+/// the model does not promise a file that will not arrive.
+#[must_use]
+pub fn guest_delivery_instructions_for(platform: &str) -> String {
+    format!(
+        "When responding on {platform}, you can attach a file from the workspace: put a media \
+         marker in your reply and the runtime uploads the file for you. Use one marker per \
+         attachment, with this exact syntax: [IMAGE:<path>], [DOCUMENT:<path>], \
+         [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>].\n\n\
+         A path is relative to the workspace. A URL is never sent. A file that only an owner \
+         may read is withheld, and the reply says so.\n\n\
+         The file has to exist before the marker is sent.\n\n\
          Keep normal user-facing text outside markers, put the markers at the end of the reply, \
          and never wrap a marker in code fences."
     )

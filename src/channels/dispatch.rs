@@ -309,6 +309,166 @@ pub(crate) fn clean_delivered_reply(text: &str) -> String {
     }
 }
 
+/// The line a guest reply ends with when an attachment it asked for was refused.
+/// One line however many were refused.
+const GUEST_ATTACHMENT_WITHHELD_LINE: &str =
+    "(An attachment was withheld: this bot does not send files to guests.)";
+
+/// A SQLite database file starts with these 16 bytes, whatever it is named.
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// File name endings of the files SQLite keeps beside a database.
+const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// Remove the attachments a guest may not receive from a guest's reply.
+///
+/// An attachment marker in a reply is uploaded by the channel with no tool
+/// call, so `GuestGate` never sees it. Without this filter a guest could ask for
+/// `[DOCUMENT:memory/brain.db]` and receive every note and every chat's history.
+///
+/// The reply is read with the same parser the channels use, so a marker the
+/// parser recovers from an unclosed bracket is caught too. A URL never passes:
+/// the runtime fetches it on the channels that upload bytes, which lets a guest
+/// aim the bot at an internal address. A local path passes only when the
+/// operator lets guests use `file_read` **and** the file is one a guest
+/// `file_read` could return: inside the workspace, not a private owner path by
+/// its name or after symlinks resolve, and not a SQLite database under any name or one of its journal files.
+///
+/// A reply that is only the path of an existing file, which Telegram uploads
+/// without a marker, is judged the same way.
+///
+/// When nothing was refused the reply comes back as it was. Otherwise the
+/// reply is rebuilt from its text, the attachments that passed, and one closing
+/// line saying an attachment was withheld. The log line carries the count, never
+/// a path.
+pub(crate) async fn withhold_guest_attachments(
+    reply: &str,
+    channel: &str,
+    workspace: &std::path::Path,
+    file_read_permitted: bool,
+) -> String {
+    // Telegram removes tool-call blocks before it reads markers, so a marker
+    // split by one is only a marker after the removal. Read the reply the way
+    // that channel will, until nothing more comes out.
+    let mut visible = reply.to_string();
+    loop {
+        let stripped = super::telegram::strip_tool_call_tags(&visible);
+        if stripped == visible {
+            break;
+        }
+        visible = stripped;
+    }
+
+    let (cleaned, attachments) = media::parse_attachment_markers(&visible);
+    if attachments.is_empty() {
+        // Telegram also uploads a reply that is nothing but the path of an
+        // existing file, with no marker. That form is judged by Telegram's own
+        // rule, on every channel: elsewhere the path would only be sent as text,
+        // and withholding a bare refused path there costs nothing.
+        if let Some(attachment) = super::telegram::parse_path_only_attachment(&visible) {
+            if !guest_may_receive(&attachment, channel, workspace, file_read_permitted).await {
+                tracing::info!(
+                    channel,
+                    refused = 1usize,
+                    "withheld attachments from a guest reply"
+                );
+                return GUEST_ATTACHMENT_WITHHELD_LINE.to_string();
+            }
+        }
+        return reply.to_string();
+    }
+
+    let mut kept = Vec::new();
+    let mut refused = 0usize;
+    for attachment in attachments {
+        if guest_may_receive(&attachment, channel, workspace, file_read_permitted).await {
+            kept.push(attachment);
+        } else {
+            refused += 1;
+        }
+    }
+    if refused == 0 {
+        return reply.to_string();
+    }
+
+    tracing::info!(channel, refused, "withheld attachments from a guest reply");
+
+    let mut rebuilt = cleaned;
+    for attachment in &kept {
+        if !rebuilt.is_empty() {
+            rebuilt.push('\n');
+        }
+        rebuilt.push_str(&attachment.to_marker());
+    }
+    if !rebuilt.is_empty() {
+        rebuilt.push('\n');
+    }
+    rebuilt.push_str(GUEST_ATTACHMENT_WITHHELD_LINE);
+    rebuilt
+}
+
+/// Whether a guest's reply may carry this attachment. See
+/// [`withhold_guest_attachments`] for the rules; every failure to check counts
+/// as a refusal.
+async fn guest_may_receive(
+    attachment: &media::OutboundAttachment,
+    channel: &str,
+    workspace: &std::path::Path,
+    file_read_permitted: bool,
+) -> bool {
+    use tokio::io::AsyncReadExt as _;
+
+    let target = attachment.target.as_str();
+    if !file_read_permitted || media::is_http_url(target) {
+        return false;
+    }
+    // The two checks a guest `file_read` gets: the name as asked, then the
+    // canonical path, which catches a symlink to a private file.
+    if crate::approval::guest::is_private_owner_path(target) {
+        return false;
+    }
+    let Ok(resolved) = media::resolve_attachment_path(channel, target, workspace) else {
+        return false;
+    };
+    let Ok(canonical) = tokio::fs::canonicalize(&resolved).await else {
+        return false;
+    };
+    let canonical_workspace = tokio::fs::canonicalize(workspace)
+        .await
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    if crate::approval::guest::is_private_owner_path_resolved(&canonical, &canonical_workspace) {
+        return false;
+    }
+    // A SQLite write-ahead log, shared-memory file or rollback journal holds
+    // database pages but has no header to recognise.
+    let is_sqlite_sidecar = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let lowered = name.to_ascii_lowercase();
+            SQLITE_SIDECAR_SUFFIXES
+                .iter()
+                .any(|suffix| lowered.ends_with(suffix))
+        });
+    if is_sqlite_sidecar {
+        return false;
+    }
+    // A regular file only: opening a FIFO to read its header would block.
+    match tokio::fs::metadata(&canonical).await {
+        Ok(meta) if meta.is_file() => {}
+        _ => return false,
+    }
+    let Ok(mut file) = tokio::fs::File::open(&canonical).await else {
+        return false;
+    };
+    let mut head = [0u8; 16];
+    match file.read_exact(&mut head).await {
+        Ok(_) => head != *SQLITE_HEADER,
+        // Shorter than the header, so not a database.
+        Err(err) => err.kind() == std::io::ErrorKind::UnexpectedEof,
+    }
+}
+
 /// What a person saw when a reply could not be delivered (plan 355).
 ///
 /// Every channel sends the text first and each attachment after, aborting on the
@@ -582,6 +742,11 @@ pub(crate) async fn process_channel_message(
         msg.sender_identities(),
     );
 
+    // A guest may be shown workspace files only when the operator lets guests use
+    // `file_read`. The prompt and the reply filter both read this.
+    let guest_may_read_files =
+        !sender_is_owner && runtime_defaults.guest_gate.tool_permitted("file_read");
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
     history::append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
@@ -686,10 +851,21 @@ pub(crate) async fn process_channel_message(
     // an attachment must not be told it can, or the model emits markers that
     // reach the user as literal text. Bound here rather than inline because the
     // text is owned now: it names the workspace path (plan 356).
-    let delivery_instructions = ctx
-        .channels_by_name
-        .get(&msg.channel)
-        .and_then(|channel| channel.delivery_instructions(ctx.workspace_dir.as_path()));
+    //
+    // A guest is told nothing about attachments unless the operator lets guests
+    // use `file_read`, and then gets the variant that names no absolute path and
+    // offers no URL marker. Whether the channel can deliver media at all is still
+    // the channel's own answer.
+    let delivery_instructions = ctx.channels_by_name.get(&msg.channel).and_then(|channel| {
+        let owner_instructions = channel.delivery_instructions(ctx.workspace_dir.as_path())?;
+        if sender_is_owner {
+            Some(owner_instructions)
+        } else if guest_may_read_files {
+            Some(media::guest_delivery_instructions_for(&msg.channel))
+        } else {
+            None
+        }
+    });
     let system_prompt = prompt::build_channel_system_prompt(
         &base_prompt,
         &msg.channel,
@@ -944,6 +1120,20 @@ pub(crate) async fn process_channel_message(
             // empty bubble (e.g. when the model ends a turn after tool calls
             // without final text).
             let delivered_response = clean_delivered_reply(&delivered_response);
+            // An attachment marker is uploaded with no tool call, so the guest
+            // gate never sees it. A guest's reply is filtered here, before either
+            // send path below.
+            let delivered_response = if sender_is_owner {
+                delivered_response
+            } else {
+                withhold_guest_attachments(
+                    &delivered_response,
+                    &msg.channel,
+                    ctx.workspace_dir.as_path(),
+                    guest_may_read_files,
+                )
+                .await
+            };
             // Moved verbatim in plan 121 row 10. `u64::try_from` rather than
             // the `as` cast the line carried: same value for any real elapsed
             // time, and the gate counts a moved line as a changed one.

@@ -209,7 +209,7 @@ fn is_path_tool(tool: &str) -> bool {
 /// Last path component (case-insensitive). `MEMORY.md`, `USER.md`, and
 /// `user.md` all match; `./MEMORY.md`, `memory/brain.db`, and
 /// `<workspace>/memory/2026-09-01.md` all match by their `memory` component.
-fn is_private_owner_path(path: &str) -> bool {
+pub(crate) fn is_private_owner_path(path: &str) -> bool {
     if path.trim().is_empty() {
         return false;
     }

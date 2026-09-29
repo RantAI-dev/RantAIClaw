@@ -6091,13 +6091,17 @@ async fn a_failed_attachment_tells_the_conversation_and_history_keeps_what_was_r
 
     let channel_impl = Arc::new(AttachmentFailingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
-    let ctx = dispatch_ctx(
+    let mut ctx = dispatch_ctx(
         vec![channel],
         Arc::new(FixedReplyProvider {
             reply: "Ini dia: [DOCUMENT:/tmp/catatan.txt]".to_string(),
         }),
         routing::RuntimeConfigSlot::default(),
     );
+    // Attachments are an owner's. A guest's reply is filtered before it is sent.
+    Arc::get_mut(&mut ctx)
+        .expect("the context is not shared yet")
+        .approval_owners = Arc::new(vec!["rantaiclaw_user".to_string()]);
 
     process_channel_message(
         Arc::clone(&ctx),
@@ -6332,13 +6336,17 @@ async fn a_marker_only_reply_is_not_silence() {
 
     let channel_impl = Arc::new(AttachmentFailingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
-    let ctx = dispatch_ctx(
+    let mut ctx = dispatch_ctx(
         vec![channel],
         Arc::new(FixedReplyProvider {
             reply: "[DOCUMENT:/tmp/catatan.txt]".to_string(),
         }),
         routing::RuntimeConfigSlot::default(),
     );
+    // Attachments are an owner's. A guest's reply is filtered before it is sent.
+    Arc::get_mut(&mut ctx)
+        .expect("the context is not shared yet")
+        .approval_owners = Arc::new(vec!["rantaiclaw_user".to_string()]);
 
     process_channel_message(
         Arc::clone(&ctx),
@@ -8313,7 +8321,8 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
         multimodal: crate::config::MultimodalConfig::default(),
         security: Arc::new(crate::security::SecurityPolicy::default()),
         channel_approval: None,
-        approval_owners: Arc::new(Vec::new()),
+        // An owner: a guest is told nothing about attachments.
+        approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
@@ -11533,4 +11542,498 @@ fn native_tools_provider_gets_no_tool_use_protocol_appended_to_either_prompt() {
 
     assert_eq!(system_prompt, "OWNER BASE");
     assert_eq!(guest_system_prompt, "GUEST BASE");
+}
+
+// ── guest replies and attachment markers ─────────────────────────────────
+
+/// Answers every turn with one fixed reply and keeps the system prompt each
+/// turn started from, so a test can pin both what the model was told and what
+/// the channel was handed.
+struct ReplyAndPromptProvider {
+    reply: String,
+    system_prompts: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for ReplyAndPromptProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(self.reply.clone())
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        self.system_prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(system);
+        Ok(self.reply.clone())
+    }
+}
+
+/// The exact line a guest reply ends with when an attachment was refused.
+const GUEST_ATTACHMENT_WITHHELD_LINE: &str =
+    "(An attachment was withheld: this bot does not send files to guests.)";
+
+const GUEST_SENDER: &str = "rantaiclaw_guest";
+const OWNER_SENDER: &str = "rantaiclaw_owner";
+
+/// What one channel turn produced: the text handed to `Channel::send` and the
+/// system prompt the model started from.
+struct AttachmentTurn {
+    sent: Vec<String>,
+    system_prompt: String,
+}
+
+/// Drives `process_channel_message` for `sender` on a marker-capable channel
+/// whose workspace is `workspace`, with `guest_tools` as the operator's
+/// `guest_allowed_tools`, and a provider that always answers `reply`.
+async fn run_attachment_turn(
+    workspace: &std::path::Path,
+    sender: &str,
+    guest_tools: &[&str],
+    reply: &str,
+) -> AttachmentTurn {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+
+    let channel_impl = Arc::new(TelegramRecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: reply.to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.workspace_dir = Arc::new(workspace.to_path_buf());
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        let tools: Vec<String> = guest_tools.iter().map(|t| (*t).to_string()).collect();
+        inner.guest_gate = Arc::new(crate::approval::GuestGate::new(&tools, &[]));
+    }
+
+    let msg = traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "attachment-msg-1".to_string(),
+        sender: sender.to_string(),
+        reply_target: "chat-attachment".to_string(),
+        content: "please send me the file".to_string(),
+        channel: "telegram".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: true,
+    };
+    process_channel_message(ctx, msg, CancellationToken::new()).await;
+
+    let sent = channel_impl
+        .sent_messages
+        .lock()
+        .await
+        .iter()
+        .map(|line| {
+            line.split_once(':')
+                .map_or(line.clone(), |(_, text)| text.to_string())
+        })
+        .collect();
+    let system_prompt = provider_impl
+        .system_prompts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .first()
+        .cloned()
+        .expect("the provider saw one prompt");
+    AttachmentTurn {
+        sent,
+        system_prompt,
+    }
+}
+
+const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
+
+/// A workspace laid out like a real one: the owner's notes database, profile
+/// files, memory notes, and one ordinary file a guest could be shown.
+fn attachment_workspace() -> TempDir {
+    let ws = TempDir::new().expect("temp workspace");
+    let root = ws.path();
+    std::fs::create_dir_all(root.join("memory")).unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    let mut db = SQLITE_HEADER.to_vec();
+    db.extend_from_slice(b"private rows");
+    std::fs::write(root.join("memory/brain.db"), &db).unwrap();
+    std::fs::write(root.join("memory/x.md"), b"owner note").unwrap();
+    std::fs::write(root.join("USER.md"), b"owner profile").unwrap();
+    std::fs::write(root.join("notes/menu.txt"), b"soup").unwrap();
+    std::fs::write(root.join("data.bin"), &db).unwrap();
+    ws
+}
+
+/// A guest with no `file_read` grant asks for the owner's notes database.
+/// The marker needs no tool call, so the guest gate never saw it; the reply
+/// filter is the only thing between the request and the upload.
+#[tokio::test]
+async fn guest_reply_marker_for_the_owner_database_is_withheld() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &[],
+        "Here you go [DOCUMENT:memory/brain.db]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(
+        !text.contains("[DOCUMENT:"),
+        "marker reached the channel: {text}"
+    );
+    assert!(text.starts_with("Here you go"), "{text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// The parser also recovers a marker that never closed, when it names a file
+/// that exists by its absolute path. That form is an attachment too.
+#[tokio::test]
+async fn guest_reply_unclosed_marker_for_the_owner_database_is_withheld() {
+    let ws = attachment_workspace();
+    let reply = format!(
+        "Here you go [DOCUMENT:{}",
+        ws.path().join("memory/brain.db").display()
+    );
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &[], &reply).await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(
+        !text.contains("[DOCUMENT:"),
+        "marker reached the channel: {text}"
+    );
+    assert!(
+        !text.contains("brain.db"),
+        "the path reached the chat: {text}"
+    );
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// A URL marker is fetched by the runtime on the channels that must upload
+/// bytes, so it never passes for a guest, `file_read` grant or not.
+#[tokio::test]
+async fn guest_reply_url_marker_is_withheld_with_or_without_file_read() {
+    let ws = attachment_workspace();
+    for tools in [&[][..], &["file_read"][..]] {
+        let turn = run_attachment_turn(
+            ws.path(),
+            GUEST_SENDER,
+            tools,
+            "Look [IMAGE:https://example.com/a.png]",
+        )
+        .await;
+
+        assert_eq!(turn.sent.len(), 1, "{tools:?}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert!(
+            !text.contains("[IMAGE:"),
+            "{tools:?}: marker reached the channel: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{tools:?}: {text}"
+        );
+    }
+}
+
+/// Without the `file_read` grant a guest's reply carries no attachment at all,
+/// not even an ordinary file: the operator has not let guests read files.
+#[tokio::test]
+async fn guest_without_file_read_receives_no_attachment_at_all() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &[],
+        "The menu [DOCUMENT:notes/menu.txt]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(!text.contains("[DOCUMENT:"), "{text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// With `file_read` granted, a guest gets what a guest `file_read` could show
+/// and nothing else, and the refusal line appears once however many were refused.
+#[tokio::test]
+async fn guest_with_file_read_receives_an_ordinary_workspace_file() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &["file_read"],
+        "The menu [DOCUMENT:notes/menu.txt]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(text.contains("[DOCUMENT:notes/menu.txt]"), "{text}");
+    assert!(
+        !text.contains(GUEST_ATTACHMENT_WITHHELD_LINE),
+        "nothing was refused: {text}"
+    );
+}
+
+#[tokio::test]
+async fn guest_file_read_grant_withholds_private_owner_files() {
+    let ws = attachment_workspace();
+    let absolute_user = format!("[DOCUMENT:{}]", ws.path().join("USER.md").display());
+    let cases = [
+        ("owner profile", "[DOCUMENT:USER.md]".to_string()),
+        ("owner profile by absolute path", absolute_user),
+        ("memory note", "[DOCUMENT:memory/x.md]".to_string()),
+        ("notes database", "[DOCUMENT:memory/brain.db]".to_string()),
+        (
+            "outside the workspace",
+            "[DOCUMENT:../outside.txt]".to_string(),
+        ),
+    ];
+    for (label, marker) in cases {
+        let reply = format!("Here {marker} and [DOCUMENT:notes/menu.txt]");
+        let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], &reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{label}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert_eq!(
+            text.matches("[DOCUMENT:").count(),
+            1,
+            "{label}: only the ordinary file may pass: {text}"
+        );
+        assert!(
+            text.contains("[DOCUMENT:notes/menu.txt]"),
+            "{label}: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{label}: {text}"
+        );
+        assert_eq!(
+            text.matches(GUEST_ATTACHMENT_WITHHELD_LINE).count(),
+            1,
+            "{label}: one line per reply: {text}"
+        );
+    }
+}
+
+/// The string rule sees `notes/link.txt`; only the resolved path shows it is
+/// the owner's profile.
+#[cfg(unix)]
+#[tokio::test]
+async fn guest_file_read_grant_withholds_a_symlink_to_a_private_file() {
+    let ws = attachment_workspace();
+    std::os::unix::fs::symlink("../USER.md", ws.path().join("notes/link.txt")).unwrap();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &["file_read"],
+        "Here [DOCUMENT:notes/link.txt]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(!text.contains("[DOCUMENT:"), "{text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// A database copied under another name keeps its header.
+#[tokio::test]
+async fn guest_file_read_grant_withholds_a_sqlite_file_under_any_name() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &["file_read"],
+        "Here [DOCUMENT:data.bin]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(!text.contains("[DOCUMENT:"), "{text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// Telegram removes tool-call blocks from a reply before it reads markers. A
+/// marker split by one is not a marker to the parser on the raw reply, and is
+/// one after the removal, so the filter has to read the reply the way Telegram
+/// will.
+#[tokio::test]
+async fn guest_reply_marker_split_by_a_tool_call_block_is_withheld() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &[],
+        "Here [DOCU<tool>x</tool>MENT:memory/brain.db]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(!text.contains("brain.db"), "the marker survived: {text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// Telegram uploads a reply that is only a path to an existing file, with no
+/// marker at all. That form needs the same filter as a marker.
+#[tokio::test]
+async fn guest_reply_that_is_only_an_owner_file_path_is_withheld() {
+    let ws = attachment_workspace();
+    let user_md = ws.path().join("USER.md").display().to_string();
+    for tools in [&[][..], &["file_read"][..]] {
+        for reply in [
+            user_md.clone(),
+            format!("`{user_md}`"),
+            format!("file://{user_md}"),
+        ] {
+            let turn = run_attachment_turn(ws.path(), GUEST_SENDER, tools, &reply).await;
+
+            assert_eq!(
+                turn.sent,
+                vec![GUEST_ATTACHMENT_WITHHELD_LINE.to_string()],
+                "{tools:?} {reply}"
+            );
+        }
+    }
+}
+
+/// With the grant, a path-only reply for an ordinary file is left as it is, and
+/// a path-only reply for a file that does not exist was never an attachment.
+#[tokio::test]
+async fn guest_path_only_reply_for_a_readable_or_missing_file_is_unchanged() {
+    let ws = attachment_workspace();
+    let menu = ws.path().join("notes/menu.txt").display().to_string();
+    let missing = ws.path().join("notes/missing.txt").display().to_string();
+
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], &menu).await;
+    assert_eq!(turn.sent, vec![menu.clone()]);
+
+    for tools in [&[][..], &["file_read"][..]] {
+        let turn = run_attachment_turn(ws.path(), GUEST_SENDER, tools, &missing).await;
+        assert_eq!(turn.sent, vec![missing.clone()], "{tools:?}");
+    }
+
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &[], &menu).await;
+    assert_eq!(
+        turn.sent,
+        vec![GUEST_ATTACHMENT_WITHHELD_LINE.to_string()],
+        "no file_read grant, no attachment"
+    );
+}
+
+#[tokio::test]
+async fn owner_path_only_reply_is_unchanged() {
+    let ws = attachment_workspace();
+    let user_md = ws.path().join("USER.md").display().to_string();
+    let turn = run_attachment_turn(ws.path(), OWNER_SENDER, &[], &user_md).await;
+
+    assert_eq!(turn.sent, vec![user_md]);
+}
+
+/// A SQLite write-ahead log, shared-memory file or rollback journal holds
+/// database pages but has no `SQLite format 3` header.
+#[tokio::test]
+async fn guest_file_read_grant_withholds_sqlite_sidecar_files() {
+    let ws = attachment_workspace();
+    for name in ["data.db-wal", "data.db-shm", "data.db-journal"] {
+        std::fs::write(ws.path().join("notes").join(name), b"arbitrary page bytes").unwrap();
+        let reply = format!("Here [DOCUMENT:notes/{name}]");
+        let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], &reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{name}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert!(!text.contains("[DOCUMENT:"), "{name}: {text}");
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{name}: {text}"
+        );
+    }
+}
+
+/// Owner turns keep the marker byte for byte: the same reply that is
+/// withheld from a guest reaches the channel untouched.
+#[tokio::test]
+async fn owner_reply_marker_reaches_the_channel_unchanged() {
+    let ws = attachment_workspace();
+    let reply = "Here you go [DOCUMENT:memory/brain.db] and [IMAGE:https://example.com/a.png]";
+    let turn = run_attachment_turn(ws.path(), OWNER_SENDER, &[], reply).await;
+
+    assert_eq!(turn.sent, vec![reply.to_string()]);
+}
+
+#[tokio::test]
+async fn guest_prompt_carries_no_attachment_instructions_without_file_read() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &[], "ok").await;
+
+    let prompt = &turn.system_prompt;
+    assert!(!prompt.contains("[DOCUMENT:"), "{prompt}");
+    assert!(!prompt.contains("media marker"), "{prompt}");
+    assert!(
+        !prompt.contains(&ws.path().display().to_string()),
+        "the workspace path reached a guest prompt: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn guest_prompt_with_file_read_gets_the_guest_variant_only() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], "ok").await;
+
+    let prompt = &turn.system_prompt;
+    assert!(
+        prompt.contains(&media::guest_delivery_instructions_for("telegram")),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains(&ws.path().display().to_string()),
+        "the workspace path reached a guest prompt: {prompt}"
+    );
+    assert!(
+        !prompt.contains("<path-or-url>"),
+        "the owner wording, which offers URLs, reached a guest: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn owner_prompt_keeps_the_attachment_instructions() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(ws.path(), OWNER_SENDER, &[], "ok").await;
+
+    assert!(
+        turn.system_prompt
+            .contains(&crate::channels::telegram::telegram_delivery_instructions(
+                ws.path()
+            )),
+        "{}",
+        turn.system_prompt
+    );
 }
