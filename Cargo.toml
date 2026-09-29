@@ -241,7 +241,7 @@ sqlite-vec = { version = "0.1", optional = true }
 # saves binary size on non-KB builds. The only consumers
 # (`src/kb/extract/pdf_splitter.rs`, `tests/kb/extract_test.rs`) are
 # already `#[cfg(feature = "kb")]`-gated.
-lopdf = { version = "0.42", optional = true }
+lopdf = { version = "0.45", optional = true }
 
 # Insertion-order-preserving map backing the KB query embedding LRU cache.
 # `IndexMap` lets us move keys to the back on access without a separate
