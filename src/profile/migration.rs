@@ -38,14 +38,21 @@ fn home_is_test_safe() -> bool {
     if crate::profile::dev_guard::allow_real_config_dir() {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME") else {
+    home_is_test_safe_for(std::env::var_os("HOME").as_deref())
+}
+
+/// The `HOME` half of [`home_is_test_safe`], with the value passed in so a test
+/// can cover the unset case without touching the process environment.
+#[cfg(any(test, debug_assertions))]
+fn home_is_test_safe_for(home: Option<&std::ffi::OsStr>) -> bool {
+    let Some(home) = home else {
         // `directories::UserDirs` (via `dirs-sys`) falls back to a
         // `getpwuid_r` lookup when `HOME` is unset, so `paths::rantaiclaw_root()`
         // still resolves to the real system user's home directory rather than
         // erroring out. An unset HOME is therefore unsafe, not exempt.
         return false;
     };
-    crate::profile::dev_guard::is_under_temp_dir(&PathBuf::from(home))
+    crate::profile::dev_guard::is_under_temp_dir(Path::new(home))
 }
 
 /// Public entry point. Call this once at the very top of `Config::load_or_init`
@@ -399,12 +406,8 @@ mod tests {
     /// safe default. The guard must refuse an unset `HOME`, not admit it.
     #[test]
     fn home_is_test_safe_refuses_an_unset_home() {
-        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
-        let _g_home = crate::test_env::EnvGuard::unset("HOME");
-        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
-
         assert!(
-            !home_is_test_safe(),
+            !home_is_test_safe_for(None),
             "an unset HOME must not be treated as safe"
         );
     }

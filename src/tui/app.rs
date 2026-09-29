@@ -5925,10 +5925,20 @@ pub(super) mod test_support {
         }
     }
 
-    /// The read-only form: profile points at the real `default` directory, as
-    /// the copies this replaces did. Safe only while nothing under test writes.
+    /// The form for tests that never write: the profile root is a `default`
+    /// directory under one temp dir shared by the whole test process, never a
+    /// path derived from `HOME`. A test that writes should call
+    /// [`app_with_profile_root`] with its own temp dir instead, so its files do
+    /// not leak into a sibling test's app.
     pub(crate) fn app_with_context(ctx: TuiContext) -> TuiApp {
-        app_with_profile_root(ctx, crate::profile::paths::profile_dir("default"))
+        static SHARED_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let root = SHARED_ROOT.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("rantaiclaw-tui-test-profile-")
+                .tempdir()
+                .expect("shared tui test profile root")
+        });
+        app_with_profile_root(ctx, root.path().join("profiles").join("default"))
     }
 }
 
