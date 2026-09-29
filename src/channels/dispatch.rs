@@ -332,7 +332,8 @@ const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 /// aim the bot at an internal address. A local path passes only when the
 /// operator lets guests use `file_read` **and** the file is one a guest
 /// `file_read` could return: inside the workspace, not a private owner path by
-/// its name or after symlinks resolve, and not a SQLite database under any name or one of its journal files.
+/// its name or after symlinks resolve, and not a SQLite database under any name
+/// or one of its journal files.
 ///
 /// A reply that is only the path of an existing file, which Telegram uploads
 /// without a marker, is judged the same way.
