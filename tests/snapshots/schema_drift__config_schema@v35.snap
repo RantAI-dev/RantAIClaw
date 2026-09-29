@@ -2208,7 +2208,7 @@ expression: pretty
       "type": "object",
       "properties": {
         "archive_after_days": {
-          "description": "Archive daily/session files older than this many days",
+          "description": "Archive session files older than this many days (daily memory files are left alone)",
           "type": "integer",
           "format": "uint32",
           "default": 7,
@@ -2278,7 +2278,7 @@ expression: pretty
           "default": 0.4
         },
         "purge_after_days": {
-          "description": "Purge archived files older than this many days",
+          "description": "Purge archived session files older than this many days",
           "type": "integer",
           "format": "uint32",
           "default": 30,
