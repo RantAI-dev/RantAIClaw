@@ -562,7 +562,7 @@ toolset; everyone else is a guest, held to a capability ceiling that is never es
 
 | Subcommand | Description |
 |---|---|
-| `show` | Current owners and the guest capability ceiling |
+| `show` | Current owners and the guest capability ceiling. An owner-only tool (for example `delegate`) listed for guests is shown as refused |
 | `add <target> <value>` | Add an entry. Targets: `owner`, `tool`, `command` (aliases: `owners`, `tools`, `commands`, `cmd`) |
 | `remove <target> <value>` | Remove an entry |
 

@@ -1262,16 +1262,22 @@ pub(crate) struct ChannelRuntime {
 /// tools on a non-native provider needs the same "## Tool Use Protocol"
 /// section the owner prompt gets, or the model never learns the
 /// `<tool_call>` syntax on that guest's first turn.
+///
+/// The owner's block lists `tools_registry`; the guest's lists only
+/// `guest_tools`, the entries the guest gate permits. A guest with none gets
+/// no block, since there is nothing it may call.
 fn append_tool_instructions_when_not_native(
     system_prompt: &mut String,
     guest_system_prompt: &mut String,
     native_tools: bool,
     tools_registry: &[Box<dyn Tool>],
+    guest_tools: &[Box<dyn Tool>],
 ) {
     if !native_tools {
-        let instructions = build_tool_instructions(tools_registry);
-        system_prompt.push_str(&instructions);
-        guest_system_prompt.push_str(&instructions);
+        system_prompt.push_str(&build_tool_instructions(tools_registry));
+        if !guest_tools.is_empty() {
+            guest_system_prompt.push_str(&build_tool_instructions(guest_tools));
+        }
     }
 }
 
@@ -1518,6 +1524,15 @@ pub(crate) async fn build_channel_runtime(
         None
     };
     let native_tools = provider.supports_native_tools();
+    // The gate is built here, ahead of the prompts, because the guest prompt
+    // describes only the tools the gate lets a guest call.
+    let guest_gate = Arc::new(guest_gate_from_config(&config));
+    let guest_tools = tools::guest_registry::permitted_tools(&tools_registry, &guest_gate);
+    let guest_tool_descs: Vec<(&str, &str)> = tool_descs
+        .iter()
+        .copied()
+        .filter(|(name, _)| guest_gate.tool_permitted(name))
+        .collect();
     let mut system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
@@ -1536,7 +1551,7 @@ pub(crate) async fn build_channel_runtime(
     let mut guest_system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
-        &tool_descs,
+        &guest_tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
@@ -1549,6 +1564,7 @@ pub(crate) async fn build_channel_runtime(
         &mut guest_system_prompt,
         native_tools,
         tools_registry.as_ref(),
+        &guest_tools,
     );
 
     if !skills.is_empty() {
@@ -1731,7 +1747,7 @@ pub(crate) async fn build_channel_runtime(
         // may use), with shell limited to `guest_allowed_commands`. Built once
         // (role-based, not per-user) by `guest_gate_from_config` so production
         // and tests share one entry point.
-        guest_gate: Arc::new(guest_gate_from_config(&config)),
+        guest_gate,
     });
 
     Ok(Some(ChannelRuntime {

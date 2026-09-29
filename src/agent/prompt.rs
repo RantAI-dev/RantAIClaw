@@ -86,11 +86,19 @@ pub struct PromptContext<'a> {
     /// machine-readable list of pre-approved shell commands; in Strict
     /// mode the list is short by design; in Manual/Off it's omitted.
     pub allowed_commands: &'a [String],
-    /// Skip `USER.md` and `MEMORY.md` injection. The owner channel surfaces
-    /// build the prompt with both files; the guest prompt omits them, so the
-    /// owner's profile and notes never reach a non-owner sender's context.
-    /// `AGENTS.md`, `SOUL.md`, `TOOLS.md` and `IDENTITY.md` still render — they
-    /// describe the agent, not the operator, and the plan keeps them in.
+    /// Build the prompt for a guest (non-owner) turn. The owner channel
+    /// surfaces build the prompt with everything; the guest prompt leaves out
+    /// what describes the operator or the host, so none of it reaches a
+    /// non-owner sender's context:
+    ///   * the files `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md`
+    ///     (`TOOLS.md` is where the owner records SSH hosts and device
+    ///     nicknames);
+    ///   * the absolute workspace path, which carries the OS user name;
+    ///   * the `Host:` line of the runtime section;
+    ///   * the host's timezone, replaced by `UTC`.
+    ///
+    /// `AGENTS.md`, `SOUL.md` and `IDENTITY.md` still render: they describe
+    /// the agent, not the operator.
     pub skip_owner_files: bool,
 }
 
@@ -168,8 +176,8 @@ pub fn render_persona_section() -> String {
 }
 
 /// Same as [`render_persona_section`], but for a guest turn: the owner's
-/// name is replaced by "the owner of this bot" and the timezone is
-/// omitted, so neither reaches a non-owner sender. Role, tone and avoid
+/// name is replaced by "the user" (the person in the chat) and the timezone
+/// is omitted, so neither reaches a non-owner sender. Role, tone and avoid
 /// render the same as the owner's persona. Used by the channel dispatch
 /// per-message persona splice (`replace_persona_section`) for turns from a
 /// non-owner sender.
@@ -285,11 +293,12 @@ impl PromptSection for IdentitySection {
         }
 
         // Core identity files, always injected (with a not-found marker if
-        // absent) on every surface. `USER.md` is skipped under a guest
-        // prompt — the owner's profile is not the guest's to read.
-        let mut files = vec!["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md"];
-        if !ctx.skip_owner_files {
-            files.push("USER.md");
+        // absent) on every surface. A guest prompt skips `USER.md` (the
+        // owner's profile) and `TOOLS.md` (the owner's SSH hosts and device
+        // nicknames): neither is the guest's to read.
+        let mut files = vec!["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
+        if ctx.skip_owner_files {
+            files.retain(|file| !matches!(*file, "TOOLS.md" | "USER.md"));
         }
         for file in files {
             inject_workspace_file(
@@ -650,6 +659,13 @@ impl PromptSection for WorkspaceSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        // The absolute path contains the OS user name, and quick setup uses
+        // that name as the owner's. A guest gets the relative form only.
+        if ctx.skip_owner_files {
+            return Ok(String::from(
+                "## Workspace\n\nFile paths are relative to the bot's workspace.",
+            ));
+        }
         Ok(format!(
             "## Workspace\n\nWorking directory: `{}`",
             ctx.workspace_dir.display()
@@ -663,6 +679,15 @@ impl PromptSection for RuntimeSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        // The host name identifies the operator's machine; a guest does not
+        // need it.
+        if ctx.skip_owner_files {
+            return Ok(format!(
+                "## Runtime\n\nOS: {} | Model: {}",
+                std::env::consts::OS,
+                ctx.model_name
+            ));
+        }
         let host =
             hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
         Ok(format!(
@@ -679,6 +704,10 @@ impl PromptSection for DateTimeSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        // The host's zone reveals where the operator is. A guest is told UTC.
+        if ctx.skip_owner_files {
+            return Ok(String::from("## Current Date & Time\n\nTimezone: UTC"));
+        }
         let now = Local::now();
         // Channel/gateway prompts are built once at daemon start and reused, so
         // a full timestamp would freeze at boot time and mislead the model on a

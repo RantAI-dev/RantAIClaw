@@ -19,13 +19,26 @@ run arbitrary privileged tools." This is the feature.
   existing approval/allowlist).
 - **Normal user (guest)** = allowed to chat (channel allowlist) but NOT an owner.
   Their turns run under a **capability ceiling**:
-  - tools filtered to `guest_allowed_tools`,
+  - tools filtered to `guest_allowed_tools`. A tool the gate treats as
+    owner-only (for example `delegate`) is refused even when it is listed, and
+    the permissions summary shows it as refused,
   - if `shell` is permitted, commands must match `guest_allowed_commands`
     (globs, same matcher as the existing command allowlist) — **out-of-list =
     hard deny**, never escalated to the owner.
   - Guests never see the owner's profile (`USER.md`) or notes (`MEMORY.md`) in
     the system prompt, and a guest's persona carries neither the owner's name
-    nor the owner's timezone. A guest who is allowed `file_read`, `file_write`,
+    nor the owner's timezone. The persona calls the person in the chat "the
+    user". The guest prompt also leaves out three things the owner prompt has:
+    `BOOTSTRAP.md` and `TOOLS.md` (its scaffold asks the owner for SSH hosts and
+    device nicknames), the absolute workspace path (it contains the OS user
+    name), and the `Host:` line of the runtime section. It reads
+    `Timezone: UTC` in place of the host's timezone, and the workspace section
+    says only that file paths are relative to the bot's workspace. `AGENTS.md`,
+    `SOUL.md` and `IDENTITY.md` stay, since they describe the bot. The guest
+    prompt lists only the tools the guest may call. On a provider without
+    native tool calling that is the tool-use protocol block, and a guest with no
+    allowed tool gets no block. On a provider with native tool calling it is
+    the tool specs sent with each request. A guest who is allowed `file_read`, `file_write`,
     `pdf_read`, or `image_info` is still denied access to `MEMORY.md`,
     `USER.md`, `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, and anything under
     `memory/`; the check runs again after the path is resolved, so a symlink
@@ -87,12 +100,13 @@ guest_allowed_commands = ["kubectl get *", "kubectl describe *", "ls *"]  # shel
 One place — the shared agent loop, per turn:
 1. Resolve `is_owner = can_approve(approval_owners, sender)` (CLI/console ⇒ owner).
 2. Owner → existing path (full registry + normal `SecurityPolicy`).
-3. Guest → full registry still runs, but a `GuestGate` checks each call before
-   execution and denies outright (`GuestGate::deny_reason`) any tool outside
-   `guest_allowed_tools` or any shell command outside `guest_allowed_commands`
-   (no union with `auto_approve`), plus a guest-scoped `SecurityPolicy`
-   (`allowed_commands = guest_allowed_commands`, out-of-list denied,
-   forbidden-paths still apply).
+3. Guest → the loop runs on the registry entries `guest_allowed_tools` permits,
+   and a `GuestGate` checks each call before execution. It denies outright
+   (`GuestGate::deny_reason`) any tool outside `guest_allowed_tools`, including
+   a call to a tool that was left out of the guest's list, and any shell command
+   outside `guest_allowed_commands` (no union with `auto_approve`). Guests do
+   not get a `SecurityPolicy` of their own: `guest_allowed_commands` reaches
+   only the `GuestGate`, and the shell tool keeps the owner's policy.
 
 Because the loop is unified, this lands on **every multi-user channel at once**:
 Telegram, WhatsApp, Discord, Slack, Mattermost, Signal, Matrix, IRC, DingTalk,
