@@ -647,7 +647,7 @@ async fn run_quick_setup_with_home(
     );
     println!();
 
-    let rantaiclaw_dir = home.join(".rantaiclaw");
+    let rantaiclaw_dir = crate::profile::paths::root_for_home(home);
     let workspace_dir = rantaiclaw_dir.join("workspace");
     let config_path = rantaiclaw_dir.join("config.toml");
 
@@ -2414,7 +2414,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    let default_dir = home.join(".rantaiclaw");
+    let default_dir = crate::profile::paths::root_for_home(&home);
 
     print_bullet(&format!(
         "Default location: {}",

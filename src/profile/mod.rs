@@ -15,6 +15,7 @@
 //!   3. The literal string `"default"`.
 
 pub mod commands;
+pub mod dev_guard;
 pub mod migration;
 pub mod paths;
 pub mod sentinel;
