@@ -4,9 +4,14 @@
 //! `crate::test_env` guards in `src/test_env.rs` (`pub(crate)`) are not
 //! reachable here. Any integration test that reaches
 //! `Config::load_or_init()` or `Config::save()` must pin its own
-//! `RANTAICLAW_CONFIG_DIR` instead, or it resolves against the real
-//! `$HOME/.rantaiclaw` when the ambient environment does not already
-//! override it.
+//! `RANTAICLAW_CONFIG_DIR` instead, or its config resolves against the real
+//! config tree when the ambient environment does not already override it.
+//!
+//! Pinning `RANTAICLAW_CONFIG_DIR` covers `config.toml` only. The profile,
+//! workspace and audit paths derive from `HOME`. In a debug or test build,
+//! `profile::paths::root_for_home` moves a `HOME` outside the temp dir to a
+//! per-process temp root, so those paths stay off the real tree without any
+//! setup. A test that needs a known root should set `HOME` to its own temp dir.
 //!
 //! This file lives at `tests/common/mod.rs` (not `tests/common.rs`) so
 //! Cargo's test-target auto-discovery does not treat it as its own test

@@ -49,7 +49,17 @@ fn resolve_for_temp_dir_check(path: &Path) -> PathBuf {
 /// Whether `path` is under `std::env::temp_dir()`, canonicalizing both sides
 /// so a symlinked temp dir doesn't produce a false negative. Shared by every
 /// debug-build write-site / `HOME`-derived isolation guard in the crate.
+///
+/// A path containing `..` is never under the temp dir: the walk in
+/// [`resolve_for_temp_dir_check`] cannot resolve `..` above a component that
+/// does not exist, so the answer would be a lexical guess.
 pub fn is_under_temp_dir(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
     let temp_dir = std::env::temp_dir();
     let resolved_path = resolve_for_temp_dir_check(path);
     let resolved_temp_dir = resolve_for_temp_dir_check(&temp_dir);
@@ -97,4 +107,29 @@ pub fn redirected_root(home: &Path) -> Option<PathBuf> {
         });
     }
     Some(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lexical `starts_with(temp_dir)` check accepts a path that climbs out of
+    /// the temp dir through `..` when the first component after the temp dir does
+    /// not exist, because the walk in `resolve_for_temp_dir_check` never
+    /// canonicalizes it.
+    #[test]
+    fn is_under_temp_dir_rejects_a_path_that_climbs_out_with_parent_dir() {
+        let escaping = std::env::temp_dir()
+            .join("rantaiclaw-no-such-dir")
+            .join("..")
+            .join("..")
+            .join("home")
+            .join("rantaiclaw_user")
+            .join(".rantaiclaw");
+        assert!(
+            !is_under_temp_dir(&escaping),
+            "{} climbs out of the temp dir and must not count as under it",
+            escaping.display()
+        );
+    }
 }
