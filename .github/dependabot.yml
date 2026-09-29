@@ -17,6 +17,27 @@ updates:
     labels:
       - "dependencies"
     groups:
+      # These crate families must move together, because their crates cannot
+      # compile at mismatched versions. Dependabot opened them as split PRs
+      # before (#935 and #939 for opentelemetry, like #762 earlier).
+      opentelemetry:
+        patterns:
+          - "opentelemetry"
+          - "opentelemetry_sdk"
+          - "opentelemetry-otlp"
+        update-types:
+          - major
+          - minor
+          - patch
+      russh:
+        patterns:
+          - "russh"
+          - "russh-keys"
+          - "russh-sftp"
+        update-types:
+          - major
+          - minor
+          - patch
       rust-all:
         patterns:
           - "*"
