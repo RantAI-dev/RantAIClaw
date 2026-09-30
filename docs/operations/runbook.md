@@ -118,6 +118,40 @@ before it exits:
 - Nothing is replayed after the restart, so a turn that already ran tools does not run again.
 - Auto-managed services stop after channels, inside the unit's `TimeoutStopSec=30`.
 
+## One-time markdown memory import
+
+A config that used the retired `markdown` memory backend imports `MEMORY.md` and `memory/*.md` into
+`brain.db` once, on the first start after the upgrade. Before it imports, the runtime copies the
+notes into a backup directory under the workspace:
+
+```text
+<workspace>/memory/migrations/markdown-<timestamp>-<pid>/
+```
+
+The directory holds `MEMORY.md`, `memory/*.md`, and a copy of `brain.db` at `memory/brain.db`. Markers
+in `<workspace>/memory/migrations/` and in the backup directory show where the import stands:
+
+| Marker | Location | Meaning |
+|---|---|---|
+| `BACKUP_COMPLETE` | backup directory | The backup is whole. It holds the cutoff time, and the import keeps any shared `brain.db` row newer than that time. The cutoff is the backup start time, or the earlier time held by `PENDING` when that marker exists. |
+| `IMPORTED` | backup directory | The import committed. The runtime does not import this backup again. |
+| `PENDING` | `<workspace>/memory/migrations/` | A backup failed and is still owed. Every start retries the backup and the import from the live files until one succeeds, then removes the marker. |
+
+Two warnings mean the import is not finished. Both retry on their own at the next start:
+
+- `failed to back up markdown memory before migrating the config to sqlite; the schema upgrade and the import both retry on the next start.`
+- `markdown memory import failed; the config still loads as sqlite, but the original markdown notes were not migrated. The backup at <path> is intact and the import retries automatically on the next start.`
+
+While `PENDING` exists, each start also logs `a markdown memory backup failed earlier and is still owed; retrying it from the live files`.
+
+To recover by hand:
+
+1. Read the error in the warning and fix its cause, which the `error` field names. Restart the runtime.
+2. If a backup directory has no `BACKUP_COMPLETE`, the backup stopped partway and the runtime ignores it. The live `MEMORY.md` and `memory/*.md` are untouched until an import commits, so copy notes from them.
+3. To stop the retries, act on the case you are in:
+   - The backup keeps failing, so no complete backup directory exists. Delete `<workspace>/memory/migrations/PENDING`. Nothing retries the backup after that, and the notes stay in the live markdown files.
+   - The backup is complete but its import keeps failing. Deleting `PENDING` does not stop it, because every start with the `sqlite` backend imports each backup directory that has `BACKUP_COMPLETE` and no `IMPORTED`. Create an empty `IMPORTED` file in that backup directory (`touch <backup directory>/IMPORTED`) and delete `PENDING` if it exists. The runtime then treats the backup as imported and skips it. The notes stay in the live markdown files and in the backup directory.
+
 ## Incident Triage Flow (Fast Path)
 
 1. Snapshot system state:
