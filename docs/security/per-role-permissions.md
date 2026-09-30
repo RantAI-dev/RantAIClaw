@@ -47,11 +47,12 @@ run arbitrary privileged tools." This is the feature.
     conversation.
   - A guest's `memory_store` stores the note in that guest's own conversation,
     so it cannot overwrite or move the owner's note or another conversation's
-    note. A guest's own core note still appears in the owner's `MEMORY.md`
-    until the projection filters by place. A key keeps the place it was first
-    stored in: storing an existing key from another place fails and changes
-    nothing, and the guest sees only "This key is already in use". That leaves
-    a guest able to tell that a key exists.
+    note. The owner's `MEMORY.md` and `MEMORY_SNAPSHOT.md` hold shared notes
+    only, so a guest's core note stays out of `MEMORY.md` and out of the
+    owner's system prompt. A key keeps the place it was first stored in:
+    storing an existing key from another place fails and changes nothing, and
+    the guest sees only "This key is already in use". That leaves a guest able
+    to tell that a key exists.
   - A guest's `file_write` refuses the files that feed the owner's prompt:
     anything under `skills/`, and `AGENTS.md`, `SOUL.md`, `TOOLS.md`,
     `IDENTITY.md` and `HEARTBEAT.md` at the workspace root. Reading them is

@@ -134,8 +134,8 @@ pub fn autosave_memory_key(prefix: &str) -> String {
 /// provider on every later recall.
 ///
 /// A refusal from [`sanitize_memory_content`] skips the store — never stores
-/// the raw text. Storage failures are swallowed, as they were at each call
-/// site: auto-save is a convenience and must not fail a turn.
+/// the raw text. A storage failure is logged at WARN, without the key or the
+/// content, and does not fail the turn: auto-save is a convenience.
 ///
 /// Every auto-save site goes through here. Four hand-written copies of this
 /// screen-then-store block is how a surface ends up being the one that forgot.
@@ -153,14 +153,25 @@ pub async fn autosave_screened(
                     "adjusted an auto-saved message before storing"
                 );
             }
-            let _ = memory
+            if let Err(e) = memory
                 .store(
                     key,
                     &sanitized.content,
                     MemoryCategory::Conversation,
                     session_id,
                 )
-                .await;
+                .await
+            {
+                // The error text of a taken key names the key, so it is not
+                // logged; nothing here logs the content either.
+                if e.downcast_ref::<KeyInUse>().is_some() {
+                    tracing::warn!(
+                        "skipped auto-saving a message: the key is held by another memory place"
+                    );
+                } else {
+                    tracing::warn!("skipped auto-saving a message: {e}");
+                }
+            }
         }
         Err(reason) => {
             tracing::warn!("skipped auto-saving a message: {reason}");
@@ -635,6 +646,75 @@ mod tests {
             mem.stored.lock().unwrap().is_empty(),
             "refused content must not be stored at all"
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A key another place already holds makes the store fail. That used to
+    /// vanish without a trace, so an operator could not tell why a turn was
+    /// never saved. The log names neither the key nor the message.
+    #[tokio::test]
+    async fn autosave_screened_logs_a_skipped_store_without_key_or_content() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "user_msg_taken",
+            "the owner's own note",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        autosave_screened(
+            &mem,
+            "user_msg_taken",
+            "a guest message worth hiding",
+            Some("chat:guest"),
+        )
+        .await;
+        drop(guard);
+
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("WARN"), "no warning was logged:\n{logs}");
+        assert!(logs.contains("skipped auto-saving a message"), "{logs}");
+        assert!(
+            !logs.contains("user_msg_taken"),
+            "the key was logged:\n{logs}"
+        );
+        assert!(
+            !logs.contains("a guest message worth hiding"),
+            "the content was logged:\n{logs}"
+        );
+        let row = mem.get("user_msg_taken").await.unwrap().unwrap();
+        assert_eq!(row.content, "the owner's own note");
     }
 
     /// Minimal session-aware memory for exercising `recall_layered`:

@@ -561,8 +561,9 @@ prompts.
 Memory reads and writes are scoped per conversation: each channel chat and each
 TUI session recalls its own rows first, then backfills from shared (unscoped)
 memory only. Entries another conversation stored never surface in this one's
-prompt. Unscoped entries — what `memory_store` writes — are the shared tier:
-visible to owners, while a guest sees only its own conversation's notes.
+prompt. Unscoped entries are the shared tier: what an owner's `memory_store`
+writes, and what the CLI, the TUI and the one-time markdown import write.
+Owners see them, while a guest sees only its own conversation's notes.
 
 The explicit `memory_recall` tool follows the same scope on interactive
 surfaces (TUI, `agent run`, the console API): it reads the active
@@ -581,14 +582,18 @@ owner's notes. An owner's memory read is unchanged.
 A guest's writes stay in its own place too. `memory_store` under a guest turn
 stores with the guest's conversation as the session, and its `replaces` and
 `memory_forget` see only that conversation's rows. A memory key keeps the place
-it was first stored in, for every writer: storing an existing key from another
-place (shared or another conversation) fails without changing the row, so a
-guest cannot overwrite the owner's notes or pull a row into the shared tier.
-A guest's own core note still appears in the owner's `MEMORY.md` until the
-projection filters by place.
-`file_write` under a guest turn refuses `skills/` and the workspace-root
-`AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md` and `HEARTBEAT.md`, which load
-into owner prompts. These rules cover only the four file tools and the memory
+it was first stored in, for every runtime writer; the one-time markdown import
+is the exception. Storing an existing key from another place (shared or another
+conversation) fails without changing the row, so a guest cannot overwrite the
+owner's notes or pull a row into the shared tier. `POST /api/v1/memory` answers
+that failure with `409`.
+The `MEMORY.md` projection and the `MEMORY_SNAPSHOT.md` export hold shared core
+notes only. A guest's core note stays in the database, in its own conversation,
+and so stays out of `MEMORY.md` and out of the owner's system prompt. The
+capacity notice of `memory_store` counts shared core notes only, and a guest
+does not get it. `file_write` under a guest turn refuses `skills/` and the
+workspace-root `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md` and
+`HEARTBEAT.md`, which load into owner prompts. These rules cover only the four file tools and the memory
 tools; `glob_search`, `shell` and MCP filesystem tools are not subject to them.
 
 ### Scores are absolute

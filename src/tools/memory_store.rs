@@ -192,7 +192,8 @@ impl Tool for MemoryStoreTool {
 
         // A guest's turn stores the note in that guest's own conversation, so it
         // cannot overwrite or move a note stored in another place. The
-        // `MEMORY.md` projection still includes core notes from every place.
+        // `MEMORY.md` projection holds shared notes only, so a guest's note
+        // stays out of the owner's prompt.
         let place = match crate::memory::current_memory_view() {
             Some(crate::memory::MemoryView::Only(key)) => Some(key),
             _ => None,
@@ -248,7 +249,8 @@ impl Tool for MemoryStoreTool {
         // the superseded one's removal in a single rewrite.
         crate::memory::snapshot::refresh_projection(self.memory.as_ref(), &self.workspace_dir);
 
-        if category == MemoryCategory::Core {
+        // The notice describes the owner's block, which a guest has no view of.
+        if category == MemoryCategory::Core && place.is_none() {
             if let Some(notice) = self.core_capacity_notice().await {
                 output.push('\n');
                 output.push_str(&notice);
@@ -278,11 +280,16 @@ impl MemoryStoreTool {
     /// that was missing — the file already says `… N more not shown`, but the
     /// agent, the one thing that could consolidate, never saw it.
     async fn core_capacity_notice(&self) -> Option<String> {
-        let entries = self
+        // The block holds shared notes only, so notes kept in a conversation do
+        // not count against it.
+        let entries: Vec<_> = self
             .memory
             .list(Some(&MemoryCategory::Core), None)
             .await
-            .ok()?;
+            .ok()?
+            .into_iter()
+            .filter(|entry| entry.session_id.is_none())
+            .collect();
 
         let mut used = 0_usize;
         let mut injected = 0_usize;
@@ -709,6 +716,97 @@ mod tests {
             "expected a capacity notice, got: {}",
             result.output
         );
+    }
+
+    /// A guest's core note stays in the guest's conversation, so the file the
+    /// owner's prompt injects must not gain it.
+    #[tokio::test]
+    async fn guest_core_store_keeps_the_note_out_of_memory_md() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "owner_pref",
+            "the owner prefers Rust",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"key": "guest_note", "content": "a guest fact"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(result.success, "control: {:?}", result.error);
+
+        let projected = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert!(projected.contains("owner_pref"), "{projected}");
+        assert!(
+            !projected.contains("guest_note") && !projected.contains("a guest fact"),
+            "the guest note reached the owner's prompt file:\n{projected}"
+        );
+        let row = mem.get("guest_note").await.unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("chat:guest"));
+    }
+
+    /// Under a guest view the notice would report how many notes the owner has
+    /// and how much of the block they fill.
+    #[tokio::test]
+    async fn core_store_shows_no_capacity_notice_under_a_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        let filler = "y".repeat(900);
+        for i in 0..6 {
+            mem.store(&format!("bulk_{i}"), &filler, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"key": "guest_note", "content": "a guest fact"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(result.success, "control: {:?}", result.error);
+        assert_eq!(result.output, "Stored memory: guest_note");
+    }
+
+    /// The block holds shared notes only, so notes kept in conversations do not
+    /// count against its budget.
+    #[tokio::test]
+    async fn core_store_counts_only_shared_notes_toward_the_budget() {
+        let (tmp, mem) = test_mem();
+        let filler = "y".repeat(900);
+        for i in 0..6 {
+            mem.store(
+                &format!("guest_bulk_{i}"),
+                &filler,
+                MemoryCategory::Core,
+                Some("chat:guest"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = tool
+            .execute(json!({"key": "one_more", "content": "a durable fact"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "control: {:?}", result.error);
+        assert_eq!(result.output, "Stored memory: one_more");
     }
 
     #[tokio::test]

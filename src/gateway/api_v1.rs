@@ -1997,7 +1997,10 @@ async fn memory_create(
         .mem
         .store(&key, &sanitized.content, category, session)
         .await
-        .map_err(err_500)?;
+        .map_err(|e| match e.downcast_ref::<crate::memory::KeyInUse>() {
+            Some(in_use) => err_409(in_use.to_string()),
+            None => err_500(e),
+        })?;
     refresh_memory_projection(&state);
 
     Ok((
@@ -3647,6 +3650,43 @@ mod tests {
             state.mem.get("poisoned").await.unwrap().is_none(),
             "nothing may be stored when the content is refused"
         );
+    }
+
+    /// A key is fixed to the place it was first stored in. Storing it from
+    /// another place is a conflict the caller can fix by choosing another key,
+    /// not a server fault.
+    #[tokio::test]
+    async fn memory_create_answers_409_for_a_key_held_in_another_place() {
+        let (_tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "shared_note",
+                "the operator prefers Rust",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = memory_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(MemoryCreateBody {
+                content: "overwrite attempt".into(),
+                key: Some("shared_note".into()),
+                category: None,
+                session_id: Some("chat:guest".into()),
+            }),
+        )
+        .await
+        .expect_err("a key held in another place must be refused");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1 .0.error, "conflict");
+        let row = state.mem.get("shared_note").await.unwrap().unwrap();
+        assert_eq!(row.content, "the operator prefers Rust");
+        assert_eq!(row.session_id, None);
     }
 
     #[tokio::test]

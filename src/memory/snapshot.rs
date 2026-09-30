@@ -39,7 +39,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let mut stmt = conn.prepare(
         "SELECT key, content, category, created_at, updated_at
          FROM memories
-         WHERE category = 'core'
+         WHERE category = 'core' AND session_id IS NULL
          ORDER BY updated_at DESC",
     )?;
 
@@ -104,7 +104,10 @@ pub(crate) const PROJECTION_END: &str = "<!-- rantaiclaw:memory:end -->";
 /// database.
 pub const PROJECTION_MAX_CHARS: usize = 4_000;
 
-/// Render core memories into the delimited block of `MEMORY.md`.
+/// Render shared core memories into the delimited block of `MEMORY.md`.
+///
+/// Only rows without a `session_id` are projected. A note stored in a guest's
+/// conversation stays in `brain.db` and out of the owner's prompt.
 ///
 /// `brain.db` is authoritative; this file is its projection. The prompt already
 /// injects `MEMORY.md`, but on the sqlite backend nothing ever wrote it — so the
@@ -127,7 +130,7 @@ pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
     let conn = Connection::open(&db_path)?;
     let mut stmt = conn.prepare(
         "SELECT key, content FROM memories
-         WHERE category = 'core'
+         WHERE category = 'core' AND session_id IS NULL
          ORDER BY updated_at DESC",
     )?;
     let rows: Vec<(String, String)> = stmt
@@ -153,7 +156,7 @@ pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
 
     let path = workspace_dir.join(MEMORY_FILE);
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    fs::write(&path, splice_block(&existing, &block))?;
+    crate::migration::replace_file_atomically(&path, splice_block(&existing, &block).as_bytes())?;
 
     Ok(projected)
 }
@@ -194,7 +197,11 @@ fn render_projection(rows: &[(String, String)]) -> (String, usize, usize) {
     let mut projected = 0_usize;
 
     for (key, content) in rows {
-        let line = format!("- {key}: {}\n", content.replace('\n', " "));
+        let line = format!(
+            "- {}: {}\n",
+            escape_projected_text(key),
+            escape_projected_text(content)
+        );
         if body.chars().count() + line.chars().count() > PROJECTION_MAX_CHARS {
             break;
         }
@@ -203,6 +210,23 @@ fn render_projection(rows: &[(String, String)]) -> (String, usize, usize) {
     }
 
     (body, projected, rows.len() - projected)
+}
+
+/// Flatten text to one line and remove both projection markers.
+///
+/// A marker inside a key or a note would make `splice_block` cut the file at
+/// the planted marker, so the rest of the old block would count as operator
+/// prose and grow on every projection.
+fn escape_projected_text(text: &str) -> String {
+    let mut out = text.replace('\n', " ");
+    // Removing a marker can join the text around it into a new marker, so
+    // repeat until none is left.
+    while out.contains(PROJECTION_BEGIN) || out.contains(PROJECTION_END) {
+        out = out
+            .replace(PROJECTION_BEGIN, "")
+            .replace(PROJECTION_END, "");
+    }
+    out
 }
 
 /// Replace the delimited block, or append one, leaving the rest untouched.
@@ -482,7 +506,8 @@ Rule 3: Protect the user.
                 category TEXT NOT NULL DEFAULT 'core',
                 embedding BLOB,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                session_id TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_mem_key ON memories(key);",
         )
@@ -711,6 +736,159 @@ Rule 3: Protect the user.
         let out = memory_md(tmp.path());
         assert!(out.contains("- core_one: durable"));
         assert!(!out.contains("chatter"));
+    }
+
+    /// `MEMORY.md` goes into the owner's system prompt. A note a guest stored
+    /// in their own conversation must stay in the database and out of that file.
+    #[tokio::test]
+    async fn projection_skips_notes_stored_in_a_conversation() {
+        let tmp = workspace_with_core(&[("owner_pref", "the owner prefers Rust")]).await;
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "guest_note",
+            "a guest fact",
+            crate::memory::MemoryCategory::Core,
+            Some("chat:guest"),
+        )
+        .await
+        .unwrap();
+
+        let projected = project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        assert_eq!(projected, 1);
+        assert!(
+            out.contains("- owner_pref: the owner prefers Rust"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("guest_note"),
+            "guest note reached MEMORY.md:\n{out}"
+        );
+        assert!(!out.contains("a guest fact"), "{out}");
+        let row = mem.get("guest_note").await.unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("chat:guest"));
+    }
+
+    /// The block stops at the first line that does not fit, so a guest note
+    /// larger than the whole block would push every older owner note out.
+    #[tokio::test]
+    async fn a_large_conversation_note_does_not_push_owner_notes_out() {
+        let tmp = workspace_with_core(&[("owner_pref", "the owner prefers Rust")]).await;
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "guest_note",
+            &"g".repeat(5_000),
+            crate::memory::MemoryCategory::Core,
+            Some("chat:guest"),
+        )
+        .await
+        .unwrap();
+
+        project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        assert!(
+            out.contains("- owner_pref: the owner prefers Rust"),
+            "{out}"
+        );
+        assert!(!out.contains("not shown"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn export_skips_notes_stored_in_a_conversation_and_hydrate_restores_only_shared() {
+        let tmp = workspace_with_core(&[("owner_pref", "the owner prefers Rust")]).await;
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "guest_note",
+            "a guest fact",
+            crate::memory::MemoryCategory::Core,
+            Some("chat:guest"),
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let exported = export_snapshot(tmp.path()).unwrap();
+
+        assert_eq!(exported, 1);
+        let snapshot = fs::read_to_string(tmp.path().join(SNAPSHOT_FILENAME)).unwrap();
+        assert!(snapshot.contains("owner_pref"), "{snapshot}");
+        assert!(!snapshot.contains("guest_note"), "{snapshot}");
+        assert!(!snapshot.contains("a guest fact"), "{snapshot}");
+
+        fs::remove_file(tmp.path().join("memory").join("brain.db")).unwrap();
+        hydrate_from_snapshot(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+        let guest_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE key = 'guest_note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(guest_rows, 0, "hydrate restored a guest note as shared");
+    }
+
+    /// A key or content that carries a projection marker used to make the next
+    /// `splice_block` cut at the planted marker, so the old block leaked into
+    /// the operator prose and grew on every projection.
+    #[tokio::test]
+    async fn projection_renders_a_planted_marker_as_one_line() {
+        let tmp = workspace_with_core(&[
+            (
+                "multi\nline <!-- rantaiclaw:memory:begin --> key",
+                "before <!-- rantaiclaw:memory:end --> after <!-- rantaiclaw:memory:e<!-- rantaiclaw:memory:end -->nd -->\nsecond line",
+            ),
+            ("plain_key", "plain value"),
+        ])
+        .await;
+
+        project_core_memories(tmp.path()).unwrap();
+        let first = memory_md(tmp.path());
+        project_core_memories(tmp.path()).unwrap();
+        let second = memory_md(tmp.path());
+
+        assert_eq!(first.matches(PROJECTION_BEGIN).count(), 1, "{first}");
+        assert_eq!(first.matches(PROJECTION_END).count(), 1, "{first}");
+        assert_eq!(
+            first.lines().filter(|l| l.starts_with("- ")).count(),
+            2,
+            "a key with a newline must stay on one line:\n{first}"
+        );
+        assert!(first.contains("- plain_key: plain value"), "{first}");
+        assert_eq!(first, second, "a second projection changed the file");
+    }
+
+    /// A crash halfway through a rewrite must leave the operator's prose, not a
+    /// truncated file. A directory that refuses new files makes the rename path
+    /// fail while the old file stays writable, which is exactly what an
+    /// in-place write survives and an atomic write does not touch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_projection_leaves_the_old_file_intact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = workspace_with_core(&[("owner_pref", "the owner prefers Rust")]).await;
+        let path = tmp.path().join(MEMORY_FILE);
+        let original = "# Long-Term Memory\n\nOperator prose that must survive.\n";
+        fs::write(&path, original).unwrap();
+
+        let mut locked = fs::metadata(tmp.path()).unwrap().permissions();
+        let writable = locked.clone();
+        locked.set_mode(0o555);
+        fs::set_permissions(tmp.path(), locked).unwrap();
+        // A privileged user can still create files here, which would make the
+        // failure impossible to provoke.
+        let can_create = fs::write(tmp.path().join(".probe"), "x").is_ok();
+        let result = project_core_memories(tmp.path());
+        fs::set_permissions(tmp.path(), writable).unwrap();
+        if can_create {
+            return;
+        }
+
+        assert!(result.is_err(), "the projection should have failed");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     /// The whole file goes into the system prompt every session, so the block
