@@ -324,10 +324,10 @@ Notes:
 | `enabled` | `true` | Enable `browser_open` tool (opens URLs without scraping) |
 | `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
-| `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
-| `native_headless` | `true` | Headless mode for rust-native backend |
-| `native_webdriver_url` | `http://127.0.0.1:9515` | WebDriver endpoint URL for rust-native backend |
-| `native_chrome_path` | unset | Optional Chrome/Chromium executable path for rust-native backend |
+| `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"computer_use"`, or `"auto"`. `"rust_native"` and `"native"` fail with an error, because the native backend was removed |
+| `native_headless` | `true` | No effect: the native backend was removed. Read by nothing |
+| `native_webdriver_url` | `http://127.0.0.1:9515` | No effect: the native backend was removed. Read by nothing |
+| `native_chrome_path` | unset | No effect: the native backend was removed. Read by nothing |
 
 ### `[browser.computer_use]`
 

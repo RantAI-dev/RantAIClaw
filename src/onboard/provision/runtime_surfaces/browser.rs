@@ -119,26 +119,6 @@ impl TuiProvisioner for BrowserProvisioner {
                     }).await?;
                 }
             }
-
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "chrome_path".into(),
-                    label: "Chrome/Chromium path (Enter to auto-detect, or type 'none' to skip)"
-                        .into(),
-                    default: Some("auto-detect".into()),
-                    secret: false,
-                },
-            )
-            .await?;
-
-            let path = recv_text(&mut responses).await?;
-            browser_cfg.native_chrome_path =
-                if path.trim().is_empty() || path.trim() == "auto-detect" {
-                    None
-                } else {
-                    Some(path.trim().to_string())
-                };
         }
 
         if enabled && backend == "computer_use" {
@@ -236,5 +216,53 @@ mod tests {
             "the curated allowlist must survive a setup re-run"
         );
         assert_eq!(config.browser.session_name.as_deref(), Some("kept"));
+    }
+
+    #[tokio::test]
+    async fn agent_browser_setup_asks_no_chrome_path() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(32);
+        let collector = tokio::spawn(async move {
+            let mut prompt_ids = Vec::new();
+            while let Some(event) = events_rx.recv().await {
+                if let ProvisionEvent::Prompt { id, .. } = event {
+                    prompt_ids.push(id);
+                }
+            }
+            prompt_ids
+        });
+        // backend = Agent Browser
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![1]))
+            .await
+            .unwrap();
+        // A stray prompt would wait for an answer that never comes, so close the
+        // response channel: the run then fails instead of hanging.
+        drop(resp_tx);
+
+        let mut config = Config::default();
+        let profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp"),
+        };
+        BrowserProvisioner::new()
+            .run(
+                &mut config,
+                &profile,
+                ProvisionIo {
+                    events: events_tx,
+                    responses: resp_rx,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(config.browser.enabled);
+        assert_eq!(config.browser.backend, "agent_browser");
+        let prompt_ids = collector.await.unwrap();
+        assert!(
+            prompt_ids.is_empty(),
+            "agent_browser setup must not prompt: {prompt_ids:?}"
+        );
     }
 }
