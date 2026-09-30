@@ -1369,6 +1369,25 @@ pub fn skills_to_prompt_with_mode(
     workspace_dir: &Path,
     mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
+    render_skills_prompt(skills, workspace_dir, mode, true)
+}
+
+/// The "Available Skills" section for a guest's prompt: the same list, without
+/// a `<location>` per skill. A location is a path on the host, and outside the
+/// workspace it is absolute and carries the OS user name.
+pub fn skills_to_prompt_for_guest(
+    skills: &[Skill],
+    mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
+    render_skills_prompt(skills, Path::new(""), mode, false)
+}
+
+fn render_skills_prompt(
+    skills: &[Skill],
+    workspace_dir: &Path,
+    mode: crate::config::SkillsPromptInjectionMode,
+    with_locations: bool,
+) -> String {
     use std::fmt::Write;
 
     if skills.is_empty() {
@@ -1382,10 +1401,15 @@ pub fn skills_to_prompt_with_mode(
              Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
              <available_skills>\n",
         ),
-        crate::config::SkillsPromptInjectionMode::Compact => String::from(
+        crate::config::SkillsPromptInjectionMode::Compact if with_locations => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
              Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\n\
+             <available_skills>\n",
+        ),
+        crate::config::SkillsPromptInjectionMode::Compact => String::from(
+            "## Available Skills\n\n\
+             Skill summaries are preloaded below to keep context compact.\n\n\
              <available_skills>\n",
         ),
     };
@@ -1401,8 +1425,10 @@ pub fn skills_to_prompt_with_mode(
         // the on-demand relative-location rendering the Compact path uses.
         let render_full =
             matches!(mode, crate::config::SkillsPromptInjectionMode::Full) && !skill.remote;
-        let location = render_skill_location(skill, workspace_dir, !render_full);
-        write_xml_text_element(&mut prompt, 4, "location", &location);
+        if with_locations {
+            let location = render_skill_location(skill, workspace_dir, !render_full);
+            write_xml_text_element(&mut prompt, 4, "location", &location);
+        }
 
         if render_full {
             if !skill.prompts.is_empty() {

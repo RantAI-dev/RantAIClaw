@@ -1642,10 +1642,6 @@ async fn run_gateway_chat_with_multimodal(
     // Prior `(role, content)` turns to re-feed so a continued channel
     // conversation has memory of the exchange (empty for one-shot webhooks).
     prior_history: &[(String, String)],
-    // Per-role capability ceiling for a non-owner ("guest") sender. `None` ⇒
-    // owner / trusted webhook (full toolset). Built by the caller from the
-    // channel sender + config; applies regardless of `autonomous_tools`.
-    guest_gate: Option<&crate::approval::GuestGate>,
 ) -> anyhow::Result<GatewayChatResult> {
     let user_messages = vec![ChatMessage::user(message)];
     let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
@@ -1761,7 +1757,9 @@ async fn run_gateway_chat_with_multimodal(
         // `web_approvals`; this path has no interactive surface, so the inline
         // backend stays the name-derived default (auto-deny) here.
         None,
-        guest_gate,
+        // No guest ceiling: a webhook turn is the operator's own, with the full
+        // toolset.
+        None,
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
         None, // no cancellation token
@@ -1938,7 +1936,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &[], &[], None).await {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &[], &[]).await {
         Ok(result) => {
             let duration = started_at.elapsed();
             state
@@ -2625,8 +2623,7 @@ async fn handle_trigger_webhook(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, &message, &[], &[], None).await
-    {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, &message, &[], &[]).await {
         Ok(result) => {
             let mut body = serde_json::json!({
                 "response": result.response,

@@ -869,6 +869,19 @@ pub(crate) async fn process_channel_message(
             }
         }
     }
+    // The registry a guest's loop runs on is the entries that gate permits, so
+    // a native provider is sent specs for those tools only, and the guest's
+    // safety section and tool-use protocol name those tools only. Built per
+    // turn from the reloaded gate, so an operator edit to `guest_allowed_tools`
+    // applies to the next message. The gate still checks every call.
+    let guest_turn_tools = if sender_is_owner {
+        Vec::new()
+    } else {
+        crate::tools::guest_registry::permitted_tools(
+            &ctx.tools_registry,
+            &runtime_defaults.guest_gate,
+        )
+    };
     // `ctx.system_prompt` is built once at channel start — it reads bootstrap
     // files and skills off disk, so rebuilding it per message is not free. The
     // approval policy can change under a running daemon, though, and the safety
@@ -887,21 +900,30 @@ pub(crate) async fn process_channel_message(
     } else {
         ctx.guest_system_prompt.as_str()
     };
-    let base_prompt = crate::agent::prompt::replace_safety_section(
-        prompt_source,
-        &crate::agent::prompt::render_safety_section(
-            // `SafetySection` matches `Channel { .. }` and never reads the
-            // payload, and the real value is only known where the provider is
-            // built (channel startup). If the section ever starts branching on
-            // it, this call site has to thread it through instead.
-            crate::agent::prompt::PromptSurface::Channel {
-                native_tools: false,
-            },
+    // `SafetySection` matches `Channel { .. }` and never reads the payload, and
+    // the real value is only known where the provider is built (channel
+    // startup). If the section ever starts branching on it, this call site has
+    // to thread it through instead.
+    let safety_surface = crate::agent::prompt::PromptSurface::Channel {
+        native_tools: false,
+    };
+    // A guest's briefing is built from the guest's tools, so it promises no
+    // read or shell access the guest does not have.
+    let safety_section = if sender_is_owner {
+        crate::agent::prompt::render_safety_section(
+            safety_surface,
             Some(runtime_defaults.autonomy_preset),
             ctx.tools_registry.as_ref(),
             &[],
-        ),
-    );
+        )
+    } else {
+        crate::agent::prompt::render_guest_safety_section(
+            safety_surface,
+            Some(runtime_defaults.autonomy_preset),
+            &guest_turn_tools,
+        )
+    };
+    let base_prompt = crate::agent::prompt::replace_safety_section(prompt_source, &safety_section);
     // Re-render the persona section too, from `persona.toml` fresh, so a
     // `PUT /api/v1/personality` reaches an already-running channel listener
     // without a restart — the same per-message in-memory splice the safety
@@ -913,7 +935,26 @@ pub(crate) async fn process_channel_message(
     } else {
         crate::agent::prompt::render_guest_persona_section()
     };
-    let base_prompt = crate::agent::prompt::replace_persona_section(&base_prompt, &persona_section);
+    let mut base_prompt =
+        crate::agent::prompt::replace_persona_section(&base_prompt, &persona_section);
+    // A guest's tool list, task framing and, without native tool calling, the
+    // tool-use protocol come from the tools the reloaded gate permits, so an
+    // operator edit to `guest_allowed_tools` applies to the next message. The
+    // guest prompt built at start-up carries none of them. The owner's sit in
+    // `ctx.system_prompt`. A guest with no tool gets no list, no protocol, and a
+    // task framing that says it has no tools.
+    if !sender_is_owner {
+        let native_tools = active_provider.supports_native_tools();
+        base_prompt.push_str(&crate::agent::prompt::render_guest_turn_sections(
+            &guest_turn_tools,
+            native_tools,
+        ));
+        if !native_tools {
+            base_prompt.push_str(&crate::agent::loop_::build_guest_tool_instructions(
+                &guest_turn_tools,
+            ));
+        }
+    }
     // The channel declares its own media support. A channel that cannot deliver
     // an attachment must not be told it can, or the model emits markers that
     // reach the user as literal text. Bound here rather than inline because the
@@ -1050,19 +1091,6 @@ pub(crate) async fn process_channel_message(
     } else {
         Some(runtime_defaults.guest_gate.as_ref())
     };
-    // The registry a guest's loop runs on is the entries that gate permits, so
-    // a native provider is sent specs for those tools only. Built per turn
-    // from the reloaded gate, so an operator edit to `guest_allowed_tools`
-    // applies to the next message. The gate still checks every call.
-    let guest_turn_tools = if sender_is_owner {
-        Vec::new()
-    } else {
-        crate::tools::guest_registry::permitted_tools(
-            &ctx.tools_registry,
-            &runtime_defaults.guest_gate,
-        )
-    };
-
     let timeout_budget_secs = channel_message_timeout_budget_secs(
         runtime_defaults.message_timeout_secs,
         runtime_defaults.max_tool_iterations,

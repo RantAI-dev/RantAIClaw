@@ -25,22 +25,44 @@ run arbitrary privileged tools." This is the feature.
   - if `shell` is permitted, commands must match `guest_allowed_commands`
     (globs, same matcher as the existing command allowlist) — **out-of-list =
     hard deny**, never escalated to the owner.
-  - Guests never see the owner's profile (`USER.md`) or notes (`MEMORY.md`) in
-    the system prompt, and a guest's persona carries neither the owner's name
-    nor the owner's timezone. The persona calls the person in the chat "the
-    user". The guest prompt also leaves out three things the owner prompt has:
-    `BOOTSTRAP.md` and `TOOLS.md` (its scaffold asks the owner for SSH hosts and
-    device nicknames), the absolute workspace path (it contains the OS user
-    name), and the `Host:` line of the runtime section. It reads
-    `Timezone: UTC` in place of the host's timezone, and the workspace section
-    says only that file paths are relative to the bot's workspace. `AGENTS.md`,
-    `SOUL.md` and `IDENTITY.md` stay, since they describe the bot. The guest
-    prompt lists only the tools the guest may call. On a provider without
-    native tool calling that is the tool-use protocol block, and a guest with no
-    allowed tool gets no block. On a provider with native tool calling it is
-    the tool specs sent with each request. A guest who is allowed `file_read`, `file_write`,
-    `pdf_read`, or `image_info` is still denied access to `MEMORY.md`,
-    `USER.md`, `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, and anything under
+  - A guest's system prompt describes the guest's turn, not the host. It leaves
+    out:
+    - the owner's profile (`USER.md`), notes (`MEMORY.md`), `BOOTSTRAP.md` and
+      `TOOLS.md` (its scaffold asks the owner for SSH hosts and device
+      nicknames);
+    - the absolute workspace path, which contains the OS user name. The
+      workspace section says only that file paths are relative to the bot's
+      workspace;
+    - the `Host:` line of the runtime section;
+    - the host's timezone. It reads `Timezone: UTC`;
+    - the `<location>` of each skill, which is a path on the host. In Full mode
+      that path is absolute, and in Compact mode it is absolute for a skill
+      outside the workspace. The skill list keeps each name and description,
+      and in Full mode its instructions and tools;
+    - the owner's name and timezone in the persona. The persona calls the
+      person in the chat "the user";
+    - every tool the guest may not call, and every instruction to use one. The
+      guest prompt built at start-up has no tool list, no task section and no
+      tool-use protocol. Each message adds them from the ceiling as reloaded,
+      so an edit to `guest_allowed_tools` applies to the next message. The
+      tool list is the tools `guest_allowed_tools` permits, each with its
+      description. The task section tells the guest to use them, or, when the
+      guest has no allowed tool, to answer from the conversation, and says it
+      has no tools. On a provider without native tool calling the tool-use
+      protocol block lists those tools only and its example calls the first of
+      them. A guest with no allowed tool gets no block and no instruction to
+      emit `<tool_call>` tags. On a provider with native tool calling the
+      tools are the specs sent with each request. Under the Strict preset the
+      safety section promises a guest only the reads it has among `file_read`,
+      `memory_recall` and `web_search_tool`. A guest with no tool is told none
+      of its tools run, and a guest whose tools are none of those three reads
+      is promised nothing. The `shell` line follows the guest's tools.
+
+    It keeps `AGENTS.md`, `SOUL.md` and `IDENTITY.md`, since they describe the
+    bot, and the skill list without locations.
+  - A guest who is allowed `file_read`, `file_write`, `pdf_read`, or
+    `image_info` is still denied access to `MEMORY.md`, `USER.md`,
+    `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, `TOOLS.md`, and anything under
     `memory/`; the check runs again after the path is resolved, so a symlink
     or an editor copy of a private file is denied too. A guest's
     `memory_store` `replaces` and `memory_forget` stay inside that guest's own
@@ -68,8 +90,8 @@ run arbitrary privileged tools." This is the feature.
   when `guest_allowed_tools` includes `file_read`, and then only a local file a
   guest `file_read` could return. The runtime filters the reply before it is
   sent, since an attachment marker needs no tool call. It withholds a URL, a
-  file under `memory/`, `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and
-  `MEMORY_SNAPSHOT.md` (also through a symlink), and any SQLite database
+  file under `memory/`, `USER.md`, `MEMORY.md`, `BOOTSTRAP.md`,
+  `MEMORY_SNAPSHOT.md` and `TOOLS.md` (also through a symlink), and any SQLite database
   under any name or its journal files (`-wal`, `-shm`, `-journal`). A reply
   that is only a file path, which Telegram uploads without a marker, is judged
   the same way. A refused attachment is replaced by one closing line in the reply.
@@ -87,7 +109,7 @@ makes a `["*"]` chat allowlist safe (public for safe stuff, private for privileg
 
 ```toml
 approval_owners        = ["alice", "+1555..."]      # owners (existing field)
-guest_allowed_tools    = ["file_read", "web_search", "shell"]  # tools a guest may use
+guest_allowed_tools    = ["file_read", "web_search_tool", "shell"]  # tools a guest may use
 guest_allowed_commands = ["kubectl get *", "kubectl describe *", "ls *"]  # shell globs for guests
 ```
 
