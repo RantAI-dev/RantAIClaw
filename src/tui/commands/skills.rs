@@ -894,17 +894,35 @@ mod tests {
 
     #[test]
     fn personality_command_sets_personality() {
+        // The command writes `<profile>/persona/persona.toml`, so pin HOME to a
+        // temp dir: the profile root then cannot be a developer's real one.
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let temp_home = tempfile::tempdir().unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", temp_home.path());
+        let _g_allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+
         let cmd = PersonalityCommand;
         let mut ctx = test_context();
 
-        let result = cmd.execute("concise", &mut ctx).unwrap();
+        let result = cmd.execute("concise_pro", &mut ctx).unwrap();
 
         match result {
             CommandResult::Message(msg) => {
-                assert!(msg.contains("concise"));
+                assert!(msg.contains("concise_pro"));
             }
             _ => panic!("Expected Message result"),
         }
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        assert!(
+            profile.root.starts_with(temp_home.path()),
+            "the persona must be written under the temp HOME, not {}",
+            profile.root.display()
+        );
+        let persona = crate::persona::read_persona_toml(&profile)
+            .unwrap()
+            .expect("the command must write persona.toml");
+        assert_eq!(persona.preset, crate::persona::PresetId::ConcisePro);
     }
 
     #[test]
