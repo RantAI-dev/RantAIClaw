@@ -477,14 +477,14 @@ mod tests {
 
     #[test]
     async fn tokens_returns_hashes() {
-        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into()]);
+        let seeds = ["zc_a".to_string(), "zc_b".to_string()];
+        let guard = PairingGuard::new(true, &seeds);
         let tokens = guard.tokens();
         assert_eq!(tokens.len(), 2);
-        // Tokens should be stored as 64-char hex hashes, not plaintext
+        // Tokens are stored as SHA-256 hashes, never as the plaintext seed.
         for t in &tokens {
-            assert_eq!(t.len(), 64, "Token should be a SHA-256 hash");
-            assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
-            assert!(!t.starts_with("rc_"), "Token should not be plaintext");
+            assert!(is_token_hash(t), "stored token should be a SHA-256 hash");
+            assert!(!seeds.contains(t), "stored token should not be plaintext");
         }
     }
 

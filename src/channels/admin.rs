@@ -478,6 +478,9 @@ mod approval_owners_warning_tests {
     }
 }
 
+/// Canonical channel roster: `(display label, configured?, support,
+/// verification)` for every channel type in a stable order, derived from
+/// [`CHANNEL_CATALOG`] rather than maintained beside it.
 pub(crate) fn channel_roster(
     config: &Config,
 ) -> Vec<(

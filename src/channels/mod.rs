@@ -1162,20 +1162,6 @@ pub(crate) fn configured_channel_count(config: &Config) -> usize {
         .count()
 }
 
-/// Canonical channel roster: `(display label, configured?)` for every channel
-/// type in a stable order, derived from [`CHANNEL_CATALOG`] rather than
-/// maintained beside it.
-///
-/// Build and run the channel runtime until every listener exits or
-/// `shutdown` is cancelled.
-///
-/// Cancelling `shutdown` makes each supervised listener stop (a
-/// well-behaved channel such as Telegram aborts its long-poll cleanly via
-/// the same token; channels that ignore it are stopped by dropping the
-/// listen future). When the listeners exit they drop their message-bus
-/// senders, which closes the dispatch loop and returns `Ok(())`. This lets
-/// the TUI tear the runtime down and respawn it with fresh config/skills
-/// without leaking listener tasks.
 /// The live message bus, so a holder that is not the channel runtime can put a
 /// parsed message onto it.
 ///
@@ -1769,6 +1755,17 @@ pub(crate) async fn build_channel_runtime(
 /// `Some`, the runtime replaces its contents with the live registry as soon as
 /// the channel fleet is built, so a peer (the cron scheduler) holding a clone
 /// can read the running channels without rebuilding them.
+///
+/// Runs until `shutdown` is cancelled. With no `bus`, it also returns once
+/// every listener has exited, because the listeners then hold the only
+/// senders.
+///
+/// Cancelling `shutdown` ends the dispatch loop and stops each supervised
+/// listener (a well-behaved channel such as Telegram aborts its long-poll
+/// through the same token; channels that ignore it are stopped by dropping the
+/// listen future). After dispatch returns, each channel is closed and every
+/// listener task is awaited, so the TUI can tear the runtime down and respawn
+/// it with fresh config and skills without leaking listener tasks.
 pub async fn start_channels_with_cancellation(
     config: Config,
     shutdown: CancellationToken,
