@@ -194,6 +194,25 @@ fn prune_dead_pid_dirs_as(base: &Path, prefix: &str, uid: u32) {
     }
 }
 
+/// [`prepare_dev_home`], but an error stops the process.
+///
+/// The preferred `<base>/rantaiclaw-dev-home-<pid>` name may be a symlink or
+/// another user's directory, which `prepare_dev_home` refuses. When the random
+/// fallback cannot be created either, using the preferred name anyway would
+/// write through that symlink or into that directory. This code only runs in
+/// debug and test builds, so failing fast is the safe answer.
+fn prepare_dev_home_or_panic(base: &Path, pid: u32, uid: u32) -> PathBuf {
+    match prepare_dev_home(base, pid, uid) {
+        Ok(dir) => dir,
+        Err(err) => panic!(
+            "rantaiclaw: could not create a private debug-build data root under {}: {err}. \
+             Check the permissions of that directory and of the temp dir, or set \
+             RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1 to use the real config tree.",
+            base.display()
+        ),
+    }
+}
+
 /// The per-process root, decided once: prune dead siblings, prepare the
 /// private directory, create the root inside it and print the notice.
 fn dev_root() -> &'static Path {
@@ -202,13 +221,7 @@ fn dev_root() -> &'static Path {
         let base = std::env::temp_dir();
         prune_dead_pid_dirs(&base, DEV_HOME_PREFIX);
         let pid = std::process::id();
-        let dev_home = prepare_dev_home(&base, pid, current_uid()).unwrap_or_else(|err| {
-            eprintln!(
-                "rantaiclaw: could not create the debug-build data root under {}: {err}",
-                base.display()
-            );
-            base.join(format!("{DEV_HOME_PREFIX}{pid}"))
-        });
+        let dev_home = prepare_dev_home_or_panic(&base, pid, current_uid());
         let root = dev_home.join(".rantaiclaw");
         if let Err(err) = std::fs::create_dir_all(&root) {
             eprintln!(
@@ -233,9 +246,9 @@ fn dev_root() -> &'static Path {
 /// The root is `<temp>/rantaiclaw-dev-home-<pid>/.rantaiclaw`, one per process,
 /// so it keeps the `.rantaiclaw` name the layout code expects. It is created
 /// (owner-only) on first use, and the choice is cached for the process; see
-/// [`prepare_dev_home`] for when a random suffix replaces the plain pid. Outside `cfg(test)` the first redirect prints one
-/// line to stderr, so a developer running `cargo run` knows where their data
-/// went.
+/// [`prepare_dev_home`] for when a random suffix replaces the plain pid.
+/// Outside `cfg(test)` the first redirect prints one line to stderr, so a
+/// developer running `cargo run` knows where their data went.
 pub fn redirected_root(home: &Path) -> Option<PathBuf> {
     if allow_real_config_dir() || is_under_temp_dir(home) {
         return None;
@@ -357,6 +370,48 @@ mod dev_home_tests {
             "a directory of another uid must not be reused"
         );
         assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn dev_home_is_never_the_refused_name_when_no_fallback_can_be_made() {
+        if current_uid() == 0 {
+            eprintln!("skipped: root ignores directory modes");
+            return;
+        }
+        let base = tempfile::tempdir().expect("base");
+        let target = tempfile::tempdir().expect("symlink target");
+        let link = base.path().join(dev_home_name(4242));
+        std::os::unix::fs::symlink(target.path(), &link).expect("symlink");
+        // With the base read-only, the random fallback cannot be created.
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("make the base read-only");
+
+        let outcome = std::panic::catch_unwind(|| {
+            prepare_dev_home_or_panic(base.path(), 4242, current_uid())
+        });
+
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore the base permissions");
+        let payload = outcome.expect_err(
+            "a refused name with no possible fallback must stop the process, not return the refused path",
+        );
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("panic message");
+        assert!(
+            message.contains(&base.path().display().to_string())
+                && message.contains("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR"),
+            "the message must name the base path and the escape hatch, got: {message}"
+        );
+        assert_eq!(
+            std::fs::read_dir(target.path())
+                .expect("read target")
+                .count(),
+            0,
+            "nothing may be written through the symlink"
+        );
     }
 
     #[test]
