@@ -40,7 +40,7 @@ Use this with:
 5. Rust path stages:
    - `lint` — fmt + clippy + strict delta clippy on changed lines.
    - `test` — `cargo nextest run --locked --workspace`.
-   - `features` — matrix `cargo check` over `no-default-features` / `hardware-only`.
+   - `features` — matrix `cargo check` over `no-default-features` / `hardware-only` / `observability-otel` / `kb-office`.
    - `bench-compile` — `cargo bench --no-run --locked`.
    - `e2e` — push-to-`main` only; never runs on PRs.
    - `build` — release-fast smoke + binary-size guard (always runs for rust changes).
