@@ -1509,7 +1509,7 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn linux_service_file_has_expected_suffix() {
+    fn linux_service_file_lives_under_the_xdg_systemd_user_dir() {
         let _lock = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", tmp.path());

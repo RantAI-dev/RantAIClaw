@@ -1321,17 +1321,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        // One clock reading taken before `add_job`. `add_job` schedules the
-        // next run strictly after its own, later reading, so `created_at` is
-        // never past the stored `next_run` however the minute boundary falls.
-        let created_at = Utc::now();
+        // `add_job` schedules the first run strictly after the moment it
+        // stamps as `created_at`, so asking at `created_at` itself never
+        // selects the new job, however the minute boundary falls. A scheduler
+        // that set `next_run` equal to `created_at` would fail both checks.
         let job = add_job(&config, "* * * * *", "echo due").unwrap();
-        assert!(job.next_run > created_at);
+        assert!(job.next_run > job.created_at);
 
-        let due_now = due_jobs(&config, created_at).unwrap();
+        let due_now = due_jobs(&config, job.created_at).unwrap();
         assert!(due_now.is_empty(), "new job should not be due immediately");
 
-        let far_future = created_at + ChronoDuration::days(365);
+        let far_future = job.created_at + ChronoDuration::days(365);
         let due_future = due_jobs(&config, far_future).unwrap();
         assert_eq!(due_future.len(), 1, "job should be due in far future");
 
