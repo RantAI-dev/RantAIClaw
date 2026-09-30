@@ -143,6 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Memory hygiene no longer archives or purges daily memory files (`memory/*.md`). Nothing reads those files any more now that the markdown backend is retired; session-log archiving/purging and the sqlite conversation-row prune are unchanged.
 - A config written by this version does not load on **0.32.0-alpha**, which only knows schema 33. This covers both the schema-34 fields (lucid/markdown retirement) and the schema-35 fields (postgres retirement, above). Restore the previous config from `config.toml.bak` (kept next to `config.toml` by the migrator) to go back.
 - Crate and CLI author metadata now name RantAI.
+- The opt-in `observability-otel` feature moves to OpenTelemetry 0.33, with `opentelemetry`, `opentelemetry_sdk` and `opentelemetry-otlp` bumped together. OTLP over HTTPS now verifies the collector against the operating system's trust store instead of bundled Mozilla roots, and the exporter retries failed exports up to three times with backoff. The default build does not include these crates.
 
 ### Security
 
