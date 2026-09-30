@@ -75,19 +75,6 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
     }
 }
 
-/// Confine an outbound attachment's local path to the agent workspace.
-///
-/// Returns `true` only if `target` — after canonicalization, which resolves
-/// symlinks and `..` — lives under the canonical `workspace` root. A model
-/// reply can be influenced (or prompt-injected) by a channel guest, so an
-/// attachment marker like `[DOCUMENT:~/.rantaiclaw/config.toml]` must not be
-/// able to read arbitrary host files (config with API keys + bot token, ssh
-/// keys, `/etc/*`) and upload them to the chat. This mirrors the workspace
-/// confinement the `file_*` tools already enforce (`is_resolved_path_allowed`);
-/// the attachment path was a second, unsandboxed file read.
-///
-/// Fails closed: an unresolvable target (missing file, canonicalize error) is
-/// not sendable.
 pub(crate) fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
