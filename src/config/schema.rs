@@ -10125,6 +10125,58 @@ default_model = "legacy-model"
         );
     }
 
+    /// A private `MEMORY.md` stays private: the rewrite must not widen its
+    /// permissions to the umask default.
+    #[cfg(unix)]
+    #[test]
+    async fn rewrite_memory_md_to_projection_only_keeps_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("MEMORY.md");
+        let begin = crate::memory::snapshot::PROJECTION_BEGIN;
+        let end = crate::memory::snapshot::PROJECTION_END;
+        std::fs::write(&path, format!("{begin}\n- a: b\n{end}\nprivate notes\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        super::rewrite_memory_md_to_projection_only(tmp.path()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the rewrite must keep the file mode, got {mode:o}"
+        );
+    }
+
+    /// A symlinked `MEMORY.md` stays a symlink: the rewrite replaces the
+    /// link target, not the link.
+    #[cfg(unix)]
+    #[test]
+    async fn rewrite_memory_md_to_projection_only_writes_through_a_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("notes-target.md");
+        let link = tmp.path().join("MEMORY.md");
+        let begin = crate::memory::snapshot::PROJECTION_BEGIN;
+        let end = crate::memory::snapshot::PROJECTION_END;
+        std::fs::write(&target, format!("{begin}\n- a: b\n{end}\nprivate notes\n")).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        super::rewrite_memory_md_to_projection_only(tmp.path()).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "MEMORY.md must still be a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            format!("{begin}\n- a: b\n{end}"),
+            "the link target must hold the new content"
+        );
+    }
+
     /// A markdown backup left without an `IMPORTED` marker (an earlier
     /// failed import) is retried; one that already finished is not touched
     /// again.

@@ -247,7 +247,19 @@ pub(crate) fn write_marker_durably(path: &Path, contents: &[u8]) -> Result<()> {
 
 /// Replace `path` with `contents` through a temp file in the same directory
 /// and a rename, so a crash leaves either the old file or the new one.
+///
+/// A symlink at `path` is resolved first, so the link stays a link and its
+/// target is replaced. The replacement keeps the mode of the file it
+/// replaces.
 pub(crate) fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let resolved;
+    let path = if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        resolved = fs::canonicalize(path)
+            .with_context(|| format!("resolve symlink {}", path.display()))?;
+        resolved.as_path()
+    } else {
+        path
+    };
     let dir = path
         .parent()
         .context("path to replace has no parent directory")?;
@@ -258,6 +270,9 @@ pub(crate) fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<()
     let temp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = fs::File::create(&temp)?;
+        if let Ok(existing) = fs::metadata(path) {
+            fs::set_permissions(&temp, existing.permissions())?;
+        }
         file.write_all(contents)?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
