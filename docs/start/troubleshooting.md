@@ -221,6 +221,30 @@ Expected behavior:
 
 If chat succeeds but persistence fails, the gateway logs a warning and still returns the completed response. Verify the RantaiClaw data directory is writable and that the active profile's `sessions.db` (`~/.rantaiclaw/profiles/<name>/sessions/sessions.db`) is not locked by another long-running process.
 
+### Markdown notes are missing after the upgrade to sqlite
+
+Symptom:
+
+- the log shows `failed to back up markdown memory before migrating the config to sqlite` or `markdown memory import failed; the config still loads as sqlite`
+- the agent does not recall notes that were in `MEMORY.md` or `memory/*.md`
+
+Cause:
+
+- The one-time import of the markdown notes into `brain.db` did not finish. A failed backup leaves `<workspace>/memory/migrations/PENDING`, and a failed import leaves a backup directory without an `IMPORTED` marker. Both retry on every start.
+
+Fix:
+
+```bash
+ls <workspace>/memory/migrations/
+```
+
+- Fix the cause named in the logged `error` field, then restart. The import retries by itself and removes `PENDING` once it succeeds.
+- The runtime does not delete the live `MEMORY.md` and `memory/*.md`, and a complete backup directory (`markdown-<timestamp>-<pid>/`, with a `BACKUP_COMPLETE` marker) holds copies of them and of `brain.db`. Copy notes back from there if you need them sooner.
+- To stop a failed backup from retrying, delete `PENDING`. The notes are then not imported.
+- To stop a failed import from retrying, create an empty `IMPORTED` file in that backup directory (`touch <backup directory>/IMPORTED`), and delete `PENDING` if it exists. Deleting `PENDING` alone does not stop it, because every start imports each complete backup that has no `IMPORTED` marker.
+
+See [One-time markdown memory import](../operations/runbook.md#one-time-markdown-memory-import) for the markers.
+
 ### `skills install-deps` download extraction fails
 
 Checks:

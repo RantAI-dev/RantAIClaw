@@ -4611,7 +4611,7 @@ impl Config {
             if config.memory.backend.trim().eq_ignore_ascii_case("sqlite")
                 || crate::migration::pending_markdown_import_marker(&config.workspace_dir).exists()
             {
-                retry_unimported_markdown_imports(&config.workspace_dir);
+                retry_unimported_markdown_imports(&config.workspace_dir, markdown_backup_failed);
             }
             tracing::info!(
                 path = %config.config_path.display(),
@@ -5574,7 +5574,9 @@ fn sorted_pending_markdown_backups(
 /// it exists, each load warns with the marker's path, retries the backup from
 /// the live files unless a pending backup already exists, imports, and
 /// removes the marker once every import succeeded. The loader also calls this
-/// for a `PENDING` marker when the backend is not `sqlite`.
+/// for a `PENDING` marker when the backend is not `sqlite`. When the load's own
+/// backup already failed (`backup_failed_this_load`), the sweep does not make
+/// a second attempt in the same load.
 /// This replaces the removed `rantaiclaw migrate` CLI retry.
 ///
 /// A backup missing `BACKUP_COMPLETE` is either still being written by a
@@ -5587,7 +5589,7 @@ fn sorted_pending_markdown_backups(
 /// never named `markdown`) `memory/migrations/` does not exist, so this is a
 /// single failed `read_dir`, and the `PENDING` marker, which lives in that
 /// directory, costs nothing more.
-fn retry_unimported_markdown_imports(workspace_dir: &Path) {
+fn retry_unimported_markdown_imports(workspace_dir: &Path, backup_failed_this_load: bool) {
     let migrations_dir = workspace_dir.join("memory").join("migrations");
     let Ok(read_dir) = std::fs::read_dir(&migrations_dir) else {
         return;
@@ -5610,6 +5612,11 @@ fn retry_unimported_markdown_imports(workspace_dir: &Path) {
     let pending_marker = crate::migration::pending_markdown_import_marker(workspace_dir);
     let marker_present = pending_marker.exists();
     if marker_present {
+        // The load's own backup just failed. Trying again here would only fail
+        // the same way, so the marker stays for the next start.
+        if pending.is_empty() && backup_failed_this_load {
+            return;
+        }
         tracing::warn!(
             marker = %pending_marker.display(),
             "a markdown memory backup failed earlier and is still owed; retrying it from the \
@@ -5686,9 +5693,11 @@ fn mark_markdown_backup_imported(backup_dir: &Path) -> Result<()> {
 ///      `memories.key` conflict: the markdown value is what the operator
 ///      has been using and wins over a `brain.db` row that is not newer than
 ///      the backup (the pre-import `brain.db` is what the backup's copy is
-///      for). A row whose `updated_at` is later than the backup time was
-///      stored after the backup, and no backup holds it, so it is kept and
-///      counted. The backup time is read from `BACKUP_COMPLETE`. The
+///      for). A row in the shared place whose `updated_at` is later than the
+///      backup time was stored after the backup, and no backup holds it, so it
+///      is kept and counted. A row held by another place (a conversation's
+///      `session_id`) is overwritten whatever its age and moves to the shared
+///      place; those moves are counted too. The backup time is read from `BACKUP_COMPLETE`. The
 ///      imported rows carry that time as their own, so a newer backup
 ///      imported afterwards can still replace them. A key whose value
 ///      passes `is_autosave_key` is stored as `conversation` regardless of
@@ -5696,8 +5705,11 @@ fn mark_markdown_backup_imported(backup_dir: &Path) -> Result<()> {
 ///      to skip it. A `busy_timeout` is set first, since a concurrently
 ///      running daemon can hold `brain.db` for ordinary traffic.
 ///
-///      The `IMPORTED` marker is written once this transaction has committed
-///      and the WAL is checkpointed to disk, before step 3 runs. That is what
+///      The connection runs with `synchronous = FULL`, so the commit is
+///      durable on its own. The `IMPORTED` marker is written once this
+///      transaction has committed, before step 3 runs. The WAL checkpoint
+///      that follows the commit is best-effort: a busy result is logged and
+///      does not fail the import. That is what
 ///      makes this idempotent under failure: once rows are durably imported,
 ///      nothing here ever re-applies markdown-wins over an edit or a delete
 ///      made afterward, no matter what happens next.
@@ -5706,16 +5718,21 @@ fn mark_markdown_backup_imported(backup_dir: &Path) -> Result<()> {
 ///      gated behind `IMPORTED`. `project_and_rewrite_live_memory_md` only
 ///      rewrites the live file when it is still byte-identical to the copy
 ///      the backup holds; an operator edit made since the backup is left
-///      alone, and a `WARN` says so. A failure here is logged and does not
-///      fail the import overall — a later ordinary memory write already
-///      re-projects `MEMORY.md` on its own (`refresh_projection`), so this
-///      step never needs its own retry machinery.
+///      alone, and a `WARN` says so. When the import kept a key because a
+///      newer row held it, the file is not rewritten to the projection
+///      alone, so the operator's line for that key survives. A failure here
+///      is logged and does not fail the import overall — a later ordinary
+///      memory write already re-projects `MEMORY.md` on its own
+///      (`refresh_projection`), so this step never needs its own retry
+///      machinery.
 ///
-/// The whole `MEMORY.md` file, not only the block outside the markers, is
-/// replaced by the projection once step 3 runs: the backup directory holds
-/// the pre-import original for recovery, nothing survives in place.
+/// Unless a key was kept as newer, the whole `MEMORY.md` file, not only the
+/// block outside the markers, is replaced by the projection once step 3 runs:
+/// the backup directory holds the pre-import original for recovery, nothing
+/// survives in place.
 fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -> Result<()> {
     use crate::migration::read_openclaw_markdown_entries;
+    use rusqlite::OptionalExtension;
 
     let raw_entries =
         read_openclaw_markdown_entries(backup_dir).context("read markdown entries")?;
@@ -5739,7 +5756,10 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
     // which itself takes a lock.
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .context("set busy timeout")?;
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+    // `FULL` flushes the WAL at every commit, so the import is durable when
+    // `commit` returns. This connection is private to the import; the
+    // daemon's own connection keeps its setting.
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
         .context("set sqlite pragmas")?;
     crate::memory::SqliteMemory::init_schema(&conn).context("initialise sqlite schema")?;
 
@@ -5751,6 +5771,7 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
         .to_rfc3339();
     let mut imported = 0_usize;
     let mut skipped_newer = 0_usize;
+    let mut moved_from_other_place = 0_usize;
     let tx = conn
         .transaction()
         .context("begin markdown import transaction")?;
@@ -5768,8 +5789,21 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
             category_str(&entry.category)
         };
         let id = uuid::Uuid::new_v4().to_string();
-        // The update applies only while the stored row is not newer than the
-        // backup (sqlite reports 0 rows changed when the guard refuses).
+        // A row already in another place (`session_id` set) is overwritten
+        // whatever its age: its `updated_at` says when a conversation wrote it,
+        // not that the operator's note is stale, and skipping it would leave
+        // the key nowhere the operator can read it.
+        let held_elsewhere = tx
+            .query_row(
+                "SELECT session_id IS NOT NULL FROM memories WHERE key = ?1",
+                rusqlite::params![entry.key],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .context("look up the place of a markdown memory entry")?
+            .unwrap_or(false);
+        // The update applies to a shared row only while it is not newer than
+        // the backup (sqlite reports 0 rows changed when the guard refuses).
         //
         // It also moves the row to the operator's place and drops its vector:
         // `session_id = NULL` and the three embedding columns cleared, so a
@@ -5790,7 +5824,7 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
                     embedding_model = NULL, \
                     embedding_dims = NULL, \
                     updated_at = excluded.updated_at \
-                 WHERE memories.updated_at <= ?5",
+                 WHERE memories.session_id IS NOT NULL OR memories.updated_at <= ?5",
                 rusqlite::params![id, entry.key, entry.content, category, backup_time],
             )
             // No key or content in the error context — only the counts
@@ -5800,28 +5834,42 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
             skipped_newer += 1;
         } else {
             imported += 1;
+            if held_elsewhere {
+                moved_from_other_place += 1;
+            }
         }
     }
     tx.commit().context("commit markdown import transaction")?;
 
-    // `synchronous = NORMAL` does not flush the WAL at commit. Checkpoint it
-    // into the main file, which flushes it, before `IMPORTED` says the rows
-    // are safe: a crash after the marker must not lose them. A busy result
-    // means a reader kept part of the WAL from being written back.
-    let checkpoint_busy: i64 = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
-        .context("checkpoint the WAL after the import")?;
-    anyhow::ensure!(
-        checkpoint_busy == 0,
-        "the WAL checkpoint after the import was blocked by another connection"
-    );
+    // The commit above is already durable (`synchronous = FULL`). Copying the
+    // WAL back into the main file is housekeeping: a reader that keeps part of
+    // the WAL in use makes the checkpoint report busy, and failing the import
+    // for that would make the next start import again and bring back every
+    // row deleted in between.
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(0) => {}
+        Ok(_) => tracing::info!(
+            backup = %backup_dir.display(),
+            "markdown import: the WAL checkpoint after the import was blocked by another \
+             connection; the imported rows are committed and the WAL is checkpointed later"
+        ),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            backup = %backup_dir.display(),
+            "markdown import: the WAL checkpoint after the import failed; the imported rows \
+             are committed"
+        ),
+    }
 
     // The rows are durable now. Mark this backup done before attempting
     // anything else: everything past this point is best-effort and must
     // never cause a later run to redo the import above.
     mark_markdown_backup_imported(backup_dir).context("write IMPORTED marker")?;
 
-    if let Err(e) = project_and_rewrite_live_memory_md(workspace_dir, backup_dir) {
+    if let Err(e) = project_and_rewrite_live_memory_md(workspace_dir, backup_dir, skipped_newer > 0)
+    {
         // No content here either — just the error chain.
         tracing::warn!(
             error = %format!("{e:#}"),
@@ -5834,6 +5882,7 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
     tracing::info!(
         imported,
         skipped_newer,
+        moved_from_other_place,
         backup = %backup_dir.display(),
         "imported markdown memory entries into sqlite"
     );
@@ -5853,7 +5902,11 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
 /// otherwise an edit made between the backup and this call (a slow first
 /// start, a crash and a manual fix, a later retry) would be silently
 /// discarded.
-fn project_and_rewrite_live_memory_md(workspace_dir: &Path, backup_dir: &Path) -> Result<()> {
+fn project_and_rewrite_live_memory_md(
+    workspace_dir: &Path,
+    backup_dir: &Path,
+    keep_operator_lines: bool,
+) -> Result<()> {
     use crate::memory::snapshot as snap;
 
     let live_path = workspace_dir.join("MEMORY.md");
@@ -5882,6 +5935,12 @@ fn project_and_rewrite_live_memory_md(workspace_dir: &Path, backup_dir: &Path) -
         // markers since. With no frozen copy to compare against, that prose
         // cannot be told from leftovers, so the file keeps everything
         // `project_core_memories` left in it.
+        return Ok(());
+    }
+    if keep_operator_lines {
+        // A key the import skipped as newer is still only in the operator's
+        // line here. The projection-only rewrite would drop that line for
+        // good, so the file keeps its lines beside the projection block.
         return Ok(());
     }
     rewrite_memory_md_to_projection_only(workspace_dir)
@@ -10125,8 +10184,10 @@ default_model = "legacy-model"
         );
     }
 
-    /// A private `MEMORY.md` stays private: the rewrite must not widen its
-    /// permissions to the umask default.
+    /// The rewrite keeps the mode of the file it replaces. 0o640 is neither
+    /// the 0o600 the temp file starts with under a strict umask nor the 0o644
+    /// it starts with under the usual one, so a rewrite that forgets to copy
+    /// the mode cannot pass by luck.
     #[cfg(unix)]
     #[test]
     async fn rewrite_memory_md_to_projection_only_keeps_the_file_mode() {
@@ -10137,13 +10198,13 @@ default_model = "legacy-model"
         let begin = crate::memory::snapshot::PROJECTION_BEGIN;
         let end = crate::memory::snapshot::PROJECTION_END;
         std::fs::write(&path, format!("{begin}\n- a: b\n{end}\nprivate notes\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
 
         super::rewrite_memory_md_to_projection_only(tmp.path()).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o600,
+            mode, 0o640,
             "the rewrite must keep the file mode, got {mode:o}"
         );
     }
@@ -10210,7 +10271,7 @@ default_model = "legacy-model"
         std::fs::write(done.join("BACKUP_COMPLETE"), "").unwrap();
         std::fs::write(done.join("IMPORTED"), "").unwrap();
 
-        super::retry_unimported_markdown_imports(&workspace);
+        super::retry_unimported_markdown_imports(&workspace, false);
 
         let db_path = workspace.join("memory").join("brain.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -10268,7 +10329,7 @@ default_model = "legacy-model"
         std::fs::write(older.join("MEMORY.md"), "- **k**: older value\n").unwrap();
         std::fs::write(older.join("BACKUP_COMPLETE"), "2026-01-01T00:00:00+00:00").unwrap();
 
-        super::retry_unimported_markdown_imports(&workspace);
+        super::retry_unimported_markdown_imports(&workspace, false);
 
         let db_path = workspace.join("memory").join("brain.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -10306,7 +10367,7 @@ default_model = "legacy-model"
 
         // The sweep must never import from the partial directory the failed
         // call left behind.
-        super::retry_unimported_markdown_imports(&workspace);
+        super::retry_unimported_markdown_imports(&workspace, false);
         let db_path = workspace.join("memory").join("brain.db");
         assert!(
             !db_path.exists(),
@@ -10336,7 +10397,7 @@ default_model = "legacy-model"
         )
         .unwrap();
 
-        super::retry_unimported_markdown_imports(&workspace);
+        super::retry_unimported_markdown_imports(&workspace, false);
 
         let db_path = workspace.join("memory").join("brain.db");
         assert!(
@@ -10474,7 +10535,7 @@ default_model = "legacy-model"
 
         // Simulate the next start: the sweep must see IMPORTED and skip
         // this backup entirely, not re-apply markdown-wins over the edit.
-        super::retry_unimported_markdown_imports(&workspace);
+        super::retry_unimported_markdown_imports(&workspace, false);
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let content: String = conn
@@ -11060,7 +11121,7 @@ default_model = "legacy-model"
         store_runtime_row(&workspace, "k", "fresh runtime text");
 
         let (logs, _guard) = capture_logs();
-        super::retry_unimported_markdown_imports(&workspace);
+        super::retry_unimported_markdown_imports(&workspace, false);
 
         assert_eq!(
             brain_db_content(&workspace, "k").as_deref(),
@@ -11095,7 +11156,11 @@ default_model = "legacy-model"
             .join("migrations")
             .join("markdown-20200101-000000-1");
         std::fs::create_dir_all(&backup_dir).unwrap();
-        std::fs::write(backup_dir.join("MEMORY.md"), "- **k**: old markdown\n").unwrap();
+        std::fs::write(
+            backup_dir.join("MEMORY.md"),
+            "- **k**: old markdown\n- **old_key**: markdown wins\n",
+        )
+        .unwrap();
         let marker = backup_dir.join("BACKUP_COMPLETE");
         std::fs::write(&marker, "").unwrap();
         std::fs::OpenOptions::new()
@@ -11105,13 +11170,28 @@ default_model = "legacy-model"
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800))
             .unwrap();
         store_runtime_row(&workspace, "k", "kept");
+        // Older than the marker's mtime: the import must replace it. With a
+        // fallback to the epoch every row would count as newer and stay.
+        open_brain_db(&workspace)
+            .execute(
+                "INSERT INTO memories (id, key, content, category, created_at, updated_at) \
+                 VALUES ('id-old', 'old_key', 'stale', 'core', \
+                         '2019-06-01T00:00:00+00:00', '2019-06-01T00:00:00+00:00')",
+                [],
+            )
+            .unwrap();
 
-        super::retry_unimported_markdown_imports(&workspace);
+        super::retry_unimported_markdown_imports(&workspace, false);
 
         assert_eq!(
             brain_db_content(&workspace, "k").as_deref(),
             Some("kept"),
             "a row newer than the marker's mtime must survive the import"
+        );
+        assert_eq!(
+            brain_db_content(&workspace, "old_key").as_deref(),
+            Some("markdown wins"),
+            "a row older than the marker's mtime must be replaced by the note"
         );
     }
 
@@ -11267,7 +11347,7 @@ default_model = "legacy-model"
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace = tmp.path().to_path_buf();
 
-        super::retry_unimported_markdown_imports(&workspace);
+        super::retry_unimported_markdown_imports(&workspace, false);
 
         assert!(
             !workspace.join("memory").exists(),
@@ -11430,5 +11510,232 @@ default_model = "legacy-model"
             Some("from markdown")
         );
         assert!(!pending_marker(workspace).exists());
+    }
+
+    fn markdown_backup_dirs(workspace: &Path) -> Vec<String> {
+        let Ok(read_dir) = std::fs::read_dir(workspace.join("memory").join("migrations")) else {
+            return Vec::new();
+        };
+        read_dir
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("markdown-"))
+            .collect()
+    }
+
+    /// The marker says a backup or an import is still owed. An import that
+    /// failed leaves it in place, and only the retry that succeeds removes it.
+    #[tokio::test]
+    async fn a_failed_import_keeps_the_pending_marker_until_a_retry_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::write(workspace.join("MEMORY.md"), "- **k**: from markdown\n").unwrap();
+        let backup_dir = crate::migration::backup_markdown_memory(&workspace)
+            .unwrap()
+            .unwrap();
+        crate::migration::record_pending_markdown_import(&workspace).unwrap();
+        // A directory where brain.db must be opened makes the import fail.
+        let db_path = workspace.join("memory").join("brain.db");
+        std::fs::create_dir(&db_path).unwrap();
+
+        super::retry_unimported_markdown_imports(&workspace, false);
+
+        assert!(
+            pending_marker(&workspace).exists(),
+            "the marker must stay while the import keeps failing"
+        );
+        assert!(!backup_dir.join("IMPORTED").exists());
+
+        std::fs::remove_dir(&db_path).unwrap();
+        super::retry_unimported_markdown_imports(&workspace, false);
+
+        assert!(backup_dir.join("IMPORTED").exists());
+        assert!(!pending_marker(&workspace).exists());
+        assert_eq!(
+            brain_db_content(&workspace, "k").as_deref(),
+            Some("from markdown")
+        );
+    }
+
+    /// The markdown files are gone by the time the owed backup retries: there
+    /// is nothing left to back up, so the marker has nothing left to say.
+    #[tokio::test]
+    async fn a_pending_marker_is_removed_when_no_markdown_files_are_left_to_back_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join("memory").join("migrations")).unwrap();
+        std::fs::write(pending_marker(&workspace), "2020-01-01T00:00:00+00:00").unwrap();
+
+        super::retry_unimported_markdown_imports(&workspace, false);
+
+        assert!(!pending_marker(&workspace).exists());
+        assert!(markdown_backup_dirs(&workspace).is_empty());
+    }
+
+    /// A load whose backup failed knows it: the sweep in the same load does not
+    /// run the same backup a second time.
+    #[tokio::test]
+    async fn the_sweep_makes_no_backup_of_its_own_after_the_load_backup_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::write(workspace.join("MEMORY.md"), "- **k**: from markdown\n").unwrap();
+        std::fs::create_dir_all(workspace.join("memory").join("migrations")).unwrap();
+        std::fs::write(pending_marker(&workspace), "2020-01-01T00:00:00+00:00").unwrap();
+
+        super::retry_unimported_markdown_imports(&workspace, true);
+
+        assert!(markdown_backup_dirs(&workspace).is_empty());
+        assert!(pending_marker(&workspace).exists());
+        assert!(!workspace.join("memory").join("brain.db").exists());
+    }
+
+    /// A load whose backup fails leaves no partial directory, and the sweep in
+    /// the same load does not try the backup again.
+    #[tokio::test]
+    async fn a_load_whose_backup_fails_makes_one_attempt_and_leaves_no_partial_directory() {
+        let _env_guard = env_override_lock().await;
+        let sandbox = load_sandbox("schema_version = 33\n\n[memory]\nbackend = \"markdown\"\n");
+        let workspace = &sandbox.workspace;
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+        std::fs::write(workspace.join("MEMORY.md"), "- **k**: from markdown\n").unwrap();
+        // A brain.db that is not a database makes the `VACUUM INTO` step fail
+        // after the markdown files were copied.
+        std::fs::write(workspace.join("memory").join("brain.db"), "not a database").unwrap();
+
+        let (logs, _guard) = capture_logs();
+        let config = Config::load_or_init().await.unwrap();
+
+        assert_eq!(config.memory.backend, "sqlite");
+        assert!(pending_marker(workspace).exists());
+        assert!(
+            markdown_backup_dirs(workspace).is_empty(),
+            "a failed backup must not leave its directory: {:?}",
+            markdown_backup_dirs(workspace)
+        );
+        let logged = logs.contents();
+        assert_eq!(
+            logged.matches("failed to back up markdown memory").count(),
+            1,
+            "the load makes exactly one backup attempt: {logged}"
+        );
+        assert!(
+            !logged.contains("backup failed again"),
+            "the sweep must not repeat the backup the load just failed: {logged}"
+        );
+    }
+
+    /// The import commits under `synchronous = FULL`, so the checkpoint after
+    /// it is a courtesy. A reader that keeps a snapshot open makes it report
+    /// busy, and the import that already committed must still be marked done:
+    /// otherwise the next start imports again and brings back every row the
+    /// operator deleted in between.
+    #[tokio::test]
+    async fn a_busy_wal_checkpoint_does_not_fail_an_import_that_committed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::write(
+            workspace.join("MEMORY.md"),
+            "- **k**: from markdown\n- **gone**: deleted later\n",
+        )
+        .unwrap();
+        let backup_dir = crate::migration::backup_markdown_memory(&workspace)
+            .unwrap()
+            .unwrap();
+
+        // A second connection in WAL mode with a read transaction left open.
+        let reader = open_brain_db(&workspace);
+        reader.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        store_runtime_row(&workspace, "existing", "row");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM memories;")
+            .unwrap();
+
+        super::import_markdown_backup_into_sqlite(&workspace, &backup_dir)
+            .expect("a busy checkpoint must not fail the import");
+        assert!(backup_dir.join("IMPORTED").exists());
+        reader.execute_batch("COMMIT;").unwrap();
+        drop(reader);
+
+        // The operator deletes a row; a second load must not bring it back.
+        open_brain_db(&workspace)
+            .execute("DELETE FROM memories WHERE key = 'gone'", [])
+            .unwrap();
+        super::retry_unimported_markdown_imports(&workspace, false);
+
+        assert_eq!(brain_db_content(&workspace, "gone"), None);
+        assert_eq!(
+            brain_db_content(&workspace, "k").as_deref(),
+            Some("from markdown")
+        );
+    }
+
+    /// The runtime keeps a key in the place that stored it, but the import is
+    /// the one exception: the operator's note wins over a conversation's row
+    /// under the same key, even a newer one, and the row moves to the shared
+    /// place. The INFO line counts those moves.
+    #[tokio::test]
+    async fn import_overwrites_and_moves_a_newer_row_held_by_another_conversation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = markdown_workspace(&tmp);
+        open_brain_db(&workspace)
+            .execute(
+                "INSERT INTO memories (id, key, content, category, created_at, updated_at, \
+                     session_id) \
+                 VALUES ('id-conv', 'user_lang', 'text of another conversation', \
+                     'conversation', '2999-01-01T00:00:00+00:00', '2999-01-01T00:00:00+00:00', \
+                     'conv-a')",
+                [],
+            )
+            .unwrap();
+
+        let (logs, _guard) = capture_logs();
+        super::import_markdown_memory_into_sqlite(&workspace).unwrap();
+
+        let conn = rusqlite::Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let (content, session): (String, Option<String>) = conn
+            .query_row(
+                "SELECT content, session_id FROM memories WHERE key = 'user_lang'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(content, "prefers Rust");
+        assert_eq!(session, None, "the row moves to the shared place");
+        let memory_md = std::fs::read_to_string(workspace.join("MEMORY.md")).unwrap();
+        assert!(
+            memory_md.contains("- user_lang: prefers Rust"),
+            "the operator's line stays in MEMORY.md: {memory_md}"
+        );
+        let logged = logs.contents();
+        assert!(
+            logged.contains("moved_from_other_place=1") && logged.contains("skipped_newer=0"),
+            "the INFO line counts the move and no skip: {logged}"
+        );
+    }
+
+    /// A key kept because a newer shared row holds it is still only in the
+    /// operator's `MEMORY.md`. Rewriting that file to the projection block
+    /// would drop the line for good, so the rewrite is skipped.
+    #[tokio::test]
+    async fn import_keeps_memory_md_lines_when_a_key_was_skipped_as_newer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = markdown_workspace(&tmp);
+        let backup_dir = crate::migration::backup_markdown_memory(&workspace)
+            .unwrap()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        store_runtime_row(&workspace, "user_lang", "fresh runtime text");
+
+        super::import_markdown_backup_into_sqlite(&workspace, &backup_dir).unwrap();
+
+        assert_eq!(
+            brain_db_content(&workspace, "user_lang").as_deref(),
+            Some("fresh runtime text")
+        );
+        let memory_md = std::fs::read_to_string(workspace.join("MEMORY.md")).unwrap();
+        assert!(
+            memory_md.contains("- **user_lang**: prefers Rust"),
+            "the operator's line must stay in MEMORY.md: {memory_md}"
+        );
     }
 }
