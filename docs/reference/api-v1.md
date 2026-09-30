@@ -66,7 +66,7 @@ Non-2xx responses share one shape:
 ```
 
 `error` is one of `unauthorized` (401), `bad_request` (400), `not_found`
-(404), `internal_error` (500). `detail` is present when the handler has more
+(404), `conflict` (409), `internal_error` (500). `detail` is present when the handler has more
 to say (it is always present for `internal_error`, which carries the
 sanitized error text).
 
@@ -779,6 +779,42 @@ should check the encoded size and say so plainly rather than surfacing a bare
   The handler fetches the entry list from the backend and windows it in the
   response — `limit` bounds the response size, not the underlying query.
 - **Status codes**: `200`, `401`.
+
+### POST /api/v1/memory
+
+- **Auth**: bearer-gated.
+- **Request**:
+  ```json
+  {
+    "content": "The operator works from Jakarta",
+    "key": "office",
+    "category": "core",
+    "session_id": "may be omitted"
+  }
+  ```
+  - `content` — required. Must not be blank. It goes through the same screen as
+    every other memory write, which redacts a credential and refuses text that
+    forges the prompt's memory block.
+  - `key` — optional. A `memory_<uuid>` key is generated when it is absent or blank.
+  - `category` — optional, default `core`. `core`, `daily` and `conversation` are
+    the built-in categories; any other name is stored as a custom category.
+  - `session_id` — optional conversation scope. Absent or blank means the shared
+    place. Only shared `core` notes reach the owner's `MEMORY.md` and system
+    prompt; a `core` note stored with a `session_id` stays in the database.
+- **Response** `201`: `{ "key": "office", "stored": true, "notes": [] }`. `notes`
+  lists what the screen changed in `content`, and is empty when nothing changed.
+- **Response** `409` — the key already belongs to another memory place. A key keeps
+  the place it was first stored in, so a request with a different `session_id`
+  (including none, against a scoped row) fails and changes nothing:
+  ```json
+  {
+    "error": "conflict",
+    "detail": "key 'office' is already in use in another memory place"
+  }
+  ```
+  Choose another key. Writing the same key from the same place replaces the note.
+- **Status codes**: `201`, `400` (`invalid_content` for blank content,
+  `rejected_content` for content the screen refuses), `401`, `409`, `500`.
 
 ### GET /api/v1/memory/{key}
 
