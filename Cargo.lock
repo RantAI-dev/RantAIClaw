@@ -2564,19 +2564,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
-name = "globset"
-version = "0.4.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
-dependencies = [
- "aho-corasick",
- "bstr",
- "log",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "gloo-timers"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5515,7 +5502,7 @@ version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219cb19e96be00ab2e37d6e299658a0cfa83e52429179969b0f0121b4ac46983"
 dependencies = [
- "toml_edit 0.23.10+spec-1.0.0",
+ "toml_edit",
 ]
 
 [[package]]
@@ -5892,7 +5879,6 @@ dependencies = [
  "futures",
  "futures-util",
  "glob",
- "globset",
  "hex",
  "hmac 0.12.1",
  "hostname",
@@ -5934,7 +5920,6 @@ dependencies = [
  "rustls-pki-types",
  "schemars",
  "serde",
- "serde-big-array",
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
@@ -5948,7 +5933,6 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml",
- "toml_edit 0.25.15+spec-1.1.0",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -7869,16 +7853,6 @@ dependencies = [
  "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "winnow 0.7.14",
-]
-
-[[package]]
-name = "toml_edit"
-version = "0.25.15+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1340ea94a5856333492c9064b02c778b191dd2c853778d9609debdcdfea3a614"
-dependencies = [
- "indexmap",
- "toml_datetime 1.1.1+spec-1.1.0",
 ]
 
 [[package]]
