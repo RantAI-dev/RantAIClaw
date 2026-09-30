@@ -1436,13 +1436,9 @@ mod tests {
 
     #[test]
     fn unit_dir_honors_xdg_config_home() {
-        let prev = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", "/custom/cfg");
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", "/custom/cfg");
         let dir = systemd_user_unit_dir().unwrap();
-        match prev {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
         assert_eq!(dir, std::path::PathBuf::from("/custom/cfg/systemd/user"));
     }
 
@@ -1479,9 +1475,35 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn linux_service_file_has_expected_suffix() {
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", tmp.path());
         let file = linux_service_file(&Config::default()).unwrap();
-        let path = file.to_string_lossy();
-        assert!(path.ends_with(".config/systemd/user/rantaiclaw.service"));
+        assert_eq!(
+            file,
+            tmp.path()
+                .join("systemd")
+                .join("user")
+                .join("rantaiclaw.service")
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn linux_service_file_defaults_to_dot_config_under_home() {
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _xdg = crate::test_env::EnvGuard::unset("XDG_CONFIG_HOME");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let file = linux_service_file(&Config::default()).unwrap();
+        assert_eq!(
+            file,
+            tmp.path()
+                .join(".config")
+                .join("systemd")
+                .join("user")
+                .join("rantaiclaw.service")
+        );
     }
 
     #[test]

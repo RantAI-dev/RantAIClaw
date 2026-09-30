@@ -1321,12 +1321,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
+        // One clock reading taken before `add_job`. `add_job` schedules the
+        // next run strictly after its own, later reading, so `created_at` is
+        // never past the stored `next_run` however the minute boundary falls.
+        let created_at = Utc::now();
         let job = add_job(&config, "* * * * *", "echo due").unwrap();
+        assert!(job.next_run > created_at);
 
-        let due_now = due_jobs(&config, Utc::now()).unwrap();
+        let due_now = due_jobs(&config, created_at).unwrap();
         assert!(due_now.is_empty(), "new job should not be due immediately");
 
-        let far_future = Utc::now() + ChronoDuration::days(365);
+        let far_future = created_at + ChronoDuration::days(365);
         let due_future = due_jobs(&config, far_future).unwrap();
         assert_eq!(due_future.len(), 1, "job should be due in far future");
 
@@ -1341,6 +1346,28 @@ mod tests {
         .unwrap();
         let due_after_disable = due_jobs(&config, far_future).unwrap();
         assert!(due_after_disable.is_empty());
+    }
+
+    /// A clock reading that lands exactly on, or past, the stored `next_run`
+    /// (a minute boundary crossed between creating the job and asking what is
+    /// due) selects the job. The clock is injected, so both sides of the
+    /// boundary are plain cases rather than a race.
+    #[test]
+    fn due_jobs_selects_a_job_from_its_next_run_onward() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "* * * * *", "echo due").unwrap();
+        let one_second = ChronoDuration::seconds(1);
+
+        let just_before = due_jobs(&config, job.next_run - one_second).unwrap();
+        assert!(just_before.is_empty(), "not due before next_run");
+
+        let at_next_run = due_jobs(&config, job.next_run).unwrap();
+        assert_eq!(at_next_run.len(), 1, "due exactly at next_run");
+
+        let just_after = due_jobs(&config, job.next_run + one_second).unwrap();
+        assert_eq!(just_after.len(), 1, "still due after next_run");
     }
 
     #[test]

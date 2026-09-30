@@ -4029,6 +4029,65 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
+    /// Tool name only the audit-trail tests below use. Tests that run tools
+    /// without `ENV_LOCK` append to whichever audit directory the process-global
+    /// override points at, so the test must pick its own records out by name.
+    const AUDIT_PROBE_TOOL: &str = "audit_probe_gate_only";
+
+    /// Counterpart of `RanFlagTool` under a name no other test registers.
+    struct AuditProbeTool {
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for AuditProbeTool {
+        fn name(&self) -> &str {
+            AUDIT_PROBE_TOOL
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "did the thing".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Wait for `want` audit records whose command is `command`, ignoring lines
+    /// other tests append to the same file. Returns the raw log text and the
+    /// matching records. Bounded like `audit_log_after_writes`.
+    async fn audit_records_for_command(
+        path: &std::path::Path,
+        command: &str,
+        want: usize,
+    ) -> (String, Vec<serde_json::Value>) {
+        let mut text = String::new();
+        let mut records = Vec::new();
+        for _ in 0..100 {
+            text = std::fs::read_to_string(path).unwrap_or_default();
+            records = text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|r| r["action"]["command"] == command)
+                .collect();
+            if records.len() >= want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        (text, records)
+    }
+
     /// Both outcomes reach the trail, not just the happy one. An audit that
     /// records only what ran would miss exactly the events an operator opens it
     /// for — and a denial was the state this surface was in before plan 305.
@@ -4049,14 +4108,14 @@ mod tests {
 
         let mgr = supervised_manager();
         let call = ParsedToolCall {
-            name: "do_thing".into(),
+            name: AUDIT_PROBE_TOOL.into(),
             arguments: serde_json::json!({}),
             tool_call_id: None,
         };
 
         // 1. Denied: no backend on a non-CLI surface ⇒ auto-deny.
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(AuditProbeTool {
             ran: Arc::clone(&ran),
         })];
         let denied = execute_tool_calls_collecting(
@@ -4079,7 +4138,7 @@ mod tests {
 
         // 2. Executed: the same call with an always-yes backend.
         let ran2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tools2: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+        let tools2: Vec<Box<dyn Tool>> = vec![Box::new(AuditProbeTool {
             ran: Arc::clone(&ran2),
         })];
         let backend = AlwaysYesBackend;
@@ -4101,12 +4160,7 @@ mod tests {
         .expect("batch completes");
         assert!(executed[0].success, "the granted call must run");
 
-        let text = audit_log_after_writes(&log_path, 2).await;
-        let records: Vec<serde_json::Value> = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad record ({e}): {l}")))
-            .collect();
+        let (text, records) = audit_records_for_command(&log_path, AUDIT_PROBE_TOOL, 2).await;
         assert_eq!(records.len(), 2, "one record per call: {text}");
 
         // Order is not asserted: the appends run on blocking workers, so the
@@ -4117,20 +4171,21 @@ mod tests {
             .find(|r| r["action"]["approval"] == "denied")
             .unwrap_or_else(|| panic!("no denial record: {text}"));
         assert_eq!(denial["actor"]["channel"], "telegram");
-        assert_eq!(denial["action"]["command"], "do_thing");
+        assert_eq!(denial["action"]["command"], AUDIT_PROBE_TOOL);
         assert_eq!(denial["result"]["success"], false);
 
         let run = records
             .iter()
             .find(|r| r["action"]["approval"] == "granted")
             .unwrap_or_else(|| panic!("no granted record: {text}"));
-        assert_eq!(run["action"]["command"], "do_thing");
+        assert_eq!(run["action"]["command"], AUDIT_PROBE_TOOL);
         assert_eq!(run["result"]["success"], true);
 
         // The arguments must never be in the trail — for `shell` they are
         // whatever the model composed, and for file tools they are paths.
+        let own_records = serde_json::to_string(&records).unwrap();
         assert!(
-            !text.contains("arguments"),
+            !own_records.contains("arguments"),
             "tool arguments must not be audited: {text}"
         );
     }
@@ -4162,16 +4217,16 @@ mod tests {
             ..crate::config::AutonomyConfig::default()
         });
         assert!(
-            !mgr.needs_approval("do_thing"),
+            !mgr.needs_approval(AUDIT_PROBE_TOOL),
             "this test needs a manager that never prompts"
         );
 
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(AuditProbeTool {
             ran: Arc::clone(&ran),
         })];
         let call = ParsedToolCall {
-            name: "do_thing".into(),
+            name: AUDIT_PROBE_TOOL.into(),
             arguments: serde_json::json!({}),
             tool_call_id: None,
         };
@@ -4193,9 +4248,9 @@ mod tests {
         .expect("batch completes");
         assert!(results[0].success, "the unprompted call must run");
 
-        let text = audit_log_after_writes(&log_path, 1).await;
-        let record: serde_json::Value = serde_json::from_str(text.trim())
-            .unwrap_or_else(|e| panic!("bad record ({e}): {text}"));
+        let (text, records) = audit_records_for_command(&log_path, AUDIT_PROBE_TOOL, 1).await;
+        assert_eq!(records.len(), 1, "one record for the call: {text}");
+        let record = &records[0];
         assert_eq!(
             record["action"]["approval"], "not_required",
             "nobody was asked, so the trail must not read as an approval: {text}"
