@@ -116,9 +116,6 @@ argon2 = { version = "0.5", features = ["std"] }
 # CSPRNG for secure token generation
 rand = "0.10"
 
-# serde-big-array for wa-rs storage (large array serialization)
-serde-big-array = { version = "0.5", optional = true }
-
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
@@ -130,11 +127,6 @@ fs2 = "0.4"
 
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
-
-# Approval gate — glob matching for command allowlist + forbidden_paths
-globset = "0.4"
-# Approval gate — round-trip TOML for command_allowlist.toml preserving comments
-toml_edit = { version = "0.25", default-features = false }
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, optional = true }
@@ -290,7 +282,7 @@ probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
+whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-tokio-transport", "dep:prost"]
 # kb = Knowledge Base subsystem (sqlite-vec + PDF extraction)
 kb = ["dep:sqlite-vec", "dep:lopdf", "rag-pdf"]
 # kb-office = Office-document ingestion for the KB (docx/xlsx/pptx)

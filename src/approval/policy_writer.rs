@@ -539,9 +539,15 @@ const AUTONOMY_HEADER: &str = "\
 ";
 
 const ALLOWLIST_HEADER: &str = "\
-# Command allowlist — globs of `<tool> <args>` shape that the approval
-# gate auto-approves. Accreted entries from `[a]lways` prompts append
-# here over time. Comments are preserved on round-trip via toml_edit.
+# Command allowlist — globs of `<tool> <args>` shape listed in the
+# model's prompt as pre-approved. The shell gate does not read this
+# file; it enforces `[autonomy].allowed_commands` in config.toml.
+# An always-allow answer is never written here. A persisted one (the
+# TUI's [A], or a channel reply with persist) goes to
+# runtime_allowlist.toml, which survives restarts and stays untouched
+# when a preset is applied. Applying a preset with `rantaiclaw
+# autonomy`, `/autonomy`, or `setup approvals --force` regenerates this
+# file and drops any comments or entries you added.
 ";
 
 const FORBIDDEN_HEADER: &str = "\
@@ -990,6 +996,37 @@ mod tests {
             verify_written_policy(tmp.path(), true, true, true)
                 .unwrap_or_else(|e| panic!("preset {} round-trip self-check failed: {e}", p.id()));
         }
+    }
+
+    #[test]
+    fn new_command_allowlist_starts_with_header_that_states_rewrite_behavior() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("command_allowlist.toml");
+        write_patterns(
+            &path,
+            "command_allowlist",
+            &["git status".to_string()],
+            ALLOWLIST_HEADER,
+            false,
+        )
+        .expect("write allowlist");
+
+        let written = std::fs::read_to_string(&path).expect("read allowlist");
+        let expected_header = "\
+# Command allowlist — globs of `<tool> <args>` shape listed in the
+# model's prompt as pre-approved. The shell gate does not read this
+# file; it enforces `[autonomy].allowed_commands` in config.toml.
+# An always-allow answer is never written here. A persisted one (the
+# TUI's [A], or a channel reply with persist) goes to
+# runtime_allowlist.toml, which survives restarts and stays untouched
+# when a preset is applied. Applying a preset with `rantaiclaw
+# autonomy`, `/autonomy`, or `setup approvals --force` regenerates this
+# file and drops any comments or entries you added.
+";
+        assert!(
+            written.starts_with(expected_header),
+            "unexpected header in:\n{written}"
+        );
     }
 
     #[test]
