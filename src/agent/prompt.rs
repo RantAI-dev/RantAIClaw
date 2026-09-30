@@ -361,6 +361,12 @@ impl PromptSection for ToolsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        // A guest's tools are the gate's as reloaded per turn, so a guest
+        // prompt built at start-up carries no list. See
+        // [`render_guest_turn_sections`].
+        if ctx.skip_owner_files {
+            return Ok(String::new());
+        }
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
             let schema = tool.parameters_schema();
@@ -407,6 +413,27 @@ pub fn render_safety_section(
     tools: &[Box<dyn Tool>],
     allowed_commands: &[String],
 ) -> String {
+    render_safety(surface, autonomy_preset, tools, allowed_commands, false)
+}
+
+/// [`render_safety_section`] for a guest turn. `tools` is the guest's own
+/// list, so the section promises the guest only what those tools give.
+#[must_use]
+pub fn render_guest_safety_section(
+    surface: PromptSurface,
+    autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
+    tools: &[Box<dyn Tool>],
+) -> String {
+    render_safety(surface, autonomy_preset, tools, &[], true)
+}
+
+fn render_safety(
+    surface: PromptSurface,
+    autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
+    tools: &[Box<dyn Tool>],
+    allowed_commands: &[String],
+    skip_owner_files: bool,
+) -> String {
     let ctx = PromptContext {
         workspace_dir: Path::new("."),
         model_name: "",
@@ -419,9 +446,56 @@ pub fn render_safety_section(
         dispatcher_instructions: "",
         autonomy_preset,
         allowed_commands,
-        skip_owner_files: false,
+        skip_owner_files,
     };
     SafetySection.build(&ctx).unwrap_or_default()
+}
+
+/// The Strict-policy line that says what a guest can still do: the read tools
+/// it has, and none it lacks. The operator sets a guest's tools, so the owner's
+/// fixed list would promise reads the guest cannot make.
+fn guest_strict_reads_line(tools: &[Box<dyn Tool>]) -> String {
+    const READS: [(&str, &str); 3] = [
+        ("file_read", "read files"),
+        ("memory_recall", "recall memory"),
+        ("web_search_tool", "search the web"),
+    ];
+    let can_still: Vec<String> = READS
+        .iter()
+        .filter(|(name, _)| tools.iter().any(|t| t.name() == *name))
+        .map(|(name, what)| format!("{what} (`{name}`)"))
+        .collect();
+    if can_still.is_empty() {
+        // A tool outside the list above may still be a read that runs, so the
+        // denial is written only when the guest has no tool at all.
+        return if tools.is_empty() {
+            String::from(
+                "- None of your tools run under this policy. Answer from the conversation.\n",
+            )
+        } else {
+            String::new()
+        };
+    }
+    format!("- You can still {}, and reason.\n", can_still.join(", "))
+}
+
+/// The `## Tools` and `## Your Task` sections of a guest turn, built from the
+/// tools the reloaded gate permits (`guest_tools`). A guest prompt built at
+/// start-up omits both, so an edit to `guest_allowed_tools` reaches the next
+/// message. A guest with no tool gets no list and the task framing that says so.
+#[must_use]
+pub fn render_guest_turn_sections(guest_tools: &[Box<dyn Tool>], native_tools: bool) -> String {
+    let mut out = String::new();
+    if !guest_tools.is_empty() {
+        out.push_str("## Tools\n\n");
+        for tool in guest_tools {
+            let _ = writeln!(out, "- **{}**: {}", tool.name(), tool.description());
+        }
+        out.push('\n');
+    }
+    out.push_str(task_framing(native_tools, !guest_tools.is_empty()));
+    out.push('\n');
+    out
 }
 
 /// Heading of the persona section, as emitted by [`render_persona_section`].
@@ -522,11 +596,17 @@ impl PromptSection for SafetySection {
                 } else {
                     out.push_str("- The shell tool is not available in this session.\n");
                 }
+                if ctx.skip_owner_files {
+                    out.push_str(&guest_strict_reads_line(ctx.tools));
+                } else {
+                    out.push_str(
+                        "- You can still read files (`file_read`), search the \
+                         workspace, recall memory (`memory_recall`), search the \
+                         web, inspect tasks, and reason.\n",
+                    );
+                }
                 out.push_str(
-                    "- You can still read files (`file_read`), search the \
-                     workspace, recall memory (`memory_recall`), search the \
-                     web, inspect tasks, and reason.\n\
-                     - For any task that would normally require running a \
+                    "- For any task that would normally require running a \
                      command or writing a file, describe what you would do — \
                      the exact commands or the exact file content — and let the \
                      user apply it. Say plainly that the policy blocked you; \
@@ -613,6 +693,14 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        // A skill's location is a host path, so a guest prompt lists skills
+        // without it.
+        if ctx.skip_owner_files {
+            return Ok(crate::skills::skills_to_prompt_for_guest(
+                ctx.skills,
+                ctx.skills_prompt_mode,
+            ));
+        }
         Ok(crate::skills::skills_to_prompt_with_mode(
             ctx.skills,
             ctx.workspace_dir,
@@ -787,21 +875,33 @@ impl PromptSection for TaskSection {
             PromptSurface::Channel { native_tools } => native_tools,
             PromptSurface::Agent => return Ok(String::new()),
         };
-        if native_tools {
-            Ok(String::from(
-                "## Your Task\n\n\
-                 When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
-                 For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
-                 Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.",
-            ))
-        } else {
-            Ok(String::from(
-                "## Your Task\n\n\
-                 When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
-                 Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-                 Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.",
-            ))
+        // Same reason as `ToolsSection`: a guest's framing depends on the tools
+        // the reloaded gate permits.
+        if ctx.skip_owner_files {
+            return Ok(String::new());
         }
+        Ok(String::from(task_framing(native_tools, true)))
+    }
+}
+
+/// The "Your Task" text. `has_tools` is false only for a guest whose gate
+/// permits no tool: telling it to use tools, or to emit `<tool_call>` tags,
+/// only produces calls that fail.
+fn task_framing(native_tools: bool, has_tools: bool) -> &'static str {
+    if !has_tools {
+        "## Your Task\n\n\
+         When the user sends a message, respond naturally and answer it directly from the conversation. You have no tools in this session.\n\
+         Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary."
+    } else if native_tools {
+        "## Your Task\n\n\
+         When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
+         For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
+         Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary."
+    } else {
+        "## Your Task\n\n\
+         When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+         Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+         Instead: emit actual <tool_call> tags when you need to act. Just do what they ask."
     }
 }
 

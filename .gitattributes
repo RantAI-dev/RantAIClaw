@@ -9,6 +9,9 @@ Dockerfile* text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 
+# Golden prompt files are compared byte for byte, so they keep LF on every OS
+src/channels/owner_prompt_golden/*.txt text eol=lf
+
 # CI
 .github/**/* text eol=lf
 

@@ -479,7 +479,9 @@ pub(crate) struct ChannelRuntimeContext {
     /// Built at start-up next to [`system_prompt`]: same builder, with
     /// `USER.md` and `MEMORY.md` omitted. Used for a guest's first turn, so
     /// the owner's profile and notes never reach a non-owner sender's
-    /// context. Owners keep using [`system_prompt`].
+    /// context. Owners keep using [`system_prompt`]. It carries no tool list,
+    /// task framing or tool-use protocol: each guest turn adds them for the
+    /// tools the reloaded gate permits.
     pub(crate) guest_system_prompt: Arc<String>,
     pub(crate) model: Arc<String>,
     pub(crate) temperature: f64,
@@ -1241,29 +1243,19 @@ pub(crate) struct ChannelRuntime {
     pub(crate) max_backoff_secs: u64,
 }
 
-/// Append the tool-use protocol to both the owner and guest system prompts
-/// when the provider lacks native tool calling. Extracted out of
-/// [`build_channel_runtime`] so the guest side of this can be tested without
-/// building a real provider, workspace or channel runtime: a guest allowed
-/// tools on a non-native provider needs the same "## Tool Use Protocol"
-/// section the owner prompt gets, or the model never learns the
-/// `<tool_call>` syntax on that guest's first turn.
+/// Append the tool-use protocol to the owner system prompt when the provider
+/// lacks native tool calling.
 ///
-/// The owner's block lists `tools_registry`; the guest's lists only
-/// `guest_tools`, the entries the guest gate permits. A guest with none gets
-/// no block, since there is nothing it may call.
+/// The guest's block is not part of the guest prompt built at start-up. It
+/// lists the tools the reloaded gate permits, so each guest turn adds it
+/// (`dispatch`, `build_guest_tool_instructions`).
 fn append_tool_instructions_when_not_native(
     system_prompt: &mut String,
-    guest_system_prompt: &mut String,
     native_tools: bool,
     tools_registry: &[Box<dyn Tool>],
-    guest_tools: &[Box<dyn Tool>],
 ) {
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry));
-        if !guest_tools.is_empty() {
-            guest_system_prompt.push_str(&build_tool_instructions(guest_tools));
-        }
     }
 }
 
@@ -1510,15 +1502,7 @@ pub(crate) async fn build_channel_runtime(
         None
     };
     let native_tools = provider.supports_native_tools();
-    // The gate is built here, ahead of the prompts, because the guest prompt
-    // describes only the tools the gate lets a guest call.
     let guest_gate = Arc::new(guest_gate_from_config(&config));
-    let guest_tools = tools::guest_registry::permitted_tools(&tools_registry, &guest_gate);
-    let guest_tool_descs: Vec<(&str, &str)> = tool_descs
-        .iter()
-        .copied()
-        .filter(|(name, _)| guest_gate.tool_permitted(name))
-        .collect();
     let mut system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
@@ -1530,14 +1514,15 @@ pub(crate) async fn build_channel_runtime(
         config.skills.prompt_injection_mode,
         false,
     );
-    // Same builder, with `skip_owner_files = true`, for the guest prompt.
+    // Same builder, with `skip_owner_files = true`, for the guest prompt. It
+    // takes no tools: a guest's list follows the reloaded gate, per turn.
     // Built once at start-up so a guest's first turn does not pay the
     // workspace-file read again; the runtime keeps both side by side in
     // [`ChannelRuntimeContext`].
-    let mut guest_system_prompt = build_system_prompt_with_mode(
+    let guest_system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
-        &guest_tool_descs,
+        &[],
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
@@ -1547,10 +1532,8 @@ pub(crate) async fn build_channel_runtime(
     );
     append_tool_instructions_when_not_native(
         &mut system_prompt,
-        &mut guest_system_prompt,
         native_tools,
         tools_registry.as_ref(),
-        &guest_tools,
     );
 
     if !skills.is_empty() {

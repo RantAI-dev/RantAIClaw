@@ -648,6 +648,40 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    /// `TOOLS.md` is the owner's file (SSH hosts, device nicknames), so a
+    /// guest view refuses it the way it refuses `USER.md`.
+    #[tokio::test]
+    async fn file_read_denies_tools_md_under_guest_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_guest_tools_md");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("TOOLS.md"), "SSH host: box-a.example")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"path": "TOOLS.md"})).await.unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("private to the owner"),
+            "{:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     #[tokio::test]
     async fn file_read_allows_ordinary_file_under_guest_view() {
         use crate::memory::{MemoryView, MEMORY_VIEW};
