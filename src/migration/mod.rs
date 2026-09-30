@@ -1,17 +1,21 @@
 //! Markdown memory import glue for the v34 config migration.
 //!
-//! Two functions remain here because they are load-bearing for
-//! `src/config/schema.rs::import_markdown_memory_into_sqlite`, which fires the
-//! one-time markdown → sqlite import when a config that still names the
-//! retired `markdown` backend is loaded under the current schema. The
-//! legacy external-import path (`pub mod openclaw`) was removed together
-//! with the `rantaiclaw migrate` command — do not reintroduce that command
-//! without also reintroducing this module's former siblings. The markdown
-//! backend retirement is what made this glue necessary.
+//! These functions back the one-time markdown → sqlite import that
+//! `src/config/schema.rs` runs when a config that still names the retired
+//! `markdown` backend is loaded under the current schema. `Config::load_or_init`
+//! calls [`backup_markdown_memory`] directly and leaves the import to
+//! `retry_unimported_markdown_imports`; `import_markdown_memory_into_sqlite`,
+//! which does both in one call, exists for tests only. The legacy
+//! external-import path (`pub mod openclaw`) was removed together with the
+//! `rantaiclaw migrate` command. Do not reintroduce that command without also
+//! reintroducing this module's former siblings. The markdown backend
+//! retirement is what made this glue necessary.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use crate::memory::MemoryCategory;
 
@@ -24,28 +28,21 @@ pub(crate) struct SourceEntry {
     pub(crate) category: MemoryCategory,
 }
 
+/// Read every entry from a workspace's markdown files.
+///
+/// When a key appears in several files the import keeps the last one read, so
+/// the order decides which value wins: the daily files come first, in name
+/// order, and `MEMORY.md`, the curated file, comes last.
 pub(crate) fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceEntry>> {
     let mut all = Vec::new();
 
-    let core_path = source_workspace.join("MEMORY.md");
-    if core_path.exists() {
-        let content = fs::read_to_string(&core_path)?;
-        all.extend(parse_markdown_file(
-            &core_path,
-            &content,
-            MemoryCategory::Core,
-            "openclaw_core",
-        ));
-    }
-
     let daily_dir = source_workspace.join("memory");
     if daily_dir.exists() {
+        let mut listed = Vec::new();
         for file in fs::read_dir(&daily_dir)? {
-            let file = file?;
-            let path = file.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-                continue;
-            }
+            listed.push(file?.path());
+        }
+        for path in sorted_daily_markdown_files(listed) {
             let content = fs::read_to_string(&path)?;
             let stem = path
                 .file_stem()
@@ -60,7 +57,40 @@ pub(crate) fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<
         }
     }
 
+    let core_path = source_workspace.join("MEMORY.md");
+    if core_path.exists() {
+        let content = fs::read_to_string(&core_path)?;
+        all.extend(parse_markdown_file(
+            &core_path,
+            &content,
+            MemoryCategory::Core,
+            "openclaw_core",
+        ));
+    }
+
     Ok(all)
+}
+
+/// The `*.md` files among `paths`, in name order. `read_dir` order is not
+/// guaranteed, so the caller's order never decides which daily file wins.
+fn sorted_daily_markdown_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// The entries one markdown file holds, without the projection block.
+pub(crate) fn read_markdown_file_entries(path: &Path) -> Result<Vec<SourceEntry>> {
+    let content = fs::read_to_string(path)?;
+    Ok(parse_markdown_file(
+        path,
+        &content,
+        MemoryCategory::Core,
+        "live",
+    ))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -145,6 +175,131 @@ fn normalize_key(key: &str, fallback_idx: usize) -> String {
     trimmed.to_string()
 }
 
+/// Name of the marker that records a markdown backup is still owed.
+const PENDING_MARKER: &str = "PENDING";
+
+/// Where the marker of an owed markdown backup lives.
+///
+/// The marker sits inside `memory/migrations/` so that an install that never
+/// used markdown, which has no such directory, pays one failed directory read
+/// per load and nothing more.
+pub(crate) fn pending_markdown_import_marker(workspace_dir: &Path) -> PathBuf {
+    workspace_dir
+        .join("memory")
+        .join("migrations")
+        .join(PENDING_MARKER)
+}
+
+/// Record that a markdown backup was attempted and failed, so a later load
+/// retries the backup and the import even when the config on disk no longer
+/// names `markdown` (a save in the failed session writes the migrated config).
+///
+/// The marker holds the time of the first failure. A marker that already
+/// exists is left alone: rows the runtime stored after the first failure must
+/// stay newer than every backup made for this import, however many attempts
+/// it takes.
+pub(crate) fn record_pending_markdown_import(workspace_dir: &Path) -> Result<()> {
+    let marker = pending_markdown_import_marker(workspace_dir);
+    let dir = marker
+        .parent()
+        .context("pending marker path has no parent directory")?;
+    fs::create_dir_all(dir)?;
+    let created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker);
+    match created {
+        Ok(mut file) => {
+            file.write_all(Utc::now().to_rfc3339().as_bytes())?;
+            file.sync_all()?;
+            sync_dir(dir)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The instant a marker file records: the RFC 3339 time it holds, or, for a
+/// marker written empty by an earlier build, its modification time.
+pub(crate) fn marker_time(marker: &Path) -> Result<DateTime<Utc>> {
+    let text =
+        fs::read_to_string(marker).with_context(|| format!("read marker {}", marker.display()))?;
+    if let Ok(time) = DateTime::parse_from_rfc3339(text.trim()) {
+        return Ok(time.with_timezone(&Utc));
+    }
+    let modified = fs::metadata(marker)
+        .and_then(|meta| meta.modified())
+        .with_context(|| format!("read the modification time of {}", marker.display()))?;
+    Ok(modified.into())
+}
+
+/// Write `contents` to `path` and flush the file and its directory entry to
+/// disk before returning, so a marker never outlives the data it vouches for.
+pub(crate) fn write_marker_durably(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    if let Some(dir) = path.parent() {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Replace `path` with `contents` through a temp file in the same directory
+/// and a rename, so a crash leaves either the old file or the new one.
+///
+/// A symlink at `path` is resolved first, so the link stays a link and its
+/// target is replaced. The replacement keeps the mode of the file it
+/// replaces.
+pub(crate) fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let resolved;
+    let path = if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        resolved = fs::canonicalize(path)
+            .with_context(|| format!("resolve symlink {}", path.display()))?;
+        resolved.as_path()
+    } else {
+        path
+    };
+    let dir = path
+        .parent()
+        .context("path to replace has no parent directory")?;
+    let name = path
+        .file_name()
+        .context("path to replace has no file name")?
+        .to_string_lossy();
+    let temp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::File::create(&temp)?;
+        if let Ok(existing) = fs::metadata(path) {
+            fs::set_permissions(&temp, existing.permissions())?;
+        }
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        sync_dir(dir)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn sync_file(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("fsync {}", path.display()))
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    sync_file(dir)
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Back up the markdown memory files before the v34 import rewrites `MEMORY.md`.
 ///
 /// The backup mirrors the live workspace layout under a
@@ -169,14 +324,29 @@ fn normalize_key(key: &str, fallback_idx: usize) -> String {
 /// alone rather than importing from a partial state. The same absence is
 /// why a flat, pre-marker backup from an earlier development build is never
 /// picked up either — it has neither this marker nor the `memory/`
-/// subdirectory layout.
-pub(crate) fn backup_markdown_memory(workspace_dir: &Path) -> Result<Option<std::path::PathBuf>> {
+/// subdirectory layout. Every copy and the directories are flushed to disk
+/// before the marker is written.
+///
+/// The marker holds an RFC 3339 time, the cutoff for the import: a row whose
+/// `updated_at` is later than it was stored after the backup, so the import
+/// leaves it alone. The cutoff is the time the backup started, taken before
+/// anything is copied, because a row written while the copy runs may or may
+/// not be in the `brain.db` snapshot. When a `PENDING` marker exists the
+/// cutoff is the earlier time it holds, because the runtime may have stored
+/// rows between the failed attempt and this one.
+pub(crate) fn backup_markdown_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
+    let started = Utc::now();
+    let pending_marker = pending_markdown_import_marker(workspace_dir);
+    let cutoff = if pending_marker.exists() {
+        marker_time(&pending_marker)?.min(started)
+    } else {
+        started
+    };
+
     let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let pid = std::process::id();
-    let backup_root = workspace_dir
-        .join("memory")
-        .join("migrations")
-        .join(format!("markdown-{timestamp}-{pid}"));
+    let migrations_dir = workspace_dir.join("memory").join("migrations");
+    let backup_root = migrations_dir.join(format!("markdown-{timestamp}-{pid}"));
     let backup_memory_dir = backup_root.join("memory");
 
     fs::create_dir_all(&backup_root)?;
@@ -184,7 +354,9 @@ pub(crate) fn backup_markdown_memory(workspace_dir: &Path) -> Result<Option<std:
     let memory_md = workspace_dir.join("MEMORY.md");
     let mut copied_any = false;
     if memory_md.exists() {
-        fs::copy(&memory_md, backup_root.join("MEMORY.md"))?;
+        let dest = backup_root.join("MEMORY.md");
+        fs::copy(&memory_md, &dest)?;
+        sync_file(&dest)?;
         copied_any = true;
     }
 
@@ -200,7 +372,9 @@ pub(crate) fn backup_markdown_memory(workspace_dir: &Path) -> Result<Option<std:
                 continue;
             };
             fs::create_dir_all(&backup_memory_dir)?;
-            fs::copy(&path, backup_memory_dir.join(name))?;
+            let dest = backup_memory_dir.join(name);
+            fs::copy(&path, &dest)?;
+            sync_file(&dest)?;
             copied_any = true;
         }
     }
@@ -213,12 +387,23 @@ pub(crate) fn backup_markdown_memory(workspace_dir: &Path) -> Result<Option<std:
     let brain_db = daily_dir.join("brain.db");
     if brain_db.exists() {
         fs::create_dir_all(&backup_memory_dir)?;
-        vacuum_brain_db_into(&brain_db, &backup_memory_dir.join("brain.db"))?;
+        let dest = backup_memory_dir.join("brain.db");
+        vacuum_brain_db_into(&brain_db, &dest)?;
+        sync_file(&dest)?;
     }
 
-    // Written last, once every copy above has succeeded: see the doc
-    // comment above for why the sweep depends on this.
-    fs::write(backup_root.join("BACKUP_COMPLETE"), [])?;
+    if backup_memory_dir.exists() {
+        sync_dir(&backup_memory_dir)?;
+    }
+    sync_dir(&backup_root)?;
+    sync_dir(&migrations_dir)?;
+
+    // Written last, once every copy above has succeeded and reached the disk:
+    // see the doc comment above for why the sweep depends on this.
+    write_marker_durably(
+        &backup_root.join("BACKUP_COMPLETE"),
+        cutoff.to_rfc3339().as_bytes(),
+    )?;
 
     Ok(Some(backup_root))
 }
@@ -244,6 +429,10 @@ fn vacuum_brain_db_into(source: &Path, dest: &Path) -> Result<()> {
     })?;
     let conn = rusqlite::Connection::open(source)
         .with_context(|| format!("open {} for backup", source.display()))?;
+    // A running daemon can hold brain.db for ordinary traffic; wait for it
+    // rather than fail the backup with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .context("set busy timeout for the backup")?;
     conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])
         .with_context(|| format!("vacuum {} into {}", source.display(), dest.display()))?;
     Ok(())
@@ -299,5 +488,112 @@ mod tests {
     #[test]
     fn parse_structured_markdown_rejects_no_stars() {
         assert!(parse_structured_memory_line("key: value").is_none());
+    }
+
+    fn backup_complete_time(backup_dir: &Path) -> String {
+        fs::read_to_string(backup_dir.join("BACKUP_COMPLETE")).unwrap()
+    }
+
+    #[test]
+    fn backup_complete_marker_records_the_time_the_backup_started() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), "- **k**: v\n").unwrap();
+
+        let before = chrono::Utc::now();
+        let backup_dir = backup_markdown_memory(tmp.path()).unwrap().unwrap();
+        let after = chrono::Utc::now();
+
+        let recorded =
+            chrono::DateTime::parse_from_rfc3339(backup_complete_time(&backup_dir).trim())
+                .expect("the marker holds an RFC 3339 time")
+                .with_timezone(&chrono::Utc);
+        assert!(
+            before <= recorded && recorded <= after,
+            "{recorded} is outside {before} .. {after}"
+        );
+    }
+
+    #[test]
+    fn a_backup_made_while_an_import_is_pending_records_the_pending_time() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), "- **k**: v\n").unwrap();
+        let migrations = tmp.path().join("memory").join("migrations");
+        fs::create_dir_all(&migrations).unwrap();
+        fs::write(migrations.join("PENDING"), "2020-01-01T00:00:00+00:00").unwrap();
+
+        let backup_dir = backup_markdown_memory(tmp.path()).unwrap().unwrap();
+
+        assert_eq!(
+            backup_complete_time(&backup_dir),
+            "2020-01-01T00:00:00+00:00",
+            "rows stored after the first failed attempt must count as newer than this backup"
+        );
+    }
+
+    #[test]
+    fn a_pending_marker_is_recorded_once_and_keeps_its_first_time() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        record_pending_markdown_import(tmp.path()).unwrap();
+        let marker = pending_markdown_import_marker(tmp.path());
+        let first = fs::read_to_string(&marker).unwrap();
+        chrono::DateTime::parse_from_rfc3339(first.trim()).expect("an RFC 3339 time");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        record_pending_markdown_import(tmp.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(&marker).unwrap(), first);
+    }
+
+    #[test]
+    fn memory_md_is_read_after_the_daily_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), "- **k**: curated\n").unwrap();
+        fs::write(
+            tmp.path().join("memory").join("2026-09-02.md"),
+            "- **k**: later day\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("memory").join("2026-09-01.md"),
+            "- **k**: earlier day\n",
+        )
+        .unwrap();
+
+        let values: Vec<String> = read_openclaw_markdown_entries(tmp.path())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.content)
+            .collect();
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(
+            values.last().map(String::as_str),
+            Some("curated"),
+            "the last entry read wins a key, so the curated file must come last"
+        );
+    }
+
+    /// The order comes from the file names, not from the order the directory
+    /// listing hands the paths over in, and only `*.md` files count.
+    #[test]
+    fn daily_markdown_files_are_sorted_whatever_the_listing_order() {
+        let dir = Path::new("memory");
+        let listed = vec![
+            dir.join("2026-09-03.md"),
+            dir.join("brain.db"),
+            dir.join("2026-09-01.md"),
+            dir.join("notes.txt"),
+            dir.join("2026-09-02.md"),
+        ];
+
+        assert_eq!(
+            sorted_daily_markdown_files(listed),
+            vec![
+                dir.join("2026-09-01.md"),
+                dir.join("2026-09-02.md"),
+                dir.join("2026-09-03.md"),
+            ]
+        );
     }
 }
