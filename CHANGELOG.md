@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Browser setup no longer asks for a Chrome/Chromium path for Agent Browser. No backend used the answer.
 - The header of a new `command_allowlist.toml` no longer claims that comments survive a rewrite or that `[a]lways` answers are appended to the file. An always-allow answer is never written to that file: a persisted one (the TUI's `[A]`, or a channel reply with persist) goes to `runtime_allowlist.toml`, which survives restarts and stays untouched when a preset is applied. Applying a preset with `rantaiclaw autonomy`, `/autonomy`, or `setup approvals --force` regenerates the file and drops any comments or entries the operator added. The header also no longer says the approval gate auto-approves the globs: they are listed in the model's prompt only, and the shell gate enforces `[autonomy].allowed_commands` in `config.toml`. Existing files keep their old header.
 - **Security.** `rantaiclaw config show` and `GET /api/v1/config` showed the values of a skill's `env` map in full, so a variable such as `DATABASE_URL = "postgres://user:pass@host/db"` or `PGPASSWORD` reached the console and the terminal. Every skill env value is now blanked, as MCP server env values already were, and the variable names stay visible.
 - **Security.** A guest could make the bot upload any workspace file, `memory/brain.db` included, by asking for an attachment marker such as `[DOCUMENT:memory/brain.db]`. The marker needs no tool call, so the guest gate never saw it. A guest's reply now carries no attachment unless the operator lets guests use `file_read`, and then only files a guest could read: not the owner's private files, not a symlink to one, not a SQLite database or its journal files, and never a URL. A reply that is only the path of a file, which Telegram uploads without a marker, is judged the same way. A refused attachment is replaced by one closing line saying it was withheld. A guest's prompt offers attachments only when `file_read` is granted, and never names the absolute workspace path. Owner turns are unchanged. **On an install with no `approval_owners`, everyone is a guest, so attachments stop until an owner is configured or `file_read` is granted.**
@@ -80,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The `browser-native` build feature (the WebDriver browser backend) and its `fantoccini` dependency are removed. A config with `backend = "rust_native"` or `"native"` now fails with an error that names the remaining backends, `agent_browser`, `computer_use` and `auto`. The `native_headless`, `native_webdriver_url` and `native_chrome_path` keys still load but have no effect. Browsing through `agent_browser` and `computer_use` is unchanged.
 - The `postgres` memory backend is retired. `[memory] backend` now accepts
   `sqlite` or `none`; `postgres` is rewritten to `sqlite` on load with a one-time
   WARN pointing at the new key, and any notes left behind in Postgres stay in

@@ -373,7 +373,7 @@ hardware you do not control, including aarch64 on-prem boxes.
 `default = ["tui", "whatsapp-web", "remote-install", "kb"]`
 
 Notable optional features: `hardware` (USB/serial boards), `peripheral-rpi`,
-`channel-matrix`, `channel-lark`, `observability-otel`, `browser-native`,
+`channel-matrix`, `channel-lark`, `observability-otel`,
 `probe` (probe-rs for Nucleo memory read), `rag-pdf`, `kb-office`,
 `legacy-providers`.
 
