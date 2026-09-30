@@ -48,9 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the integration test that reached `Config::save` through
   `Config::load_or_init` (`tests/config_persistence.rs`) now pins its own
   `RANTAICLAW_CONFIG_DIR` to a temp directory behind a process-wide lock
-  (`tests/common/mod.rs`) instead of setting it unguarded — the library guard
-  above does not apply to `tests/` binaries, which link the crate without
-  `cfg(test)`. Release behaviour is unchanged.
+  (`tests/common/mod.rs`) instead of setting it unguarded. Since #956 the guard
+  is compiled under `cfg(any(test, debug_assertions))`, so it covers every
+  debug build, including integration tests and spawned binaries. Release
+  behaviour is unchanged.
 - The email channel finds the `Authentication-Results` header by name, so owner
   recognition keeps working on any header spelling and survives the next
   mail-parser upgrade. The previous lookup matched `HeaderName::Other(...)`,
@@ -102,9 +103,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wizard and the global `sessions.db` and `kb.db` migrations. When `HOME` is
   outside the temp dir it uses a per-process temporary root and says so once on
   stderr, unless `RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR=1` is set. `Config::save`
-  refuses a path outside the temp dir in every debug build. Only the OpenRC
-  service installer still reads the invoking user's home. Release builds are
-  unchanged.
+  refuses a path outside the temp dir in every debug build. The service
+  installers still write the operating system's unit files under the real home
+  (systemd user units and macOS LaunchAgents); RantaiClaw's own data paths,
+  including the OpenRC installer's config-dir lookup, go through the dev-root
+  guard. Release builds are unchanged.
 - Gateway pairing tokens now start with `rc_`. Tokens issued before this change (`zc_…`) keep authenticating: storage is keyed by SHA-256, prefix-agnostic.
 - Guests (allowed senders who are not in `channels_config.approval_owners`)
   no longer inherit `autonomy.auto_approve`. The agent now calls **only** the

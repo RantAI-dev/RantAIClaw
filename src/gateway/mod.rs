@@ -792,7 +792,7 @@ pub fn build_gateway_router(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| {
             directories::BaseDirs::new()
-                .map(|d| d.home_dir().join(".rantaiclaw"))
+                .map(|d| crate::profile::paths::root_for_home(d.home_dir()))
                 .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw"))
         });
     let webhook_routes = Arc::new(load_webhook_routes(&config_dir));

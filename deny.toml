@@ -24,12 +24,13 @@ ignore = [
     # verified-clean release. Reached transitively via blake3 + wa-rs-libsignal.
     "arrayref@0.3.9",
     # chacha20 0.10.0 was YANKED upstream (RustCrypto), flagged by cargo-deny's
-    # yanked check — NOT a RUSTSEC vulnerability. It is a transitive dep of
-    # chacha20poly1305 0.10.1 (our `enc2:` secret cipher) and russh 0.45 →
-    # ssh-cipher/ssh-key. crates.io bytes are immutable, so the yanked version is
+    # yanked check — NOT a RUSTSEC vulnerability. It comes from rand 0.10.3 (its
+    # default ChaCha RNG), which rantaiclaw depends on directly and which russh
+    # 0.60 (also via internal-russh-num-bigint) and lopdf 0.42 (via pdf-extract)
+    # pull in. crates.io bytes are immutable, so the yanked version is
     # byte-identical to when it was published, and there is no in-range non-yanked
-    # replacement without a major parent bump. REMOVE once chacha20poly1305/russh
-    # move to a non-yanked chacha20 (or 0.10.0 is un-yanked).
+    # replacement. REMOVE once a rand 0.10.x release depends on a non-yanked
+    # chacha20 and the lockfile picks it up (or 0.10.0 is un-yanked).
     "chacha20@0.10.0",
     # bitmaps v3.2.1 — unsound `Bitmap::try_from(&[u8])`, no patched version.
     # Reached only through the opt-in `channel-matrix` feature via matrix-sdk 0.18

@@ -32,7 +32,6 @@ updates:
       russh:
         patterns:
           - "russh"
-          - "russh-keys"
           - "russh-sftp"
         update-types:
           - major
