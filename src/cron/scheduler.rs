@@ -2555,6 +2555,9 @@ mod tests {
         .unwrap();
         let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
         let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
+        // RANTAICLAW_CONFIG_DIR outranks RANTAICLAW_WORKSPACE, so one inherited
+        // from the parent shell would send the load elsewhere.
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
 
         let boot = Config::load_or_init().await.unwrap();
         let security = std::sync::Arc::new(SecurityPolicy::from_config(

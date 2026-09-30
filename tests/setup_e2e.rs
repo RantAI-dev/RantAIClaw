@@ -34,7 +34,11 @@ fn cmd(home: &TempDir) -> Command {
         .env_remove("RANTAICLAW_PROFILE")
         // Avoid pulling whatever the developer configured for their own
         // shell into the test binary.
-        .env_remove("RANTAICLAW_HOME");
+        .env_remove("RANTAICLAW_HOME")
+        // An override inherited from the parent shell would shadow the
+        // default resolution under the temp HOME.
+        .env_remove("RANTAICLAW_CONFIG_DIR")
+        .env_remove("RANTAICLAW_WORKSPACE");
     c
 }
 

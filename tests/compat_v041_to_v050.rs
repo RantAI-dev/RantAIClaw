@@ -39,8 +39,14 @@ fn with_legacy_fixture<F: FnOnce(&Path)>(f: F) {
     let tmp = TempDir::new().expect("tempdir");
     let prev_home = std::env::var_os("HOME");
     let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
+    // An override inherited from the parent shell would shadow the default
+    // resolution under the temp HOME.
+    let prev_config_dir = std::env::var_os("RANTAICLAW_CONFIG_DIR");
+    let prev_workspace = std::env::var_os("RANTAICLAW_WORKSPACE");
     std::env::set_var("HOME", tmp.path());
     std::env::remove_var("RANTAICLAW_PROFILE");
+    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    std::env::remove_var("RANTAICLAW_WORKSPACE");
 
     let dest = tmp.path().join(".rantaiclaw");
     copy_dir_into(&fixture_root(), &dest);
@@ -55,6 +61,16 @@ fn with_legacy_fixture<F: FnOnce(&Path)>(f: F) {
         std::env::set_var("RANTAICLAW_PROFILE", p);
     } else {
         std::env::remove_var("RANTAICLAW_PROFILE");
+    }
+    if let Some(c) = prev_config_dir {
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", c);
+    } else {
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    }
+    if let Some(w) = prev_workspace {
+        std::env::set_var("RANTAICLAW_WORKSPACE", w);
+    } else {
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
     }
     if let Err(e) = result {
         std::panic::resume_unwind(e);

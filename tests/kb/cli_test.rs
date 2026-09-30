@@ -224,6 +224,10 @@ fn run_kb(db_path: &PathBuf, args: &[&str]) -> (i32, String, String) {
         .env("RUST_LOG", "warn")
         // Sandbox the binary's profile directory creation to the temp dir.
         .env("HOME", &fake_home)
+        // An override inherited from the parent shell would shadow the
+        // default resolution under the temp HOME.
+        .env_remove("RANTAICLAW_CONFIG_DIR")
+        .env_remove("RANTAICLAW_WORKSPACE")
         .output()
         .expect("failed to spawn rantaiclaw binary");
     let code = output.status.code().unwrap_or(-1);
@@ -455,7 +459,11 @@ fn run_kb_with_env(
         .env("KB_EMBEDDING_API_KEY", "")
         .env("RANTAICLAW_LOG_STDERR", "1")
         .env("RUST_LOG", "warn")
-        .env("HOME", &fake_home);
+        .env("HOME", &fake_home)
+        // An override inherited from the parent shell would shadow the
+        // default resolution under the temp HOME.
+        .env_remove("RANTAICLAW_CONFIG_DIR")
+        .env_remove("RANTAICLAW_WORKSPACE");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -733,6 +741,8 @@ fn kb_data_subcommands_gate_on_disabled() {
         .env("RANTAICLAW_LOG_STDERR", "1")
         .env("RUST_LOG", "warn")
         .env("HOME", &fake_home)
+        .env_remove("RANTAICLAW_CONFIG_DIR")
+        .env_remove("RANTAICLAW_WORKSPACE")
         .output()
         .expect("spawn binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -763,6 +773,8 @@ fn kb_status_reports_disabled_state() {
         .env("RANTAICLAW_LOG_STDERR", "1")
         .env("RUST_LOG", "warn")
         .env("HOME", &fake_home)
+        .env_remove("RANTAICLAW_CONFIG_DIR")
+        .env_remove("RANTAICLAW_WORKSPACE")
         .output()
         .expect("spawn binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
