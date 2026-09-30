@@ -201,6 +201,41 @@ jobs:
                   cargo test --locked --lib config::migrations
                   cargo test --locked --lib sessions::migrations
 
+    # No other workflow runs a test on Windows, and `build-release` only
+    # compiles the Windows target. The markdown import backs up and rewrites
+    # the operator's notes through fsync, rename and mode handling that differ
+    # between Windows and Unix, so the two modules that own that file I/O run
+    # here. A red result blocks `publish`. Tests that assert Unix-only behaviour
+    # (mode bits, symlinks, directory fsync) carry `#[cfg(unix)]`.
+    windows-io-tests:
+        name: Windows file I/O tests
+        needs: [prepare]
+        runs-on: windows-latest
+        timeout-minutes: 40
+        # Nothing here writes to the repository, a registry or a release.
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ needs.prepare.outputs.release_ref }}
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+            - name: Migration and snapshot tests
+              shell: bash
+              run: |
+                  cargo --version
+                  # `cargo test` only accepts ONE positional filter, so both
+                  # filters go after `--` to the test binary. `migration::` is a
+                  # substring match and would also select `profile::migration`,
+                  # whose tests read and write profile state under HOME; the
+                  # skip keeps this job to the two modules named here.
+                  cargo test --locked --lib -- \
+                    migration:: memory::snapshot:: \
+                    --skip profile::migration
+
     build-release:
         name: Build ${{ matrix.target }}
         needs: [prepare, verify-update-cycle]
@@ -413,7 +448,7 @@ jobs:
     publish:
         name: Publish Release
         if: needs.prepare.outputs.publish_release == 'true'
-        needs: [prepare, verify-artifacts]
+        needs: [prepare, verify-artifacts, windows-io-tests]
         runs-on: ubuntu-latest
         timeout-minutes: 90
         steps:

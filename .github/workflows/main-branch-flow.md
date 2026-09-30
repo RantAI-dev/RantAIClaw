@@ -82,8 +82,9 @@ Workflow: `.github/workflows/pub-release.yml`.
 2. `prepare` resolves release context and validates manual publish inputs.
 3. `build-release` builds matrix artifacts across Linux/macOS/Windows.
 4. `verify-artifacts` enforces presence of all expected archives.
-5. In publish mode: SBOM (CycloneDX + SPDX), `SHA256SUMS`, keyless cosign signatures, GHCR release-tag check.
-6. In publish mode: creates/updates the GitHub Release.
+5. `windows-io-tests` runs the `migration::` and `memory::snapshot::` lib tests on Windows. Publish mode waits for it.
+6. In publish mode: SBOM (CycloneDX + SPDX), `SHA256SUMS`, keyless cosign signatures, GHCR release-tag check.
+7. In publish mode: creates/updates the GitHub Release.
 
 ## Merge/Policy Notes
 

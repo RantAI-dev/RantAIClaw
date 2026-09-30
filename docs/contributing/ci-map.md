@@ -43,6 +43,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: scheduled/manual static analysis for security findings.
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode.
+    - The `windows-io-tests` job runs the `migration::` and `memory::snapshot::` lib tests on `windows-latest`, the only place a test runs on Windows. `publish` needs it, so a red run blocks the release.
 - `.github/workflows/test-fuzz.yml` (`Fuzz`)
     - Purpose: weekly `cargo fuzz` over `fuzz/fuzz_targets/`. Default 300s/target; opens an issue on crash.
 
@@ -73,7 +74,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 1. `CI Required Gate` failing: the job prints every stage result it read before deciding; find the non-`success` one, then look at that stage's own logs (`lint`, `test`, `msrv`, `channel-lark`, `channel-matrix`, `features`, `e2e`, `bench-compile`, `build`, `docs-quality`).
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
-3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
+3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs. A red `windows-io-tests` job means a file I/O test failed on Windows; a test that asserts Unix-only behaviour belongs under `#[cfg(unix)]`, and any other failure is a bug in the code.
 4. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
 5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
 6. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
