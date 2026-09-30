@@ -273,6 +273,8 @@ The next release is the first to run `softprops/action-gh-release` v3 (bumped fr
 
 The next `Pub Release` run is also the first on `actions/upload-artifact` v7 and `actions/download-artifact` v8 (bumped from v6 and v7 in #936 and #930). The weekly scheduled verification run, or a manual dispatch with `publish_release=false`, exercises the upload in the `Build <target>` jobs and the download in `Verify Artifact Set`; only the download in the `Publish Release` job waits for a release tag. `Pub Docker Img` already passed both on `main`. Confirm a verification run is green before tagging, and have the revert ready.
 
+The next release is also the first to publish its image with `docker/build-push-action` v7 (bumped from v6.19.2 to v7.4.0 in #960). `Pub Docker Img` already ran v7's push-by-digest path green on `main` (run 36688108025), but the `Build and push release Docker image` step in the release job has `continue-on-error: true`, so a v7 failure there does not turn the job red. Read that step's conclusion with the recipe in section 6 (Post-release validation, step 2) and have the revert ready.
+
 Expected publish outputs:
 
 - release archives
