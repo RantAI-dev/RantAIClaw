@@ -2352,6 +2352,39 @@ async fn force_final_summary(
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
 pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+    build_tool_instructions_with_example(
+        tools_registry,
+        "Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n",
+    )
+}
+
+/// [`build_tool_instructions`] for a guest turn, or an empty string when the
+/// guest has no tool. The example uses the first tool of `guest_tools`: the
+/// owner's example calls `shell`, which a guest usually cannot.
+pub(crate) fn build_guest_tool_instructions(guest_tools: &[Box<dyn Tool>]) -> String {
+    let Some(first) = guest_tools.first() else {
+        return String::new();
+    };
+    // Only the arguments the tool requires, each with a placeholder value.
+    let required_args: serde_json::Map<String, serde_json::Value> = first
+        .parameters_schema()
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|name| (name.to_string(), serde_json::Value::from("value")))
+        .collect();
+    let example = format!(
+        "Example: to use `{name}`, you MUST respond with:\n<tool_call>\n{{\"name\":{name_json},\"arguments\":{args}}}\n</tool_call>\n\n",
+        name = first.name(),
+        name_json = serde_json::Value::from(first.name()),
+        args = serde_json::Value::Object(required_args),
+    );
+    build_tool_instructions_with_example(guest_tools, &example)
+}
+
+fn build_tool_instructions_with_example(tools_registry: &[Box<dyn Tool>], example: &str) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -2359,7 +2392,7 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str(
         "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
     );
-    instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
+    instructions.push_str(example);
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
     instructions

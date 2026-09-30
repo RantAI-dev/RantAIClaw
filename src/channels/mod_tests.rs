@@ -10719,28 +10719,31 @@ fn tool_protocol_block(prompt: &str) -> &str {
         .map_or("", |(_, block)| block)
 }
 
-/// The runtime's two prompts as built at start-up. A guest allowed one tool on
-/// a provider without native tool calling gets the tool-use protocol for that
-/// tool, not for the whole registry, and none of the host details the owner
-/// prompt carries.
+/// The runtime's two prompts as built at start-up. A guest allowed one tool
+/// is told about that tool, not the whole registry, and none of the host
+/// details the owner prompt carries.
 #[tokio::test]
 async fn built_runtime_guest_prompt_lists_only_the_permitted_tools_in_the_protocol() {
     let (owner, guest, workspace_path) = non_native_runtime_prompts(&["file_read"]).await;
 
     assert!(owner.contains("## Tool Use Protocol"), "{owner}");
+    // The guest's protocol block follows the gate as reloaded, so it joins the
+    // prompt on each turn and not at start-up.
     assert!(
-        guest.contains("## Tool Use Protocol"),
-        "a guest with a tool needs the protocol on a non-native provider:\n{guest}"
+        !guest.contains("## Tool Use Protocol"),
+        "the guest's protocol block belongs to the turn:\n{guest}"
     );
 
     let owner_block = tool_protocol_block(&owner);
     assert!(owner_block.contains("**shell**"), "{owner_block}");
-    let guest_block = tool_protocol_block(&guest);
-    assert!(guest_block.contains("**file_read**"), "{guest_block}");
+    // Nor does it carry a tool list: the list follows the reloaded gate, so it
+    // joins the prompt on each turn (`guest_turn_tools_and_task_follow_*`).
+    assert!(!guest.contains("## Tools"), "{guest}");
+    assert!(!guest.contains("## Your Task"), "{guest}");
     for hidden in ["**shell**", "**file_write**", "**memory_store**"] {
         assert!(
-            !guest_block.contains(hidden),
-            "the guest protocol lists {hidden}, which the gate refuses:\n{guest_block}"
+            !guest.contains(hidden),
+            "the guest prompt lists {hidden}, which the gate refuses:\n{guest}"
         );
     }
     assert!(
@@ -10772,9 +10775,27 @@ async fn built_runtime_guest_prompt_has_no_tool_protocol_when_no_tool_is_allowed
         "a chat-only guest was given the tool-use protocol:\n{guest}"
     );
     assert!(
+        !guest.contains("<tool_call>"),
+        "a chat-only guest was told to emit tool calls:\n{guest}"
+    );
+    assert!(
         !guest.contains("**shell**"),
         "a chat-only guest was shown shell:\n{guest}"
     );
+    assert!(
+        owner.contains("emit actual <tool_call> tags"),
+        "control: the owner keeps the tool-call instruction:\n{owner}"
+    );
+}
+
+/// The guest prompt built at start-up lists no tool, even one the operator
+/// permits: the list is added on each turn from the reloaded gate.
+#[tokio::test]
+async fn built_runtime_guest_prompt_lists_no_tool_at_start_up() {
+    let (_owner, guest, _workspace_path) = non_native_runtime_prompts(&["web_search_tool"]).await;
+
+    assert!(!guest.contains("web_search_tool"), "{guest}");
+    assert!(!guest.contains("## Tools"), "{guest}");
 }
 
 /// Every tier channel that can receive an image must charge the shared media
@@ -11691,82 +11712,31 @@ fn guest_gate_from_config_does_not_inherit_auto_approve() {
     assert!(!gate.tool_permitted("manage_permissions"));
 }
 
-/// A guest allowed tools on a provider without native tool calling still
-/// needs the `<tool_call>` syntax explained, or the model has no way to call
-/// a tool at all. This used to be appended only to the owner prompt. The
-/// guest's block lists only the tools the guest may call.
+/// The owner prompt built at start-up gets the `<tool_call>` syntax on a
+/// provider without native tool calling. A guest's block is added per turn,
+/// from the gate as reloaded (see the guest turn tests below).
 #[test]
-fn guest_prompt_gets_the_tool_use_protocol_when_the_provider_lacks_native_tools() {
+fn owner_prompt_gets_the_tool_use_protocol_when_the_provider_lacks_native_tools() {
     let mut system_prompt = "OWNER BASE".to_string();
-    let mut guest_system_prompt = "GUEST BASE".to_string();
-    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![
-        Box::new(NamedStubTool("shell")),
-        Box::new(NamedStubTool("web_search_tool")),
-    ];
-    let guest_tools: Vec<Box<dyn crate::tools::Tool>> =
-        vec![Box::new(NamedStubTool("web_search_tool"))];
+    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(NamedStubTool("shell"))];
 
-    super::append_tool_instructions_when_not_native(
-        &mut system_prompt,
-        &mut guest_system_prompt,
-        false,
-        &tools_registry,
-        &guest_tools,
-    );
+    super::append_tool_instructions_when_not_native(&mut system_prompt, false, &tools_registry);
 
     assert!(system_prompt.contains("## Tool Use Protocol"));
     assert!(system_prompt.contains("**shell**"));
-    assert!(
-        guest_system_prompt.contains("## Tool Use Protocol"),
-        "guest prompt must also get the tool-use protocol on a non-native provider: {guest_system_prompt}"
-    );
-    assert!(guest_system_prompt.contains("**web_search_tool**"));
-    assert!(
-        !guest_system_prompt.contains("**shell**"),
-        "the guest protocol lists a tool the guest may not call: {guest_system_prompt}"
-    );
 }
 
-/// A guest that may call nothing is not taught how to call anything.
-#[test]
-fn guest_prompt_gets_no_tool_use_protocol_when_the_guest_may_call_no_tool() {
-    let mut system_prompt = "OWNER BASE".to_string();
-    let mut guest_system_prompt = "GUEST BASE".to_string();
-    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(NamedStubTool("shell"))];
-
-    super::append_tool_instructions_when_not_native(
-        &mut system_prompt,
-        &mut guest_system_prompt,
-        false,
-        &tools_registry,
-        &[],
-    );
-
-    assert!(system_prompt.contains("## Tool Use Protocol"));
-    assert_eq!(guest_system_prompt, "GUEST BASE");
-}
-
-/// A provider with native tool calling needs neither prompt touched: the
+/// A provider with native tool calling needs the prompt untouched: the
 /// tool-call syntax comes from the API's own tool-calling feature, not the
 /// prompt text.
 #[test]
-fn native_tools_provider_gets_no_tool_use_protocol_appended_to_either_prompt() {
+fn native_tools_provider_gets_no_tool_use_protocol_appended() {
     let mut system_prompt = "OWNER BASE".to_string();
-    let mut guest_system_prompt = "GUEST BASE".to_string();
-    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![];
-    let guest_tools: Vec<Box<dyn crate::tools::Tool>> =
-        vec![Box::new(NamedStubTool("web_search_tool"))];
+    let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(NamedStubTool("shell"))];
 
-    super::append_tool_instructions_when_not_native(
-        &mut system_prompt,
-        &mut guest_system_prompt,
-        true,
-        &tools_registry,
-        &guest_tools,
-    );
+    super::append_tool_instructions_when_not_native(&mut system_prompt, true, &tools_registry);
 
     assert_eq!(system_prompt, "OWNER BASE");
-    assert_eq!(guest_system_prompt, "GUEST BASE");
 }
 
 // ── guest replies and attachment markers ─────────────────────────────────
@@ -11929,6 +11899,7 @@ fn attachment_workspace() -> TempDir {
     std::fs::write(root.join("memory/brain.db"), &db).unwrap();
     std::fs::write(root.join("memory/x.md"), b"owner note").unwrap();
     std::fs::write(root.join("USER.md"), b"owner profile").unwrap();
+    std::fs::write(root.join("TOOLS.md"), b"SSH host: box-a.example").unwrap();
     std::fs::write(root.join("notes/menu.txt"), b"soup").unwrap();
     std::fs::write(root.join("data.bin"), &db).unwrap();
     ws
@@ -12062,6 +12033,7 @@ async fn guest_file_read_grant_withholds_private_owner_files() {
     let cases = [
         ("owner profile", "[DOCUMENT:USER.md]".to_string()),
         ("owner profile by absolute path", absolute_user),
+        ("owner tool notes", "[DOCUMENT:TOOLS.md]".to_string()),
         ("memory note", "[DOCUMENT:memory/x.md]".to_string()),
         ("notes database", "[DOCUMENT:memory/brain.db]".to_string()),
         (
@@ -12520,11 +12492,13 @@ impl Tool for NamedStubTool {
     }
 }
 
-/// A provider with native tool calling that keeps the tool names each request
+/// A provider with native tool calling that keeps the tool specs each request
 /// carried (`None` when the request carried no tool specs at all).
 #[derive(Default)]
 struct NativeSpecRecorder {
-    requests: std::sync::Mutex<Vec<Option<Vec<String>>>>,
+    requests: std::sync::Mutex<Vec<Option<Vec<crate::tools::ToolSpec>>>>,
+    /// The system prompt each request started from.
+    system_prompts: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -12552,10 +12526,17 @@ impl Provider for NativeSpecRecorder {
         self.requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .push(request.tools.map(<[crate::tools::ToolSpec]>::to_vec));
+        self.system_prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .push(
                 request
-                    .tools
-                    .map(|specs| specs.iter().map(|s| s.name.clone()).collect()),
+                    .messages
+                    .iter()
+                    .find(|m| m.role == "system")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default(),
             );
         Ok(crate::providers::ChatResponse {
             usage: None,
@@ -12574,6 +12555,19 @@ async fn native_specs_seen_by(
     registry: &[&'static str],
     guest_tools: &[&str],
 ) -> Vec<Option<Vec<String>>> {
+    native_spec_requests_seen_by(sender, registry, guest_tools)
+        .await
+        .into_iter()
+        .map(|request| request.map(|specs| specs.into_iter().map(|s| s.name).collect()))
+        .collect()
+}
+
+/// [`native_specs_seen_by`], keeping each whole spec.
+async fn native_spec_requests_seen_by(
+    sender: &str,
+    registry: &[&'static str],
+    guest_tools: &[&str],
+) -> Vec<Option<Vec<crate::tools::ToolSpec>>> {
     let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
 
     let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
@@ -12744,5 +12738,763 @@ async fn guest_call_to_a_tool_outside_its_list_is_refused_by_the_gate() {
     assert!(
         !tool_results.contains("Unknown tool"),
         "the call fell through to the unknown-tool path:\n{tool_results}"
+    );
+}
+
+// ── the owner prompt stays as it was ─────────────────────────────────────
+
+/// A runtime-defaults slot seeded with `preset` and `guest_gate`, so a turn
+/// reads them from the reloaded state the way a daemon that has applied its
+/// config does.
+fn seeded_defaults_slot(
+    preset: crate::approval::policy_writer::PolicyPreset,
+    guest_gate: crate::approval::GuestGate,
+) -> routing::RuntimeConfigSlot {
+    routing::RuntimeConfigSlot {
+        state: Some(routing::RuntimeConfigState {
+            defaults: ChannelRuntimeDefaults {
+                default_provider: "test-provider".to_string(),
+                model: "default-model".to_string(),
+                temperature: 0.0,
+                api_key: None,
+                api_url: None,
+                reliability: crate::config::ReliabilityConfig::default(),
+                approval_owners: Arc::new(vec![OWNER_SENDER.to_string()]),
+                guest_gate: Arc::new(guest_gate),
+                allowed_commands: Arc::new(Vec::new()),
+                autonomy_level: crate::security::AutonomyLevel::Supervised,
+                autonomy_preset: preset,
+                allowlists: Arc::new(HashMap::new()),
+                message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+                max_tool_iterations: 5,
+                auto_save_memory: false,
+                min_relevance_score: 0.0,
+                autonomous_tools: false,
+                mention_only: Arc::new(HashMap::new()),
+                thread_replies: Arc::new(HashMap::new()),
+            },
+            last_applied_stamp: None,
+            last_reload_error: None,
+        }),
+        ..routing::RuntimeConfigSlot::default()
+    }
+}
+
+/// A skill that reads as one loaded from `location`.
+fn skill_at(name: &str, location: std::path::PathBuf) -> crate::skills::Skill {
+    crate::skills::Skill {
+        name: name.into(),
+        description: format!("Does the {name} work"),
+        version: "1.0.0".into(),
+        author: None,
+        tags: vec![],
+        tools: vec![crate::skills::SkillTool {
+            name: format!("{name}_tool"),
+            description: "Runs a check".into(),
+            kind: "shell".into(),
+            command: "true".into(),
+            args: HashMap::new(),
+        }],
+        prompts: vec![format!("Follow the {name} steps.")],
+        location: Some(location),
+        requires: crate::skills::SkillRequires::default(),
+        install_recipes: Vec::new(),
+        remote: false,
+        origin: None,
+    }
+}
+
+/// Replaces what differs between machines and runs with fixed markers, so the
+/// prompt of a turn can be compared with a stored copy.
+fn normalise_prompt(
+    prompt: &str,
+    workspace: &std::path::Path,
+    profile: &std::path::Path,
+) -> String {
+    let host =
+        hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
+    prompt
+        .replace(&workspace.display().to_string(), "<WORKSPACE>")
+        .replace(&profile.display().to_string(), "<PROFILE>")
+        .replace(&format!("Host: {host} |"), "Host: <HOST> |")
+        .replace(&format!("OS: {} |", std::env::consts::OS), "OS: <OS> |")
+        .lines()
+        .map(|line| {
+            if line.starts_with("Timezone: ") {
+                "Timezone: <TZ>"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The system prompt an owner's turn starts from, the way a daemon composes it:
+/// the start-up prompt for `mode` plus the tool-use protocol of a
+/// provider without native tool calling, then the per-turn splices under the
+/// Strict preset. The workspace has one skill under `<workspace>/skills` and
+/// one under `<profile>/skills`.
+async fn owner_turn_prompt(mode: crate::config::SkillsPromptInjectionMode) -> String {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let workspace = TempDir::new().expect("temp workspace");
+    let profile = TempDir::new().expect("temp profile");
+    std::fs::write(
+        workspace.path().join("AGENTS.md"),
+        "# Agents\nFollow instructions.",
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("SOUL.md"), "# Soul\nBe helpful.").unwrap();
+    std::fs::write(
+        workspace.path().join("TOOLS.md"),
+        "# Tools\nSSH host: box-a.example",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("IDENTITY.md"),
+        "# Identity\nName: RantaiClaw",
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("USER.md"), "# User\nName: Test User").unwrap();
+
+    let skills = vec![
+        skill_at(
+            "workspace-skill",
+            workspace.path().join("skills/workspace-skill/SKILL.md"),
+        ),
+        skill_at(
+            "profile-skill",
+            profile.path().join("skills/profile-skill/SKILL.md"),
+        ),
+    ];
+    let tool_descs: Vec<(&str, &str)> = vec![
+        ("shell", "Run a terminal command."),
+        ("file_read", "Read a file."),
+    ];
+    let registry: Vec<Box<dyn Tool>> = vec![
+        Box::new(NamedStubTool("shell")),
+        Box::new(NamedStubTool("file_read")),
+    ];
+    let mut system_prompt = build_system_prompt_with_mode(
+        workspace.path(),
+        "golden-model",
+        &tool_descs,
+        &skills,
+        None,
+        None,
+        false,
+        mode,
+        false,
+    );
+    system_prompt.push_str(&build_tool_instructions(&registry));
+
+    let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: "ok".to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        seeded_defaults_slot(
+            crate::approval::policy_writer::PolicyPreset::Strict,
+            crate::approval::GuestGate::new(&[], &[]),
+        ),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.workspace_dir = Arc::new(workspace.path().to_path_buf());
+        inner.tools_registry = Arc::new(registry);
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        inner.system_prompt = Arc::new(system_prompt);
+    }
+    process_channel_message(
+        ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "golden-msg-1".to_string(),
+            sender: OWNER_SENDER.to_string(),
+            reply_target: "chat-golden".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let prompt = provider_impl
+        .system_prompts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .first()
+        .cloned()
+        .expect("the provider saw one prompt");
+    normalise_prompt(&prompt, workspace.path(), profile.path())
+}
+
+/// The stored prompts in `owner_prompt_golden/` were captured from the
+/// builders before guest prompts were changed to leave out skill locations and
+/// to describe only the guest's tools. Nothing done for a guest may change
+/// one byte an owner turn sends, or the provider's prompt cache misses.
+#[tokio::test]
+async fn owner_turn_prompt_is_unchanged_in_full_skills_mode() {
+    let prompt = owner_turn_prompt(crate::config::SkillsPromptInjectionMode::Full).await;
+
+    assert_eq!(prompt, include_str!("owner_prompt_golden/full.txt"));
+}
+
+#[tokio::test]
+async fn owner_turn_prompt_is_unchanged_in_compact_skills_mode() {
+    let prompt = owner_turn_prompt(crate::config::SkillsPromptInjectionMode::Compact).await;
+
+    assert_eq!(prompt, include_str!("owner_prompt_golden/compact.txt"));
+}
+
+// ── a guest prompt names no host path ────────────────────────────────────
+
+/// The skill list of a guest prompt is what the guest may use, not where the
+/// skill files sit on the host: a `<location>` is an absolute path under
+/// `/home/<user>` for a skill outside the workspace (Full mode, and Compact
+/// mode for skills under the profile), and a guest only has to ask the bot to
+/// quote it. The owner prompt keeps the locations.
+#[test]
+fn guest_prompt_lists_skills_without_locations_in_both_modes() {
+    let ws = make_workspace();
+    let profile = TempDir::new().expect("temp profile");
+    let skills = vec![
+        skill_at(
+            "workspace-skill",
+            ws.path().join("skills/workspace-skill/SKILL.md"),
+        ),
+        skill_at(
+            "profile-skill",
+            profile.path().join("skills/profile-skill/SKILL.md"),
+        ),
+    ];
+    let profile_path = profile.path().display().to_string();
+    let workspace_path = ws.path().display().to_string();
+
+    for mode in [
+        crate::config::SkillsPromptInjectionMode::Full,
+        crate::config::SkillsPromptInjectionMode::Compact,
+    ] {
+        let build = |guest: bool| {
+            build_system_prompt_with_mode(
+                ws.path(),
+                "model",
+                &[],
+                &skills,
+                None,
+                None,
+                false,
+                mode,
+                guest,
+            )
+        };
+        let guest = build(true);
+        let owner = build(false);
+
+        assert!(
+            !guest.contains("<location>"),
+            "{mode:?}: a location reached a guest prompt:\n{guest}"
+        );
+        assert!(!guest.contains(&profile_path), "{mode:?}:\n{guest}");
+        assert!(!guest.contains(&workspace_path), "{mode:?}:\n{guest}");
+        assert!(
+            !guest.contains("`location`"),
+            "{mode:?}: the header points at a location the guest is not given:\n{guest}"
+        );
+        assert!(guest.contains("<name>workspace-skill</name>"), "{guest}");
+        assert!(guest.contains("<name>profile-skill</name>"), "{guest}");
+
+        assert!(
+            owner.contains(&format!("{profile_path}/skills/profile-skill/SKILL.md")),
+            "{mode:?}: control, the owner prompt keeps the location:\n{owner}"
+        );
+        assert!(owner.contains("<location>"), "{mode:?}: {owner}");
+    }
+}
+
+// ── a guest turn describes only what the guest can do ────────────────────
+
+fn gate_of(tools: &[&str]) -> crate::approval::GuestGate {
+    let tools: Vec<String> = tools.iter().map(|t| (*t).to_string()).collect();
+    crate::approval::GuestGate::new(&tools, &[])
+}
+
+/// A dispatch context whose start-up gate lists `startup_gate` and whose
+/// reloaded defaults list `reloaded_gate` under `preset`, over a registry of
+/// stub tools named `registry`. `guest_base` is the guest prompt as built at
+/// start-up.
+fn guest_turn_context(
+    provider: Arc<dyn Provider>,
+    registry: &[&'static str],
+    startup_gate: &[&str],
+    reloaded_gate: &[&str],
+    preset: crate::approval::policy_writer::PolicyPreset,
+    guest_base: &str,
+) -> Arc<ChannelRuntimeContext> {
+    let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider,
+        seeded_defaults_slot(preset, gate_of(reloaded_gate)),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.tools_registry = Arc::new(
+            registry
+                .iter()
+                .map(|name| Box::new(NamedStubTool(name)) as Box<dyn Tool>)
+                .collect(),
+        );
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        inner.guest_gate = Arc::new(gate_of(startup_gate));
+        inner.guest_system_prompt = Arc::new(guest_base.to_string());
+    }
+    ctx
+}
+
+/// Replaces the guest ceiling of the reloaded defaults, the way a config edit
+/// does between two messages.
+fn reload_guest_gate(ctx: &ChannelRuntimeContext, tools: &[&str]) {
+    let mut slot = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+    slot.state
+        .as_mut()
+        .expect("the slot is seeded")
+        .defaults
+        .guest_gate = Arc::new(gate_of(tools));
+}
+
+async fn send_guest_message(ctx: &Arc<ChannelRuntimeContext>, sender: &str, id: &str) {
+    process_channel_message(
+        Arc::clone(ctx),
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: id.to_string(),
+            sender: sender.to_string(),
+            reply_target: "chat-guest-turn".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+}
+
+fn prompts_seen_by(provider: &ReplyAndPromptProvider) -> Vec<String> {
+    provider
+        .system_prompts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// The guest prompt as the runtime builds it at start-up for a guest allowed
+/// `tools`: the same builder call, with the descriptions of those tools.
+fn startup_guest_prompt(workspace: &std::path::Path, tools: &[(&str, &str)]) -> String {
+    build_system_prompt_with_mode(
+        workspace,
+        "model",
+        tools,
+        &[],
+        None,
+        None,
+        false,
+        crate::config::SkillsPromptInjectionMode::Full,
+        true,
+    )
+}
+
+/// The protocol block of a guest turn follows the gate as reloaded, so a tool
+/// the operator adds or removes live is described from the next message on.
+/// The example names the first tool of the block it heads.
+#[tokio::test]
+async fn guest_turn_protocol_block_follows_the_reloaded_gate() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: "ok".to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["shell", "web_search_tool", "file_read"],
+        &["web_search_tool"],
+        &["web_search_tool"],
+        crate::approval::policy_writer::PolicyPreset::Manual,
+        "GUEST BASE",
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+    reload_guest_gate(&ctx, &["file_read"]);
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-2").await;
+
+    let prompts = prompts_seen_by(&provider_impl);
+    assert_eq!(prompts.len(), 2, "one provider call per turn");
+    let first = tool_protocol_block(&prompts[0]);
+    assert!(first.contains(r#"{"name":"web_search_tool""#), "{first}");
+    assert!(first.contains("**web_search_tool**: stub tool"), "{first}");
+    assert!(!first.contains("file_read"), "{first}");
+    assert!(!first.contains("shell"), "{first}");
+
+    let second = tool_protocol_block(&prompts[1]);
+    assert!(second.contains(r#"{"name":"file_read""#), "{second}");
+    assert!(second.contains("**file_read**: stub tool"), "{second}");
+    assert!(
+        !second.contains("web_search_tool"),
+        "the turn described the start-up gate, not the reloaded one:\n{second}"
+    );
+    assert!(!second.contains("shell"), "{second}");
+}
+
+/// Each guest tool is described in the block exactly as the registry describes
+/// it, description and schema both, not only by name.
+#[tokio::test]
+async fn guest_turn_protocol_block_carries_each_tools_description_and_schema() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: "ok".to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["file_read"],
+        &["file_read"],
+        &["file_read"],
+        crate::approval::policy_writer::PolicyPreset::Manual,
+        "GUEST BASE",
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+
+    let prompts = prompts_seen_by(&provider_impl);
+    let block = tool_protocol_block(&prompts[0]);
+    let owner_entry = build_tool_instructions(&[Box::new(NamedStubTool("file_read"))]);
+    let entry = owner_entry
+        .split_once("**file_read**")
+        .map(|(_, rest)| format!("**file_read**{rest}"))
+        .expect("the registry entry is rendered");
+    assert!(
+        block.contains(entry.trim_end()),
+        "the guest block does not carry the registry entry:\n{block}\n--- expected ---\n{entry}"
+    );
+}
+
+/// A guest with no tool is not told to call one, and a Strict policy does not
+/// promise it file reads or memory recall it does not have.
+#[tokio::test]
+async fn guest_turn_without_tools_gets_no_tool_call_instruction_or_strict_promise() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let ws = make_workspace();
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: "ok".to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["shell", "file_read", "memory_recall"],
+        &[],
+        &[],
+        crate::approval::policy_writer::PolicyPreset::Strict,
+        &startup_guest_prompt(ws.path(), &[]),
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+
+    let prompts = prompts_seen_by(&provider_impl);
+    let prompt = &prompts[0];
+    assert!(prompt.contains("Strict (read-only)"), "{prompt}");
+    assert!(
+        !prompt.contains("<tool_call>"),
+        "a guest with no tool was told to emit tool calls:\n{prompt}"
+    );
+    assert!(!prompt.contains("## Tool Use Protocol"), "{prompt}");
+    for promise in ["You can still read files", "memory_recall", "`shell`"] {
+        assert!(
+            !prompt.contains(promise),
+            "a guest with no tool was promised {promise:?}:\n{prompt}"
+        );
+    }
+    assert!(
+        prompt.contains("The shell tool is not available"),
+        "{prompt}"
+    );
+}
+
+/// Under Strict, a guest is promised the reads its own tools give and no more.
+#[tokio::test]
+async fn guest_turn_strict_promise_names_only_the_guests_tools() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let ws = make_workspace();
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: "ok".to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["shell", "file_read", "memory_recall"],
+        &["file_read"],
+        &["file_read"],
+        crate::approval::policy_writer::PolicyPreset::Strict,
+        &startup_guest_prompt(ws.path(), &[("file_read", "Read a file.")]),
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+
+    let prompts = prompts_seen_by(&provider_impl);
+    let prompt = &prompts[0];
+    assert!(prompt.contains("read files (`file_read`)"), "{prompt}");
+    assert!(!prompt.contains("memory_recall"), "{prompt}");
+    assert!(!prompt.contains("`shell`"), "{prompt}");
+    assert!(
+        prompt.contains("emit actual <tool_call> tags"),
+        "a guest with a tool keeps the instruction:\n{prompt}"
+    );
+}
+
+/// The system prompt of one guest turn whose start-up gate lists `startup` and
+/// whose reloaded gate lists `reloaded`, on a provider with or without native
+/// tool calling. The guest base prompt is the one the runtime builds at
+/// start-up for `startup`, so a section wrongly taken from it shows.
+async fn guest_prompt_when_gates_differ(
+    native: bool,
+    startup: &[&str],
+    reloaded: &[&str],
+    preset: crate::approval::policy_writer::PolicyPreset,
+) -> String {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let ws = make_workspace();
+    let registry = ["shell", "file_read", "pdf_read"];
+    let startup_descs: Vec<(&str, &str)> = startup.iter().map(|t| (*t, "stub tool")).collect();
+    let base = startup_guest_prompt(ws.path(), &startup_descs);
+    if native {
+        let provider_impl = Arc::new(NativeSpecRecorder::default());
+        let ctx = guest_turn_context(
+            provider_impl.clone(),
+            &registry,
+            startup,
+            reloaded,
+            preset,
+            &base,
+        );
+        send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+        let prompts = provider_impl
+            .system_prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        prompts[0].clone()
+    } else {
+        let provider_impl = Arc::new(ReplyAndPromptProvider {
+            reply: "ok".to_string(),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let ctx = guest_turn_context(
+            provider_impl.clone(),
+            &registry,
+            startup,
+            reloaded,
+            preset,
+            &base,
+        );
+        send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+        prompts_seen_by(&provider_impl)[0].clone()
+    }
+}
+
+/// The tool list and the task framing of a guest turn follow the gate as
+/// reloaded, like the protocol block and the specs. A tool the operator grants
+/// after start-up is listed and the model is told to use it, on a native and on
+/// a non-native provider.
+#[tokio::test]
+async fn guest_turn_tools_and_task_follow_a_reloaded_grant() {
+    use crate::approval::policy_writer::PolicyPreset::Manual;
+    for native in [true, false] {
+        let prompt = guest_prompt_when_gates_differ(native, &[], &["file_read"], Manual).await;
+        assert!(
+            prompt.contains("## Tools\n\n- **file_read**: stub tool"),
+            "native={native}: the granted tool is not listed:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("You have no tools in this session"),
+            "native={native}: a guest with a tool was told it has none:\n{prompt}"
+        );
+        if native {
+            assert!(
+                prompt.contains("Use tools when the request requires action"),
+                "{prompt}"
+            );
+        } else {
+            assert!(prompt.contains("emit actual <tool_call> tags"), "{prompt}");
+            assert!(prompt.contains("**file_read**: stub tool"), "{prompt}");
+        }
+    }
+}
+
+/// A tool the operator withdraws after start-up is no longer listed, and the
+/// task framing stops telling the model to use tools.
+#[tokio::test]
+async fn guest_turn_tools_and_task_follow_a_reloaded_revoke() {
+    use crate::approval::policy_writer::PolicyPreset::Manual;
+    for native in [true, false] {
+        let prompt = guest_prompt_when_gates_differ(native, &["file_read"], &[], Manual).await;
+        assert!(
+            !prompt.contains("**file_read**"),
+            "native={native}: the withdrawn tool is still listed:\n{prompt}"
+        );
+        assert!(!prompt.contains("## Tools"), "native={native}: {prompt}");
+        assert!(
+            prompt.contains("You have no tools in this session"),
+            "native={native}: {prompt}"
+        );
+        assert!(
+            !prompt.contains("<tool_call>"),
+            "native={native}: a guest with no tool was told to emit tool calls:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Use tools when the request requires action"),
+            "native={native}: {prompt}"
+        );
+    }
+}
+
+/// Under Strict, a guest whose only tool is a read tool the promise does not
+/// know is not told that none of its tools run: `pdf_read` runs under Strict.
+#[tokio::test]
+async fn guest_strict_line_does_not_deny_a_read_tool_it_does_not_know() {
+    use crate::approval::policy_writer::PolicyPreset::Strict;
+    let prompt = guest_prompt_when_gates_differ(false, &["pdf_read"], &["pdf_read"], Strict).await;
+    assert!(prompt.contains("Strict (read-only)"), "{prompt}");
+    assert!(
+        !prompt.contains("None of your tools run"),
+        "a guest with `pdf_read` was told none of its tools run:\n{prompt}"
+    );
+    assert!(prompt.contains("- **pdf_read**: stub tool"), "{prompt}");
+
+    // Control: a guest with no tool at all is told so.
+    let none = guest_prompt_when_gates_differ(false, &[], &[], Strict).await;
+    assert!(none.contains("None of your tools run"), "{none}");
+}
+
+/// The specs a native provider receives follow the gate as reloaded. The
+/// start-up gate stays what the context was built with.
+#[tokio::test]
+async fn guest_turn_native_specs_follow_the_reloaded_gate() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let provider_impl = Arc::new(NativeSpecRecorder::default());
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["shell", "web_search_tool", "file_read"],
+        &["web_search_tool"],
+        &["web_search_tool"],
+        crate::approval::policy_writer::PolicyPreset::Manual,
+        "GUEST BASE",
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+    reload_guest_gate(&ctx, &["file_read"]);
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-2").await;
+
+    let names: Vec<Option<Vec<String>>> = provider_impl
+        .requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|request| {
+            request
+                .as_ref()
+                .map(|specs| specs.iter().map(|s| s.name.clone()).collect())
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            Some(vec!["web_search_tool".to_string()]),
+            Some(vec!["file_read".to_string()]),
+        ],
+        "the second turn must carry the reloaded gate's tool"
+    );
+    // The specs carry the tool syntax, so the prompt has no protocol block.
+    for prompt in provider_impl
+        .system_prompts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        assert!(!prompt.contains("## Tool Use Protocol"), "{prompt}");
+    }
+}
+
+/// The spec a guest's native provider receives for a tool is the owner's spec
+/// for it: name, description and parameters.
+#[tokio::test]
+async fn guest_native_spec_equals_the_owners_spec_for_the_same_tool() {
+    let registry = ["shell", "web_search_tool"];
+    let guest = native_spec_requests_seen_by(GUEST_SENDER, &registry, &["web_search_tool"]).await;
+    let owner = native_spec_requests_seen_by(OWNER_SENDER, &registry, &["web_search_tool"]).await;
+
+    let guest_specs = guest[0].as_ref().expect("the guest request carries specs");
+    let owner_specs = owner[0].as_ref().expect("the owner request carries specs");
+    let owner_spec = owner_specs
+        .iter()
+        .find(|s| s.name == "web_search_tool")
+        .expect("the owner is offered the tool");
+    assert_eq!(guest_specs.len(), 1);
+    assert_eq!(guest_specs[0].name, owner_spec.name);
+    assert_eq!(guest_specs[0].description, owner_spec.description);
+    assert_eq!(guest_specs[0].parameters, owner_spec.parameters);
+    assert_eq!(
+        guest_specs[0].description, "stub tool",
+        "the spec is not empty"
+    );
+    assert_eq!(guest_specs[0].parameters["type"], "object");
+}
+
+/// The gate that answers a guest's call is the one reloaded from the config,
+/// like the tool list, so a tool an operator adds to `guest_allowed_tools`
+/// runs on the next message and is not refused by the start-up gate.
+#[tokio::test]
+async fn guest_call_is_checked_against_the_reloaded_gate() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["memory_view_probe"],
+        &[],
+        &["memory_view_probe"],
+        crate::approval::policy_writer::PolicyPreset::Manual,
+        "GUEST BASE",
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2, "one tool round, then the final answer");
+    let tool_results = calls[1]
+        .iter()
+        .find(|(role, content)| role == "user" && content.contains("[Tool results]"))
+        .map(|(_, content)| content.clone())
+        .expect("the second request carries the tool results");
+    assert!(
+        tool_results.contains("stub ran"),
+        "the call was refused by the start-up gate:\n{tool_results}"
     );
 }

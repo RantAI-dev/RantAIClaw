@@ -158,7 +158,7 @@ impl GuestGate {
         }
         // Path-bearing tools (file_read, file_write, pdf_read, image_info)
         // may still try to reach `MEMORY.md`, `USER.md`, `BOOTSTRAP.md`,
-        // `MEMORY_SNAPSHOT.md`, or anything under `memory/` even when they are
+        // `MEMORY_SNAPSHOT.md`, `TOOLS.md`, or anything under `memory/` even when they are
         // in `guest_allowed_tools`. The owner's profile and notes are private
         // to the owner; deny with the same single sentence regardless of which
         // tool tried. Operates even when the operator listed the tool for
@@ -199,17 +199,18 @@ fn is_shell_tool(tool: &str) -> bool {
 
 /// Tools whose calls reach the workspace on a path argument. This keeps
 /// a guest from reaching the owner's private files (`USER.md`, `MEMORY.md`,
-/// `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md` and `memory/`) directly even when the
-/// operator lists one of these tools in `guest_allowed_tools`. The dispatch
-/// skips those files in the system prompt's identity section, so a guest
-/// should never see that content in the prompt either — these extra checks
-/// stop a guest's tool call from reopening the path through `file_read`.
+/// `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, `TOOLS.md` and `memory/`) directly even
+/// when the operator lists one of these tools in `guest_allowed_tools`. The
+/// dispatch skips those files in the system prompt's identity section, so a
+/// guest should never see that content in the prompt either — these extra
+/// checks stop a guest's tool call from reopening the path through
+/// `file_read`.
 fn is_path_tool(tool: &str) -> bool {
     matches!(tool, "file_read" | "file_write" | "pdf_read" | "image_info")
 }
 
 /// Last path component (case-insensitive). `MEMORY.md`, `USER.md`,
-/// `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, and `user.md` all match;
+/// `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, `TOOLS.md`, and `user.md` all match;
 /// `./MEMORY.md`, `memory/brain.db`, and `<workspace>/memory/2026-09-01.md`
 /// all match by their `memory` component.
 pub(crate) fn is_private_owner_path(path: &str) -> bool {
@@ -218,13 +219,13 @@ pub(crate) fn is_private_owner_path(path: &str) -> bool {
     }
     let normalized = path.replace('\\', "/");
     let lowered = normalized.to_ascii_lowercase();
-    // Last component is `MEMORY.md`, `USER.md`, `BOOTSTRAP.md`, or
-    // `MEMORY_SNAPSHOT.md`, case-insensitive. ".//USER.md" and
+    // Last component is `MEMORY.md`, `USER.md`, `BOOTSTRAP.md`,
+    // `MEMORY_SNAPSHOT.md`, or `TOOLS.md`, case-insensitive. ".//USER.md" and
     // "/foo/USER.md" both have `USER.md` as their last segment.
     let last = lowered.rsplit('/').next().unwrap_or("");
     if matches!(
         last,
-        "memory.md" | "user.md" | "bootstrap.md" | "memory_snapshot.md"
+        "memory.md" | "user.md" | "bootstrap.md" | "memory_snapshot.md" | "tools.md"
     ) {
         return true;
     }
@@ -262,7 +263,13 @@ pub fn is_private_owner_path_resolved(resolved: &Path, canonical_workspace: &Pat
     };
     let lowered = name.to_ascii_lowercase();
     let stripped = lowered.strip_prefix('.').unwrap_or(&lowered);
-    const PRIVATE_STEMS: &[&str] = &["memory.md", "user.md", "bootstrap.md", "memory_snapshot.md"];
+    const PRIVATE_STEMS: &[&str] = &[
+        "memory.md",
+        "user.md",
+        "bootstrap.md",
+        "memory_snapshot.md",
+        "tools.md",
+    ];
     PRIVATE_STEMS.iter().any(|stem| stripped.starts_with(stem))
 }
 
@@ -632,6 +639,24 @@ mod tests {
         assert!(r2.contains("private to the owner"), "{r2}");
     }
 
+    /// `TOOLS.md` holds the owner's SSH hosts and device nicknames. The guest
+    /// prompt leaves it out, so a guest must not read it through a tool either.
+    #[test]
+    fn guest_path_tool_blocked_on_tools_md() {
+        let g = GuestGate::new(&["file_read".to_string()], &[]);
+        for path in [
+            "TOOLS.md",
+            "tools.md",
+            "./TOOLS.md",
+            "/var/lib/rantaiclaw/TOOLS.md",
+        ] {
+            let r = g
+                .deny_reason("file_read", &json!({ "path": path }))
+                .unwrap_or_else(|| panic!("file_read on {path} must deny"));
+            assert!(r.contains("private to the owner"), "{path}: {r}");
+        }
+    }
+
     #[test]
     fn guest_path_tool_allowed_on_non_private_paths() {
         let g = GuestGate::new(&["file_read".to_string()], &[]);
@@ -668,6 +693,17 @@ mod tests {
     fn resolved_path_denies_private_stems_case_insensitively() {
         let workspace = Path::new("/ws");
         for name in ["USER.md", "memory.md", "BOOTSTRAP.md", "MEMORY_SNAPSHOT.md"] {
+            assert!(
+                is_private_owner_path_resolved(&workspace.join(name), workspace),
+                "{name} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_path_denies_tools_md_and_its_backup_names() {
+        let workspace = Path::new("/ws");
+        for name in ["TOOLS.md", "tools.md", "TOOLS.md~", ".TOOLS.md.swp"] {
             assert!(
                 is_private_owner_path_resolved(&workspace.join(name), workspace),
                 "{name} must be denied"
