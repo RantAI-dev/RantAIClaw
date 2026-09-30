@@ -5933,8 +5933,12 @@ pub(super) mod test_support {
     pub(crate) fn app_with_context(ctx: TuiContext) -> TuiApp {
         static SHARED_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         let root = SHARED_ROOT.get_or_init(|| {
+            // A static `TempDir` never drops, so the pid in the name lets a later
+            // run prune the directories of test processes that have exited.
+            const PREFIX: &str = "rantaiclaw-tui-test-profile-";
+            crate::profile::dev_guard::prune_dead_pid_dirs(&std::env::temp_dir(), PREFIX);
             tempfile::Builder::new()
-                .prefix("rantaiclaw-tui-test-profile-")
+                .prefix(&format!("{PREFIX}{}-", std::process::id()))
                 .tempdir()
                 .expect("shared tui test profile root")
         });

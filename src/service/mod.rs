@@ -949,7 +949,7 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
                 let entry = String::from_utf8_lossy(&output.stdout);
                 let fields: Vec<&str> = entry.trim().split(':').collect();
                 if fields.len() >= 6 {
-                    return Some(PathBuf::from(fields[5]).join(".rantaiclaw"));
+                    return Some(crate::profile::paths::root_for_home(Path::new(fields[5])));
                 }
             }
         }
@@ -957,8 +957,7 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
 
     std::env::var("HOME")
         .ok()
-        .map(PathBuf::from)
-        .map(|home| home.join(".rantaiclaw"))
+        .map(|home| crate::profile::paths::root_for_home(Path::new(&home)))
 }
 
 fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
@@ -1470,6 +1469,42 @@ mod tests {
         let err = run_checked(Command::new("sh").args(["-lc", "exit 17"]))
             .expect_err("non-zero exit should error");
         assert!(err.to_string().contains("Command failed"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn invoking_user_config_dir_from_home_follows_the_debug_redirect() {
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        // A home that is deliberately not under the temp dir, standing in for a real one.
+        let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "rantaiclaw_test_home_outside_{}",
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(
+            !crate::profile::dev_guard::is_under_temp_dir(&home),
+            "test setup bug: a target dir under the OS temp dir would defeat this test"
+        );
+        let _sudo = crate::test_env::EnvGuard::unset("SUDO_USER");
+        let _allow = crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
+        let _home = crate::test_env::EnvGuard::set("HOME", &home);
+
+        let dir = resolve_invoking_user_config_dir().expect("HOME is set");
+
+        assert!(
+            crate::profile::dev_guard::is_under_temp_dir(&dir),
+            "the config dir must be redirected under the temp dir, got {dir:?}"
+        );
+        assert!(!dir.starts_with(&home));
+        assert_eq!(
+            std::fs::read_dir(&home).unwrap().count(),
+            0,
+            "resolving the dir must not create anything under the home"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(not(target_os = "windows"))]
