@@ -1913,3 +1913,9 @@ pub(crate) async fn run_channel_runtime(
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+mod guest_privacy_tests;

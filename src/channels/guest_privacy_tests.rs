@@ -1,0 +1,2717 @@
+//! The guest privacy invariant, as one executable list.
+//!
+//! **A guest turn never receives the owner's data, and never changes what the
+//! owner sees.**
+//!
+//! Each case drives `process_channel_message` as a guest, with a provider that
+//! attempts the leak: a tool call, or reply text that asks for a file. A case
+//! asserts only on what leaves the process: the requests the provider receives
+//! (system prompt, tool specs, the tool results fed back), the text the channel
+//! is handed, and what the owner reads next (`MEMORY.md`, the owner's next
+//! prompt). It does not assert on an internal helper.
+//!
+//! The cases run against the runtime `build_channel_runtime` builds, with only
+//! the provider and the channel replaced, so the tools, the guest gate, the
+//! prompts and the memory are the ones a daemon runs. Each guest case has an
+//! owner counterpart that makes the same attempt and succeeds, which shows the
+//! case tests the guest rule and not a fixture that refuses everything.
+//!
+//! Any new path that can break the invariant, such as a new door to the owner's
+//! memory, gets a case here.
+//!
+//! The cases group by what they guard: prompt, memory, files, attachments, tools
+//! and owner control.
+
+use super::dispatch::*;
+use super::test_support::*;
+use super::*;
+use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+use crate::observability::NoopObserver;
+use crate::providers::{ChatMessage, Provider};
+use crate::tools::{Tool, ToolResult};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tempfile::TempDir;
+
+// ── cases moved from mod_tests.rs, driven through a stubbed context ──────
+
+/// Shared recorder for [`MemoryViewProbeTool`]: cloned into the tool so a test
+/// keeps a handle to read back what the tool saw after dispatch returns.
+#[derive(Clone, Default)]
+struct MemoryViewRecorder(Arc<std::sync::Mutex<Vec<Option<crate::memory::MemoryView>>>>);
+
+impl MemoryViewRecorder {
+    fn snapshot(&self) -> Vec<Option<crate::memory::MemoryView>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// A test-only tool that does nothing but record the `MemoryView` the current
+/// task runs under (`crate::memory::current_memory_view()`) each time it
+/// executes. Lets a dispatch-level test see what a tool call actually runs
+/// under, not just what the injected `[Memory context]` block held.
+struct MemoryViewProbeTool {
+    recorder: MemoryViewRecorder,
+}
+
+#[async_trait::async_trait]
+impl Tool for MemoryViewProbeTool {
+    fn name(&self) -> &str {
+        "memory_view_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Test-only probe: records the current memory view"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.recorder
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(crate::memory::current_memory_view());
+        Ok(ToolResult {
+            success: true,
+            output: "probed".to_string(),
+            error: None,
+        })
+    }
+}
+
+/// Records every history snapshot handed to it (the system prompt lives at
+/// index 0 of each), and drives exactly one round through `memory_view_probe`
+/// before giving a final answer — so a dispatch-level test can see both the
+/// prompt a turn started from and what the probe saw while the tool loop ran.
+#[derive(Default)]
+struct PromptAndProbeProvider {
+    calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for PromptAndProbeProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("fallback".to_string())
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let snapshot = messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect::<Vec<_>>();
+        let has_tool_results = messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("[Tool results]"));
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(snapshot);
+        if has_tool_results {
+            Ok("Probed the memory view for this turn.".to_string())
+        } else {
+            Ok(r#"<tool_call>
+{"name":"memory_view_probe","arguments":{}}
+</tool_call>"#
+                .to_string())
+        }
+    }
+}
+
+/// A guest's channel turn: the prompt it runs from, the `[Memory context]` it
+/// is allowed to see, and the memory view its own tool calls run under, must
+/// all come from the guest path, never the owner's. Drives the real
+/// dispatcher against a real SQLite store (session-id filtering is exercised
+/// at the SQL level, not stubbed) and a provider that both records the
+/// prompt and forces one round through the probe tool.
+#[tokio::test]
+async fn guest_channel_turn_uses_guest_prompt_scoped_memory_and_probe_view() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+    let msg = traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "guest-msg-1".to_string(),
+        sender: "rantaiclaw_guest".to_string(),
+        reply_target: "chat-guest".to_string(),
+        content: "what is the zorblatt status".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: false,
+    };
+    let guest_conv_key = dispatch::conversation_memory_scope(&msg);
+
+    mem.store(
+        "shared_zorblatt",
+        "The zorblatt status is fine for everyone",
+        MemoryCategory::Core,
+        None,
+    )
+    .await
+    .unwrap();
+    mem.store(
+        "guest_zorblatt",
+        "The zorblatt status for this guest chat is green",
+        MemoryCategory::Core,
+        Some(&guest_conv_key),
+    )
+    .await
+    .unwrap();
+    mem.store(
+        "other_zorblatt",
+        "The zorblatt status for another chat is red",
+        MemoryCategory::Core,
+        Some("other-chat-key"),
+    )
+    .await
+    .unwrap();
+
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let recorder = MemoryViewRecorder::default();
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(mem),
+        tools_registry: Arc::new(vec![Box::new(MemoryViewProbeTool {
+            recorder: recorder.clone(),
+        }) as Box<dyn Tool>]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(tmp.path().to_path_buf()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(
+            &["memory_view_probe".to_string()],
+            &[],
+        )),
+    });
+
+    process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2, "one tool round, then the final answer");
+
+    let system_prompt = calls[0][0].1.clone();
+    assert!(
+        system_prompt.starts_with("GUEST_SYSTEM_PROMPT"),
+        "a guest turn must start from the guest prompt: {system_prompt}"
+    );
+    assert!(
+        system_prompt.contains(
+            "This conversation is a group chat; the current sender is a guest, not an owner."
+        ),
+        "guest group chat-kind line missing: {system_prompt}"
+    );
+
+    let user_turn = calls[0]
+        .iter()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.clone())
+        .expect("a user turn should reach the provider");
+    assert!(
+        user_turn.contains("guest chat is green"),
+        "the guest's own conversation entry never reached the prompt:\n{user_turn}"
+    );
+    assert!(
+        !user_turn.contains("fine for everyone"),
+        "a guest must not see the shared-tier entry:\n{user_turn}"
+    );
+    assert!(
+        !user_turn.contains("another chat is red"),
+        "a guest must not see another conversation's entry:\n{user_turn}"
+    );
+
+    let seen = recorder.snapshot();
+    assert_eq!(
+        seen,
+        vec![Some(crate::memory::MemoryView::Only(
+            guest_conv_key.clone()
+        ))],
+        "the probe tool must run under this guest's own conversation scope: {seen:?}"
+    );
+}
+
+/// An owner's channel turn keeps today's behaviour: the owner prompt, the
+/// layered memory read (own conversation plus the shared tier), and no
+/// `MemoryView` set around its tool calls at all.
+#[tokio::test]
+async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_with_no_probe_view() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+    mem.store(
+        "shared_zorblatt",
+        "The zorblatt status is fine for everyone",
+        MemoryCategory::Core,
+        None,
+    )
+    .await
+    .unwrap();
+    mem.store(
+        "guest_zorblatt",
+        "The zorblatt status for this guest chat is green",
+        MemoryCategory::Core,
+        Some("some-other-guest-key"),
+    )
+    .await
+    .unwrap();
+
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let recorder = MemoryViewRecorder::default();
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(mem),
+        tools_registry: Arc::new(vec![Box::new(MemoryViewProbeTool {
+            recorder: recorder.clone(),
+        }) as Box<dyn Tool>]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(tmp.path().to_path_buf()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(
+            &["memory_view_probe".to_string()],
+            &[],
+        )),
+    });
+
+    process_channel_message(
+        runtime_ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "owner-msg-1".to_string(),
+            sender: "rantaiclaw_owner".to_string(),
+            reply_target: "chat-owner".to_string(),
+            content: "what is the zorblatt status".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2, "one tool round, then the final answer");
+
+    let system_prompt = calls[0][0].1.clone();
+    assert!(
+        system_prompt.starts_with("OWNER_SYSTEM_PROMPT"),
+        "an owner turn must start from the owner prompt: {system_prompt}"
+    );
+    assert!(
+        system_prompt.contains("This conversation is a direct message with the bot's owner."),
+        "owner direct-message chat-kind line missing: {system_prompt}"
+    );
+
+    let user_turn = calls[0]
+        .iter()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.clone())
+        .expect("a user turn should reach the provider");
+    assert!(
+        user_turn.contains("fine for everyone"),
+        "an owner must still see the shared-tier entry:\n{user_turn}"
+    );
+
+    let seen = recorder.snapshot();
+    assert_eq!(
+        seen,
+        vec![None],
+        "an owner's tool calls must run with no memory view set: {seen:?}"
+    );
+}
+
+/// The per-message persona splice in dispatch must use the guest render for
+/// a non-owner sender, so the owner's configured name and timezone never
+/// reach a guest's system prompt. This drives a guest turn against a
+/// `persona.toml` that sets both, and checks neither shows up in the
+/// resulting system prompt.
+#[tokio::test]
+async fn guest_channel_turn_uses_guest_persona_without_owner_name_or_timezone() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let _profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-persona-dispatch");
+
+    let profile = crate::profile::ProfileManager::active().unwrap();
+    crate::persona::write_persona_toml(
+        &profile,
+        &crate::persona::PersonaToml {
+            preset: crate::persona::PresetId::Default,
+            name: "Owner Name".to_string(),
+            timezone: "Asia/Jakarta".to_string(),
+            role: "general productivity and helpful assistance".to_string(),
+            tone: "neutral".to_string(),
+            avoid: None,
+            always_on_kbs: Vec::new(),
+        },
+    )
+    .unwrap();
+
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    // Fixture prompts carry a `## Persona` placeholder so the dispatch splice
+    // (`replace_persona_section`) has a section to swap out.
+    let prompt_fixture = "SYSTEM_PROMPT\n\n## Persona\n\nPLACEHOLDER\n";
+
+    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new(prompt_fixture.to_string()),
+        guest_system_prompt: Arc::new(prompt_fixture.to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        runtime_ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "guest-persona-1".to_string(),
+            sender: "rantaiclaw_guest".to_string(),
+            reply_target: "chat-guest-persona".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let system_prompt = calls[0][0].1.clone();
+    assert!(
+        system_prompt.contains("assistant for the user"),
+        "the guest persona render should replace the owner's name: {system_prompt}"
+    );
+    assert!(
+        !system_prompt.contains("Owner Name"),
+        "guest persona must not carry the owner's name: {system_prompt}"
+    );
+    assert!(
+        !system_prompt.contains("Asia/Jakarta"),
+        "guest persona must not carry the owner's timezone: {system_prompt}"
+    );
+}
+
+/// The exact line a guest reply ends with when an attachment was refused.
+const GUEST_ATTACHMENT_WITHHELD_LINE: &str =
+    "(An attachment was withheld: this bot does not send files to guests.)";
+
+/// What one channel turn produced: the text handed to `Channel::send` and the
+/// system prompt the model started from.
+struct AttachmentTurn {
+    sent: Vec<String>,
+    system_prompt: String,
+}
+
+/// Drives `process_channel_message` for `sender` on a marker-capable channel
+/// whose workspace is `workspace`, with `guest_tools` as the operator's
+/// `guest_allowed_tools`, and a provider that always answers `reply`.
+async fn run_attachment_turn(
+    workspace: &std::path::Path,
+    sender: &str,
+    guest_tools: &[&str],
+    reply: &str,
+) -> AttachmentTurn {
+    run_attachment_turn_on("telegram", workspace, sender, guest_tools, reply).await
+}
+
+/// [`run_attachment_turn`] on the channel named `platform`: `"telegram"` gets the
+/// Telegram-shaped recorder, any other name a plain recorder that reads the
+/// reply the way Discord, Slack, WhatsApp Web and Lark do.
+async fn run_attachment_turn_on(
+    platform: &str,
+    workspace: &std::path::Path,
+    sender: &str,
+    guest_tools: &[&str],
+    reply: &str,
+) -> AttachmentTurn {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+
+    let telegram_impl = Arc::new(TelegramRecordingChannel::default());
+    let plain_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = if platform == "telegram" {
+        telegram_impl.clone()
+    } else {
+        plain_impl.clone()
+    };
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: reply.to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.workspace_dir = Arc::new(workspace.to_path_buf());
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        let tools: Vec<String> = guest_tools.iter().map(|t| (*t).to_string()).collect();
+        inner.guest_gate = Arc::new(crate::approval::GuestGate::new(&tools, &[]));
+    }
+
+    let msg = traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "attachment-msg-1".to_string(),
+        sender: sender.to_string(),
+        reply_target: "chat-attachment".to_string(),
+        content: "please send me the file".to_string(),
+        channel: if platform == "telegram" {
+            "telegram".to_string()
+        } else {
+            plain_impl.name().to_string()
+        },
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: true,
+    };
+    process_channel_message(ctx, msg, CancellationToken::new()).await;
+
+    let recorded = if platform == "telegram" {
+        telegram_impl.sent_messages.lock().await.clone()
+    } else {
+        plain_impl.sent_messages.lock().await.clone()
+    };
+    let sent = recorded
+        .iter()
+        .map(|line| {
+            line.split_once(':')
+                .map_or(line.clone(), |(_, text)| text.to_string())
+        })
+        .collect();
+    let system_prompt = provider_impl
+        .system_prompts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .first()
+        .cloned()
+        .expect("the provider saw one prompt");
+    AttachmentTurn {
+        sent,
+        system_prompt,
+    }
+}
+
+const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
+
+/// A workspace laid out like a real one: the owner's notes database, profile
+/// files, memory notes, and one ordinary file a guest could be shown.
+fn attachment_workspace() -> TempDir {
+    let ws = TempDir::new().expect("temp workspace");
+    let root = ws.path();
+    std::fs::create_dir_all(root.join("memory")).unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    let mut db = SQLITE_HEADER.to_vec();
+    db.extend_from_slice(b"private rows");
+    std::fs::write(root.join("memory/brain.db"), &db).unwrap();
+    std::fs::write(root.join("memory/x.md"), b"owner note").unwrap();
+    std::fs::write(root.join("USER.md"), b"owner profile").unwrap();
+    std::fs::write(root.join("TOOLS.md"), b"SSH host: box-a.example").unwrap();
+    std::fs::write(root.join("notes/menu.txt"), b"soup").unwrap();
+    std::fs::write(root.join("data.bin"), &db).unwrap();
+    ws
+}
+
+/// A guest with no `file_read` grant asks for the owner's notes database.
+/// The marker needs no tool call, so the guest gate never saw it; the reply
+/// filter is the only thing between the request and the upload.
+#[tokio::test]
+async fn guest_reply_marker_for_the_owner_database_is_withheld() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &[],
+        "Here you go [DOCUMENT:memory/brain.db]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(
+        !text.contains("[DOCUMENT:"),
+        "marker reached the channel: {text}"
+    );
+    assert!(text.starts_with("Here you go"), "{text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// The parser also recovers a marker that never closed, when it names a file
+/// that exists by its absolute path. That form is an attachment too.
+#[tokio::test]
+async fn guest_reply_unclosed_marker_for_the_owner_database_is_withheld() {
+    let ws = attachment_workspace();
+    let reply = format!(
+        "Here you go [DOCUMENT:{}",
+        ws.path().join("memory/brain.db").display()
+    );
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &[], &reply).await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(
+        !text.contains("[DOCUMENT:"),
+        "marker reached the channel: {text}"
+    );
+    assert!(
+        !text.contains("brain.db"),
+        "the path reached the chat: {text}"
+    );
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// A URL marker is fetched by the runtime on the channels that must upload
+/// bytes, so it never passes for a guest, `file_read` grant or not.
+#[tokio::test]
+async fn guest_reply_url_marker_is_withheld_with_or_without_file_read() {
+    let ws = attachment_workspace();
+    // A relative target is joined to the workspace, so this URL also names a
+    // real file there. A guest with `file_write` can create it. The marker must
+    // still not pass, because the channel would fetch the URL.
+    std::fs::create_dir_all(ws.path().join("https:/example.com")).unwrap();
+    std::fs::write(ws.path().join("https:/example.com/a.png"), b"png").unwrap();
+    for tools in [&[][..], &["file_read"][..]] {
+        let turn = run_attachment_turn(
+            ws.path(),
+            GUEST_SENDER,
+            tools,
+            "Look [IMAGE:https://example.com/a.png]",
+        )
+        .await;
+
+        assert_eq!(turn.sent.len(), 1, "{tools:?}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert!(
+            !text.contains("[IMAGE:"),
+            "{tools:?}: marker reached the channel: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{tools:?}: {text}"
+        );
+    }
+}
+
+/// Without the `file_read` grant a guest's reply carries no attachment at all,
+/// not even an ordinary file: the operator has not let guests read files.
+#[tokio::test]
+async fn guest_without_file_read_receives_no_attachment_at_all() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &[],
+        "The menu [DOCUMENT:notes/menu.txt]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(!text.contains("[DOCUMENT:"), "{text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// With `file_read` granted, a guest gets what a guest `file_read` could show
+/// and nothing else, and the refusal line appears once however many were refused.
+#[tokio::test]
+async fn guest_with_file_read_receives_an_ordinary_workspace_file() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &["file_read"],
+        "The menu [DOCUMENT:notes/menu.txt]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(text.contains("[DOCUMENT:notes/menu.txt]"), "{text}");
+    assert!(
+        !text.contains(GUEST_ATTACHMENT_WITHHELD_LINE),
+        "nothing was refused: {text}"
+    );
+}
+
+#[tokio::test]
+async fn guest_file_read_grant_withholds_private_owner_files() {
+    let ws = attachment_workspace();
+    let absolute_user = format!("[DOCUMENT:{}]", ws.path().join("USER.md").display());
+    let cases = [
+        ("owner profile", "[DOCUMENT:USER.md]".to_string()),
+        ("owner profile by absolute path", absolute_user),
+        ("owner tool notes", "[DOCUMENT:TOOLS.md]".to_string()),
+        ("memory note", "[DOCUMENT:memory/x.md]".to_string()),
+        ("notes database", "[DOCUMENT:memory/brain.db]".to_string()),
+        (
+            "outside the workspace",
+            "[DOCUMENT:../outside.txt]".to_string(),
+        ),
+    ];
+    for (label, marker) in cases {
+        let reply = format!("Here {marker} and [DOCUMENT:notes/menu.txt]");
+        let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], &reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{label}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert_eq!(
+            text.matches("[DOCUMENT:").count(),
+            1,
+            "{label}: only the ordinary file may pass: {text}"
+        );
+        assert!(
+            text.contains("[DOCUMENT:notes/menu.txt]"),
+            "{label}: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{label}: {text}"
+        );
+        assert_eq!(
+            text.matches(GUEST_ATTACHMENT_WITHHELD_LINE).count(),
+            1,
+            "{label}: one line per reply: {text}"
+        );
+    }
+}
+
+/// The string rule sees `notes/link.txt`; only the resolved path shows it is
+/// the owner's profile.
+#[cfg(unix)]
+#[tokio::test]
+async fn guest_file_read_grant_withholds_a_symlink_to_a_private_file() {
+    let ws = attachment_workspace();
+    std::os::unix::fs::symlink("../USER.md", ws.path().join("notes/link.txt")).unwrap();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &["file_read"],
+        "Here [DOCUMENT:notes/link.txt]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(!text.contains("[DOCUMENT:"), "{text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// A database copied under another name keeps its header.
+#[tokio::test]
+async fn guest_file_read_grant_withholds_a_sqlite_file_under_any_name() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &["file_read"],
+        "Here [DOCUMENT:data.bin]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(!text.contains("[DOCUMENT:"), "{text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// Telegram removes tool-call blocks from a reply before it reads markers. A
+/// marker split by one is not a marker to the parser on the raw reply, and is
+/// one after the removal, so the filter has to read the reply the way Telegram
+/// will.
+#[tokio::test]
+async fn guest_reply_marker_split_by_a_tool_call_block_is_withheld() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(
+        ws.path(),
+        GUEST_SENDER,
+        &[],
+        "Here [DOCU<tool>x</tool>MENT:memory/brain.db]",
+    )
+    .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    assert!(!text.contains("brain.db"), "the marker survived: {text}");
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// What each kind of channel reads out of a sent reply: Discord, Slack, WhatsApp
+/// Web and Lark parse the text as it is, Telegram parses it after removing
+/// tool-call blocks once. Neither may find a marker in a withheld reply.
+fn markers_in_either_view(text: &str) -> Vec<media::OutboundAttachment> {
+    let (_, mut markers) = media::parse_attachment_markers(text);
+    let once = crate::channels::telegram::strip_tool_call_tags(text);
+    let (_, in_telegram_view) = media::parse_attachment_markers(&once);
+    markers.extend(in_telegram_view);
+    markers
+}
+
+/// A tool-call opener with no closer makes Telegram drop everything after it,
+/// so a marker behind one is invisible there. Every other channel parses the raw
+/// text and uploads the file, so the filter has to judge the raw text too.
+#[tokio::test]
+async fn guest_reply_marker_hidden_from_telegram_by_a_tool_tag_is_withheld_everywhere() {
+    let ws = attachment_workspace();
+    for platform in ["telegram", "test-channel"] {
+        for reply in [
+            "<tool>[DOCUMENT:memory/brain.db]",
+            "<tool>[DOCUMENT:memory/brain.db]</tool>",
+            "<function_calls>[DOCUMENT:memory/brain.db]",
+        ] {
+            let turn = run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &[], reply).await;
+
+            assert_eq!(turn.sent.len(), 1, "{platform} {reply}: {:?}", turn.sent);
+            let text = &turn.sent[0];
+            assert_eq!(
+                markers_in_either_view(text),
+                Vec::new(),
+                "{platform} {reply}: a marker reached the channel: {text}"
+            );
+            assert!(
+                text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+                "{platform} {reply}: {text}"
+            );
+        }
+    }
+}
+
+/// Telegram removes tool-call blocks once, not until none is left. Here one
+/// removal turns the reply into `<tool>[DOCUMENT:memory/brain.db]</tool>` and
+/// Telegram uploads the file. Removing to the end would hide the marker, and the
+/// raw text has none, so the filter has to read the reply once, as Telegram does.
+#[tokio::test]
+async fn guest_reply_marker_revealed_by_one_tool_tag_removal_is_withheld() {
+    let ws = attachment_workspace();
+    let reply = "<too<tool>x</tool>l>[DOC<tool>y</tool>UMENT:memory/brain.db]</tool>";
+    let once = crate::channels::telegram::strip_tool_call_tags(reply);
+    assert_eq!(once, "<tool>[DOCUMENT:memory/brain.db]</tool>", "fixture");
+    assert_eq!(media::parse_attachment_markers(reply).1, Vec::new());
+
+    for platform in ["telegram", "test-channel"] {
+        let turn = run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &[], reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{platform}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert_eq!(
+            markers_in_either_view(text),
+            Vec::new(),
+            "{platform}: a marker reached the channel: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{platform}: {text}"
+        );
+    }
+}
+
+/// The rebuilt reply keeps what passed and, read either way, carries nothing
+/// else. The refused marker sits behind a tool-call opener that Telegram cuts at.
+#[tokio::test]
+async fn guest_reply_rebuilt_around_a_hidden_marker_keeps_only_what_passed() {
+    let ws = attachment_workspace();
+    let reply = "Menu [DOCUMENT:notes/menu.txt] <tool>[DOCUMENT:memory/brain.db]";
+    for platform in ["telegram", "test-channel"] {
+        let turn =
+            run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &["file_read"], reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{platform}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        let expected = vec![media::OutboundAttachment {
+            kind: media::AttachmentKind::Document,
+            target: "notes/menu.txt".to_string(),
+        }];
+        assert_eq!(media::parse_attachment_markers(text).1, expected, "{text}");
+        assert_eq!(
+            media::parse_attachment_markers(&crate::channels::telegram::strip_tool_call_tags(text))
+                .1,
+            expected,
+            "{text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{platform}: {text}"
+        );
+    }
+}
+
+/// Removing a refused marker joins the text on both sides of it. A marker the
+/// original reply had inside a code span is never judged, and the joined text
+/// must not turn that span into live text. Here two separate backtick runs
+/// become one run, which closes the span, so the rebuilt reply would upload
+/// the database on every channel.
+#[tokio::test]
+async fn guest_reply_rebuild_does_not_expose_a_marker_from_a_code_span() {
+    let ws = attachment_workspace();
+    let reply = "`x`[IMAGE:https://example.com/a.png]` [DOCUMENT:memory/brain.db]";
+    for platform in ["telegram", "test-channel"] {
+        let turn = run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &[], reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{platform}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert_eq!(
+            markers_in_either_view(text),
+            Vec::new(),
+            "{platform}: a marker reached the channel: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{platform}: {text}"
+        );
+    }
+}
+
+/// Removing a refused marker can also join the halves of a tool-call tag, and
+/// Telegram's single removal then leaves a live marker the original reply had
+/// only inside a code span.
+#[tokio::test]
+async fn guest_reply_rebuild_does_not_join_a_tool_tag_around_a_code_span_marker() {
+    let ws = attachment_workspace();
+    let reply = "`x`<to[IMAGE:https://example.com/a.png]ol></tool>` [DOCUMENT:memory/brain.db]";
+    for platform in ["telegram", "test-channel"] {
+        let turn = run_attachment_turn_on(platform, ws.path(), GUEST_SENDER, &[], reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{platform}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert_eq!(
+            markers_in_either_view(text),
+            Vec::new(),
+            "{platform}: a marker reached the channel: {text}"
+        );
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{platform}: {text}"
+        );
+    }
+}
+
+/// Only Telegram uploads a reply that is just a path or a URL. On the other
+/// channels the same text is sent as text, so it stays as it is.
+#[tokio::test]
+async fn guest_path_only_reply_is_judged_on_telegram_only() {
+    let ws = attachment_workspace();
+    let user_md = ws.path().join("USER.md").display().to_string();
+    for reply in ["https://example.com/menu.pdf".to_string(), user_md.clone()] {
+        for tools in [&[][..], &["file_read"][..]] {
+            let turn =
+                run_attachment_turn_on("test-channel", ws.path(), GUEST_SENDER, tools, &reply)
+                    .await;
+            assert_eq!(turn.sent, vec![reply.clone()], "{tools:?}");
+        }
+    }
+
+    let turn = run_attachment_turn_on(
+        "telegram",
+        ws.path(),
+        GUEST_SENDER,
+        &["file_read"],
+        "https://example.com/menu.pdf",
+    )
+    .await;
+    assert_eq!(turn.sent, vec![GUEST_ATTACHMENT_WITHHELD_LINE.to_string()]);
+}
+
+/// A marker the guest may receive, placed inside a tool-call block, is a marker
+/// for the channels that read the raw text. Telegram removes the block and is
+/// left with a reply that is only an owner file's path, which it uploads. The
+/// marker found elsewhere must not stop the path-only check.
+#[tokio::test]
+async fn guest_reply_path_only_after_tool_block_removal_is_withheld_on_telegram() {
+    let ws = attachment_workspace();
+    let user_md = ws.path().join("USER.md").display().to_string();
+    let reply = format!("{user_md}<tool>[DOCUMENT:notes/menu.txt]</tool>");
+    let once = crate::channels::telegram::strip_tool_call_tags(&reply);
+    assert_eq!(once, user_md, "fixture");
+
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], &reply).await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let text = &turn.sent[0];
+    let telegram_view = crate::channels::telegram::strip_tool_call_tags(text);
+    assert!(
+        crate::channels::telegram::parse_path_only_attachment(&telegram_view).is_none(),
+        "Telegram would upload the owner file: {text}"
+    );
+    assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+}
+
+/// Telegram uploads a reply that is only a path to an existing file, with no
+/// marker at all. That form needs the same filter as a marker.
+#[tokio::test]
+async fn guest_reply_that_is_only_an_owner_file_path_is_withheld() {
+    let ws = attachment_workspace();
+    let user_md = ws.path().join("USER.md").display().to_string();
+    for tools in [&[][..], &["file_read"][..]] {
+        for reply in [
+            user_md.clone(),
+            format!("`{user_md}`"),
+            format!("file://{user_md}"),
+        ] {
+            let turn = run_attachment_turn(ws.path(), GUEST_SENDER, tools, &reply).await;
+
+            assert_eq!(
+                turn.sent,
+                vec![GUEST_ATTACHMENT_WITHHELD_LINE.to_string()],
+                "{tools:?} {reply}"
+            );
+        }
+    }
+}
+
+/// With the grant, a path-only reply for an ordinary file is left as it is, and
+/// a path-only reply for a file that does not exist was never an attachment.
+#[tokio::test]
+async fn guest_path_only_reply_for_a_readable_or_missing_file_is_unchanged() {
+    let ws = attachment_workspace();
+    let menu = ws.path().join("notes/menu.txt").display().to_string();
+    let missing = ws.path().join("notes/missing.txt").display().to_string();
+
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], &menu).await;
+    assert_eq!(turn.sent, vec![menu.clone()]);
+
+    for tools in [&[][..], &["file_read"][..]] {
+        let turn = run_attachment_turn(ws.path(), GUEST_SENDER, tools, &missing).await;
+        assert_eq!(turn.sent, vec![missing.clone()], "{tools:?}");
+    }
+
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &[], &menu).await;
+    assert_eq!(
+        turn.sent,
+        vec![GUEST_ATTACHMENT_WITHHELD_LINE.to_string()],
+        "no file_read grant, no attachment"
+    );
+}
+
+#[tokio::test]
+async fn owner_path_only_reply_is_unchanged() {
+    let ws = attachment_workspace();
+    let user_md = ws.path().join("USER.md").display().to_string();
+    let turn = run_attachment_turn(ws.path(), OWNER_SENDER, &[], &user_md).await;
+
+    assert_eq!(turn.sent, vec![user_md]);
+}
+
+/// A SQLite write-ahead log, shared-memory file or rollback journal holds
+/// database pages but has no `SQLite format 3` header.
+#[tokio::test]
+async fn guest_file_read_grant_withholds_sqlite_sidecar_files() {
+    let ws = attachment_workspace();
+    for name in ["data.db-wal", "data.db-shm", "data.db-journal"] {
+        std::fs::write(ws.path().join("notes").join(name), b"arbitrary page bytes").unwrap();
+        let reply = format!("Here [DOCUMENT:notes/{name}]");
+        let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], &reply).await;
+
+        assert_eq!(turn.sent.len(), 1, "{name}: {:?}", turn.sent);
+        let text = &turn.sent[0];
+        assert!(!text.contains("[DOCUMENT:"), "{name}: {text}");
+        assert!(
+            text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
+            "{name}: {text}"
+        );
+    }
+}
+
+/// Owner turns keep the marker byte for byte: the same reply that is
+/// withheld from a guest reaches the channel untouched.
+#[tokio::test]
+async fn owner_reply_marker_reaches_the_channel_unchanged() {
+    let ws = attachment_workspace();
+    let reply = "Here you go [DOCUMENT:memory/brain.db] and [IMAGE:https://example.com/a.png]";
+    let turn = run_attachment_turn(ws.path(), OWNER_SENDER, &[], reply).await;
+
+    assert_eq!(turn.sent, vec![reply.to_string()]);
+}
+
+#[tokio::test]
+async fn guest_prompt_carries_no_attachment_instructions_without_file_read() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &[], "ok").await;
+
+    let prompt = &turn.system_prompt;
+    assert!(!prompt.contains("[DOCUMENT:"), "{prompt}");
+    assert!(!prompt.contains("media marker"), "{prompt}");
+    assert!(
+        !prompt.contains(&ws.path().display().to_string()),
+        "the workspace path reached a guest prompt: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn guest_prompt_with_file_read_gets_the_guest_variant_only() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(ws.path(), GUEST_SENDER, &["file_read"], "ok").await;
+
+    let prompt = &turn.system_prompt;
+    assert!(
+        prompt.contains(&media::guest_delivery_instructions_for("telegram")),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains(&ws.path().display().to_string()),
+        "the workspace path reached a guest prompt: {prompt}"
+    );
+    assert!(
+        !prompt.contains("<path-or-url>"),
+        "the owner wording, which offers URLs, reached a guest: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn owner_prompt_keeps_the_attachment_instructions() {
+    let ws = attachment_workspace();
+    let turn = run_attachment_turn(ws.path(), OWNER_SENDER, &[], "ok").await;
+
+    assert!(
+        turn.system_prompt
+            .contains(&crate::channels::telegram::telegram_delivery_instructions(
+                ws.path()
+            )),
+        "{}",
+        turn.system_prompt
+    );
+}
+
+/// Runs one turn from `sender` against a registry of stub tools named
+/// `registry`, with `guest_tools` as the operator's `guest_allowed_tools`, on
+/// a provider with native tool calling. Returns the tool names each provider
+/// request carried.
+async fn native_specs_seen_by(
+    sender: &str,
+    registry: &[&'static str],
+    guest_tools: &[&str],
+) -> Vec<Option<Vec<String>>> {
+    native_spec_requests_seen_by(sender, registry, guest_tools)
+        .await
+        .into_iter()
+        .map(|request| request.map(|specs| specs.into_iter().map(|s| s.name).collect()))
+        .collect()
+}
+
+/// [`native_specs_seen_by`], keeping each whole spec.
+async fn native_spec_requests_seen_by(
+    sender: &str,
+    registry: &[&'static str],
+    guest_tools: &[&str],
+) -> Vec<Option<Vec<crate::tools::ToolSpec>>> {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+
+    let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+    let provider_impl = Arc::new(NativeSpecRecorder::default());
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.tools_registry = Arc::new(
+            registry
+                .iter()
+                .map(|name| Box::new(NamedStubTool(name)) as Box<dyn Tool>)
+                .collect(),
+        );
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        let tools: Vec<String> = guest_tools.iter().map(|t| (*t).to_string()).collect();
+        inner.guest_gate = Arc::new(crate::approval::GuestGate::new(&tools, &[]));
+    }
+
+    process_channel_message(
+        ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "spec-msg-1".to_string(),
+            sender: sender.to_string(),
+            reply_target: "chat-spec".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let mut requests = provider_impl
+        .requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *requests)
+}
+
+/// A native provider is handed a spec per tool in the loop's registry, so a
+/// guest turn must run on the tools the guest may use and no others.
+#[tokio::test]
+async fn guest_turn_hands_a_native_provider_only_the_permitted_tool_specs() {
+    let seen = native_specs_seen_by(
+        GUEST_SENDER,
+        &["shell", "web_search_tool", "delegate"],
+        &["web_search_tool"],
+    )
+    .await;
+
+    assert_eq!(
+        seen,
+        vec![Some(vec!["web_search_tool".to_string()])],
+        "a guest's request must carry the permitted tool only"
+    );
+}
+
+/// An owner-only tool in `guest_allowed_tools` is still refused by the gate,
+/// so the guest is not offered it either.
+#[tokio::test]
+async fn guest_turn_is_not_offered_an_owner_only_tool_the_operator_listed() {
+    let seen = native_specs_seen_by(
+        GUEST_SENDER,
+        &["web_search_tool", "delegate"],
+        &["web_search_tool", "delegate"],
+    )
+    .await;
+
+    assert_eq!(seen, vec![Some(vec!["web_search_tool".to_string()])]);
+}
+
+/// A guest with no allowed tools is shown no tool specs, not the registry
+/// with every call refused at execution.
+#[tokio::test]
+async fn guest_turn_with_no_allowed_tools_carries_no_tool_specs() {
+    let seen = native_specs_seen_by(GUEST_SENDER, &["shell", "web_search_tool"], &[]).await;
+
+    assert_eq!(seen, vec![None], "the request must carry no tool specs");
+}
+
+/// Control: an owner turn on the same registry keeps every tool.
+#[tokio::test]
+async fn owner_turn_keeps_every_tool_spec() {
+    let seen = native_specs_seen_by(
+        OWNER_SENDER,
+        &["shell", "web_search_tool", "delegate"],
+        &["web_search_tool"],
+    )
+    .await;
+
+    assert_eq!(
+        seen,
+        vec![Some(vec![
+            "shell".to_string(),
+            "web_search_tool".to_string(),
+            "delegate".to_string()
+        ])]
+    );
+}
+
+/// The guest gate still answers every call, including one for a tool that was
+/// left out of the guest's list: the refusal names the ceiling, not an
+/// unknown tool.
+#[tokio::test]
+async fn guest_call_to_a_tool_outside_its_list_is_refused_by_the_gate() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+
+    let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.tools_registry = Arc::new(vec![
+            Box::new(NamedStubTool("memory_view_probe")) as Box<dyn Tool>,
+            Box::new(NamedStubTool("web_search_tool")) as Box<dyn Tool>,
+        ]);
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        inner.guest_gate = Arc::new(crate::approval::GuestGate::new(
+            &["web_search_tool".to_string()],
+            &[],
+        ));
+    }
+
+    process_channel_message(
+        ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "gate-msg-1".to_string(),
+            sender: GUEST_SENDER.to_string(),
+            reply_target: "chat-gate".to_string(),
+            content: "probe".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2, "one tool round, then the final answer");
+    let tool_results = calls[1]
+        .iter()
+        .find(|(role, content)| role == "user" && content.contains("[Tool results]"))
+        .map(|(_, content)| content.clone())
+        .expect("the second request carries the tool results");
+    assert!(
+        tool_results.contains("isn't available to non-owner users"),
+        "the gate's refusal is missing:\n{tool_results}"
+    );
+    assert!(
+        !tool_results.contains("Unknown tool"),
+        "the call fell through to the unknown-tool path:\n{tool_results}"
+    );
+}
+
+/// The protocol block of a guest turn follows the gate as reloaded, so a tool
+/// the operator adds or removes live is described from the next message on.
+/// The example names the first tool of the block it heads.
+#[tokio::test]
+async fn guest_turn_protocol_block_follows_the_reloaded_gate() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: "ok".to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["shell", "web_search_tool", "file_read"],
+        &["web_search_tool"],
+        &["web_search_tool"],
+        crate::approval::policy_writer::PolicyPreset::Manual,
+        "GUEST BASE",
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+    reload_guest_gate(&ctx, &["file_read"]);
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-2").await;
+
+    let prompts = prompts_seen_by(&provider_impl);
+    assert_eq!(prompts.len(), 2, "one provider call per turn");
+    let first = tool_protocol_block(&prompts[0]);
+    assert!(first.contains(r#"{"name":"web_search_tool""#), "{first}");
+    assert!(first.contains("**web_search_tool**: stub tool"), "{first}");
+    assert!(!first.contains("file_read"), "{first}");
+    assert!(!first.contains("shell"), "{first}");
+
+    let second = tool_protocol_block(&prompts[1]);
+    assert!(second.contains(r#"{"name":"file_read""#), "{second}");
+    assert!(second.contains("**file_read**: stub tool"), "{second}");
+    assert!(
+        !second.contains("web_search_tool"),
+        "the turn described the start-up gate, not the reloaded one:\n{second}"
+    );
+    assert!(!second.contains("shell"), "{second}");
+}
+
+/// The specs a native provider receives follow the gate as reloaded. The
+/// start-up gate stays what the context was built with.
+#[tokio::test]
+async fn guest_turn_native_specs_follow_the_reloaded_gate() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let provider_impl = Arc::new(NativeSpecRecorder::default());
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["shell", "web_search_tool", "file_read"],
+        &["web_search_tool"],
+        &["web_search_tool"],
+        crate::approval::policy_writer::PolicyPreset::Manual,
+        "GUEST BASE",
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+    reload_guest_gate(&ctx, &["file_read"]);
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-2").await;
+
+    let names: Vec<Option<Vec<String>>> = provider_impl
+        .requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|request| {
+            request
+                .as_ref()
+                .map(|specs| specs.iter().map(|s| s.name.clone()).collect())
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            Some(vec!["web_search_tool".to_string()]),
+            Some(vec!["file_read".to_string()]),
+        ],
+        "the second turn must carry the reloaded gate's tool"
+    );
+    // The specs carry the tool syntax, so the prompt has no protocol block.
+    for prompt in provider_impl
+        .system_prompts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        assert!(!prompt.contains("## Tool Use Protocol"), "{prompt}");
+    }
+}
+
+/// The spec a guest's native provider receives for a tool is the owner's spec
+/// for it: name, description and parameters.
+#[tokio::test]
+async fn guest_native_spec_equals_the_owners_spec_for_the_same_tool() {
+    let registry = ["shell", "web_search_tool"];
+    let guest = native_spec_requests_seen_by(GUEST_SENDER, &registry, &["web_search_tool"]).await;
+    let owner = native_spec_requests_seen_by(OWNER_SENDER, &registry, &["web_search_tool"]).await;
+
+    let guest_specs = guest[0].as_ref().expect("the guest request carries specs");
+    let owner_specs = owner[0].as_ref().expect("the owner request carries specs");
+    let owner_spec = owner_specs
+        .iter()
+        .find(|s| s.name == "web_search_tool")
+        .expect("the owner is offered the tool");
+    assert_eq!(guest_specs.len(), 1);
+    assert_eq!(guest_specs[0].name, owner_spec.name);
+    assert_eq!(guest_specs[0].description, owner_spec.description);
+    assert_eq!(guest_specs[0].parameters, owner_spec.parameters);
+    assert_eq!(
+        guest_specs[0].description, "stub tool",
+        "the spec is not empty"
+    );
+    assert_eq!(guest_specs[0].parameters["type"], "object");
+}
+
+/// The gate that answers a guest's call is the one reloaded from the config,
+/// like the tool list, so a tool an operator adds to `guest_allowed_tools`
+/// runs on the next message and is not refused by the start-up gate.
+#[tokio::test]
+async fn guest_call_is_checked_against_the_reloaded_gate() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let ctx = guest_turn_context(
+        provider_impl.clone(),
+        &["memory_view_probe"],
+        &[],
+        &["memory_view_probe"],
+        crate::approval::policy_writer::PolicyPreset::Manual,
+        "GUEST BASE",
+    );
+
+    send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2, "one tool round, then the final answer");
+    let tool_results = calls[1]
+        .iter()
+        .find(|(role, content)| role == "user" && content.contains("[Tool results]"))
+        .map(|(_, content)| content.clone())
+        .expect("the second request carries the tool results");
+    assert!(
+        tool_results.contains("stub ran"),
+        "the call was refused by the start-up gate:\n{tool_results}"
+    );
+}
+
+// ── the built runtime the cases below run against ────────────────────────
+
+/// Content only the owner's files carry. A guest turn must never put one of
+/// these in front of the provider, and an owner turn still reads them.
+const USER_FILE_SECRET: &str = "owner-profile-secret-41c9";
+const MEMORY_FILE_SECRET: &str = "owner-notes-secret-52d0";
+const BOOTSTRAP_FILE_SECRET: &str = "owner-bootstrap-secret-63e1";
+const TOOLS_FILE_SECRET: &str = "owner-tools-secret-74f2";
+const SNAPSHOT_FILE_SECRET: &str = "owner-snapshot-secret-85a3";
+const DAILY_NOTE_SECRET: &str = "owner-daily-note-secret-96b4";
+const PERSONA_NAME: &str = "Owner Name";
+// A zone no tool schema uses as an example (the cron tool names `Asia/Jakarta`),
+// so the string is in a prompt only when the persona put it there.
+const PERSONA_TIMEZONE: &str = "Pacific/Kiritimati";
+
+const OWNER_FILE_SECRETS: [&str; 6] = [
+    USER_FILE_SECRET,
+    MEMORY_FILE_SECRET,
+    BOOTSTRAP_FILE_SECRET,
+    TOOLS_FILE_SECRET,
+    SNAPSHOT_FILE_SECRET,
+    DAILY_NOTE_SECRET,
+];
+
+/// Fails when `text`, which reached `sink`, carries any of the owner's file
+/// content, or one of the `extra` owner strings.
+fn assert_owner_data_absent(sink: &str, text: &str, extra: &[&str]) {
+    for secret in OWNER_FILE_SECRETS.iter().chain(extra) {
+        assert!(!text.contains(secret), "{secret} reached {sink}:\n{text}");
+    }
+}
+
+/// One word per stored note, so a test can tell which note reached the provider.
+const SHARED_NOTE_WORD: &str = "saffronquartz";
+const OTHER_CHAT_NOTE_WORD: &str = "marigoldquartz";
+const GUEST_NOTE_WORD: &str = "juniperquartz";
+
+const GUEST_CHAT: &str = "chat-guest";
+const OTHER_GUEST_CHAT: &str = "chat-other-guest";
+const OWNER_CHAT: &str = "chat-owner";
+
+/// A reply that asks the runtime to run `tool`.
+fn call(tool: &str, arguments: serde_json::Value) -> String {
+    format!(
+        "<tool_call>\n{}\n</tool_call>",
+        serde_json::json!({ "name": tool, "arguments": arguments })
+    )
+}
+
+/// One provider reply that asks for every call in `calls`, in order.
+fn all_calls(calls: &[(&str, serde_json::Value)]) -> String {
+    calls
+        .iter()
+        .map(|(tool, arguments)| call(tool, arguments.clone()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The paths of the owner's files a guest asks for by name, by a backup name and
+/// through a link.
+fn private_owner_paths() -> Vec<&'static str> {
+    let mut paths = vec![
+        "USER.md",
+        "MEMORY.md",
+        "MEMORY_SNAPSHOT.md",
+        "BOOTSTRAP.md",
+        "TOOLS.md",
+        "memory/x.md",
+        "USER.md~",
+    ];
+    if cfg!(unix) {
+        paths.push("notes/link.txt");
+    }
+    paths
+}
+
+/// What a provider was sent in one request: every message, and the names of
+/// the tool specs a native request carried (`None` when it carried none).
+struct Request {
+    messages: Vec<(String, String)>,
+    tools: Option<Vec<String>>,
+}
+
+/// A provider that plays a script. Each request is answered with the next
+/// scripted reply, so a case decides what the model attempts, and every
+/// request is kept for the case to read back.
+struct ScriptedProvider {
+    native: std::sync::atomic::AtomicBool,
+    script: std::sync::Mutex<std::collections::VecDeque<String>>,
+    seen: std::sync::Mutex<Vec<Request>>,
+}
+
+impl ScriptedProvider {
+    fn new() -> Self {
+        Self {
+            native: std::sync::atomic::AtomicBool::new(false),
+            script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, messages: &[ChatMessage], tools: Option<&[crate::tools::ToolSpec]>) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Request {
+                messages: messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect(),
+                tools: tools.map(|specs| specs.iter().map(|s| s.name.clone()).collect()),
+            });
+    }
+
+    fn next_reply(&self) -> String {
+        self.script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+            .unwrap_or_else(|| "Done.".to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ScriptedProvider {
+    fn supports_native_tools(&self) -> bool {
+        self.native.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.record(messages, None);
+        Ok(self.next_reply())
+    }
+
+    async fn chat(
+        &self,
+        request: crate::providers::ChatRequest<'_>,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<crate::providers::ChatResponse> {
+        self.record(request.messages, request.tools);
+        Ok(crate::providers::ChatResponse {
+            usage: None,
+            text: Some(self.next_reply()),
+            tool_calls: Vec::new(),
+        })
+    }
+}
+
+/// What one turn sent out: the requests the provider received and the text the
+/// channel was handed.
+struct Turn {
+    requests: Vec<Request>,
+    sent: Vec<String>,
+}
+
+impl Turn {
+    fn system_prompt(&self) -> &str {
+        self.requests
+            .first()
+            .and_then(|request| request.messages.iter().find(|(role, _)| role == "system"))
+            .map_or("", |(_, content)| content.as_str())
+    }
+
+    /// Everything the provider was sent, in every request of the turn.
+    fn provider_text(&self) -> String {
+        self.requests
+            .iter()
+            .flat_map(|request| request.messages.iter().map(|(_, content)| content.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The tool results fed back to the provider by the end of the turn.
+    fn tool_results(&self) -> String {
+        self.requests
+            .last()
+            .map(|request| {
+                request
+                    .messages
+                    .iter()
+                    .filter(|(role, content)| role != "system" && content.contains("<tool_result"))
+                    .map(|(_, content)| content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// What a deployment is started with.
+#[derive(Clone)]
+struct Options {
+    guest_tools: Vec<&'static str>,
+    crowded_core_memory: bool,
+    skills_mode: crate::config::SkillsPromptInjectionMode,
+}
+
+impl Options {
+    fn guest_tools(tools: &[&'static str]) -> Self {
+        Self {
+            guest_tools: tools.to_vec(),
+            crowded_core_memory: false,
+            skills_mode: crate::config::SkillsPromptInjectionMode::Full,
+        }
+    }
+
+    /// Shared core notes past the size of the block the prompt carries.
+    fn crowded(mut self) -> Self {
+        self.crowded_core_memory = true;
+        self
+    }
+
+    fn skills_mode(mut self, mode: crate::config::SkillsPromptInjectionMode) -> Self {
+        self.skills_mode = mode;
+        self
+    }
+}
+
+/// The names of the tools a tool-use protocol block describes, sorted. Each
+/// tool opens a line with `**<name>**: ` under "### Available Tools".
+fn protocol_block_tool_names(block: &str) -> Vec<String> {
+    let listed = block
+        .split_once("### Available Tools")
+        .map_or("", |(_, listed)| listed);
+    let mut names: Vec<String> = listed
+        .lines()
+        .filter_map(|line| line.strip_prefix("**"))
+        .filter_map(|rest| rest.split_once("**: "))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The message a channel hands to dispatch.
+fn channel_message(sender: &str, chat: &str, content: &str, id: &str) -> traits::ChannelMessage {
+    traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: id.to_string(),
+        sender: sender.to_string(),
+        reply_target: chat.to_string(),
+        content: content.to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: true,
+    }
+}
+
+/// Owner files, a shared skill and notes in every tier, laid out like the
+/// workspace of a bot that has been in use.
+async fn seed_owner_workspace(root: &std::path::Path, crowded: bool) {
+    let write = |name: &str, content: String| {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().expect("a parent directory")).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write("AGENTS.md", "# Agents\nFollow instructions.".to_string());
+    write("SOUL.md", "# Soul\nBe helpful.".to_string());
+    write("IDENTITY.md", "# Identity\nName: RantaiClaw".to_string());
+    write("USER.md", format!("# User\n{USER_FILE_SECRET}"));
+    write("USER.md~", format!("# User backup\n{USER_FILE_SECRET}"));
+    write(
+        "TOOLS.md",
+        format!("# Tools\nSSH host: {TOOLS_FILE_SECRET}"),
+    );
+    write(
+        "BOOTSTRAP.md",
+        format!("# Bootstrap\n{BOOTSTRAP_FILE_SECRET}"),
+    );
+    write("MEMORY.md", format!("# Memory\n{MEMORY_FILE_SECRET}"));
+    write(
+        "MEMORY_SNAPSHOT.md",
+        format!("# Snapshot\n{SNAPSHOT_FILE_SECRET}"),
+    );
+    write("memory/x.md", DAILY_NOTE_SECRET.to_string());
+    write("notes/menu.txt", "soup".to_string());
+    write(
+        "skills/greeting/SKILL.md",
+        "---\nname: greeting\ndescription: Greets people\n---\n# Greeting\nSay hello.".to_string(),
+    );
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../USER.md", root.join("notes/link.txt")).unwrap();
+
+    let memory = SqliteMemory::new(root).expect("the notes database opens");
+    memory
+        .store(
+            "shared_recipe",
+            &format!("Owner shared note about the lantern: {SHARED_NOTE_WORD}"),
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+    memory
+        .store(
+            "other_chat_note",
+            &format!("Another chat's note about the lantern: {OTHER_CHAT_NOTE_WORD}"),
+            MemoryCategory::Core,
+            Some("other-chat"),
+        )
+        .await
+        .unwrap();
+    let guest_scope = dispatch::conversation_memory_scope(&channel_message(
+        GUEST_SENDER,
+        GUEST_CHAT,
+        "seed",
+        "seed",
+    ));
+    memory
+        .store(
+            "guest_chat_note",
+            &format!("The guest chat's note about the lantern: {GUEST_NOTE_WORD}"),
+            MemoryCategory::Core,
+            Some(&guest_scope),
+        )
+        .await
+        .unwrap();
+    if crowded {
+        for index in 0..60 {
+            memory
+                .store(
+                    &format!("filler_{index}"),
+                    &"filler text for the shared block ".repeat(4),
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// The runtime a bot operator would run, built by `build_channel_runtime` over
+/// a real workspace, with the provider and the channel replaced by ones the
+/// case can script and read. The tools, the gate, the prompts and the memory
+/// are the ones a daemon builds.
+///
+/// `autonomous_tools` is on so no owner approval prompt sits between a tool
+/// call and the tool. Guests are still held by the guest gate.
+struct Deployment {
+    ctx: Arc<ChannelRuntimeContext>,
+    provider: Arc<ScriptedProvider>,
+    channel: Arc<RecordingChannel>,
+    config: Config,
+    workspace: TempDir,
+    next_message: std::sync::atomic::AtomicUsize,
+    // Fields drop in declaration order: the runtime first, then the
+    // directories, then the environment guards that put the variables back,
+    // and the lock last.
+    config_dir: TempDir,
+    home: TempDir,
+    _profile: crate::test_env::EnvGuard,
+    _config_dir_env: crate::test_env::EnvGuard,
+    _home_env: crate::test_env::HomeGuard,
+    _audit: crate::test_env::EnvGuard,
+    _lock: crate::test_env::EnvAuditRedirect,
+}
+
+impl Deployment {
+    async fn start(options: Options) -> Self {
+        let (lock, audit) = crate::test_env::redirect_audit_temp().await;
+        let home = TempDir::new().expect("temp home");
+        let config_dir = TempDir::new().expect("temp config dir");
+        let workspace = TempDir::new().expect("temp workspace");
+        let home_env = crate::test_env::HomeGuard::set(home.path());
+        let config_dir_env =
+            crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+        let profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "guest-privacy");
+
+        let active = crate::profile::ProfileManager::active().expect("the profile resolves");
+        crate::persona::write_persona_toml(
+            &active,
+            &crate::persona::PersonaToml {
+                preset: crate::persona::PresetId::Default,
+                name: PERSONA_NAME.to_string(),
+                timezone: PERSONA_TIMEZONE.to_string(),
+                role: "general productivity and helpful assistance".to_string(),
+                tone: "neutral".to_string(),
+                avoid: None,
+                always_on_kbs: Vec::new(),
+            },
+        )
+        .unwrap();
+        seed_owner_workspace(workspace.path(), options.crowded_core_memory).await;
+
+        let mut config = Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            config_path: config_dir.path().join("config.toml"),
+            default_provider: Some("openai-codex".to_string()),
+            channels_config: crate::config::schema::ChannelsConfig {
+                telegram: Some(crate::config::TelegramConfig {
+                    bot_token: "111111111:not-a-real-token".into(),
+                    allowed_users: vec!["*".into()],
+                    stream_mode: crate::config::StreamMode::default(),
+                    draft_update_interval_ms: 1000,
+                    interrupt_on_new_message: false,
+                    mention_only: false,
+                }),
+                approval_owners: vec![OWNER_SENDER.to_string()],
+                guest_allowed_tools: options
+                    .guest_tools
+                    .iter()
+                    .map(|t| (*t).to_string())
+                    .collect(),
+                autonomous_tools: true,
+                ..crate::config::schema::ChannelsConfig::default()
+            },
+            ..Config::default()
+        };
+        config.skills.prompt_injection_mode = options.skills_mode;
+
+        let provider = Arc::new(ScriptedProvider::new());
+        let channel = Arc::new(RecordingChannel::default());
+        let ctx = Self::build_context(&config, &provider, &channel).await;
+        Self {
+            ctx,
+            provider,
+            channel,
+            config,
+            workspace,
+            next_message: std::sync::atomic::AtomicUsize::new(0),
+            config_dir,
+            home,
+            _profile: profile,
+            _config_dir_env: config_dir_env,
+            _home_env: home_env,
+            _audit: audit,
+            _lock: lock,
+        }
+    }
+
+    async fn build_context(
+        config: &Config,
+        provider: &Arc<ScriptedProvider>,
+        channel: &Arc<RecordingChannel>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut runtime = build_channel_runtime(config, None)
+            .await
+            .expect("the runtime builds")
+            .expect("a configured channel means a runtime");
+        let ctx = Arc::get_mut(&mut runtime.ctx).expect("the context is not shared yet");
+        let scripted: Arc<dyn Provider> = provider.clone();
+        ctx.provider = Arc::clone(&scripted);
+        ctx.provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(routing::resolved_default_provider(config), scripted);
+        let recording: Arc<dyn Channel> = channel.clone();
+        ctx.channels_by_name = Arc::new(HashMap::from([(recording.name().to_string(), recording)]));
+        Arc::clone(&runtime.ctx)
+    }
+
+    /// Stops the runtime and starts it again over the same workspace, the way a
+    /// daemon restart rebuilds the prompts from the files on disk.
+    async fn restart(&mut self) {
+        self.ctx = Self::build_context(&self.config, &self.provider, &self.channel).await;
+    }
+
+    /// Runs one message from `sender` in `chat` through dispatch, with the
+    /// provider answering `script` in order.
+    async fn turn(&self, sender: &str, chat: &str, content: &str, script: Vec<String>) -> Turn {
+        *self
+            .provider
+            .script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = script.into();
+        let before = self.channel.sent_messages.lock().await.len();
+        let id = self
+            .next_message
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        process_channel_message(
+            Arc::clone(&self.ctx),
+            channel_message(sender, chat, content, &format!("msg-{id}")),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = self.channel.sent_messages.lock().await[before..]
+            .iter()
+            .map(|line| {
+                line.split_once(':')
+                    .map_or(line.clone(), |(_, text)| text.to_string())
+            })
+            .collect();
+        let requests =
+            std::mem::take(&mut *self.provider.seen.lock().unwrap_or_else(|e| e.into_inner()));
+        Turn { requests, sent }
+    }
+
+    fn read(&self, relative: &str) -> String {
+        std::fs::read_to_string(self.workspace.path().join(relative)).unwrap_or_default()
+    }
+
+    fn workspace_path(&self) -> String {
+        self.workspace.path().display().to_string()
+    }
+
+    fn home_path(&self) -> String {
+        self.home.path().display().to_string()
+    }
+
+    fn config_dir_path(&self) -> String {
+        self.config_dir.path().display().to_string()
+    }
+}
+
+// ── Prompt ───────────────────────────────────────────────────────────────
+
+/// The prompt a guest starts from carries the bot's own files and none of the
+/// owner's: `USER.md`, `MEMORY.md`, `BOOTSTRAP.md`, `TOOLS.md`, the owner's
+/// name and timezone from the persona.
+#[tokio::test]
+async fn guest_prompt_carries_no_owner_file_or_persona_content() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(GUEST_SENDER, GUEST_CHAT, "hello", Vec::new())
+        .await;
+
+    assert_owner_data_absent(
+        "the provider of a guest turn",
+        &turn.provider_text(),
+        &[PERSONA_NAME, PERSONA_TIMEZONE],
+    );
+    assert_owner_data_absent("the guest's chat", &turn.sent.join("\n"), &[]);
+    assert!(
+        turn.system_prompt().contains("Follow instructions."),
+        "control: the files that describe the bot stay in the guest prompt"
+    );
+}
+
+/// No absolute path reaches a guest: neither the workspace, the home and config
+/// directories of the deployment, nor the location of a skill, in either skills
+/// mode.
+#[tokio::test]
+async fn guest_prompt_names_no_absolute_path_in_either_skills_mode() {
+    for mode in [
+        crate::config::SkillsPromptInjectionMode::Full,
+        crate::config::SkillsPromptInjectionMode::Compact,
+    ] {
+        let deployment = Deployment::start(Options::guest_tools(&[]).skills_mode(mode)).await;
+
+        let turn = deployment
+            .turn(GUEST_SENDER, GUEST_CHAT, "hello", Vec::new())
+            .await;
+
+        let prompt = turn.system_prompt();
+        for (what, path) in [
+            ("workspace", deployment.workspace_path()),
+            ("home", deployment.home_path()),
+            ("config dir", deployment.config_dir_path()),
+        ] {
+            assert!(
+                !prompt.contains(&path),
+                "{mode:?}: the {what} path {path} reached a guest prompt:\n{prompt}"
+            );
+        }
+        assert!(
+            !prompt.contains("<location>"),
+            "{mode:?}: a skill location reached a guest prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("<name>greeting</name>"),
+            "{mode:?}: control: the guest is still told about the skill:\n{prompt}"
+        );
+    }
+}
+
+/// A guest prompt has no `Host:` line and states UTC, not the host's zone.
+#[tokio::test]
+async fn guest_prompt_has_no_host_line_and_states_utc() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(GUEST_SENDER, GUEST_CHAT, "hello", Vec::new())
+        .await;
+
+    let prompt = turn.system_prompt();
+    assert!(!prompt.contains("Host:"), "{prompt}");
+    assert!(prompt.contains("Timezone: UTC"), "{prompt}");
+}
+
+// ── Memory ───────────────────────────────────────────────────────────────
+
+/// `memory_recall` under a guest turn returns the guest's own conversation and
+/// not the shared tier or another chat.
+#[tokio::test]
+async fn guest_memory_recall_returns_only_the_guests_conversation() {
+    let deployment = Deployment::start(Options::guest_tools(&["memory_recall"])).await;
+
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "what do you remember",
+            vec![
+                call(
+                    "memory_recall",
+                    serde_json::json!({ "query": "lantern", "limit": 10 }),
+                ),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert!(
+        results.contains(GUEST_NOTE_WORD),
+        "control: the guest's own note is recalled:\n{results}"
+    );
+    let seen = turn.provider_text();
+    for other in [SHARED_NOTE_WORD, OTHER_CHAT_NOTE_WORD] {
+        assert!(
+            !seen.contains(other),
+            "{other} reached the provider of a guest turn:\n{seen}"
+        );
+    }
+}
+
+/// A note a guest stores lands in the guest's conversation: the guest finds it
+/// there, another chat does not. The guest cannot take a shared key, so the
+/// shared note is what the owner still reads.
+#[tokio::test]
+async fn guest_memory_store_lands_in_the_guests_conversation_and_cannot_take_a_shared_key() {
+    let deployment =
+        Deployment::start(Options::guest_tools(&["memory_store", "memory_recall"])).await;
+
+    let stored = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "remember this",
+            vec![
+                all_calls(&[
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "guest_tea", "content": "The guest chat drinks jasminetea" }),
+                    ),
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "shared_recipe", "content": "guest overwrite takeoverword" }),
+                    ),
+                ]),
+                "Saved.".to_string(),
+            ],
+        )
+        .await;
+    let results = stored.tool_results();
+    assert!(results.contains("Stored memory: guest_tea"), "{results}");
+    assert!(results.contains("already in use"), "{results}");
+
+    let recall = |word: &'static str| {
+        vec![
+            call("memory_recall", serde_json::json!({ "query": word })),
+            "Done.".to_string(),
+        ]
+    };
+    let same_chat = deployment
+        .turn(GUEST_SENDER, GUEST_CHAT, "recall", recall("jasminetea"))
+        .await;
+    assert!(
+        same_chat.tool_results().contains("jasminetea"),
+        "the guest's note is kept in its own conversation:\n{}",
+        same_chat.tool_results()
+    );
+    let other_chat = deployment
+        .turn(
+            GUEST_SENDER,
+            OTHER_GUEST_CHAT,
+            "recall",
+            recall("jasminetea"),
+        )
+        .await;
+    assert!(
+        !other_chat.tool_results().contains("jasminetea"),
+        "a guest note reached another conversation:\n{}",
+        other_chat.tool_results()
+    );
+
+    let owner = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "recall", recall(SHARED_NOTE_WORD))
+        .await;
+    let owner_results = owner.tool_results();
+    assert!(owner_results.contains(SHARED_NOTE_WORD), "{owner_results}");
+    assert!(
+        !owner_results.contains("takeoverword"),
+        "the guest took a shared key:\n{owner_results}"
+    );
+}
+
+/// A core note a guest stores stays out of `MEMORY.md`, and so out of the
+/// prompt the owner starts from after the next restart, and out of the memory
+/// context of the owner's next turn.
+#[tokio::test]
+async fn guest_note_stays_out_of_memory_md_and_the_owners_next_prompt() {
+    let mut deployment = Deployment::start(Options::guest_tools(&["memory_store"])).await;
+    deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "remember this",
+            vec![
+                call(
+                    "memory_store",
+                    serde_json::json!({ "key": "guest_core", "content": "guest core note bluebirdword" }),
+                ),
+                "Saved.".to_string(),
+            ],
+        )
+        .await;
+
+    let memory_md = deployment.read("MEMORY.md");
+    assert!(
+        !memory_md.contains("bluebirdword"),
+        "the guest note reached MEMORY.md:\n{memory_md}"
+    );
+    assert!(
+        memory_md.contains(SHARED_NOTE_WORD),
+        "control: the shared note is projected into MEMORY.md:\n{memory_md}"
+    );
+
+    deployment.restart().await;
+    let owner = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "what do you know", Vec::new())
+        .await;
+
+    assert!(
+        !owner.provider_text().contains("bluebirdword"),
+        "the guest note reached the owner's next turn:\n{}",
+        owner.provider_text()
+    );
+    assert!(
+        owner.system_prompt().contains(SHARED_NOTE_WORD),
+        "control: the owner prompt carries the shared notes of MEMORY.md"
+    );
+}
+
+/// `replaces` and `forget` from a guest cannot reach a shared note or another
+/// chat's note, by key or by a phrase from its text, and their answers name
+/// none of it.
+#[tokio::test]
+async fn guest_replaces_and_forget_cannot_reach_other_rows() {
+    let deployment = Deployment::start(Options::guest_tools(&[
+        "memory_store",
+        "memory_forget",
+        "memory_recall",
+    ]))
+    .await;
+
+    let attempt = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "tidy up",
+            vec![
+                all_calls(&[
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "guest_fix", "content": "guest correction", "replaces": SHARED_NOTE_WORD }),
+                    ),
+                    ("memory_forget", serde_json::json!({ "key": "shared_recipe" })),
+                    ("memory_forget", serde_json::json!({ "contains": SHARED_NOTE_WORD })),
+                    ("memory_forget", serde_json::json!({ "key": "other_chat_note" })),
+                    (
+                        "memory_forget",
+                        serde_json::json!({ "contains": OTHER_CHAT_NOTE_WORD }),
+                    ),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+    let results = attempt.tool_results();
+    assert_eq!(
+        results.matches("No memory contains").count(),
+        3,
+        "{results}"
+    );
+    assert_eq!(
+        results.matches("No memory found with key").count(),
+        2,
+        "{results}"
+    );
+    for note_text in ["Owner shared note", "Another chat's note"] {
+        assert!(
+            !results.contains(note_text),
+            "an answer to the guest names a note it cannot reach ({note_text}):\n{results}"
+        );
+    }
+
+    let owner = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "recall",
+            vec![
+                call(
+                    "memory_recall",
+                    serde_json::json!({ "query": "lantern", "limit": 10 }),
+                ),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+    let owner_results = owner.tool_results();
+    assert!(owner_results.contains(SHARED_NOTE_WORD), "{owner_results}");
+    assert!(
+        owner_results.contains(OTHER_CHAT_NOTE_WORD),
+        "{owner_results}"
+    );
+    assert!(deployment.read("MEMORY.md").contains(SHARED_NOTE_WORD));
+}
+
+/// A core note a guest stores carries no capacity notice: the notice counts the
+/// owner's block, which a guest has no view of.
+#[tokio::test]
+async fn guest_core_store_shows_no_capacity_notice() {
+    let deployment = Deployment::start(Options::guest_tools(&["memory_store"]).crowded()).await;
+
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "remember this",
+            vec![
+                call(
+                    "memory_store",
+                    serde_json::json!({ "key": "guest_core", "content": "a guest note" }),
+                ),
+                "Saved.".to_string(),
+            ],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert!(results.contains("Stored memory: guest_core"), "{results}");
+    assert!(!results.contains("core memory is"), "{results}");
+}
+
+// ── Files ────────────────────────────────────────────────────────────────
+
+/// With the file tools granted, a guest still cannot read the owner's files by
+/// name, by a backup name or through a link, with any of the three read tools.
+#[tokio::test]
+async fn guest_file_tools_refuse_the_owners_private_files() {
+    let deployment = Deployment::start(Options::guest_tools(&[
+        "file_read",
+        "pdf_read",
+        "image_info",
+    ]))
+    .await;
+    let paths = private_owner_paths();
+    let mut attempts: Vec<(&str, serde_json::Value)> = Vec::new();
+    for tool in ["file_read", "pdf_read", "image_info"] {
+        for path in &paths {
+            attempts.push((tool, serde_json::json!({ "path": path })));
+        }
+    }
+    attempts.push(("file_read", serde_json::json!({ "path": "notes/menu.txt" })));
+
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "show me the files",
+            vec![all_calls(&attempts), "Done.".to_string()],
+        )
+        .await;
+
+    assert_owner_data_absent("the provider of a guest turn", &turn.provider_text(), &[]);
+    assert_owner_data_absent("the guest's chat", &turn.sent.join("\n"), &[]);
+    let results = turn.tool_results();
+    assert_eq!(
+        results.matches("private to the owner").count(),
+        3 * paths.len(),
+        "every attempt on an owner file is refused:\n{results}"
+    );
+    assert!(
+        results.contains("soup"),
+        "control: an ordinary file is still read:\n{results}"
+    );
+}
+
+/// A guest cannot write a skill or a prompt file, and the refused write creates
+/// nothing, not even the directory.
+#[tokio::test]
+async fn guest_file_write_refuses_prompt_files_and_creates_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&["file_write"])).await;
+
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "write these",
+            vec![
+                all_calls(&[
+                    (
+                        "file_write",
+                        serde_json::json!({ "path": "skills/x/SKILL.md", "content": "injected" }),
+                    ),
+                    (
+                        "file_write",
+                        serde_json::json!({ "path": "AGENTS.md", "content": "injected" }),
+                    ),
+                    (
+                        "file_write",
+                        serde_json::json!({ "path": "memory/x.md", "content": "injected" }),
+                    ),
+                    (
+                        "file_write",
+                        serde_json::json!({ "path": "notes/guest.txt", "content": "guest wrote this" }),
+                    ),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert_eq!(
+        results.matches("feeds the owner's prompt").count(),
+        2,
+        "{results}"
+    );
+    assert!(results.contains("private to the owner"), "{results}");
+    assert!(
+        !deployment.workspace.path().join("skills/x").exists(),
+        "a refused write created the skill directory"
+    );
+    assert_eq!(
+        deployment.read("AGENTS.md"),
+        "# Agents\nFollow instructions."
+    );
+    assert_eq!(deployment.read("memory/x.md"), DAILY_NOTE_SECRET);
+    assert_eq!(
+        deployment.read("notes/guest.txt"),
+        "guest wrote this",
+        "control: an ordinary write still lands"
+    );
+}
+
+// ── Tools ────────────────────────────────────────────────────────────────
+
+/// The specs a native provider receives are the permitted tools of the real
+/// registry, an owner-only tool the operator listed by mistake excluded.
+#[tokio::test]
+async fn guest_native_specs_list_only_the_permitted_tools_of_the_registry() {
+    let deployment = Deployment::start(Options::guest_tools(&[
+        "file_read",
+        "memory_recall",
+        "manage_permissions",
+        "delegate",
+    ]))
+    .await;
+    deployment
+        .provider
+        .native
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let turn = deployment
+        .turn(GUEST_SENDER, GUEST_CHAT, "hello", Vec::new())
+        .await;
+
+    let mut specs = turn.requests[0]
+        .tools
+        .clone()
+        .expect("the request carries the guest's tools");
+    specs.sort();
+    assert_eq!(specs, vec!["file_read", "memory_recall"]);
+}
+
+/// Without native tool calling, the protocol block of a guest turn describes
+/// only the permitted tools.
+#[tokio::test]
+async fn guest_protocol_block_lists_only_the_permitted_tools_of_the_registry() {
+    let deployment = Deployment::start(Options::guest_tools(&[
+        "file_read",
+        "memory_recall",
+        "manage_permissions",
+    ]))
+    .await;
+
+    let turn = deployment
+        .turn(GUEST_SENDER, GUEST_CHAT, "hello", Vec::new())
+        .await;
+
+    let block = tool_protocol_block(turn.system_prompt());
+    assert_eq!(
+        protocol_block_tool_names(block),
+        vec!["file_read", "memory_recall"],
+        "{block}"
+    );
+}
+
+/// A call to a tool outside the guest's list is refused by the gate, and the
+/// tool does not run.
+#[tokio::test]
+async fn guest_call_to_an_unlisted_tool_is_refused_and_does_not_run() {
+    let deployment =
+        Deployment::start(Options::guest_tools(&["file_read", "manage_permissions"])).await;
+
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "run these",
+            vec![
+                all_calls(&[
+                    (
+                        "shell",
+                        serde_json::json!({ "command": "echo ran > guest_shell_ran.txt" }),
+                    ),
+                    (
+                        "file_write",
+                        serde_json::json!({ "path": "notes/guest.txt", "content": "ran" }),
+                    ),
+                    (
+                        "manage_permissions",
+                        serde_json::json!({ "action": "list" }),
+                    ),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert_eq!(
+        results
+            .matches("isn't available to non-owner users")
+            .count(),
+        2,
+        "{results}"
+    );
+    assert!(results.contains("owner-only"), "{results}");
+    assert!(!deployment
+        .workspace
+        .path()
+        .join("guest_shell_ran.txt")
+        .exists());
+    assert!(!deployment.workspace.path().join("notes/guest.txt").exists());
+}
+
+// ── Owner control ────────────────────────────────────────────────────────
+//
+// The same attempts from an owner succeed. They prove the guest cases above
+// test the guest rule, and not a fixture that refuses everything.
+
+/// The owner prompt keeps the owner's files, the absolute paths and the host
+/// line.
+#[tokio::test]
+async fn owner_prompt_keeps_owner_files_paths_and_host() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello", Vec::new())
+        .await;
+
+    let prompt = turn.system_prompt();
+    for secret in [
+        USER_FILE_SECRET,
+        MEMORY_FILE_SECRET,
+        BOOTSTRAP_FILE_SECRET,
+        TOOLS_FILE_SECRET,
+        PERSONA_NAME,
+        PERSONA_TIMEZONE,
+    ] {
+        assert!(prompt.contains(secret), "{secret} is missing:\n{prompt}");
+    }
+    assert!(prompt.contains(&deployment.workspace_path()), "{prompt}");
+    assert!(prompt.contains("<location>"), "{prompt}");
+    assert!(prompt.contains("Host: "), "{prompt}");
+}
+
+/// The owner reads the private files, and writes a skill, with the calls that
+/// a guest is refused.
+#[tokio::test]
+async fn owner_turn_with_the_same_attempts_reads_files_and_writes_a_skill() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let mut attempts: Vec<(&str, serde_json::Value)> = private_owner_paths()
+        .into_iter()
+        .map(|path| ("file_read", serde_json::json!({ "path": path })))
+        .collect();
+    attempts.push((
+        "file_write",
+        serde_json::json!({ "path": "skills/x/SKILL.md", "content": "owner skill" }),
+    ));
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "show me the files",
+            vec![all_calls(&attempts), "Done.".to_string()],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    for secret in OWNER_FILE_SECRETS {
+        assert!(results.contains(secret), "{secret} is missing:\n{results}");
+    }
+    assert!(!results.contains("private to the owner"), "{results}");
+    assert_eq!(deployment.read("skills/x/SKILL.md"), "owner skill");
+}
+
+/// The owner recalls every tier, supersedes a shared note, and hears about the
+/// size of the block the prompt carries.
+#[tokio::test]
+async fn owner_turn_with_the_same_attempts_keeps_its_notes_and_capacity_notice() {
+    let deployment = Deployment::start(Options::guest_tools(&[]).crowded()).await;
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "tidy up",
+            vec![
+                all_calls(&[
+                    (
+                        "memory_recall",
+                        serde_json::json!({ "query": "lantern", "limit": 10 }),
+                    ),
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "owner_fix", "content": "owner correction cardamomword", "replaces": SHARED_NOTE_WORD }),
+                    ),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert!(results.contains(OTHER_CHAT_NOTE_WORD), "{results}");
+    assert!(results.contains("superseded 'shared_recipe'"), "{results}");
+    assert!(results.contains("Note: core memory is"), "{results}");
+    let memory_md = deployment.read("MEMORY.md");
+    assert!(memory_md.contains("cardamomword"), "{memory_md}");
+}
+
+/// An owner turn is offered every tool of the registry.
+#[tokio::test]
+async fn owner_native_specs_list_every_tool_of_the_registry() {
+    let deployment = Deployment::start(Options::guest_tools(&["file_read"])).await;
+    deployment
+        .provider
+        .native
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let turn = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello", Vec::new())
+        .await;
+
+    let registry: Vec<String> = deployment
+        .ctx
+        .tools_registry
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect();
+    assert!(registry.len() > 2, "the registry is the built one");
+    assert_eq!(turn.requests[0].tools.as_ref(), Some(&registry));
+}
