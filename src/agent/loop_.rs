@@ -4047,21 +4047,6 @@ mod tests {
 
     // ── Tool-call audit trail (plan 305) ────────────────────────────────────
 
-    /// Wait for the best-effort `spawn_blocking` append to land, then return the
-    /// audit log's contents. Bounded so a genuinely missing write fails the test
-    /// rather than hanging it.
-    async fn audit_log_after_writes(path: &std::path::Path, want_lines: usize) -> String {
-        for _ in 0..100 {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if text.lines().filter(|l| !l.trim().is_empty()).count() >= want_lines {
-                    return text;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        std::fs::read_to_string(path).unwrap_or_default()
-    }
-
     /// Tool name only the audit-trail tests below use. Tests that run tools
     /// without `ENV_LOCK` append to whichever audit directory the process-global
     /// override points at, so the test must pick its own records out by name.
@@ -4098,7 +4083,8 @@ mod tests {
 
     /// Wait for `want` audit records whose command is `command`, ignoring lines
     /// other tests append to the same file. Returns the raw log text and the
-    /// matching records. Bounded like `audit_log_after_writes`.
+    /// matching records. Bounded so a genuinely missing write fails the test
+    /// rather than hanging it.
     async fn audit_records_for_command(
         path: &std::path::Path,
         command: &str,
@@ -4682,16 +4668,16 @@ mod tests {
         );
 
         let call = ParsedToolCall {
-            name: "do_thing".into(),
+            name: AUDIT_PROBE_TOOL.into(),
             arguments: serde_json::json!({}),
             tool_call_id: None,
         };
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(AuditProbeTool {
             ran: Arc::clone(&ran),
         })];
-        // Guest may use only `file_read`; `do_thing` is not permitted, so the
-        // gate hits the `guest_ceiling` denial branch in the executor.
+        // Guest may use only `file_read`; the probe tool is not permitted, so
+        // the gate hits the `guest_ceiling` denial branch in the executor.
         let gate = crate::approval::GuestGate::new(&["file_read".to_string()], &[]);
         let audit_actor = crate::security::AuditActor::chat("u_42".to_string(), "guest");
         let _ = execute_tool_calls_collecting(
@@ -4711,23 +4697,22 @@ mod tests {
         .await
         .unwrap();
 
-        // The shared audit log accumulates records across tests in the same
-        // module invocation, so we filter to the one we wrote (user_id = u_42)
-        // rather than assuming the log holds a single line.
-        let text = audit_log_after_writes(&log_path, 1).await;
-        let mut records: Vec<serde_json::Value> = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad record ({e}): {l}")))
-            .collect();
+        // Other tests append to the same audit directory, so wait for this
+        // tool's own record rather than for any line to exist.
+        let (text, records) = audit_records_for_command(&log_path, AUDIT_PROBE_TOOL, 1).await;
         let record = records
-            .iter_mut()
+            .iter()
             .find(|r| r["actor"]["user_id"] == "u_42")
             .unwrap_or_else(|| panic!("no u_42 record in log: {text}"));
         let actor = &record["actor"];
         assert_eq!(actor["channel"], "telegram");
         assert_eq!(actor["user_id"], "u_42");
         assert_eq!(actor["role"], "guest");
+        assert_eq!(
+            record["action"]["risk_level"], "guest_ceiling",
+            "the denial must come from the guest ceiling: {text}"
+        );
+        assert_eq!(record["action"]["approval"], "denied");
     }
 
     /// An owner turn's audit record must say so. The defect this guards: a
@@ -4747,12 +4732,12 @@ mod tests {
 
         // No guest gate ⇒ owner path; tool runs through the happy path.
         let call = ParsedToolCall {
-            name: "do_thing".into(),
+            name: AUDIT_PROBE_TOOL.into(),
             arguments: serde_json::json!({}),
             tool_call_id: None,
         };
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(AuditProbeTool {
             ran: Arc::clone(&ran),
         })];
         let audit_actor = crate::security::AuditActor::chat("u_42".to_string(), "owner");
@@ -4774,17 +4759,11 @@ mod tests {
         .unwrap();
         assert!(ran.load(Ordering::SeqCst), "owner tool must run");
 
-        // The shared audit log accumulates records across tests in the same
-        // module invocation, so we filter to the one we wrote (user_id = u_42)
-        // rather than assuming the log holds a single line.
-        let text = audit_log_after_writes(&log_path, 1).await;
-        let mut records: Vec<serde_json::Value> = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad record ({e}): {l}")))
-            .collect();
+        // Other tests append to the same audit directory, so wait for this
+        // tool's own record rather than for any line to exist.
+        let (text, records) = audit_records_for_command(&log_path, AUDIT_PROBE_TOOL, 1).await;
         let record = records
-            .iter_mut()
+            .iter()
             .find(|r| r["actor"]["user_id"] == "u_42")
             .unwrap_or_else(|| panic!("no u_42 record in log: {text}"));
         let actor = &record["actor"];
