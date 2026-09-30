@@ -5956,7 +5956,7 @@ fn rewrite_memory_md_to_projection_only(workspace_dir: &Path) -> Result<()> {
         .context("projection end marker missing or out of order after project_core_memories")?
         + PROJECTION_END.len();
 
-    crate::migration::replace_file_atomically(&path, current[start..end].as_bytes())
+    crate::migration::replace_file_atomically(&path, &current.as_bytes()[start..end])
         .context("write MEMORY.md to projection only")
 }
 

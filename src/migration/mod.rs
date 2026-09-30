@@ -38,15 +38,11 @@ pub(crate) fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<
 
     let daily_dir = source_workspace.join("memory");
     if daily_dir.exists() {
-        let mut daily_files = Vec::new();
+        let mut listed = Vec::new();
         for file in fs::read_dir(&daily_dir)? {
-            let path = file?.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-                daily_files.push(path);
-            }
+            listed.push(file?.path());
         }
-        daily_files.sort();
-        for path in daily_files {
+        for path in sorted_daily_markdown_files(listed) {
             let content = fs::read_to_string(&path)?;
             let stem = path
                 .file_stem()
@@ -73,6 +69,17 @@ pub(crate) fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<
     }
 
     Ok(all)
+}
+
+/// The `*.md` files among `paths`, in name order. `read_dir` order is not
+/// guaranteed, so the caller's order never decides which daily file wins.
+fn sorted_daily_markdown_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .collect();
+    files.sort();
+    files
 }
 
 /// The entries one markdown file holds, without the projection block.
@@ -316,7 +323,7 @@ pub(crate) fn backup_markdown_memory(workspace_dir: &Path) -> Result<Option<Path
     let started = Utc::now();
     let pending_marker = pending_markdown_import_marker(workspace_dir);
     let cutoff = if pending_marker.exists() {
-        started
+        marker_time(&pending_marker)?.min(started)
     } else {
         started
     };
@@ -523,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn daily_files_are_read_before_memory_md_and_in_name_order() {
+    fn memory_md_is_read_after_the_daily_files() {
         let tmp = tempfile::TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("memory")).unwrap();
         fs::write(tmp.path().join("MEMORY.md"), "- **k**: curated\n").unwrap();
@@ -544,6 +551,34 @@ mod tests {
             .map(|e| e.content)
             .collect();
 
-        assert_eq!(values, ["earlier day", "later day", "curated"]);
+        assert_eq!(values.len(), 3);
+        assert_eq!(
+            values.last().map(String::as_str),
+            Some("curated"),
+            "the last entry read wins a key, so the curated file must come last"
+        );
+    }
+
+    /// The order comes from the file names, not from the order the directory
+    /// listing hands the paths over in, and only `*.md` files count.
+    #[test]
+    fn daily_markdown_files_are_sorted_whatever_the_listing_order() {
+        let dir = Path::new("memory");
+        let listed = vec![
+            dir.join("2026-09-03.md"),
+            dir.join("brain.db"),
+            dir.join("2026-09-01.md"),
+            dir.join("notes.txt"),
+            dir.join("2026-09-02.md"),
+        ];
+
+        assert_eq!(
+            sorted_daily_markdown_files(listed),
+            vec![
+                dir.join("2026-09-01.md"),
+                dir.join("2026-09-02.md"),
+                dir.join("2026-09-03.md"),
+            ]
+        );
     }
 }
