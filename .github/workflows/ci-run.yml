@@ -279,8 +279,10 @@ jobs:
         name: Features (${{ matrix.name }})
         needs: [changes, lint]
         # Was label-gated behind `ci:full`, which meant a feature combination
-        # only broke after merge. Each variant takes ~60-80s and they run in
-        # parallel, well inside the `build` job's ~8 minutes — so requiring
+        # only broke after merge. The no-default-features entries take ~60-80s.
+        # The entries that add one feature to the default set take about 2
+        # minutes with a warm cache, and longer on the first cold run. They run
+        # in parallel, still inside the `build` job's ~8 minutes, so requiring
         # them costs no wall-clock.
         if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: ubuntu-latest
@@ -302,8 +304,11 @@ jobs:
                     - name: hardware-only
                       args: --no-default-features --features hardware
                       install_libudev: false
-                    - name: browser-native
-                      args: --no-default-features --features browser-native
+                    - name: observability-otel
+                      args: --features observability-otel
+                      install_libudev: false
+                    - name: kb-office
+                      args: --features kb-office
                       install_libudev: false
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
