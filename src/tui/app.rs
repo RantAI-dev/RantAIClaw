@@ -601,8 +601,11 @@ impl TuiApp {
     /// persist it to
     /// `<policy_dir>/{autonomy,command_allowlist,forbidden_paths}.toml`.
     ///
-    /// Wired to `KeyCode::BackTab` (Shift+Tab) and shared with the
-    /// `/autonomy` slash command (which calls into the same write path).
+    /// Wired to `KeyCode::BackTab` (Shift+Tab). The `/autonomy` slash
+    /// command goes through the same writer but with `force = true` (see
+    /// `src/tui/commands/autonomy.rs`), so it regenerates the policy
+    /// files and overwrites hand-edited `command_allowlist.toml` /
+    /// `forbidden_paths.toml`; only Shift+Tab preserves user edits.
     ///
     /// Two writes, and both are needed:
     ///

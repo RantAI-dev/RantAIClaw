@@ -23,7 +23,7 @@ When the agent attempts a shell command not on the active preset's allowlist:
 4. **Cascading approvals** walk `&&` chains — approving `cd` then re-prompts for the next blocking basename (e.g. `python3`), capped at 6 prompts per call.
 5. **Strict preset = plan mode.** The `shell` tool is dropped from the model's tool list entirely. The agent describes commands instead of attempting them. CC plan-mode analog.
 6. **Preset switching is live.** `Shift+Tab` cycles in the TUI; the runtime rebuilds the `SecurityPolicy` on each switch and the TUI re-subscribes to the fresh `PendingApprovals` broadcast (no more silent dropped approvals after a switch).
-7. **The bundle is now the source of truth.** `<policy_dir>/command_allowlist.toml` patterns are bridged into `config.autonomy.allowed_commands` at preset-apply time; the runtime gate reads the bridged list (previously the bundle was write-only).
+7. **The bundle is now the source of truth.** Applying a preset copies the preset's built-in list — reduced to command basenames — into `[autonomy].allowed_commands` in `config.toml`, which is what the runtime shell gate enforces. `<policy_dir>/command_allowlist.toml` holds the same list (the full glob patterns) for the model's prompt; editing it changes what the model is told, not what the gate allows.
 
 ## Vs OpenClaw / Hermes-agent
 

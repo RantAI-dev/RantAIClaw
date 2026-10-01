@@ -104,7 +104,7 @@ fn setup_non_interactive_visits_all_sections_and_exits_zero() {
 }
 
 #[test]
-fn setup_non_interactive_then_doctor_brief_runs_clean() {
+fn setup_non_interactive_then_doctor_brief_reports_the_written_allowlist() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = TempDir::new().expect("tempdir");
 
@@ -113,10 +113,15 @@ fn setup_non_interactive_then_doctor_brief_runs_clean() {
         .assert()
         .success();
 
-    // After a headless setup, no provider has been configured, no
-    // allowlist has been chosen, and no daemon is registered. `doctor
-    // --brief` must run cleanly (exit 0) and surface those gaps with
-    // actionable hints, not panic on missing config keys.
+    // After a headless setup, no provider has been configured and no
+    // daemon is registered. `doctor --brief` must run cleanly (exit 0)
+    // and surface those gaps with actionable hints, not panic on missing
+    // config keys. The approvals section's headless path applies the
+    // Smart preset through the real writer, so the doctor check reads
+    // `[command_allowlist].patterns` from the file the writer wrote and
+    // reports the written bundle as healthy. A `setup approvals` hint
+    // would only fire if the file were missing or malformed, never on a
+    // successful headless setup.
     let assert = cmd(&home).args(["doctor", "--brief"]).assert().success();
 
     let output = assert.get_output();
@@ -128,12 +133,19 @@ fn setup_non_interactive_then_doctor_brief_runs_clean() {
         combined.contains("RantaiClaw Doctor"),
         "doctor --brief must emit its banner; got:\n{combined}"
     );
-    // The L1-L4 approval policy was never picked, so the allowlist
-    // check should fire (warn or info) and point at `setup approvals`.
+    // The Smart bundle the writer lays down on a fresh headless install
+    // has 63 pre-approved patterns; the allowlist check must report that
+    // exact count from the file on disk, not fall back to the old
+    // top-level `commands`-array parse that misreported every install as
+    // empty.
     assert!(
-        combined.contains("rantaiclaw setup approvals"),
-        "doctor --brief should hint at `setup approvals` after a fresh \
-         non-interactive setup; got:\n{combined}"
+        combined
+            .contains("command_allowlist.toml reports 63 pre-approved patterns shown to the model"),
+        "doctor --brief should report the written Smart bundle's 63 patterns; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("strict-like autonomy mode with empty allowlist"),
+        "doctor --brief must not replay the pre-fix empty-allowlist warning on a healthy headless install; got:\n{combined}"
     );
     assert!(
         combined.contains("Summary:"),
