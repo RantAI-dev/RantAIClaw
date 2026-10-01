@@ -31,6 +31,12 @@ jobs:
               with:
                   fetch-depth: 0
 
+            # Bash + git only, takes seconds. Runs first so a regression in
+            # the script never silently turns the rest of the job green.
+            - name: Self-test change scope detection
+              shell: bash
+              run: bash ./scripts/ci/tests/test_detect_change_scope.sh
+
             - name: Detect docs-only changes
               id: scope
               shell: bash
@@ -293,18 +299,27 @@ jobs:
                 # `all-features` is still omitted, but no longer because of
                 # matrix-sdk: 0.18 type-checks at the default limit, and
                 # `channel-matrix` has its own job above. What `all-features`
-                # would additionally pull is tokio-postgres, which is a
+                # would additionally pull is the remaining opt-in set —
+                # `legacy-providers`, `rag-pdf`, `kb-ocr` — which is a
                 # separate cost question from this one. Re-adding it is a
                 # follow-up, not a side effect of the matrix pin bump.
+                #
+                # `--all-targets` on the two feature entries that have tests,
+                # benches or examples of their own: the library compiles fine
+                # under `--features <f>` but the targets built only with
+                # `--all-targets` (tests, benches, examples) are what the
+                # `features` matrix needs to defend. The `no-default-features`
+                # entry has no feature to verify with tests/benches/examples
+                # specific to that configuration, so it stays as is.
                 include:
                     - name: no-default-features
                       args: --no-default-features
                       install_libudev: false
                     - name: observability-otel
-                      args: --features observability-otel
+                      args: --features observability-otel --all-targets
                       install_libudev: false
                     - name: kb-office
-                      args: --features kb-office
+                      args: --features kb-office --all-targets
                       install_libudev: false
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
