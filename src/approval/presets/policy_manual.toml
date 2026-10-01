@@ -9,10 +9,11 @@
 #   [forbidden_paths]   → `<profile>/policy/forbidden_paths.toml`
 #
 # Manual is the most restrictive preset. Every tool call is gated by an
-# interactive prompt. The allowlist starts empty — accreted entries
-# accumulate as the user picks `[a]lways` over time. The forbidden-paths
-# list covers system + user-secret directories that no agent should ever
-# touch.
+# interactive prompt. The allowlist starts empty — an `[a]lways` answer
+# is saved to `runtime_allowlist.toml` (the persisted one, separate from
+# this preset's allowlist), so the list here changes only when a preset
+# is applied. The forbidden-paths list covers system + user-secret
+# directories that no agent should ever touch.
 
 [autonomy]
 preset = "manual"

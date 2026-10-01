@@ -111,13 +111,27 @@ async fn provider_ping_skips_when_offline() {
 }
 
 #[test]
-fn allowlist_check_warns_on_strict_empty_allowlist_via_pure_helper() {
-    // Verifies the diagnose helper used by AllowlistCheck — strict-mode
-    // wiring is covered by the unit tests inside `policy.rs`.
+fn allowlist_diagnose_reads_what_the_writer_writes() {
+    // Pin the seam between the doctor helper and the on-disk writer. The old
+    // version read a top-level `commands = [...]` array the writer never
+    // produced, so every real install came back empty. The new helper reads
+    // `[command_allowlist].patterns`; we build the file with the real writer
+    // so this test catches a regression in either direction.
+    use rantaiclaw::approval::policy_writer::{self, PolicyPreset};
+    use rantaiclaw::profile::Profile;
+
     let tmp = TempDir::new().unwrap();
-    let file = tmp.path().join("command_allowlist.toml");
-    std::fs::write(&file, "commands = []\n").unwrap();
-    assert_eq!(diagnose_allowlist(&file), AllowlistDiagnosis::Empty);
+    let profile = Profile {
+        name: "test".into(),
+        root: tmp.path().to_path_buf(),
+    };
+    policy_writer::write_policy_files(&profile, PolicyPreset::Smart, true).unwrap();
+    let allowlist = profile.policy_dir().join("command_allowlist.toml");
+    let diag = diagnose_allowlist(&allowlist);
+    assert!(
+        matches!(diag, AllowlistDiagnosis::Healthy { count } if count > 0),
+        "writer-built allowlist must report a positive count, got {diag:?}"
+    );
 }
 
 // ── Renderer snapshots ─────────────────────────────────────────────
