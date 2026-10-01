@@ -1079,12 +1079,51 @@ These are the routes the web console writes settings through. All are bearer-gat
 ### GET /api/v1/config
 
 - **Request**: none.
-- **Response** `200`: the whole active config as JSON, **redacted**. A key is blanked when its
-  name ends in `_token`, or is exactly `token` or `paired_tokens`. Redaction is by key name,
-  so a secret stored under a name outside that set is returned in full. Besides the key-name
-  rule, every value in an MCP server `env` and in a skill `env` is returned as an empty
-  string, and the variable names stay.
+- **Response** `200`: the whole active config as JSON, **redacted** in two passes.
+  `rantaiclaw config show` runs the same two.
+  1. A typed pass blanks these fields whatever their names:
+     - `api_key`, every value of `provider_api_keys` (the map comes back empty), `composio.api_key`,
+       `browser.computer_use.api_key`, `web_search.brave_api_key`, each `agents.<name>.api_key`,
+       `knowledge.embedding_api_key`, `knowledge.vision_api_key`, `skills.entries.<name>.api_key.value`,
+       and the Telegram `bot_token`.
+     - Every value in an MCP server `env`, in a skill `env` and in a skill `config`. The names stay.
+       In `config` a string comes back as `""` and any other JSON value as `null`.
+     - MCP server `args`: the value after a flag whose name contains `key`, `token`, `secret` or
+       `password` (and the value of the `--flag=value` form), and any arg that looks like a provider
+       key. MCP `command` is blanked when it looks like a provider key.
+     - `api_url`: `null` when it looks like a provider key. Otherwise the `user:pass@` part and any
+       `key`, `api_key` or `access_token` query parameter are removed. `GET /secrets` shows the same value.
+     - The `user:pass@` part of `proxy.http_proxy`, `proxy.https_proxy` and `proxy.all_proxy`.
+  2. A key-name pass then blanks any key, at any depth, that ends in `_token`, `_secret`, `_password`
+     or `_key`, is named `token`, `secret`, `password`, `password_hash`, `paired_tokens`, `api_keys`,
+     `provider_api_keys` or `db_url`, or contains `credential`. A string becomes `""` and any other
+     value `null`.
+
+  A secret stored under a name neither pass knows is returned as stored. That includes
+  `tunnel.custom.start_command`, `tunnel.custom.health_url` and the channel URL fields (`url`,
+  `homeserver`, `base_url`, `http_url`). Do not put a credential in them.
 - **Status codes**: `200`, `401`, `500`.
+
+#### Writing back what you read
+
+A value in the response above is either the real value or a blank that the matching write route
+reads as "keep what is stored". Sending a read back never erases or weakens a stored secret.
+
+| Route | A blank or echoed value | How to clear on purpose |
+|---|---|---|
+| `PUT /secrets` `api_key` | `null` or omitted keeps it | send `""` |
+| `PUT /secrets` `api_url` | omitted keeps it. A value equal to the URL `GET` showed keeps the stored URL, credentials included | send `""` |
+| `PUT /config/knowledge` keys | omitted keeps it | send `""` |
+| `POST /config/mcp_servers/{name}` `env` | a name sent with `""` keeps the stored value of that name | leave the name out of the map |
+| `POST /config/mcp_servers/{name}` `args` | an arg equal to the blanked form of a stored arg keeps the stored arg | leave the arg out of the list |
+| `POST /channels/telegram`, `discord`, `slack` `bot_token` | omitted or empty keeps it | `DELETE` the channel |
+| `POST /channels/slack` `app_token` | omitted or empty keeps it | `DELETE` the channel |
+| `POST /channels/lark` `app_id` and `app_secret` | both omitted or empty keeps the pair. One without the other is refused with `400` | `DELETE` the channel |
+| `POST /channels/lark` `encrypt_key`, `verification_token` | omitted or empty keeps it | `DELETE` the channel |
+
+MCP `args` are matched in order: each sent arg takes the first not-yet-used stored arg whose blanked
+form equals it, so a secret stays with its flag when an earlier arg is removed. An arg that matches
+no stored arg is taken as written.
 
 ### PUT /api/v1/config/model
 
@@ -1117,13 +1156,16 @@ These are the routes the web console writes settings through. All are bearer-gat
 ### GET / PUT /api/v1/secrets
 
 - **GET response** `200`: `{ "provider": "...", "api_url": "...", "api_key_present": true, "encrypt_at_rest": true }` — presence, never the key.
-- **PUT request**: `{ "api_key": "...", "api_url": "..." }`, both optional.
+- **PUT request**: `{ "api_key": "...", "api_url": "..." }`, both optional. An omitted field keeps the
+  stored value and `""` clears it. An `api_url` equal to the value `GET` returned keeps the stored URL
+  (see [Writing back what you read](#writing-back-what-you-read)).
 - **PUT response** `200`: `{ "ok": true, "api_key_present": true }`
 - **Status codes**: `200`, `400`, `401`, `500`.
 
 ### GET / PUT /api/v1/config/knowledge
 
 - **PUT request**: `{ "enabled": true, "embedding_api_key": "...", "vision_api_key": "..." }`, all optional.
+  An omitted key is left alone. **An empty string deletes the key.**
 - **Response** `200`: `{ "enabled": true, "embedding_configured": true, "vision_configured": false, "source": "..." }`
 - Enabling probes the embedding key before persisting, so a bad key fails the request rather
   than being written and failing later.
@@ -1132,7 +1174,9 @@ These are the routes the web console writes settings through. All are bearer-gat
 ### POST / DELETE /api/v1/config/mcp_servers/{name}
 
 - **POST request**: `{ "command": "...", "args": ["..."], "env": { "KEY": "value" } }` — `command` required.
-  `env` is encrypted at rest.
+  `env` is encrypted at rest. An omitted `args` or `env` keeps the stored value. A supplied one
+  replaces it, except that an `env` name sent with `""` and an arg equal to the blanked form of a stored
+  arg keep the stored value (see [Writing back what you read](#writing-back-what-you-read)).
 - **POST response** `200`: `{ "name": "...", "added": true, "count": 3 }`
 - **DELETE response** `200`: `{ "name": "...", "removed": true, "count": 2 }`
 - **Status codes**: `200`, `400`, `401`, `500`.
@@ -1172,7 +1216,8 @@ never probed, because the only real check opens a live socket and `doctor` owns 
 
 - **POST request**: `{ "bot_token": "xoxb-...", "app_token": "xapp-...", "allowed_users": ["..."],
   "channel_id": "..." }` — every field except `allowed_users` may be omitted to leave the saved value
-  alone.
+  alone. An empty `bot_token` or `app_token` also leaves the saved value alone, because `GET /config`
+  returns both as empty strings. `DELETE` the channel to remove an app token.
 - **POST response** `200`: `{ "connected": true, "channel": "slack", "bot_username": null,
   "allowed_users": 2, "warning": "...", "restarts_runtime": false, "note": "..." }`
 - **`warning`**: set when Socket Mode is on and `channel_id` is also set; the bot then ignores
@@ -1195,7 +1240,9 @@ already share — before anything is written; a rejected or unreachable check is
   `app_secret` may both be omitted to edit the allowlist or region on an already connected channel
   without re-entering the credential pair (one without the other is refused as malformed); `use_feishu`
   may be omitted to leave the saved region alone (D-2: unset, and on a fresh connect, defaults to Lark
-  International).
+  International). `encrypt_key` and `verification_token` may be omitted, and an empty value leaves the
+  saved one alone, because `GET /config` returns both as empty strings. `DELETE` the channel to remove
+  them.
 - **POST response** `200`: `{ "connected": true, "channel": "lark", "app_id": "...",
   "allowed_users": 2, "warning": null, "restarts_runtime": false, "note": "..." }` — `app_id` is a public
   application identifier, not the secret; `app_secret`, `encrypt_key` and `verification_token` never

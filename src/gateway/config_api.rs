@@ -262,6 +262,17 @@ pub(crate) fn redact_config_secrets(cfg: &mut crate::config::Config) {
         for value in entry.env.values_mut() {
             value.clear();
         }
+        // `config` values reach the skill as `RANTAICLAW_SKILL_<NAME>_<KEY>`
+        // environment variables, so they are as sensitive as `env`. They are
+        // free-form JSON: a string blanks to "" and any other type to null, the
+        // convention `redact_secrets_in_json` uses.
+        for value in entry.config.values_mut() {
+            *value = if value.is_string() {
+                serde_json::Value::String(String::new())
+            } else {
+                serde_json::Value::Null
+            };
+        }
     }
     // `api_url` can carry a credential (a pasted key, or a `user:pass@` / `?key=`
     // URL). `secrets_view` already withholds such a value; `get_config` must apply
@@ -758,6 +769,11 @@ fn validate_tool_entries(entries: Vec<String>) -> Result<Vec<String>, ApiError> 
 
 /// Merge an MCP write onto an existing entry: the command is required, but an
 /// omitted (`None`) args/env keeps the existing value rather than clearing it.
+///
+/// A supplied list or map replaces the stored one, except that a value which is
+/// the blanked form `GET /config` serves for a stored one keeps the stored value
+/// (see [`restore_redacted_mcp_args`] and [`restore_blank_mcp_env`]). Leaving an
+/// arg or an env key out removes it.
 fn merge_mcp_server(
     existing: Option<&McpServerConfig>,
     command: String,
@@ -766,13 +782,65 @@ fn merge_mcp_server(
 ) -> McpServerConfig {
     McpServerConfig {
         command,
-        args: args
-            .or_else(|| existing.map(|e| e.args.clone()))
-            .unwrap_or_default(),
-        env: env
-            .or_else(|| existing.map(|e| e.env.clone()))
-            .unwrap_or_default(),
+        args: match (args, existing) {
+            (Some(incoming), Some(e)) => restore_redacted_mcp_args(&e.args, incoming),
+            (Some(incoming), None) => incoming,
+            (None, Some(e)) => e.args.clone(),
+            (None, None) => Vec::new(),
+        },
+        env: match (env, existing) {
+            (Some(incoming), Some(e)) => restore_blank_mcp_env(&e.env, incoming),
+            (Some(incoming), None) => incoming,
+            (None, Some(e)) => e.env.clone(),
+            (None, None) => HashMap::new(),
+        },
     }
+}
+
+/// `GET /config` returns every MCP env value as an empty string and keeps the
+/// names. An empty value for a name that is already stored therefore means
+/// "keep what is stored", not "set it to nothing". To drop a variable, leave its
+/// name out of the map.
+fn restore_blank_mcp_env(
+    stored: &HashMap<String, String>,
+    mut incoming: HashMap<String, String>,
+) -> HashMap<String, String> {
+    for (name, value) in &mut incoming {
+        if value.is_empty() {
+            if let Some(kept) = stored.get(name) {
+                value.clone_from(kept);
+            }
+        }
+    }
+    incoming
+}
+
+/// `GET /config` blanks the secret in an MCP arg list through
+/// [`redact_mcp_args`]. An incoming arg that equals the redacted form of a stored
+/// arg is that stored arg, so the stored one is kept.
+///
+/// Matching walks both lists in order and never goes back: an incoming arg takes
+/// the first not-yet-used stored arg whose redacted form equals it. A secret
+/// therefore follows its flag when an earlier arg is removed or inserted, rather
+/// than being matched by index. An arg that matches nothing is new text and is
+/// taken as written.
+fn restore_redacted_mcp_args(stored: &[String], incoming: Vec<String>) -> Vec<String> {
+    let mut redacted = stored.to_vec();
+    redact_mcp_args(&mut redacted);
+    let mut next = 0;
+    incoming
+        .into_iter()
+        .map(
+            |arg| match redacted[next..].iter().position(|r| *r == arg) {
+                Some(offset) => {
+                    let index = next + offset;
+                    next = index + 1;
+                    stored[index].clone()
+                }
+                None => arg,
+            },
+        )
+        .collect()
 }
 
 async fn add_mcp_server(
@@ -1167,8 +1235,10 @@ struct SlackConnectBody {
     /// Discord.
     #[serde(default)]
     bot_token: String,
-    /// App-level token (`xapp-…`) that turns on Socket Mode. Absent leaves the
-    /// saved value untouched.
+    /// App-level token (`xapp-…`) that turns on Socket Mode. Absent or empty
+    /// leaves the saved value untouched: `GET /config` returns it as an empty
+    /// string, so an empty value is a read played back. `DELETE` the channel to
+    /// remove it.
     #[serde(default)]
     app_token: Option<String>,
     /// Slack user ids allowed to talk to the bot. Empty = deny all.
@@ -1291,11 +1361,8 @@ fn apply_slack_update(
         sc.bot_token = token.to_string();
     }
     sc.allowed_users = allowed_users;
-    if let Some(app) = app_token {
-        let app = app.trim();
-        if app.is_empty() {
-            sc.app_token = None;
-        } else if is_valid_slack_app_token(app) {
+    if let Some(app) = app_token.map(str::trim).filter(|app| !app.is_empty()) {
+        if is_valid_slack_app_token(app) {
             sc.app_token = Some(app.to_string());
         } else {
             return Err(err_400(format!(
@@ -1540,13 +1607,15 @@ struct LarkConnectBody {
     /// before persisting. Must be supplied together with `app_id`.
     #[serde(default)]
     app_secret: String,
-    /// Encrypt key for webhook event-body decryption. Absent leaves the saved
-    /// value untouched; present (even empty) sets or clears it. This build
-    /// does not decrypt event bodies, so a non-empty key here means Lark
-    /// refuses to start until it is cleared — the connect response warns.
+    /// Encrypt key for webhook event-body decryption. Absent or empty leaves
+    /// the saved value untouched: `GET /config` returns it as an empty string,
+    /// so an empty value is a read played back. `DELETE` the channel to remove
+    /// it. This build does not decrypt event bodies, so a non-empty key here
+    /// means Lark refuses to start until it is removed — the connect response
+    /// warns.
     #[serde(default)]
     encrypt_key: Option<String>,
-    /// Verification token for webhook validation. Same absent/present
+    /// Verification token for webhook validation. Same absent/empty
     /// convention as `encrypt_key`.
     #[serde(default)]
     verification_token: Option<String>,
@@ -1636,13 +1705,14 @@ fn apply_lark_update(
     }
     lc.allowed_users = allowed_users;
     lc.use_feishu = use_feishu;
-    if let Some(key) = encrypt_key {
-        let key = key.trim();
-        lc.encrypt_key = (!key.is_empty()).then(|| key.to_string());
+    if let Some(key) = encrypt_key.map(str::trim).filter(|key| !key.is_empty()) {
+        lc.encrypt_key = Some(key.to_string());
     }
-    if let Some(token) = verification_token {
-        let token = token.trim();
-        lc.verification_token = (!token.is_empty()).then(|| token.to_string());
+    if let Some(token) = verification_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        lc.verification_token = Some(token.to_string());
     }
     Ok(lc)
 }
@@ -2186,7 +2256,8 @@ fn secrets_view(cfg: &crate::config::Config) -> serde_json::Value {
 }
 
 /// Apply a secrets mutation: a provided field sets the value (empty string clears
-/// it), an omitted field leaves the existing value untouched.
+/// it), an omitted field leaves the existing value untouched. An `api_url` equal
+/// to what the read showed for the stored one also leaves it untouched.
 /// Switch the active provider, carrying per-provider keys correctly: preserve
 /// the outgoing provider's key in the per-provider store (covers keys that only
 /// ever lived in the top-level `api_key`), then point the top-level `api_key` at
@@ -2239,11 +2310,16 @@ fn apply_secrets(cfg: &mut crate::config::Config, body: &SecretsBody) -> Result<
     }
     if let Some(u) = body.api_url.as_ref() {
         let u = u.trim();
-        cfg.api_url = if u.is_empty() {
-            None
-        } else {
-            Some(u.to_string())
-        };
+        // `GET /secrets` and `GET /config` show `sanitize_api_url` of the stored
+        // value, so a write that equals it is a read played back: keep the stored
+        // URL, credentials included. Only an empty value clears.
+        let is_read_played_back =
+            cfg.api_url.as_deref().and_then(sanitize_api_url).as_deref() == Some(u);
+        if u.is_empty() {
+            cfg.api_url = None;
+        } else if !is_read_played_back {
+            cfg.api_url = Some(u.to_string());
+        }
     }
     Ok(())
 }
@@ -3361,25 +3437,21 @@ mod tests {
         );
     }
 
-    /// `encrypt_key`/`verification_token` follow the present-even-empty-clears
-    /// convention `guild_id` established for Discord: `Some("")` clears,
-    /// `Some(value)` sets, `None` (the field omitted) leaves the saved value.
+    /// `GET /config` returns both as empty strings, so a request that carries
+    /// both empty (a read played back) must keep both. The old contract, where
+    /// `Some("")` cleared, erased them on exactly that round trip. The way to
+    /// remove them is `DELETE /channels/lark`.
     #[test]
-    fn lark_encrypt_key_and_verification_token_can_be_cleared_explicitly() {
-        let mut existing = lark_config("saved-app", "saved-secret-not-real", false);
-        existing.encrypt_key = Some("saved-encrypt-key".into());
-        existing.verification_token = Some("saved-verification-token".into());
+    fn lark_encrypt_key_and_verification_token_are_kept_when_both_arrive_empty() {
+        let existing = lark_with_webhook_secrets();
 
         let updated = apply_lark_update(Some(existing), None, vec![], Some(""), Some(""), false)
             .expect("apply");
 
-        assert!(
-            updated.encrypt_key.is_none(),
-            "an explicitly empty encrypt_key clears it"
-        );
-        assert!(
-            updated.verification_token.is_none(),
-            "an explicitly empty verification_token clears it"
+        assert_eq!(updated.encrypt_key.as_deref(), Some("saved-encrypt-key"));
+        assert_eq!(
+            updated.verification_token.as_deref(),
+            Some("saved-verification-token")
         );
     }
 
@@ -4147,6 +4219,643 @@ mod tests {
         assert!(
             handler.contains("finish_pairing(") && handler.contains("schedule_daemon_reload,"),
             "the Connected arm must pass schedule_daemon_reload to finish_pairing"
+        );
+    }
+
+    // ── A blanked read never erases the secret behind it ─────────────────
+    //
+    // The invariant: a value the config API hands out is either the real value
+    // or a blank that the matching write path reads as "keep what is stored".
+
+    /// What `get_config` serves: the typed pass, then the key-name backstop.
+    fn read_response(cfg: &Config) -> serde_json::Value {
+        let mut cfg = cfg.clone();
+        redact_config_secrets(&mut cfg);
+        let mut val = serde_json::to_value(&cfg).expect("config serializes");
+        redact_secrets_in_json(&mut val);
+        val
+    }
+
+    fn mcp_server(args: &[&str], env: &[(&str, &str)]) -> McpServerConfig {
+        McpServerConfig {
+            command: "npx".into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `compose_skill_env` exports every `config` value to the skill's
+    /// environment, so a value here is as sensitive as one in `env`. The key
+    /// stays so the operator sees what is set. Strings become `""` and every
+    /// other JSON type becomes `null`, the convention the key-name backstop
+    /// already uses for a secret it blanks.
+    #[test]
+    fn skill_config_values_are_blank_on_read_and_keys_stay() {
+        let mut cfg = Config::default();
+        cfg.skills.entries.insert(
+            "x".into(),
+            crate::config::SkillEntryConfig {
+                config: std::collections::HashMap::from([
+                    ("dsn".to_string(), json!("postgres://u:neutral-pw@h/db")),
+                    ("retries".to_string(), json!(3)),
+                    ("verbose".to_string(), json!(true)),
+                    ("hosts".to_string(), json!(["neutral-host-secret"])),
+                    (
+                        "nested".to_string(),
+                        json!({ "inner": "neutral-nested-pw" }),
+                    ),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let val = read_response(&cfg);
+        let json = val.to_string();
+        for leaked in ["neutral-pw", "neutral-host-secret", "neutral-nested-pw"] {
+            assert!(!json.contains(leaked), "{leaked} leaked in:\n{json}");
+        }
+        let config = val["skills"]["entries"]["x"]["config"]
+            .as_object()
+            .unwrap_or_else(|| panic!("skill config missing in:\n{json}"));
+        assert_eq!(config.len(), 5, "keys must stay visible in:\n{json}");
+        assert_eq!(
+            config["dsn"],
+            json!(""),
+            "a string blanks to an empty string"
+        );
+        for key in ["retries", "verbose", "hosts", "nested"] {
+            assert_eq!(config[key], json!(null), "{key} blanks to null in:\n{json}");
+        }
+    }
+
+    #[test]
+    fn mcp_env_blank_write_keeps_stored_value() {
+        let existing = mcp_server(
+            &[],
+            &[("DATABASE_URL", "neutral-db-secret"), ("PLAIN", "1")],
+        );
+        let read = read_response(&{
+            let mut cfg = Config::default();
+            cfg.mcp_servers.insert("srv".into(), existing.clone());
+            cfg
+        });
+        let echoed: HashMap<String, String> =
+            serde_json::from_value(read["mcp_servers"]["srv"]["env"].clone())
+                .expect("env reads back as a string map");
+        assert_eq!(echoed.len(), 2, "the names stay visible");
+        assert!(
+            echoed.values().all(String::is_empty),
+            "the values are blank"
+        );
+
+        let merged = merge_mcp_server(Some(&existing), "npx".into(), None, Some(echoed));
+        assert_eq!(merged.env, existing.env, "a blanked read must not erase");
+    }
+
+    #[test]
+    fn mcp_env_real_write_replaces_stored_value_and_omitted_key_is_removed() {
+        let existing = mcp_server(&[], &[("DATABASE_URL", "old"), ("DROPPED", "old")]);
+        let incoming = HashMap::from([
+            ("DATABASE_URL".to_string(), "new".to_string()),
+            ("ADDED".to_string(), "fresh".to_string()),
+        ]);
+
+        let merged = merge_mcp_server(Some(&existing), "npx".into(), None, Some(incoming));
+
+        assert_eq!(
+            merged.env.get("DATABASE_URL").map(String::as_str),
+            Some("new")
+        );
+        assert_eq!(merged.env.get("ADDED").map(String::as_str), Some("fresh"));
+        assert!(
+            !merged.env.contains_key("DROPPED"),
+            "a key left out of the map is removed"
+        );
+    }
+
+    #[test]
+    fn mcp_args_redacted_write_keeps_stored_arg() {
+        let existing = mcp_server(
+            &[
+                "-y",
+                "server",
+                "--api-key",
+                "neutral-flag-secret",
+                "--token=neutral-inline-secret",
+                "sk-neutral-bare-key",
+                "--verbose",
+            ],
+            &[],
+        );
+        let read = read_response(&{
+            let mut cfg = Config::default();
+            cfg.mcp_servers.insert("srv".into(), existing.clone());
+            cfg
+        });
+        let echoed: Vec<String> =
+            serde_json::from_value(read["mcp_servers"]["srv"]["args"].clone())
+                .expect("args read back as a string list");
+        assert!(
+            !echoed.iter().any(|a| a.contains("neutral")),
+            "the read blanks them: {echoed:?}"
+        );
+
+        let merged = merge_mcp_server(Some(&existing), "npx".into(), Some(echoed), None);
+        assert_eq!(merged.args, existing.args, "a blanked read must not erase");
+    }
+
+    /// The edit that makes positional matching unsafe: an earlier arg is
+    /// removed, so every later position shifts by one.
+    #[test]
+    fn mcp_args_redacted_write_keeps_stored_arg_after_an_earlier_arg_is_removed() {
+        let existing = mcp_server(&["-y", "server", "--api-key", "neutral-flag-secret"], &[]);
+
+        let merged = merge_mcp_server(
+            Some(&existing),
+            "npx".into(),
+            Some(strings(&["-y", "--api-key", ""])),
+            None,
+        );
+
+        assert_eq!(
+            merged.args,
+            strings(&["-y", "--api-key", "neutral-flag-secret"]),
+            "the secret follows its flag, not its position"
+        );
+    }
+
+    #[test]
+    fn mcp_args_real_write_replaces_stored_arg() {
+        let existing = mcp_server(&["-y", "server", "--api-key", "neutral-old-secret"], &[]);
+
+        let merged = merge_mcp_server(
+            Some(&existing),
+            "npx".into(),
+            Some(strings(&[
+                "-y",
+                "server",
+                "--api-key",
+                "neutral-new-secret",
+            ])),
+            None,
+        );
+
+        assert_eq!(
+            merged.args,
+            strings(&["-y", "server", "--api-key", "neutral-new-secret"])
+        );
+    }
+
+    #[test]
+    fn slack_app_token_blank_write_keeps_stored_value() {
+        let existing = slack_config("xoxb-saved");
+        let read = read_response(&{
+            let mut cfg = Config::default();
+            cfg.channels_config.slack = Some(existing.clone());
+            cfg
+        });
+        let echoed = read["channels_config"]["slack"]["app_token"]
+            .as_str()
+            .expect("a stored app token reads back as a string")
+            .to_string();
+        assert_eq!(echoed, "", "the read blanks it");
+
+        for blank in [echoed.as_str(), "   "] {
+            let updated =
+                apply_slack_update(Some(existing.clone()), None, vec![], Some(blank), None)
+                    .expect("apply");
+            assert_eq!(
+                updated.app_token.as_deref(),
+                Some("xapp-1-AAA"),
+                "a blank app_token ({blank:?}) must not erase the stored one"
+            );
+        }
+    }
+
+    #[test]
+    fn slack_app_token_real_write_replaces_stored_value() {
+        let updated = apply_slack_update(
+            Some(slack_config("xoxb-saved")),
+            None,
+            vec![],
+            Some("xapp-1-BBB"),
+            None,
+        )
+        .expect("apply");
+        assert_eq!(updated.app_token.as_deref(), Some("xapp-1-BBB"));
+    }
+
+    fn lark_with_webhook_secrets() -> LarkConfig {
+        let mut existing = lark_config("saved-app", "saved-secret-not-real", false);
+        existing.encrypt_key = Some("saved-encrypt-key".into());
+        existing.verification_token = Some("saved-verification-token".into());
+        existing
+    }
+
+    #[test]
+    fn lark_encrypt_key_blank_write_keeps_stored_value() {
+        let existing = lark_with_webhook_secrets();
+        let read = read_response(&{
+            let mut cfg = Config::default();
+            cfg.channels_config.lark = Some(existing.clone());
+            cfg
+        });
+        let echoed = read["channels_config"]["lark"]["encrypt_key"]
+            .as_str()
+            .expect("a stored encrypt key reads back as a string")
+            .to_string();
+        assert_eq!(echoed, "", "the read blanks it");
+
+        for blank in [echoed.as_str(), "   "] {
+            let updated = apply_lark_update(
+                Some(existing.clone()),
+                None,
+                vec![],
+                Some(blank),
+                None,
+                false,
+            )
+            .expect("apply");
+            assert_eq!(
+                updated.encrypt_key.as_deref(),
+                Some("saved-encrypt-key"),
+                "a blank encrypt_key ({blank:?}) must not erase the stored one"
+            );
+        }
+    }
+
+    #[test]
+    fn lark_encrypt_key_real_write_replaces_stored_value() {
+        let updated = apply_lark_update(
+            Some(lark_with_webhook_secrets()),
+            None,
+            vec![],
+            Some("  new-encrypt-key  "),
+            None,
+            false,
+        )
+        .expect("apply");
+        assert_eq!(updated.encrypt_key.as_deref(), Some("new-encrypt-key"));
+    }
+
+    #[test]
+    fn lark_verification_token_blank_write_keeps_stored_value() {
+        let existing = lark_with_webhook_secrets();
+        let read = read_response(&{
+            let mut cfg = Config::default();
+            cfg.channels_config.lark = Some(existing.clone());
+            cfg
+        });
+        let echoed = read["channels_config"]["lark"]["verification_token"]
+            .as_str()
+            .expect("a stored verification token reads back as a string")
+            .to_string();
+        assert_eq!(echoed, "", "the read blanks it");
+
+        for blank in [echoed.as_str(), "   "] {
+            let updated = apply_lark_update(
+                Some(existing.clone()),
+                None,
+                vec![],
+                None,
+                Some(blank),
+                false,
+            )
+            .expect("apply");
+            assert_eq!(
+                updated.verification_token.as_deref(),
+                Some("saved-verification-token"),
+                "a blank verification_token ({blank:?}) must not erase the stored one"
+            );
+        }
+    }
+
+    #[test]
+    fn lark_verification_token_real_write_replaces_stored_value() {
+        let updated = apply_lark_update(
+            Some(lark_with_webhook_secrets()),
+            None,
+            vec![],
+            None,
+            Some("  new-verification-token  "),
+            false,
+        )
+        .expect("apply");
+        assert_eq!(
+            updated.verification_token.as_deref(),
+            Some("new-verification-token")
+        );
+    }
+
+    const URL_WITH_CREDENTIALS: &str =
+        "https://user:neutral-pw@gateway.example.com/v1?key=neutral-q&region=eu";
+
+    #[test]
+    fn secrets_api_url_sanitized_write_keeps_stored_url() {
+        let mut cfg = Config::default();
+        cfg.api_url = Some(URL_WITH_CREDENTIALS.into());
+        let shown = secrets_view(&cfg)["api_url"]
+            .as_str()
+            .expect("a URL with credentials still reads as a URL")
+            .to_string();
+        assert_eq!(shown, "https://gateway.example.com/v1?region=eu");
+        assert_eq!(
+            read_response(&cfg)["api_url"],
+            json!(shown),
+            "GET /config and GET /secrets show the same value"
+        );
+
+        apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: None,
+                api_url: Some(shown),
+            },
+        )
+        .expect("apply");
+        assert_eq!(
+            cfg.api_url.as_deref(),
+            Some(URL_WITH_CREDENTIALS),
+            "writing back what the read showed must not strip the credentials"
+        );
+    }
+
+    /// The console's "reset base URL" button sends `api_url: ""`. It has to
+    /// keep working, so an empty value clears and only the sanitized form of
+    /// the stored value is read as "keep".
+    #[test]
+    fn secrets_api_url_empty_write_clears_stored_url() {
+        let mut cfg = Config::default();
+        cfg.api_url = Some(URL_WITH_CREDENTIALS.into());
+        apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: None,
+                api_url: Some(String::new()),
+            },
+        )
+        .expect("apply");
+        assert!(cfg.api_url.is_none());
+    }
+
+    #[test]
+    fn secrets_api_url_real_write_replaces_stored_url() {
+        let mut cfg = Config::default();
+        cfg.api_url = Some(URL_WITH_CREDENTIALS.into());
+        apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: None,
+                api_url: Some("https://other.example.com/v1".into()),
+            },
+        )
+        .expect("apply");
+        assert_eq!(cfg.api_url.as_deref(), Some("https://other.example.com/v1"));
+    }
+
+    /// The whole loop through the real handlers: serve `GET /config`, replay
+    /// what it returned into every route that takes a field it blanked, and
+    /// check the stored config did not move.
+    #[tokio::test]
+    async fn a_config_read_replayed_into_every_write_route_keeps_every_stored_secret() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        config.api_url = Some(URL_WITH_CREDENTIALS.into());
+        config.channels_config.slack = Some(slack_config("xoxb-saved"));
+        config.channels_config.lark = Some(lark_with_webhook_secrets());
+        config.mcp_servers.insert(
+            "srv".into(),
+            mcp_server(
+                &["-y", "server", "--api-key", "neutral-flag-secret"],
+                &[("DATABASE_URL", "neutral-db-secret")],
+            ),
+        );
+        let before = config.clone();
+        let state = console_state(config);
+
+        let read = get_config(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("read")
+            .0;
+
+        let slack = &read["channels_config"]["slack"];
+        let _slack_response = Box::pin(connect_slack(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SlackConnectBody {
+                bot_token: slack["bot_token"].as_str().unwrap_or_default().into(),
+                app_token: slack["app_token"].as_str().map(str::to_string),
+                allowed_users: vec!["U_KEEP".into()],
+                channel_id: None,
+            }),
+        ))
+        .await
+        .expect("slack write");
+
+        let lark = &read["channels_config"]["lark"];
+        let _lark_response = Box::pin(connect_lark(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(LarkConnectBody {
+                app_id: String::new(),
+                app_secret: String::new(),
+                encrypt_key: lark["encrypt_key"].as_str().map(str::to_string),
+                verification_token: lark["verification_token"].as_str().map(str::to_string),
+                allowed_users: vec!["U_KEEP".into()],
+                use_feishu: None,
+            }),
+        ))
+        .await
+        .expect("lark write");
+
+        let srv = &read["mcp_servers"]["srv"];
+        let _mcp_response = Box::pin(add_mcp_server(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("srv".into()),
+            Json(McpServerBody {
+                command: srv["command"].as_str().unwrap_or_default().into(),
+                args: serde_json::from_value(srv["args"].clone()).ok(),
+                env: serde_json::from_value(srv["env"].clone()).ok(),
+            }),
+        ))
+        .await
+        .expect("mcp write");
+
+        let _secrets_response = Box::pin(set_secrets(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SecretsBody {
+                api_key: None,
+                api_url: read["api_url"].as_str().map(str::to_string),
+            }),
+        ))
+        .await
+        .expect("secrets write");
+
+        let after = state.config.lock().clone();
+        let slack = after.channels_config.slack.expect("slack stays connected");
+        assert_eq!(
+            slack.app_token,
+            before.channels_config.slack.unwrap().app_token
+        );
+        let lark = after.channels_config.lark.expect("lark stays connected");
+        let lark_before = before.channels_config.lark.unwrap();
+        assert_eq!(lark.encrypt_key, lark_before.encrypt_key);
+        assert_eq!(lark.verification_token, lark_before.verification_token);
+        assert_eq!(after.mcp_servers, before.mcp_servers);
+        assert_eq!(after.api_url, before.api_url);
+    }
+
+    /// Fill every property of `Config` from its published JSON Schema, with a
+    /// marker in each string whose name is a credential. Fields added to the
+    /// schema later are filled the same way, so the gate needs no upkeep.
+    fn fill_from_schema(
+        schema: &serde_json::Value,
+        root: &serde_json::Value,
+        name: &str,
+        depth: usize,
+    ) -> serde_json::Value {
+        use serde_json::Value;
+        const MARKER: &str = "MARKER_SECRET_walk";
+        if depth > 16 {
+            return Value::Null;
+        }
+        if let Some(target) = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| root.pointer(r.trim_start_matches('#')))
+        {
+            return fill_from_schema(target, root, name, depth + 1);
+        }
+        if let Some(variants) = schema
+            .get("anyOf")
+            .or_else(|| schema.get("oneOf"))
+            .and_then(Value::as_array)
+        {
+            let chosen = variants
+                .iter()
+                .find(|v| v.get("type") != Some(&json!("null")))
+                .or_else(|| variants.first());
+            return chosen.map_or(Value::Null, |v| fill_from_schema(v, root, name, depth + 1));
+        }
+        if let Some(first) = schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .and_then(|e| e.first())
+        {
+            return first.clone();
+        }
+        if let Some(value) = schema.get("const") {
+            return value.clone();
+        }
+        let kind = match schema.get("type") {
+            Some(Value::String(s)) => s.as_str(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|s| *s != "null")
+                .unwrap_or("null"),
+            _ => "",
+        };
+        match kind {
+            "object" => {
+                if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+                    Value::Object(
+                        props
+                            .iter()
+                            .map(|(k, v)| (k.clone(), fill_from_schema(v, root, k, depth + 1)))
+                            .collect(),
+                    )
+                } else if let Some(values) = schema.get("additionalProperties") {
+                    json!({ "entry": fill_from_schema(values, root, name, depth + 1) })
+                } else {
+                    json!({})
+                }
+            }
+            "array" => schema.get("items").map_or(json!([]), |items| {
+                json!([fill_from_schema(items, root, name, depth + 1)])
+            }),
+            "string" => {
+                let credential =
+                    name.split('_').any(|w| {
+                        matches!(
+                            w,
+                            "key"
+                                | "keys"
+                                | "token"
+                                | "secret"
+                                | "password"
+                                | "credential"
+                                | "credentials"
+                        )
+                    }) && !matches!(name, "rate_limit_max_keys" | "idempotency_max_keys");
+                json!(if credential { MARKER } else { "x" })
+            }
+            "integer" | "number" => json!(1),
+            "boolean" => json!(false),
+            _ => Value::Null,
+        }
+    }
+
+    fn leaked_marker_paths(v: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) if s.contains("MARKER_SECRET_walk") => {
+                out.push(path.to_string());
+            }
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    leaked_marker_paths(child, &format!("{path}.{k}"), out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    leaked_marker_paths(child, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The marker test above seeds the fields it knows about, so a field added
+    /// to `Config` tomorrow is outside its reach. This one fills every property
+    /// of the schema whose name is a credential and fails naming the path of
+    /// any that still carries a value in the response.
+    #[test]
+    fn no_credential_named_config_field_reaches_the_response_with_a_value() {
+        let schema = serde_json::to_value(schemars::schema_for!(Config)).expect("schema");
+        let filled = fill_from_schema(&schema, &schema, "", 0);
+        let cfg: Config = serde_json::from_value(filled)
+            .expect("a Config filled from its own schema deserializes");
+
+        let val = read_response(&cfg);
+        let mut leaks = Vec::new();
+        leaked_marker_paths(&val, "", &mut leaks);
+        assert!(
+            leaks.is_empty(),
+            "credential-named fields reach GET /config with a value: {leaks:?}"
+        );
+
+        // A control: without redaction the same fill does leak, so an empty
+        // `leaks` above cannot come from a fill that placed no marker.
+        let raw = serde_json::to_value(&cfg).expect("config serializes");
+        let mut raw_leaks = Vec::new();
+        leaked_marker_paths(&raw, "", &mut raw_leaks);
+        assert!(
+            raw_leaks.len() > 20,
+            "the schema fill placed too few markers to mean anything: {raw_leaks:?}"
         );
     }
 }
