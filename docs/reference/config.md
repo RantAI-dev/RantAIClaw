@@ -325,9 +325,6 @@ Notes:
 | `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"computer_use"`, or `"auto"`. `"rust_native"` and `"native"` fail with an error, because the native backend was removed |
-| `native_headless` | `true` | No effect: the native backend was removed. Read by nothing |
-| `native_webdriver_url` | `http://127.0.0.1:9515` | No effect: the native backend was removed. Read by nothing |
-| `native_chrome_path` | unset | No effect: the native backend was removed. Read by nothing |
 
 ### `[browser.computer_use]`
 
@@ -904,6 +901,24 @@ is refused rather than half-understood.
 Migrations only move forward. There is no automatic downgrade, so reverting to a
 binary older than your config's `schema_version` needs a manual edit.
 
+### v36: hardware sections and native browser keys retired
+
+The `[peripherals]` and `[hardware]` config sections are removed in their
+entirety; the runtime stack behind them (`rantaiclaw hardware`,
+`rantaiclaw peripheral`, the board firmware and the datasheet RAG) shipped
+disabled by default in an earlier tag, so the two sections configured code
+paths that no longer exist. The three `[browser]` native-backend keys are
+removed too; they configured the WebDriver browser backend that was
+deleted in an earlier tag. The `[browser].backend` value `"rust_native"`
+(and its alias `"native"`) keep failing at startup as they did before —
+the remaining values are `"agent_browser"`, `"computer_use"` and `"auto"`.
+
+Existing configs drop both sections and all three keys on load (config
+schema **35 → 36**). The migrator is unconditional: a v35 file that
+carried a custom `[peripherals].datasheet_dir` or a non-default
+`[hardware].baud_rate` still loses those entries, because the code that
+read them is gone. No operator-visible key is renamed or carried across.
+
 ### v33: Telegram and Discord `mention_only` defaults to `true`
 
 Fresh installs and configs without the key now answer in groups only when
@@ -943,65 +958,6 @@ Upgrading rewrites a v31 WhatsApp section:
 3. Set `schema_version = 31`.
 
 Keeping a copy of `config.toml` before a major upgrade is cheaper than step 1.
-
-## `[hardware]`
-
-Hardware wizard configuration for physical-world access (STM32, probe, serial).
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Whether hardware access is enabled |
-| `transport` | `none` | Transport mode: `"none"`, `"native"`, `"serial"`, or `"probe"` |
-| `serial_port` | unset | Serial port path (e.g. `"/dev/ttyACM0"`) |
-| `baud_rate` | `115200` | Serial baud rate |
-| `probe_target` | unset | Probe target chip (e.g. `"STM32F401RE"`) |
-| `workspace_datasheets` | `false` | Enable workspace datasheet RAG (index PDF schematics for AI pin lookups) |
-
-Notes:
-
-- Use `transport = "serial"` with `serial_port` for USB-serial connections.
-- Use `transport = "probe"` with `probe_target` for debug-probe flashing (e.g. ST-Link).
-- See [hardware-peripherals-design.md](../hardware/peripherals-design.md) for protocol details.
-
-## `[peripherals]`
-
-Higher-level peripheral board configuration. Boards become agent tools when enabled.
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Enable peripheral support (boards become agent tools) |
-| `boards` | `[]` | Board configurations |
-| `datasheet_dir` | unset | Path to datasheet docs (relative to workspace) for RAG retrieval |
-
-Each entry in `boards`:
-
-| Key | Default | Purpose |
-|---|---|---|
-| `board` | _required_ | Board type: `"nucleo-f401re"`, `"rpi-gpio"`, `"esp32"`, etc. |
-| `transport` | `serial` | Transport: `"serial"`, `"native"`, `"websocket"` |
-| `path` | unset | Path for serial: `"/dev/ttyACM0"`, `"/dev/ttyUSB0"` |
-| `baud` | `115200` | Baud rate for serial |
-
-```toml
-[peripherals]
-enabled = true
-datasheet_dir = "docs/datasheets"
-
-[[peripherals.boards]]
-board = "nucleo-f401re"
-transport = "serial"
-path = "/dev/ttyACM0"
-baud = 115200
-
-[[peripherals.boards]]
-board = "rpi-gpio"
-transport = "native"
-```
-
-Notes:
-
-- Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
-- See [hardware-peripherals-design.md](../hardware/peripherals-design.md) for board protocol and firmware notes.
 
 ## KB (Knowledge Base)
 

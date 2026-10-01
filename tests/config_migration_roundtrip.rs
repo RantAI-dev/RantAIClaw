@@ -238,13 +238,13 @@ fn v32_leaves_a_cloud_only_config_alone() {
 /// The version the migration chain claims to reach. If this drifts from
 /// `CURRENT_VERSION` the three cases above are testing a migration nobody runs.
 #[test]
-fn v35_is_the_current_version() {
-    assert_eq!(CURRENT_VERSION, 35);
+fn v36_is_the_current_version() {
+    assert_eq!(CURRENT_VERSION, 36);
     let mut v = v31_with_whatsapp("session_path = \"/tmp/wa.db\"");
     migrate(&mut v).expect("migrate runs");
     assert_eq!(
         v.get(SCHEMA_VERSION_KEY).and_then(toml::Value::as_integer),
-        Some(35),
+        Some(36),
         "the migrated config must be stamped with the version it reached"
     );
 }

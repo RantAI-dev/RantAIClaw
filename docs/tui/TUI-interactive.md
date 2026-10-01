@@ -45,8 +45,6 @@
 - `src/onboard/provision/browser.rs` — `BrowserProvisioner`
 - `src/onboard/provision/web_search.rs` — `WebSearchProvisioner`
 - `src/onboard/provision/multimodal.rs` — `MultimodalProvisioner`
-- `src/onboard/provision/peripherals.rs` — `PeripheralsProvisioner`
-- `src/onboard/provision/hardware.rs` — `HardwareProvisioner`
 - `src/onboard/provision/composio.rs` — `ComposioProvisioner`
 - `src/onboard/provision/secrets.rs` — `SecretsProvisioner`
 - `src/onboard/provision/agents.rs` — `AgentsProvisioner` (sub-agent delegation)
@@ -894,29 +892,7 @@ These have no legacy `SetupSection` — design from `Config` schema. Each is a s
 
 **Standard cycle.**
 
-## Task D9: `PeripheralsProvisioner`
-
-**Prompt schedule:**
-1. `Choose` (multi-select) — boards to register: `["STM32 (USB serial)", "Raspberry Pi GPIO", "Arduino (USB)"]`.
-2. Per board: `Prompt` for serial path / GPIO chip / USB device. Auto-detect via `validate::process::list_serial_ports`.
-
-**Config writes:** `config.peripherals.boards.push(PeripheralBoardConfig { ... })`.
-
-**Note:** Reference `docs/hardware/peripherals-design.md`.
-
-**Standard cycle.**
-
-## Task D10: `HardwareProvisioner`
-
-**Prompt schedule:**
-1. `Choose` (multi-select) — hardware groups: `["motors", "sensors", "displays", "cameras"]`.
-2. Per group: `Prompt` for device count + interface (I2C/SPI/UART).
-
-**Config writes:** `config.hardware = HardwareConfig { ... }`.
-
-**Standard cycle.**
-
-## Task D11: `ComposioProvisioner`
+## Task D9: `ComposioProvisioner`
 
 **Prompt schedule:**
 1. `Prompt` (secret) — Composio API key.
@@ -928,7 +904,7 @@ These have no legacy `SetupSection` — design from `Config` schema. Each is a s
 
 **Standard cycle.**
 
-## Task D12: `SecretsProvisioner`
+## Task D10: `SecretsProvisioner`
 
 **Prompt schedule:**
 1. `Choose` — backend: `["Local file (encrypted)", "OS keyring", "1Password CLI", "AWS Secrets Manager", "HashiCorp Vault"]`.
@@ -940,7 +916,7 @@ These have no legacy `SetupSection` — design from `Config` schema. Each is a s
 
 **Standard cycle.**
 
-## Task D13: `AgentsProvisioner` (sub-agent delegation)
+## Task D11: `AgentsProvisioner` (sub-agent delegation)
 
 **Prompt schedule:**
 1. `Choose` (multi-select) — built-in delegate agents to enable: `["researcher", "coder", "planner", "reviewer", "debugger"]`.
@@ -950,7 +926,7 @@ These have no legacy `SetupSection` — design from `Config` schema. Each is a s
 
 **Standard cycle.**
 
-## Task D14: `ModelRoutesProvisioner` + `EmbeddingRoutesProvisioner`
+## Task D12: `ModelRoutesProvisioner` + `EmbeddingRoutesProvisioner`
 
 Two provisioners, same shape — embeddings = same flow with different `Config` field. Implement together; commit separately.
 
@@ -1105,11 +1081,11 @@ After all provisioners ship and `tests/all_provisioners_smoke.rs` is green, the 
 
 **2. Placeholder scan** — Each task names the exact prompt sequence (Prompt vs Choose, IDs, defaults), the exact `Config` field path written, and the validation method. The standard test+impl+commit cycle is templated at the top with a runnable test scaffold. Tasks B1–E2 reference the template instead of repeating the boilerplate, but each enumerates the section-specific data (prompts, config writes, validation) that's the actual content the engineer needs.
 
-**3. Type consistency** — `ProvisionerCategory` enum (Task A1) is consumed by Tasks A3, B1-B5, C1-C15, D1-D14, E1. `validate::http::probe_get/probe_post` (Task A2) is consumed by every Phase B+C task that does live validation. `available()` and `provisioner_for(name)` are the registry contract used by Tasks A3, E1, F1, G1 — signatures match.
+**3. Type consistency** — `ProvisionerCategory` enum (Task A1) is consumed by Tasks A3, B1-B5, C1-C15, D1-D12, E1. `validate::http::probe_get/probe_post` (Task A2) is consumed by every Phase B+C task that does live validation. `available()` and `provisioner_for(name)` are the registry contract used by Tasks A3, E1, F1, G1 — signatures match.
 
 **4. Risk flags:**
 - Phase B3 (`SkillsProvisioner`) depends on the audit §7 `clawhub::install_one` rewrite. If that hasn't shipped, ClawHub picks write stub placeholders. Plan calls this out; ship Phase B3 anyway.
-- Phase D12 (`SecretsProvisioner`) needs cross-platform care — OS keyring requires Secret Service on Linux, Keychain on macOS, Credential Manager on Windows. The `keyring` crate handles this but each backend needs a smoke test.
+- Phase D10 (`SecretsProvisioner`) needs cross-platform care — OS keyring requires Secret Service on Linux, Keychain on macOS, Credential Manager on Windows. The `keyring` crate handles this but each backend needs a smoke test.
 - Phase G1 (legacy removal) is a single big-bang commit. Prefer doing it after all per-section ports have soaked in `main` for at least a week so any missed usage surfaces.
 
 **5. Validation matrix (per CLAUDE.md §8):** Each task ends with `cargo test -p rantaiclaw`. Phase F adds `cargo test --test all_provisioners_smoke`. Phase G adds the full clippy gate `cargo clippy --all-targets -- -D warnings`.
