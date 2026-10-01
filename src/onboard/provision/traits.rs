@@ -15,7 +15,6 @@ pub enum ProvisionerCategory {
     Channel,
     Integration,
     Runtime,
-    Hardware,
     Routing,
 }
 
@@ -131,8 +130,7 @@ mod tests {
             ProvisionerCategory::Integration,
             ProvisionerCategory::Runtime
         );
-        assert_ne!(ProvisionerCategory::Runtime, ProvisionerCategory::Hardware);
-        assert_ne!(ProvisionerCategory::Hardware, ProvisionerCategory::Routing);
+        assert_ne!(ProvisionerCategory::Runtime, ProvisionerCategory::Routing);
     }
 
     #[test]

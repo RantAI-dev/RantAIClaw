@@ -16,7 +16,6 @@ A lightweight, complete, Rust-native AI agent runtime. Direct competitor to Open
 | See channel / transport coverage | [reference/channels.md](reference/channels.md) |
 | Run a production deployment | [operations/runbook.md](operations/runbook.md) |
 | Understand the security model | [security/model.md](security/model.md) (forthcoming · for now: [security/agnostic-security.md](security/agnostic-security.md) + [security/frictionless-security.md](security/frictionless-security.md)) |
-| Add a board / peripheral | [hardware/](hardware/) |
 | Contribute a PR | [contributing/](contributing/) |
 | See what's planned and shipped | [pillars/](pillars/) (per-pillar maturity table) · [ClickUp](https://app.clickup.com/t/86exe9tdq) |
 
@@ -64,14 +63,6 @@ These tracks behavior. Every PR that affects a CLI flag or config key updates th
 - [security/http-request-ssrf-threat-model.md](security/http-request-ssrf-threat-model.md)
 - [security/shell-execution-security-note.md](security/shell-execution-security-note.md)
 - Roadmap: now tracked in ClickUp v0.6.0 release task (see [pillar 3](pillars/3-tools-approvals.md))
-
-## Hardware (niche but supported)
-
-- [hardware/peripherals-design.md](hardware/peripherals-design.md)
-- [hardware/adding-boards-and-tools.md](hardware/adding-boards-and-tools.md)
-- [hardware/arduino-uno-q-setup.md](hardware/arduino-uno-q-setup.md)
-- [hardware/nucleo-setup.md](hardware/nucleo-setup.md)
-- [datasheets/](datasheets/)
 
 ## Contributing
 

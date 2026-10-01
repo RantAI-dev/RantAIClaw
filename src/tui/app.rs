@@ -422,7 +422,7 @@ pub enum SetupTopicAction {
     TuiProvisioner(String),
     /// Drill down into a category sub-picker. The string is the
     /// category key (`core`, `channel`, `integration`, `runtime`,
-    /// `hardware`, `routing`).
+    /// `routing`).
     OpenCategorySubPicker(String),
     Unknown,
 }
@@ -4354,7 +4354,7 @@ impl TuiApp {
 
     /// Build and open a sub-picker showing only items in the given
     /// category. `cat_key` is one of `core` / `channel` /
-    /// `integration` / `runtime` / `hardware` / `routing`.
+    /// `integration` / `runtime` / `routing`.
     fn open_category_sub_picker(&mut self, cat_key: &str) {
         use crate::onboard::provision::{available, provisioner_for, ProvisionerCategory};
         use crate::tui::commands::setup::{cat_label, category_from_key, channel_picker_entries};

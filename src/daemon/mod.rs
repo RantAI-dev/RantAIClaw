@@ -641,7 +641,6 @@ async fn run_heartbeat_worker(
                 None,
                 None,
                 temp,
-                vec![],
                 "scheduler",
                 // Heartbeat runs under the daemon, where stdout is the
                 // journal; the reply (if any) is logged through the

@@ -207,7 +207,6 @@ mod core_skill_hook_tests {
             ProvisionerCategory::Core,
             ProvisionerCategory::Integration,
             ProvisionerCategory::Runtime,
-            ProvisionerCategory::Hardware,
             ProvisionerCategory::Routing,
         ] {
             let tmp = tempfile::tempdir().expect("temp home");
@@ -263,7 +262,6 @@ mod core_skill_hook_tests {
             ProvisionerCategory::Core,
             ProvisionerCategory::Integration,
             ProvisionerCategory::Runtime,
-            ProvisionerCategory::Hardware,
             ProvisionerCategory::Routing,
         ] {
             assert!(

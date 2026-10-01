@@ -63,18 +63,7 @@
 - [security/shell-execution-security-note.md](security/shell-execution-security-note.md)
 - Roadmap: tracked in the ClickUp v0.6.0 release task · pointer in [pillar 3](pillars/3-tools-approvals.md)
 
-## 6) Hardware (niche but supported)
-
-- [hardware/peripherals-design.md](hardware/peripherals-design.md)
-- [hardware/adding-boards-and-tools.md](hardware/adding-boards-and-tools.md)
-- [hardware/arduino-uno-q-setup.md](hardware/arduino-uno-q-setup.md)
-- [hardware/nucleo-setup.md](hardware/nucleo-setup.md)
-- [datasheets/arduino-uno-q.md](datasheets/arduino-uno-q.md)
-- [datasheets/arduino-uno.md](datasheets/arduino-uno.md)
-- [datasheets/nucleo-f401re.md](datasheets/nucleo-f401re.md)
-- [datasheets/esp32.md](datasheets/esp32.md)
-
-## 7) Contributing & CI
+## 6) Contributing & CI
 
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
 - [contributing/pr-workflow.md](contributing/pr-workflow.md)
@@ -82,7 +71,7 @@
 - [contributing/ci-map.md](contributing/ci-map.md)
 - [contributing/actions-source-policy.md](contributing/actions-source-policy.md)
 
-## 8) Project — conventions + archived snapshots
+## 7) Project — conventions + archived snapshots
 
 - [project/README.md](project/README.md)
 - [project/2026-08-14-attachments-cost-estimate.md](project/2026-08-14-attachments-cost-estimate.md) — inbound media: what shipped, and what each remaining channel costs

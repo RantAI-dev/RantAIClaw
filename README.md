@@ -302,9 +302,6 @@ for streaming and tool calling. The hand-rolled implementations remain available
   (feature `kb`, on by default; `kb-office` adds docx/xlsx/pptx).
 - `src/memory/` — agent memory with pluggable backends (sqlite), embeddings and
   vector merge.
-- `src/rag/` — hardware datasheet retrieval: keyword by default, semantic optional, plus
-  explicit pin-alias tables (`red_led: 13`). For pin lookup an alias table beats any
-  embedding; not every retrieval problem is a vector problem.
 
 **KB and memory may not import each other.** Different lifecycles, different ownership,
 different retention — mixing them is the most common way an agent platform leaks one
@@ -372,10 +369,8 @@ hardware you do not control, including aarch64 on-prem boxes.
 
 `default = ["tui", "whatsapp-web", "remote-install", "kb"]`
 
-Notable optional features: `hardware` (USB/serial boards), `peripheral-rpi`,
-`channel-matrix`, `channel-lark`, `observability-otel`,
-`probe` (probe-rs for Nucleo memory read), `rag-pdf`, `kb-office`,
-`legacy-providers`.
+Notable optional features: `channel-matrix`, `channel-lark`, `observability-otel`,
+`rag-pdf`, `kb-office`, `legacy-providers`.
 
 The Landlock crate compiles in automatically on Linux with no feature flag, but see
 **What these controls do not cover** — the sandbox layer is not wired to command
