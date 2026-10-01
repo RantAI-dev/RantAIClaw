@@ -312,7 +312,7 @@ pub fn render(config: &Config) -> String {
         crate::config::SkillsPromptInjectionMode::Compact
     ) {
         out.push_str(
-            "  always: skill names and descriptions in the prompt (instructions load on demand through a tool; a skill's own tools still need guest_allowed_tools)\n",
+            "  always: skill names and descriptions in the prompt (loading a skill's instructions, and a skill's own tools, need a tool in guest_allowed_tools)\n",
         );
     } else {
         out.push_str(

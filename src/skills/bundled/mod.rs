@@ -9,7 +9,7 @@
 //! a useful general-purpose assistant out of the box, not a code agent.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -115,7 +115,14 @@ fn refresh_old_owner_permissions_passage(dir: &Path) -> Result<bool> {
         .open(&backup)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tracing::warn!(
+                "bundled: {} still carries the old guest passage, but {} already exists and is never overwritten; move the .bak away and the next setup run refreshes the skill",
+                skill_md.display(),
+                backup.display()
+            );
+            return Ok(false);
+        }
         Err(e) => return Err(e).with_context(|| format!("create {}", backup.display())),
     };
     backup_file
@@ -209,6 +216,7 @@ pub fn find_by_slug(slug: &str) -> Option<&'static StarterPackSkill> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn starter_pack_has_exactly_five_skills() {
