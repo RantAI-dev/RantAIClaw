@@ -240,7 +240,7 @@ ls <workspace>/memory/migrations/
 
 - Fix the cause named in the logged `error` field, then restart. The import retries by itself and removes `PENDING` once it succeeds.
 - The runtime does not delete the live `MEMORY.md` and `memory/*.md`, and a complete backup directory (`markdown-<timestamp>-<pid>/`, with a `BACKUP_COMPLETE` marker) holds copies of them and of `brain.db`. Copy notes back from there if you need them sooner.
-- To stop a failed backup from retrying, set `[memory] backend = "sqlite"` in the config, remove a `[storage.provider.config] provider = "markdown"` line if there is one, and delete `PENDING`. Deleting `PENDING` alone does not stop it while the config still names `markdown`, because the next start makes the backup again and writes `PENDING` again. The notes are then not imported.
+- To stop a failed backup from retrying, set `[memory] backend = "sqlite"` in the config, remove a `[storage.provider.config] provider = "markdown"` line if either is there, and delete `PENDING`. The on-disk config may still name `markdown`, so check the file. While it does, deleting `PENDING` alone does not stop the retry, because the next start makes the backup again and writes `PENDING` again. The notes are then not imported.
 - To stop a failed import from retrying, create an empty `IMPORTED` file in that backup directory (`touch <backup directory>/IMPORTED`), and delete `PENDING` if it exists. Deleting `PENDING` alone does not stop it, because every start imports each complete backup that has no `IMPORTED` marker.
 
 See [One-time markdown memory import](../operations/runbook.md#one-time-markdown-memory-import) for the markers.

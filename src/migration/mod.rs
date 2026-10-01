@@ -30,8 +30,9 @@ pub(crate) struct SourceEntry {
 
 /// Fail unless `path` is a regular file (a symlink to one counts).
 ///
-/// Every read or copy of a note, a marker or a live file goes through this
-/// check before the open. Opening a FIFO for reading blocks until a writer
+/// The import's reads of notes and markers call this helper before the open.
+/// The live `MEMORY.md` is checked once, before the projection step reads it.
+/// Opening a FIFO for reading blocks until a writer
 /// appears, and a device file such as `/dev/zero` never ends, so the open
 /// itself is what must not happen.
 pub(crate) fn require_regular_file(path: &Path) -> Result<()> {
