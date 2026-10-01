@@ -400,13 +400,12 @@ pub(crate) fn warn_on_risky_approval_owners(owners: &[String]) {
             crate::channels::cli::CLI_SENDER_ID
         );
     }
-    // promote themselves to owner. The user almost always wants at least
-    // their own chat id in there. Warn once at startup so a misconfigured
-    // daemon doesn't silently strand approvals. The doctor surface covers
-    // the same case with a check, sharing this wording via
-    // [`crate::approval::APPROVAL_OWNERS_EMPTY_MESSAGE`] so the two never say
-    // different things about the same condition; this warning is the noisy
-    // sibling for operators who aren't running `rantaiclaw doctor`.
+    // An empty list (or one holding only blank entries) leaves nobody able to
+    // approve, so every sender is a guest. Warn at startup so a daemon with no
+    // owner does not silently strand approvals. `rantaiclaw doctor` reports the
+    // same condition with the same wording
+    // ([`crate::approval::APPROVAL_OWNERS_EMPTY_MESSAGE`]); this warning
+    // reaches operators who never run it.
     if owners.iter().all(|o| o.trim().is_empty()) {
         tracing::warn!("{}", approval_owners_empty_warning());
     }
@@ -427,22 +426,65 @@ fn approval_owners_empty_warning() -> String {
 mod approval_owners_warning_tests {
     use super::*;
 
-    fn capture_warnings(owners: &[String]) -> Vec<String> {
-        // tracing-test would be heavier; the warn message is a constant string
-        // template, so we just verify the conditions under which the warning
-        // is meant to fire (i.e. `warn_on_risky_approval_owners` is exercised
-        // and we assert that the function does not panic, plus we double-check
-        // each branch with a targeted call). The exact log line is exercised
-        // in operator smoke tests.
-        warn_on_risky_approval_owners(owners);
-        vec![owners.join(",")]
+    /// Run `run` under a subscriber scoped to this thread and return what it
+    /// logged at WARN or above, so parallel tests cannot see each other's
+    /// events.
+    fn warnings_from(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("lock the log buffer")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Buffer {
+            type Writer = Self;
+
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().expect("lock the log buffer").clone();
+        String::from_utf8(bytes).expect("log output is utf-8")
     }
 
+    fn logged_for(owners: &[String]) -> String {
+        warnings_from(|| warn_on_risky_approval_owners(owners))
+    }
+
+    /// The warning the startup path really emits for an empty list must say
+    /// every sender is a guest and name `/claim`. Asserted on the captured log
+    /// line, so a change to the text at the call site fails it, not only a
+    /// change to the helper or the shared constants.
     #[test]
-    fn empty_owners_does_not_panic() {
-        capture_warnings(&[]);
-        capture_warnings(&[String::new()]);
-        capture_warnings(&["   ".into()]);
+    fn empty_owners_startup_warning_names_guest_and_claim() {
+        for owners in [
+            Vec::<String>::new(),
+            vec![String::new()],
+            vec!["   ".to_string()],
+        ] {
+            let logged = logged_for(&owners);
+            assert!(logged.contains("guest"), "{owners:?}: {logged}");
+            assert!(logged.contains("/claim"), "{owners:?}: {logged}");
+        }
     }
 
     /// Pins the wording of the empty-owners warning: it must say every sender
@@ -462,19 +504,24 @@ mod approval_owners_warning_tests {
     }
 
     #[test]
-    fn non_empty_owners_does_not_panic() {
-        capture_warnings(&["alice".into()]);
-        capture_warnings(&["alice".into(), "bob".into()]);
+    fn explicit_owners_emit_no_startup_warning() {
+        assert_eq!(logged_for(&["alice".into()]), "");
+        assert_eq!(logged_for(&["alice".into(), "bob".into()]), "");
     }
 
     #[test]
-    fn wildcard_owners_does_not_panic() {
-        capture_warnings(&["*".into()]);
+    fn wildcard_owner_startup_warning_says_every_sender_is_an_owner() {
+        let logged = logged_for(&["*".into()]);
+        assert!(logged.contains("EVERY sender"), "{logged}");
     }
 
     #[test]
-    fn legacy_cli_owner_does_not_panic() {
-        capture_warnings(&[crate::channels::cli::LEGACY_CLI_SENDER_ID.into()]);
+    fn legacy_cli_owner_startup_warning_names_the_replacement() {
+        let logged = logged_for(&[crate::channels::cli::LEGACY_CLI_SENDER_ID.into()]);
+        assert!(
+            logged.contains(crate::channels::cli::CLI_SENDER_ID),
+            "{logged}"
+        );
     }
 }
 

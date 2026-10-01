@@ -165,11 +165,11 @@ mod tests {
 // ────────────────────────────────────────────────────────────────────────
 // `approval_owners` empty-list check.
 //
-// An empty `approval_owners` means no remote sender can ever promote
-// themselves to owner — every chat is a guest, every approval is denied,
-// and the operator ends up at the console to escape the loop. Surface this
-// in `rantaiclaw doctor` instead of letting the warning in
-// `channels::admin::warn_on_risky_approval_owners` be the only signal.
+// An empty `approval_owners` leaves nobody able to approve: every sender is a
+// guest and every approval is denied until an owner is added in `config.toml`
+// or claims ownership with a pairing code. This check reports that in
+// `rantaiclaw doctor`, so the startup warning in
+// `channels::admin::warn_on_risky_approval_owners` is not the only signal.
 pub struct ApprovalOwnersCheck;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +301,10 @@ mod approval_owners_tests {
         );
         let hint = result.hint.expect("warn should carry a hint");
         assert_eq!(hint, crate::approval::APPROVAL_OWNERS_EMPTY_HINT);
+        // The literal words an operator reads, not only the shared constants,
+        // so rewording the finding at either end shows up here.
+        assert!(result.message.contains("guest"), "{}", result.message);
+        assert!(hint.contains("/claim"), "{hint}");
     }
 
     #[test]

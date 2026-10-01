@@ -534,7 +534,7 @@ Notes:
 | `keyword_weight` | `0.3` | weight of the keyword signal in hybrid ranking |
 | `hygiene_enabled` | `true` | run the retention pass (throttled to once every 12h) |
 | `archive_after_days` | `7` | move session files to `archive/` after this many days; daily memory files are left alone. `0` disables |
-| `purge_after_days` | `30` | delete archived files after this many days. `0` disables |
+| `purge_after_days` | `30` | delete archived session files from `sessions/archive/` after this many days (`archive_after_days` moves them there). `0` disables |
 | `conversation_retention_days` | `30` | delete `conversation` memories older than this. `0` disables |
 | `snapshot_enabled` | `false` | export core memories to `MEMORY_SNAPSHOT.md` |
 | `snapshot_on_hygiene` | `false` | run that export during the hygiene pass |

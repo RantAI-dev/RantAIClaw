@@ -307,9 +307,18 @@ pub fn render(config: &Config) -> String {
     // `guest_allowed_tools` is still the guest's entire tool-execution
     // ceiling; the owner's `auto_approve` list does not reach guests at all.
     out.push_str("\nNon-owner (guest) tools:\n");
-    out.push_str(
-        "  always: skill instructions in the prompt (a skill's own tools still need guest_allowed_tools)\n",
-    );
+    if matches!(
+        config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) {
+        out.push_str(
+            "  always: skill names and descriptions in the prompt (loading a skill's instructions, and a skill's own tools, need a tool in guest_allowed_tools)\n",
+        );
+    } else {
+        out.push_str(
+            "  always: skill instructions in the prompt (a skill's own tools still need guest_allowed_tools)\n",
+        );
+    }
     // `GuestGate` refuses an owner-only tool whatever the list says, so an
     // entry like that is shown as refused, not as something guests can call.
     let (refused_tools, usable_tools): (Vec<&str>, Vec<&str>) = cc
@@ -569,6 +578,30 @@ mod tests {
             s.lines()
                 .any(|l| l.contains("refused") && l.contains("delegate")),
             "{s}"
+        );
+    }
+
+    /// Compact mode inlines no skill instructions, so the guest summary must
+    /// not promise them there; Full mode keeps its line.
+    #[test]
+    fn render_skill_line_follows_the_skills_prompt_mode() {
+        let mut c = cfg();
+        c.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
+        let full = render(&c);
+        assert!(
+            full.contains("always: skill instructions in the prompt"),
+            "{full}"
+        );
+
+        c.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
+        let compact = render(&c);
+        assert!(
+            !compact.contains("skill instructions in the prompt"),
+            "Compact mode puts no skill instructions in the prompt:\n{compact}"
+        );
+        assert!(
+            compact.contains("always: skill names and descriptions in the prompt"),
+            "{compact}"
         );
     }
 

@@ -921,9 +921,8 @@ mod tests {
     }
 
     /// Telegram is DM-aware and IRC is not — the message must name both,
-    /// grouped by which side of the boundary they fall on. This is the
-    /// rendered answer the owner asked for (the
-    /// `memory-langkah-04-deteksi-dm.png` snapshot).
+    /// grouped by which side of the boundary they fall on, with the DM-aware
+    /// channels first and the channels treated as group chats after them.
     #[test]
     fn dm_detection_check_names_telegram_as_aware_and_irc_as_treated_as_group() {
         let mut cfg = Config::default();
