@@ -28,6 +28,29 @@ pub(crate) struct SourceEntry {
     pub(crate) category: MemoryCategory,
 }
 
+/// Fail unless `path` is a regular file (a symlink to one counts).
+///
+/// Every read or copy of a note, a marker or a live file goes through this
+/// check before the open. Opening a FIFO for reading blocks until a writer
+/// appears, and a device file such as `/dev/zero` never ends, so the open
+/// itself is what must not happen.
+pub(crate) fn require_regular_file(path: &Path) -> Result<()> {
+    let file_type = fs::metadata(path)
+        .with_context(|| format!("read the type of {}", path.display()))?
+        .file_type();
+    if !file_type.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    Ok(())
+}
+
+/// Read a regular file as UTF-8 text. The error names the file, so an
+/// operator can find the note that stops the import.
+fn read_regular_file_to_string(path: &Path) -> Result<String> {
+    require_regular_file(path)?;
+    fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+}
+
 /// Read every entry from a workspace's markdown files.
 ///
 /// When a key appears in several files the import keeps the last one read, so
@@ -43,7 +66,7 @@ pub(crate) fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<
             listed.push(file?.path());
         }
         for path in sorted_daily_markdown_files(listed) {
-            let content = fs::read_to_string(&path)?;
+            let content = read_regular_file_to_string(&path)?;
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -59,7 +82,7 @@ pub(crate) fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<
 
     let core_path = source_workspace.join("MEMORY.md");
     if core_path.exists() {
-        let content = fs::read_to_string(&core_path)?;
+        let content = read_regular_file_to_string(&core_path)?;
         all.extend(parse_markdown_file(
             &core_path,
             &content,
@@ -84,7 +107,7 @@ fn sorted_daily_markdown_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 /// The entries one markdown file holds, without the projection block.
 pub(crate) fn read_markdown_file_entries(path: &Path) -> Result<Vec<SourceEntry>> {
-    let content = fs::read_to_string(path)?;
+    let content = read_regular_file_to_string(path)?;
     Ok(parse_markdown_file(
         path,
         &content,
@@ -222,8 +245,8 @@ pub(crate) fn record_pending_markdown_import(workspace_dir: &Path) -> Result<()>
 /// The instant a marker file records: the RFC 3339 time it holds, or, for a
 /// marker written empty by an earlier build, its modification time.
 pub(crate) fn marker_time(marker: &Path) -> Result<DateTime<Utc>> {
-    let text =
-        fs::read_to_string(marker).with_context(|| format!("read marker {}", marker.display()))?;
+    let text = read_regular_file_to_string(marker)
+        .with_context(|| format!("read marker {}", marker.display()))?;
     if let Ok(time) = DateTime::parse_from_rfc3339(text.trim()) {
         return Ok(time.with_timezone(&Utc));
     }
@@ -270,18 +293,44 @@ pub(crate) fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<()
     let temp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = fs::File::create(&temp)?;
-        if let Ok(existing) = fs::metadata(path) {
+        let existing = fs::metadata(path).ok();
+        if let Some(existing) = &existing {
             fs::set_permissions(&temp, existing.permissions())?;
         }
         file.write_all(contents)?;
         file.sync_all()?;
-        fs::rename(&temp, path)?;
+        // Windows cannot rename over a read-only file. The replacement already
+        // carries the attribute (copied above), so it is lifted from the old
+        // file only for the rename, and put back on it if the rename fails.
+        #[cfg(windows)]
+        let lifted = match &existing {
+            Some(existing) if existing.permissions().readonly() => {
+                set_read_only(path, false)?;
+                true
+            }
+            _ => false,
+        };
+        let renamed = fs::rename(&temp, path);
+        #[cfg(windows)]
+        if renamed.is_err() && lifted {
+            let _ = set_read_only(path, true);
+        }
+        renamed?;
         sync_dir(dir)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Set or clear the read-only attribute of `path`. Windows only: on Unix,
+/// `set_readonly(false)` would make the file writable for everyone.
+#[cfg(windows)]
+fn set_read_only(path: &Path, read_only: bool) -> std::io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(read_only);
+    fs::set_permissions(path, permissions)
 }
 
 /// Flush a regular file to disk. The handle is opened for writing because
@@ -383,12 +432,20 @@ fn backup_markdown_memory_started_at(
         .join("migrations")
         .join(backup_dir_name(started));
 
-    // Only a directory this call created is this call's to remove; an earlier
-    // backup that got the same name (same second, same process) is not.
-    let created = !backup_root.exists();
-    fs::create_dir_all(&backup_root)?;
+    // `migrations/` may already hold earlier backups or the `PENDING` marker,
+    // so the parent is created if missing. The backup directory itself must be
+    // new: an earlier backup that got the same name (same second, same
+    // process) is not this call's to write into or to remove, and reusing it
+    // would mix two backups under one `BACKUP_COMPLETE`.
+    let migrations_dir = backup_root
+        .parent()
+        .context("backup directory has no parent")?;
+    fs::create_dir_all(migrations_dir)
+        .with_context(|| format!("create {}", migrations_dir.display()))?;
+    fs::create_dir(&backup_root)
+        .with_context(|| format!("create backup directory {}", backup_root.display()))?;
     let backup = fill_backup_dir(workspace_dir, &backup_root, cutoff);
-    if created && !matches!(backup, Ok(Some(_))) {
+    if !matches!(backup, Ok(Some(_))) {
         if let Err(e) = fs::remove_dir_all(&backup_root) {
             // Path and error only: no note content.
             tracing::warn!(
@@ -411,6 +468,9 @@ fn fill_backup_dir(
     let migrations_dir = backup_root
         .parent()
         .context("backup directory has no parent")?;
+    // `backup_root` is new, so `backup_memory_dir` exists only once this call
+    // has made it. The two `create_dir_all` calls below run once per daily file
+    // and again for `brain.db`, so the second must find the first's directory.
     let backup_memory_dir = backup_root.join("memory");
 
     let memory_md = workspace_dir.join("MEMORY.md");
@@ -474,6 +534,7 @@ fn fill_backup_dir(
 /// Elsewhere the mode is applied after the flush, because a read-only
 /// attribute would block later writes.
 fn copy_file_durably(src: &Path, dest: &Path) -> Result<()> {
+    require_regular_file(src)?;
     let mut input = fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
     let permissions = input.metadata()?.permissions();
     let mut output = create_copy_destination(dest, &permissions)
@@ -546,6 +607,78 @@ fn vacuum_brain_db_into(source: &Path, dest: &Path) -> Result<()> {
     conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])
         .with_context(|| format!("vacuum {} into {}", source.display(), dest.display()))?;
     Ok(())
+}
+
+/// A FIFO that records whether anything opened it for reading.
+///
+/// Opening a FIFO for reading blocks until a writer shows up, so code that
+/// wrongly opens one would hang its test. A helper thread plays the writer and
+/// reconnects after every reader, so the wrongly opening code reads end of
+/// file and the test fails on `was_opened` instead of hanging.
+#[cfg(all(test, unix))]
+pub(crate) mod test_fifo {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    pub(crate) struct Fifo {
+        path: PathBuf,
+        opened: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        writer: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Fifo {
+        pub(crate) fn create(path: &Path) -> Self {
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            let opened = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let (path, opened, stop) = (path.to_path_buf(), opened.clone(), stop.clone());
+                std::thread::spawn(move || loop {
+                    drop(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+                    opened.store(true, Ordering::SeqCst);
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                })
+            };
+            Self {
+                path: path.to_path_buf(),
+                opened,
+                stop,
+                writer: Some(writer),
+            }
+        }
+
+        /// Whether a reader opened the FIFO. The pause lets the helper thread
+        /// record a connection a moment ago.
+        pub(crate) fn was_opened(&self) -> bool {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.opened.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Fifo {
+        /// Connect a reader so a helper still blocked in its open returns, and
+        /// join it. The reader stays open until the join: the helper may not
+        /// have reached its open yet.
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path);
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.join();
+            }
+            drop(reader);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +769,8 @@ mod tests {
     fn sync_file_opens_the_file_with_write_access() {
         use std::os::unix::fs::PermissionsExt;
 
+        // SAFETY: `geteuid` takes no arguments, reads no memory of ours and
+        // cannot fail, so no precondition can be broken.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
@@ -721,6 +856,243 @@ mod tests {
             0o444,
             "the copy keeps the mode of the note"
         );
+    }
+
+    /// Whatever the umask cut from the creation mode, the copy ends up with
+    /// the exact mode of the note. The destination already exists here, so its
+    /// own mode is what the creation mode would not have changed, and only the
+    /// mode set on the open handle can give the copy `0o664`.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_takes_the_exact_mode_of_its_note() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let note = tmp.path().join("note.md");
+        let copy = tmp.path().join("copy.md");
+        fs::write(&note, "- **k**: v\n").unwrap();
+        fs::set_permissions(&note, fs::Permissions::from_mode(0o664)).unwrap();
+        fs::write(&copy, "stale").unwrap();
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o600)).unwrap();
+
+        copy_file_durably(&note, &copy).unwrap();
+
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "- **k**: v\n");
+        assert_eq!(
+            fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            0o664
+        );
+    }
+
+    /// A directory named like a note is refused by name, and nothing is
+    /// created for it: the copy never starts.
+    #[test]
+    fn a_directory_is_refused_as_a_note_and_nothing_is_copied() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let note = tmp.path().join("notes.md");
+        let copy = tmp.path().join("copy.md");
+        fs::create_dir(&note).unwrap();
+
+        let message = format!("{:#}", copy_file_durably(&note, &copy).unwrap_err());
+
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(&note.display().to_string()),
+            "the error names the path: {message}"
+        );
+        assert!(!copy.exists(), "no copy is created for a refused note");
+    }
+
+    /// Opening a FIFO for reading blocks until a writer shows up, so a FIFO
+    /// named like a note would stall the start-up. The refusal has to come
+    /// before the open.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_as_a_note_without_being_opened() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let note = tmp.path().join("pipe.md");
+        let copy = tmp.path().join("copy.md");
+        let fifo = test_fifo::Fifo::create(&note);
+
+        let message = format!("{:#}", copy_file_durably(&note, &copy).unwrap_err());
+
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+        assert!(!fifo.was_opened(), "the FIFO must not be opened");
+        assert!(!copy.exists(), "no copy is created for a refused note");
+    }
+
+    /// The live notes are read to see whether they are newer than a backup.
+    /// That read goes through the same refusal as the copy.
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_live_note_refuses_a_fifo_without_opening_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let note = tmp.path().join("pipe.md");
+        let fifo = test_fifo::Fifo::create(&note);
+
+        let message = format!("{:#}", read_markdown_file_entries(&note).unwrap_err());
+
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+        assert!(!fifo.was_opened(), "the FIFO must not be opened");
+    }
+
+    /// A backup directory is read back by the sweep. A FIFO named like a daily
+    /// note in it must stop the read with an error, not stall the start-up.
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_backup_refuses_a_fifo_named_like_a_daily_note() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let fifo = test_fifo::Fifo::create(&tmp.path().join("memory").join("2026-09-01.md"));
+
+        let message = format!(
+            "{:#}",
+            read_openclaw_markdown_entries(tmp.path()).unwrap_err()
+        );
+
+        assert!(
+            message.contains("not a regular file") && message.contains("2026-09-01.md"),
+            "unexpected error: {message}"
+        );
+        assert!(!fifo.was_opened(), "the FIFO must not be opened");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_backup_refuses_a_fifo_named_memory_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = test_fifo::Fifo::create(&tmp.path().join("MEMORY.md"));
+
+        let message = format!(
+            "{:#}",
+            read_openclaw_markdown_entries(tmp.path()).unwrap_err()
+        );
+
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+        assert!(!fifo.was_opened(), "the FIFO must not be opened");
+    }
+
+    /// A marker is read for its time. A FIFO in its place is refused too.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_that_is_a_fifo_is_refused_without_being_opened() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("BACKUP_COMPLETE");
+        let fifo = test_fifo::Fifo::create(&marker);
+
+        let message = format!("{:#}", marker_time(&marker).unwrap_err());
+
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+        assert!(!fifo.was_opened(), "the FIFO must not be opened");
+    }
+
+    /// A note that is not UTF-8 fails the import on every start, so the error
+    /// has to say which file it is.
+    #[test]
+    fn a_note_that_is_not_utf8_is_named_in_the_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::write(
+            tmp.path().join("memory").join("2026-09-02.md"),
+            [0xff, 0xfe],
+        )
+        .unwrap();
+
+        let message = format!(
+            "{:#}",
+            read_openclaw_markdown_entries(tmp.path()).unwrap_err()
+        );
+
+        assert!(
+            message.contains("2026-09-02.md"),
+            "unexpected error: {message}"
+        );
+
+        let curated = tempfile::TempDir::new().unwrap();
+        fs::write(curated.path().join("MEMORY.md"), [0xff, 0xfe]).unwrap();
+        let message = format!(
+            "{:#}",
+            read_openclaw_markdown_entries(curated.path()).unwrap_err()
+        );
+        assert!(message.contains("MEMORY.md"), "unexpected error: {message}");
+    }
+
+    /// A backup directory that is already there belongs to an earlier backup.
+    /// Writing into it would mix two backups under one `BACKUP_COMPLETE`, so
+    /// the attempt fails and the earlier backup stays as it was.
+    #[test]
+    fn a_backup_never_reuses_an_existing_backup_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), "- **k**: new\n").unwrap();
+        let started = "2001-02-03T04:05:06Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let earlier = tmp
+            .path()
+            .join("memory")
+            .join("migrations")
+            .join(backup_dir_name(started));
+        fs::create_dir_all(&earlier).unwrap();
+        fs::write(earlier.join("BACKUP_COMPLETE"), "earlier backup").unwrap();
+        fs::write(earlier.join("MEMORY.md"), "- **k**: old\n").unwrap();
+
+        let message = format!(
+            "{:#}",
+            backup_markdown_memory_started_at(tmp.path(), started).unwrap_err()
+        );
+
+        assert!(
+            message.contains(&earlier.display().to_string()),
+            "the error names the directory: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(earlier.join("MEMORY.md")).unwrap(),
+            "- **k**: old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(earlier.join("BACKUP_COMPLETE")).unwrap(),
+            "earlier backup"
+        );
+    }
+
+    /// On Windows a rename cannot replace a read-only file. The note the
+    /// operator made read-only is still rewritten, and the new file stays
+    /// read-only. Unix renames over a read-only file already, so this passes
+    /// there; it matters in the Windows job.
+    #[test]
+    fn a_read_only_file_is_replaced_and_stays_read_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let note = tmp.path().join("MEMORY.md");
+        fs::write(&note, "old").unwrap();
+        let mut permissions = fs::metadata(&note).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&note, permissions).unwrap();
+
+        replace_file_atomically(&note, b"new").unwrap();
+
+        assert_eq!(fs::read_to_string(&note).unwrap(), "new");
+        assert!(fs::metadata(&note).unwrap().permissions().readonly());
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("MEMORY.md")]);
     }
 
     /// A filesystem that cannot fsync a directory answers EINVAL or ENOTSUP.
