@@ -350,7 +350,7 @@ rows, and the output says when it is showing a subset.
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
 
-`config show` prints the **active** configuration as JSON with all secrets redacted (provider/API keys, channel tokens, tunnel tokens, the gateway login hash, paired tokens, etc.). Every value in an MCP server `env` map and in a skill `env` map (`[skills.entries.<name>.env]`) is shown as an empty string, because the variable names are the operator's own (`DATABASE_URL`, `PGPASSWORD`); the names stay visible.
+`config show` prints the **active** configuration as JSON with all secrets redacted (provider/API keys, channel tokens, tunnel tokens, the gateway login hash, paired tokens, etc.). Every value in an MCP server `env` map, in a skill `env` map (`[skills.entries.<name>.env]`) and in a skill `config` map (`[skills.entries.<name>.config]`) is shown as an empty string (`null` for a value that is not a string), because the variable names are the operator's own (`DATABASE_URL`, `PGPASSWORD`) and skill `config` values reach the skill as environment variables; the names stay visible. `api_url` is shown without its `user:pass@` part and without `key`, `api_key` and `access_token` query parameters, or as `null` when it looks like a provider key. The proxy URLs lose their `user:pass@` part. It runs the same two redaction passes as `GET /api/v1/config`, which [`docs/reference/api-v1.md`](api-v1.md#get-apiv1config) lists in full.
 
 ### `completions`
 
