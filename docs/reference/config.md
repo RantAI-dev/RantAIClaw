@@ -562,12 +562,11 @@ decides what `memory_recall`, the `[Memory context]` block in front of the
 user's message, and the lookups of `memory_store` and `memory_forget` may read.
 
 - A named owner in a direct chat, the TUI, `agent -m`, `chat -m`, the web
-  console chat, the daemon heartbeat and a `main` cron job with no origin chat
-  read all of memory.
+  console chat, the daemon heartbeat and a cron job with no origin chat, whatever
+  its `session_target`, read all of memory.
 - A guest, an owner in a group or in a chat the platform did not mark as a
   direct message, a sender who is an owner only through `approval_owners = ["*"]`,
   and a cron job created from a chat read that conversation's notes only.
-- An `isolated` cron job with no origin chat reads its own notes (`cron:<job_id>`).
 - A turn that no door gave a view, such as a webhook turn, reads nothing: recall
   finds no note and the context block is empty.
 
@@ -590,7 +589,11 @@ and so stays out of `MEMORY.md` and out of the owner's system prompt. The
 capacity notice of `memory_store` counts shared core notes only, and a guest
 does not get it. `file_write` under a guest turn refuses `skills/` and the
 workspace-root `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md` and
-`HEARTBEAT.md`, which load into owner prompts. These rules cover only the four file tools and the memory
+`HEARTBEAT.md`, which load into owner prompts, and the owner's private files.
+That write rule applies to a guest only. The read rule is wider: `file_read`,
+`pdf_read` and `image_info` refuse the owner's private files (`USER.md`,
+`MEMORY.md`, `memory/` and the rest) in every turn that does not read all of
+memory, a webhook turn included. These rules cover only the four file tools and the memory
 tools; `glob_search`, `shell` and MCP filesystem tools are not subject to them.
 
 ### Scores are absolute

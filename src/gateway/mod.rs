@@ -3789,11 +3789,21 @@ mod tests {
         ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
     }
 
-    /// A provider that asks for `memory_recall` once and then answers, and keeps
-    /// every request it was sent, so a test reads what the model received.
-    #[derive(Default)]
+    /// A provider that asks for one tool call and then answers, and keeps every
+    /// request it was sent, so a test reads what the model received.
     struct RecallingProvider {
+        /// The `<tool_call>` block the provider asks for on its first turn.
+        call: String,
         seen: Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    impl RecallingProvider {
+        fn new(call: String) -> Self {
+            Self {
+                call,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait]
@@ -3826,8 +3836,7 @@ mod tests {
             if after_tools {
                 Ok("Done.".to_string())
             } else {
-                Ok("<tool_call>\n{\"name\":\"memory_recall\",\"arguments\":{\"query\":\"lantern\"}}\n</tool_call>"
-                    .to_string())
+                Ok(self.call.clone())
             }
         }
     }
@@ -3836,13 +3845,25 @@ mod tests {
     const WEBHOOK_USER_CANARY: &str = "owner-profile-canary-41c9";
     const WEBHOOK_MEMORY_CANARY: &str = "owner-notes-canary-52d0";
     const WEBHOOK_SOUL_CANARY: &str = "bot-soul-canary-63e1";
+    const RECALL_CALL: &str = "<tool_call>\n{\"name\":\"memory_recall\",\"arguments\":{\"query\":\"lantern\"}}\n</tool_call>";
+
+    /// A model asking to read an owner file through `file_read`.
+    fn read_call(path: &str) -> String {
+        format!(
+            "<tool_call>\n{{\"name\":\"file_read\",\"arguments\":{{\"path\":\"{path}\"}}}}\n</tool_call>"
+        )
+    }
 
     /// Drives a webhook door over a store that holds a note about the lantern,
     /// owner files in the workspace, and the real `memory_recall` tool. Returns
     /// the system prompt and the rest of what the model was sent. With
     /// `all_view` the handler runs under the `All` view as a control; a webhook
     /// does not set a view itself.
-    async fn webhook_door_over_a_note(trigger: bool, all_view: bool) -> (String, String) {
+    async fn webhook_door_over_a_note(
+        trigger: bool,
+        all_view: bool,
+        tool_call: &str,
+    ) -> (String, String) {
         let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
         let home = tempfile::tempdir().expect("temp home");
         let _home = crate::test_env::HomeGuard::set(home.path());
@@ -3874,7 +3895,7 @@ mod tests {
             .unwrap();
         let memory: Arc<dyn Memory> = Arc::new(sqlite);
 
-        let provider_impl = Arc::new(RecallingProvider::default());
+        let provider_impl = Arc::new(RecallingProvider::new(tool_call.to_string()));
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let tools_memory = Arc::clone(&memory);
         let config = Config {
@@ -3911,10 +3932,17 @@ mod tests {
             ledger: None,
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
-            tools_factory: Arc::new(move |_: &crate::config::Config| {
-                vec![Box::new(crate::tools::MemoryRecallTool::new(Arc::clone(
-                    &tools_memory,
-                ))) as Box<dyn crate::tools::Tool>]
+            tools_factory: Arc::new(move |config: &crate::config::Config| {
+                let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                    &config.autonomy,
+                    &config.workspace_dir,
+                ));
+                vec![
+                    Box::new(crate::tools::MemoryRecallTool::new(Arc::clone(
+                        &tools_memory,
+                    ))) as Box<dyn crate::tools::Tool>,
+                    Box::new(crate::tools::FileReadTool::new(security)),
+                ]
             }),
         };
 
@@ -3969,7 +3997,7 @@ mod tests {
     /// and the prompt carries neither `USER.md` nor `MEMORY.md`.
     #[tokio::test]
     async fn the_webhook_door_reads_nothing_from_memory() {
-        let (system, rest) = webhook_door_over_a_note(false, false).await;
+        let (system, rest) = webhook_door_over_a_note(false, false, RECALL_CALL).await;
 
         assert!(rest.contains("No memories found"), "{rest}");
         assert!(
@@ -3987,7 +4015,7 @@ mod tests {
     /// The trigger route runs the same turn and gets the same answer.
     #[tokio::test]
     async fn the_trigger_webhook_door_reads_nothing_from_memory() {
-        let (system, rest) = webhook_door_over_a_note(true, false).await;
+        let (system, rest) = webhook_door_over_a_note(true, false, RECALL_CALL).await;
 
         assert!(rest.contains("No memories found"), "{rest}");
         assert!(
@@ -3998,11 +4026,42 @@ mod tests {
         assert!(!system.contains(WEBHOOK_MEMORY_CANARY), "{system}");
     }
 
+    /// The tool-level counterpart: a webhook turn has no view, so `file_read`
+    /// refuses `MEMORY.md` and `USER.md` too. The model asks for each file and
+    /// receives a refusal, never the content.
+    #[tokio::test]
+    async fn the_webhook_door_cannot_read_the_owner_files_through_file_read() {
+        for (trigger, name, canary) in [
+            (false, "MEMORY.md", WEBHOOK_MEMORY_CANARY),
+            (false, "USER.md", WEBHOOK_USER_CANARY),
+            (true, "MEMORY.md", WEBHOOK_MEMORY_CANARY),
+        ] {
+            let (_system, rest) = webhook_door_over_a_note(trigger, false, &read_call(name)).await;
+
+            assert!(
+                rest.contains("private to the owner"),
+                "{name} (trigger {trigger}): {rest}"
+            );
+            assert!(
+                !rest.contains(canary),
+                "{name} (trigger {trigger}) was read:\n{rest}"
+            );
+        }
+    }
+
+    /// The control: the same call under the `All` view reads the file, so the
+    /// refusal above is the view and not a broken fixture.
+    #[tokio::test]
+    async fn a_webhook_turn_under_the_all_view_would_read_the_owner_files() {
+        let (_system, rest) = webhook_door_over_a_note(false, true, &read_call("MEMORY.md")).await;
+        assert!(rest.contains(WEBHOOK_MEMORY_CANARY), "{rest}");
+    }
+
     /// The control: the same store, tool and handler read the note once a view
     /// is set, so the two cases above are not passing on an empty fixture.
     #[tokio::test]
     async fn a_webhook_turn_under_the_all_view_would_read_the_note() {
-        let (_system, rest) = webhook_door_over_a_note(false, true).await;
+        let (_system, rest) = webhook_door_over_a_note(false, true, RECALL_CALL).await;
         assert!(rest.contains(WEBHOOK_NOTE_WORD), "{rest}");
     }
 

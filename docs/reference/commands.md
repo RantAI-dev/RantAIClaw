@@ -181,13 +181,13 @@ Notes:
   `MEMORY.md` in the prompt. This holds for `main` and `isolated` alike. The
   origin has no thread, so a job created in a thread reads the conversation of the
   chat that holds the thread.
-- **`session_target` picks the memory view of an agent job that has no chat.**
-  `isolated` (the default) reads `cron:<job_id>`: its own rows and nothing else,
-  not the shared tier. `main` reads all of memory, as the CLI and the daemon
-  heartbeat do, and its prompt carries `USER.md` and `MEMORY.md`. An `isolated`
-  job's prompt carries neither file, its file tools refuse the owner's private
-  paths, and its `memory_store` notes belong to `cron:<job_id>`. Set it through
-  the `cron_add`/`cron_update` tools or the HTTP API.
+- **A job with no chat reads all of memory, whatever its `session_target`.** A
+  job an operator creates from the CLI, the TUI or the console carries no chat.
+  Its run reads all of memory, as the CLI and the daemon heartbeat do: every
+  note, including notes scoped to other conversations, and `USER.md` and
+  `MEMORY.md` in its prompt. This holds for `main` and for `isolated`, the
+  default. `session_target` does not change the memory view of a job. Set it
+  through the `cron_add`/`cron_update` tools or the HTTP API.
 
 #### HTTP control (`/api/v1/cron*`)
 

@@ -168,6 +168,23 @@ impl MockLlm {
             .collect()
     }
 
+    /// The system prompt of the last request the model was sent.
+    pub(crate) fn last_system_text(&self) -> String {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .and_then(|request| request.get("messages")?.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+            })
+            .filter_map(|message| message.get("content").map(content_text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Every system prompt the model was sent.
     pub(crate) fn system_text(&self) -> String {
         self.messages()
@@ -300,6 +317,19 @@ impl DoorFixture {
         let system = self.llm.system_text();
         for canary in [USER_FILE_CANARY, MEMORY_FILE_CANARY, SOUL_FILE_CANARY] {
             assert!(system.contains(canary), "{canary} is missing:\n{system}");
+        }
+    }
+
+    /// Asserts the system prompt of the last request carries the owner's files.
+    /// A door that rebuilds its prompt for a session that already has turns is
+    /// judged on this request, not on the first one.
+    pub(crate) fn assert_last_system_prompt_carries_the_owner_files(&self) {
+        let system = self.llm.last_system_text();
+        for canary in [USER_FILE_CANARY, MEMORY_FILE_CANARY, SOUL_FILE_CANARY] {
+            assert!(
+                system.contains(canary),
+                "{canary} is missing from the last system prompt:\n{system}"
+            );
         }
     }
 

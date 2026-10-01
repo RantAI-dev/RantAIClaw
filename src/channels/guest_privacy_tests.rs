@@ -2906,6 +2906,40 @@ async fn a_named_owner_in_a_group_recalls_only_that_groups_notes() {
     }
 }
 
+/// `Only` narrows what a turn reads. It does not take write access away, so an
+/// owner in a group writes a skill and a prompt file as an owner in a direct
+/// chat does, and the same calls from a guest are refused.
+#[tokio::test]
+async fn an_owner_in_a_group_keeps_write_access_to_skills_and_prompt_files() {
+    let deployment = Deployment::start(Options::guest_tools(&[]).owners(&["*"])).await;
+
+    let turn = deployment
+        .turn(
+            "rantaiclaw_wildcard_user",
+            GUEST_CHAT,
+            "write these",
+            vec![
+                all_calls(&[
+                    (
+                        "file_write",
+                        serde_json::json!({ "path": "skills/x/SKILL.md", "content": "owner skill" }),
+                    ),
+                    (
+                        "file_write",
+                        serde_json::json!({ "path": "AGENTS.md", "content": "owner rules" }),
+                    ),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert!(!results.contains("feeds the owner's prompt"), "{results}");
+    assert_eq!(deployment.read("skills/x/SKILL.md"), "owner skill");
+    assert_eq!(deployment.read("AGENTS.md"), "owner rules");
+}
+
 /// An owner through the wildcard alone keeps the owner's rights and not the
 /// owner's notes. The store is written by an owner-only tool the guest gate
 /// refuses, so the sender is an owner. The recall finds only the chat's own note.

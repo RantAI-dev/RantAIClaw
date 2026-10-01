@@ -241,7 +241,7 @@ explicitly:
 | Daemon down for a week, then a flood of catch-ups | Stale catch-up runs gated behind `max_catchup_age_secs` |
 | DST spring-forward deletes an hour | The schedule warns when it skips one |
 | crontab weekday ordinals ≠ Quartz numbering | Remapped |
-| `memory_recall` bleeding across conversations | Runs scoped to `cron:<job_id>` |
+| `memory_recall` bleeding across conversations | A job created from a chat reads only that chat's conversation |
 | A policy refusal looking like a crash | Recorded as status `refused`, and never announced to a channel |
 
 Run history is redacted before storage and `jobs.db` is locked to `0600`.

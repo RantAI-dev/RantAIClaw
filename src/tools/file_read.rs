@@ -115,7 +115,7 @@ impl Tool for FileReadTool {
         }
 
         if let Some(denial) =
-            crate::tools::guest_private_path_denial(&resolved_path, &self.security.workspace_dir)
+            crate::tools::private_file_read_denial(&resolved_path, &self.security.workspace_dir)
                 .await
         {
             return Ok(ToolResult {
@@ -592,9 +592,12 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    /// A turn no door gave a view has no owner identity behind it (a webhook), so
+    /// it reads the owner's private files no more than a conversation-scoped
+    /// turn does.
     #[cfg(unix)]
     #[tokio::test]
-    async fn file_read_allows_symlink_to_user_md_without_guest_view() {
+    async fn file_read_denies_symlink_to_user_md_with_no_view() {
         use std::os::unix::fs::symlink;
 
         let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_no_view_symlink");
@@ -608,9 +611,71 @@ mod tests {
         let tool = FileReadTool::new(test_security(dir.clone()));
         let result = tool.execute(json!({"path": "notes.txt"})).await.unwrap();
 
-        assert!(result.success, "control: {:?}", result.error);
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("private to the owner"),
+            "{:?}",
+            result.error
+        );
+        assert!(!result.output.contains("owner profile"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Every owner file is refused to a turn with no view, by its own name.
+    #[tokio::test]
+    async fn file_read_denies_the_owner_files_with_no_view() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in ["MEMORY.md", "USER.md", "TOOLS.md"] {
+            tokio::fs::write(dir.path().join(name), "owner content")
+                .await
+                .unwrap();
+        }
+
+        let tool = FileReadTool::new(test_security(dir.path().to_path_buf()));
+        for name in ["MEMORY.md", "USER.md", "TOOLS.md"] {
+            let result = tool.execute(json!({"path": name})).await.unwrap();
+            assert!(!result.success, "{name} was read with no view");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("private to the owner"),
+                "{name}: {:?}",
+                result.error
+            );
+            assert!(!result.output.contains("owner content"), "{name}");
+        }
+    }
+
+    /// The control for the two above: the same files, read under the `All` view
+    /// of the operator's own doors.
+    #[tokio::test]
+    async fn file_read_allows_the_owner_files_under_the_all_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in ["MEMORY.md", "USER.md"] {
+            tokio::fs::write(dir.path().join(name), "owner content")
+                .await
+                .unwrap();
+        }
+
+        let tool = FileReadTool::new(test_security(dir.path().to_path_buf()));
+        for name in ["MEMORY.md", "USER.md"] {
+            let result = MEMORY_VIEW
+                .scope(MemoryView::All, async {
+                    tool.execute(json!({"path": name})).await.unwrap()
+                })
+                .await;
+            assert!(result.success, "{name}: {:?}", result.error);
+            assert!(result.output.contains("owner content"), "{name}");
+        }
     }
 
     /// The plan's editor-backup case (`USER.md~`), exercised through the tool

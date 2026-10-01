@@ -33,9 +33,11 @@ impl FileWriteTool {
         }
 
         let resolved_target = resolved_parent.join(file_name);
-        if let Some(denial) =
-            crate::tools::guest_private_path_denial(&resolved_target, &self.security.workspace_dir)
-                .await
+        if let Some(denial) = crate::tools::guest_private_file_write_denial(
+            &resolved_target,
+            &self.security.workspace_dir,
+        )
+        .await
         {
             return Some(denial);
         }
@@ -267,6 +269,29 @@ mod tests {
                 .with_workspace_dir(workspace)
                 .with_max_actions_per_hour(max_actions_per_hour),
         )
+    }
+
+    /// Runs `turn` as dispatch runs a guest's: the guest marker, under the
+    /// conversation-scoped view a guest gets.
+    async fn as_guest<F: std::future::Future>(turn: F) -> F::Output {
+        crate::approval::guest::GUEST_TURN
+            .scope(
+                (),
+                crate::memory::MEMORY_VIEW
+                    .scope(crate::memory::MemoryView::Only("chat:guest".into()), turn),
+            )
+            .await
+    }
+
+    /// Runs `turn` as an owner asking in a group: the same conversation-scoped
+    /// view a guest gets, and no guest marker.
+    async fn as_owner_in_a_group<F: std::future::Future>(turn: F) -> F::Output {
+        crate::memory::MEMORY_VIEW
+            .scope(
+                crate::memory::MemoryView::Only("telegram:group-a".into()),
+                turn,
+            )
+            .await
     }
 
     #[test]
@@ -536,20 +561,17 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_denies_writing_into_memory_dir_under_guest_view() {
-        use crate::memory::{MemoryView, MEMORY_VIEW};
-
         let dir = std::env::temp_dir().join("rantaiclaw_test_file_write_guest_memory_dir");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
-        let result = MEMORY_VIEW
-            .scope(MemoryView::Only("chat:guest".into()), async {
-                tool.execute(json!({"path": "memory/x.md", "content": "leak"}))
-                    .await
-                    .unwrap()
-            })
-            .await;
+        let result = as_guest(async {
+            tool.execute(json!({"path": "memory/x.md", "content": "leak"}))
+                .await
+                .unwrap()
+        })
+        .await;
 
         assert!(!result.success);
         assert!(
@@ -586,20 +608,17 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_allows_ordinary_file_under_guest_view() {
-        use crate::memory::{MemoryView, MEMORY_VIEW};
-
         let dir = std::env::temp_dir().join("rantaiclaw_test_file_write_guest_ordinary");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
-        let result = MEMORY_VIEW
-            .scope(MemoryView::Only("chat:guest".into()), async {
-                tool.execute(json!({"path": "notes.txt", "content": "fine"}))
-                    .await
-                    .unwrap()
-            })
-            .await;
+        let result = as_guest(async {
+            tool.execute(json!({"path": "notes.txt", "content": "fine"}))
+                .await
+                .unwrap()
+        })
+        .await;
 
         assert!(result.success, "{:?}", result.error);
 
@@ -614,7 +633,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn file_write_refused_by_containment_creates_no_directories() {
-        use crate::memory::{MemoryView, MEMORY_VIEW};
         use std::os::unix::fs::symlink;
 
         let root = tempfile::TempDir::new().unwrap();
@@ -625,13 +643,12 @@ mod tests {
         symlink(&outside, workspace.join("out")).unwrap();
 
         let tool = FileWriteTool::new(test_security(workspace.clone()));
-        let guest = MEMORY_VIEW
-            .scope(MemoryView::Only("chat:guest".into()), async {
-                tool.execute(json!({"path": "out/sub/f.txt", "content": "x"}))
-                    .await
-                    .unwrap()
-            })
-            .await;
+        let guest = as_guest(async {
+            tool.execute(json!({"path": "out/sub/f.txt", "content": "x"}))
+                .await
+                .unwrap()
+        })
+        .await;
         assert!(!guest.success);
         assert!(
             guest
@@ -657,18 +674,15 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_refused_for_a_guest_creates_no_directories() {
-        use crate::memory::{MemoryView, MEMORY_VIEW};
-
         let workspace = tempfile::TempDir::new().unwrap();
         let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
 
-        let result = MEMORY_VIEW
-            .scope(MemoryView::Only("chat:guest".into()), async {
-                tool.execute(json!({"path": "memory/deep/x.md", "content": "x"}))
-                    .await
-                    .unwrap()
-            })
-            .await;
+        let result = as_guest(async {
+            tool.execute(json!({"path": "memory/deep/x.md", "content": "x"}))
+                .await
+                .unwrap()
+        })
+        .await;
 
         assert!(!result.success);
         assert!(
@@ -681,18 +695,15 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_denies_skill_files_under_guest_view() {
-        use crate::memory::{MemoryView, MEMORY_VIEW};
-
         let workspace = tempfile::TempDir::new().unwrap();
         let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
 
-        let result = MEMORY_VIEW
-            .scope(MemoryView::Only("chat:guest".into()), async {
-                tool.execute(json!({"path": "skills/x/SKILL.md", "content": "planted"}))
-                    .await
-                    .unwrap()
-            })
-            .await;
+        let result = as_guest(async {
+            tool.execute(json!({"path": "skills/x/SKILL.md", "content": "planted"}))
+                .await
+                .unwrap()
+        })
+        .await;
 
         assert!(!result.success);
         assert!(
@@ -712,8 +723,6 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_denies_prompt_files_under_guest_view() {
-        use crate::memory::{MemoryView, MEMORY_VIEW};
-
         let workspace = tempfile::TempDir::new().unwrap();
         let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
 
@@ -724,13 +733,12 @@ mod tests {
             "IDENTITY.md",
             "HEARTBEAT.md",
         ] {
-            let result = MEMORY_VIEW
-                .scope(MemoryView::Only("chat:guest".into()), async {
-                    tool.execute(json!({"path": name, "content": "planted"}))
-                        .await
-                        .unwrap()
-                })
-                .await;
+            let result = as_guest(async {
+                tool.execute(json!({"path": name, "content": "planted"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
             assert!(!result.success, "{name} must be refused");
             assert!(!workspace.path().join(name).exists(), "{name} was written");
         }
@@ -738,18 +746,15 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_allows_notes_and_owner_prompt_files() {
-        use crate::memory::{MemoryView, MEMORY_VIEW};
-
         let workspace = tempfile::TempDir::new().unwrap();
         let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
 
-        let guest = MEMORY_VIEW
-            .scope(MemoryView::Only("chat:guest".into()), async {
-                tool.execute(json!({"path": "notes/a.txt", "content": "fine"}))
-                    .await
-                    .unwrap()
-            })
-            .await;
+        let guest = as_guest(async {
+            tool.execute(json!({"path": "notes/a.txt", "content": "fine"}))
+                .await
+                .unwrap()
+        })
+        .await;
         assert!(guest.success, "{:?}", guest.error);
         assert!(workspace.path().join("notes/a.txt").exists());
 
@@ -765,6 +770,28 @@ mod tests {
             .unwrap();
         assert!(skill.success, "{:?}", skill.error);
         assert!(workspace.path().join("skills/x/SKILL.md").exists());
+    }
+
+    /// `Only` narrows what a turn reads. It is not a mark of a guest, so an owner
+    /// asking in a group keeps the write access an owner has in a direct chat.
+    #[tokio::test]
+    async fn file_write_lets_an_owner_in_a_group_write_prompt_and_private_files() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()));
+
+        for path in ["skills/x/SKILL.md", "AGENTS.md", "memory/x.md", "USER.md"] {
+            let result = as_owner_in_a_group(async {
+                tool.execute(json!({"path": path, "content": "owner text"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+            assert!(result.success, "{path}: {:?}", result.error);
+            assert!(
+                workspace.path().join(path).exists(),
+                "{path} was not written"
+            );
+        }
     }
 
     #[tokio::test]

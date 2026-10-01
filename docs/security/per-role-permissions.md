@@ -124,8 +124,7 @@ empty. A door that forgets to set a view fails closed.
 | The `/compress` memory flush of the TUI | all of memory |
 | Daemon heartbeat | all of memory (its reply goes to the journal and the observer, never to a chat) |
 | Cron job created from a chat | that chat's conversation, for `main` and `isolated` |
-| Cron job with no chat, `main` | all of memory |
-| Cron job with no chat, `isolated` | `cron:<job_id>` |
+| Cron job with no chat, `main` or `isolated` | all of memory |
 | Webhook (`POST /webhook`, `POST /triggers/{path}`) | none: reads nothing |
 | A delegated sub-agent | the view of the turn that delegated |
 
@@ -140,13 +139,22 @@ empty. A door that forgets to set a view fails closed.
   and still carries them. Until that prompt is built for each turn, a named owner
   in a group gets the conversation as the memory view and a prompt that holds
   `MEMORY.md`, and a wildcard owner gets the same.
-- A turn under a conversation view gets the guest path rules of the file tools
-  (`file_read`, `file_write`, `pdf_read`, `image_info`), stores a note in that
+- **The file tools split their rules by what they do.** The read rule follows
+  the view: `file_read`, `pdf_read` and `image_info` refuse the owner's private
+  files (`USER.md`, `MEMORY.md`, `memory/` and the rest) in every turn that does
+  not read all of memory. That covers a turn under a conversation view, an owner
+  in a group included, and a turn with no view, a webhook included. The write
+  rule follows guest status, not the view: `file_write` refuses the private
+  files, `skills/` and the owner prompt files to a guest only. An owner in a
+  group, an owner through `approval_owners = ["*"]` and a cron job created from a
+  chat keep the write access an owner has in a direct chat.
+- A turn under a conversation view also stores a `memory_store` note in that
   conversation, and `memory_forget` by key reaches that conversation's notes
-  only, whoever asks. An owner's turn in a group is subject to all three.
-- The webhook keeps `shell` and the file tools. A webhook turn can still read
-  `MEMORY.md`, `MEMORY_SNAPSHOT.md` and `memory/brain.db` as files, which the
-  memory view does not cover.
+  only, whoever asks.
+- The webhook keeps `shell` and the file tools. Its file tools refuse the owner's
+  private files, but `shell` and `glob_search` are not covered by the file rules,
+  so a webhook turn can still read `MEMORY.md`, `MEMORY_SNAPSHOT.md` and
+  `memory/brain.db` through them.
 
 ## Config (`[channels_config]`)
 

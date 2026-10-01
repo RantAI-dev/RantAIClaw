@@ -463,13 +463,11 @@ pub(crate) async fn refresh_working_config(
 /// the place the chat writes to. `origin_chat` is the reply target and carries
 /// no thread, so a job created in a thread reads the chat's own conversation.
 ///
-/// A job with no origin gets what `session_target` selects:
-/// * `Isolated` (the default) reads `cron:<job_id>`, its own rows and no one
-///   else's. `memory_recall` is auto-approved, so a wider read could quote
-///   another conversation into the announced output.
-/// * `Main` is the operator asking for the opposite: it shares context with the
-///   CLI and the daemon, which read all of memory. The point of the setting,
-///   and the reason it is not the default.
+/// A job with no origin was made by the operator from the TUI, the console or
+/// the CLI, so it reads all of memory whatever its `session_target`. That
+/// includes notes scoped to other conversations, and `USER.md` and `MEMORY.md`
+/// in its prompt. A narrower view for the default `isolated` target would strip
+/// them from every job the operator schedules.
 ///
 /// A job with half an origin names no chat, so it reads nothing. That is the
 /// fail-closed answer for a row the tools do not write.
@@ -480,10 +478,7 @@ fn memory_view_for(job: &CronJob) -> Option<MemoryView> {
         (Some(channel), Some(chat)) => Some(MemoryView::Only(
             ConversationKey::new(channel, chat).resolve(),
         )),
-        (None, None) => Some(match job.session_target {
-            SessionTarget::Isolated => MemoryView::Only(format!("cron:{}", job.id)),
-            SessionTarget::Main => MemoryView::All,
-        }),
+        (None, None) => Some(MemoryView::All),
         (Some(_), None) | (None, Some(_)) => None,
     }
 }
@@ -1170,28 +1165,26 @@ mod tests {
 
     // ── session_target and origin ───────────────────────────────────────────
     //
-    // One test per arm. `session_target` picks the view of a job with no origin,
-    // and an origin overrides it for both targets.
+    // One test per arm. A job with no origin reads all of memory and a job
+    // created from a chat reads that chat, for both targets.
 
+    /// A job no chat created reads all of memory, whichever target it has. An
+    /// operator makes such a job from the TUI, the console or the CLI, and
+    /// `isolated` is the default target, so a narrower view here would strip the
+    /// owner's files and notes from every job they schedule.
     #[test]
-    fn an_isolated_job_with_no_origin_reads_its_own_id() {
-        let mut job = test_job("echo hi");
-        job.id = "job-42".into();
-        job.session_target = SessionTarget::Isolated;
-        assert_eq!(
-            memory_view_for(&job),
-            Some(MemoryView::Only("cron:job-42".into()))
-        );
-    }
-
-    #[test]
-    fn a_main_job_with_no_origin_reads_all_of_memory() {
-        let mut job = test_job("echo hi");
-        job.id = "job-42".into();
-        job.session_target = SessionTarget::Main;
-        // The view the CLI and the daemon heartbeat run under. Sharing it is
-        // what `session_target = "main"` promises.
-        assert_eq!(memory_view_for(&job), Some(MemoryView::All));
+    fn a_job_with_no_origin_reads_all_of_memory_for_either_target() {
+        for target in [SessionTarget::Main, SessionTarget::Isolated] {
+            let mut job = test_job("echo hi");
+            job.id = "job-42".into();
+            job.session_target = target;
+            assert_eq!(
+                memory_view_for(&job),
+                Some(MemoryView::All),
+                "target {:?}",
+                job.session_target
+            );
+        }
     }
 
     /// A job created from a chat reads that chat, whichever target it has. A
@@ -1321,11 +1314,14 @@ mod tests {
         fixture.assert_every_note_was_sent();
     }
 
+    /// An isolated job no chat created sees what a `main` one does: every note,
+    /// including those scoped to other conversations, and the owner's files in
+    /// its prompt.
     #[tokio::test]
-    async fn an_isolated_job_with_no_origin_reads_only_its_own_notes() {
+    async fn an_isolated_job_with_no_origin_reads_all_of_memory_through_the_door() {
         let fixture = crate::agent::door_test_support::DoorFixture::start().await;
         run_door_job(&fixture, SessionTarget::Isolated, None).await;
-        fixture.assert_only_notes_were_sent(&[crate::agent::door_test_support::CRON_WORD]);
+        fixture.assert_every_note_was_sent();
     }
 
     #[tokio::test]

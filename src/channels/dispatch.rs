@@ -1141,7 +1141,10 @@ pub(crate) async fn process_channel_message(
                             )
                             .await
                         } else {
-                            run_tool_call_loop(
+                            // The guest marker the file tools read: `Only` alone
+                            // does not say a turn is a guest's, since an owner in a
+                            // group runs under it too.
+                            crate::approval::guest::GUEST_TURN.scope((), run_tool_call_loop(
                                 active_provider.as_ref(),
                                 &mut history,
                                 &guest_turn_tools,
@@ -1163,7 +1166,7 @@ pub(crate) async fn process_channel_message(
                                 None,
                                 ctx.ledger.as_deref(),
                                 &audit_actor,
-                            )
+                            ))
                             .await
                         }
                     },
