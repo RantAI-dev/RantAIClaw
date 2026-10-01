@@ -798,10 +798,10 @@ pub(crate) async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
-    // Owner status drives both the prompt (tell the model the sender is an
-    // owner so it doesn't self-refuse owner-only tools) and the capability
-    // ceiling below, and now the memory-context view above. Compute once so
-    // the three never disagree.
+    // Owner status drives the prompt (tell the model the sender is an owner so
+    // it doesn't self-refuse owner-only tools), the memory-context view, the
+    // tool registry, the persona and safety text, and the capability ceiling,
+    // all below. Compute once so they never disagree.
     let sender_is_owner = crate::approval::can_approve_any(
         &runtime_defaults.approval_owners,
         msg.sender_identities(),

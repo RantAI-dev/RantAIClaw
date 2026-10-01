@@ -174,6 +174,11 @@ mod tests {
     /// `clear_all_session_grants` (through `apply_preset_to_config`) between the
     /// record and the read, so the round trip gets a few attempts. A function
     /// that stops using the shared instance never passes any of them.
+    ///
+    /// The `clear_all_session_grants` case lives in this test, not a second
+    /// one, so the two cases cannot clear each other's session. It records its
+    /// own session id and asserts only on that id, so it neither reads nor
+    /// depends on another test's grants.
     #[test]
     fn public_functions_share_one_process_wide_instance() {
         let sid = "sess-public-fns-shared-instance-4e8f";
@@ -187,5 +192,22 @@ mod tests {
         record_session_grants(sid, &tools);
         clear_session_grants(sid);
         assert!(session_granted_tools(sid).is_empty());
+
+        // `clear_all_session_grants` drops a recorded grant. Only count an
+        // attempt once the grant was readable just before the call, so a clear
+        // from another test cannot make an empty read look like this call's
+        // work.
+        let all_cleared = (0..5).any(|_| {
+            record_session_grants(sid, &tools);
+            if session_granted_tools(sid) != vec!["http_request".to_string()] {
+                return false;
+            }
+            clear_all_session_grants();
+            session_granted_tools(sid).is_empty()
+        });
+        assert!(
+            all_cleared,
+            "clear_all_session_grants left the grant behind"
+        );
     }
 }
