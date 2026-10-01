@@ -1678,7 +1678,8 @@ async fn run_gateway_chat_with_multimodal(
     // Build system prompt with full tool + skill awareness.
     //
     // This turn runs with no memory view, so it reads nothing from memory: the
-    // prompt carries neither `USER.md` nor `MEMORY.md`.
+    // prompt carries none of the owner's files (`USER.md`, `MEMORY.md`,
+    // `BOOTSTRAP.md`, `TOOLS.md`).
     let mut system_prompt = {
         let config_guard = state.config.lock();
         crate::channels::build_system_prompt(

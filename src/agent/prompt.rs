@@ -848,11 +848,11 @@ impl PromptSection for DateTimeSection {
             return Ok(String::from("## Current Date & Time\n\nTimezone: UTC"));
         }
         let now = Local::now();
-        // Channel/gateway prompts are built once at daemon start and reused, so
-        // a full timestamp would freeze at boot time and mislead the model on a
-        // long-running bot. Emit timezone-only there (matches the prior channel
-        // builder); the interactive agent rebuilds per session and shows the
-        // full timestamp.
+        // A channel prompt carries the timezone only, as the prior channel
+        // builder did, so its text does not change from one message to the next.
+        // The owner prompt is rebuilt per message and could carry the time, but
+        // the interactive agent is the one surface that shows a full timestamp:
+        // it rebuilds per session.
         if matches!(ctx.surface, PromptSurface::Channel { .. }) {
             return Ok(format!(
                 "## Current Date & Time\n\nTimezone: {}",

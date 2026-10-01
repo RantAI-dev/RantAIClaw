@@ -341,10 +341,11 @@ pub(crate) struct ChannelRuntimeDefaults {
     /// `SecurityPolicy` on reload so `rantaiclaw autonomy <preset>` (e.g.
     /// Off → Full) applies without a `channels run`/daemon restart.
     pub(crate) autonomy_level: crate::security::AutonomyLevel,
-    /// Active approval preset, refreshed on reload. The channel system prompt
-    /// is built once at startup (it reads bootstrap files and skills off disk),
-    /// so without carrying this the prompt kept describing whatever preset was
-    /// active when the daemon started — the gate moved, the briefing did not.
+    /// Active approval preset, refreshed on reload. The guest prompt is built
+    /// once at startup, and the owner prompt carries the tool list and skills
+    /// from startup, so without carrying this the prompt kept describing
+    /// whatever preset was active when the daemon started — the gate moved, the
+    /// briefing did not.
     pub(crate) autonomy_preset: crate::approval::policy_writer::PolicyPreset,
     /// Per-channel sender allowlists, keyed by the same lowercase channel name
     /// used by `channels_by_name`. Reloaded from disk so a console or CLI

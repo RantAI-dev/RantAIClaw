@@ -73,10 +73,17 @@ pub struct MemoryStoreTool {
     /// below already reasons about the injected block; without this, the block it
     /// reasons about does not yet contain the entry that was just stored.
     workspace_dir: std::path::PathBuf,
-    /// Held from the check "does this key already hold a different note?" until
-    /// the write lands, so two calls for one key cannot both pass the check.
-    write_lock: tokio::sync::Mutex<()>,
 }
+
+/// Held from the check "does this key already hold a different note?" until the
+/// write lands, so two calls for one key cannot both pass the check.
+///
+/// One lock per process, not per tool instance: the webhook and every channel
+/// turn build their own tool registry, so a per-instance lock would not order
+/// calls from different turns. It does not reach a second process. The TUI and
+/// the CLI run beside the daemon and are not serialised with it; they replace a
+/// note on purpose, so they have no check to race.
+static STORE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl MemoryStoreTool {
     pub fn new(
@@ -88,7 +95,6 @@ impl MemoryStoreTool {
             memory,
             security,
             workspace_dir,
-            write_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -172,9 +178,9 @@ impl Tool for MemoryStoreTool {
         };
         let content = sanitized.content.as_str();
 
-        // From the check below to the write, one call at a time per tool, so a
-        // second call for the same key sees the note the first one stored.
-        let _write_guard = self.write_lock.lock().await;
+        // From the check below to the write, one call at a time in this process,
+        // so a second call for the same key sees the note the first one stored.
+        let _write_guard = STORE_WRITE_LOCK.lock().await;
 
         // Resolve the superseded entry before writing anything: an unresolvable
         // `replaces` means the caller's belief about stored state is wrong, and
@@ -270,7 +276,7 @@ impl Tool for MemoryStoreTool {
             // Storing under the same key already replaced it.
             if old_key != key {
                 use std::fmt::Write as _;
-                match self.memory.forget(&old_key).await {
+                match crate::memory::forget_in_view(self.memory.as_ref(), &old_key).await {
                     Ok(_) => {
                         let _ = write!(output, " (superseded '{old_key}')");
                     }
@@ -1033,6 +1039,32 @@ mod tests {
         let (a, b) = tokio::join!(
             execute_in_all_view(&tool, json!({"key": "race_key", "content": "from a"})),
             execute_in_all_view(&tool, json!({"key": "race_key", "content": "from b"})),
+        );
+
+        assert_eq!(
+            [a.success, b.success].iter().filter(|ok| **ok).count(),
+            1,
+            "a: {:?}, b: {:?}",
+            a.error,
+            b.error
+        );
+        let winner = if a.success { "from a" } else { "from b" };
+        assert_eq!(mem.get("race_key").await.unwrap().unwrap().content, winner);
+    }
+
+    /// The lock is shared by every tool instance in the process, because the
+    /// webhook and each channel turn build their own registry. Two different
+    /// instances over one store, storing different content under one key at the
+    /// same moment, cannot both win.
+    #[tokio::test]
+    async fn concurrent_stores_through_different_tool_instances_cannot_both_win() {
+        let (tmp, mem) = test_mem();
+        let tool_a = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let tool_b = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let (a, b) = tokio::join!(
+            execute_in_all_view(&tool_a, json!({"key": "race_key", "content": "from a"})),
+            execute_in_all_view(&tool_b, json!({"key": "race_key", "content": "from b"})),
         );
 
         assert_eq!(
