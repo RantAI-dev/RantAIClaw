@@ -149,7 +149,7 @@ To recover by hand:
 1. Read the error in the warning and fix its cause, which the `error` field names. Restart the runtime.
 2. If a backup directory has no `BACKUP_COMPLETE`, the backup stopped partway and the runtime ignores it. The live `MEMORY.md` and `memory/*.md` are untouched until an import commits, so copy notes from them.
 3. To stop the retries, act on the case you are in:
-   - The backup keeps failing, so no complete backup directory exists. Delete `<workspace>/memory/migrations/PENDING`. Nothing retries the backup after that, and the notes stay in the live markdown files.
+   - The backup keeps failing, so no complete backup directory exists. A failed backup normally leaves the config on disk unwritten, but a config saved earlier in the same failed session may already differ, so check what the file names. While it names `markdown`, every start makes the backup again and writes `PENDING` again, and deleting `PENDING` alone does not stop that. Set `[memory] backend = "sqlite"` in the config, remove a `[storage.provider.config] provider = "markdown"` line if either is there, and then delete `<workspace>/memory/migrations/PENDING`. Nothing retries the backup after that, and the notes stay in the live markdown files.
    - The backup is complete but its import keeps failing. Deleting `PENDING` does not stop it, because every start with the `sqlite` backend imports each backup directory that has `BACKUP_COMPLETE` and no `IMPORTED`. Create an empty `IMPORTED` file in that backup directory (`touch <backup directory>/IMPORTED`) and delete `PENDING` if it exists. The runtime then treats the backup as imported and skips it. The notes stay in the live markdown files and in the backup directory.
 
 ## Incident Triage Flow (Fast Path)

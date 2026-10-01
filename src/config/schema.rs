@@ -5528,6 +5528,33 @@ fn remove_pending_marker(marker: &Path) {
     }
 }
 
+/// Open (creating) `brain.db` for the markdown import, through the same
+/// schema the backend would use.
+///
+/// The connection must outlive the inserts; `SqliteMemory::init_schema`
+/// builds the FTS5 schema and the trigger pair `memories` keeps in sync with
+/// `memories_fts`. Using the backend's own schema (not a duplicate here) is
+/// the same reason `hydrate_from_snapshot` does it.
+fn open_markdown_import_connection(workspace_dir: &Path) -> Result<rusqlite::Connection> {
+    let db_dir = workspace_dir.join("memory");
+    std::fs::create_dir_all(&db_dir).context("create memory directory")?;
+    let db_path = db_dir.join("brain.db");
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("open {}", db_path.display()))?;
+    // A running daemon can hold brain.db for ordinary traffic; wait for it
+    // rather than fail immediately with SQLITE_BUSY. Set before any pragma,
+    // which itself takes a lock.
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .context("set busy timeout")?;
+    // `FULL` flushes the WAL at every commit, so the import is durable when
+    // `commit` returns. This connection is private to the import; the
+    // daemon's own connection keeps its setting.
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
+        .context("set sqlite pragmas")?;
+    crate::memory::SqliteMemory::init_schema(&conn).context("initialise sqlite schema")?;
+    Ok(conn)
+}
+
 fn mark_markdown_backup_imported(backup_dir: &Path) -> Result<()> {
     crate::migration::write_marker_durably(&backup_dir.join("IMPORTED"), &[])
         .context("write IMPORTED marker")
@@ -5595,27 +5622,7 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
         .filter(|e| !is_template_scaffold_line(&e.content))
         .collect();
 
-    // Open (creating) brain.db through the same path the backend would.
-    // The connection must outlive the inserts; SqliteMemory::init_schema
-    // builds the FTS5 schema and the trigger pair `memories` keeps in sync
-    // with `memories_fts`. Using the backend's own schema (not a duplicate
-    // here) is the same reason hydrate_from_snapshot does it.
-    let db_dir = workspace_dir.join("memory");
-    std::fs::create_dir_all(&db_dir).context("create memory directory")?;
-    let db_path = db_dir.join("brain.db");
-    let mut conn = rusqlite::Connection::open(&db_path)
-        .with_context(|| format!("open {}", db_path.display()))?;
-    // A running daemon can hold brain.db for ordinary traffic; wait for it
-    // rather than fail immediately with SQLITE_BUSY. Set before any pragma,
-    // which itself takes a lock.
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .context("set busy timeout")?;
-    // `FULL` flushes the WAL at every commit, so the import is durable when
-    // `commit` returns. This connection is private to the import; the
-    // daemon's own connection keeps its setting.
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
-        .context("set sqlite pragmas")?;
-    crate::memory::SqliteMemory::init_schema(&conn).context("initialise sqlite schema")?;
+    let mut conn = open_markdown_import_connection(workspace_dir)?;
 
     // The imported rows carry the backup time, not the import time: a row
     // stored at runtime after the backup stays newer than the note, and a
@@ -5626,8 +5633,12 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
     let mut imported = 0_usize;
     let mut skipped_newer = 0_usize;
     let mut moved_from_other_place = 0_usize;
+    // `Immediate` takes the write lock here, where SQLite runs the busy
+    // handler. A deferred transaction would read first and ask for the lock at
+    // its first `INSERT`, and SQLite fails that upgrade at once with
+    // `SQLITE_BUSY` instead of waiting while a daemon is writing.
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .context("begin markdown import transaction")?;
     for entry in &entries {
         if entry.content.trim().is_empty() {
@@ -5765,6 +5776,11 @@ fn project_and_rewrite_live_memory_md(
 
     let live_path = workspace_dir.join("MEMORY.md");
     let live_existed = live_path.exists();
+    if live_existed {
+        // The reads below, and `project_core_memories`'s own, would block on a
+        // FIFO that took the place of the file after the backup.
+        crate::migration::require_regular_file(&live_path)?;
+    }
     let backed_up_memory_md = backup_dir.join("MEMORY.md");
     let backup_had_memory_md = backed_up_memory_md.exists();
     if backup_had_memory_md {
@@ -10256,6 +10272,148 @@ default_model = "legacy-model"
             content, "wal only value",
             "un-checkpointed WAL data must survive the backup"
         );
+    }
+
+    /// A running daemon holds the database's write lock while it stores a
+    /// note. The import must wait for that lock, not fail and leave the notes
+    /// to the next start. A deferred transaction reads first and asks for the
+    /// write lock on its first `INSERT`; SQLite does not run the busy handler
+    /// for that upgrade, so it returned `SQLITE_BUSY` at once.
+    #[tokio::test]
+    async fn markdown_import_waits_for_a_writer_that_holds_the_database() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+        std::fs::write(workspace.join("MEMORY.md"), "- **busy_key**: busy value\n").unwrap();
+
+        // The schema exists before the writer starts, so the import's own
+        // schema step has nothing to create and takes no write lock: the
+        // transaction is the first thing that needs one.
+        let db_path = workspace.join("memory").join("brain.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            crate::memory::SqliteMemory::init_schema(&conn).unwrap();
+        }
+        let backup_dir = crate::migration::backup_markdown_memory(&workspace)
+            .unwrap()
+            .unwrap();
+
+        // The writer owns the lock before the import starts and gives it up
+        // after a fixed delay far below the import's 5 s busy timeout.
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            writer.execute_batch("COMMIT;").unwrap();
+        });
+
+        let outcome = super::import_markdown_backup_into_sqlite(&workspace, &backup_dir);
+        release.join().unwrap();
+
+        outcome.expect("the import waits for the writer instead of failing");
+        assert!(
+            backup_dir.join("IMPORTED").exists(),
+            "a finished import is marked done"
+        );
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE key = 'busy_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "busy value");
+    }
+
+    /// `FULL` makes the commit durable on its own, which the `IMPORTED` marker
+    /// relies on. The import's connection is the only place the setting
+    /// lives, so it is read back from there.
+    #[tokio::test]
+    async fn markdown_import_connection_commits_with_full_synchronous() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let conn = super::open_markdown_import_connection(tmp.path()).unwrap();
+
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2, "0 = OFF, 1 = NORMAL, 2 = FULL");
+    }
+
+    /// The start-up compares the live notes with an existing backup. A FIFO
+    /// named like a note, newer than the backup, must not be opened: opening
+    /// one for reading blocks until a writer appears, and the start-up waits
+    /// with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_markdown_newer_than_backup_does_not_open_a_fifo_named_like_a_note() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+        std::fs::write(workspace.join("MEMORY.md"), "- **k**: v\n").unwrap();
+        let backup_dir = crate::migration::backup_markdown_memory(&workspace)
+            .unwrap()
+            .unwrap();
+        // Make every live file newer than the backup without waiting for the
+        // clock.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(backup_dir.join("BACKUP_COMPLETE"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        // The live `MEMORY.md` is a newer note too, so only the FIFO is left.
+        std::fs::remove_file(workspace.join("MEMORY.md")).unwrap();
+        let fifo =
+            crate::migration::test_fifo::Fifo::create(&workspace.join("memory").join("pipe.md"));
+
+        assert!(
+            !super::live_markdown_newer_than_backup(&workspace, &backup_dir),
+            "a FIFO is not a note"
+        );
+        assert!(!fifo.was_opened(), "the FIFO must not be opened");
+
+        // The check still sees a real note next to the FIFO.
+        std::fs::write(
+            workspace.join("memory").join("2026-09-03.md"),
+            "- **fresh**: written after the backup\n",
+        )
+        .unwrap();
+        assert!(super::live_markdown_newer_than_backup(
+            &workspace,
+            &backup_dir
+        ));
+    }
+
+    /// The live `MEMORY.md` is read before the import rewrites it. One that
+    /// became a FIFO after the backup is left alone, and the import, whose
+    /// rows are already committed, still finishes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_leaves_a_live_memory_md_that_became_a_fifo_unopened() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+        std::fs::write(workspace.join("MEMORY.md"), "- **k**: v\n").unwrap();
+        let backup_dir = crate::migration::backup_markdown_memory(&workspace)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(workspace.join("MEMORY.md")).unwrap();
+        let fifo = crate::migration::test_fifo::Fifo::create(&workspace.join("MEMORY.md"));
+
+        super::import_markdown_backup_into_sqlite(&workspace, &backup_dir)
+            .expect("the rows import even though the projection step is refused");
+
+        assert!(!fifo.was_opened(), "the FIFO must not be opened");
+        assert!(backup_dir.join("IMPORTED").exists());
+        assert!(std::fs::symlink_metadata(workspace.join("MEMORY.md"))
+            .unwrap()
+            .file_type()
+            .is_fifo());
     }
 
     /// A live `MEMORY.md` edited after the backup was taken (a slow first
