@@ -184,7 +184,9 @@ Notes:
 - **`session_target` picks the memory view of an agent job that has no chat.**
   `isolated` (the default) reads `cron:<job_id>`: its own rows and nothing else,
   not the shared tier. `main` reads all of memory, as the CLI and the daemon
-  heartbeat do, and its prompt carries `USER.md` and `MEMORY.md`. Set it through
+  heartbeat do, and its prompt carries `USER.md` and `MEMORY.md`. An `isolated`
+  job's prompt carries neither file, its file tools refuse the owner's private
+  paths, and its `memory_store` notes belong to `cron:<job_id>`. Set it through
   the `cron_add`/`cron_update` tools or the HTTP API.
 
 #### HTTP control (`/api/v1/cron*`)

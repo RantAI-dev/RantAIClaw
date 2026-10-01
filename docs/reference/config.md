@@ -555,26 +555,26 @@ prompts.
 
 ### Conversation scoping
 
-Memory reads and writes are scoped per conversation: each channel chat and each
-TUI session recalls its own rows first, then backfills from shared (unscoped)
-memory only. Entries another conversation stored never surface in this one's
-prompt. Unscoped entries are the shared tier: what an owner's `memory_store`
-writes, and what the CLI, the TUI and the one-time markdown import write.
-Owners see them, while a guest sees only its own conversation's notes.
+Every turn reads memory under a memory view that the door which started it
+sets. A view is either all of memory or one conversation's notes. There is no
+backfill: a conversation view never adds the shared (unscoped) tier. The view
+decides what `memory_recall`, the `[Memory context]` block in front of the
+user's message, and the lookups of `memory_store` and `memory_forget` may read.
 
-The explicit `memory_recall` tool follows the same scope on interactive
-surfaces (TUI, `agent run`, the console API): it reads the active
-conversation's rows plus the shared tier, never another conversation's.
-Surfaces that serve many conversations through one tool registry (channels,
-the gateway webhook) keep the tool's read global — a single shared scope
-would race across concurrent turns — and guests cannot invoke it at all
-unless an operator adds `memory_recall` to `guest_allowed_tools`.
+- A named owner in a direct chat, the TUI, `agent -m`, `chat -m`, the web
+  console chat, the daemon heartbeat and a `main` cron job with no origin chat
+  read all of memory.
+- A guest, an owner in a group or in a chat the platform did not mark as a
+  direct message, a sender who is an owner only through `approval_owners = ["*"]`,
+  and a cron job created from a chat read that conversation's notes only.
+- An `isolated` cron job with no origin chat reads its own notes (`cron:<job_id>`).
+- A turn that no door gave a view, such as a webhook turn, reads nothing: recall
+  finds no note and the context block is empty.
 
-On channels, a guest's `memory_recall` reads only rows that belong to the
-active conversation (matching `session_id`). The shared unscoped tier is never
-backfilled into a guest's prompt. Even when the operator lists `memory_recall`
-in `guest_allowed_tools`, a guest cannot see other conversations' memory or the
-owner's notes. An owner's memory read is unchanged.
+The table in
+[Per-role channel permissions](../security/per-role-permissions.md#memory-view-what-a-turn-may-read)
+lists every door. `USER.md` and `MEMORY.md` in the prompt follow the view too:
+only a turn that reads all of memory carries them.
 
 A guest's writes stay in its own place too. `memory_store` under a guest turn
 stores with the guest's conversation as the session, and its `replaces` and
