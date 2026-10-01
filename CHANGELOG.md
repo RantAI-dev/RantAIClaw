@@ -101,6 +101,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator expected to migrate. Existing RantaiClaw installs are unaffected —
   their own layout migration (`maybe_migrate_legacy_layout`) lives in a
   separate path and is unchanged.
+- The hardware and peripheral stack is removed: `rantaiclaw hardware` and
+  `rantaiclaw peripheral`, `rantaiclaw agent --peripheral`, the wizard's
+  Hardware step (ten steps become nine), the `hardware` topic of
+  `rantaiclaw setup`, the hardware block of `rantaiclaw status`, the
+  `hardware`, `probe`, and `peripheral-rpi` Cargo features, the board firmware
+  in `firmware/`, the `crates/robot-kit` workspace member, and the datasheet
+  RAG (`src/rag/`, `HardwareRag`). Release builds compiled the board code out,
+  so these surfaces existed but did nothing, and the opt-in features went
+  unused.
 
 ### Changed
 

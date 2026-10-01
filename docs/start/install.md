@@ -459,9 +459,6 @@ cargo install --path . --locked
 # WhatsApp Web support
 cargo install --path . --locked --features whatsapp-web
 
-# Hardware peripherals (RPi GPIO, Arduino)
-cargo install --path . --locked --features peripherals
-
 # Browser automation
 cargo install --path . --locked --features browser
 

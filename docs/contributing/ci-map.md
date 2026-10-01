@@ -15,7 +15,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
         - `lint` — `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, plus strict delta clippy on changed Rust lines (`scripts/ci/rust_strict_delta_gate.sh`).
         - `test` — `cargo test --locked --workspace -- --test-threads=1`. Not `nextest`: it was tried and the runner SIGTERM'd or hit the job cap on this codebase. `--test-threads=1` because many unit tests mutate process-global env behind per-file locks that do not serialize across modules.
         - `msrv` — `cargo check --all-targets` at the toolchain `Cargo.toml`'s `rust-version` field declares, read out of the manifest rather than pinned in the workflow so the job cannot defend a number the manifest no longer says.
-        - `features` — matrix `cargo check`: `no-default-features`, `hardware-only`, `observability-otel`, `kb-office`.
+        - `features` — matrix `cargo check`: `no-default-features`, `observability-otel`, `kb-office`.
         - `e2e` — `cargo test --test agent_e2e --locked --verbose`. Runs on PRs; it was push-only until an end-to-end regression turned out to be invisible until after merge.
         - `bench-compile` — `cargo bench --no-run --locked` (verifies criterion benches build).
         - `build` — `cargo build --profile release-fast --locked` smoke + binary-size guard (`scripts/ci/check_binary_size.sh`).

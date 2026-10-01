@@ -24,7 +24,6 @@ Key extension points:
 - `src/memory/traits.rs` (`Memory`)
 - `src/observability/traits.rs` (`Observer`)
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
-- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
@@ -148,7 +147,6 @@ Required:
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
-- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware/peripherals-design.md`
 - `src/runtime/` — runtime adapters (currently native)
 - `docs/` — task-oriented documentation system (hubs, unified TOC, references, operations, security proposals)
 - `.github/` — CI, templates, automation workflows
@@ -170,7 +168,6 @@ Collection trees (**migrated** — all twelve exist; only the hub, the TOC and t
 - `docs/reference/` — commands, config, providers, channels, tools, extending
 - `docs/operations/` — runbook, deployment, proxy, resource-limits
 - `docs/security/` — model, audit, sandboxing, threats/
-- `docs/hardware/` — README, boards/, adding-boards, datasheets/
 - `docs/contributing/` — pr-workflow, reviewer, release, ci, actions-policy
 - `docs/project/` — date-stamped snapshots; `docs/project/archive/` for superseded planning artifacts
 
@@ -284,13 +281,6 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Implement `Tool` in `src/tools/` with strict parameter schema.
 - Validate and sanitize all inputs.
 - Return structured `ToolResult`; avoid panics in runtime path.
-
-### 7.4 Adding a Peripheral
-
-- Implement `Peripheral` in `src/peripherals/`.
-- Peripherals expose `tools()` — each tool delegates to the hardware (GPIO, sensors, etc.).
-- Register board type in config schema if needed.
-- See `docs/hardware/peripherals-design.md` for protocol and firmware notes.
 
 ### 7.5 Security / Runtime / Gateway Changes
 

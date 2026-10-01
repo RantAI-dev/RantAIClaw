@@ -9,7 +9,7 @@ The docs are a product surface. They have to convince a new visitor in 30 second
 - Entry hub (`docs/README.md`) — 30-second decision tree
 - Pillar docs (this directory) — one per product pillar, mirroring the ClickUp `[Product]` task
 - Runtime contracts (`docs/reference/`) — what users build against
-- Operations / security / hardware / contributing — domain trees
+- Operations / security / contributing — domain trees
 - Project snapshots (`docs/project/`) — date-stamped, immutable
 
 ## Vs OpenClaw / Hermes-agent
@@ -52,7 +52,6 @@ docs/
 ├── pillars/                   ← this directory (1-9)
 ├── operations/                ← day-2 ops
 ├── security/                  ← model + threats
-├── hardware/                  ← niche but supported
 ├── contributing/              ← contributor flow
 └── project/                   ← time-bound snapshots
     └── archive/               ← superseded planning artifacts

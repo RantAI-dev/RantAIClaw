@@ -126,7 +126,6 @@ pub fn cat_label(c: ProvisionerCategory) -> &'static str {
         ProvisionerCategory::Channel => "Channels",
         ProvisionerCategory::Integration => "Integrations",
         ProvisionerCategory::Runtime => "Runtime",
-        ProvisionerCategory::Hardware => "Hardware",
         ProvisionerCategory::Routing => "Routing",
     }
 }
@@ -137,7 +136,6 @@ pub fn category_key(c: ProvisionerCategory) -> &'static str {
         ProvisionerCategory::Channel => "channel",
         ProvisionerCategory::Integration => "integration",
         ProvisionerCategory::Runtime => "runtime",
-        ProvisionerCategory::Hardware => "hardware",
         ProvisionerCategory::Routing => "routing",
     }
 }
@@ -166,7 +164,6 @@ pub fn category_from_key(key: &str) -> Option<ProvisionerCategory> {
         "channel" => Some(ProvisionerCategory::Channel),
         "integration" => Some(ProvisionerCategory::Integration),
         "runtime" => Some(ProvisionerCategory::Runtime),
-        "hardware" => Some(ProvisionerCategory::Hardware),
         "routing" => Some(ProvisionerCategory::Routing),
         _ => None,
     }
@@ -218,8 +215,7 @@ fn cat_order(c: ProvisionerCategory) -> u8 {
         ProvisionerCategory::Channel => 1,
         ProvisionerCategory::Integration => 2,
         ProvisionerCategory::Runtime => 3,
-        ProvisionerCategory::Hardware => 4,
-        ProvisionerCategory::Routing => 5,
+        ProvisionerCategory::Routing => 4,
     }
 }
 
@@ -259,23 +255,22 @@ mod tests {
         }
     }
 
-    /// `runtime` and `hardware` name both a provisioner and a category. They
-    /// have always opened the provisioner, and the dispatcher resolves
-    /// provisioners first so they still do — this pins that the fallback is
+    /// `runtime` names both a provisioner and a category. It
+    /// has always opened the provisioner, and the dispatcher resolves
+    /// provisioners first so it still does — this pins that the fallback is
     /// additive, not a behavior change.
     #[test]
-    fn runtime_and_hardware_still_resolve_as_provisioners_first() {
-        for name in ["runtime", "hardware"] {
-            assert!(
-                crate::onboard::provision::provisioner_for(name).is_some(),
-                "{name} must stay a provisioner"
-            );
-            // They also name categories — which is exactly why order matters.
-            assert!(
-                category_from_arg(name).is_some(),
-                "{name} also names a category"
-            );
-        }
+    fn runtime_still_resolves_as_provisioner_first() {
+        let name = "runtime";
+        assert!(
+            crate::onboard::provision::provisioner_for(name).is_some(),
+            "{name} must stay a provisioner"
+        );
+        // It also names a category — which is exactly why order matters.
+        assert!(
+            category_from_arg(name).is_some(),
+            "{name} also names a category"
+        );
     }
 
     #[test]
@@ -285,7 +280,6 @@ mod tests {
             ProvisionerCategory::Channel,
             ProvisionerCategory::Integration,
             ProvisionerCategory::Runtime,
-            ProvisionerCategory::Hardware,
             ProvisionerCategory::Routing,
         ] {
             assert_eq!(category_from_arg(category_key(cat)), Some(cat));

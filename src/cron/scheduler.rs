@@ -517,7 +517,6 @@ async fn run_agent_job(
         None,
         model_override,
         config.default_temperature,
-        vec![],
         "scheduler",
         memory_scope,
         observer.cloned(),

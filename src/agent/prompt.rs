@@ -10,7 +10,7 @@ use std::path::Path;
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 /// Which surface the prompt is being built for. Selects the surface-specific
-/// hint sections (hardware/task/channel-capabilities) while keeping the
+/// hint sections (task/channel-capabilities) while keeping the
 /// capability-defining sections (persona/identity/tools/safety/skills)
 /// identical everywhere. One builder, surface-aware tail — the core of the
 /// unified-agent-runtime prompt design.
@@ -124,10 +124,8 @@ impl SystemPromptBuilder {
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
                 // Surface-specific hints. These self-gate: on the Agent
-                // surface (and when no hardware tools are present) they emit
-                // nothing, so the TUI prompt is unchanged. On a Channel they
-                // add hardware access, action framing, and delivery hints.
-                Box::new(HardwareSection),
+                // surface they emit nothing, so the TUI prompt is unchanged.
+                // On a Channel they add action framing and delivery hints.
                 Box::new(TaskSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
@@ -217,7 +215,6 @@ pub struct MemorySection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
-pub struct HardwareSection;
 pub struct TaskSection;
 pub struct ChannelCapabilitiesSection;
 
@@ -822,44 +819,6 @@ fn is_empty_schema(schema: &serde_json::Value) -> bool {
         serde_json::Value::Null => true,
         serde_json::Value::Object(map) => map.is_empty(),
         _ => false,
-    }
-}
-
-/// Names of the hardware/peripheral tools that unlock the Hardware Access block.
-const HARDWARE_TOOL_NAMES: &[&str] = &[
-    "gpio_read",
-    "gpio_write",
-    "arduino_upload",
-    "hardware_memory_map",
-    "hardware_board_info",
-    "hardware_memory_read",
-    "hardware_capabilities",
-];
-
-impl PromptSection for HardwareSection {
-    fn name(&self) -> &str {
-        "hardware"
-    }
-
-    /// Emitted on any surface when hardware tools are present (previously
-    /// channel-only). Tells the model the connected board is authorized so it
-    /// uses the tools instead of inventing security refusals.
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let has_hardware = ctx
-            .tools
-            .iter()
-            .any(|t| HARDWARE_TOOL_NAMES.contains(&t.name()));
-        if !has_hardware {
-            return Ok(String::new());
-        }
-        Ok(String::from(
-            "## Hardware Access\n\n\
-             You HAVE direct access to connected hardware (Arduino, Nucleo, etc.). The user owns this system and has configured it.\n\
-             All hardware tools (gpio_read, gpio_write, hardware_memory_read, hardware_board_info, hardware_memory_map) are AUTHORIZED and NOT blocked by security.\n\
-             When they ask to read memory, registers, or board info, USE hardware_memory_read or hardware_board_info — do NOT refuse or invent security excuses.\n\
-             When they ask to control LEDs, run patterns, or interact with the Arduino, USE the tools — do NOT refuse or say you cannot access physical devices.\n\
-             Use gpio_write for simple on/off; use arduino_upload when they want patterns (heart, blink) or custom behavior.",
-        ))
     }
 }
 

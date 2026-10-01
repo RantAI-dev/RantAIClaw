@@ -378,6 +378,58 @@ fn migrate_subcommand_is_removed_and_fails_as_unknown() {
     );
 }
 
+/// `rantaiclaw hardware` was removed in plan 506. The CLI no longer accepts
+/// the subcommand, so clap exits non-zero and surfaces an "unrecognized
+/// subcommand" error. This pins the removal so a future PR cannot quietly
+/// reintroduce the command.
+#[test]
+fn hardware_subcommand_is_removed_and_fails_as_unknown() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+
+    let assert = cmd(&home).arg("hardware").assert().failure().stderr(
+        predicate::str::contains("hardware").and(
+            predicate::str::contains("unrecognized subcommand")
+                .or(predicate::str::contains("unknown subcommand"))
+                .or(predicate::str::contains("unexpected argument")),
+        ),
+    );
+
+    let output = assert.get_output();
+    let exit_code = output.status.code();
+    assert_eq!(
+        exit_code,
+        Some(2),
+        "clap usage errors should exit with status 2; got {exit_code:?}"
+    );
+}
+
+/// `rantaiclaw peripheral` was removed in plan 506. The CLI no longer accepts
+/// the subcommand, so clap exits non-zero and surfaces an "unrecognized
+/// subcommand" error. This pins the removal so a future PR cannot quietly
+/// reintroduce the command.
+#[test]
+fn peripheral_subcommand_is_removed_and_fails_as_unknown() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+
+    let assert = cmd(&home).arg("peripheral").assert().failure().stderr(
+        predicate::str::contains("peripheral").and(
+            predicate::str::contains("unrecognized subcommand")
+                .or(predicate::str::contains("unknown subcommand"))
+                .or(predicate::str::contains("unexpected argument")),
+        ),
+    );
+
+    let output = assert.get_output();
+    let exit_code = output.status.code();
+    assert_eq!(
+        exit_code,
+        Some(2),
+        "clap usage errors should exit with status 2; got {exit_code:?}"
+    );
+}
+
 #[test]
 fn version_reports_package_version() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());

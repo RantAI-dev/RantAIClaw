@@ -1402,16 +1402,6 @@ pub(crate) async fn build_channel_runtime(
         &config,
     );
 
-    // Merge peripheral tools (UNO Q Bridge, RPi GPIO, etc.)
-    let peripheral_tools = crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        tracing::info!(
-            count = peripheral_tools.len(),
-            "Peripheral tools added to channel server"
-        );
-        all_tools.extend(peripheral_tools);
-    }
-
     // MCP tools, from one pool for the life of this runtime.
     //
     // Issue #283: a configured MCP server reached the TUI/CLI agent and the
