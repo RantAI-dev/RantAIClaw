@@ -73,6 +73,9 @@ pub struct MemoryStoreTool {
     /// below already reasons about the injected block; without this, the block it
     /// reasons about does not yet contain the entry that was just stored.
     workspace_dir: std::path::PathBuf,
+    /// Held from the check "does this key already hold a different note?" until
+    /// the write lands, so two calls for one key cannot both pass the check.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl MemoryStoreTool {
@@ -85,6 +88,7 @@ impl MemoryStoreTool {
             memory,
             security,
             workspace_dir,
+            write_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -96,7 +100,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context (kept for explicit recall only; never auto-injected into prompts), or a custom category name. To correct an existing memory, pass 'replaces' with a distinctive phrase from the old one so it is superseded instead of piling up beside the correction."
+        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context (kept for explicit recall only; never auto-injected into prompts), or a custom category name. A key that already holds a different note is refused: choose another key, or to correct that note pass 'replaces' with a distinctive phrase from the old one so it is superseded instead of piling up beside the correction."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -168,6 +172,10 @@ impl Tool for MemoryStoreTool {
         };
         let content = sanitized.content.as_str();
 
+        // From the check below to the write, one call at a time per tool, so a
+        // second call for the same key sees the note the first one stored.
+        let _write_guard = self.write_lock.lock().await;
+
         // Resolve the superseded entry before writing anything: an unresolvable
         // `replaces` means the caller's belief about stored state is wrong, and
         // storing anyway would leave the stale memory in place beside the new one
@@ -197,6 +205,38 @@ impl Tool for MemoryStoreTool {
             Some(crate::memory::MemoryView::Only(key)) => Some(key.clone()),
             _ => None,
         };
+
+        // A save never replaces a different note by accident. When the key holds
+        // a note of this place with other content, the caller must say it means to
+        // replace it: `replaces` naming that note. The same content again is not
+        // an error. A key held in another place is left to the store, which
+        // refuses it without saying where it lives.
+        match self.memory.get(key).await {
+            Ok(Some(existing))
+                if existing.session_id.as_deref() == place.as_deref()
+                    && existing.content != content
+                    && superseded.as_deref() != Some(key) =>
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "This key already holds a different note. Store the new note under a \
+                         different key, or pass 'replaces' with a phrase from the old note to \
+                         supersede it."
+                            .to_string(),
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read memory: {e}")),
+                });
+            }
+        }
 
         if let Err(e) = self
             .memory
@@ -840,6 +880,223 @@ mod tests {
             "no notice below the budget, got: {}",
             result.output
         );
+    }
+
+    // ── a save never replaces a different note by accident ────────
+
+    /// A key that holds a note is not free for a different one. The second call is
+    /// refused with a way forward, and the first note is intact with its own
+    /// content and timestamp.
+    #[tokio::test]
+    async fn store_under_a_key_holding_different_content_is_refused_and_keeps_the_first_note() {
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let first = execute_in_all_view(
+            &tool,
+            json!({"key": "drive_code", "content": "the drive code is alpha"}),
+        )
+        .await;
+        assert!(first.success, "control: {:?}", first.error);
+        let before = mem.get("drive_code").await.unwrap().unwrap();
+
+        let second = execute_in_all_view(
+            &tool,
+            json!({"key": "drive_code", "content": "the drive code is bravo"}),
+        )
+        .await;
+
+        assert!(!second.success);
+        let error = second.error.unwrap_or_default();
+        assert!(error.contains("different key"), "{error}");
+        assert!(error.contains("replaces"), "{error}");
+        let after = mem.get("drive_code").await.unwrap().unwrap();
+        assert_eq!(after.content, "the drive code is alpha");
+        assert_eq!(after.timestamp, before.timestamp);
+    }
+
+    /// `replaces` naming the note under that key is the way to change it on
+    /// purpose.
+    #[tokio::test]
+    async fn store_with_replaces_naming_the_same_key_supersedes_it() {
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        execute_in_all_view(
+            &tool,
+            json!({"key": "drive_code", "content": "the drive code is alpha"}),
+        )
+        .await;
+
+        let result = execute_in_all_view(
+            &tool,
+            json!({
+                "key": "drive_code",
+                "content": "the drive code is bravo",
+                "replaces": "drive code is alpha",
+            }),
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            mem.get("drive_code").await.unwrap().unwrap().content,
+            "the drive code is bravo"
+        );
+    }
+
+    /// Saving the same note again is not an error.
+    #[tokio::test]
+    async fn store_of_identical_content_under_the_same_key_succeeds() {
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let args = json!({"key": "drive_code", "content": "the drive code is alpha"});
+        execute_in_all_view(&tool, args.clone()).await;
+
+        let again = execute_in_all_view(&tool, args).await;
+
+        assert!(again.success, "{:?}", again.error);
+        assert_eq!(
+            mem.get("drive_code").await.unwrap().unwrap().content,
+            "the drive code is alpha"
+        );
+    }
+
+    /// `replaces` that resolves to a different note says nothing about the note
+    /// that holds the key, so that note is still not overwritten.
+    #[tokio::test]
+    async fn store_with_replaces_naming_another_key_does_not_overwrite_the_key_holder() {
+        let (tmp, mem) = test_mem();
+        mem.store("old_lang", "prefers Python", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("user_lang", "speaks Dutch", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let result = execute_in_all_view(
+            &tool,
+            json!({"key": "user_lang", "content": "prefers Rust", "replaces": "prefers Python"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            mem.get("user_lang").await.unwrap().unwrap().content,
+            "speaks Dutch"
+        );
+        assert!(
+            mem.get("old_lang").await.unwrap().is_some(),
+            "a refused call removes nothing"
+        );
+    }
+
+    /// The refusal holds inside a conversation too: the conversation's own note
+    /// under a key is not replaced by a different one.
+    #[tokio::test]
+    async fn store_under_a_conversation_view_refuses_a_different_note_for_its_own_key() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "chat_note",
+            "first fact",
+            MemoryCategory::Core,
+            Some("chat:one"),
+        )
+        .await
+        .unwrap();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:one".into()), async {
+                tool.execute(json!({"key": "chat_note", "content": "second fact"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            mem.get("chat_note").await.unwrap().unwrap().content,
+            "first fact"
+        );
+    }
+
+    /// Two calls for one key at the same moment cannot both pass the check: one
+    /// is stored, the other is refused, and the stored note is the one that won.
+    #[tokio::test]
+    async fn concurrent_stores_under_one_key_cannot_both_win() {
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let (a, b) = tokio::join!(
+            execute_in_all_view(&tool, json!({"key": "race_key", "content": "from a"})),
+            execute_in_all_view(&tool, json!({"key": "race_key", "content": "from b"})),
+        );
+
+        assert_eq!(
+            [a.success, b.success].iter().filter(|ok| **ok).count(),
+            1,
+            "a: {:?}, b: {:?}",
+            a.error,
+            b.error
+        );
+        let winner = if a.success { "from a" } else { "from b" };
+        assert_eq!(mem.get("race_key").await.unwrap().unwrap().content, winner);
+    }
+
+    // ── the place of a new note ───────────────────────────────────
+
+    /// The `All` view stores in the shared place, which is the only place
+    /// `MEMORY.md` reads.
+    #[tokio::test]
+    async fn store_in_the_all_view_writes_the_shared_place() {
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let result =
+            execute_in_all_view(&tool, json!({"key": "shared_note", "content": "a fact"})).await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            mem.get("shared_note").await.unwrap().unwrap().session_id,
+            None
+        );
+    }
+
+    /// `replaces` finds only what the view can see: a shared note is out of reach
+    /// of a conversation, so the call fails and the note survives.
+    #[tokio::test]
+    async fn store_with_replaces_under_a_conversation_view_cannot_reach_a_shared_note() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "shared_note",
+            "the lantern is red",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:one".into()), async {
+                tool.execute(json!({
+                    "key": "chat_fix",
+                    "content": "the lantern is blue",
+                    "replaces": "lantern is red",
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(mem.get("shared_note").await.unwrap().is_some());
+        assert!(mem.get("chat_fix").await.unwrap().is_none());
     }
 
     /// A turn no door gave a view reads nothing, and `replaces` is a read: it

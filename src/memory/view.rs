@@ -19,7 +19,7 @@
 
 use anyhow::Result;
 
-use super::traits::{Memory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry};
 
 tokio::task_local! {
     /// The memory view the current task runs under. Outside any
@@ -75,6 +75,50 @@ pub async fn recall_in_view(
                 .into_iter()
                 .filter(|e| e.session_id.as_deref() == Some(key.as_str()))
                 .collect())
+        }
+    }
+}
+
+/// Delete the entry stored under `key` if the current turn's view can see it.
+///
+/// `All` deletes any entry. `Only(place)` deletes it only when its `session_id`
+/// is exactly `place`. A task with no view deletes nothing, as it reads
+/// nothing. Both refusals return `Ok(false)`, the answer a key nobody stored
+/// gets, so a caller learns nothing about a row outside its view.
+///
+/// A host-side door (the console, the CLI, the TUI) is a private place and sets
+/// `All` around the call. If one of them is ever reachable from a chat, the view
+/// it runs under already limits it.
+pub async fn forget_in_view(memory: &dyn Memory, key: &str) -> Result<bool> {
+    match current_memory_view() {
+        Some(MemoryView::All) => memory.forget(key).await,
+        Some(MemoryView::Only(place)) => match memory.get(key).await? {
+            Some(entry) if entry.session_id.as_deref() == Some(place.as_str()) => {
+                memory.forget(key).await
+            }
+            _ => Ok(false),
+        },
+        None => Ok(false),
+    }
+}
+
+/// Store a note at an explicit `session_id` on behalf of a host-side door.
+///
+/// Choosing the place of a note is the operator's authority, so it needs the
+/// `All` view: under `Only(..)` or with no view the write is refused. The
+/// agent's own `memory_store` does not come through here; it takes its place
+/// from the view.
+pub async fn store_in_view(
+    memory: &dyn Memory,
+    key: &str,
+    content: &str,
+    category: MemoryCategory,
+    session_id: Option<&str>,
+) -> Result<()> {
+    match current_memory_view() {
+        Some(MemoryView::All) => memory.store(key, content, category, session_id).await,
+        Some(MemoryView::Only(_)) | None => {
+            anyhow::bail!("choosing where a note is stored needs the operator's All memory view")
         }
     }
 }

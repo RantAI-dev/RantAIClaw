@@ -8,7 +8,17 @@ use anyhow::{bail, Result};
 use console::style;
 
 /// Handle `rantaiclaw memory <subcommand>` CLI commands.
+///
+/// The CLI is the operator's private place, so every subcommand runs under the
+/// `All` view: a delete or a write to any place goes through the view check
+/// with that authority stated, not through an unchecked call.
 pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> Result<()> {
+    super::MEMORY_VIEW
+        .scope(super::MemoryView::All, dispatch_command(command, config))
+        .await
+}
+
+async fn dispatch_command(command: crate::MemoryCommands, config: &Config) -> Result<()> {
     match command {
         crate::MemoryCommands::List {
             category,
@@ -178,8 +188,14 @@ async fn handle_add(config: &Config, key: &str, content: &str, category: &str) -
         println!("  {} {note}", style("note:").yellow());
     }
 
-    mem.store(key, &sanitized.content, parse_category(category), None)
-        .await?;
+    super::store_in_view(
+        &*mem,
+        key,
+        &sanitized.content,
+        parse_category(category),
+        None,
+    )
+    .await?;
     println!("Stored {} [{}]", style(key).white().bold(), category);
     refresh_projection(&*mem, config);
     Ok(())
@@ -374,7 +390,7 @@ async fn handle_clear(
 
     let mut deleted = 0usize;
     for entry in &entries {
-        if mem.forget(&entry.key).await? {
+        if super::forget_in_view(&*mem, &entry.key).await? {
             deleted += 1;
         }
     }
@@ -429,7 +445,7 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
         }
     }
 
-    if mem.forget(&target).await? {
+    if super::forget_in_view(mem, &target).await? {
         println!("{} Deleted key: {target}", style("✓").green().bold());
     }
 
@@ -471,23 +487,160 @@ mod tests {
 
         let projected = tmp.path().join(super::super::snapshot::MEMORY_FILE);
 
-        handle_add(&config, "user_lang", "prefers Bahasa Indonesia", "core")
-            .await
-            .unwrap();
+        handle_command(
+            crate::MemoryCommands::Add {
+                key: "user_lang".into(),
+                content: "prefers Bahasa Indonesia".into(),
+                category: "core".into(),
+            },
+            &config,
+        )
+        .await
+        .unwrap();
         let after_add = std::fs::read_to_string(&projected).expect("add must project");
         assert!(
             after_add.contains("- user_lang: prefers Bahasa Indonesia"),
             "{after_add}"
         );
 
-        handle_clear(&config, Some("user_lang".into()), None, true)
-            .await
-            .unwrap();
+        handle_command(
+            crate::MemoryCommands::Clear {
+                key: Some("user_lang".into()),
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap();
         let after_clear = std::fs::read_to_string(&projected).expect("clear must project");
         assert!(
             !after_clear.contains("user_lang"),
             "a cleared memory must leave the block too:\n{after_clear}"
         );
+    }
+
+    fn sqlite_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+        config
+    }
+
+    /// Notes in two places, written straight to the store: one shared, one kept
+    /// in a conversation.
+    async fn seed_two_places(config: &Config) {
+        let mem = create_cli_memory(config).unwrap();
+        mem.store("shared_note", "a shared note", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store(
+            "chat_note",
+            "a conversation note",
+            MemoryCategory::Core,
+            Some("chat:one"),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The operator's CLI reaches every place: `memory clear <key>` removes a
+    /// shared note and a note kept in a conversation alike.
+    #[tokio::test]
+    async fn clear_by_key_reaches_notes_in_every_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = sqlite_config(&tmp);
+        seed_two_places(&config).await;
+
+        for key in ["shared_note", "chat_note"] {
+            handle_command(
+                crate::MemoryCommands::Clear {
+                    key: Some(key.into()),
+                    category: None,
+                    yes: true,
+                },
+                &config,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mem = create_cli_memory(&config).unwrap();
+        assert!(mem.get("shared_note").await.unwrap().is_none());
+        assert!(mem.get("chat_note").await.unwrap().is_none());
+    }
+
+    /// `memory clear --category` is a batch delete, and it reaches every place
+    /// too.
+    #[tokio::test]
+    async fn clear_by_category_reaches_notes_in_every_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = sqlite_config(&tmp);
+        seed_two_places(&config).await;
+
+        handle_command(
+            crate::MemoryCommands::Clear {
+                key: None,
+                category: Some("core".into()),
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let mem = create_cli_memory(&config).unwrap();
+        assert!(mem.get("shared_note").await.unwrap().is_none());
+        assert!(mem.get("chat_note").await.unwrap().is_none());
+    }
+
+    /// The delete takes its authority from the view the door sets. Called with no
+    /// view, as if some chat path reached it, the same clear removes nothing.
+    #[tokio::test]
+    async fn clear_without_the_operators_view_deletes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = sqlite_config(&tmp);
+        seed_two_places(&config).await;
+
+        handle_clear(&config, Some("shared_note".into()), None, true)
+            .await
+            .unwrap();
+        handle_clear(&config, None, Some("core".into()), true)
+            .await
+            .unwrap();
+
+        let mem = create_cli_memory(&config).unwrap();
+        assert!(mem.get("shared_note").await.unwrap().is_some());
+        assert!(mem.get("chat_note").await.unwrap().is_some());
+    }
+
+    /// `memory add` is an operator edit: a second add under the same key replaces
+    /// the note on purpose, and without the operator's view it writes nothing.
+    #[tokio::test]
+    async fn add_replaces_a_note_on_purpose_and_needs_the_operators_view() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = sqlite_config(&tmp);
+        let add = |content: &str| crate::MemoryCommands::Add {
+            key: "drive_code".into(),
+            content: content.into(),
+            category: "core".into(),
+        };
+
+        handle_command(add("the drive code is alpha"), &config)
+            .await
+            .unwrap();
+        handle_command(add("the drive code is bravo"), &config)
+            .await
+            .unwrap();
+        let mem = create_cli_memory(&config).unwrap();
+        assert_eq!(
+            mem.get("drive_code").await.unwrap().unwrap().content,
+            "the drive code is bravo"
+        );
+
+        let refused = handle_add(&config, "other_key", "no view", "core").await;
+        assert!(refused.is_err(), "a write with no view must be refused");
+        assert!(mem.get("other_key").await.unwrap().is_none());
     }
 
     /// The CLI borrowed the migration factory, so an operator running

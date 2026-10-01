@@ -26,7 +26,9 @@ pub use sqlite::SqliteMemory;
 pub use traits::{KeyInUse, Memory};
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
-pub use view::{current_memory_view, recall_in_view, MemoryView, MEMORY_VIEW};
+pub use view::{
+    current_memory_view, forget_in_view, recall_in_view, store_in_view, MemoryView, MEMORY_VIEW,
+};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig};
 use std::path::Path;

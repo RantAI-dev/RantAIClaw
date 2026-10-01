@@ -98,41 +98,14 @@ impl Tool for MemoryForgetTool {
             });
         }
 
+        // The turn's view decides what is deletable, whichever selector named it.
+        // `Contains` resolves its target from the rows the view can list, and
+        // `forget_in_view` repeats the check for the key it ends up with, so a
+        // key addressed directly gets the same answer a missing key gets and
+        // confirms nothing about a row outside the view. A turn with no view
+        // reaches no row.
         let key: String = match selector {
-            Selector::Key(k) => {
-                // Under a guest's conversation-scoped turn, a key addressed
-                // directly must still belong to that conversation — `Selector::Contains`
-                // gets this for free from `resolve_unique_entry`'s own view filter, but
-                // `key` skips that lookup, so the check is repeated here. Answering
-                // "not found" for a key outside the view (the same message a genuinely
-                // missing key gets) avoids confirming to the guest that the key exists.
-                if let Some(crate::memory::MemoryView::Only(view_key)) =
-                    crate::memory::current_memory_view()
-                {
-                    match self.memory.get(k).await {
-                        Ok(Some(entry))
-                            if entry.session_id.as_deref() == Some(view_key.as_str()) => {}
-                        Ok(_) => {
-                            return Ok(ToolResult {
-                                success: true,
-                                output: format!("No memory found with key: {k}"),
-                                error: None,
-                            });
-                        }
-                        // A backend error resolving the guard is a failure, not "not
-                        // found" — conflating the two would tell the caller the key
-                        // does not exist when the store simply could not be read.
-                        Err(e) => {
-                            return Ok(ToolResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(format!("Failed to forget memory: {e}")),
-                            });
-                        }
-                    }
-                }
-                k.to_string()
-            }
+            Selector::Key(k) => k.to_string(),
             Selector::Contains(needle) => {
                 match super::memory_store::resolve_unique_entry(
                     self.memory.as_ref(),
@@ -154,7 +127,7 @@ impl Tool for MemoryForgetTool {
         };
         let key = key.as_str();
 
-        match self.memory.forget(key).await {
+        match crate::memory::forget_in_view(self.memory.as_ref(), key).await {
             Ok(true) => {
                 crate::memory::snapshot::refresh_projection(
                     self.memory.as_ref(),
@@ -171,6 +144,8 @@ impl Tool for MemoryForgetTool {
                 output: format!("No memory found with key: {key}"),
                 error: None,
             }),
+            // A backend error is a failure, not "not found": the key was not
+            // shown to be absent, the store could not be read.
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -222,7 +197,7 @@ mod tests {
             .unwrap();
 
         let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool.execute(json!({"key": "temp"})).await.unwrap();
+        let result = execute_in_all_view(&tool, json!({"key": "temp"})).await;
         assert!(result.success);
         assert!(result.output.contains("Forgot"));
 
@@ -384,6 +359,133 @@ mod tests {
         assert!(mem.get("this_conv_fact").await.unwrap().is_none());
     }
 
+    // ── every selector reaches only what the view can see ─────────
+
+    /// A turn no door gave a view reads nothing, so it deletes nothing: a key
+    /// addressed directly is "not found", the same answer a missing key gets, and
+    /// the row survives. Before the view was required here the key was deleted.
+    #[tokio::test]
+    async fn forget_by_key_with_no_view_deletes_nothing() {
+        let (tmp, mem) = test_mem();
+        mem.store("shared_key", "a shared note", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = tool.execute(json!({"key": "shared_key"})).await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.output.contains("No memory found"),
+            "{}",
+            result.output
+        );
+        assert!(
+            mem.get("shared_key").await.unwrap().is_some(),
+            "a turn with no view deleted a row"
+        );
+    }
+
+    /// Control for the case above: the `All` view reaches a shared row and a row
+    /// kept in a conversation alike.
+    #[tokio::test]
+    async fn forget_by_key_in_the_all_view_reaches_every_place() {
+        let (tmp, mem) = test_mem();
+        mem.store("shared_key", "a shared note", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store(
+            "scoped_key",
+            "a conversation note",
+            MemoryCategory::Core,
+            Some("chat:one"),
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        for key in ["shared_key", "scoped_key"] {
+            let result = execute_in_all_view(&tool, json!({ "key": key })).await;
+            assert!(result.output.contains("Forgot"), "{}", result.output);
+            assert!(mem.get(key).await.unwrap().is_none(), "{key} survived");
+        }
+    }
+
+    /// A phrase that only a row in another place carries matches nothing under a
+    /// conversation view, and that row survives. The answer is the one a phrase
+    /// nobody wrote gets, so it confirms nothing about the other place.
+    #[tokio::test]
+    async fn forget_by_contains_outside_the_view_finds_nothing_and_keeps_the_row() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "other_conv_fact",
+            "the other conversation's lantern",
+            MemoryCategory::Core,
+            Some("chat:other"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "shared_fact",
+            "the shared lantern",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        for phrase in ["other conversation's lantern", "shared lantern"] {
+            let result = MEMORY_VIEW
+                .scope(MemoryView::Only("chat:guest".into()), async {
+                    tool.execute(json!({ "contains": phrase })).await.unwrap()
+                })
+                .await;
+            assert!(!result.success, "{phrase}: {:?}", result.output);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("No memory contains"),
+                "{phrase}: {:?}",
+                result.error
+            );
+        }
+        assert!(mem.get("other_conv_fact").await.unwrap().is_some());
+        assert!(mem.get("shared_fact").await.unwrap().is_some());
+    }
+
+    /// Control: a phrase from a row in the view's own place resolves and deletes.
+    #[tokio::test]
+    async fn forget_by_contains_inside_the_view_removes_the_row() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "this_conv_fact",
+            "the guest's own lantern",
+            MemoryCategory::Core,
+            Some("chat:guest"),
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({"contains": "own lantern"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(mem.get("this_conv_fact").await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn forget_missing_key() {
         let (tmp, mem) = test_mem();
@@ -516,7 +618,7 @@ mod tests {
         );
 
         let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool.execute(json!({"key": "rotation_note"})).await.unwrap();
+        let result = execute_in_all_view(&tool, json!({"key": "rotation_note"})).await;
         assert!(result.success, "control: the tool reports success");
         assert!(
             mem.get("rotation_note").await.unwrap().is_none(),
@@ -544,7 +646,7 @@ mod tests {
         crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
 
         let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        tool.execute(json!({"key": "drop"})).await.unwrap();
+        execute_in_all_view(&tool, json!({"key": "drop"})).await;
 
         let after = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
         assert!(
@@ -562,7 +664,7 @@ mod tests {
             .unwrap();
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
         let tool = MemoryForgetTool::new(mem.clone(), readonly, tmp.path().to_path_buf());
-        let result = tool.execute(json!({"key": "temp"})).await.unwrap();
+        let result = execute_in_all_view(&tool, json!({"key": "temp"})).await;
         assert!(!result.success);
         assert!(result
             .error
@@ -580,7 +682,7 @@ mod tests {
             .unwrap();
         let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
         let tool = MemoryForgetTool::new(mem.clone(), limited, tmp.path().to_path_buf());
-        let result = tool.execute(json!({"key": "temp"})).await.unwrap();
+        let result = execute_in_all_view(&tool, json!({"key": "temp"})).await;
         assert!(!result.success);
         assert!(result
             .error

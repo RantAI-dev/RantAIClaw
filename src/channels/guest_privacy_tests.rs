@@ -2982,3 +2982,313 @@ async fn an_owner_through_the_wildcard_alone_keeps_owner_rights_and_reads_one_co
         );
     }
 }
+
+// ── Where a note is written and who can delete it ───────────────────────
+
+/// The conversation scope a message of `sender` in `chat` writes its notes to.
+fn scope_of(sender: &str, chat: &str, is_direct: bool) -> String {
+    dispatch::conversation_memory_scope(&channel_message_in(
+        sender, chat, "scope", "scope", is_direct,
+    ))
+}
+
+/// An owner in a group reads and writes that group's place and nothing else. A
+/// new note lands in the group, a shared key is taken or unreachable, and
+/// `replaces` and `memory_forget` by key or by a phrase find only the group's
+/// own notes. The answers name nothing outside the group.
+#[tokio::test]
+async fn an_owner_in_a_group_writes_and_deletes_only_in_that_groups_place() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let group_scope = scope_of(OWNER_SENDER, GUEST_CHAT, false);
+
+    let attempt = deployment
+        .turn_in(
+            OWNER_SENDER,
+            GUEST_CHAT,
+            false,
+            "tidy the group notes",
+            vec![
+                all_calls(&[
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "group_fact", "content": "The group keeps the lantern in the shed" }),
+                    ),
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "shared_recipe", "content": "group overwrite takeoverword" }),
+                    ),
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "group_fix", "content": "group correction", "replaces": SHARED_NOTE_WORD }),
+                    ),
+                    ("memory_forget", serde_json::json!({ "key": "shared_recipe" })),
+                    ("memory_forget", serde_json::json!({ "contains": SHARED_NOTE_WORD })),
+                    ("memory_forget", serde_json::json!({ "key": "other_chat_note" })),
+                    (
+                        "memory_forget",
+                        serde_json::json!({ "contains": OTHER_CHAT_NOTE_WORD }),
+                    ),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+    let results = attempt.tool_results();
+    assert!(results.contains("Stored memory: group_fact"), "{results}");
+    assert!(results.contains("already in use"), "{results}");
+    assert_eq!(
+        results.matches("No memory contains").count(),
+        3,
+        "{results}"
+    );
+    assert_eq!(
+        results.matches("No memory found with key").count(),
+        2,
+        "{results}"
+    );
+
+    let memory = &deployment.ctx.memory;
+    let stored = memory.get("group_fact").await.unwrap().unwrap();
+    assert_eq!(stored.session_id.as_deref(), Some(group_scope.as_str()));
+    assert!(memory.get("group_fix").await.unwrap().is_none());
+    let shared = memory.get("shared_recipe").await.unwrap().unwrap();
+    assert!(shared.content.contains(SHARED_NOTE_WORD), "{shared:?}");
+    assert_eq!(shared.session_id, None);
+    assert!(memory.get("other_chat_note").await.unwrap().is_some());
+
+    // The group's own notes are within reach by key and by a phrase. The store
+    // and the deletes are separate turns: the calls of one reply run together.
+    deployment
+        .turn_in(
+            OWNER_SENDER,
+            GUEST_CHAT,
+            false,
+            "remember the tea",
+            vec![
+                call(
+                    "memory_store",
+                    serde_json::json!({ "key": "group_tea", "content": "The group likes cardamomtea" }),
+                ),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+    let own = deployment
+        .turn_in(
+            OWNER_SENDER,
+            GUEST_CHAT,
+            false,
+            "forget the group notes",
+            vec![
+                all_calls(&[
+                    (
+                        "memory_forget",
+                        serde_json::json!({ "contains": "cardamomtea" }),
+                    ),
+                    ("memory_forget", serde_json::json!({ "key": "group_fact" })),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+    assert_eq!(
+        own.tool_results().matches("Forgot memory").count(),
+        2,
+        "{}",
+        own.tool_results()
+    );
+    assert!(memory.get("group_tea").await.unwrap().is_none());
+    assert!(memory.get("group_fact").await.unwrap().is_none());
+    assert!(deployment.read("MEMORY.md").contains(SHARED_NOTE_WORD));
+}
+
+/// The owner control for the case above: the same owner in a direct chat writes
+/// the shared place and deletes in any place, by key and by a phrase.
+#[tokio::test]
+async fn a_named_owner_in_a_direct_chat_writes_the_shared_place_and_deletes_in_any_place() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "tidy up",
+            vec![
+                all_calls(&[
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "dm_fact", "content": "A private note" }),
+                    ),
+                    (
+                        "memory_forget",
+                        serde_json::json!({ "key": "other_chat_note" }),
+                    ),
+                    (
+                        "memory_forget",
+                        serde_json::json!({ "contains": GUEST_NOTE_WORD }),
+                    ),
+                    (
+                        "memory_forget",
+                        serde_json::json!({ "contains": SHARED_NOTE_WORD }),
+                    ),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert!(results.contains("Stored memory: dm_fact"), "{results}");
+    assert_eq!(results.matches("Forgot memory").count(), 3, "{results}");
+    let memory = &deployment.ctx.memory;
+    assert_eq!(
+        memory.get("dm_fact").await.unwrap().unwrap().session_id,
+        None
+    );
+    for key in ["other_chat_note", "guest_chat_note", "shared_recipe"] {
+        assert!(memory.get(key).await.unwrap().is_none(), "{key} survived");
+    }
+}
+
+/// A save under a key that holds a different note is refused, for the owner in a
+/// direct chat, for an owner in a group and for a guest alike. The first note is
+/// intact, `replaces` names the way to change it, and the same content again is
+/// no error.
+#[tokio::test]
+async fn a_save_never_replaces_a_different_note_by_accident() {
+    let deployment = Deployment::start(Options::guest_tools(&["memory_store"])).await;
+    let store = |key: &str, content: &str| {
+        call(
+            "memory_store",
+            serde_json::json!({ "key": key, "content": content }),
+        )
+    };
+    let places = [
+        (OWNER_SENDER, OWNER_CHAT, true, "owner_dm_code"),
+        (OWNER_SENDER, GUEST_CHAT, false, "owner_group_code"),
+        (GUEST_SENDER, GUEST_CHAT, true, "guest_code"),
+    ];
+
+    for (sender, chat, is_direct, key) in places {
+        let first = deployment
+            .turn_in(
+                sender,
+                chat,
+                is_direct,
+                "remember",
+                vec![store(key, "the code is alpha"), "Saved.".to_string()],
+            )
+            .await;
+        assert!(
+            first
+                .tool_results()
+                .contains(&format!("Stored memory: {key}")),
+            "control, {key}: {}",
+            first.tool_results()
+        );
+
+        let second = deployment
+            .turn_in(
+                sender,
+                chat,
+                is_direct,
+                "remember",
+                vec![store(key, "the code is bravo"), "Saved.".to_string()],
+            )
+            .await;
+        let results = second.tool_results();
+        assert!(results.contains("different key"), "{key}: {results}");
+        assert!(!results.contains("Stored memory"), "{key}: {results}");
+        let row = deployment.ctx.memory.get(key).await.unwrap().unwrap();
+        assert_eq!(row.content, "the code is alpha", "{key}");
+
+        let same = deployment
+            .turn_in(
+                sender,
+                chat,
+                is_direct,
+                "remember",
+                vec![store(key, "the code is alpha"), "Saved.".to_string()],
+            )
+            .await;
+        assert!(
+            same.tool_results()
+                .contains(&format!("Stored memory: {key}")),
+            "{key}: {}",
+            same.tool_results()
+        );
+
+        let on_purpose = deployment
+            .turn_in(
+                sender,
+                chat,
+                is_direct,
+                "remember",
+                vec![
+                    call(
+                        "memory_store",
+                        serde_json::json!({ "key": key, "content": "the code is bravo", "replaces": "code is alpha" }),
+                    ),
+                    "Saved.".to_string(),
+                ],
+            )
+            .await;
+        assert!(
+            on_purpose
+                .tool_results()
+                .contains(&format!("Stored memory: {key}")),
+            "{key}: {}",
+            on_purpose.tool_results()
+        );
+        let row = deployment.ctx.memory.get(key).await.unwrap().unwrap();
+        assert_eq!(row.content, "the code is bravo", "{key}");
+    }
+}
+
+/// Auto-save writes each message to the conversation it arrived in, never to the
+/// shared place `MEMORY.md` reads: a guest's, an owner's in a group and an owner's
+/// in a direct chat.
+#[tokio::test]
+async fn auto_save_writes_each_message_to_its_own_conversation() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    for (sender, chat, is_direct, text) in [
+        (
+            GUEST_SENDER,
+            GUEST_CHAT,
+            true,
+            "guest says the harbour lantern is red",
+        ),
+        (
+            OWNER_SENDER,
+            GUEST_CHAT,
+            false,
+            "owner says the group lantern is green",
+        ),
+        (
+            OWNER_SENDER,
+            OWNER_CHAT,
+            true,
+            "owner says the private lantern is blue",
+        ),
+    ] {
+        deployment
+            .turn_in(sender, chat, is_direct, text, Vec::new())
+            .await;
+        let saved: Vec<_> = deployment
+            .ctx
+            .memory
+            .list(Some(&MemoryCategory::Conversation), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.content.contains(text))
+            .collect();
+        assert_eq!(saved.len(), 1, "{text}: {saved:?}");
+        assert_eq!(
+            saved[0].session_id.as_deref(),
+            Some(scope_of(sender, chat, is_direct).as_str()),
+            "{text}"
+        );
+    }
+}
