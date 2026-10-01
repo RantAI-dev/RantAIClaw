@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 35;
+pub const CURRENT_VERSION: u32 = 36;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -467,7 +467,17 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v35(raw);
     }
 
-    // Future migrations (v36, …) inserted here in order.
+    // v35 → v36: the `[peripherals]` and `[hardware]` sections and the three
+    // `browser.native_*` keys are retired. The hardware/peripheral runtime
+    // stack (commands, board code, datasheet RAG) and the native browser
+    // backend were removed earlier, so both sections and the three keys
+    // configure nothing; stripping them keeps the on-disk surface honest.
+    // Everything else — including the rest of `[browser]` — is kept.
+    if from < 36 {
+        migrate_v36(raw);
+    }
+
+    // Future migrations (v37, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -612,6 +622,50 @@ fn migrate_v35(raw: &mut Value) {
     //    gone from the on-disk surface as soon as the migration stamps, and a
     //    later `Config::load_or_init` write-back persists the cleaned form.
     root.remove("storage");
+}
+
+/// v35 → v36: the `[peripherals]` and `[hardware]` sections and the three
+/// `browser.native_*` keys are retired.
+///
+/// The hardware/peripheral runtime stack (the `hardware` and `peripheral`
+/// commands, the board firmware, the datasheet RAG) and the native browser
+/// backend were removed earlier, so both sections and the three keys
+/// configure nothing. Two narrow strips:
+///
+///   1. The top-level `[peripherals]` and `[hardware]` tables are removed in
+///      their entirety. An operator who customised them customised code paths
+///      that no longer exist, which is exactly what this migration cleans up.
+///
+///   2. From `[browser]`, the keys `native_headless`, `native_webdriver_url`
+///      and `native_chrome_path` are removed. Every other `[browser]` key —
+///      `backend` first among them — is kept untouched.
+///
+/// A config that carries none of them comes out byte-identical apart from the
+/// version stamp, and no empty tables are invented.
+///
+/// This module stays a pure `toml::Value` transform — no env reads, no disk
+/// I/O — like every other `migrate_vN` arm.
+fn migrate_v36(raw: &mut Value) {
+    const BROWSER_NATIVE_KEYS: [&str; 3] = [
+        "native_headless",
+        "native_webdriver_url",
+        "native_chrome_path",
+    ];
+
+    let Some(root) = raw.as_table_mut() else {
+        return;
+    };
+
+    // 1. Strip the two retired sections in their entirety.
+    root.remove("peripherals");
+    root.remove("hardware");
+
+    // 2. Strip the three native-backend keys from [browser].
+    if let Some(browser) = root.get_mut("browser").and_then(Value::as_table_mut) {
+        for key in BROWSER_NATIVE_KEYS {
+            browser.remove(key);
+        }
+    }
 }
 
 /// v33 → v34: `lucid` and `markdown` are retired.
@@ -2078,6 +2132,148 @@ allowed_users = ["*"]
         assert!(
             cfg.is_ok(),
             "post-v35 config must deserialise into Config: {:?}",
+            cfg.err()
+        );
+    }
+
+    // ── v36: retire the [peripherals] and [hardware] sections ───────────────
+    //
+    // The runtime stack behind both was removed earlier (the `hardware` /
+    // `peripheral` commands, the board code and the datasheet RAG); this arm
+    // is the on-disk half — the two sections leave every stamped config, so
+    // the file stops advertising sections nothing reads.
+
+    /// Both retired sections are stripped in their entirety. Everything an
+    /// operator wrote elsewhere survives, including the rest of `[browser]`.
+    #[test]
+    fn v36_strips_the_peripherals_and_hardware_tables() {
+        let mut v = parse(
+            "schema_version = 35\n\
+             [agent]\nmax_tool_iterations = 25\n\
+             [peripherals]\n\
+             enabled = true\n\
+             datasheet_dir = \"docs/datasheets\"\n\
+             [hardware]\n\
+             enabled = true\n\
+             transport = \"serial\"\n\
+             serial_port = \"/dev/ttyACM0\"\n\
+             baud_rate = 115200\n\
+             [browser]\n\
+             backend = \"agent_browser\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        assert!(
+            v.get("peripherals").is_none(),
+            "the entire [peripherals] section must be removed: {v:?}"
+        );
+        assert!(
+            v.get("hardware").is_none(),
+            "the entire [hardware] section must be removed: {v:?}"
+        );
+        // Unrelated tables survive untouched.
+        let agent = v.get("agent").and_then(Value::as_table).expect("agent");
+        assert_eq!(
+            agent.get("max_tool_iterations").and_then(Value::as_integer),
+            Some(25),
+            "an unrelated table must not be touched"
+        );
+        let browser = v.get("browser").and_then(Value::as_table).expect("browser");
+        assert_eq!(
+            browser.get("backend").and_then(Value::as_str),
+            Some("agent_browser"),
+            "the rest of [browser] must survive"
+        );
+    }
+
+    /// The three `browser.native_*` keys configure a backend that was removed,
+    /// so they are stripped from `[browser]` while every other key there stays.
+    #[test]
+    fn v36_strips_the_browser_native_keys() {
+        let mut v = parse(
+            "schema_version = 35\n\
+             [browser]\n\
+             backend = \"auto\"\n\
+             native_headless = false\n\
+             native_webdriver_url = \"http://localhost:4444\"\n\
+             native_chrome_path = \"/usr/bin/chromium\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        let browser = v
+            .get("browser")
+            .and_then(Value::as_table)
+            .expect("browser table survives");
+        for key in [
+            "native_headless",
+            "native_webdriver_url",
+            "native_chrome_path",
+        ] {
+            assert!(
+                browser.get(key).is_none(),
+                "browser.{key} must be removed: {browser:?}"
+            );
+        }
+        assert_eq!(
+            browser.get("backend").and_then(Value::as_str),
+            Some("auto"),
+            "the operator's backend choice must survive"
+        );
+    }
+
+    /// A config that never carried the retired sections or keys is untouched
+    /// apart from the version stamp, and no empty tables are invented.
+    #[test]
+    fn v36_leaves_a_config_without_them_untouched() {
+        let mut v = parse(
+            "schema_version = 35\n\
+             [agent]\nmax_tool_iterations = 25\n\
+             [browser]\nbackend = \"agent_browser\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        assert!(
+            v.get("peripherals").is_none() && v.get("hardware").is_none(),
+            "no retired table may be invented: {v:?}"
+        );
+        let agent = v.get("agent").and_then(Value::as_table).expect("agent");
+        assert_eq!(
+            agent.get("max_tool_iterations").and_then(Value::as_integer),
+            Some(25),
+            "an unrelated table must not be touched"
+        );
+        let browser = v.get("browser").and_then(Value::as_table).expect("browser");
+        assert_eq!(
+            browser.get("backend").and_then(Value::as_str),
+            Some("agent_browser")
+        );
+    }
+
+    /// After v36, the migrated config must still deserialise into `Config`.
+    /// The two retired sections and the three native browser keys were
+    /// dropped from the `Config` struct in the same bump, so a v35-shaped
+    /// config carrying both sections and the native browser keys should come
+    /// out as a current `Config`.
+    #[test]
+    fn v36_migrated_config_deserialises_into_current_config() {
+        let mut v = parse(
+            "schema_version = 35\n\
+             [peripherals]\n\
+             enabled = true\n\
+             [hardware]\n\
+             enabled = true\n\
+             transport = \"serial\"\n\
+             [browser]\n\
+             backend = \"agent_browser\"\n\
+             native_headless = true\n\
+             native_webdriver_url = \"http://127.0.0.1:9515\"\n\
+             native_chrome_path = \"/usr/bin/chromium\"\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        let cfg: Result<crate::config::Config, _> = v.try_into();
+        assert!(
+            cfg.is_ok(),
+            "post-v36 config must deserialise into Config: {:?}",
             cfg.err()
         );
     }

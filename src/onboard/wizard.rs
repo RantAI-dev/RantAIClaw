@@ -421,10 +421,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
-        peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         gateway_agents: std::collections::HashMap::new(),
-        hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         mcp_servers: std::collections::HashMap::new(),
     };
@@ -705,10 +703,8 @@ async fn run_quick_setup_with_home(
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
-        peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         gateway_agents: std::collections::HashMap::new(),
-        hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         mcp_servers: std::collections::HashMap::new(),
     };
