@@ -4,18 +4,18 @@ This document explains what runs when code is proposed to `main`, merged into `m
 
 Use this with:
 
-- [`docs/ci-map.md`](../../docs/ci-map.md)
-- [`docs/pr-workflow.md`](../../docs/pr-workflow.md)
-- [`docs/release-process.md`](../../docs/release-process.md)
+- [`docs/contributing/ci-map.md`](../../docs/contributing/ci-map.md)
+- [`docs/contributing/pr-workflow.md`](../../docs/contributing/pr-workflow.md)
+- [`docs/contributing/release-process.md`](../../docs/contributing/release-process.md)
 
 ## Event Summary
 
 | Event | Main workflows |
 | --- | --- |
 | PR activity (`pull_request_target`) | `pr-intake-checks.yml`, `pr-labeler.yml`, `pr-title-lint.yml` |
-| PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml`, plus path-scoped `pub-docker-img.yml`, `workflow-sanity.yml` |
-| Push to `main` | `ci-run.yml`, `sec-audit.yml`, plus path-scoped workflows |
-| Tag push (`v*`) | `pub-release.yml` publish mode, `pub-docker-img.yml` publish job |
+| PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml` (no path filter on PRs); `pub-docker-img.yml` only when its Dockerfile paths change; `workflow-sanity.yml` on every PR (no path filter) |
+| Push to `main` | `ci-run.yml`, `sec-audit.yml` (path-scoped on Cargo paths), `pub-docker-img.yml` (no path filter on push), `workflow-sanity.yml` (path-scoped on workflow files) |
+| Tag push (`v*`) | `pub-release.yml` publish mode (publishes the GitHub Release and a multi-arch Docker image) |
 | Scheduled/manual | `pub-release.yml` verification mode, `sec-codeql.yml`, `sec-audit.yml`, `test-fuzz.yml` |
 
 ## Step-By-Step
@@ -28,21 +28,21 @@ Use this with:
    - `pr-labeler.yml` sets size/risk/scope labels.
    - `pr-title-lint.yml` validates the Conventional Commits PR title.
 3. `pull_request` CI workflows start:
-   - `ci-run.yml` (consolidated Rust quality gate)
-   - `sec-audit.yml`
-   - path-scoped workflows if matching files changed:
-     - `pub-docker-img.yml` (Docker build-input paths only)
-     - `workflow-sanity.yml` (workflow files only)
+   - `ci-run.yml` (consolidated Rust quality gate) — every PR
+   - `sec-audit.yml` — every PR (the `pull_request` trigger is intentionally unfiltered, because a required check that does not report on a PR leaves it pending forever)
+   - path-scoped workflows when matching files changed:
+     - `pub-docker-img.yml` — Dockerfile build-input paths only
+   - `workflow-sanity.yml` — every PR (the `pull_request` trigger is intentionally unfiltered for the same reason as `sec-audit.yml`)
 4. In `ci-run.yml`, `changes` computes:
    - `docs_only`
    - `docs_changed`
    - `rust_changed`
 5. Rust path stages:
    - `lint` — fmt + clippy + strict delta clippy on changed lines.
-   - `test` — `cargo nextest run --locked --workspace`.
+   - `test` — `cargo test --locked --workspace -- --test-threads=1`.
    - `features` — matrix `cargo check` over `no-default-features` / `observability-otel` / `kb-office`.
    - `bench-compile` — `cargo bench --no-run --locked`.
-   - `e2e` — push-to-`main` only; never runs on PRs.
+   - `e2e` — runs on PRs whenever `rust_changed` is true (and on pushes to `main`); not push-only.
    - `build` — release-fast smoke + binary-size guard (always runs for rust changes).
 6. Docs path: `docs-quality` runs incremental markdownlint + lychee on added links.
 7. `lint-feedback` posts an actionable failure comment if lint/docs gates fail on a PR.
@@ -68,8 +68,9 @@ Use this with:
 
 Workflow: `.github/workflows/pub-docker-img.yml`.
 
-- PR: `pr-smoke` job builds + `docker run ... --version` smoke; no registry push.
-- Push to `main` (build-input paths) + tag `v*` + manual dispatch: `publish` job builds multi-arch (`linux/amd64,linux/arm64`) and pushes to `ghcr.io/<owner>/<repo>`. Tag computation: `latest` + `sha-<12>` for `main`, `vX.Y.Z` + `sha-<12>` for tags.
+- PR (Dockerfile build-input paths only): `pr-smoke` job builds + `docker run ... --version` smoke; no registry push.
+- Push to `main` (no path filter on the `push` trigger; only `pull_request` is path-scoped) + manual dispatch: `build` + `merge` jobs build multi-arch (`linux/amd64,linux/arm64`) and push to `ghcr.io/<owner>/<repo>`. Tag computation: `latest` + `sha-<12>` for `main`. There is no tag trigger on this workflow.
+- The release Docker image for a `v*` tag is published by `pub-release.yml`'s `publish` job, not by `pub-docker-img.yml`.
 
 ## Release Logic
 
@@ -105,10 +106,10 @@ flowchart TD
   B --> B2["pr-labeler.yml"]
   B --> B3["pr-title-lint.yml"]
   A --> C["pull_request CI lane"]
-  C --> C1["ci-run.yml (lint, test, features, bench-compile, build, docs-quality)"]
+  C --> C1["ci-run.yml (lint, test, msrv, features, e2e, bench-compile, build, docs-quality)"]
   C --> C2["sec-audit.yml"]
   C --> C3["pub-docker-img.yml (if Docker paths changed)"]
-  C --> C4["workflow-sanity.yml (if workflow files changed)"]
+  C --> C4["workflow-sanity.yml (every PR — no path filter)"]
   C1 --> D["CI Required Gate"]
   D --> E{"Checks + review policy pass?"}
   E -->|No| F["PR stays open"]
@@ -123,17 +124,17 @@ flowchart TD
   A["Commit reaches main"] --> B["ci-run.yml (adds e2e stage on push)"]
   A --> C["sec-audit.yml"]
   A --> D["path-scoped workflows (if matched)"]
+  A --> E["pub-docker-img.yml (no path filter on push)"]
   T["Tag push v*"] --> R["pub-release.yml"]
   W["Manual/Scheduled release verify"] --> R
-  T --> P["pub-docker-img.yml publish job"]
-  R --> R1["Artifacts + SBOM + checksums + signatures + GitHub Release"]
+  R --> R1["Artifacts + SBOM + checksums + signatures + GitHub Release + release Docker image"]
   W --> R2["Verification build only (no GitHub Release publish)"]
-  P --> P1["Push ghcr image tags (version + sha)"]
+  E --> E1["Push ghcr image tags (latest + sha-12)"]
 ```
 
 ## Quick Troubleshooting
 
-1. Unexpected skipped jobs: inspect `scripts/ci/detect_change_scope.sh` outputs — a Rust stage skips only when the diff touched no Rust or when `lint` failed upstream.
+1. Unexpected skipped jobs: inspect `scripts/ci/detect_change_scope.sh` — the file's `rust-set` clause is the definition of what counts as a Rust change for `ci-run.yml`. A Rust stage skips only when the diff touched no Rust, workflow, gate-script, or `Cargo`/`clippy.toml`/`rustfmt.toml`/`.cargo/config.toml` path AND when `lint` did not fail upstream.
 2. Fork PR appears stalled: check whether Actions run approval is pending.
 3. Docker not published: confirm changed files match Docker build-input paths, or run workflow dispatch manually.
 4. PR title check failing: ensure title matches Conventional Commits (`feat|fix|chore|docs|refactor|perf|test|build|ci|style|revert`, optional scope, colon, summary).

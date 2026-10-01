@@ -36,7 +36,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ### Non-Blocking but Important
 
 - `.github/workflows/pub-docker-img.yml` (`Docker`)
-    - Purpose: PR Docker smoke check and publish images on `main` pushes (build-input paths), tag pushes (`v*`), and manual dispatch.
+    - Purpose: PR Docker smoke check on its build-input paths, and publish a multi-arch `latest`+`sha-<12>` image on every push to `main` (the `push` trigger is not path-scoped; only `pull_request` is). Manual dispatch triggers the same build + publish. There is no `v*` tag trigger on this workflow — the release Docker image for a tag is published by `pub-release.yml`'s `publish` job.
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
     - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA) and policy/license checks (`cargo deny`). Runs on PR + push to main + weekly Mon 06:00 UTC.
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
@@ -59,11 +59,11 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ## Trigger Map
 
 - `CI`: push to `main`, PRs to `main`.
-- `Docker`: push to `main` when Docker build inputs change, tag push (`v*`), matching PRs, manual dispatch.
+- `Docker`: push to `main` (no path filter on the `push` trigger; only `pull_request` is path-scoped on Dockerfile build inputs), PRs to `main` when Dockerfile build inputs change, manual dispatch. No `v*` tag trigger.
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish).
-- `Security Audit`: push to `main`, PRs to `main`, weekly schedule.
+- `Security Audit`: push to `main` when Cargo paths change, PRs to `main` (no path filter), weekly schedule.
 - `CodeQL`: weekly schedule, manual dispatch.
-- `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change.
+- `Workflow Sanity`: every PR (no path filter), push to `main` when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change.
 - `PR Intake Checks`: `pull_request_target` on opened/reopened/synchronize/edited/ready_for_review.
 - `PR Title Lint`: `pull_request_target` on opened/reopened/edited/synchronize.
 - `PR Labeler`: `pull_request_target` lifecycle events.

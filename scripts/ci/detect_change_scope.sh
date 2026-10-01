@@ -79,12 +79,36 @@ while IFS= read -r file; do
   # Without this, a PR that edits a gate script skips every job that runs it —
   # so the gate lands green having never executed, which is the failure mode
   # these gates exist to prevent.
+  #
+  # The same rule extends to everything the Rust jobs build, lint or read:
+  # `benches/` and `examples/` (only `cargo check --all-targets`, the MSRV
+  # job, `clippy --all-targets`, and `cargo bench --no-run` compile them);
+  # the cargo and lint configs that change the build/linker (`Cargo.toml`,
+  # `Cargo.lock`, `.cargo/config.toml`, `clippy.toml`, `rustfmt.toml`,
+  # `deny.toml`); and `build.rs`, which cargo invokes itself. A `.md` under
+  # any of these paths still matches the docs branch above and stays
+  # docs-only — the docs check runs first, so it never reaches this clause.
+  #
+  # `.github/workflows/ci-run.yml` is also a Rust change: this workflow file
+  # is what selects which Rust jobs run and what they run. Skipping those
+  # jobs on a workflow edit lets the workflow itself land green without ever
+  # executing — the same failure mode the `scripts/ci/*` clause prevents.
+  # Other workflow files (pr-labeler.yml, sec-audit.yml, test-fuzz.yml, …)
+  # do not change what the Rust jobs build and stay workflow-only — routing
+  # them into the full Rust pipeline wastes the Rust jobs' run time on a
+  # workflow-only edit.
   if [[ "$file" == src/* ]] \
     || [[ "$file" == tests/* ]] \
+    || [[ "$file" == benches/* ]] \
+    || [[ "$file" == examples/* ]] \
     || [[ "$file" == scripts/ci/* ]] \
+    || [[ "$file" == ".github/workflows/ci-run.yml" ]] \
     || [[ "$file" == "Cargo.toml" ]] \
     || [[ "$file" == "Cargo.lock" ]] \
     || [[ "$file" == "deny.toml" ]] \
+    || [[ "$file" == ".cargo/config.toml" ]] \
+    || [[ "$file" == "clippy.toml" ]] \
+    || [[ "$file" == "rustfmt.toml" ]] \
     || [[ "$file" == "build.rs" ]]; then
     rust_changed=true
   fi
