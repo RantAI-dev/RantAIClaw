@@ -3,7 +3,7 @@ use crate::channels::SendMessage;
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, remove_job, reschedule_after_run, update_job,
-    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
 };
 use crate::memory::MemoryView;
 use crate::security::SecurityPolicy;
@@ -1118,7 +1118,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::cron::{self, DeliveryConfig};
+    use crate::cron::{self, DeliveryConfig, SessionTarget};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
