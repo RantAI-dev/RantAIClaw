@@ -572,8 +572,13 @@ user's message, and the lookups of `memory_store` and `memory_forget` may read.
 
 The table in
 [Per-role channel permissions](../security/per-role-permissions.md#memory-view-what-a-turn-may-read)
-lists every door. `USER.md` and `MEMORY.md` in the prompt follow the view too:
-only a turn that reads all of memory carries them.
+lists every door. `USER.md` and `MEMORY.md` in the prompt follow the view on
+the doors that build the prompt for the turn: the CLI, a cron job, the
+heartbeat, the TUI, the console and the webhook. Only a turn that reads all of
+memory carries them. A channel's owner prompt is built once when the channel
+starts, outside any turn, and still carries them, so a named owner in a group
+and a wildcard owner have them in the prompt while their memory view is the
+conversation.
 
 A guest's writes stay in its own place too. `memory_store` under a guest turn
 stores with the guest's conversation as the session, and its `replaces` and
