@@ -1115,7 +1115,8 @@ reads as "keep what is stored". Sending a read back never erases or weakens a st
 | `PUT /secrets` `api_url` | omitted keeps it. A value equal to the URL `GET` showed keeps the stored URL, credentials included | send `""` |
 | `PUT /config/knowledge` keys | omitted keeps it | send `""` |
 | `POST /config/mcp_servers/{name}` `env` | a name sent with `""` keeps the stored value of that name | leave the name out of the map |
-| `POST /config/mcp_servers/{name}` `args` | an arg equal to the blanked form of a stored arg keeps the stored arg | leave the arg out of the list |
+| `POST /config/mcp_servers/{name}` `args` | an arg equal to the blanked form of a stored arg keeps the stored arg, unless the next read would then show it in the clear (a placeholder sent without its flag, or after a renamed flag), in which case the arg is taken as written | leave the arg out of the list |
+| `POST /config/mcp_servers/{name}` `command` | a command that looks like a provider key reads as `""`, and sending `""` back is refused with `400` (`command must not be empty`), so the stored command stays | send the new command |
 | `POST /channels/telegram`, `discord`, `slack` `bot_token` | omitted or empty keeps it | `DELETE` the channel |
 | `POST /channels/slack` `app_token` | omitted or empty keeps it | `DELETE` the channel |
 | `POST /channels/lark` `app_id` and `app_secret` | both omitted or empty keeps the pair. One without the other is refused with `400` | `DELETE` the channel |
@@ -1158,7 +1159,9 @@ no stored arg is taken as written.
 - **GET response** `200`: `{ "provider": "...", "api_url": "...", "api_key_present": true, "encrypt_at_rest": true }` — presence, never the key.
 - **PUT request**: `{ "api_key": "...", "api_url": "..." }`, both optional. An omitted field keeps the
   stored value and `""` clears it. An `api_url` equal to the value `GET` returned keeps the stored URL
-  (see [Writing back what you read](#writing-back-what-you-read)).
+  (see [Writing back what you read](#writing-back-what-you-read)). Sending the same URL without its
+  credentials is read as that played-back value and keeps the stored credentials. To drop them, send `""`
+  first and then the new URL.
 - **PUT response** `200`: `{ "ok": true, "api_key_present": true }`
 - **Status codes**: `200`, `400`, `401`, `500`.
 
@@ -1247,9 +1250,11 @@ already share — before anything is written; a rejected or unreachable check is
   "allowed_users": 2, "warning": null, "restarts_runtime": false, "note": "..." }` — `app_id` is a public
   application identifier, not the secret; `app_secret`, `encrypt_key` and `verification_token` never
   appear in the response.
-- **`warning`**: set for the same empty/`"*"` allowlist cases as the other channels, and also when
-  `encrypt_key` is set — this build does not decrypt event bodies, so a non-empty key means the channel
-  refuses to start until it is cleared.
+- **`warning`**: set for the same empty/`"*"` allowlist cases as the other channels, and also when the
+  `encrypt_key` that ends up stored is set, whether the request carried it or only kept it. This build
+  does not decrypt event bodies, so a stored key means the channel refuses to start. Send
+  `DELETE /api/v1/channels/lark`, then connect again without the key. An allowlist warning takes
+  precedence over this one in the same response.
 - **DELETE response** `200`: `{ "disconnected": true, "channel": "lark", "restarts_runtime": true }`
 - **Restarts**: only a *changed* app ID, app secret or region restarts the channel runtime — resubmitting
   the same credentials or region does not, because the daemon hosts this gateway. An allowlist-only edit

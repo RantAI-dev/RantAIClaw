@@ -824,23 +824,40 @@ fn restore_blank_mcp_env(
 /// therefore follows its flag when an earlier arg is removed or inserted, rather
 /// than being matched by index. An arg that matches nothing is new text and is
 /// taken as written.
+///
+/// A restored arg must still be hidden where it lands, or the next read would
+/// print it. A placeholder sent without its flag, or after a renamed flag, would
+/// otherwise bring the secret back in the clear. Such an arg is taken as written
+/// instead.
 fn restore_redacted_mcp_args(stored: &[String], incoming: Vec<String>) -> Vec<String> {
     let mut redacted = stored.to_vec();
     redact_mcp_args(&mut redacted);
     let mut next = 0;
-    incoming
-        .into_iter()
-        .map(
-            |arg| match redacted[next..].iter().position(|r| *r == arg) {
-                Some(offset) => {
-                    let index = next + offset;
-                    next = index + 1;
-                    stored[index].clone()
-                }
-                None => arg,
-            },
-        )
-        .collect()
+    let mut merged: Vec<String> = incoming
+        .iter()
+        .map(|arg| match redacted[next..].iter().position(|r| r == arg) {
+            Some(offset) => {
+                let index = next + offset;
+                next = index + 1;
+                stored[index].clone()
+            }
+            None => arg.clone(),
+        })
+        .collect();
+    loop {
+        let mut shown = merged.clone();
+        redact_mcp_args(&mut shown);
+        let mut reverted = false;
+        for (i, arg) in merged.iter_mut().enumerate() {
+            if *arg != incoming[i] && shown[i] == *arg {
+                arg.clone_from(&incoming[i]);
+                reverted = true;
+            }
+        }
+        if !reverted {
+            return merged;
+        }
+    }
 }
 
 async fn add_mcp_server(
@@ -1775,8 +1792,8 @@ fn lark_encrypt_key_warning(encrypt_key: Option<&str>) -> Option<&'static str> {
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .map(|_| {
-            "encrypt_key is set — this build does not decrypt event bodies, and Lark will refuse \
-             to start until it is cleared."
+            "encrypt_key is set. This build does not decrypt event bodies, so Lark will refuse to \
+             start. Send DELETE /api/v1/channels/lark, then connect again without the key."
         })
 }
 
@@ -1847,6 +1864,9 @@ async fn connect_lark(
     let restarts_runtime =
         lark_restart_needed(credentials_changed, region_before, effective_use_feishu);
     let app_id = lc.app_id.clone();
+    // The key that was stored, not the one in the body: an empty or omitted field
+    // keeps the stored key, and Lark refuses to start with one.
+    let stored_encrypt_key = lc.encrypt_key.clone();
     cfg.channels_config.lark = Some(lc);
     persist_and_swap(&state, cfg, "channels.lark").await?;
 
@@ -1855,7 +1875,7 @@ async fn connect_lark(
     }
 
     let warning = allowlist_warning(&body.allowed_users, "Lark")
-        .or_else(|| lark_encrypt_key_warning(body.encrypt_key.as_deref()).map(str::to_string));
+        .or_else(|| lark_encrypt_key_warning(stored_encrypt_key.as_deref()).map(str::to_string));
     Ok(Json(lark_connect_response(
         &app_id,
         body.allowed_users.len(),
@@ -3535,6 +3555,7 @@ mod tests {
         assert!(lark_encrypt_key_warning(Some("   ")).is_none());
         let warning = lark_encrypt_key_warning(Some("a-real-key")).expect("a warning");
         assert!(warning.contains("does not decrypt"));
+        assert!(warning.contains("DELETE /api/v1/channels/lark"));
     }
 
     /// A running Lark channel, for the direct-handler tests below. Nothing on
@@ -4413,6 +4434,145 @@ mod tests {
         );
     }
 
+    /// What the next `GET /config` would show for these args.
+    fn shown_args(args: &[String]) -> Vec<String> {
+        let mut shown = args.to_vec();
+        redact_mcp_args(&mut shown);
+        shown
+    }
+
+    /// A placeholder sent without its flag lands where `redact_mcp_args` no
+    /// longer hides it, so restoring the stored value there would print the
+    /// secret in full on the next read.
+    #[test]
+    fn mcp_args_placeholder_without_its_flag_does_not_surface_the_stored_secret() {
+        let existing = mcp_server(&["--api-key", "neutral-flag-secret"], &[]);
+
+        let merged = merge_mcp_server(Some(&existing), "npx".into(), Some(strings(&[""])), None);
+
+        assert_eq!(
+            merged.args,
+            strings(&[""]),
+            "taken as written, not restored"
+        );
+        assert!(
+            !shown_args(&merged.args)
+                .concat()
+                .contains("neutral-flag-secret"),
+            "the next read shows the secret"
+        );
+    }
+
+    #[test]
+    fn mcp_args_renamed_flag_does_not_surface_the_stored_secret() {
+        let existing = mcp_server(&["--api-key", "neutral-flag-secret"], &[]);
+
+        let merged = merge_mcp_server(
+            Some(&existing),
+            "npx".into(),
+            Some(strings(&["--auth", ""])),
+            None,
+        );
+
+        assert_eq!(merged.args, strings(&["--auth", ""]));
+        assert!(
+            !shown_args(&merged.args)
+                .concat()
+                .contains("neutral-flag-secret"),
+            "the next read shows the secret"
+        );
+    }
+
+    /// A key-shaped command reads as `""`. Replaying that is refused, so the
+    /// stored command is not replaced by an empty one.
+    #[tokio::test]
+    async fn mcp_command_blank_write_is_refused_and_keeps_stored_command() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let key_shaped = "sk-neutral-command-key";
+        config.mcp_servers.insert(
+            "srv".into(),
+            McpServerConfig {
+                command: key_shaped.into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+        );
+        let state = console_state(config);
+
+        let read = get_config(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("read")
+            .0;
+        assert_eq!(read["mcp_servers"]["srv"]["command"], json!(""));
+
+        let err = Box::pin(add_mcp_server(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("srv".into()),
+            Json(McpServerBody {
+                command: read["mcp_servers"]["srv"]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                args: None,
+                env: None,
+            }),
+        ))
+        .await
+        .expect_err("a blank command is refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(state.config.lock().mcp_servers["srv"].command, key_shaped);
+    }
+
+    /// `connect_lark` must report the key that ends up stored, not the one in
+    /// the body: an empty or omitted field keeps the stored key, and Lark
+    /// refuses to start with one.
+    #[tokio::test]
+    async fn lark_connect_warns_about_a_stored_encrypt_key_the_body_does_not_carry() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        for body_key in [Some(String::new()), None] {
+            let tmp = tempfile::tempdir().expect("temp root");
+            let _home = crate::test_env::HomeGuard::set(tmp.path());
+            let mut config = running_lark_config(tmp.path());
+            config
+                .channels_config
+                .lark
+                .as_mut()
+                .expect("lark")
+                .encrypt_key = Some("saved-encrypt-key".into());
+            let state = console_state(config);
+
+            let response = Box::pin(connect_lark(
+                State(state),
+                HeaderMap::new(),
+                Json(LarkConnectBody {
+                    app_id: String::new(),
+                    app_secret: String::new(),
+                    encrypt_key: body_key.clone(),
+                    verification_token: None,
+                    allowed_users: vec!["U_NEW".into()],
+                    use_feishu: None,
+                }),
+            ))
+            .await
+            .expect("an allowlist-only edit succeeds");
+
+            let warning = response.0["warning"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no warning for body {body_key:?}: {}", response.0));
+            assert!(
+                warning.contains("DELETE /api/v1/channels/lark"),
+                "the warning names the way out: {warning}"
+            );
+        }
+    }
+
     #[test]
     fn slack_app_token_blank_write_keeps_stored_value() {
         let existing = slack_config("xoxb-saved");
@@ -4796,6 +4956,7 @@ mod tests {
                             "key"
                                 | "keys"
                                 | "token"
+                                | "tokens"
                                 | "secret"
                                 | "password"
                                 | "credential"
