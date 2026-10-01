@@ -80,9 +80,9 @@ pub struct MemoryStoreTool {
 ///
 /// One lock per process, not per tool instance: the webhook and every channel
 /// turn build their own tool registry, so a per-instance lock would not order
-/// calls from different turns. It does not reach a second process. The TUI and
-/// the CLI run beside the daemon and are not serialised with it; they replace a
-/// note on purpose, so they have no check to race.
+/// calls from different turns. It does not reach a second process. A second
+/// process, including an agent turn in the TUI or the CLI running beside the
+/// daemon, is not serialised with it.
 static STORE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl MemoryStoreTool {
