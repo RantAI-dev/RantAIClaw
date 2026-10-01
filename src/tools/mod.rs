@@ -30,9 +30,10 @@ the workspace directory; [autonomy].workspace_only and [autonomy].forbidden_path
 in config.toml control this. Move the file into the workspace, or have an operator \
 relax those settings.";
 
-/// The canonical workspace when this turn runs under a guest's
-/// conversation-scoped memory view (`MemoryView::Only`), or `None` for owner
-/// turns and turns without a view.
+/// The canonical workspace when this turn runs under a conversation-scoped
+/// memory view (`MemoryView::Only`): a guest's turn, an owner's turn in a group,
+/// a job created from a chat. `None` for a turn under the `All` view and for a
+/// turn with no view.
 ///
 /// The workspace itself may be reached through a symlink (a temp dir on some
 /// platforms), so it is canonicalised here. Without that, `strip_prefix` in the
@@ -50,17 +51,18 @@ async fn guest_view_workspace(workspace_dir: &std::path::Path) -> Option<std::pa
     )
 }
 
-/// Denial message for a **canonicalised** path a guest's conversation-scoped
-/// turn (`MemoryView::Only`) may not reach, or `None` when the turn carries no
-/// such view or the path is not private.
+/// Denial message for a **canonicalised** path a conversation-scoped turn
+/// (`MemoryView::Only`) may not reach, or `None` when the turn carries no such
+/// view or the path is not private.
 ///
 /// `approval::guest::is_private_owner_path` runs on the string a caller asked
 /// for, before a file tool resolves it — a symlink, an editor backup name
 /// (`USER.md~`), or the snapshot file's real path can slip past that string
 /// rule while still pointing at the same private content. `file_read`,
 /// `file_write`, `pdf_read` and `image_info` all call this once they have a
-/// resolved path, closing that bypass. Owner turns and turns without a view
-/// never reach this: `current_memory_view()` is `None` or `All` for them.
+/// resolved path, closing that bypass. Turns under the `All` view and turns
+/// with no view never reach this: `current_memory_view()` is `All` or `None` for
+/// them.
 pub(crate) async fn guest_private_path_denial(
     resolved_path: &std::path::Path,
     workspace_dir: &std::path::Path,
@@ -270,7 +272,6 @@ pub fn all_tools(
         security,
         Arc::new(NativeRuntime::new()),
         memory,
-        memory_recall::ConversationScope::default(),
         composio_key,
         composio_entity_id,
         browser_config,
@@ -289,11 +290,6 @@ pub fn all_tools_with_runtime(
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
-    // Conversation scope for `memory_recall`. Surfaces that serve one
-    // conversation per registry (the interactive Agent) pass their own handle
-    // and keep it updated; multi-conversation surfaces pass a fresh unset
-    // handle (= global recall, the prior behaviour).
-    memory_recall_scope: memory_recall::ConversationScope,
     composio_key: Option<&str>,
     composio_entity_id: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
@@ -324,7 +320,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
-        Arc::new(MemoryRecallTool::new(memory.clone(), memory_recall_scope)),
+        Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(
             memory,
             security.clone(),

@@ -9,7 +9,7 @@
 //! rules to reason about — and one place to fix the next thing that is wrong
 //! with them.
 
-use super::{recall_in_view, recall_layered, Memory, MemoryCategory, MemoryEntry, MemoryView};
+use super::{current_memory_view, recall_in_view, Memory, MemoryCategory, MemoryEntry, MemoryView};
 use crate::util::truncate_with_ellipsis;
 
 /// How much recalled memory may enter a prompt.
@@ -123,95 +123,38 @@ impl MemoryContext {
     }
 }
 
-/// Recall for this turn and render the `[Memory context]` block.
+/// Recall for this turn under the task's [`MemoryView`] and render the
+/// `[Memory context]` block.
 ///
-/// Returns an empty block when nothing survives — callers concatenate it, so
-/// an empty result must cost nothing.
-///
-/// `conversation_id` scopes the recall through [`recall_layered`]: the
-/// conversation's own memory surfaces first, then shared memory backfills.
-/// `None` recalls globally.
+/// Returns an empty block when nothing survives, and when the task has no view:
+/// a door that never set one reads nothing. Callers concatenate the block, so an
+/// empty result must cost nothing. A caller that holds its view as a value, and
+/// runs before the view's scope is entered, uses [`build_memory_context_in_view`].
 pub async fn build_memory_context(
     memory: &dyn Memory,
     user_message: &str,
     min_relevance_score: f64,
-    conversation_id: Option<&str>,
     limits: MemoryContextLimits,
 ) -> MemoryContext {
-    // Over-fetch so dropping self-echoes does not shrink the usable page.
-    let recall_limit = limits.max_entries.max(1) + 1 + ECHO_OVERFETCH;
-    let mut entries =
-        match recall_layered(memory, user_message, recall_limit, conversation_id).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                // Recall failing is not the same as recalling nothing. Callers
-                // cannot tell the difference from an empty string, so say it here.
-                tracing::warn!("memory recall failed while building context: {e}");
-                return MemoryContext::default();
-            }
-        };
-
-    // Drop self-echoes: the stored copy of the question being answered is
-    // worthless as context. Scores are absolute, so removing one entry does
-    // not change what any other entry is worth — no re-ranking needed.
-    entries.retain(|e| !is_echo_of_query(&e.content, user_message));
-
-    let mut context = String::new();
-    let mut keys: Vec<String> = Vec::new();
-    let mut included = 0_usize;
-    let mut used_chars = 0_usize;
-
-    for entry in entries.iter().filter(|e| match e.score {
-        Some(score) => score >= min_relevance_score,
-        // Backends that do not rank still have something to say.
-        None => true,
-    }) {
-        if included >= limits.max_entries {
-            break;
+    match current_memory_view() {
+        Some(view) => {
+            build_memory_context_in_view(memory, user_message, min_relevance_score, &view, limits)
+                .await
         }
-        if should_skip(entry, &limits) {
-            continue;
-        }
-
-        let content = if entry.content.chars().count() > limits.max_entry_chars {
-            truncate_with_ellipsis(&entry.content, limits.max_entry_chars)
-        } else {
-            entry.content.clone()
-        };
-
-        let line = format!("- {}: {}\n", entry.key, content);
-        let line_chars = line.chars().count();
-
-        if used_chars + line_chars > limits.max_total_chars {
-            break;
-        }
-
-        if included == 0 {
-            context.push_str("[Memory context]\n");
-        }
-        context.push_str(&line);
-        keys.push(entry.key.clone());
-        used_chars += line_chars;
-        included += 1;
-    }
-
-    if included > 0 {
-        context.push('\n');
-    }
-    MemoryContext {
-        block: context,
-        keys,
+        None => MemoryContext::default(),
     }
 }
 
 /// Recall for this turn under an explicit [`MemoryView`] and render the
 /// `[Memory context]` block.
 ///
-/// Identical rendering rules to [`build_memory_context`]; the only change is
-/// the read path. `MemoryView::Only(key)` filters out every entry whose
-/// `session_id` does not exactly match — that drops the shared tier and other
-/// conversations' rows in one step, which is what a non-owner turn needs.
-/// `MemoryView::All` is today's unscoped read.
+/// `MemoryView::Only(key)` filters out every entry whose `session_id` does not
+/// exactly match, which drops the shared tier and other conversations' rows in
+/// one step. `MemoryView::All` is the unscoped read.
+///
+/// The rendering rules are the single set of rules for every surface: the same
+/// bounds, the same self-echo drop, the same skipped categories. Only the
+/// candidate set differs between views.
 pub async fn build_memory_context_in_view(
     memory: &dyn Memory,
     user_message: &str,
@@ -219,18 +162,21 @@ pub async fn build_memory_context_in_view(
     view: &MemoryView,
     limits: MemoryContextLimits,
 ) -> MemoryContext {
+    // Over-fetch so dropping self-echoes does not shrink the usable page.
     let recall_limit = limits.max_entries.max(1) + 1 + ECHO_OVERFETCH;
     let mut entries = match recall_in_view(memory, user_message, recall_limit, view).await {
         Ok(entries) => entries,
         Err(e) => {
+            // Recall failing is not the same as recalling nothing. Callers
+            // cannot tell the difference from an empty string, so say it here.
             tracing::warn!("memory recall failed while building context: {e}");
             return MemoryContext::default();
         }
     };
 
-    // Same drop + render path as the layered builder. Keeping them in lockstep
-    // is the point: a guest's prompt block must look identical to an owner's
-    // when both reach the model, only the candidate set differs.
+    // Drop self-echoes: the stored copy of the question being answered is
+    // worthless as context. Scores are absolute, so removing one entry does
+    // not change what any other entry is worth, and no re-ranking is needed.
     entries.retain(|e| !is_echo_of_query(&e.content, user_message));
 
     let mut context = String::new();
@@ -351,12 +297,59 @@ mod tests {
         FixedMemory { entries }
     }
 
+    /// A turn no door gave a view reads nothing, however good the match. This
+    /// is the fail-closed default: a door that forgets to set a view must not
+    /// widen a read.
+    #[tokio::test]
+    async fn a_turn_with_no_view_reads_nothing() {
+        let mem = memory_of(vec![entry("lang", "prefers Rust", 1.0)]);
+        let ctx = build_memory_context(&mem, "q", 0.0, MemoryContextLimits::default()).await;
+        assert!(ctx.is_empty(), "no view must read nothing: {ctx:?}");
+        assert!(ctx.keys.is_empty());
+    }
+
+    /// Under `All` the same builder reads, so the test above is not passing
+    /// because the fixture is empty.
+    #[tokio::test]
+    async fn a_turn_under_the_all_view_reads_the_store() {
+        let mem = memory_of(vec![entry("lang", "prefers Rust", 1.0)]);
+        let ctx = crate::memory::MEMORY_VIEW
+            .scope(
+                MemoryView::All,
+                build_memory_context(&mem, "q", 0.0, MemoryContextLimits::default()),
+            )
+            .await;
+        assert_eq!(ctx.keys, vec!["lang"]);
+    }
+
+    /// Under `Only` the builder keeps the view's own rows, and drops the
+    /// unscoped ones that the fixture backend returns whatever slot is asked.
+    #[tokio::test]
+    async fn a_turn_under_an_only_view_reads_only_that_conversation() {
+        let mut own = entry("own_note", "the conversation's own note", 1.0);
+        own.session_id = Some("conv1".into());
+        let mem = memory_of(vec![entry("shared_note", "a shared note", 1.0), own]);
+        let ctx = crate::memory::MEMORY_VIEW
+            .scope(
+                MemoryView::Only("conv1".into()),
+                build_memory_context(&mem, "q", 0.0, MemoryContextLimits::default()),
+            )
+            .await;
+        assert_eq!(ctx.keys, vec!["own_note"]);
+    }
+
     #[tokio::test]
     async fn renders_entries_above_the_threshold() {
         let mem = memory_of(vec![entry("lang", "prefers Rust", 1.0)]);
-        let out = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default())
-            .await
-            .block;
+        let out = build_memory_context_in_view(
+            &mem,
+            "q",
+            0.4,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await
+        .block;
         assert!(out.starts_with("[Memory context]\n"));
         assert!(out.contains("- lang: prefers Rust"));
         assert!(out.ends_with("\n\n"));
@@ -365,9 +358,15 @@ mod tests {
     #[tokio::test]
     async fn empty_when_everything_is_below_the_threshold() {
         let mem = memory_of(vec![entry("weak", "barely related", 0.1)]);
-        let out = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default())
-            .await
-            .block;
+        let out = build_memory_context_in_view(
+            &mem,
+            "q",
+            0.4,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await
+        .block;
         assert!(out.is_empty(), "expected no block at all, got {out:?}");
     }
 
@@ -384,7 +383,7 @@ mod tests {
             max_entries: 3,
             ..MemoryContextLimits::default()
         };
-        let out = build_memory_context(&mem, "q", 0.0, None, limits)
+        let out = build_memory_context_in_view(&mem, "q", 0.0, &MemoryView::All, limits)
             .await
             .block;
         assert_eq!(out.lines().filter(|l| l.starts_with("- ")).count(), 3);
@@ -397,7 +396,7 @@ mod tests {
             max_entry_chars: 50,
             ..MemoryContextLimits::default()
         };
-        let out = build_memory_context(&mem, "q", 0.0, None, limits)
+        let out = build_memory_context_in_view(&mem, "q", 0.0, &MemoryView::All, limits)
             .await
             .block;
         assert!(out.contains("..."), "expected an ellipsis, got {out:?}");
@@ -416,7 +415,7 @@ mod tests {
             max_entry_chars: 100,
             max_total_chars: 150,
         };
-        let out = build_memory_context(&mem, "q", 0.0, None, limits)
+        let out = build_memory_context_in_view(&mem, "q", 0.0, &MemoryView::All, limits)
             .await
             .block;
         assert!(
@@ -433,9 +432,15 @@ mod tests {
             entry("telegram_123_history", "serialised transcript", 1.0),
             entry("user_fact", "prefers concise answers", 1.0),
         ]);
-        let out = build_memory_context(&mem, "q", 0.0, None, MemoryContextLimits::default())
-            .await
-            .block;
+        let out = build_memory_context_in_view(
+            &mem,
+            "q",
+            0.0,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await
+        .block;
         assert!(out.contains("user_fact"));
         assert!(!out.contains("fabricated"));
         assert!(!out.contains("transcript"));
@@ -453,7 +458,14 @@ mod tests {
             1.0,
             MemoryCategory::Conversation,
         )]);
-        let ctx = build_memory_context(&mem, "q", 0.0, None, MemoryContextLimits::default()).await;
+        let ctx = build_memory_context_in_view(
+            &mem,
+            "q",
+            0.0,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await;
         assert!(ctx.is_empty(), "conversation turn was injected: {ctx:?}");
         assert!(ctx.keys.is_empty());
     }
@@ -468,7 +480,14 @@ mod tests {
             1.0,
             MemoryCategory::Core,
         )]);
-        let ctx = build_memory_context(&mem, "q", 0.0, None, MemoryContextLimits::default()).await;
+        let ctx = build_memory_context_in_view(
+            &mem,
+            "q",
+            0.0,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await;
         assert_eq!(ctx.keys, vec!["telegram_chat_42"]);
     }
 
@@ -497,7 +516,14 @@ mod tests {
                 MemoryCategory::Core,
             ),
         ]);
-        let ctx = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default()).await;
+        let ctx = build_memory_context_in_view(
+            &mem,
+            "q",
+            0.4,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await;
         assert_eq!(ctx.keys, vec!["user_fact"]);
         assert!(!ctx.block.contains("request"));
     }
@@ -518,7 +544,7 @@ mod tests {
             max_entries: 5,
             ..MemoryContextLimits::default()
         };
-        let ctx = build_memory_context(&mem, "q", 0.4, None, limits).await;
+        let ctx = build_memory_context_in_view(&mem, "q", 0.4, &MemoryView::All, limits).await;
 
         assert_eq!(ctx.keys, vec!["kept_a", "kept_b"]);
         for key in &ctx.keys {
@@ -531,7 +557,14 @@ mod tests {
     #[tokio::test]
     async fn keys_are_empty_when_nothing_survives() {
         let mem = memory_of(vec![entry("weak", "barely related", 0.1)]);
-        let ctx = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default()).await;
+        let ctx = build_memory_context_in_view(
+            &mem,
+            "q",
+            0.4,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await;
         assert!(ctx.is_empty());
         assert!(ctx.keys.is_empty(), "no block means no keys");
     }
@@ -549,7 +582,7 @@ mod tests {
             max_entries: 3,
             ..MemoryContextLimits::default()
         };
-        let ctx = build_memory_context(&mem, "q", 0.0, None, limits).await;
+        let ctx = build_memory_context_in_view(&mem, "q", 0.0, &MemoryView::All, limits).await;
         assert_eq!(ctx.keys.len(), 3);
         assert_eq!(
             ctx.keys.len(),
@@ -574,8 +607,14 @@ mod tests {
             entry("release_cadence", "Releases cut on the first Monday", 0.45),
         ]);
 
-        let ctx =
-            build_memory_context(&mem, question, 0.4, None, MemoryContextLimits::default()).await;
+        let ctx = build_memory_context_in_view(
+            &mem,
+            question,
+            0.4,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await;
 
         assert!(
             !ctx.block.contains(question),
@@ -595,11 +634,11 @@ mod tests {
     #[tokio::test]
     async fn a_weak_best_hit_is_not_injected() {
         let mem = memory_of(vec![entry("barely", "a marginal overlap", 0.25)]);
-        let ctx = build_memory_context(
+        let ctx = build_memory_context_in_view(
             &mem,
             "unrelated question",
             0.4,
-            None,
+            &MemoryView::All,
             MemoryContextLimits::default(),
         )
         .await;
@@ -615,11 +654,11 @@ mod tests {
             entry("user_msg_a1b2", "when is  the\ndeployment window?", 1.0),
             entry("deploy_window", "Friday afternoons", 0.55),
         ]);
-        let ctx = build_memory_context(
+        let ctx = build_memory_context_in_view(
             &mem,
             "when is the deployment window?",
             0.4,
-            None,
+            &MemoryView::All,
             MemoryContextLimits::default(),
         )
         .await;
@@ -636,8 +675,14 @@ mod tests {
             "The deployment window is Friday, per the release runbook",
             1.0,
         )]);
-        let ctx =
-            build_memory_context(&mem, question, 0.4, None, MemoryContextLimits::default()).await;
+        let ctx = build_memory_context_in_view(
+            &mem,
+            question,
+            0.4,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await;
         assert_eq!(ctx.keys, vec!["prior_answer"]);
     }
 
@@ -645,8 +690,14 @@ mod tests {
     #[tokio::test]
     async fn an_empty_query_drops_nothing() {
         let mem = memory_of(vec![entry("k", "a fact", 1.0)]);
-        let ctx =
-            build_memory_context(&mem, "   ", 0.0, None, MemoryContextLimits::default()).await;
+        let ctx = build_memory_context_in_view(
+            &mem,
+            "   ",
+            0.0,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await;
         assert_eq!(ctx.keys, vec!["k"]);
     }
 
@@ -655,9 +706,15 @@ mod tests {
         let mut e = entry("k", "v", 0.0);
         e.score = None;
         let mem = memory_of(vec![e]);
-        let out = build_memory_context(&mem, "q", 0.9, None, MemoryContextLimits::default())
-            .await
-            .block;
+        let out = build_memory_context_in_view(
+            &mem,
+            "q",
+            0.9,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await
+        .block;
         assert!(out.contains("- k: v"), "unscored entries must survive");
     }
 }

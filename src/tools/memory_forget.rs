@@ -197,6 +197,15 @@ mod tests {
         (tmp, Arc::new(mem))
     }
 
+    /// Runs the tool the way a door that serves the operator does: under the
+    /// `All` view.
+    async fn execute_in_all_view(tool: &MemoryForgetTool, args: serde_json::Value) -> ToolResult {
+        crate::memory::MEMORY_VIEW
+            .scope(crate::memory::MemoryView::All, tool.execute(args))
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn name_and_schema() {
         let (tmp, mem) = test_mem();
@@ -398,13 +407,38 @@ mod tests {
         .unwrap();
 
         let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = execute_in_all_view(&tool, json!({"contains": "staging password"})).await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(mem.get("obscure_key_9f2").await.unwrap().is_none());
+    }
+
+    /// `contains` reads the store to find its target. A turn no door gave a
+    /// view reads nothing, so the phrase matches nothing and nothing is deleted.
+    #[tokio::test]
+    async fn forget_by_contains_with_no_view_finds_nothing() {
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "obscure_key_9f2",
+            "The staging password rotates weekly",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"contains": "staging password"}))
             .await
             .unwrap();
 
-        assert!(result.success, "{:?}", result.error);
-        assert!(mem.get("obscure_key_9f2").await.unwrap().is_none());
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("nothing to forget"));
+        assert!(mem.get("obscure_key_9f2").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -418,7 +452,7 @@ mod tests {
             .unwrap();
 
         let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
+        let result = execute_in_all_view(&tool, json!({"contains": "deploy"})).await;
 
         assert!(!result.success);
         assert!(result
@@ -716,7 +750,7 @@ mod tests {
         // counter is wired to something that actually happens.
         let tool =
             MemoryForgetTool::new(counting.clone(), test_security(), tmp.path().to_path_buf());
-        let _ = tool.execute(json!({"contains": "anything"})).await.unwrap();
+        let _ = execute_in_all_view(&tool, json!({"contains": "anything"})).await;
         assert!(
             counting.reads.load(Ordering::SeqCst) > 0,
             "control: a permitted call resolves the selector"

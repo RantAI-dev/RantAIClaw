@@ -1,39 +1,40 @@
-//! Memory view — task-local scope of what `memory_recall` and the dispatch
-//! memory-context injection may see.
+//! Memory view: the task-local scope of what a turn may read from memory.
 //!
-//! A guest's turn must see only its own conversation's memory: not the owner's
-//! profile (`USER.md`), the owner's notes (`MEMORY.md`), or any other chat's
-//! stored exchanges. `MemoryView` is the per-turn switch that enforces it.
+//! Every door that starts an agent turn sets a view, and a turn whose view is
+//! unset reads nothing. A door that forgets to set one fails closed: the
+//! reader returns no entries instead of every entry.
+//!
+//! * `All` is a private, host-side place: the operator's console, the CLI, the
+//!   TUI, a heartbeat, a named owner in a direct chat.
+//! * `Only(key)` is one conversation: the channel + reply target + optional
+//!   thread that `conversation_memory_scope` builds on a `ChannelMessage`. A
+//!   guest, an owner in a group and a scheduled job created from a chat run
+//!   under it.
+//! * Unset is a place with no owner identity, such as a webhook caller.
 //!
 //! Modeled on `TURN_SCOPE` (`src/security/pending.rs:84-105`): a `tokio`
-//! task-local set by the channel dispatch around the tool loop, and read by
-//! the read paths that need to honour it. `current_memory_view()` returns
-//! `None` everywhere it is unset, so the TUI, the CLI and tests run with
-//! today's behaviour.
-//!
-//! `Only(key)` is the conversation scope (channel + reply_target + optional
-//! thread — the same value `conversation_memory_scope` builds on a `ChannelMessage`).
-//! `All` is the unscoped view every non-channel surface already has; step 5
-//! of the memory effort starts setting it on the TUI.
+//! task-local set by the door around the turn, and read by every path that
+//! feeds stored memory into a prompt or a tool result. `current_memory_view()`
+//! returns `None` where no door set a view.
 
 use anyhow::Result;
 
 use super::traits::{Memory, MemoryEntry};
 
 tokio::task_local! {
-    /// The memory view the current task runs under. `None` is the default
-    /// outside any channel turn — the read paths treat it as [`MemoryView::All`]
-    /// so today's behaviour is unchanged for the TUI, CLI, console, cron and
-    /// webhook. Set to `Some(MemoryView::Only(scope))` around a guest's tool
-    /// loop so any read inside the future is scoped to that conversation.
+    /// The memory view the current task runs under. Outside any
+    /// `MEMORY_VIEW.scope(..)` block no view is set, and every read path
+    /// returns nothing. A door sets [`MemoryView::All`] for a private place or
+    /// [`MemoryView::Only`] for one conversation around the turn's future, so
+    /// any read inside the future follows it.
     pub static MEMORY_VIEW: MemoryView;
 }
 
 /// Per-turn memory visibility. See [`MEMORY_VIEW`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryView {
-    /// No scoping: every recall returns everything the backend has. The
-    /// pre-plan default for owners, TUI, CLI, console, cron, webhook.
+    /// No scoping: every recall returns everything the backend has. Set by
+    /// the doors that are private to the operator.
     All,
     /// The recall must contain only entries whose `session_id` equals `key`
     /// (the conversation scope from `conversation_memory_scope`). Reads on
@@ -42,11 +43,10 @@ pub enum MemoryView {
     Only(String),
 }
 
-/// The view the current task runs under, or `None` when no view is set.
+/// The view the current task runs under, or `None` when no door set one.
 ///
-/// Outside any `MEMORY_VIEW.scope(...)` block this returns `None`, which every
-/// read path treats as "today's unscoped behaviour" — so a missing view never
-/// silently widens a guest's read.
+/// Every read path treats `None` as "read nothing", so a door that forgets to
+/// set a view never widens a read.
 #[must_use]
 pub fn current_memory_view() -> Option<MemoryView> {
     MEMORY_VIEW.try_with(|v| v.clone()).ok()
@@ -57,7 +57,7 @@ pub fn current_memory_view() -> Option<MemoryView> {
 /// read.
 ///
 /// The trait cannot ask "shared tier only", so the only way for a guest to
-/// reach shared memory on a scope-capable backend is the unsocped slot — and
+/// reach shared memory on a scope-capable backend is the unscoped slot, and
 /// that is exactly the slot the `Only` filter discards. A guest on markdown
 /// (no `session_id` on its entries) sees nothing; that is the plan:
 /// conversation-only, by construction.
@@ -184,9 +184,8 @@ mod tests {
         };
 
         // The backend is allowed to hand back all entries when called with
-        // `Some(conv1)` — that is what the layered read does today. The filter
-        // must still drop the shared (no `session_id`) row and the other
-        // conversation's row.
+        // `Some(conv1)`, as the fixture does. The filter must still drop the
+        // shared (no `session_id`) row and the other conversation's row.
         mem.calls.lock().unwrap().clear();
         let got = recall_in_view(&mem, "q", 10, &MemoryView::Only("conv1".into()))
             .await
@@ -223,9 +222,9 @@ mod tests {
         );
     }
 
-    /// `All` is today's unscoped read: the backend is asked for `None`, and
-    /// everything it returns survives. Owners and the TUI never get the view
-    /// set, so they fall to this path — it must keep behaving like before.
+    /// `All` is the unscoped read: the backend is asked for `None`, and
+    /// everything it returns survives. The doors private to the operator set
+    /// this view.
     #[tokio::test]
     async fn recall_in_view_all_is_a_plain_unscoped_recall() {
         let mem = ScopeRecordingMemory {

@@ -105,6 +105,49 @@ run arbitrary privileged tools." This is the feature.
 This subsumes the sharing case, removes the approval ping-pong for guests, and
 makes a `["*"]` chat allowlist safe (public for safe stuff, private for privileged).
 
+## Memory view: what a turn may read
+
+Every turn runs under a memory view that the door which started it sets. The
+view decides what `memory_recall`, the `[Memory context]` block in front of the
+user's message, the `replaces` and `contains` lookups of `memory_store` and
+`memory_forget`, and the capacity notice of `memory_store` may read. A turn that
+no door gave a view reads nothing: the recall finds no note and the block is
+empty. A door that forgets to set a view fails closed.
+
+| Door | View |
+|---|---|
+| Channel turn, a named owner in a direct chat | all of memory |
+| Channel turn, a named owner in a group, or in a chat the platform did not mark as a direct message | that conversation only |
+| Channel turn, a sender who is an owner only through `approval_owners = ["*"]` | that conversation only, in a direct chat as well |
+| Channel turn, a guest | that conversation only |
+| TUI, `agent -m`, `chat -m`, the web console chat | all of memory |
+| The `/compress` memory flush of the TUI | all of memory |
+| Daemon heartbeat | all of memory (its reply goes to the journal and the observer, never to a chat) |
+| Cron job created from a chat | that chat's conversation, for `main` and `isolated` |
+| Cron job with no chat, `main` | all of memory |
+| Cron job with no chat, `isolated` | `cron:<job_id>` |
+| Webhook (`POST /webhook`, `POST /triggers/{path}`) | none: reads nothing |
+| A delegated sub-agent | the view of the turn that delegated |
+
+- **A named owner** is an identity written in `approval_owners`. The `"*"` entry
+  lets any allowed sender approve tool calls and names nobody, so a sender who is
+  an owner only through it keeps approval rights and never gets the view of all
+  of memory. This needs no new key.
+- **`USER.md` and `MEMORY.md` in the prompt follow the view** on the doors that
+  build the prompt for the turn: the CLI, a cron job, the heartbeat, the TUI, the
+  console and the webhook. Only a turn that sees all of memory carries them. A
+  channel's owner prompt is built once when the channel starts, outside any turn,
+  and still carries them. Until that prompt is built for each turn, a named owner
+  in a group gets the conversation as the memory view and a prompt that holds
+  `MEMORY.md`, and a wildcard owner gets the same.
+- A turn under a conversation view gets the guest path rules of the file tools
+  (`file_read`, `file_write`, `pdf_read`, `image_info`), stores a note in that
+  conversation, and `memory_forget` by key reaches that conversation's notes
+  only, whoever asks. An owner's turn in a group is subject to all three.
+- The webhook keeps `shell` and the file tools. A webhook turn can still read
+  `MEMORY.md`, `MEMORY_SNAPSHOT.md` and `memory/brain.db` as files, which the
+  memory view does not cover.
+
 ## Config (`[channels_config]`)
 
 ```toml

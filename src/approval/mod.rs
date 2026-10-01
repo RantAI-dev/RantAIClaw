@@ -300,16 +300,33 @@ pub fn can_approve_any<'a>(
     owners: &[String],
     identities: impl IntoIterator<Item = &'a str>,
 ) -> bool {
+    owners.iter().any(|o| o == "*") || is_named_owner_any(owners, identities)
+}
+
+/// True when **any** of the sender's identity forms is written in the owner
+/// list. The `"*"` entry names nobody, so a sender who is an owner only
+/// through the wildcard is not a named owner.
+///
+/// Approval rights and access to the owner's private notes are different
+/// grants. [`can_approve_any`] answers the first, and the wildcard satisfies
+/// it. This answers the second: the notes are for an identity the operator
+/// wrote down. Matching is the same as in [`can_approve_any`]: case-sensitive,
+/// with a leading `@` stripped on both sides.
+pub fn is_named_owner_any<'a>(
+    owners: &[String],
+    identities: impl IntoIterator<Item = &'a str>,
+) -> bool {
     fn normalize(s: &str) -> &str {
         s.trim().trim_start_matches('@')
     }
-    if owners.iter().any(|o| o == "*") {
-        return true;
-    }
-    let normalized_owners: Vec<&str> = owners.iter().map(|o| normalize(o.as_str())).collect();
+    let named_owners: Vec<&str> = owners
+        .iter()
+        .filter(|o| o.as_str() != "*")
+        .map(|o| normalize(o.as_str()))
+        .collect();
     identities
         .into_iter()
-        .any(|id| normalized_owners.contains(&normalize(id)))
+        .any(|id| named_owners.contains(&normalize(id)))
 }
 
 // ── Approval backends (surface-pluggable decision) ───────────────
@@ -663,6 +680,39 @@ mod tests {
             &["@rantaiclaw_owner".to_string()],
             ["@rantaiclaw_owner"]
         ));
+    }
+
+    /// Private notes need an identity the operator wrote down. The wildcard
+    /// makes every sender an approver, and it must not also make every sender
+    /// the owner of the notes.
+    #[test]
+    fn wildcard_owner_is_not_a_named_owner() {
+        let wildcard = vec!["*".to_string()];
+        assert!(can_approve_any(&wildcard, ["anyone"]));
+        assert!(!is_named_owner_any(&wildcard, ["anyone"]));
+        // Even a sender who calls itself `*` is not named by the wildcard entry.
+        assert!(!is_named_owner_any(&wildcard, ["*"]));
+    }
+
+    /// A list that carries the wildcard and a name still names its owner, and
+    /// the name matches the way `can_approve_any` matches it.
+    #[test]
+    fn a_named_owner_beside_the_wildcard_is_still_named() {
+        let owners = vec!["*".to_string(), "@rantaiclaw_owner".to_string()];
+        assert!(is_named_owner_any(&owners, ["rantaiclaw_owner"]));
+        assert!(is_named_owner_any(&owners, ["alias", "@rantaiclaw_owner"]));
+        assert!(!is_named_owner_any(&owners, ["rantaiclaw_guest"]));
+    }
+
+    #[test]
+    fn named_owner_check_matches_any_identity_form_and_an_empty_list_names_nobody() {
+        let owners = vec!["100000001".to_string()];
+        assert!(is_named_owner_any(
+            &owners,
+            ["rantaiclaw_user", "100000001"]
+        ));
+        assert!(!is_named_owner_any(&owners, ["RantaiClaw_User"]));
+        assert!(!is_named_owner_any(&[], ["100000001"]));
     }
 
     // ── needs_approval ───────────────────────────────────────

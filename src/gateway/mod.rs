@@ -600,7 +600,6 @@ fn build_tools_factory(
             &security,
             Arc::clone(&runtime),
             Arc::clone(&mem),
-            crate::tools::memory_recall::ConversationScope::default(),
             composio_key,
             composio_entity_id,
             &config.browser,
@@ -1677,6 +1676,9 @@ async fn run_gateway_chat_with_multimodal(
         .collect();
 
     // Build system prompt with full tool + skill awareness.
+    //
+    // This turn runs with no memory view, so it reads nothing from memory: the
+    // prompt carries neither `USER.md` nor `MEMORY.md`.
     let mut system_prompt = {
         let config_guard = state.config.lock();
         crate::channels::build_system_prompt(
@@ -1686,6 +1688,7 @@ async fn run_gateway_chat_with_multimodal(
             &loaded_skills,
             Some(&config_guard.identity),
             None, // bootstrap_max_chars - use default
+            false,
         )
     };
 
@@ -3784,6 +3787,223 @@ mod tests {
 
     fn test_connect_info() -> ConnectInfo<SocketAddr> {
         ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
+    }
+
+    /// A provider that asks for `memory_recall` once and then answers, and keeps
+    /// every request it was sent, so a test reads what the model received.
+    #[derive(Default)]
+    struct RecallingProvider {
+        seen: Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecallingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[crate::providers::ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let after_tools = messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.contains("[Tool results]"));
+            self.seen.lock().push(
+                messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect(),
+            );
+            if after_tools {
+                Ok("Done.".to_string())
+            } else {
+                Ok("<tool_call>\n{\"name\":\"memory_recall\",\"arguments\":{\"query\":\"lantern\"}}\n</tool_call>"
+                    .to_string())
+            }
+        }
+    }
+
+    const WEBHOOK_NOTE_WORD: &str = "saffronquartz";
+    const WEBHOOK_USER_CANARY: &str = "owner-profile-canary-41c9";
+    const WEBHOOK_MEMORY_CANARY: &str = "owner-notes-canary-52d0";
+    const WEBHOOK_SOUL_CANARY: &str = "bot-soul-canary-63e1";
+
+    /// Drives a webhook door over a store that holds a note about the lantern,
+    /// owner files in the workspace, and the real `memory_recall` tool. Returns
+    /// the system prompt and the rest of what the model was sent. With
+    /// `all_view` the handler runs under the `All` view as a control; a webhook
+    /// does not set a view itself.
+    async fn webhook_door_over_a_note(trigger: bool, all_view: bool) -> (String, String) {
+        let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        std::fs::write(
+            workspace.path().join("USER.md"),
+            format!("# User\n{WEBHOOK_USER_CANARY}"),
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("MEMORY.md"),
+            format!("# Memory\n{WEBHOOK_MEMORY_CANARY}"),
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("SOUL.md"),
+            format!("# Soul\n{WEBHOOK_SOUL_CANARY}"),
+        )
+        .unwrap();
+        let sqlite = crate::memory::SqliteMemory::new(workspace.path()).unwrap();
+        sqlite
+            .store(
+                "shared_note",
+                &format!("A note about the lantern: {WEBHOOK_NOTE_WORD}"),
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(sqlite);
+
+        let provider_impl = Arc::new(RecallingProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let tools_memory = Arc::clone(&memory);
+        let config = Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..Config::default()
+        };
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(vec![WebhookRoute {
+                path: "lantern".into(),
+                skill: "lantern_skill".into(),
+                message: "what about the lantern".into(),
+            }]),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
+            tools_factory: Arc::new(move |_: &crate::config::Config| {
+                vec![Box::new(crate::tools::MemoryRecallTool::new(Arc::clone(
+                    &tools_memory,
+                ))) as Box<dyn crate::tools::Tool>]
+            }),
+        };
+
+        let run = async {
+            let response = if trigger {
+                handle_trigger_webhook(
+                    State(state),
+                    test_connect_info(),
+                    HeaderMap::new(),
+                    axum::extract::Path("lantern".to_string()),
+                    Ok(Json(TriggerBody::default())),
+                )
+                .await
+                .into_response()
+            } else {
+                handle_webhook(
+                    State(state),
+                    test_connect_info(),
+                    HeaderMap::new(),
+                    Ok(Json(WebhookBody {
+                        message: "what about the lantern".into(),
+                    })),
+                )
+                .await
+                .into_response()
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+        if all_view {
+            crate::memory::MEMORY_VIEW
+                .scope(crate::memory::MemoryView::All, run)
+                .await;
+        } else {
+            run.await;
+        }
+
+        let seen = provider_impl.seen.lock().clone();
+        assert_eq!(seen.len(), 2, "one tool round, then the answer");
+        let flat = |keep_system: bool| {
+            seen.iter()
+                .flatten()
+                .filter(|(role, _)| (role == "system") == keep_system)
+                .map(|(_, content)| content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        (flat(true), flat(false))
+    }
+
+    /// A webhook turn has no owner identity behind it, so no door sets a view
+    /// for it, and a turn with no view reads nothing. The recall finds nothing,
+    /// and the prompt carries neither `USER.md` nor `MEMORY.md`.
+    #[tokio::test]
+    async fn the_webhook_door_reads_nothing_from_memory() {
+        let (system, rest) = webhook_door_over_a_note(false, false).await;
+
+        assert!(rest.contains("No memories found"), "{rest}");
+        assert!(
+            !format!("{system}\n{rest}").contains(WEBHOOK_NOTE_WORD),
+            "a note reached a webhook turn:\n{system}\n{rest}"
+        );
+        assert!(!system.contains(WEBHOOK_USER_CANARY), "{system}");
+        assert!(!system.contains(WEBHOOK_MEMORY_CANARY), "{system}");
+        assert!(
+            system.contains(WEBHOOK_SOUL_CANARY),
+            "control: the prompt reads the workspace files:\n{system}"
+        );
+    }
+
+    /// The trigger route runs the same turn and gets the same answer.
+    #[tokio::test]
+    async fn the_trigger_webhook_door_reads_nothing_from_memory() {
+        let (system, rest) = webhook_door_over_a_note(true, false).await;
+
+        assert!(rest.contains("No memories found"), "{rest}");
+        assert!(
+            !format!("{system}\n{rest}").contains(WEBHOOK_NOTE_WORD),
+            "a note reached a trigger turn:\n{system}\n{rest}"
+        );
+        assert!(!system.contains(WEBHOOK_USER_CANARY), "{system}");
+        assert!(!system.contains(WEBHOOK_MEMORY_CANARY), "{system}");
+    }
+
+    /// The control: the same store, tool and handler read the note once a view
+    /// is set, so the two cases above are not passing on an empty fixture.
+    #[tokio::test]
+    async fn a_webhook_turn_under_the_all_view_would_read_the_note() {
+        let (_system, rest) = webhook_door_over_a_note(false, true).await;
+        assert!(rest.contains(WEBHOOK_NOTE_WORD), "{rest}");
     }
 
     #[tokio::test]

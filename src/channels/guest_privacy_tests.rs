@@ -277,11 +277,10 @@ async fn guest_channel_turn_uses_guest_prompt_scoped_memory_and_probe_view() {
     );
 }
 
-/// An owner's channel turn keeps today's behaviour: the owner prompt, the
-/// layered memory read (own conversation plus the shared tier), and no
-/// `MemoryView` set around its tool calls at all.
+/// A named owner's turn in a direct chat: the owner prompt, the whole store
+/// (the shared tier included), and the `All` view around its tool calls.
 #[tokio::test]
-async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_with_no_probe_view() {
+async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_and_the_all_view() {
     let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
@@ -397,8 +396,8 @@ async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_with_no_probe_vi
     let seen = recorder.snapshot();
     assert_eq!(
         seen,
-        vec![None],
-        "an owner's tool calls must run with no memory view set: {seen:?}"
+        vec![Some(crate::memory::MemoryView::All)],
+        "a named owner's tool calls in a direct chat must run under the All view: {seen:?}"
     );
 }
 
@@ -1746,6 +1745,7 @@ struct Options {
     guest_tools: Vec<&'static str>,
     crowded_core_memory: bool,
     skills_mode: crate::config::SkillsPromptInjectionMode,
+    owners: Vec<&'static str>,
 }
 
 impl Options {
@@ -1754,7 +1754,14 @@ impl Options {
             guest_tools: tools.to_vec(),
             crowded_core_memory: false,
             skills_mode: crate::config::SkillsPromptInjectionMode::Full,
+            owners: vec![OWNER_SENDER],
         }
+    }
+
+    /// Replaces the owner list (`approval_owners`).
+    fn owners(mut self, owners: &[&'static str]) -> Self {
+        self.owners = owners.to_vec();
+        self
     }
 
     /// Shared core notes past the size of the block the prompt carries.
@@ -1785,8 +1792,19 @@ fn protocol_block_tool_names(block: &str) -> Vec<String> {
     names
 }
 
-/// The message a channel hands to dispatch.
+/// The message a channel hands to dispatch, in a direct chat.
 fn channel_message(sender: &str, chat: &str, content: &str, id: &str) -> traits::ChannelMessage {
+    channel_message_in(sender, chat, content, id, true)
+}
+
+/// The message a channel hands to dispatch, in a direct chat or in a group.
+fn channel_message_in(
+    sender: &str,
+    chat: &str,
+    content: &str,
+    id: &str,
+    is_direct: bool,
+) -> traits::ChannelMessage {
     traits::ChannelMessage {
         sender_aliases: Vec::new(),
         id: id.to_string(),
@@ -1797,7 +1815,7 @@ fn channel_message(sender: &str, chat: &str, content: &str, id: &str) -> traits:
         timestamp: 1,
         thread_ts: None,
         reply_anchor: None,
-        is_direct: true,
+        is_direct,
     }
 }
 
@@ -1951,7 +1969,7 @@ impl Deployment {
                     interrupt_on_new_message: false,
                     mention_only: false,
                 }),
-                approval_owners: vec![OWNER_SENDER.to_string()],
+                approval_owners: options.owners.iter().map(|o| (*o).to_string()).collect(),
                 guest_allowed_tools: options
                     .guest_tools
                     .iter()
@@ -2014,6 +2032,18 @@ impl Deployment {
     /// Runs one message from `sender` in `chat` through dispatch, with the
     /// provider answering `script` in order.
     async fn turn(&self, sender: &str, chat: &str, content: &str, script: Vec<String>) -> Turn {
+        self.turn_in(sender, chat, true, content, script).await
+    }
+
+    /// Like [`Deployment::turn`], in a direct chat or in a group.
+    async fn turn_in(
+        &self,
+        sender: &str,
+        chat: &str,
+        is_direct: bool,
+        content: &str,
+        script: Vec<String>,
+    ) -> Turn {
         *self
             .provider
             .script
@@ -2025,7 +2055,7 @@ impl Deployment {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         process_channel_message(
             Arc::clone(&self.ctx),
-            channel_message(sender, chat, content, &format!("msg-{id}")),
+            channel_message_in(sender, chat, content, &format!("msg-{id}"), is_direct),
             CancellationToken::new(),
         )
         .await;
@@ -2714,4 +2744,207 @@ async fn owner_native_specs_list_every_tool_of_the_registry() {
         .collect();
     assert!(registry.len() > 2, "the registry is the built one");
     assert_eq!(turn.requests[0].tools.as_ref(), Some(&registry));
+}
+
+// ── Memory view at every channel door ────────────────────────────────────
+//
+// Every turn dispatch starts runs under a memory view, and the view follows who
+// asked and where: a named owner in a direct chat sees all of memory, and
+// everyone else sees the conversation they are in.
+
+/// What a tool call runs under in a turn of `sender` in `chat`, over a real
+/// store, with the probe tool as the whole registry and `owners` as
+/// `approval_owners`. Also returns the conversation scope dispatch derived for
+/// the message, the key an `Only` view must carry.
+async fn view_under_which_a_turn_runs(
+    owners: &[&str],
+    sender: &str,
+    chat: &str,
+    is_direct: bool,
+) -> (Vec<Option<crate::memory::MemoryView>>, String) {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let tmp = TempDir::new().unwrap();
+    let recorder = MemoryViewRecorder::default();
+    let provider_impl = Arc::new(PromptAndProbeProvider::default());
+    let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.memory = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        inner.tools_registry = Arc::new(vec![Box::new(MemoryViewProbeTool {
+            recorder: recorder.clone(),
+        }) as Box<dyn Tool>]);
+        inner.approval_owners = Arc::new(owners.iter().map(|o| (*o).to_string()).collect());
+        inner.guest_gate = Arc::new(crate::approval::GuestGate::new(
+            &["memory_view_probe".to_string()],
+            &[],
+        ));
+        inner.workspace_dir = Arc::new(tmp.path().to_path_buf());
+    }
+
+    let msg = channel_message_in(sender, chat, "hello", "view-probe-1", is_direct);
+    let scope = dispatch::conversation_memory_scope(&msg);
+    process_channel_message(ctx, msg, CancellationToken::new()).await;
+    (recorder.snapshot(), scope)
+}
+
+/// A named owner in a direct chat is the one sender that sees all of memory.
+#[tokio::test]
+async fn a_named_owner_in_a_direct_chat_runs_under_the_all_view() {
+    let (seen, _scope) =
+        view_under_which_a_turn_runs(&[OWNER_SENDER], OWNER_SENDER, OWNER_CHAT, true).await;
+    assert_eq!(seen, vec![Some(crate::memory::MemoryView::All)]);
+}
+
+/// The same owner in a group, or in a chat the platform did not mark as a direct
+/// message, sees only that conversation.
+#[tokio::test]
+async fn a_named_owner_in_a_group_runs_under_the_conversation_view() {
+    let (seen, scope) =
+        view_under_which_a_turn_runs(&[OWNER_SENDER], OWNER_SENDER, GUEST_CHAT, false).await;
+    assert_eq!(seen, vec![Some(crate::memory::MemoryView::Only(scope))]);
+}
+
+/// `approval_owners = ["*"]` gives a sender approval rights and no named
+/// identity, so the sender never gets the private view, in a direct chat or out
+/// of it.
+#[tokio::test]
+async fn an_owner_through_the_wildcard_alone_never_runs_under_the_all_view() {
+    for is_direct in [true, false] {
+        let (seen, scope) =
+            view_under_which_a_turn_runs(&["*"], "rantaiclaw_wildcard_user", OWNER_CHAT, is_direct)
+                .await;
+        assert_eq!(
+            seen,
+            vec![Some(crate::memory::MemoryView::Only(scope))],
+            "is_direct = {is_direct}"
+        );
+    }
+}
+
+/// What the model was shown of the conversation itself: every message of the
+/// turn except the system prompt. The system prompt is left out on purpose,
+/// since an owner's start-up prompt carries `MEMORY.md` whichever view the turn
+/// runs under.
+fn conversation_text(turn: &Turn) -> String {
+    turn.requests
+        .iter()
+        .flat_map(|request| {
+            request
+                .messages
+                .iter()
+                .filter(|(role, _)| role != "system")
+                .map(|(_, content)| content.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn recall_lantern() -> Vec<String> {
+    vec![
+        call(
+            "memory_recall",
+            serde_json::json!({ "query": "lantern", "limit": 10 }),
+        ),
+        "Done.".to_string(),
+    ]
+}
+
+/// The control for the cases below: a named owner in a direct chat reads every
+/// tier of the store.
+#[tokio::test]
+async fn a_named_owner_in_a_direct_chat_recalls_every_tier() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "what about the lantern",
+            recall_lantern(),
+        )
+        .await;
+
+    let results = turn.tool_results();
+    for word in [SHARED_NOTE_WORD, OTHER_CHAT_NOTE_WORD, GUEST_NOTE_WORD] {
+        assert!(results.contains(word), "{word} is missing:\n{results}");
+    }
+}
+
+/// A named owner asking in a group reads that group's notes and nothing else:
+/// not the shared tier, not another chat's. What the model is told in the
+/// conversation, and what its recall returns, carry the group's note only.
+#[tokio::test]
+async fn a_named_owner_in_a_group_recalls_only_that_groups_notes() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn_in(
+            OWNER_SENDER,
+            GUEST_CHAT,
+            false,
+            "what about the lantern",
+            recall_lantern(),
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert!(
+        results.contains(GUEST_NOTE_WORD),
+        "control: the group's own note is recalled:\n{results}"
+    );
+    let seen = conversation_text(&turn);
+    for other in [SHARED_NOTE_WORD, OTHER_CHAT_NOTE_WORD] {
+        assert!(
+            !seen.contains(other),
+            "{other} reached an owner's turn in a group:\n{seen}"
+        );
+    }
+}
+
+/// An owner through the wildcard alone keeps the owner's rights and not the
+/// owner's notes. The store is written by an owner-only tool the guest gate
+/// refuses, so the sender is an owner. The recall finds only the chat's own note.
+#[tokio::test]
+async fn an_owner_through_the_wildcard_alone_keeps_owner_rights_and_reads_one_conversation() {
+    let deployment = Deployment::start(Options::guest_tools(&[]).owners(&["*"])).await;
+
+    let turn = deployment
+        .turn(
+            "rantaiclaw_wildcard_user",
+            GUEST_CHAT,
+            "what about the lantern",
+            vec![
+                all_calls(&[
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "wildcard_note", "content": "stored by the wildcard owner" }),
+                    ),
+                    (
+                        "memory_recall",
+                        serde_json::json!({ "query": "lantern", "limit": 10 }),
+                    ),
+                ]),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+
+    let results = turn.tool_results();
+    assert!(
+        results.contains("Stored memory: wildcard_note"),
+        "control: the wildcard sender is an owner, so a tool the guest gate refuses ran:\n{results}"
+    );
+    assert!(results.contains(GUEST_NOTE_WORD), "{results}");
+    let seen = conversation_text(&turn);
+    for other in [SHARED_NOTE_WORD, OTHER_CHAT_NOTE_WORD] {
+        assert!(
+            !seen.contains(other),
+            "{other} reached the turn of an owner who is one only through the wildcard:\n{seen}"
+        );
+    }
 }

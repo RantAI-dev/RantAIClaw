@@ -1,29 +1,21 @@
 use super::traits::{Tool, ToolResult};
-use crate::memory::{recall_in_view, Memory, MemoryView};
+use crate::memory::{recall_in_view, Memory};
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
 
-/// Let the agent search its own memory
-/// Shared handle through which a surface points this tool at the active
-/// conversation. `None` (the default) recalls globally — the behaviour every
-/// surface had before scoping. The `Agent` writes it from
-/// `set_conversation_id`, so the tool follows the same per-request scope the
-/// injection path uses; surfaces that serve many conversations concurrently
-/// through one registry (channels, the gateway webhook) leave it unset — a
-/// single shared slot would race across concurrent turns and mis-scope reads,
-/// which is worse than a global read.
-pub type ConversationScope = std::sync::Arc<std::sync::Mutex<Option<String>>>;
-
+/// Let the agent search its own memory.
+///
+/// The read follows the turn's [`crate::memory::MemoryView`], which the door
+/// that started the turn sets. A turn with no view finds nothing.
 pub struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
-    scope: ConversationScope,
 }
 
 impl MemoryRecallTool {
-    pub fn new(memory: Arc<dyn Memory>, scope: ConversationScope) -> Self {
-        Self { memory, scope }
+    pub fn new(memory: Arc<dyn Memory>) -> Self {
+        Self { memory }
     }
 }
 
@@ -34,7 +26,7 @@ impl Tool for MemoryRecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Scoped to the current conversation plus shared memory when the surface provides a conversation; global otherwise."
+        "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Scoped to the current conversation when the surface limits the turn to one; a turn that no surface gave a memory view finds nothing."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -66,37 +58,11 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
 
-        // Scope the read to the active conversation when a surface has set
-        // one: conversation-local rows first, shared unscoped tier as
-        // backfill, other conversations' rows filtered — the same layered
-        // read the injection path uses. Unset ⇒ global, as before.
-        //
-        // A per-turn override: when the dispatch runs a guest
-        // turn it sets `MEMORY_VIEW = Some(MemoryView::Only(conversation))`,
-        // and that view overrides the tool's own scope slot. A guest must
-        // never reach the unscoped backfill even if the channel happened to
-        // set a different scope earlier in the conversation lifecycle.
+        // The turn's view decides what is readable. No view means no door set
+        // one, and the answer is the same as for an empty store.
         let recalled = match crate::memory::current_memory_view() {
-            // Only the restricted `Only` view overrides the scope slot. `All`
-            // means "no restriction", so it defers to the tool's own layered
-            // read below, exactly as an unset view does.
-            Some(view @ MemoryView::Only(_)) => {
-                recall_in_view(self.memory.as_ref(), query, limit, &view).await
-            }
-            _ => {
-                let scope = self
-                    .scope
-                    .lock()
-                    .map(|guard| guard.clone())
-                    .unwrap_or_default();
-                match scope.as_deref() {
-                    Some(cid) => {
-                        crate::memory::recall_layered(self.memory.as_ref(), query, limit, Some(cid))
-                            .await
-                    }
-                    None => self.memory.recall(query, limit, None).await,
-                }
-            }
+            Some(view) => recall_in_view(self.memory.as_ref(), query, limit, &view).await,
+            None => Ok(Vec::new()),
         };
         match recalled {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
@@ -146,11 +112,24 @@ mod tests {
         (tmp, Arc::new(mem))
     }
 
+    /// Runs the tool the way a door that serves the operator does: under the
+    /// `All` view.
+    async fn execute_in_all_view(
+        tool: &MemoryRecallTool,
+        args: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        crate::memory::MEMORY_VIEW
+            .scope(crate::memory::MemoryView::All, tool.execute(args))
+            .await
+    }
+
     #[tokio::test]
     async fn recall_empty() {
         let (_tmp, mem) = seeded_mem();
-        let tool = MemoryRecallTool::new(mem, ConversationScope::default());
-        let result = tool.execute(json!({"query": "anything"})).await.unwrap();
+        let tool = MemoryRecallTool::new(mem);
+        let result = execute_in_all_view(&tool, json!({"query": "anything"}))
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(result.output.contains("No memories found"));
     }
@@ -165,8 +144,10 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = MemoryRecallTool::new(mem, ConversationScope::default());
-        let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
+        let tool = MemoryRecallTool::new(mem);
+        let result = execute_in_all_view(&tool, json!({"query": "Rust"}))
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(result.output.contains("Rust"));
         assert!(result.output.contains("Found 1"));
@@ -186,9 +167,8 @@ mod tests {
             .unwrap();
         }
 
-        let tool = MemoryRecallTool::new(mem, ConversationScope::default());
-        let result = tool
-            .execute(json!({"query": "Rust", "limit": 3}))
+        let tool = MemoryRecallTool::new(mem);
+        let result = execute_in_all_view(&tool, json!({"query": "Rust", "limit": 3}))
             .await
             .unwrap();
         assert!(result.success);
@@ -198,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn recall_missing_query() {
         let (_tmp, mem) = seeded_mem();
-        let tool = MemoryRecallTool::new(mem, ConversationScope::default());
+        let tool = MemoryRecallTool::new(mem);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -217,8 +197,10 @@ mod tests {
         .await
         .unwrap();
 
-        let tool = MemoryRecallTool::new(mem, ConversationScope::default());
-        let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
+        let tool = MemoryRecallTool::new(mem);
+        let result = execute_in_all_view(&tool, json!({"query": "Rust"}))
+            .await
+            .unwrap();
 
         // Scores are absolute now — the exact value depends on the BM25
         // magnitude, not on being the best of the set. Pin the rendering shape
@@ -241,7 +223,7 @@ mod tests {
     #[test]
     fn name_and_schema() {
         let (_tmp, mem) = seeded_mem();
-        let tool = MemoryRecallTool::new(mem, ConversationScope::default());
+        let tool = MemoryRecallTool::new(mem);
         assert_eq!(tool.name(), "memory_recall");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
     }
@@ -299,48 +281,43 @@ mod tests {
         }
     }
 
-    /// With a conversation set, the tool reads through `recall_layered`:
-    /// the conversation's own rows first, then the shared unscoped backfill —
-    /// never a bare global read that would cross into other conversations.
+    /// A turn that no door gave a view finds nothing, and does not even ask the
+    /// backend. The store holds a matching note, so an empty answer is the
+    /// default doing its work and not an empty fixture.
     #[tokio::test]
-    async fn a_set_conversation_scopes_the_tools_read() {
+    async fn a_turn_with_no_view_finds_nothing_and_does_not_read() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mem: Arc<dyn Memory> = Arc::new(RecallScopeProbe {
             calls: calls.clone(),
         });
-        let scope = ConversationScope::default();
-        *scope.lock().unwrap() = Some("tui:s1".into());
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool.execute(json!({"query": "anything"})).await.unwrap();
 
-        let tool = MemoryRecallTool::new(mem, scope);
-        tool.execute(json!({"query": "anything"})).await.unwrap();
-
-        let seen = calls.lock().unwrap().clone();
-        assert_eq!(
-            seen,
-            vec![Some("tui:s1".to_string()), None],
-            "expected the layered read: scoped first, shared backfill second"
+        assert!(result.success);
+        assert!(result.output.contains("No memories found"));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a turn with no view must not read the backend"
         );
+
+        let (_tmp, stored) = seeded_mem();
+        stored
+            .store("lang", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let tool = MemoryRecallTool::new(stored);
+        let blind = tool.execute(json!({"query": "Rust"})).await.unwrap();
+        assert!(blind.output.contains("No memories found"), "{blind:?}");
+        let sighted = execute_in_all_view(&tool, json!({"query": "Rust"}))
+            .await
+            .unwrap();
+        assert!(sighted.output.contains("Found 1"), "{sighted:?}");
     }
 
-    /// The control: no conversation set ⇒ exactly the old single global read.
-    #[tokio::test]
-    async fn an_unset_scope_reads_globally_as_before() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mem: Arc<dyn Memory> = Arc::new(RecallScopeProbe {
-            calls: calls.clone(),
-        });
-        let tool = MemoryRecallTool::new(mem, ConversationScope::default());
-        tool.execute(json!({"query": "anything"})).await.unwrap();
-
-        let seen = calls.lock().unwrap().clone();
-        assert_eq!(seen, vec![None]);
-    }
-
-    /// When a turn runs inside `MEMORY_VIEW.scope(Only(k), ...)`
-    /// the tool reads through `recall_in_view`, which calls `recall(Some(k))`
-    /// (the exact session key, never the stale scope slot, never the unscoped
-    /// backfill). The view filter in `recall_in_view` then drops anything
-    /// without a matching `session_id`.
+    /// When a turn runs inside `MEMORY_VIEW.scope(Only(k), ...)` the tool reads
+    /// through `recall_in_view`, which calls `recall(Some(k))`: the exact
+    /// session key, never an unscoped read. The view filter in
+    /// `recall_in_view` then drops anything without a matching `session_id`.
     #[tokio::test]
     async fn memory_view_only_routes_through_recall_in_view() {
         use crate::memory::{MemoryView, MEMORY_VIEW};
@@ -348,11 +325,8 @@ mod tests {
         let mem: Arc<dyn Memory> = Arc::new(RecallScopeProbe {
             calls: calls.clone(),
         });
-        let scope = ConversationScope::default();
-        // A different scope than the view: the view must win.
-        *scope.lock().unwrap() = Some("stale-scope".into());
 
-        let tool = MemoryRecallTool::new(mem, scope);
+        let tool = MemoryRecallTool::new(mem);
         let view = MemoryView::Only("chat:abc".into());
         MEMORY_VIEW
             .scope(view, async {
@@ -360,10 +334,6 @@ mod tests {
             })
             .await;
 
-        // The view routes through `recall_in_view`, which under the hood
-        // calls `recall(Some("chat:abc"))` — a single read scoped to the
-        // view key, not the tool's stale scope. The probe records exactly
-        // that single argument.
         let seen = calls.lock().unwrap().clone();
         assert_eq!(
             seen,
@@ -372,34 +342,21 @@ mod tests {
         );
     }
 
-    /// `MEMORY_VIEW = All` does NOT change today's behavior —
-    /// the tool still routes through the scope slot (layered read with the
-    /// tool's stored conversation, then shared unscoped backfill). This
-    /// documents the intent so future readers know the view is "off" unless
-    /// explicitly set to `Only`.
+    /// `MEMORY_VIEW = All` is the unscoped read: one recall that asks for no
+    /// session.
     #[tokio::test]
-    async fn memory_view_all_falls_back_to_scope() {
-        use crate::memory::{MemoryView, MEMORY_VIEW};
+    async fn memory_view_all_reads_the_whole_store() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mem: Arc<dyn Memory> = Arc::new(RecallScopeProbe {
             calls: calls.clone(),
         });
-        let scope = ConversationScope::default();
-        *scope.lock().unwrap() = Some("chat:abc".into());
 
-        let tool = MemoryRecallTool::new(mem, scope);
-        let view = MemoryView::All;
-        MEMORY_VIEW
-            .scope(view, async {
-                tool.execute(json!({"query": "anything"})).await.unwrap();
-            })
-            .await;
+        let tool = MemoryRecallTool::new(mem);
+        execute_in_all_view(&tool, json!({"query": "anything"}))
+            .await
+            .unwrap();
 
         let seen = calls.lock().unwrap().clone();
-        assert_eq!(
-            seen,
-            vec![Some("chat:abc".to_string()), None],
-            "MEMORY_VIEW = All must defer to the scope slot (existing layered read), got {seen:?}"
-        );
+        assert_eq!(seen, vec![None], "MEMORY_VIEW = All must read globally");
     }
 }

@@ -753,7 +753,7 @@ Top-level channel options are configured under `channels_config`.
 | Key | Default | Purpose |
 |---|---|---|
 | `message_timeout_secs` | `600` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
-| `approval_owners` | `[]` | Senders who may approve privileged tool calls. Empty = **nobody** can approve, so approval-required tools auto-deny. `"*"` lets any allowed sender approve (insecure, opt-in) |
+| `approval_owners` | `[]` | Senders who may approve privileged tool calls. Empty = **nobody** can approve, so approval-required tools auto-deny. `"*"` lets any allowed sender approve (insecure, opt-in). A sender who is an owner only through `"*"` never reads the owner's notes: its turns read the conversation they are in, not the whole store. Private notes need an identity named in the list. |
 | `guest_allowed_tools` | `[]` | Capability ceiling for allowed senders who are not owners. Empty = the agent calls no tool on a guest's behalf; list names like `"shell"` or `"web_search_tool"` to widen. The owner's `autonomy.auto_approve` list is intentionally **not** unioned in — an operator who wants a guest to be able to read files or recall memory must list those tools here |
 | `guest_allowed_commands` | `[]` | Shell globs a guest may run (needs `"shell"` in `guest_allowed_tools`). Hard ceiling — a non-matching command is denied, never escalated |
 | `autonomous_tools` | `false` | `true` skips the approval gate entirely for this channel, for every sender |

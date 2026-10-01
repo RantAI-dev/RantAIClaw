@@ -705,7 +705,12 @@ async fn agent_chat_sync(
     );
     // Scrub any secret-looking token, and return a 400 (not 500) when the turn
     // failed only because no model is configured — that's the caller's to fix.
-    let text = agent.turn(&turn_input).await.map_err(map_agent_error)?;
+    //
+    // The console is the operator's own surface, so its turn reads all of memory.
+    let text = crate::memory::MEMORY_VIEW
+        .scope(crate::memory::MemoryView::All, agent.turn(&turn_input))
+        .await
+        .map_err(map_agent_error)?;
     let mut session_id = body.session_id.clone().unwrap_or_default();
     // `agent.turn` already returned Err on failure; skip persisting an empty
     // answer so a no-op turn doesn't create or append to a session.
@@ -942,13 +947,20 @@ async fn agent_chat_stream(
                 // and the Layer-A modal register their approvals against it. The
                 // agent loop does not spawn between here and `Tool::execute`, so
                 // the task-local survives (same pattern as channel dispatch).
-                let _ = crate::security::TURN_SCOPE
+                //
+                // The console is the operator's own surface, so its turn reads
+                // all of memory. The view is set inside the spawned task, since
+                // a task-local does not cross `tokio::spawn`.
+                let _ = crate::memory::MEMORY_VIEW
                     .scope(
-                        ("console".to_string(), turn_scope.clone()),
-                        agent.turn_streaming(
-                            &agent_message,
-                            Some(events_tx.clone()),
-                            Some(cancel_for_agent),
+                        crate::memory::MemoryView::All,
+                        crate::security::TURN_SCOPE.scope(
+                            ("console".to_string(), turn_scope.clone()),
+                            agent.turn_streaming(
+                                &agent_message,
+                                Some(events_tx.clone()),
+                                Some(cancel_for_agent),
+                            ),
                         ),
                     )
                     .await;
@@ -2914,6 +2926,68 @@ mod tests {
         assert_eq!(json["model"], "test-model");
         assert_eq!(json["provider"], "test-sse");
         assert!(json["duration_ms"].as_u64().is_some());
+    }
+
+    /// A console chat request about the lantern, for the memory view cases.
+    fn lantern_chat() -> Json<ChatRequestBody> {
+        Json(ChatRequestBody {
+            message: "what about the lantern".to_string(),
+            model: None,
+            provider: None,
+            temperature: None,
+            session_id: None,
+            context: None,
+            render_mode: None,
+        })
+    }
+
+    /// The console is the operator's own surface: its turn reads all of memory,
+    /// so every note reaches the model and the prompt carries `USER.md` and
+    /// `MEMORY.md`. This is the non-streaming route, `agent.turn`.
+    #[tokio::test]
+    async fn the_console_chat_door_reads_all_of_memory() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        let state = test_state();
+        *state.config.lock() = fixture.config.clone();
+
+        let response = agent_chat_dispatch(
+            State(state),
+            HeaderMap::new(),
+            Query(ChatQuery::default()),
+            lantern_chat(),
+        )
+        .await
+        .expect("sync response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        fixture.assert_every_note_was_sent();
+    }
+
+    /// The same, through the streaming route: its turn runs in a spawned task,
+    /// and a task-local does not cross a spawn, so the view is set inside it.
+    #[tokio::test]
+    async fn the_console_streaming_chat_door_reads_all_of_memory() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        let state = test_state();
+        *state.config.lock() = fixture.config.clone();
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "text/event-stream".parse().unwrap());
+
+        let response = agent_chat_dispatch(
+            State(state),
+            headers,
+            Query(ChatQuery::default()),
+            lantern_chat(),
+        )
+        .await
+        .expect("sse response");
+
+        let body = response_text(response).await;
+        assert!(
+            sse_values(&body).iter().any(|ev| ev["type"] == "done"),
+            "no done event in {body:?}"
+        );
+        fixture.assert_every_note_was_sent();
     }
 
     /// The console used to append its generative-UI instruction to `message`,

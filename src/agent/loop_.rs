@@ -262,18 +262,11 @@ async fn auto_compact_history(
     Ok(true)
 }
 
-/// Build context preamble by searching memory for relevant entries, scoped to
-/// `conversation_id` when the caller has one. Entries with a hybrid score below
-/// `min_relevance_score` are dropped to prevent unrelated memories from bleeding
-/// into the conversation. With `None` this is a plain global recall (the prior
-/// behaviour); with `Some(id)` it returns that scope's rows plus the
-/// shared/global tier and excludes other conversations' scoped rows.
-async fn build_context_scoped(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    conversation_id: Option<&str>,
-) -> String {
+/// Build context preamble by searching memory for relevant entries under the
+/// task's memory view. Entries with a hybrid score below `min_relevance_score`
+/// are dropped to prevent unrelated memories from bleeding into the
+/// conversation. A task with no view gets an empty preamble: nothing is read.
+async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
     // One builder, shared with the agent's memory loader and the channel
     // dispatcher. This path used to render its own block with no cap on entry
     // count, entry size or total size.
@@ -281,16 +274,22 @@ async fn build_context_scoped(
         mem,
         user_msg,
         min_relevance_score,
-        conversation_id,
         memory::MemoryContextLimits::default(),
     )
     .await
     .block
 }
 
-/// Global-scope convenience for callers with no conversation identity.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
-    build_context_scoped(mem, user_msg, min_relevance_score, None).await
+/// Run `turn` under the memory view a door chose, or with no view when the door
+/// has none. A turn with no view reads nothing from memory.
+async fn in_memory_view<T>(
+    view: Option<&memory::MemoryView>,
+    turn: impl std::future::Future<Output = T>,
+) -> T {
+    match view {
+        Some(view) => memory::MEMORY_VIEW.scope(view.clone(), turn).await,
+        None => turn.await,
+    }
 }
 
 /// Find a tool by name in the registry.
@@ -2387,7 +2386,10 @@ pub async fn run_with_scope(
     model_override: Option<String>,
     temperature: f64,
     surface: &str,
-    conversation_id: Option<String>,
+    // What the run's turns may read from memory: `All` for a place private to
+    // the operator, `Only(key)` for one conversation, and `None` for a run
+    // with no owner identity, which reads nothing.
+    memory_view: Option<memory::MemoryView>,
     // The process's observer when a long-lived caller owns one (the cron
     // scheduler under the daemon). `None` ⇒ a one-shot CLI run, its own process
     // and correctly its own registry.
@@ -2441,7 +2443,6 @@ pub async fn run_with_scope(
         &security,
         runtime,
         mem.clone(),
-        std::sync::Arc::new(std::sync::Mutex::new(conversation_id.clone())),
         composio_key,
         composio_entity_id,
         &config.browser,
@@ -2618,6 +2619,9 @@ pub async fn run_with_scope(
         native_tools,
         config.skills.prompt_injection_mode,
         false,
+        // `USER.md` and `MEMORY.md` are memory read into the prompt: only a run
+        // that sees all of memory carries them.
+        matches!(memory_view, Some(memory::MemoryView::All)),
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -2672,11 +2676,9 @@ pub async fn run_with_scope(
         }
 
         // Inject memory context into user message
-        let mem_context = build_context_scoped(
-            mem.as_ref(),
-            &msg,
-            config.memory.min_relevance_score,
-            conversation_id.as_deref(),
+        let mem_context = in_memory_view(
+            memory_view.as_ref(),
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score),
         )
         .await;
         let enriched = if mem_context.is_empty() {
@@ -2690,27 +2692,30 @@ pub async fn run_with_scope(
             ChatMessage::user(&enriched),
         ];
 
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            model_name,
-            temperature,
-            silent,
-            Some(&approval_manager),
-            surface,
-            None, // no origin chat on the CLI/scheduler surface
-            None,
-            None,
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            None,
-            None,
-            None,
-            ledger.as_deref(),
-            &crate::security::AuditActor::surface(),
+        let response = in_memory_view(
+            memory_view.as_ref(),
+            run_tool_call_loop(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                provider_name,
+                model_name,
+                temperature,
+                silent,
+                Some(&approval_manager),
+                surface,
+                None, // no origin chat on the CLI/scheduler surface
+                None,
+                None,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+                None,
+                None,
+                None,
+                ledger.as_deref(),
+                &crate::security::AuditActor::surface(),
+            ),
         )
         .await?;
         final_output = response.clone();
@@ -2834,11 +2839,9 @@ pub async fn run_with_scope(
             }
 
             // Inject memory context into user message
-            let mem_context = build_context_scoped(
-                mem.as_ref(),
-                &user_input,
-                config.memory.min_relevance_score,
-                conversation_id.as_deref(),
+            let mem_context = in_memory_view(
+                memory_view.as_ref(),
+                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score),
             )
             .await;
             let enriched = if mem_context.is_empty() {
@@ -2849,27 +2852,30 @@ pub async fn run_with_scope(
 
             history.push(ChatMessage::user(&enriched));
 
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                model_name,
-                temperature,
-                silent,
-                Some(&approval_manager),
-                "cli",
-                None, // CLI — no origin chat
-                None,
-                None,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                ledger.as_deref(),
-                &crate::security::AuditActor::surface(),
+            let response = match in_memory_view(
+                memory_view.as_ref(),
+                run_tool_call_loop(
+                    provider.as_ref(),
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    provider_name,
+                    model_name,
+                    temperature,
+                    silent,
+                    Some(&approval_manager),
+                    "cli",
+                    None, // CLI — no origin chat
+                    None,
+                    None,
+                    &config.multimodal,
+                    config.agent.max_tool_iterations,
+                    None,
+                    None,
+                    None,
+                    ledger.as_deref(),
+                    &crate::security::AuditActor::surface(),
+                ),
             )
             .await
             {
@@ -2921,9 +2927,10 @@ pub async fn run_with_scope(
     Ok(final_output)
 }
 
-/// Back-compat entry point: run with no conversation scope (global memory),
-/// exactly as before scoping was threaded through. The CLI/daemon callers have
-/// no conversation identity; only cron passes one (via `run_with_scope`).
+/// Entry point for the CLI and the daemon heartbeat: run under the `All` memory
+/// view. Both are private to the operator, and the heartbeat reply goes to the
+/// journal and the observer, never into a chat. Only cron passes another view
+/// (via `run_with_scope`).
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -2944,7 +2951,7 @@ pub async fn run(
         model_override,
         temperature,
         surface,
-        None,
+        Some(memory::MemoryView::All),
         None,
         // A one-shot CLI run owns its process, so it spawns its own servers and
         // drops them with the registry.
@@ -2984,7 +2991,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &security,
         runtime,
         mem.clone(),
-        crate::tools::memory_recall::ConversationScope::default(),
         composio_key,
         composio_entity_id,
         &config.browser,
@@ -3054,6 +3060,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        false,
+        // No door sets a view for this entry point, and a turn with no view
+        // reads nothing from memory.
         false,
     );
     if !native_tools {
@@ -5127,7 +5136,12 @@ Done."#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0).await;
+        let context = memory::MEMORY_VIEW
+            .scope(
+                memory::MemoryView::All,
+                build_context(&mem, "status updates", 0.0),
+            )
+            .await;
         assert!(context.contains("status_pref"));
         assert!(!context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
@@ -5187,26 +5201,41 @@ Done."#;
         }
     }
 
+    /// The preamble reads under the task's view: the view's own key for `Only`,
+    /// the global slot for `All`, and nothing at all when no door set one.
     #[tokio::test]
-    async fn build_context_scoped_forwards_conversation_id() {
+    async fn build_context_reads_under_the_tasks_view() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
         let mem = RecallScopeProbe {
             calls: calls.clone(),
         };
 
-        // Scoped: recall_layered(Some(cid)) reads the conversation first, then the
-        // shared backfill — proving the id reached build_memory_context.
-        let _ = build_context_scoped(&mem, "q", 0.0, Some("cron:job1")).await;
+        let _ = memory::MEMORY_VIEW
+            .scope(
+                memory::MemoryView::Only("cron:job1".into()),
+                build_context(&mem, "q", 0.0),
+            )
+            .await;
         assert_eq!(
             calls.lock().unwrap().clone(),
-            vec![Some("cron:job1".to_string()), None],
+            vec![Some("cron:job1".to_string())],
         );
 
         calls.lock().unwrap().clear();
 
-        // Unscoped: exactly one global read, as before.
-        let _ = build_context(&mem, "q", 0.0).await;
+        let _ = memory::MEMORY_VIEW
+            .scope(memory::MemoryView::All, build_context(&mem, "q", 0.0))
+            .await;
         assert_eq!(calls.lock().unwrap().clone(), vec![None]);
+
+        calls.lock().unwrap().clear();
+
+        let blind = build_context(&mem, "q", 0.0).await;
+        assert!(blind.is_empty());
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a task with no view must not read the backend"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -5813,6 +5842,7 @@ Let me check the result."#;
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
             false,
+            true,
         );
 
         // Must contain zero XML protocol artifacts

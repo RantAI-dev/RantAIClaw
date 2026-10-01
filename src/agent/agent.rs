@@ -103,16 +103,11 @@ pub struct Agent {
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
-    /// Conversation scope for layered memory. `None` (default) stores and
-    /// recalls turn memory globally — prior behavior. When set, this agent's
-    /// turn memory is stored under and recalled from this conversation id
-    /// (via `recall_layered`), so distinct conversations don't bleed context.
+    /// Conversation scope for the turn's memory writes. `None` (default)
+    /// stores turn memory in the shared tier. When set, this agent's turn
+    /// memory is stored under this conversation id. What a turn may read is
+    /// the door's [`crate::memory::MemoryView`], not this id.
     conversation_id: Option<String>,
-    /// Handle into the registry's `memory_recall` tool, written together with
-    /// `conversation_id` so the explicit recall tool follows the same scope
-    /// the injection path uses. Fresh (shared with nothing) on bare-builder
-    /// agents; `from_config` replaces it with the handle the registry holds.
-    memory_recall_scope: crate::tools::memory_recall::ConversationScope,
     /// Optional Layer-A tool-approval gate. `None` (default — TUI / `agent run`)
     /// means tools are not gated here (the shell tool's own `PendingApprovals`
     /// still applies). The console SSE surface sets this so non-read-only tools
@@ -203,8 +198,8 @@ impl AgentBuilder {
         self
     }
 
-    /// Scope this agent's turn memory to a conversation id (layered memory).
-    /// Omit for the default global behavior.
+    /// Store this agent's turn memory under a conversation id. Omit to store in
+    /// the shared tier. What a turn may read is the door's memory view.
     pub fn conversation_id(mut self, conversation_id: Option<String>) -> Self {
         self.conversation_id = conversation_id;
         self
@@ -347,7 +342,6 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             conversation_id: self.conversation_id,
-            memory_recall_scope: crate::tools::memory_recall::ConversationScope::default(),
             approval_manager: self.approval_manager,
             approval_backend: self.approval_backend,
             ledger: self.ledger,
@@ -528,13 +522,11 @@ impl Agent {
             None
         };
 
-        let memory_recall_scope = crate::tools::memory_recall::ConversationScope::default();
         let mut tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
             memory.clone(),
-            memory_recall_scope.clone(),
             composio_key,
             composio_entity_id,
             &config.browser,
@@ -650,7 +642,6 @@ impl Agent {
                 agent.security = Some(security);
                 agent.mcp_health = mcp_health;
                 agent.mcp_tools_by_server = mcp_tools_by_server;
-                agent.memory_recall_scope = memory_recall_scope;
                 // Every agent built from a real config is subject to the daily
                 // token ceiling. Bare-builder agents (tests, embeds) are not —
                 // they have no workspace to keep a ledger in.
@@ -675,17 +666,12 @@ impl Agent {
     /// via [`Agent::from_config`], `None` for bare-builder agents
     /// (tests/custom embeds). Use this to mutate the runtime allowlist
     /// or resolve pending approvals from outside the agent loop.
-    /// Point this agent's turn memory at a conversation.
+    /// Point this agent's turn memory writes at a conversation.
     ///
     /// Set per request by surfaces that serve more than one conversation through
     /// one agent, or that only learn the identity after construction. `None`
-    /// restores global behaviour.
+    /// restores the shared tier.
     pub fn set_conversation_id(&mut self, conversation_id: Option<String>) {
-        // Keep the explicit recall tool on the same scope as the injection
-        // path — one conversation identity, two readers.
-        if let Ok(mut slot) = self.memory_recall_scope.lock() {
-            slot.clone_from(&conversation_id);
-        }
         self.conversation_id = conversation_id;
     }
 
@@ -1004,6 +990,13 @@ impl Agent {
             // owner's path; guest-scoping applies only to channel turns and
             // does not apply here.
             skip_owner_files: false,
+            // `USER.md` and `MEMORY.md` are memory read into the prompt, so only
+            // a turn that sees all of memory carries them. The door sets the
+            // view before the turn starts, and this runs inside the turn.
+            inject_memory_files: matches!(
+                crate::memory::current_memory_view(),
+                Some(crate::memory::MemoryView::All)
+            ),
         };
         self.prompt_builder.build(&ctx)
     }
@@ -1095,10 +1088,9 @@ impl Agent {
                 )));
         }
 
-        // Store and recall turn memory under this agent's conversation scope.
-        // `None` (default) keeps the prior global behavior; when set, write-side
-        // (`store`) and read-side (`recall_layered`) agree so a conversation's
-        // memory is isolated yet still backfilled from shared/global memory.
+        // Store turn memory under this agent's conversation scope. `None`
+        // (default) writes to the shared tier. What the turn reads is the
+        // door's memory view, read by the loader below.
         let conversation_scope = self.conversation_id.as_deref();
 
         if self.auto_save {
@@ -1114,9 +1106,8 @@ impl Agent {
             .await;
         }
 
-        // Loader routes through recall_layered with the same conversation scope
-        // used for writes above, so reads and writes stay consistent.
-        // ready for when write-side scoping threads a conversation_id through.
+        // The loader reads under the door's memory view; a turn with no view
+        // recalls nothing.
         let context = self
             .memory_loader
             .load_context(self.memory.as_ref(), user_message, conversation_scope)
@@ -1789,40 +1780,6 @@ mod tests {
         let mut agent = build_test_agent("delegated");
         let text = agent.turn("hi").await.unwrap();
         assert_eq!(text, "delegated");
-    }
-
-    /// One conversation identity, two readers: setting the id must reach the
-    /// registry's `memory_recall` tool through the shared scope handle.
-    #[test]
-    fn set_conversation_id_updates_the_recall_scope_handle() {
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = Agent::builder()
-            .provider(Box::new(MockProvider {
-                responses: Mutex::new(vec![]),
-            }))
-            .tools(vec![])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .build()
-            .expect("agent builder should succeed");
-
-        agent.set_conversation_id(Some("tui:s1".into()));
-        assert_eq!(
-            agent.memory_recall_scope.lock().unwrap().as_deref(),
-            Some("tui:s1")
-        );
-        agent.set_conversation_id(None);
-        assert_eq!(agent.memory_recall_scope.lock().unwrap().as_deref(), None);
     }
 
     #[tokio::test]

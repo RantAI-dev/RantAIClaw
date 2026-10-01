@@ -9,6 +9,10 @@ pub mod memory_loader;
 pub mod prompt;
 
 #[cfg(test)]
+pub(crate) mod door_test_support;
+#[cfg(test)]
+mod memory_view_doors_tests;
+#[cfg(test)]
 mod tests;
 
 #[allow(unused_imports)]
