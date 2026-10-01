@@ -121,9 +121,11 @@ pub fn build_system_prompt(
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
+    inject_memory_files: bool,
 ) -> String {
-    // Default public surface: include `USER.md` and `MEMORY.md`. Owners and
-    // tests use this entry; the guest-only path goes through
+    // Default public surface: the owner's prompt. `inject_memory_files` says
+    // whether `USER.md` and `MEMORY.md` go in; the caller sets it from the memory
+    // view of the turn the prompt is for. The guest-only path goes through
     // [`build_system_prompt_with_mode`] with `skip_owner_files = true`.
     build_system_prompt_with_mode(
         workspace_dir,
@@ -135,9 +137,16 @@ pub fn build_system_prompt(
         false,
         crate::config::SkillsPromptInjectionMode::Full,
         false,
+        inject_memory_files,
     )
 }
 
+/// [`build_system_prompt`] with the guest and memory switches spelled out.
+///
+/// `skip_owner_files` builds the guest prompt. `inject_memory_files` says
+/// whether `USER.md` and `MEMORY.md` go in: the caller sets it from the memory
+/// view of the turn the prompt is for, since both files are memory read into
+/// the prompt.
 pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -148,6 +157,7 @@ pub fn build_system_prompt_with_mode(
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     skip_owner_files: bool,
+    inject_memory_files: bool,
 ) -> String {
     // Unified prompt builder: the SAME `SystemPromptBuilder` the TUI/`Agent`
     // path uses, with `surface = Channel` so the surface-specific hint sections
@@ -192,6 +202,7 @@ pub fn build_system_prompt_with_mode(
         autonomy_preset,
         allowed_commands: &[],
         skip_owner_files,
+        inject_memory_files,
     };
 
     let prompt = SystemPromptBuilder::with_defaults()

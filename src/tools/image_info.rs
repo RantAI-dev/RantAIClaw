@@ -198,7 +198,7 @@ impl Tool for ImageInfoTool {
         }
 
         if let Some(denial) =
-            crate::tools::guest_private_path_denial(&resolved_path, &self.security.workspace_dir)
+            crate::tools::private_file_read_denial(&resolved_path, &self.security.workspace_dir)
                 .await
         {
             return Ok(ToolResult {
@@ -563,9 +563,11 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    /// A turn no door gave a view (a webhook) is refused the owner's private
+    /// files, as a conversation-scoped turn is.
     #[cfg(unix)]
     #[tokio::test]
-    async fn execute_allows_symlink_to_user_md_without_guest_view() {
+    async fn execute_denies_symlink_to_user_md_with_no_view() {
         use std::os::unix::fs::symlink;
 
         let dir = std::env::temp_dir().join("rantaiclaw_image_info_no_view_symlink");
@@ -579,6 +581,43 @@ mod tests {
         let tool = ImageInfoTool::new(test_security());
         let path_str = dir.join("notes.png").to_string_lossy().to_string();
         let result = tool.execute(json!({"path": path_str})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("private to the owner"),
+            "{:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The control: the same link under the `All` view is read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_allows_symlink_to_user_md_under_the_all_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join("rantaiclaw_image_info_all_view_symlink");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("USER.md"), "owner profile")
+            .await
+            .unwrap();
+        symlink(dir.join("USER.md"), dir.join("notes.png")).unwrap();
+
+        let tool = ImageInfoTool::new(test_security());
+        let path_str = dir.join("notes.png").to_string_lossy().to_string();
+        let result = MEMORY_VIEW
+            .scope(MemoryView::All, async {
+                tool.execute(json!({"path": path_str})).await.unwrap()
+            })
+            .await;
 
         assert!(result.success, "control: {:?}", result.error);
 

@@ -14,6 +14,23 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+tokio::task_local! {
+    /// Set by channel dispatch around a non-owner's tool loop, and nowhere else.
+    ///
+    /// A `Tool` carries no sender, so the file tools cannot ask who the turn is
+    /// for. The memory view does not say either: a guest, an owner in a group
+    /// and a job created from a chat all run under `MemoryView::Only`. The rule
+    /// that stops a write to the owner's private files and prompt files keys on
+    /// this marker, so only a guest loses that access.
+    pub static GUEST_TURN: ();
+}
+
+/// True when the current task runs a guest's turn. See [`GUEST_TURN`].
+#[must_use]
+pub fn current_turn_is_guest() -> bool {
+    GUEST_TURN.try_with(|()| ()).is_ok()
+}
+
 /// The capability ceiling applied to a single non-owner ("guest") turn.
 #[derive(Debug, Clone)]
 pub struct GuestGate {

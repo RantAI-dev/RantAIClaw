@@ -26,19 +26,17 @@ pub(super) async fn resolve_unique_entry(
         return Err(format!("'{selector_name}' must not be empty"));
     }
 
-    // Under a guest's conversation-scoped turn, only that conversation's rows
-    // are candidates: listing the whole store would let a guest probe
-    // substrings across every conversation, and the ambiguity error below
-    // would name keys the guest has no business seeing.
-    let session_filter = match crate::memory::current_memory_view() {
-        Some(crate::memory::MemoryView::Only(key)) => Some(key),
-        _ => None,
-    };
-
-    let entries = memory
-        .list(None, session_filter.as_deref())
-        .await
-        .map_err(|e| format!("Failed to read memory: {e}"))?;
+    // The turn's view decides which rows are candidates. Under a guest's
+    // conversation-scoped turn, only that conversation's rows: listing the whole
+    // store would let a guest probe substrings across every conversation, and the
+    // ambiguity error below would name keys the guest has no business seeing. A
+    // turn with no view has nothing to read, so it finds no candidate at all.
+    let entries = match crate::memory::current_memory_view() {
+        Some(crate::memory::MemoryView::All) => memory.list(None, None).await,
+        Some(crate::memory::MemoryView::Only(key)) => memory.list(None, Some(key.as_str())).await,
+        None => Ok(Vec::new()),
+    }
+    .map_err(|e| format!("Failed to read memory: {e}"))?;
 
     let needle_lower = needle_trimmed.to_lowercase();
     let matches: Vec<&crate::memory::MemoryEntry> = entries
@@ -194,8 +192,9 @@ impl Tool for MemoryStoreTool {
         // cannot overwrite or move a note stored in another place. The
         // `MEMORY.md` projection holds shared notes only, so a guest's note
         // stays out of the owner's prompt.
-        let place = match crate::memory::current_memory_view() {
-            Some(crate::memory::MemoryView::Only(key)) => Some(key),
+        let view = crate::memory::current_memory_view();
+        let place = match &view {
+            Some(crate::memory::MemoryView::Only(key)) => Some(key.clone()),
             _ => None,
         };
 
@@ -249,8 +248,11 @@ impl Tool for MemoryStoreTool {
         // the superseded one's removal in a single rewrite.
         crate::memory::snapshot::refresh_projection(self.memory.as_ref(), &self.workspace_dir);
 
-        // The notice describes the owner's block, which a guest has no view of.
-        if category == MemoryCategory::Core && place.is_none() {
+        // The notice counts the shared notes, so it is a read of memory. It goes
+        // to a turn that sees all of it: not to a guest, whose notes are not in
+        // that block, and not to a turn with no view, which reads nothing.
+        if category == MemoryCategory::Core && matches!(view, Some(crate::memory::MemoryView::All))
+        {
             if let Some(notice) = self.core_capacity_notice().await {
                 output.push('\n');
                 output.push_str(&notice);
@@ -335,6 +337,15 @@ mod tests {
         (tmp, Arc::new(mem))
     }
 
+    /// Runs the tool the way a door that serves the operator does: under the
+    /// `All` view.
+    async fn execute_in_all_view(tool: &MemoryStoreTool, args: serde_json::Value) -> ToolResult {
+        crate::memory::MEMORY_VIEW
+            .scope(crate::memory::MemoryView::All, tool.execute(args))
+            .await
+            .unwrap()
+    }
+
     // ── the projection follows the store ──────────────────────────
 
     /// `MEMORY.md` is injected into every system prompt, and on sqlite it is a
@@ -375,14 +386,15 @@ mod tests {
         crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
 
         let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool
-            .execute(json!({
+        let result = execute_in_all_view(
+            &tool,
+            json!({
                 "key": "new_key",
                 "content": "the office is in Jakarta",
                 "replaces": "office is in Bandung",
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.success, "control: {:?}", result.error);
 
         let projected = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
@@ -519,14 +531,15 @@ mod tests {
         .unwrap();
 
         let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool
-            .execute(json!({
+        let result = execute_in_all_view(
+            &tool,
+            json!({
                 "key": "user_lang",
                 "content": "The operator prefers Rust",
                 "replaces": "prefers Python"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(result.success, "{:?}", result.error);
         assert!(
@@ -554,10 +567,11 @@ mod tests {
             .unwrap();
 
         let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool
-            .execute(json!({"key": "c", "content": "new", "replaces": "deploy"}))
-            .await
-            .unwrap();
+        let result = execute_in_all_view(
+            &tool,
+            json!({"key": "c", "content": "new", "replaces": "deploy"}),
+        )
+        .await;
 
         assert!(!result.success);
         let error = result.error.unwrap_or_default();
@@ -681,10 +695,11 @@ mod tests {
         let (tmp, mem) = test_mem();
         let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
 
-        let result = tool
-            .execute(json!({"key": "k", "content": "v", "replaces": "nothing like this"}))
-            .await
-            .unwrap();
+        let result = execute_in_all_view(
+            &tool,
+            json!({"key": "k", "content": "v", "replaces": "nothing like this"}),
+        )
+        .await;
 
         assert!(!result.success);
         assert!(result
@@ -705,10 +720,11 @@ mod tests {
         }
 
         let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool
-            .execute(json!({"key": "one_more", "content": "a durable fact"}))
-            .await
-            .unwrap();
+        let result = execute_in_all_view(
+            &tool,
+            json!({"key": "one_more", "content": "a durable fact"}),
+        )
+        .await;
 
         assert!(result.success, "the write must still succeed");
         assert!(
@@ -800,10 +816,11 @@ mod tests {
         }
 
         let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool
-            .execute(json!({"key": "one_more", "content": "a durable fact"}))
-            .await
-            .unwrap();
+        let result = execute_in_all_view(
+            &tool,
+            json!({"key": "one_more", "content": "a durable fact"}),
+        )
+        .await;
 
         assert!(result.success, "control: {:?}", result.error);
         assert_eq!(result.output, "Stored memory: one_more");
@@ -814,10 +831,8 @@ mod tests {
         let (tmp, mem) = test_mem();
         let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
 
-        let result = tool
-            .execute(json!({"key": "small", "content": "a durable fact"}))
-            .await
-            .unwrap();
+        let result =
+            execute_in_all_view(&tool, json!({"key": "small", "content": "a durable fact"})).await;
 
         assert!(result.success);
         assert!(
@@ -825,6 +840,63 @@ mod tests {
             "no notice below the budget, got: {}",
             result.output
         );
+    }
+
+    /// A turn no door gave a view reads nothing, and `replaces` is a read: it
+    /// finds no candidate, so the call fails and nothing is stored or removed.
+    #[tokio::test]
+    async fn store_with_replaces_and_no_view_reads_nothing() {
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "old_lang",
+            "The operator prefers Python",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = tool
+            .execute(json!({
+                "key": "user_lang",
+                "content": "The operator prefers Rust",
+                "replaces": "prefers Python"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("nothing to replace"), "{error}");
+        assert!(
+            mem.get("old_lang").await.unwrap().is_some(),
+            "the old row must survive"
+        );
+        assert!(mem.get("user_lang").await.unwrap().is_none());
+    }
+
+    /// The capacity notice counts the shared notes, which is a read. A turn
+    /// with no view gets the write and no count of the owner's notes.
+    #[tokio::test]
+    async fn core_store_shows_no_capacity_notice_with_no_view() {
+        let (tmp, mem) = test_mem();
+        let filler = "y".repeat(900);
+        for i in 0..6 {
+            mem.store(&format!("bulk_{i}"), &filler, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = tool
+            .execute(json!({"key": "one_more", "content": "a durable fact"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "control: {:?}", result.error);
+        assert_eq!(result.output, "Stored memory: one_more");
+        assert!(mem.get("one_more").await.unwrap().is_some());
     }
 
     // ── content screening ─────────────────────────────────────────

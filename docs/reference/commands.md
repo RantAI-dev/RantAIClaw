@@ -174,12 +174,20 @@ Notes:
 - `cron run` reuses the same manual-run path as the `cron_run` tool and the web `POST /api/v1/cron/{id}/run`: it records to run history but does not shift the schedule or consume a one-shot.
 - Mutating schedule/cron actions (CLI `cron add/add-at/add-every/once/update/remove/pause/resume/run`, the `cron_*` tools, and the `POST`/`PUT`/`DELETE` `/api/v1/cron*` endpoints) require `cron.enabled = true`; when it is false they are refused. Listing and run history stay readable. If `scheduler.enabled = false`, jobs persist but never fire — `cron list` shows a "scheduler disabled" banner.
 - Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
-- **`session_target` picks the memory scope an agent job runs with.** `isolated`
-  (the default) scopes the run to `cron:<job_id>`, so its `memory_recall` sees its
-  own rows plus the shared/global tier and nothing else. `main` runs with no scope
-  — the same global tier the CLI and daemon use — so the job shares context with
-  them. Set it through the `cron_add`/`cron_update` tools or the HTTP API; until
-  schema v29 the two values behaved identically.
+- **A job created from a chat reads only that chat.** A job that `cron_add` created
+  from a chat carries that chat's channel and reply target. Its run reads the
+  conversation of that chat, built the way channel dispatch builds it, and
+  nothing else: not the shared tier, not another chat, not `USER.md` or
+  `MEMORY.md` in the prompt. This holds for `main` and `isolated` alike. The
+  origin has no thread, so a job created in a thread reads the conversation of the
+  chat that holds the thread.
+- **A job with no chat reads all of memory, whatever its `session_target`.** A
+  job an operator creates from the CLI, the TUI or the console carries no chat.
+  Its run reads all of memory, as the CLI and the daemon heartbeat do: every
+  note, including notes scoped to other conversations, and `USER.md` and
+  `MEMORY.md` in its prompt. This holds for `main` and for `isolated`, the
+  default. `session_target` does not change the memory view of a job. Set it
+  through the `cron_add`/`cron_update` tools or the HTTP API.
 
 #### HTTP control (`/api/v1/cron*`)
 

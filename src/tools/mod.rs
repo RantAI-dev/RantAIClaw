@@ -30,43 +30,73 @@ the workspace directory; [autonomy].workspace_only and [autonomy].forbidden_path
 in config.toml control this. Move the file into the workspace, or have an operator \
 relax those settings.";
 
-/// The canonical workspace when this turn runs under a guest's
-/// conversation-scoped memory view (`MemoryView::Only`), or `None` for owner
-/// turns and turns without a view.
+/// The workspace, canonicalised.
 ///
 /// The workspace itself may be reached through a symlink (a temp dir on some
-/// platforms), so it is canonicalised here. Without that, `strip_prefix` in the
-/// guest path rules fails and their `memory/` and `skills/` directory rules are
-/// skipped; the file-name rules still apply.
-async fn guest_view_workspace(workspace_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    match crate::memory::current_memory_view() {
-        Some(crate::memory::MemoryView::Only(_)) => {}
-        _ => return None,
-    }
-    Some(
-        tokio::fs::canonicalize(workspace_dir)
-            .await
-            .unwrap_or_else(|_| workspace_dir.to_path_buf()),
-    )
+/// platforms). Without canonicalising it, `strip_prefix` in the private-path
+/// rules fails and their `memory/` and `skills/` directory rules are skipped;
+/// the file-name rules still apply.
+async fn canonical_workspace(workspace_dir: &std::path::Path) -> std::path::PathBuf {
+    tokio::fs::canonicalize(workspace_dir)
+        .await
+        .unwrap_or_else(|_| workspace_dir.to_path_buf())
 }
 
-/// Denial message for a **canonicalised** path a guest's conversation-scoped
-/// turn (`MemoryView::Only`) may not reach, or `None` when the turn carries no
-/// such view or the path is not private.
+/// Denial message for a **canonicalised** path this turn may not **read**, or
+/// `None` when the turn runs under the `All` view or the path is not private.
+///
+/// Reading the owner's private files (`MEMORY.md`, `USER.md`, `memory/` and the
+/// rest) needs the full view. A turn under `MemoryView::Only` (a guest, an owner
+/// in a group, a job created from a chat) and a turn no door gave a view (a
+/// webhook) are refused alike.
 ///
 /// `approval::guest::is_private_owner_path` runs on the string a caller asked
-/// for, before a file tool resolves it — a symlink, an editor backup name
-/// (`USER.md~`), or the snapshot file's real path can slip past that string
-/// rule while still pointing at the same private content. `file_read`,
-/// `file_write`, `pdf_read` and `image_info` all call this once they have a
-/// resolved path, closing that bypass. Owner turns and turns without a view
-/// never reach this: `current_memory_view()` is `None` or `All` for them.
-pub(crate) async fn guest_private_path_denial(
+/// for, before a file tool resolves it: a symlink, an editor backup name
+/// (`USER.md~`), or the snapshot file's real path can slip past that string rule
+/// while still pointing at the same private content. `file_read`, `pdf_read` and
+/// `image_info` call this once they have a resolved path, closing that bypass.
+pub(crate) async fn private_file_read_denial(
     resolved_path: &std::path::Path,
     workspace_dir: &std::path::Path,
 ) -> Option<String> {
-    let canonical_workspace = guest_view_workspace(workspace_dir).await?;
-    if crate::approval::guest::is_private_owner_path_resolved(resolved_path, &canonical_workspace) {
+    if matches!(
+        crate::memory::current_memory_view(),
+        Some(crate::memory::MemoryView::All)
+    ) {
+        return None;
+    }
+    if crate::approval::guest::is_private_owner_path_resolved(
+        resolved_path,
+        &canonical_workspace(workspace_dir).await,
+    ) {
+        Some(
+            "This file is private to the owner and is not reachable from this conversation."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Denial message for a **canonicalised** path a guest's turn may not **write**
+/// among the owner's private files, or `None` when the turn is not a guest's or
+/// the path is not private.
+///
+/// Keyed on the guest marker, not on the memory view: an owner in a group, a
+/// wildcard owner and a job created from a chat run under `MemoryView::Only` and
+/// keep the write access an owner has in a direct chat. Only `file_write` calls
+/// this; the read tools call [`private_file_read_denial`].
+pub(crate) async fn guest_private_file_write_denial(
+    resolved_path: &std::path::Path,
+    workspace_dir: &std::path::Path,
+) -> Option<String> {
+    if !crate::approval::guest::current_turn_is_guest() {
+        return None;
+    }
+    if crate::approval::guest::is_private_owner_path_resolved(
+        resolved_path,
+        &canonical_workspace(workspace_dir).await,
+    ) {
         Some(
             "This file is private to the owner and is not reachable from this conversation."
                 .to_string(),
@@ -78,15 +108,21 @@ pub(crate) async fn guest_private_path_denial(
 
 /// Denial message for a **canonicalised** write target that feeds the owner's
 /// prompt (`skills/` and the workspace-root prompt files), or `None` when the
-/// turn carries no guest view or the path is not one of them.
+/// turn is not a guest's or the path is not one of them.
 ///
-/// Only `file_write` calls this. Reading these files stays allowed.
+/// Keyed on the guest marker, as [`guest_private_file_write_denial`] is. Only
+/// `file_write` calls this. Reading these files stays allowed.
 pub(crate) async fn guest_prompt_file_write_denial(
     resolved_path: &std::path::Path,
     workspace_dir: &std::path::Path,
 ) -> Option<String> {
-    let canonical_workspace = guest_view_workspace(workspace_dir).await?;
-    if crate::approval::guest::is_owner_prompt_path_resolved(resolved_path, &canonical_workspace) {
+    if !crate::approval::guest::current_turn_is_guest() {
+        return None;
+    }
+    if crate::approval::guest::is_owner_prompt_path_resolved(
+        resolved_path,
+        &canonical_workspace(workspace_dir).await,
+    ) {
         Some(
             "This file feeds the owner's prompt and cannot be written from this conversation."
                 .to_string(),
@@ -270,7 +306,6 @@ pub fn all_tools(
         security,
         Arc::new(NativeRuntime::new()),
         memory,
-        memory_recall::ConversationScope::default(),
         composio_key,
         composio_entity_id,
         browser_config,
@@ -289,11 +324,6 @@ pub fn all_tools_with_runtime(
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
-    // Conversation scope for `memory_recall`. Surfaces that serve one
-    // conversation per registry (the interactive Agent) pass their own handle
-    // and keep it updated; multi-conversation surfaces pass a fresh unset
-    // handle (= global recall, the prior behaviour).
-    memory_recall_scope: memory_recall::ConversationScope,
     composio_key: Option<&str>,
     composio_entity_id: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
@@ -324,7 +354,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
-        Arc::new(MemoryRecallTool::new(memory.clone(), memory_recall_scope)),
+        Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(
             memory,
             security.clone(),

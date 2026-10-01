@@ -100,6 +100,13 @@ pub struct PromptContext<'a> {
     /// `AGENTS.md`, `SOUL.md` and `IDENTITY.md` still render: they describe
     /// the agent, not the operator.
     pub skip_owner_files: bool,
+    /// Inject `USER.md` and `MEMORY.md`: the operator's profile and the notes
+    /// projected from memory. They are memory read into the prompt, so the
+    /// door that builds the prompt sets this from the turn's memory view. A turn
+    /// that sees all of memory carries them; a turn limited to one conversation,
+    /// or with no view, does not. `skip_owner_files` still wins: a guest prompt
+    /// never carries them.
+    pub inject_memory_files: bool,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -297,6 +304,9 @@ impl PromptSection for IdentitySection {
         if ctx.skip_owner_files {
             files.retain(|file| !matches!(*file, "TOOLS.md" | "USER.md"));
         }
+        if !ctx.inject_memory_files {
+            files.retain(|file| *file != "USER.md");
+        }
         for file in files {
             inject_workspace_file(
                 &mut prompt,
@@ -339,7 +349,7 @@ impl PromptSection for IdentitySection {
         // Their conversation-local memory comes through the recall tier
         // (`memory_recall` + the dispatch memory-context injection); the
         // shared tier is owner-scoped only.
-        if !ctx.skip_owner_files {
+        if !ctx.skip_owner_files && ctx.inject_memory_files {
             inject_workspace_file(
                 &mut prompt,
                 ctx.workspace_dir,
@@ -444,6 +454,7 @@ fn render_safety(
         autonomy_preset,
         allowed_commands,
         skip_owner_files,
+        inject_memory_files: true,
     };
     SafetySection.build(&ctx).unwrap_or_default()
 }
@@ -988,6 +999,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
 
         let section = IdentitySection;
@@ -1021,6 +1033,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -1049,6 +1062,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Memory"), "nudge missing: {prompt}");
@@ -1076,6 +1090,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(
@@ -1102,6 +1117,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(
@@ -1127,6 +1143,7 @@ mod tests {
             autonomy_preset: Some(PolicyPreset::Smart),
             allowed_commands: &["ls *".to_string()],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1230,6 +1247,7 @@ mod tests {
             autonomy_preset: Some(PolicyPreset::Strict),
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1262,6 +1280,7 @@ mod tests {
             autonomy_preset: Some(PolicyPreset::Strict),
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1297,6 +1316,7 @@ mod tests {
             autonomy_preset: Some(PolicyPreset::Smart),
             allowed_commands: &["ls *".to_string()],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1329,6 +1349,7 @@ mod tests {
             autonomy_preset: Some(PolicyPreset::Manual),
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(out.contains("Manual (messaging channel)"), "{out}");
@@ -1373,6 +1394,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1420,6 +1442,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1446,6 +1469,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -1493,6 +1517,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: false,
+            inject_memory_files: true,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1541,6 +1566,7 @@ mod tests {
             autonomy_preset: None,
             allowed_commands: &[],
             skip_owner_files: true,
+            inject_memory_files: true,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1585,6 +1611,7 @@ mod tests {
                 autonomy_preset: None,
                 allowed_commands: &[],
                 skip_owner_files: false,
+                inject_memory_files: true,
             })
             .unwrap();
         let guest_prompt = SystemPromptBuilder::with_defaults()
@@ -1603,6 +1630,7 @@ mod tests {
                 autonomy_preset: None,
                 allowed_commands: &[],
                 skip_owner_files: true,
+                inject_memory_files: true,
             })
             .unwrap();
 
@@ -1613,6 +1641,69 @@ mod tests {
         assert!(
             !guest_prompt.contains("OWNER_MEMORY_CANARY_TOKEN_51297"),
             "guest prompt must not contain MEMORY.md, got:\n{guest_prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// `USER.md` and `MEMORY.md` are memory read into the prompt. A prompt built
+    /// for a turn that does not see all of memory carries neither, and the same
+    /// workspace still carries the other identity files, so the test is not
+    /// passing on an empty fixture.
+    #[test]
+    fn memory_files_follow_inject_memory_files() {
+        let workspace =
+            std::env::temp_dir().join(format!("rantaiclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("USER.md"), "PROFILE_CANARY_TOKEN_30418").unwrap();
+        std::fs::write(workspace.join("MEMORY.md"), "NOTES_CANARY_TOKEN_70215").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "SOUL_CANARY_TOKEN_44190").unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let build = |inject_memory_files: bool| {
+            SystemPromptBuilder::with_defaults()
+                .build(&PromptContext {
+                    workspace_dir: &workspace,
+                    model_name: "test-model",
+                    surface: PromptSurface::Channel {
+                        native_tools: false,
+                    },
+                    bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                    tools: &tools,
+                    skills: &[],
+                    skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                    identity_config: None,
+                    dispatcher_instructions: "",
+                    autonomy_preset: None,
+                    allowed_commands: &[],
+                    skip_owner_files: false,
+                    inject_memory_files,
+                })
+                .unwrap()
+        };
+
+        let with_files = build(true);
+        assert!(
+            with_files.contains("PROFILE_CANARY_TOKEN_30418"),
+            "{with_files}"
+        );
+        assert!(
+            with_files.contains("NOTES_CANARY_TOKEN_70215"),
+            "{with_files}"
+        );
+
+        let without_files = build(false);
+        assert!(
+            !without_files.contains("PROFILE_CANARY_TOKEN_30418"),
+            "USER.md reached a prompt that does not see memory:\n{without_files}"
+        );
+        assert!(
+            !without_files.contains("NOTES_CANARY_TOKEN_70215"),
+            "MEMORY.md reached a prompt that does not see memory:\n{without_files}"
+        );
+        assert!(
+            without_files.contains("SOUL_CANARY_TOKEN_44190"),
+            "the other identity files stay:\n{without_files}"
         );
 
         let _ = std::fs::remove_dir_all(workspace);
@@ -1673,6 +1764,7 @@ mod tests {
                 autonomy_preset: None,
                 allowed_commands: &[],
                 skip_owner_files: false,
+                inject_memory_files: true,
             })
             .unwrap();
         let guest_prompt = SystemPromptBuilder::with_defaults()
@@ -1691,6 +1783,7 @@ mod tests {
                 autonomy_preset: None,
                 allowed_commands: &[],
                 skip_owner_files: true,
+                inject_memory_files: true,
             })
             .unwrap();
 
@@ -1737,6 +1830,7 @@ mod tests {
                 autonomy_preset: None,
                 allowed_commands: &[],
                 skip_owner_files: false,
+                inject_memory_files: true,
             })
             .unwrap();
         let guest = IdentitySection
@@ -1755,6 +1849,7 @@ mod tests {
                 autonomy_preset: None,
                 allowed_commands: &[],
                 skip_owner_files: true,
+                inject_memory_files: true,
             })
             .unwrap();
 
@@ -1801,6 +1896,7 @@ mod tests {
                 autonomy_preset: None,
                 allowed_commands: &[],
                 skip_owner_files: false,
+                inject_memory_files: true,
             })
             .unwrap();
         let guest_prompt = SystemPromptBuilder::with_defaults()
@@ -1819,6 +1915,7 @@ mod tests {
                 autonomy_preset: None,
                 allowed_commands: &[],
                 skip_owner_files: true,
+                inject_memory_files: true,
             })
             .unwrap();
 

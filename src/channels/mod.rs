@@ -1391,7 +1391,6 @@ pub(crate) async fn build_channel_runtime(
         &security,
         runtime,
         Arc::clone(&mem),
-        crate::tools::memory_recall::ConversationScope::default(),
         composio_key,
         composio_entity_id,
         &config.browser,
@@ -1503,6 +1502,9 @@ pub(crate) async fn build_channel_runtime(
         native_tools,
         config.skills.prompt_injection_mode,
         false,
+        // Built once at start-up, outside any turn and so outside any memory
+        // view. It is the owner's prompt, and it carries the owner's files.
+        true,
     );
     // Same builder, with `skip_owner_files = true`, for the guest prompt. It
     // takes no tools: a guest's list follows the reloaded gate, per turn.
@@ -1519,6 +1521,7 @@ pub(crate) async fn build_channel_runtime(
         native_tools,
         config.skills.prompt_injection_mode,
         true,
+        false,
     );
     append_tool_instructions_when_not_native(
         &mut system_prompt,

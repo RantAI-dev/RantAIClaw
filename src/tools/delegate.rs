@@ -1064,6 +1064,136 @@ mod tests {
         assert!(result.output.contains("done"));
     }
 
+    /// Asks for `memory_recall` once, then answers, and keeps the text of every
+    /// tool message it was sent back.
+    #[derive(Default)]
+    struct RecallThenFinalProvider {
+        tool_messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecallThenFinalProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_messages: Vec<String> = request
+                .messages
+                .iter()
+                .filter(|m| m.role == "tool")
+                .map(|m| m.content.clone())
+                .collect();
+            if tool_messages.is_empty() {
+                return Ok(ChatResponse {
+                    usage: None,
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "memory_recall".to_string(),
+                        arguments: "{\"query\":\"lantern\"}".to_string(),
+                    }],
+                });
+            }
+            *self.tool_messages.lock().unwrap() = tool_messages;
+            Ok(ChatResponse {
+                usage: None,
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    /// What a sub-agent's `memory_recall` returns when the delegate runs under
+    /// `view` (or under none), over a store holding a note in the conversation
+    /// `chat:a` and one in the shared tier.
+    async fn delegated_recall(view: Option<crate::memory::MemoryView>) -> String {
+        use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+
+        let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let memory = SqliteMemory::new(workspace.path()).unwrap();
+        memory
+            .store(
+                "chat_note",
+                "A note about the lantern: juniperquartz",
+                MemoryCategory::Core,
+                Some("chat:a"),
+            )
+            .await
+            .unwrap();
+        memory
+            .store(
+                "shared_note",
+                "A note about the lantern: saffronquartz",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(memory);
+
+        let config = agentic_config(vec!["memory_recall".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
+            Arc::new(vec![Arc::new(crate::tools::MemoryRecallTool::new(memory))]),
+        );
+        let provider = RecallThenFinalProvider::default();
+
+        let run = tool.execute_agentic("agentic", &config, &provider, "run", 0.2);
+        let result = match view {
+            Some(view) => crate::memory::MEMORY_VIEW.scope(view, run).await,
+            None => run.await,
+        }
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let seen = provider.tool_messages.lock().unwrap().join("\n");
+        seen
+    }
+
+    /// A delegated sub-agent runs in the caller's task, so it inherits the
+    /// caller's memory view and cannot read more than the caller could. A turn
+    /// limited to one conversation delegates a read of that conversation.
+    #[tokio::test]
+    async fn a_delegated_agent_inherits_the_callers_conversation_view() {
+        let seen =
+            delegated_recall(Some(crate::memory::MemoryView::Only("chat:a".to_string()))).await;
+        assert!(seen.contains("juniperquartz"), "{seen}");
+        assert!(
+            !seen.contains("saffronquartz"),
+            "the sub-agent read a tier its caller could not:\n{seen}"
+        );
+    }
+
+    /// The same under the `All` view, and under none: the sub-agent reads what
+    /// its caller reads, which is everything or nothing.
+    #[tokio::test]
+    async fn a_delegated_agent_inherits_the_all_view_and_the_lack_of_one() {
+        let all = delegated_recall(Some(crate::memory::MemoryView::All)).await;
+        assert!(
+            all.contains("juniperquartz") && all.contains("saffronquartz"),
+            "{all}"
+        );
+
+        let none = delegated_recall(None).await;
+        assert!(none.contains("No memories found"), "{none}");
+    }
+
     #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_config(vec!["delegate".to_string()], 10);

@@ -60,7 +60,8 @@ pub(crate) fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
         .resolve()
 }
 
-/// The scope layered memory stores and recalls under.
+/// The scope a conversation's memory rows are stored under, and the key an
+/// `Only` memory view carries for it.
 ///
 /// Deliberately the **same** value as [`conversation_history_key`]: memory and
 /// history describe the same conversation, and keying them differently is what
@@ -146,20 +147,21 @@ pub(crate) fn find_provider_capability_error(
         .find_map(|cause| cause.downcast_ref::<ProviderCapabilityError>())
 }
 
+/// The `[Memory context]` block for a channel turn, read under `view`.
+///
+/// The view is passed in because this runs before the turn's view scope is
+/// entered. The shared builder owns the bounds and the filtering rules.
 pub(crate) async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
-    conversation_id: Option<&str>,
+    view: &MemoryView,
 ) -> String {
-    // The shared builder now owns these rules. This was the only one of the
-    // three that bounded its output; the agent loader and the CLI loop have
-    // been moved onto it rather than the other way round.
-    crate::memory::build_memory_context(
+    crate::memory::build_memory_context_in_view(
         mem,
         user_msg,
         min_relevance_score,
-        conversation_id,
+        view,
         crate::memory::MemoryContextLimits {
             max_entries: MEMORY_CONTEXT_MAX_ENTRIES,
             max_entry_chars: MEMORY_CONTEXT_ENTRY_MAX_CHARS,
@@ -758,7 +760,7 @@ pub(crate) async fn process_channel_message(
             return TurnEnd::Finished;
         }
     };
-    // Conversation scope for layered memory: one scope per chat/thread, the same
+    // Conversation scope for memory: one scope per chat/thread, the same
     // identity used for history keying — literally the same function, so the two
     // cannot drift again.
     //
@@ -807,6 +809,23 @@ pub(crate) async fn process_channel_message(
         msg.sender_identities(),
     );
 
+    // What this turn may read from memory. Only a named owner in a chat the
+    // platform marked as a direct message sees all of it. Everyone else, an
+    // owner in a group or in a chat the platform did not mark included, sees
+    // the conversation they are in. An owner through `approval_owners = ["*"]`
+    // has approval rights and no named identity, so never gets the private
+    // view. The same value drives the injected context below and every tool
+    // read in the turn.
+    let memory_view = if msg.is_direct
+        && crate::approval::is_named_owner_any(
+            &runtime_defaults.approval_owners,
+            msg.sender_identities(),
+        ) {
+        MemoryView::All
+    } else {
+        MemoryView::Only(conversation_scope.clone())
+    };
+
     // A guest may be shown workspace files only when the operator lets guests use
     // `file_read`. The prompt and the reply filter both read this.
     let guest_may_read_files =
@@ -828,41 +847,18 @@ pub(crate) async fn process_channel_message(
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     //
-    // A guest's view is `Only(conv)` — every recalled entry must carry its
-    // own `session_id`. The shared tier and other chats' auto-save rows are
-    // filtered out. Owner keeps the existing layered read (own conv + shared
-    // backfill, no cross-chat bleed). Same conversation key the rest of
-    // dispatch uses.
+    // The read goes through the turn's memory view, so a view limited to one
+    // conversation never lets the shared tier or another chat's auto-save rows
+    // reach the prompt. The view key is the conversation scope, not the bare
+    // sender, so two senders in the same chat cannot see each other's words.
     if !had_prior_history {
-        let memory_context = if sender_is_owner {
-            build_memory_context(
-                ctx.memory.as_ref(),
-                &msg.content,
-                runtime_defaults.min_relevance_score,
-                Some(conversation_scope.as_str()),
-            )
-            .await
-        } else {
-            // Same block builder, but the read goes through the view filter
-            // so shared-tier / cross-chat / no-session entries never reach
-            // the prompt. The view key is the conversation scope —
-            // `Only(conv)` — not the bare sender, so two guests in the same
-            // chat cannot see each other's words.
-            let view = MemoryView::Only(conversation_scope.clone());
-            crate::memory::build_memory_context_in_view(
-                ctx.memory.as_ref(),
-                &msg.content,
-                runtime_defaults.min_relevance_score,
-                &view,
-                crate::memory::MemoryContextLimits {
-                    max_entries: MEMORY_CONTEXT_MAX_ENTRIES,
-                    max_entry_chars: MEMORY_CONTEXT_ENTRY_MAX_CHARS,
-                    max_total_chars: MEMORY_CONTEXT_MAX_CHARS,
-                },
-            )
-            .await
-            .block
-        };
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            runtime_defaults.min_relevance_score,
+            &memory_view,
+        )
+        .await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{}", msg.content);
@@ -1110,66 +1106,71 @@ pub(crate) async fn process_channel_message(
             // a shell approval registers unscoped and cannot be answered by a
             // bare `ok` from the chat that triggered it.
             //
-            // Memory view: a guest's tool reads (memory_recall when an
-            // operator allowed it) are scoped to this conversation's own
-            // session id. Owners get no view set, which is exactly today's
-            // behaviour. The outer crate::memory::MEMORY_VIEW task-local is
-            // a sibling of TURN_SCOPE, set the same way per turn.
-            crate::security::TURN_SCOPE.scope(
-                (msg.channel.clone(), msg.reply_target.clone()),
-                async {
-                    if sender_is_owner {
-                        run_tool_call_loop(
-                            active_provider.as_ref(),
-                            &mut history,
-                            ctx.tools_registry.as_ref(),
-                            ctx.observer.as_ref(),
-                            route.provider.as_str(),
-                            route.model.as_str(),
-                            runtime_defaults.temperature,
-                            true,
-                            tool_gate,
-                            msg.channel.as_str(),
-                            // Origin chat → `cron_add` delivery safety net (announce channels).
-                            Some(msg.reply_target.as_str()),
-                            chat_relay_backend_ref,
-                            guest_gate_ref,
-                            &ctx.multimodal,
-                            runtime_defaults.max_tool_iterations,
-                            Some(cancellation_token.clone()),
-                            delta_tx,
-                            None,
-                            ctx.ledger.as_deref(),
-                            &audit_actor,
-                        )
-                        .await
-                    } else {
-                        let view = MemoryView::Only(conversation_scope.clone());
-                        MEMORY_VIEW.scope(view, run_tool_call_loop(
-                            active_provider.as_ref(),
-                            &mut history,
-                            &guest_turn_tools,
-                            ctx.observer.as_ref(),
-                            route.provider.as_str(),
-                            route.model.as_str(),
-                            runtime_defaults.temperature,
-                            true,
-                            tool_gate,
-                            msg.channel.as_str(),
-                            // Origin chat → `cron_add` delivery safety net (announce channels).
-                            Some(msg.reply_target.as_str()),
-                            chat_relay_backend_ref,
-                            guest_gate_ref,
-                            &ctx.multimodal,
-                            runtime_defaults.max_tool_iterations,
-                            Some(cancellation_token.clone()),
-                            delta_tx,
-                            None,
-                            ctx.ledger.as_deref(),
-                            &audit_actor,
-                        )).await
-                    }
-                },
+            // Memory view: the tool reads of this turn (`memory_recall` and the
+            // rest) follow `memory_view`, set once above from who asked and
+            // where. The outer `MEMORY_VIEW` task-local is a sibling of
+            // `TURN_SCOPE`, set the same way per turn.
+            MEMORY_VIEW.scope(
+                memory_view.clone(),
+                crate::security::TURN_SCOPE.scope(
+                    (msg.channel.clone(), msg.reply_target.clone()),
+                    async {
+                        if sender_is_owner {
+                            run_tool_call_loop(
+                                active_provider.as_ref(),
+                                &mut history,
+                                ctx.tools_registry.as_ref(),
+                                ctx.observer.as_ref(),
+                                route.provider.as_str(),
+                                route.model.as_str(),
+                                runtime_defaults.temperature,
+                                true,
+                                tool_gate,
+                                msg.channel.as_str(),
+                                // Origin chat → `cron_add` delivery safety net (announce channels).
+                                Some(msg.reply_target.as_str()),
+                                chat_relay_backend_ref,
+                                guest_gate_ref,
+                                &ctx.multimodal,
+                                runtime_defaults.max_tool_iterations,
+                                Some(cancellation_token.clone()),
+                                delta_tx,
+                                None,
+                                ctx.ledger.as_deref(),
+                                &audit_actor,
+                            )
+                            .await
+                        } else {
+                            // The guest marker the file tools read: `Only` alone
+                            // does not say a turn is a guest's, since an owner in a
+                            // group runs under it too.
+                            crate::approval::guest::GUEST_TURN.scope((), run_tool_call_loop(
+                                active_provider.as_ref(),
+                                &mut history,
+                                &guest_turn_tools,
+                                ctx.observer.as_ref(),
+                                route.provider.as_str(),
+                                route.model.as_str(),
+                                runtime_defaults.temperature,
+                                true,
+                                tool_gate,
+                                msg.channel.as_str(),
+                                // Origin chat → `cron_add` delivery safety net (announce channels).
+                                Some(msg.reply_target.as_str()),
+                                chat_relay_backend_ref,
+                                guest_gate_ref,
+                                &ctx.multimodal,
+                                runtime_defaults.max_tool_iterations,
+                                Some(cancellation_token.clone()),
+                                delta_tx,
+                                None,
+                                ctx.ledger.as_deref(),
+                                &audit_actor,
+                            ))
+                            .await
+                        }
+                    },
+                ),
             ),
         ) => LlmExecutionResult::Completed(result),
     };

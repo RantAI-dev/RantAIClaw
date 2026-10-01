@@ -8138,6 +8138,29 @@ pub(crate) fn provider_key_status(c: &crate::config::Config) -> Option<bool> {
     )
 }
 
+/// Re-feeds the stored turns of session `resume_id` to `agent`, so the model
+/// remembers the earlier conversation.
+fn restore_resumed_session(agent: &mut Agent, resume_id: &str) {
+    match crate::sessions::cli::open_store().and_then(|s| s.get_messages(resume_id)) {
+        Ok(msgs) => {
+            let prior = crate::sessions::messages_to_turns(&msgs);
+            if !prior.is_empty() {
+                // Rebuilding the system prompt reads the view, and the actor
+                // sets it only around each turn. The TUI is the operator's own
+                // surface, so the rebuild runs under the `All` view too.
+                let restored = crate::memory::MEMORY_VIEW
+                    .sync_scope(crate::memory::MemoryView::All, || {
+                        agent.restore_history(&prior)
+                    });
+                if let Err(e) = restored {
+                    tracing::warn!("failed to restore resumed history: {e}");
+                }
+            }
+        }
+        Err(e) => tracing::warn!("could not load resumed session {resume_id}: {e}"),
+    }
+}
+
 pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("TUI requires an interactive terminal (stdin is not a TTY)");
@@ -8186,17 +8209,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // actually remembers the earlier conversation (not just the scrollback).
     if let Some(resume_id) = tui_config.resume_session.as_deref() {
         if let Some(agent) = agent.as_mut() {
-            match crate::sessions::cli::open_store().and_then(|s| s.get_messages(resume_id)) {
-                Ok(msgs) => {
-                    let prior = crate::sessions::messages_to_turns(&msgs);
-                    if !prior.is_empty() {
-                        if let Err(e) = agent.restore_history(&prior) {
-                            tracing::warn!("failed to restore resumed history: {e}");
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("could not load resumed session {resume_id}: {e}"),
-            }
+            restore_resumed_session(agent, resume_id);
         }
     }
 
@@ -10625,5 +10638,44 @@ mod scrollback_cast_tests {
         let row_count = usize::MAX;
         let clamped = u16::try_from(row_count).unwrap_or(u16::MAX);
         assert_eq!(clamped, u16::MAX);
+    }
+}
+
+#[cfg(test)]
+mod resume_view_tests {
+    use super::restore_resumed_session;
+    use crate::agent::door_test_support::DoorFixture;
+    use crate::agent::Agent;
+
+    /// Resuming a session rebuilds the system prompt from the stored turns,
+    /// before the actor starts the first turn. The TUI reads all of memory, so
+    /// that prompt carries the owner's files.
+    #[tokio::test]
+    async fn resuming_a_session_sends_the_owner_files() {
+        let fixture = DoorFixture::start().await;
+        let session_id = crate::sessions::cli::open_store()
+            .expect("the sessions store opens")
+            .record_api_turn(
+                "mock-model",
+                None,
+                "an earlier question",
+                "an earlier answer",
+            )
+            .expect("a session is stored");
+
+        let mut agent = Agent::from_config(&fixture.config)
+            .await
+            .expect("the agent builds");
+        restore_resumed_session(&mut agent, &session_id);
+        crate::memory::MEMORY_VIEW
+            .scope(
+                crate::memory::MemoryView::All,
+                agent.turn("what about the lantern"),
+            )
+            .await
+            .expect("the turn runs against the local server");
+
+        assert_eq!(fixture.llm.request_count(), 1);
+        fixture.assert_last_system_prompt_carries_the_owner_files();
     }
 }
