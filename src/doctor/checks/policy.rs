@@ -7,12 +7,19 @@ use crate::doctor::{CheckResult, DoctorCheck, DoctorContext};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllowlistDiagnosis {
-    Healthy { count: usize, has_wildcard: bool },
+    Healthy { count: usize },
     Empty,
     Missing,
     Malformed(String),
 }
 
+/// Read the `<profile>/policy/command_allowlist.toml` file and classify it.
+///
+/// The file is written by `crate::approval::policy_writer::write_policy_files`
+/// with `[command_allowlist].patterns = [...]` — that shape, not a top-level
+/// `commands` array, is what the agent prompt and the on-disk reality use.
+/// Reading the wrong key is the doctor-bug this whole module exists to
+/// keep fixed; tests build every fixture with the real writer.
 pub fn diagnose_allowlist(file: &Path) -> AllowlistDiagnosis {
     if !file.exists() {
         return AllowlistDiagnosis::Missing;
@@ -21,22 +28,22 @@ pub fn diagnose_allowlist(file: &Path) -> AllowlistDiagnosis {
         Ok(s) => s,
         Err(e) => return AllowlistDiagnosis::Malformed(e.to_string()),
     };
-    let parsed: toml::Table = match raw.parse() {
+    let table: toml::Table = match raw.parse() {
         Ok(v) => v,
         Err(e) => return AllowlistDiagnosis::Malformed(e.to_string()),
     };
-    let entries = parsed
-        .get("commands")
+    let entries = table
+        .get("command_allowlist")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("patterns"))
         .and_then(toml::Value::as_array)
         .cloned()
         .unwrap_or_default();
     if entries.is_empty() {
         return AllowlistDiagnosis::Empty;
     }
-    let has_wildcard = entries.iter().any(|v| v.as_str() == Some("*"));
     AllowlistDiagnosis::Healthy {
         count: entries.len(),
-        has_wildcard,
     }
 }
 
@@ -56,48 +63,58 @@ impl DoctorCheck for AllowlistCheck {
             .root
             .join("policy")
             .join("command_allowlist.toml");
-        let diag = diagnose_allowlist(&file);
-        let strict_like = matches!(
-            ctx.config.autonomy.level,
-            crate::security::AutonomyLevel::ReadOnly | crate::security::AutonomyLevel::Supervised
-        );
+        let file_diag = diagnose_allowlist(&file);
+        let level = ctx.config.autonomy.level;
+        let allowed_commands = &ctx.config.autonomy.allowed_commands;
 
-        match diag {
-            AllowlistDiagnosis::Healthy { count, has_wildcard } => {
-                if has_wildcard {
-                    CheckResult::warn(
-                        self.name(),
-                        format!("allowlist has {count} entries but includes a bare \"*\""),
-                    )
-                    .with_category(self.category())
-                    .with_hint("replace \"*\" with explicit command globs")
-                } else {
-                    CheckResult::ok(self.name(), format!("allowlist healthy ({count} entries)"))
-                        .with_category(self.category())
-                }
-            }
-            AllowlistDiagnosis::Empty if strict_like => CheckResult::warn(
+        // File malformed wins everything: the model prompt renders nothing
+        // (agent.rs falls back to `unwrap_or_default()`), so the user must
+        // see and fix it.
+        if let AllowlistDiagnosis::Malformed(ref err) = file_diag {
+            return CheckResult::fail(
                 self.name(),
-                "strict-like autonomy mode with empty allowlist — every tool call will require approval",
+                format!("command_allowlist.toml is malformed: {err}"),
             )
             .with_category(self.category())
-            .with_hint("run: rantaiclaw setup approvals"),
-            AllowlistDiagnosis::Empty => CheckResult::info(
+            .with_hint("delete or fix the file then re-run doctor");
+        }
+
+        // Gate warning — the source the shell `is_command_allowed` actually
+        // reads is `config.autonomy.allowed_commands`. The bare-`*` warning
+        // the old check emitted was about a key the gate does NOT treat as
+        // allow-all (`a == base_cmd` is an exact match), so dropping the
+        // warning also keeps the operator from chasing a fake fix. Under
+        // `ReadOnly` the gate denies every shell command regardless, and
+        // under `Full` it allows them — so neither level needs a heads-up.
+        if level == crate::security::AutonomyLevel::Supervised && allowed_commands.is_empty() {
+            return CheckResult::warn(
                 self.name(),
-                "allowlist is empty (autonomy mode is permissive)",
+                "[autonomy].allowed_commands is empty under Supervised — every shell command outside the runtime allowlist will prompt for approval",
             )
-            .with_category(self.category()),
+            .with_category(self.category())
+            .with_hint(
+                "run: rantaiclaw setup approvals (or set [autonomy].allowed_commands in config.toml)",
+            );
+        }
+
+        // No gate warning — report the on-disk file as the model sees it.
+        match file_diag {
             AllowlistDiagnosis::Missing => CheckResult::info(
                 self.name(),
-                "no command_allowlist.toml yet (will be created on first approval)",
+                "no command_allowlist.toml yet (written when a preset is applied: `rantaiclaw setup approvals`)",
             )
             .with_category(self.category()),
-            AllowlistDiagnosis::Malformed(e) => CheckResult::fail(
+            AllowlistDiagnosis::Empty => CheckResult::ok(
                 self.name(),
-                format!("command_allowlist.toml is malformed: {e}"),
+                "command_allowlist.toml is empty (no pre-approved commands shown to the model)",
             )
-            .with_category(self.category())
-            .with_hint("delete or fix the file then re-run doctor"),
+            .with_category(self.category()),
+            AllowlistDiagnosis::Healthy { count } => CheckResult::ok(
+                self.name(),
+                format!("command_allowlist.toml reports {count} pre-approved patterns shown to the model"),
+            )
+            .with_category(self.category()),
+            AllowlistDiagnosis::Malformed(_) => unreachable!("handled above"),
         }
     }
 }
@@ -105,7 +122,32 @@ impl DoctorCheck for AllowlistCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::policy_writer::{self, PolicyPreset};
+    use crate::config::Config;
+    use crate::doctor::Severity;
+    use crate::profile::Profile;
     use tempfile::TempDir;
+
+    /// Count the patterns in the Smart bundle. Used as the test's expected
+    /// value so the assertion tracks the writer rather than a literal count.
+    fn smart_command_allowlist_count() -> usize {
+        let bundle = include_str!("../../approval/presets/policy_smart.toml");
+        let parsed: toml::Table = bundle.parse().expect("smart bundle parses");
+        parsed
+            .get("command_allowlist")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("patterns"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .expect("smart bundle has command_allowlist.patterns")
+    }
+
+    fn profile_with(tmp: &TempDir) -> Profile {
+        Profile {
+            name: "test".into(),
+            root: tmp.path().to_path_buf(),
+        }
+    }
 
     #[test]
     fn diagnose_returns_missing_when_file_absent() {
@@ -115,38 +157,29 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_returns_empty_for_zero_entries() {
+    fn diagnose_returns_empty_when_writer_wrote_an_empty_patterns_list() {
         let tmp = TempDir::new().unwrap();
-        let file = tmp.path().join("command_allowlist.toml");
-        std::fs::write(&file, "commands = []\n").unwrap();
-        assert_eq!(diagnose_allowlist(&file), AllowlistDiagnosis::Empty);
+        let profile = profile_with(&tmp);
+        // Manual preset ships with `patterns = []` — the writer puts that on
+        // disk under `<profile>/policy/command_allowlist.toml`.
+        policy_writer::write_policy_files(&profile, PolicyPreset::Manual, true)
+            .expect("writer succeeds for Manual");
+        let allowlist = profile.policy_dir().join("command_allowlist.toml");
+        assert_eq!(diagnose_allowlist(&allowlist), AllowlistDiagnosis::Empty);
     }
 
     #[test]
-    fn diagnose_returns_healthy_with_count() {
+    fn diagnose_returns_healthy_with_count_when_writer_wrote_patterns() {
         let tmp = TempDir::new().unwrap();
-        let file = tmp.path().join("command_allowlist.toml");
-        std::fs::write(&file, "commands = [\"git status\", \"ls -la\"]\n").unwrap();
+        let profile = profile_with(&tmp);
+        let expected = smart_command_allowlist_count();
+        assert!(expected > 0, "Smart bundle must declare patterns");
+        policy_writer::write_policy_files(&profile, PolicyPreset::Smart, true)
+            .expect("writer succeeds for Smart");
+        let allowlist = profile.policy_dir().join("command_allowlist.toml");
         assert_eq!(
-            diagnose_allowlist(&file),
-            AllowlistDiagnosis::Healthy {
-                count: 2,
-                has_wildcard: false
-            }
-        );
-    }
-
-    #[test]
-    fn diagnose_flags_bare_wildcard() {
-        let tmp = TempDir::new().unwrap();
-        let file = tmp.path().join("command_allowlist.toml");
-        std::fs::write(&file, "commands = [\"*\"]\n").unwrap();
-        assert_eq!(
-            diagnose_allowlist(&file),
-            AllowlistDiagnosis::Healthy {
-                count: 1,
-                has_wildcard: true
-            }
+            diagnose_allowlist(&allowlist),
+            AllowlistDiagnosis::Healthy { count: expected }
         );
     }
 
@@ -159,6 +192,117 @@ mod tests {
             AllowlistDiagnosis::Malformed(_) => {}
             other => panic!("expected Malformed, got {other:?}"),
         }
+    }
+
+    // ── AllowlistCheck::run — gate wiring ──────────────────────────────
+
+    fn stage_allowlist_file(root: &std::path::Path, diag: &AllowlistDiagnosis) {
+        use std::fmt::Write as _;
+        let dir = root.join("policy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("command_allowlist.toml");
+        match diag {
+            AllowlistDiagnosis::Missing => {}
+            AllowlistDiagnosis::Empty => {
+                std::fs::write(&file, "[command_allowlist]\npatterns = []\n").unwrap();
+            }
+            AllowlistDiagnosis::Healthy { count } => {
+                let mut body = String::from("[command_allowlist]\npatterns = [\n");
+                for i in 0..*count {
+                    writeln!(body, "  \"p{i}\",").unwrap();
+                }
+                body.push_str("]\n");
+                std::fs::write(&file, body).unwrap();
+            }
+            AllowlistDiagnosis::Malformed(_) => {
+                std::fs::write(&file, "this is { not toml = ").unwrap();
+            }
+        }
+    }
+
+    fn run_check(
+        level: crate::security::AutonomyLevel,
+        allowed_commands: Vec<String>,
+        file_diag: AllowlistDiagnosis,
+    ) -> CheckResult {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.autonomy.level = level;
+        config.autonomy.allowed_commands = allowed_commands;
+        stage_allowlist_file(tmp.path(), &file_diag);
+        let ctx = DoctorContext {
+            profile: profile_with(&tmp),
+            config,
+            offline: true,
+        };
+        futures::executor::block_on(AllowlistCheck.run(&ctx))
+    }
+
+    #[test]
+    fn run_warns_when_allowed_commands_empty_under_supervised() {
+        let r = run_check(
+            crate::security::AutonomyLevel::Supervised,
+            vec![],
+            AllowlistDiagnosis::Missing,
+        );
+        assert_eq!(r.severity, Severity::Warn, "{}", r.message);
+        assert!(
+            r.message.contains("allowed_commands"),
+            "warn should name the gate key: {}",
+            r.message
+        );
+        let hint = r.hint.expect("warn should carry a hint");
+        assert!(
+            hint.contains("setup approvals"),
+            "hint should name `rantaiclaw setup approvals`: {hint}"
+        );
+        assert!(
+            hint.contains("allowed_commands"),
+            "hint should name `[autonomy].allowed_commands`: {hint}"
+        );
+    }
+
+    #[test]
+    fn run_does_not_warn_when_allowed_commands_non_empty_under_supervised() {
+        let r = run_check(
+            crate::security::AutonomyLevel::Supervised,
+            vec!["git".to_string(), "ls".to_string()],
+            AllowlistDiagnosis::Healthy { count: 63 },
+        );
+        assert_ne!(r.severity, Severity::Warn, "{}", r.message);
+        assert_eq!(r.severity, Severity::Ok, "{}", r.message);
+        assert!(
+            r.message.contains("63"),
+            "ok should report the file's pattern count: {}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn run_does_not_warn_about_approvals_under_read_only() {
+        let r = run_check(
+            crate::security::AutonomyLevel::ReadOnly,
+            vec![],
+            AllowlistDiagnosis::Healthy { count: 63 },
+        );
+        assert_ne!(
+            r.severity,
+            Severity::Warn,
+            "ReadOnly must never warn about approvals: {}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn run_does_not_warn_about_approvals_under_full() {
+        // Full mode allows every shell command by default, so an empty
+        // allowed_commands is the expected state — never a warning.
+        let r = run_check(
+            crate::security::AutonomyLevel::Full,
+            vec![],
+            AllowlistDiagnosis::Healthy { count: 63 },
+        );
+        assert_ne!(r.severity, Severity::Warn, "{}", r.message);
     }
 }
 
