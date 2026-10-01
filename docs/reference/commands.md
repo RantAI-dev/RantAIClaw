@@ -38,8 +38,6 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `skills` | List/install/remove skills |
 | `config` | Show the active config (redacted) or export its JSON schema |
 | `completions` | Generate shell completion scripts to stdout |
-| `hardware` | Discover and introspect USB hardware (present in every build; real USB access needs `--features hardware`) |
-| `peripheral` | Configure and flash peripherals (needs `--features hardware` for serial/flash access) |
 | `kb` | Knowledge Base CRUD + maintenance (in the default build) |
 | `ui` | Install/run/stop the optional web console (claw-ui) |
 | `memory` | Agent memory: list, get, add, recall, reindex, stats, clear |
@@ -118,7 +116,6 @@ Single-topic examples:
 - `rantaiclaw agent`
 - `rantaiclaw agent -m "Hello"`
 - `rantaiclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `rantaiclaw agent --peripheral <board:path>`
 
 ### `gateway` / `daemon`
 
@@ -364,22 +361,6 @@ rows, and the output says when it is showing a subset.
 - `rantaiclaw completions elvish`
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
-
-### `hardware`
-
-The subcommands are always registered, but real USB enumeration needs the `hardware` feature (not in the default set). Without it they print `Hardware discovery requires the 'hardware' feature. Build with: cargo build --features hardware` and exit `0`.
-
-- `rantaiclaw hardware discover`
-- `rantaiclaw hardware introspect <path>`
-- `rantaiclaw hardware info [--chip <chip_name>]`
-
-### `peripheral`
-
-- `rantaiclaw peripheral list`
-- `rantaiclaw peripheral add <board> <path>`
-- `rantaiclaw peripheral flash [--port <serial_port>]`
-- `rantaiclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `rantaiclaw peripheral flash-nucleo`
 
 ### `kb` (Knowledge Base)
 

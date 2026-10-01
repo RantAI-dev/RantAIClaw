@@ -35,7 +35,6 @@ Last reviewed: **February 18, 2026**.
 | `docs/reference/README.md` | Current Guide | users/operators |
 | `docs/operations/README.md` | Current Guide | operators |
 | `docs/security/README.md` | Current Guide | operators/contributors |
-| `docs/hardware/README.md` | Current Guide | hardware builders |
 | `docs/contributing/README.md` | Current Guide | contributors/reviewers |
 | `docs/project/README.md` | Current Guide | maintainers |
 
@@ -56,13 +55,6 @@ Last reviewed: **February 18, 2026**.
 | `docs/start/troubleshooting.md` | Current Guide | users/operators |
 | `docs/operations/network-deployment.md` | Current Guide | operators |
 | `docs/reference/mattermost-setup.md` | Current Guide | operators |
-| `docs/hardware/adding-boards-and-tools.md` | Current Guide | hardware builders |
-| `docs/hardware/arduino-uno-q-setup.md` | Current Guide | hardware builders |
-| `docs/hardware/nucleo-setup.md` | Current Guide | hardware builders |
-| `docs/hardware/peripherals-design.md` | Current Design Spec | hardware contributors |
-| `docs/datasheets/nucleo-f401re.md` | Current Hardware Reference | hardware builders |
-| `docs/datasheets/arduino-uno.md` | Current Hardware Reference | hardware builders |
-| `docs/datasheets/esp32.md` | Current Hardware Reference | hardware builders |
 
 ## Policy / Process Docs
 

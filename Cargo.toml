@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/robot-kit"]
+members = ["."]
 resolver = "2"
 
 [package]
@@ -189,19 +189,10 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 
 # Serial port for peripheral communication (STM32, etc.)
-tokio-serial = { version = "5", default-features = false, optional = true }
 russh = { version = "0.60", optional = true }
 russh-sftp = { version = "2.0", optional = true }
 
-# USB device enumeration (hardware discovery) — only on platforms nusb supports
-# (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
-[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-nusb = { version = "0.2", default-features = false, optional = true }
-
-# probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.32", optional = true }
-
-# PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
+# PDF extraction for the pdf_read tool and KB ingestion (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.12", optional = true }
 
 # Terminal QR rendering (used by `whatsapp-web` for pairing display, and any
@@ -243,12 +234,6 @@ indexmap = "2"
 calamine = { version = "0.36", optional = true }
 docx-rs = { version = "0.4", optional = true }
 
-# Raspberry Pi GPIO (Linux only) — target-specific to avoid compile failure on macOS.
-# The `landlock` crate lived here for the sandbox backend plan 305 deleted; it had
-# no other consumer, so it goes with it.
-[target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.22", optional = true }
-
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -266,14 +251,10 @@ default = ["tui", "whatsapp-web", "remote-install", "kb", "channel-lark"]
 # plans/025-rigprovider-auth-parity.md.
 legacy-providers = []
 tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width"]
-hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
-peripheral-rpi = ["rppal"]
-# probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
-probe = ["dep:probe-rs"]
-# rag-pdf = PDF ingestion for datasheet RAG
+# rag-pdf = PDF extraction for pdf_read and the knowledge base
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-tokio-transport", "dep:prost"]

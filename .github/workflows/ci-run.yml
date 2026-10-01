@@ -293,16 +293,12 @@ jobs:
                 # `all-features` is still omitted, but no longer because of
                 # matrix-sdk: 0.18 type-checks at the default limit, and
                 # `channel-matrix` has its own job above. What `all-features`
-                # would additionally pull is the hardware/probe/postgres set
-                # (rppal, probe-rs and ~50 of its deps, tokio-postgres), which
-                # is a separate cost question from this one. Re-adding it is a
+                # would additionally pull is tokio-postgres, which is a
+                # separate cost question from this one. Re-adding it is a
                 # follow-up, not a side effect of the matrix pin bump.
                 include:
                     - name: no-default-features
                       args: --no-default-features
-                      install_libudev: false
-                    - name: hardware-only
-                      args: --no-default-features --features hardware
                       install_libudev: false
                     - name: observability-otel
                       args: --features observability-otel

@@ -1410,21 +1410,3 @@ mod multimodal {
         assert_terminal_event(&events, "multimodal");
     }
 }
-
-mod hardware {
-    use super::*;
-
-    #[tokio::test]
-    async fn hardware_completes() {
-        let events = run_provisioner_headless(
-            "hardware",
-            vec![
-                ProvisionResponse::Selection(vec![0]), // disabled
-            ],
-        )
-        .await
-        .unwrap();
-        assert_no_panic(&events);
-        assert_terminal_event(&events, "hardware");
-    }
-}

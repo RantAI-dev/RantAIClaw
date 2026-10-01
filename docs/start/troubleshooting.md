@@ -78,8 +78,8 @@ CARGO_BUILD_JOBS=1 cargo build --release --locked
 cargo build --release --locked --no-default-features --features tui
 ```
 
-   Do **not** add `--features hardware` to shrink a build — it pulls extra
-   USB/serial dependencies (`nusb`, `tokio-serial`) and makes the build heavier.
+   Do **not** add `--features hardware` to shrink a build — the feature
+   no longer exists, and the build flags worth considering all add weight.
 
 1. Cross-compile on a stronger machine and copy the binary to the target host.
 
@@ -120,10 +120,10 @@ To build with Matrix support explicitly enabled:
 cargo check --features channel-matrix
 ```
 
-To build with Matrix + Lark + hardware support:
+To build with Matrix + Lark support:
 
 ```bash
-cargo check --features hardware,channel-matrix,channel-lark
+cargo check --features channel-matrix,channel-lark
 ```
 
 Lock-contention mitigation:

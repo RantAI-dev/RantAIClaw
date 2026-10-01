@@ -113,9 +113,6 @@ pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
 pub(crate) mod guest_registry;
-pub mod hardware_board_info;
-pub mod hardware_memory_map;
-pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
 pub mod issue_pairing_code;
@@ -162,12 +159,6 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
-#[allow(unused_imports)]
-pub use hardware_board_info::HardwareBoardInfoTool;
-#[allow(unused_imports)]
-pub use hardware_memory_map::HardwareMemoryMapTool;
-#[allow(unused_imports)]
-pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;

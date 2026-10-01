@@ -81,9 +81,6 @@ pub fn provisioner_for(name: &str) -> Option<Box<dyn TuiProvisioner>> {
         "multimodal" => Some(Box::new(
             super::runtime_surfaces::multimodal::MultimodalProvisioner::new(),
         )),
-        "hardware" => Some(Box::new(
-            super::runtime_surfaces::hardware::HardwareProvisioner::new(),
-        )),
         // Feature-gated
         #[cfg(feature = "whatsapp-web")]
         "whatsapp-web" => Some(Box::new(
@@ -240,10 +237,6 @@ pub fn available() -> Vec<(&'static str, &'static str)> {
         super::runtime_surfaces::multimodal::MULTIMODAL_NAME,
         super::runtime_surfaces::multimodal::MultimodalProvisioner::new().description(),
     ));
-    list.push((
-        super::runtime_surfaces::hardware::HARDWARE_NAME,
-        super::runtime_surfaces::hardware::HardwareProvisioner::new().description(),
-    ));
     // Feature-gated
     #[cfg(feature = "whatsapp-web")]
     {
@@ -348,7 +341,6 @@ pub fn test_responses_for(name: &str) -> Vec<ProvisionResponse> {
             ProvisionResponse::Text(String::new()),
             ProvisionResponse::Selection(vec![0]),
         ],
-        "hardware" => vec![ProvisionResponse::Selection(vec![0])],
         #[cfg(feature = "whatsapp-web")]
         "whatsapp-web" => vec![ProvisionResponse::Text(String::new())],
         _ => vec![ProvisionResponse::Text(String::new())],
@@ -463,7 +455,6 @@ mod tests {
             "embedding-routes",
             "secrets",
             "multimodal",
-            "hardware",
         ];
         for name in expected {
             assert!(names.contains(&name), "{name} should be registered");

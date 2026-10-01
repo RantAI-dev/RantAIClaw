@@ -53,16 +53,12 @@ mod approval;
 mod auth;
 mod channels;
 mod cli_style;
-mod rag {
-    pub use rantaiclaw::rag::*;
-}
 mod config;
 mod cost;
 mod cron;
 mod daemon;
 mod doctor;
 mod gateway;
-mod hardware;
 mod health;
 mod heartbeat;
 mod identity;
@@ -80,7 +76,6 @@ mod migration;
 mod multimodal;
 mod observability;
 mod onboard;
-mod peripherals;
 mod persona {
     pub use rantaiclaw::persona::*;
 }
@@ -107,9 +102,6 @@ mod tunnel;
 mod util;
 
 use config::Config;
-
-// Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
-pub use rantaiclaw::{HardwareCommands, PeripheralCommands};
 
 /// `RantaiClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
@@ -331,7 +323,7 @@ Examples:
   rantaiclaw agent                              # interactive session
   rantaiclaw agent -m \"Summarize today's logs\"  # single message
   rantaiclaw agent -p anthropic --model claude-sonnet-4-20250514
-  rantaiclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
+")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -348,10 +340,6 @@ Examples:
         /// Temperature (0.0 - 2.0)
         #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
         temperature: f64,
-
-        /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
-        #[arg(long)]
-        peripheral: Vec<String>,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -540,42 +528,6 @@ Targets: owner | tool | command (aliases: owners, tools, commands, cmd).")]
     Auth {
         #[command(subcommand)]
         auth_command: AuthCommands,
-    },
-
-    /// Discover and introspect USB hardware
-    #[command(long_about = "\
-Discover and introspect USB hardware.
-
-Enumerate connected USB devices, identify known development boards \
-(STM32 Nucleo, Arduino, ESP32), and retrieve chip information via \
-probe-rs / ST-Link.
-
-Examples:
-  rantaiclaw hardware discover
-  rantaiclaw hardware introspect /dev/ttyACM0
-  rantaiclaw hardware info --chip STM32F401RETx")]
-    Hardware {
-        #[command(subcommand)]
-        hardware_command: rantaiclaw::HardwareCommands,
-    },
-
-    /// Manage hardware peripherals (STM32, RPi GPIO, etc.)
-    #[command(long_about = "\
-Manage hardware peripherals.
-
-Add, list, flash, and configure hardware boards that expose tools \
-to the agent (GPIO, sensors, actuators). Supported boards: \
-nucleo-f401re, rpi-gpio, esp32, arduino-uno.
-
-Examples:
-  rantaiclaw peripheral list
-  rantaiclaw peripheral add nucleo-f401re /dev/ttyACM0
-  rantaiclaw peripheral add rpi-gpio native
-  rantaiclaw peripheral flash --port /dev/cu.usbmodem12345
-  rantaiclaw peripheral flash-nucleo")]
-    Peripheral {
-        #[command(subcommand)]
-        peripheral_command: rantaiclaw::PeripheralCommands,
     },
 
     /// Start interactive chat (default when no subcommand given)
@@ -1842,14 +1794,12 @@ async fn main() -> Result<()> {
             provider,
             model,
             temperature,
-            peripheral,
         }) => Box::pin(agent::run(
             config,
             message,
             provider,
             model,
             temperature,
-            peripheral,
             "cli",
             false,
         ))
@@ -1980,13 +1930,6 @@ async fn main() -> Result<()> {
                     "accounting off".to_string()
                 },
             );
-
-            cli_style::section("peripherals");
-            if config.peripherals.enabled {
-                cli_style::field("Boards", W, &config.peripherals.boards.len().to_string());
-            } else {
-                cli_style::field("Boards", W, "none (disabled)");
-            }
 
             // Probe the running daemon off the async worker — `curl` + the 300 ms
             // retry sleep would stall the runtime otherwise. Capture both fields
@@ -2268,7 +2211,6 @@ async fn main() -> Result<()> {
                         None,
                         model_override,
                         config.default_temperature,
-                        Vec::new(),
                         "cli",
                         // The caller owns the print for this surface, so the
                         // loop must not print the reply too.
@@ -2296,14 +2238,6 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Auth { auth_command }) => handle_auth_command(auth_command, &config).await,
-
-        Some(Commands::Hardware { hardware_command }) => {
-            hardware::handle_command(hardware_command.clone(), &config)
-        }
-
-        Some(Commands::Peripheral { peripheral_command }) => {
-            peripherals::handle_command(peripheral_command.clone(), &config).await
-        }
 
         Some(Commands::Config { config_command }) => match config_command {
             ConfigCommands::Schema => {
