@@ -5,6 +5,7 @@
 //! surface and are re-exported from `mod.rs` so their public path is unchanged.
 
 use super::BOOTSTRAP_MAX_CHARS;
+pub use crate::agent::prompt::{OwnerFiles, PromptAudience};
 
 /// Appended to a channel system prompt when the sender is an approval owner
 /// (`can_approve` is true for them). Without it, a cautious model self-refuses
@@ -78,7 +79,10 @@ pub(crate) fn build_channel_system_prompt(
     let chat_kind_line = match (is_direct, is_owner) {
         (true, true) => "This conversation is a direct message with the bot's owner.",
         (true, false) => "This conversation is a direct message with a guest, not an owner.",
-        (false, true) => "This conversation is a group chat; the current sender is an owner.",
+        (false, true) => {
+            "This conversation is a group chat; the current sender is an owner. \
+             The owner's private notes are available only in a direct chat with the bot."
+        }
         (false, false) => {
             "This conversation is a group chat; the current sender is a guest, not an owner."
         }
@@ -121,12 +125,13 @@ pub fn build_system_prompt(
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
-    inject_memory_files: bool,
+    load_owner_files: bool,
 ) -> String {
-    // Default public surface: the owner's prompt. `inject_memory_files` says
-    // whether `USER.md` and `MEMORY.md` go in; the caller sets it from the memory
-    // view of the turn the prompt is for. The guest-only path goes through
-    // [`build_system_prompt_with_mode`] with `skip_owner_files = true`.
+    // Default public surface: the owner's prompt. `load_owner_files` says
+    // whether `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md` go in; the
+    // caller sets it from the memory view of the turn the prompt is for. The
+    // guest-only path goes through [`build_system_prompt_with_mode`] with
+    // [`PromptAudience::Guest`].
     build_system_prompt_with_mode(
         workspace_dir,
         model_name,
@@ -136,17 +141,21 @@ pub fn build_system_prompt(
         bootstrap_max_chars,
         false,
         crate::config::SkillsPromptInjectionMode::Full,
-        false,
-        inject_memory_files,
+        PromptAudience::Owner,
+        if load_owner_files {
+            OwnerFiles::Load
+        } else {
+            OwnerFiles::Omit
+        },
     )
 }
 
-/// [`build_system_prompt`] with the guest and memory switches spelled out.
+/// [`build_system_prompt`] with the audience and the owner files spelled out.
 ///
-/// `skip_owner_files` builds the guest prompt. `inject_memory_files` says
-/// whether `USER.md` and `MEMORY.md` go in: the caller sets it from the memory
-/// view of the turn the prompt is for, since both files are memory read into
-/// the prompt.
+/// `audience` picks the guest or the owner rendering. `owner_files` says
+/// whether `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md` go in: the
+/// caller sets it from the memory view of the turn the prompt is for
+/// ([`OwnerFiles::for_view`]). A guest prompt carries none of them.
 pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -156,8 +165,8 @@ pub fn build_system_prompt_with_mode(
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
-    skip_owner_files: bool,
-    inject_memory_files: bool,
+    audience: PromptAudience,
+    owner_files: OwnerFiles,
 ) -> String {
     // Unified prompt builder: the SAME `SystemPromptBuilder` the TUI/`Agent`
     // path uses, with `surface = Channel` so the surface-specific hint sections
@@ -201,8 +210,8 @@ pub fn build_system_prompt_with_mode(
         dispatcher_instructions: "",
         autonomy_preset,
         allowed_commands: &[],
-        skip_owner_files,
-        inject_memory_files,
+        audience,
+        owner_files,
     };
 
     let prompt = SystemPromptBuilder::with_defaults()
@@ -215,4 +224,12 @@ pub fn build_system_prompt_with_mode(
     } else {
         prompt
     }
+}
+
+/// An owner prompt that ignores the file policy, for test contexts that do not
+/// read a workspace.
+#[cfg(test)]
+pub(crate) fn fixed_owner_prompt(prompt: impl Into<String>) -> super::OwnerPromptBuilder {
+    let prompt = prompt.into();
+    std::sync::Arc::new(move |_| prompt.clone())
 }

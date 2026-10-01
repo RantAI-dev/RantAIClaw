@@ -4651,7 +4651,9 @@ mod tests {
             memory: Arc::new(MockMemory),
             tools_registry: Arc::new(tools),
             observer: Arc::new(crate::observability::NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            owner_prompt: crate::channels::prompt::fixed_owner_prompt(
+                "test-system-prompt".to_string(),
+            ),
             guest_system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,

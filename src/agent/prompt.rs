@@ -60,6 +60,38 @@ impl Tool for DescriptorTool {
     }
 }
 
+/// Who a prompt is written for. See [`PromptContext::audience`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAudience {
+    /// The owner: persona with the owner's name and timezone, the host and the
+    /// workspace path, skill locations.
+    Owner,
+    /// A non-owner sender of a channel.
+    Guest,
+}
+
+/// Whether the owner's files go into a prompt. `USER.md` and `MEMORY.md` are
+/// memory read into the prompt, `BOOTSTRAP.md` carries the owner's name and
+/// timezone from setup, and `TOOLS.md` carries the owner's SSH hosts and device
+/// nicknames, so one rule decides all four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerFiles {
+    Load,
+    Omit,
+}
+
+impl OwnerFiles {
+    /// The files load only for a turn that reads all of memory. A turn limited
+    /// to one conversation, and a turn with no view, get none of them.
+    #[must_use]
+    pub fn for_view(view: Option<&crate::memory::MemoryView>) -> Self {
+        match view {
+            Some(crate::memory::MemoryView::All) => Self::Load,
+            Some(crate::memory::MemoryView::Only(_)) | None => Self::Omit,
+        }
+    }
+}
+
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
     pub model_name: &'a str,
@@ -86,27 +118,33 @@ pub struct PromptContext<'a> {
     /// machine-readable list of pre-approved shell commands; in Strict
     /// mode the list is short by design; in Manual/Off it's omitted.
     pub allowed_commands: &'a [String],
-    /// Build the prompt for a guest (non-owner) turn. The owner channel
-    /// surfaces build the prompt with everything; the guest prompt leaves out
-    /// what describes the operator or the host, so none of it reaches a
-    /// non-owner sender's context:
-    ///   * the files `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md`
-    ///     (`TOOLS.md` is where the owner records SSH hosts and device
-    ///     nicknames);
+    /// Who the prompt is written for. A guest prompt leaves out what describes
+    /// the operator or the host, so none of it reaches a non-owner sender's
+    /// context:
     ///   * the absolute workspace path, which carries the OS user name;
     ///   * the `Host:` line of the runtime section;
-    ///   * the host's timezone, replaced by `UTC`.
+    ///   * the host's timezone, replaced by `UTC`;
+    ///   * the owner's name in the persona, and the location of each skill.
     ///
-    /// `AGENTS.md`, `SOUL.md` and `IDENTITY.md` still render: they describe
-    /// the agent, not the operator.
-    pub skip_owner_files: bool,
-    /// Inject `USER.md` and `MEMORY.md`: the operator's profile and the notes
-    /// projected from memory. They are memory read into the prompt, so the
-    /// door that builds the prompt sets this from the turn's memory view. A turn
-    /// that sees all of memory carries them; a turn limited to one conversation,
-    /// or with no view, does not. `skip_owner_files` still wins: a guest prompt
-    /// never carries them.
-    pub inject_memory_files: bool,
+    /// `AGENTS.md`, `SOUL.md` and `IDENTITY.md` render for both audiences: they
+    /// describe the agent, not the operator.
+    pub audience: PromptAudience,
+    /// Whether `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md` go into
+    /// the prompt. The door that builds the prompt sets it from the memory view
+    /// of the turn the prompt is for ([`OwnerFiles::for_view`]). A guest
+    /// prompt never carries them, whatever this says.
+    pub owner_files: OwnerFiles,
+}
+
+impl PromptContext<'_> {
+    fn is_guest(&self) -> bool {
+        self.audience == PromptAudience::Guest
+    }
+
+    /// True when the four owner files go into this prompt.
+    fn loads_owner_files(&self) -> bool {
+        self.audience == PromptAudience::Owner && self.owner_files == OwnerFiles::Load
+    }
 }
 
 pub trait PromptSection: Send + Sync {
@@ -240,14 +278,16 @@ impl PromptSection for PersonaSection {
     /// persona is configured (fresh installs, headless tests, profile
     /// without a `persona/` dir) — silent rather than noisy.
     ///
-    /// `ctx.skip_owner_files` renders the guest persona here too: the
+    /// A guest audience renders the guest persona here too: the
     /// channel dispatch's per-message splice (`replace_persona_section`)
     /// overwrites this section on every turn anyway, but the guest prompt
     /// built once at channel start-up (`guest_system_prompt`) is this
     /// section's output until the first splice runs, so it must not carry
-    /// the owner's name or timezone even briefly.
+    /// the owner's name or timezone even briefly. The persona follows the
+    /// audience alone: an owner whose turn reads one conversation keeps the
+    /// owner persona and loses only the files.
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(if ctx.skip_owner_files {
+        Ok(if ctx.is_guest() {
             render_guest_persona_section()
         } else {
             render_persona_section()
@@ -296,16 +336,13 @@ impl PromptSection for IdentitySection {
             return Ok(prompt);
         }
 
-        // Core identity files, always injected (with a not-found marker if
-        // absent) on every surface. A guest prompt skips `USER.md` (the
-        // owner's profile) and `TOOLS.md` (the owner's SSH hosts and device
-        // nicknames): neither is the guest's to read.
+        // Core identity files, injected (with a not-found marker if absent) on
+        // every surface. `USER.md` (the owner's profile) and `TOOLS.md` (the
+        // owner's SSH hosts and device nicknames) are owner files: they go in
+        // only when the turn reads all of memory.
         let mut files = vec!["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
-        if ctx.skip_owner_files {
+        if !ctx.loads_owner_files() {
             files.retain(|file| !matches!(*file, "TOOLS.md" | "USER.md"));
-        }
-        if !ctx.inject_memory_files {
-            files.retain(|file| *file != "USER.md");
         }
         for file in files {
             inject_workspace_file(
@@ -331,9 +368,9 @@ impl PromptSection for IdentitySection {
         // BOOTSTRAP.md is a first-run ritual: on channels inject it only when
         // present (no noisy not-found marker); on the agent surface keep the
         // marker so the absence is visible. The setup wizard writes the
-        // owner's name and timezone into this file, so a guest prompt must
-        // skip it the same way it skips USER.md and MEMORY.md.
-        if !ctx.skip_owner_files
+        // owner's name and timezone into this file, so it is an owner file like
+        // USER.md and MEMORY.md.
+        if ctx.loads_owner_files()
             && (matches!(ctx.surface, PromptSurface::Agent)
                 || ctx.workspace_dir.join("BOOTSTRAP.md").exists())
         {
@@ -345,11 +382,11 @@ impl PromptSection for IdentitySection {
             );
         }
 
-        // `MEMORY.md` is the owner's notes — a guest must not see them.
-        // Their conversation-local memory comes through the recall tier
-        // (`memory_recall` + the dispatch memory-context injection); the
-        // shared tier is owner-scoped only.
-        if !ctx.skip_owner_files && ctx.inject_memory_files {
+        // `MEMORY.md` is the projection of the owner's private notes. A turn
+        // that reads one conversation, a guest's included, gets that
+        // conversation's notes through the recall tier (`memory_recall` + the
+        // dispatch memory-context injection) and not through this file.
+        if ctx.loads_owner_files() {
             inject_workspace_file(
                 &mut prompt,
                 ctx.workspace_dir,
@@ -371,7 +408,7 @@ impl PromptSection for ToolsSection {
         // A guest's tools are the gate's as reloaded per turn, so a guest
         // prompt built at start-up carries no list. See
         // [`render_guest_turn_sections`].
-        if ctx.skip_owner_files {
+        if ctx.is_guest() {
             return Ok(String::new());
         }
         let mut out = String::from("## Tools\n\n");
@@ -420,7 +457,13 @@ pub fn render_safety_section(
     tools: &[Box<dyn Tool>],
     allowed_commands: &[String],
 ) -> String {
-    render_safety(surface, autonomy_preset, tools, allowed_commands, false)
+    render_safety(
+        surface,
+        autonomy_preset,
+        tools,
+        allowed_commands,
+        PromptAudience::Owner,
+    )
 }
 
 /// [`render_safety_section`] for a guest turn. `tools` is the guest's own
@@ -431,7 +474,7 @@ pub fn render_guest_safety_section(
     autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
     tools: &[Box<dyn Tool>],
 ) -> String {
-    render_safety(surface, autonomy_preset, tools, &[], true)
+    render_safety(surface, autonomy_preset, tools, &[], PromptAudience::Guest)
 }
 
 fn render_safety(
@@ -439,7 +482,7 @@ fn render_safety(
     autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
     tools: &[Box<dyn Tool>],
     allowed_commands: &[String],
-    skip_owner_files: bool,
+    audience: PromptAudience,
 ) -> String {
     let ctx = PromptContext {
         workspace_dir: Path::new("."),
@@ -453,8 +496,8 @@ fn render_safety(
         dispatcher_instructions: "",
         autonomy_preset,
         allowed_commands,
-        skip_owner_files,
-        inject_memory_files: true,
+        audience,
+        owner_files: OwnerFiles::Omit,
     };
     SafetySection.build(&ctx).unwrap_or_default()
 }
@@ -604,7 +647,7 @@ impl PromptSection for SafetySection {
                 } else {
                     out.push_str("- The shell tool is not available in this session.\n");
                 }
-                if ctx.skip_owner_files {
+                if ctx.is_guest() {
                     out.push_str(&guest_strict_reads_line(ctx.tools));
                 } else {
                     out.push_str(
@@ -703,7 +746,7 @@ impl PromptSection for SkillsSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         // A skill's location is a host path, so a guest prompt lists skills
         // without it.
-        if ctx.skip_owner_files {
+        if ctx.is_guest() {
             return Ok(crate::skills::skills_to_prompt_for_guest(
                 ctx.skills,
                 ctx.skills_prompt_mode,
@@ -757,7 +800,7 @@ impl PromptSection for WorkspaceSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         // The absolute path contains the OS user name, and quick setup uses
         // that name as the owner's. A guest gets the relative form only.
-        if ctx.skip_owner_files {
+        if ctx.is_guest() {
             return Ok(String::from(
                 "## Workspace\n\nFile paths are relative to the bot's workspace.",
             ));
@@ -777,7 +820,7 @@ impl PromptSection for RuntimeSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         // The host name identifies the operator's machine; a guest does not
         // need it.
-        if ctx.skip_owner_files {
+        if ctx.is_guest() {
             return Ok(format!(
                 "## Runtime\n\nOS: {} | Model: {}",
                 std::env::consts::OS,
@@ -801,7 +844,7 @@ impl PromptSection for DateTimeSection {
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         // The host's zone reveals where the operator is. A guest is told UTC.
-        if ctx.skip_owner_files {
+        if ctx.is_guest() {
             return Ok(String::from("## Current Date & Time\n\nTimezone: UTC"));
         }
         let now = Local::now();
@@ -847,7 +890,7 @@ impl PromptSection for TaskSection {
         };
         // Same reason as `ToolsSection`: a guest's framing depends on the tools
         // the reloaded gate permits.
-        if ctx.skip_owner_files {
+        if ctx.is_guest() {
             return Ok(String::new());
         }
         Ok(String::from(task_framing(native_tools, true)))
@@ -998,8 +1041,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
 
         let section = IdentitySection;
@@ -1032,8 +1075,8 @@ mod tests {
             dispatcher_instructions: "instr",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -1061,8 +1104,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Memory"), "nudge missing: {prompt}");
@@ -1089,8 +1132,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(
@@ -1116,8 +1159,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(
@@ -1142,8 +1185,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Smart),
             allowed_commands: &["ls *".to_string()],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1246,8 +1289,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Strict),
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1279,8 +1322,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Strict),
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1315,8 +1358,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Smart),
             allowed_commands: &["ls *".to_string()],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
@@ -1348,8 +1391,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: Some(PolicyPreset::Manual),
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(out.contains("Manual (messaging channel)"), "{out}");
@@ -1393,8 +1436,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1441,8 +1484,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1468,8 +1511,8 @@ mod tests {
             dispatcher_instructions: "instr",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -1516,8 +1559,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: false,
-            inject_memory_files: true,
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1537,8 +1580,8 @@ mod tests {
 
     /// A guest prompt must not contain `USER.md` content. The owner's
     /// profile is private to the owner; the channel runtime builds the guest
-    /// prompt via `build_system_prompt_with_mode(..., skip_owner_files =
-    /// true)`, and the identity section omits the file in that branch.
+    /// prompt via `build_system_prompt_with_mode` with `PromptAudience::Guest`,
+    /// and the identity section omits the file in that branch.
     #[test]
     fn guest_prompt_omits_user_md() {
         let workspace =
@@ -1565,8 +1608,8 @@ mod tests {
             dispatcher_instructions: "",
             autonomy_preset: None,
             allowed_commands: &[],
-            skip_owner_files: true,
-            inject_memory_files: true,
+            audience: PromptAudience::Guest,
+            owner_files: OwnerFiles::Load,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1610,8 +1653,8 @@ mod tests {
                 dispatcher_instructions: "",
                 autonomy_preset: None,
                 allowed_commands: &[],
-                skip_owner_files: false,
-                inject_memory_files: true,
+                audience: PromptAudience::Owner,
+                owner_files: OwnerFiles::Load,
             })
             .unwrap();
         let guest_prompt = SystemPromptBuilder::with_defaults()
@@ -1629,8 +1672,8 @@ mod tests {
                 dispatcher_instructions: "",
                 autonomy_preset: None,
                 allowed_commands: &[],
-                skip_owner_files: true,
-                inject_memory_files: true,
+                audience: PromptAudience::Guest,
+                owner_files: OwnerFiles::Load,
             })
             .unwrap();
 
@@ -1646,21 +1689,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
     }
 
-    /// `USER.md` and `MEMORY.md` are memory read into the prompt. A prompt built
-    /// for a turn that does not see all of memory carries neither, and the same
-    /// workspace still carries the other identity files, so the test is not
-    /// passing on an empty fixture.
+    /// The four owner files reach a prompt only for a turn that reads all of
+    /// memory. A turn limited to one conversation, and a turn with no view, get
+    /// none of them, and the same workspace still carries the other identity
+    /// files, so the test is not passing on an empty fixture.
     #[test]
-    fn memory_files_follow_inject_memory_files() {
+    fn owner_files_load_only_under_the_all_view() {
         let workspace =
             std::env::temp_dir().join(format!("rantaiclaw_prompt_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("USER.md"), "PROFILE_CANARY_TOKEN_30418").unwrap();
-        std::fs::write(workspace.join("MEMORY.md"), "NOTES_CANARY_TOKEN_70215").unwrap();
-        std::fs::write(workspace.join("SOUL.md"), "SOUL_CANARY_TOKEN_44190").unwrap();
+        let canaries = [
+            ("USER.md", "PROFILE_CANARY_TOKEN_30418"),
+            ("MEMORY.md", "NOTES_CANARY_TOKEN_70215"),
+            ("BOOTSTRAP.md", "BOOTSTRAP_CANARY_TOKEN_61873"),
+            ("TOOLS.md", "TOOLS_CANARY_TOKEN_28046"),
+            ("SOUL.md", "SOUL_CANARY_TOKEN_44190"),
+        ];
+        for (file, canary) in canaries {
+            std::fs::write(workspace.join(file), canary).unwrap();
+        }
 
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let build = |inject_memory_files: bool| {
+        let build = |view: Option<&crate::memory::MemoryView>| {
             SystemPromptBuilder::with_defaults()
                 .build(&PromptContext {
                     workspace_dir: &workspace,
@@ -1676,48 +1726,114 @@ mod tests {
                     dispatcher_instructions: "",
                     autonomy_preset: None,
                     allowed_commands: &[],
-                    skip_owner_files: false,
-                    inject_memory_files,
+                    audience: PromptAudience::Owner,
+                    owner_files: OwnerFiles::for_view(view),
                 })
                 .unwrap()
         };
 
-        let with_files = build(true);
-        assert!(
-            with_files.contains("PROFILE_CANARY_TOKEN_30418"),
-            "{with_files}"
-        );
-        assert!(
-            with_files.contains("NOTES_CANARY_TOKEN_70215"),
-            "{with_files}"
-        );
+        let under_all = build(Some(&crate::memory::MemoryView::All));
+        for (file, canary) in canaries {
+            assert!(under_all.contains(canary), "{file} missing:\n{under_all}");
+        }
 
-        let without_files = build(false);
-        assert!(
-            !without_files.contains("PROFILE_CANARY_TOKEN_30418"),
-            "USER.md reached a prompt that does not see memory:\n{without_files}"
-        );
-        assert!(
-            !without_files.contains("NOTES_CANARY_TOKEN_70215"),
-            "MEMORY.md reached a prompt that does not see memory:\n{without_files}"
-        );
-        assert!(
-            without_files.contains("SOUL_CANARY_TOKEN_44190"),
-            "the other identity files stay:\n{without_files}"
-        );
+        let one_conversation = crate::memory::MemoryView::Only("conversation-a".to_string());
+        for (label, view) in [
+            ("one conversation", Some(&one_conversation)),
+            ("no view", None),
+        ] {
+            let prompt = build(view);
+            for (file, canary) in &canaries[..4] {
+                assert!(
+                    !prompt.contains(canary),
+                    "{file} reached a prompt built for {label}:\n{prompt}"
+                );
+            }
+            assert!(
+                prompt.contains("SOUL_CANARY_TOKEN_44190"),
+                "{label}: the other identity files stay:\n{prompt}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(workspace);
     }
 
-    /// `PersonaSection` itself must render the guest persona when
-    /// `skip_owner_files` is set. The dispatch per-turn splice
+    /// The persona follows the audience and nothing else. An owner whose turn
+    /// reads one conversation loses the owner files and keeps the owner persona.
+    #[test]
+    fn an_owner_without_the_owner_files_keeps_the_owner_persona() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let home = std::env::temp_dir().join(format!(
+            "rantaiclaw_prompt_test_home_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = crate::test_env::HomeGuard::set(&home);
+        let _profile_env =
+            crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-prompt-persona-owner-only");
+
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        crate::persona::write_persona_toml(
+            &profile,
+            &crate::persona::PersonaToml {
+                preset: crate::persona::PresetId::Default,
+                name: "Owner Name".to_string(),
+                timezone: "Asia/Jakarta".to_string(),
+                role: "general productivity and helpful assistance".to_string(),
+                tone: "neutral".to_string(),
+                avoid: None,
+                always_on_kbs: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let workspace =
+            std::env::temp_dir().join(format!("rantaiclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let prompt = SystemPromptBuilder::with_defaults()
+            .build(&PromptContext {
+                workspace_dir: &workspace,
+                model_name: "test-model",
+                surface: PromptSurface::Channel {
+                    native_tools: false,
+                },
+                bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+                tools: &tools,
+                skills: &[],
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                identity_config: None,
+                dispatcher_instructions: "",
+                autonomy_preset: None,
+                allowed_commands: &[],
+                audience: PromptAudience::Owner,
+                owner_files: OwnerFiles::Omit,
+            })
+            .unwrap();
+
+        assert!(
+            prompt.contains("Owner Name") && prompt.contains("Asia/Jakarta"),
+            "an owner keeps the owner persona without the owner files:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("assistant for the user"),
+            "the guest persona reached an owner prompt:\n{prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `PersonaSection` itself must render the guest persona for a guest
+    /// audience. The dispatch per-turn splice
     /// (`replace_persona_section`, tested in `channels::mod_tests`) fixes this
     /// up on every channel turn anyway, but the guest prompt built once at
     /// channel start-up (`guest_system_prompt`) is this section's own output
     /// until the first splice runs, so it must not carry the owner's name or
     /// timezone even briefly.
     #[test]
-    fn persona_section_skips_owner_name_and_timezone_under_skip_owner_files() {
+    fn persona_section_skips_owner_name_and_timezone_for_a_guest_audience() {
         let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let home = std::env::temp_dir().join(format!(
             "rantaiclaw_prompt_test_home_{}",
@@ -1763,8 +1879,8 @@ mod tests {
                 dispatcher_instructions: "",
                 autonomy_preset: None,
                 allowed_commands: &[],
-                skip_owner_files: false,
-                inject_memory_files: true,
+                audience: PromptAudience::Owner,
+                owner_files: OwnerFiles::Load,
             })
             .unwrap();
         let guest_prompt = SystemPromptBuilder::with_defaults()
@@ -1782,8 +1898,8 @@ mod tests {
                 dispatcher_instructions: "",
                 autonomy_preset: None,
                 allowed_commands: &[],
-                skip_owner_files: true,
-                inject_memory_files: true,
+                audience: PromptAudience::Guest,
+                owner_files: OwnerFiles::Load,
             })
             .unwrap();
 
@@ -1805,7 +1921,7 @@ mod tests {
     }
 
     /// Tests `IdentitySection` directly — assert it omits the
-    /// "USER.md" header when `skip_owner_files` is true, even if the file
+    /// "USER.md" header for a guest audience, even if the file
     /// does not exist on disk. The not-found marker is also owner-private.
     #[test]
     fn identity_section_marks_user_md_when_owner() {
@@ -1829,8 +1945,8 @@ mod tests {
                 dispatcher_instructions: "",
                 autonomy_preset: None,
                 allowed_commands: &[],
-                skip_owner_files: false,
-                inject_memory_files: true,
+                audience: PromptAudience::Owner,
+                owner_files: OwnerFiles::Load,
             })
             .unwrap();
         let guest = IdentitySection
@@ -1848,8 +1964,8 @@ mod tests {
                 dispatcher_instructions: "",
                 autonomy_preset: None,
                 allowed_commands: &[],
-                skip_owner_files: true,
-                inject_memory_files: true,
+                audience: PromptAudience::Guest,
+                owner_files: OwnerFiles::Load,
             })
             .unwrap();
 
@@ -1895,8 +2011,8 @@ mod tests {
                 dispatcher_instructions: "",
                 autonomy_preset: None,
                 allowed_commands: &[],
-                skip_owner_files: false,
-                inject_memory_files: true,
+                audience: PromptAudience::Owner,
+                owner_files: OwnerFiles::Load,
             })
             .unwrap();
         let guest_prompt = SystemPromptBuilder::with_defaults()
@@ -1914,8 +2030,8 @@ mod tests {
                 dispatcher_instructions: "",
                 autonomy_preset: None,
                 allowed_commands: &[],
-                skip_owner_files: true,
-                inject_memory_files: true,
+                audience: PromptAudience::Guest,
+                owner_files: OwnerFiles::Load,
             })
             .unwrap();
 

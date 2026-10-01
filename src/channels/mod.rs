@@ -67,6 +67,7 @@ pub mod supervisor;
 // and `src/cron` call them), so they keep their `crate::channels::` path.
 pub use prompt::{
     build_system_prompt, build_system_prompt_with_mode, channel_supports_announce_delivery,
+    OwnerFiles, PromptAudience,
 };
 pub mod qq;
 pub mod qr_terminal;
@@ -475,13 +476,16 @@ pub(crate) struct ChannelRuntimeContext {
     pub(crate) memory: Arc<dyn Memory>,
     pub(crate) tools_registry: Arc<Vec<Box<dyn Tool>>>,
     pub(crate) observer: Arc<dyn Observer>,
-    pub(crate) system_prompt: Arc<String>,
-    /// Built at start-up next to [`system_prompt`]: same builder, with
-    /// `USER.md` and `MEMORY.md` omitted. Used for a guest's first turn, so
-    /// the owner's profile and notes never reach a non-owner sender's
-    /// context. Owners keep using [`system_prompt`]. It carries no tool list,
-    /// task framing or tool-use protocol: each guest turn adds them for the
-    /// tools the reloaded gate permits.
+    /// Builds the owner's prompt for one turn. Dispatch calls it per message
+    /// with the files the turn's memory view allows, so the files are read at
+    /// the turn that uses them and a note deleted since the last message is gone
+    /// from this one.
+    pub(crate) owner_prompt: OwnerPromptBuilder,
+    /// Built at start-up: the guest audience of the same builder, without the
+    /// owner's files. It stays correct when built once, because a guest prompt
+    /// never carries a file that can change under a running daemon. It carries
+    /// no tool list, task framing or tool-use protocol: each guest turn adds
+    /// them for the tools the reloaded gate permits.
     pub(crate) guest_system_prompt: Arc<String>,
     pub(crate) model: Arc<String>,
     pub(crate) temperature: f64,
@@ -1243,6 +1247,47 @@ pub(crate) struct ChannelRuntime {
     pub(crate) max_backoff_secs: u64,
 }
 
+/// How the runtime builds the owner prompt for a turn: given whether the turn
+/// may carry the owner's files, the whole prompt including the tool-use protocol.
+pub(crate) type OwnerPromptBuilder = Arc<dyn Fn(OwnerFiles) -> String + Send + Sync>;
+
+/// The owner prompt of a runtime, rebuilt from the workspace on every call.
+///
+/// Reading the workspace files costs a few file reads, and the prompt depends
+/// on the memory view of the turn it is for, so nothing here is cached.
+fn owner_prompt_builder(
+    workspace: PathBuf,
+    model: String,
+    tool_descs: Vec<(&'static str, &'static str)>,
+    skills: Vec<crate::skills::Skill>,
+    identity: crate::config::IdentityConfig,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    tools_registry: Arc<Vec<Box<dyn Tool>>>,
+) -> OwnerPromptBuilder {
+    Arc::new(move |owner_files| {
+        let mut prompt = build_system_prompt_with_mode(
+            &workspace,
+            &model,
+            &tool_descs,
+            &skills,
+            Some(&identity),
+            bootstrap_max_chars,
+            native_tools,
+            skills_prompt_mode,
+            PromptAudience::Owner,
+            owner_files,
+        );
+        append_tool_instructions_when_not_native(
+            &mut prompt,
+            native_tools,
+            tools_registry.as_ref(),
+        );
+        prompt
+    })
+}
+
 /// Append the tool-use protocol to the owner system prompt when the provider
 /// lacks native tool calling.
 ///
@@ -1492,25 +1537,24 @@ pub(crate) async fn build_channel_runtime(
     };
     let native_tools = provider.supports_native_tools();
     let guest_gate = Arc::new(guest_gate_from_config(&config));
-    let mut system_prompt = build_system_prompt_with_mode(
-        &workspace,
-        &model,
-        &tool_descs,
-        &skills,
-        Some(&config.identity),
+    // The owner's prompt is built per turn, from the turn's memory view: the
+    // owner files it carries are memory, and a note deleted since the last
+    // message must be gone from the next one.
+    let owner_prompt = owner_prompt_builder(
+        workspace.clone(),
+        model.clone(),
+        tool_descs.clone(),
+        skills.clone(),
+        config.identity.clone(),
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-        false,
-        // Built once at start-up, outside any turn and so outside any memory
-        // view. It is the owner's prompt, and it carries the owner's files.
-        true,
+        Arc::clone(&tools_registry),
     );
-    // Same builder, with `skip_owner_files = true`, for the guest prompt. It
-    // takes no tools: a guest's list follows the reloaded gate, per turn.
-    // Built once at start-up so a guest's first turn does not pay the
-    // workspace-file read again; the runtime keeps both side by side in
-    // [`ChannelRuntimeContext`].
+    // The guest audience of the same builder, for the guest prompt. It takes no
+    // tools: a guest's list follows the reloaded gate, per turn. It carries no
+    // owner file, so a start-up build stays correct and a guest's first turn
+    // does not pay the workspace-file read again.
     let guest_system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
@@ -1520,13 +1564,8 @@ pub(crate) async fn build_channel_runtime(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-        true,
-        false,
-    );
-    append_tool_instructions_when_not_native(
-        &mut system_prompt,
-        native_tools,
-        tools_registry.as_ref(),
+        PromptAudience::Guest,
+        OwnerFiles::Omit,
     );
 
     if !skills.is_empty() {
@@ -1658,7 +1697,7 @@ pub(crate) async fn build_channel_runtime(
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
-        system_prompt: Arc::new(system_prompt),
+        owner_prompt,
         guest_system_prompt: Arc::new(guest_system_prompt),
         model: Arc::new(model.clone()),
         temperature,
@@ -1909,6 +1948,9 @@ pub(crate) mod tests;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+pub(crate) mod owner_dm;
 
 #[cfg(test)]
 mod guest_privacy_tests;

@@ -8,11 +8,11 @@
 use super::traits;
 use super::{
     approval_relay, channel_message_timeout_budget_secs, commands, conversation, history, media,
-    prompt, routing, sanitize, supervisor, ChannelRuntimeContext, AUTOSAVE_MIN_MESSAGE_CHARS,
-    CHANNEL_DRAIN_DEADLINE, CHANNEL_NOTICE_SEND_TIMEOUT, FAILED_TURN_MARKER,
-    INTERRUPTED_TURN_MARKER, IN_FLIGHT_COMPLETION_WAIT_TIMEOUT, MEMORY_CONTEXT_ENTRY_MAX_CHARS,
-    MEMORY_CONTEXT_MAX_CHARS, MEMORY_CONTEXT_MAX_ENTRIES, RESTART_NOTICE, TIMED_OUT_TURN_MARKER,
-    UNDELIVERED_ATTACHMENT_NOTE, UNDELIVERED_TURN_MARKER,
+    prompt, routing, sanitize, supervisor, ChannelRuntimeContext, OwnerFiles,
+    AUTOSAVE_MIN_MESSAGE_CHARS, CHANNEL_DRAIN_DEADLINE, CHANNEL_NOTICE_SEND_TIMEOUT,
+    FAILED_TURN_MARKER, INTERRUPTED_TURN_MARKER, IN_FLIGHT_COMPLETION_WAIT_TIMEOUT,
+    MEMORY_CONTEXT_ENTRY_MAX_CHARS, MEMORY_CONTEXT_MAX_CHARS, MEMORY_CONTEXT_MAX_ENTRIES,
+    RESTART_NOTICE, TIMED_OUT_TURN_MARKER, UNDELIVERED_ATTACHMENT_NOTE, UNDELIVERED_TURN_MARKER,
 };
 use crate::agent::loop_::run_tool_call_loop;
 use crate::memory::{Memory, MemoryView, MEMORY_VIEW};
@@ -878,21 +878,27 @@ pub(crate) async fn process_channel_message(
             &runtime_defaults.guest_gate,
         )
     };
-    // `ctx.system_prompt` is built once at channel start — it reads bootstrap
-    // files and skills off disk, so rebuilding it per message is not free. The
-    // approval policy can change under a running daemon, though, and the safety
+    // The owner's prompt is built here, per turn, and the files it carries
+    // follow this turn's memory view: `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and
+    // `TOOLS.md` go in only under `All`, and are read now, so a note deleted
+    // since the last message is gone from this one. An owner whose view is one
+    // conversation keeps the owner prompt and loses the files.
+    //
+    // Guests run from `ctx.guest_system_prompt`, built once at channel start
+    // (same builder, without the owner files, the host name, the absolute
+    // workspace path or the host timezone). It holds no file that changes under
+    // a running daemon.
+    //
+    // The approval policy can change under a running daemon, and the safety
     // section is pure in-memory work, so re-render just that part against the
     // preset carried on the reloaded defaults. Without this the gate followed a
     // config change while the briefing kept describing the boot-time preset.
-    //
-    // Guests run from `ctx.guest_system_prompt` (same builder, without the
-    // owner files `USER.md`, `MEMORY.md` and `TOOLS.md`, the host name, the
-    // absolute workspace path or the host timezone). The persona and safety
-    // splice below applies to
-    // both — they are persona/safety, not profile/notes — and the rest of
-    // dispatch branches on `sender_is_owner` for memory.
+    // The persona and safety splice below applies to both prompts, and the rest
+    // of dispatch branches on `sender_is_owner` for memory.
+    let owner_prompt;
     let prompt_source = if sender_is_owner {
-        ctx.system_prompt.as_str()
+        owner_prompt = (ctx.owner_prompt)(OwnerFiles::for_view(Some(&memory_view)));
+        owner_prompt.as_str()
     } else {
         ctx.guest_system_prompt.as_str()
     };
@@ -923,9 +929,8 @@ pub(crate) async fn process_channel_message(
     // Re-render the persona section too, from `persona.toml` fresh, so a
     // `PUT /api/v1/personality` reaches an already-running channel listener
     // without a restart — the same per-message in-memory splice the safety
-    // section uses (`ctx.system_prompt` is built once at channel start). A
-    // guest turn gets the guest render: the owner's name and timezone must
-    // not reach a non-owner sender.
+    // section uses. A guest turn gets the guest render: the owner's name and
+    // timezone must not reach a non-owner sender.
     let persona_section = if sender_is_owner {
         crate::agent::prompt::render_persona_section()
     } else {
@@ -936,9 +941,9 @@ pub(crate) async fn process_channel_message(
     // A guest's tool list, task framing and, without native tool calling, the
     // tool-use protocol come from the tools the reloaded gate permits, so an
     // operator edit to `guest_allowed_tools` applies to the next message. The
-    // guest prompt built at start-up carries none of them. The owner's sit in
-    // `ctx.system_prompt`. A guest with no tool gets no list, no protocol, and a
-    // task framing that says it has no tools.
+    // guest prompt built at start-up carries none of them. The owner's come
+    // with the owner prompt. A guest with no tool gets no list, no protocol, and
+    // a task framing that says it has no tools.
     if !sender_is_owner {
         let native_tools = active_provider.supports_native_tools();
         base_prompt.push_str(&crate::agent::prompt::render_guest_turn_sections(

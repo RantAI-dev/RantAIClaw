@@ -642,6 +642,42 @@ mod tests {
         );
     }
 
+    /// `/memory remove` deletes a core note, and the next message of the owner in
+    /// a direct chat, in the same running channel runtime, no longer carries it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_note_removed_in_the_tui_is_gone_from_the_next_owner_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+        mem.store(
+            "lantern_note",
+            "The lantern is kept in the saffronquartz cabinet",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::memory::snapshot::refresh_projection(mem.as_ref(), tmp.path());
+        let mut ctx = ctx_with_memory(mem.clone());
+        ctx.workspace_dir = Some(tmp.path().to_path_buf());
+        let owner_dm = crate::channels::owner_dm::OwnerDm::start(tmp.path()).await;
+
+        let before = owner_dm.turn().await;
+        assert!(
+            before.contains("saffronquartz"),
+            "control: the owner prompt carries the note:\n{before}"
+        );
+
+        MemoryCommand
+            .execute("remove lantern_note", &mut ctx)
+            .unwrap();
+
+        let after = owner_dm.turn().await;
+        assert!(
+            !after.contains("saffronquartz"),
+            "a removed note reached the next owner prompt:\n{after}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn memory_help_shows_subcommands() {
         let mut ctx = ctx_with_memory(StubMemory::arc());

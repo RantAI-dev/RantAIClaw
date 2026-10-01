@@ -1361,6 +1361,29 @@ fn channel_system_prompt_marks_dm_and_owner_in_all_four_combinations() {
     assert!(!group_guest.contains("verified OWNER"));
 }
 
+/// An owner in a group does not get the private notes in the prompt, so the
+/// model is told where they are. No other chat kind gets the sentence: a direct
+/// chat with the owner carries them, and a guest has none.
+#[test]
+fn only_an_owner_in_a_group_is_told_the_private_notes_are_in_a_direct_chat() {
+    const HINT: &str =
+        "The owner's private notes are available only in a direct chat with the bot.";
+    let group_owner =
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, false, None);
+    assert!(group_owner.contains(HINT), "{group_owner}");
+    assert_eq!(group_owner.matches(HINT).count(), 1, "{group_owner}");
+
+    for (label, is_owner, is_direct) in [
+        ("direct+owner", true, true),
+        ("direct+guest", false, true),
+        ("group+guest", false, false),
+    ] {
+        let prompt =
+            prompt::build_channel_system_prompt("BASE", "telegram", "1", is_owner, is_direct, None);
+        assert!(!prompt.contains(HINT), "{label}: {prompt}");
+    }
+}
+
 /// Build a saveable `Config` whose Telegram allowlist is `users`, backed by
 /// a `config.toml` inside `dir`. Returns the config plus its path so tests
 /// can reload and assert the persisted allowlist.
@@ -1566,7 +1589,7 @@ fn durable_history_writes_through_and_reloads() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("system".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("system".to_string()),
         guest_system_prompt: Arc::new("system".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -1662,7 +1685,7 @@ fn compact_sender_history_keeps_recent_truncated_messages() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("system".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("system".to_string()),
         guest_system_prompt: Arc::new("system".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -2046,7 +2069,7 @@ async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -2116,7 +2139,7 @@ async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_repl
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -2186,7 +2209,7 @@ async fn process_channel_message_executes_tool_calls_with_alias_tags() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -2264,7 +2287,7 @@ async fn process_channel_message_handles_models_command_without_llm_call() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),
         temperature: 0.0,
@@ -2364,7 +2387,7 @@ async fn process_channel_message_uses_route_override_provider_and_model() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),
         temperature: 0.0,
@@ -2445,7 +2468,7 @@ async fn process_channel_message_prefers_cached_default_provider_instance() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),
         temperature: 0.0,
@@ -2548,7 +2571,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("startup-model".to_string()),
         temperature: 0.0,
@@ -2644,7 +2667,7 @@ async fn maybe_apply_runtime_config_update_hot_reloads_owners_guest_gate_and_all
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("startup-model".to_string()),
         temperature: 0.0,
@@ -2740,7 +2763,7 @@ fn allowlist_test_ctx(
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("startup-model".to_string()),
         temperature: 0.0,
@@ -3356,7 +3379,7 @@ async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("startup-model".to_string()),
         temperature: 0.0,
@@ -3483,7 +3506,7 @@ async fn maybe_apply_runtime_config_update_clears_pinned_sender_on_provider_swit
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("model-a".to_string()),
         temperature: 0.0,
@@ -3583,7 +3606,7 @@ async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("model-a".to_string()),
         temperature: 0.0,
@@ -3665,7 +3688,7 @@ async fn process_channel_message_respects_configured_max_tool_iterations_above_d
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -3745,7 +3768,7 @@ async fn process_channel_message_reports_configured_max_tool_iterations_limit() 
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -3956,7 +3979,7 @@ async fn channel_error_replies_are_sanitized_before_delivery() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -6999,7 +7022,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -7099,7 +7122,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -7212,7 +7235,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -7299,7 +7322,7 @@ async fn process_channel_message_cancels_scoped_typing_task() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -7580,8 +7603,8 @@ fn prompt_skills_compact_mode_omits_instructions_and_tools() {
         None,
         false,
         crate::config::SkillsPromptInjectionMode::Compact,
-        false,
-        true,
+        PromptAudience::Owner,
+        OwnerFiles::Load,
     );
 
     assert!(prompt.contains("<available_skills>"), "missing skills XML");
@@ -7709,8 +7732,8 @@ fn prompt_workspace_path() {
     assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
 }
 
-/// Builds the channel system prompt for `skip_owner_files` (a guest turn) or
-/// not (an owner turn) over the workspace `ws`, with no skills and no tools.
+/// Builds the channel system prompt for a guest audience or an owner audience
+/// over the workspace `ws`, with no skills and no tools.
 fn channel_prompt_for(ws: &TempDir, guest: bool) -> String {
     build_system_prompt_with_mode(
         ws.path(),
@@ -7721,8 +7744,12 @@ fn channel_prompt_for(ws: &TempDir, guest: bool) -> String {
         None,
         false,
         crate::config::SkillsPromptInjectionMode::Full,
-        guest,
-        true,
+        if guest {
+            PromptAudience::Guest
+        } else {
+            PromptAudience::Owner
+        },
+        OwnerFiles::Load,
     )
 }
 
@@ -7945,7 +7972,7 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -8043,7 +8070,7 @@ async fn process_channel_message_enriches_current_turn_without_persisting_contex
         memory: Arc::new(RecallMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -8139,7 +8166,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -8248,7 +8275,7 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
         memory: Arc::new(mem),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -8393,7 +8420,9 @@ async fn lark_chat_id_in_approval_owners_does_not_make_a_member_an_owner() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt(
+            "OWNER_SYSTEM_PROMPT".to_string(),
+        ),
         guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -8458,7 +8487,9 @@ async fn owner_group_channel_turn_keeps_owner_and_direct_flags_in_their_own_slot
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt(
+            "OWNER_SYSTEM_PROMPT".to_string(),
+        ),
         guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -9416,7 +9447,7 @@ async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() 
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(Vec::new()),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -9993,7 +10024,7 @@ async fn non_native_runtime_prompts(guest_tools: &[&str]) -> (String, String, St
     );
 
     (
-        runtime.ctx.system_prompt.to_string(),
+        (runtime.ctx.owner_prompt)(OwnerFiles::Load),
         runtime.ctx.guest_system_prompt.to_string(),
         workspace.path().display().to_string(),
     )
@@ -11084,9 +11115,9 @@ fn normalise_prompt(
 }
 
 /// The system prompt an owner's turn starts from, the way a daemon composes it:
-/// the start-up prompt for `mode` plus the tool-use protocol of a
-/// provider without native tool calling, then the per-turn splices under the
-/// Strict preset. The workspace has one skill under `<workspace>/skills` and
+/// the owner prompt for `mode` built for the turn, which includes the tool-use
+/// protocol of a provider without native tool calling, then the per-turn
+/// splices under the Strict preset. The workspace has one skill under `<workspace>/skills` and
 /// one under `<profile>/skills`.
 async fn owner_turn_prompt(mode: crate::config::SkillsPromptInjectionMode) -> String {
     let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
@@ -11122,27 +11153,27 @@ async fn owner_turn_prompt(mode: crate::config::SkillsPromptInjectionMode) -> St
             profile.path().join("skills/profile-skill/SKILL.md"),
         ),
     ];
-    let tool_descs: Vec<(&str, &str)> = vec![
+    let tool_descs: Vec<(&'static str, &'static str)> = vec![
         ("shell", "Run a terminal command."),
         ("file_read", "Read a file."),
     ];
-    let registry: Vec<Box<dyn Tool>> = vec![
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
         Box::new(NamedStubTool("shell")),
         Box::new(NamedStubTool("file_read")),
-    ];
-    let mut system_prompt = build_system_prompt_with_mode(
-        workspace.path(),
-        "golden-model",
-        &tool_descs,
-        &skills,
-        None,
+    ]);
+    // The builder the runtime keeps in its context, over the same inputs the
+    // start-up prompt used to be built from.
+    let owner_prompt = owner_prompt_builder(
+        workspace.path().to_path_buf(),
+        "golden-model".to_string(),
+        tool_descs,
+        skills,
+        crate::config::IdentityConfig::default(),
         None,
         false,
         mode,
-        false,
-        true,
+        Arc::clone(&registry),
     );
-    system_prompt.push_str(&build_tool_instructions(&registry));
 
     let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
     let provider_impl = Arc::new(ReplyAndPromptProvider {
@@ -11160,9 +11191,9 @@ async fn owner_turn_prompt(mode: crate::config::SkillsPromptInjectionMode) -> St
     {
         let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
         inner.workspace_dir = Arc::new(workspace.path().to_path_buf());
-        inner.tools_registry = Arc::new(registry);
+        inner.tools_registry = registry;
         inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
-        inner.system_prompt = Arc::new(system_prompt);
+        inner.owner_prompt = owner_prompt;
     }
     process_channel_message(
         ctx,
@@ -11248,8 +11279,12 @@ fn guest_prompt_lists_skills_without_locations_in_both_modes() {
                 None,
                 false,
                 mode,
-                guest,
-                true,
+                if guest {
+                    PromptAudience::Guest
+                } else {
+                    PromptAudience::Owner
+                },
+                OwnerFiles::Load,
             )
         };
         let guest = build(true);

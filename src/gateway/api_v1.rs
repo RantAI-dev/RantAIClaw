@@ -4093,6 +4093,48 @@ mod tests {
         assert!(state.mem.get("chat_note").await.unwrap().is_none());
     }
 
+    /// The console deletes a core note, and the next message of the owner in a
+    /// direct chat, in the same running channel runtime, no longer carries it.
+    /// The owner prompt is read from `MEMORY.md` at the turn that uses it, so the
+    /// operator's delete takes effect without a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_note_deleted_in_the_console_is_gone_from_the_next_owner_prompt() {
+        let (tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "lantern_note",
+                "The lantern is kept in the saffronquartz cabinet",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        crate::memory::snapshot::refresh_projection(state.mem.as_ref(), tmp.path());
+        let owner_dm = crate::channels::owner_dm::OwnerDm::start(tmp.path()).await;
+
+        let before = owner_dm.turn().await;
+        assert!(
+            before.contains("saffronquartz"),
+            "control: the owner prompt carries the note:\n{before}"
+        );
+
+        let resp = memory_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("lantern_note".to_string()),
+        )
+        .await
+        .expect("delete should succeed");
+        assert_eq!(resp.0["removed"], true);
+
+        let after = owner_dm.turn().await;
+        assert!(
+            !after.contains("saffronquartz"),
+            "a deleted note reached the next owner prompt:\n{after}"
+        );
+    }
+
     /// The CLI and TUI could both open one entry directly; the API could only
     /// page through a list.
     #[tokio::test]

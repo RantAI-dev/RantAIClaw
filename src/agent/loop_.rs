@@ -2639,10 +2639,10 @@ pub async fn run_with_scope(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-        false,
-        // `USER.md` and `MEMORY.md` are memory read into the prompt: only a run
-        // that sees all of memory carries them.
-        matches!(memory_view, Some(memory::MemoryView::All)),
+        crate::channels::PromptAudience::Owner,
+        // The owner files are memory read into the prompt: only a run that sees
+        // all of memory carries them.
+        crate::channels::OwnerFiles::for_view(memory_view.as_ref()),
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -3074,10 +3074,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-        false,
+        crate::channels::PromptAudience::Owner,
         // No door sets a view for this entry point, and a turn with no view
         // reads nothing from memory.
-        false,
+        crate::channels::OwnerFiles::Omit,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -5855,8 +5855,8 @@ Let me check the result."#;
             None, // no bootstrap_max_chars
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
-            false,
-            true,
+            crate::channels::PromptAudience::Owner,
+            crate::channels::OwnerFiles::Load,
         );
 
         // Must contain zero XML protocol artifacts

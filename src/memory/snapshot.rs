@@ -155,8 +155,31 @@ pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
     );
 
     let path = workspace_dir.join(MEMORY_FILE);
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    crate::migration::replace_file_atomically(&path, splice_block(&existing, &block).as_bytes())?;
+    // Only a missing file is an empty one. A file that cannot be read as text is
+    // the operator's, and reading it as empty would replace all of it with the
+    // block alone.
+    let existing = match fs::read(&path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "{} is not valid UTF-8, so the memory projection was not written and the \
+                 file is left as it is",
+                path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "read {}: the memory projection was not written and the file is left as it is",
+                path.display()
+            )));
+        }
+    };
+    let updated = splice_block(&existing, &block);
+    // Every daemon start projects. A file that already holds this block is not
+    // replaced, so its inode and modification time stay.
+    if updated != existing {
+        crate::migration::replace_file_atomically(&path, updated.as_bytes())?;
+    }
 
     Ok(projected)
 }
@@ -212,13 +235,15 @@ fn render_projection(rows: &[(String, String)]) -> (String, usize, usize) {
     (body, projected, rows.len() - projected)
 }
 
-/// Flatten text to one line and remove both projection markers.
+/// Flatten text to one line and remove both projection markers. A carriage
+/// return and the Unicode line and paragraph separators break a line as `\n`
+/// does, so all four become a space.
 ///
 /// A marker inside a key or a note would make `splice_block` cut the file at
 /// the planted marker, so the rest of the old block would count as operator
 /// prose and grow on every projection.
 fn escape_projected_text(text: &str) -> String {
-    let mut out = text.replace('\n', " ");
+    let mut out = text.replace(['\n', '\r', '\u{2028}', '\u{2029}'], " ");
     // Removing a marker can join the text around it into a new marker, so
     // repeat until none is left.
     while out.contains(PROJECTION_BEGIN) || out.contains(PROJECTION_END) {
@@ -638,6 +663,130 @@ Rule 3: Protect the user.
         fs::read_to_string(dir.join(MEMORY_FILE)).unwrap_or_default()
     }
 
+    /// The generated lines of a projection: what sits between the marker and the
+    /// closing marker, less the comment line under the opening one.
+    fn projected_lines(file: &str) -> Vec<&str> {
+        file.split(PROJECTION_BEGIN)
+            .nth(1)
+            .and_then(|rest| rest.split(PROJECTION_END).next())
+            .map(|block| block.lines().skip(2).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// A key or a note with a carriage return, a Unicode line separator or a
+    /// paragraph separator must stay on one projected line, as one with a newline
+    /// does: a renderer or a model reading the file may break the line there.
+    #[tokio::test]
+    async fn projection_flattens_every_line_separator() {
+        let tmp = workspace_with_core(&[
+            ("cr\rkey", "first\rsecond"),
+            ("ls\u{2028}key", "first\u{2028}second"),
+            ("ps\u{2029}key", "first\u{2029}second"),
+            ("crlf\r\nkey", "first\r\nsecond\nthird"),
+        ])
+        .await;
+
+        project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        let body = projected_lines(&out);
+        assert_eq!(body.len(), 4, "{out}");
+        for line in &body {
+            assert!(line.starts_with("- "), "{out}");
+            assert!(
+                !line.contains(['\r', '\u{2028}', '\u{2029}']),
+                "a line separator survived in {line:?}"
+            );
+        }
+        assert!(out.contains("- cr key: first second"), "{out}");
+    }
+
+    /// The operator saw `MEMORY.md` rewritten at every daemon start with the same
+    /// bytes. A projection that would leave the file as it is writes nothing, so
+    /// the file is not replaced: its inode and its contents stay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_projection_of_unchanged_content_writes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
+        let path = tmp.path().join(MEMORY_FILE);
+        project_core_memories(tmp.path()).unwrap();
+        let first = fs::read(&path).unwrap();
+        let first_inode = fs::metadata(&path).unwrap().ino();
+
+        let projected = project_core_memories(tmp.path()).unwrap();
+
+        assert_eq!(projected, 1, "the count still reports what the block holds");
+        assert_eq!(fs::read(&path).unwrap(), first);
+        assert_eq!(
+            fs::metadata(&path).unwrap().ino(),
+            first_inode,
+            "an unchanged projection replaced the file"
+        );
+    }
+
+    /// A changed store still reaches the file: the unchanged check compares the
+    /// whole new content, not the presence of a block.
+    #[tokio::test]
+    async fn a_projection_of_changed_content_is_written() {
+        let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
+        project_core_memories(tmp.path()).unwrap();
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "editor",
+            "uses a terminal editor",
+            crate::memory::MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        assert!(out.contains("- editor: uses a terminal editor"), "{out}");
+    }
+
+    /// A `MEMORY.md` that cannot be read as text is not an empty file. Reading it
+    /// as empty would replace the operator's whole file with the block alone, so
+    /// the projection stops, says why, and leaves the bytes where they are.
+    #[tokio::test]
+    async fn a_memory_md_that_is_not_utf8_aborts_the_projection() {
+        let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
+        let path = tmp.path().join(MEMORY_FILE);
+        let original: Vec<u8> = vec![b'#', b' ', 0xff, 0xfe, b'\n', b'k', b'e', b'e', b'p'];
+        fs::write(&path, &original).unwrap();
+
+        let err = project_core_memories(tmp.path()).expect_err("the projection must abort");
+
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "the error names the cause: {err}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original, "the file was replaced");
+    }
+
+    /// An error other than "not found" is also not an empty file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_memory_md_that_cannot_be_read_aborts_the_projection() {
+        let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
+        let path = tmp.path().join(MEMORY_FILE);
+        fs::create_dir(&path).unwrap();
+
+        let err = project_core_memories(tmp.path()).expect_err("the projection must abort");
+
+        assert!(
+            err.to_string().contains("MEMORY.md"),
+            "the error names the file: {err}"
+        );
+        assert!(path.is_dir(), "the directory was replaced");
+    }
+
     #[tokio::test]
     async fn projection_writes_core_memories_into_the_block() {
         let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
@@ -851,11 +1000,13 @@ Rule 3: Protect the user.
 
         assert_eq!(first.matches(PROJECTION_BEGIN).count(), 1, "{first}");
         assert_eq!(first.matches(PROJECTION_END).count(), 1, "{first}");
+        let body = projected_lines(&first);
         assert_eq!(
-            first.lines().filter(|l| l.starts_with("- ")).count(),
+            body.len(),
             2,
             "a key with a newline must stay on one line:\n{first}"
         );
+        assert!(body.iter().all(|line| line.starts_with("- ")), "{first}");
         assert!(first.contains("- plain_key: plain value"), "{first}");
         assert_eq!(first, second, "a second projection changed the file");
     }

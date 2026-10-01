@@ -572,13 +572,11 @@ user's message, and the lookups of `memory_store` and `memory_forget` may read.
 
 The table in
 [Per-role channel permissions](../security/per-role-permissions.md#memory-view-what-a-turn-may-read)
-lists every door. `USER.md` and `MEMORY.md` in the prompt follow the view on
-the doors that build the prompt for the turn: the CLI, a cron job, the
-heartbeat, the TUI, the console and the webhook. Only a turn that reads all of
-memory carries them. A channel's owner prompt is built once when the channel
-starts, outside any turn, and still carries them, so a named owner in a group
-and a wildcard owner have them in the prompt while their memory view is the
-conversation.
+lists every door. `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md` in the
+prompt follow the view: only a turn that reads all of memory carries them. A
+channel builds the owner prompt on every message, so a named owner in a group
+and a wildcard owner get none of them, and a note deleted since the last message
+is gone from the next one.
 
 A guest's writes stay in its own place too. `memory_store` under a guest turn
 stores with the guest's conversation as the session, and its `replaces` and
@@ -588,8 +586,17 @@ is the exception. Storing an existing key from another place (shared or another
 conversation) fails without changing the row, so a guest cannot overwrite the
 owner's notes or pull a row into the shared tier. `POST /api/v1/memory` answers
 that failure with `409`.
+
+The agent's `memory_store` also refuses a key that already holds a different note
+unless `replaces` names it, so a second save under a model-chosen key cannot drop
+the first note; identical content succeeds. `memory_forget` deletes only rows the
+turn's view can see, by key and by `contains`, and nothing in a turn with no view.
+An operator's own surfaces, `POST` and `DELETE /api/v1/memory`, `rantaiclaw
+memory add` and `clear`, and the TUI `/memory` commands, run under the view of all
+of memory and replace a note on purpose.
 The `MEMORY.md` projection and the `MEMORY_SNAPSHOT.md` export hold shared core
-notes only. A guest's core note stays in the database, in its own conversation,
+notes only. Notes a guest wrote in 0.32 or earlier carry no conversation, so they
+count as shared and still appear in both until removed. A guest's core note stays in the database, in its own conversation,
 and so stays out of `MEMORY.md` and out of the owner's system prompt. The
 capacity notice of `memory_store` counts shared core notes only, and a guest
 does not get it. `file_write` under a guest turn refuses `skills/` and the
@@ -649,9 +656,16 @@ markers is yours and is preserved; content inside is generated and is replaced o
 each run. The database is authoritative — edit memories through the agent or
 `rantaiclaw memory`, and keep prose outside the block.
 
-The system prompt is built once per session, so a memory stored mid-session
-appears in the file immediately but reaches the prompt next session. Within-session
-recall covers the gap.
+A projection that would leave the file as it is writes nothing. A `MEMORY.md`
+that is not valid UTF-8, or cannot be read for a reason other than being absent,
+stops the projection with an error and is left as it is. A carriage return and the
+Unicode line and paragraph separators in a note are flattened to a space, as a
+newline is.
+
+A channel reads `MEMORY.md` when it builds the owner prompt for a message, so a
+memory stored or deleted mid-session reaches the next message of a turn that
+reads all of memory. The interactive TUI and CLI session builds its prompt once,
+when the session starts; within-session recall covers the gap there.
 
 Notes:
 

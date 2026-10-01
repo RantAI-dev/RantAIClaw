@@ -199,7 +199,9 @@ async fn guest_channel_turn_uses_guest_prompt_scoped_memory_and_probe_view() {
             recorder: recorder.clone(),
         }) as Box<dyn Tool>]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt(
+            "OWNER_SYSTEM_PROMPT".to_string(),
+        ),
         guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -319,7 +321,9 @@ async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_and_the_all_view
             recorder: recorder.clone(),
         }) as Box<dyn Tool>]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("OWNER_SYSTEM_PROMPT".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt(
+            "OWNER_SYSTEM_PROMPT".to_string(),
+        ),
         guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -446,7 +450,7 @@ async fn guest_channel_turn_uses_guest_persona_without_owner_name_or_timezone() 
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new(prompt_fixture.to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt(prompt_fixture.to_string()),
         guest_system_prompt: Arc::new(prompt_fixture.to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
@@ -2657,6 +2661,91 @@ async fn owner_prompt_keeps_owner_files_paths_and_host() {
     assert!(prompt.contains("Host: "), "{prompt}");
 }
 
+/// A core note the owner deletes is gone from the owner's next message in the
+/// same running runtime. The owner prompt is read from `MEMORY.md` at the turn
+/// that uses it, so no restart is needed. The first turn is the control: the
+/// note is in the prompt before the delete.
+#[tokio::test]
+async fn a_note_deleted_with_memory_forget_is_gone_from_the_next_owner_prompt() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let first = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello", Vec::new())
+        .await;
+    assert!(
+        first.system_prompt().contains(SHARED_NOTE_WORD),
+        "control: the note is in the owner prompt before it is deleted:\n{}",
+        first.system_prompt()
+    );
+
+    let delete = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "forget the lantern note",
+            vec![
+                call(
+                    "memory_forget",
+                    serde_json::json!({ "key": "shared_recipe" }),
+                ),
+                "Done.".to_string(),
+            ],
+        )
+        .await;
+    assert!(
+        delete
+            .tool_results()
+            .contains("Forgot memory: shared_recipe"),
+        "{}",
+        delete.tool_results()
+    );
+
+    let next = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello again", Vec::new())
+        .await;
+    assert!(
+        !next.system_prompt().contains(SHARED_NOTE_WORD),
+        "a deleted note reached the next owner prompt:\n{}",
+        next.system_prompt()
+    );
+}
+
+/// The same for the operator's `memory clear` on the host: the daemon is still
+/// running when the note is cleared, and its next owner prompt does not carry it.
+#[tokio::test]
+async fn a_note_cleared_on_the_cli_is_gone_from_the_next_owner_prompt() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let first = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello", Vec::new())
+        .await;
+    assert!(
+        first.system_prompt().contains(SHARED_NOTE_WORD),
+        "control: the note is in the owner prompt before it is cleared:\n{}",
+        first.system_prompt()
+    );
+
+    crate::memory::cli::handle_command(
+        crate::MemoryCommands::Clear {
+            key: Some("shared_recipe".to_string()),
+            category: None,
+            yes: true,
+        },
+        &deployment.config,
+    )
+    .await
+    .expect("the clear runs");
+
+    let next = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello again", Vec::new())
+        .await;
+    assert!(
+        !next.system_prompt().contains(SHARED_NOTE_WORD),
+        "a cleared note reached the next owner prompt:\n{}",
+        next.system_prompt()
+    );
+}
+
 /// The owner reads the private files, and writes a skill, with the calls that
 /// a guest is refused.
 #[tokio::test]
@@ -2826,10 +2915,35 @@ async fn an_owner_through_the_wildcard_alone_never_runs_under_the_all_view() {
     }
 }
 
+/// The owner prompt of a turn that reads one conversation: the owner files and
+/// the notes projected from the shared tier are absent, while the owner stays an
+/// owner. The persona, the workspace path and the host line still render, and the
+/// prompt tells the model where the private notes are.
+fn assert_owner_files_absent_from_an_owner_prompt(who: &str, turn: &Turn) {
+    let prompt = turn.system_prompt();
+    for secret in [
+        USER_FILE_SECRET,
+        MEMORY_FILE_SECRET,
+        BOOTSTRAP_FILE_SECRET,
+        TOOLS_FILE_SECRET,
+        SHARED_NOTE_WORD,
+    ] {
+        assert!(
+            !prompt.contains(secret),
+            "{secret} reached the prompt of {who}:\n{prompt}"
+        );
+    }
+    for owner_rendering in [PERSONA_NAME, PERSONA_TIMEZONE, "Host: ", "verified OWNER"] {
+        assert!(
+            prompt.contains(owner_rendering),
+            "{who} keeps the owner rendering, {owner_rendering} is missing:\n{prompt}"
+        );
+    }
+}
+
 /// What the model was shown of the conversation itself: every message of the
-/// turn except the system prompt. The system prompt is left out on purpose,
-/// since an owner's start-up prompt carries `MEMORY.md` whichever view the turn
-/// runs under.
+/// turn except the system prompt. Each caller checks the system prompt on its
+/// own, with [`assert_owner_files_absent_from_an_owner_prompt`].
 fn conversation_text(turn: &Turn) -> String {
     turn.requests
         .iter()
@@ -2904,6 +3018,14 @@ async fn a_named_owner_in_a_group_recalls_only_that_groups_notes() {
             "{other} reached an owner's turn in a group:\n{seen}"
         );
     }
+    assert_owner_files_absent_from_an_owner_prompt("a named owner in a group", &turn);
+    assert!(
+        turn.system_prompt().contains(
+            "The owner's private notes are available only in a direct chat with the bot."
+        ),
+        "an owner in a group is told where the private notes are:\n{}",
+        turn.system_prompt()
+    );
 }
 
 /// `Only` narrows what a turn reads. It does not take write access away, so an
@@ -2981,6 +3103,7 @@ async fn an_owner_through_the_wildcard_alone_keeps_owner_rights_and_reads_one_co
             "{other} reached the turn of an owner who is one only through the wildcard:\n{seen}"
         );
     }
+    assert_owner_files_absent_from_an_owner_prompt("a wildcard owner", &turn);
 }
 
 // ── Where a note is written and who can delete it ───────────────────────
