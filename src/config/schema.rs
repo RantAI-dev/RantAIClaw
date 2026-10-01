@@ -208,10 +208,6 @@ pub struct Config {
     #[serde(default)]
     pub cost: CostConfig,
 
-    /// Peripheral board configuration for hardware integration (`[peripherals]`).
-    #[serde(default)]
-    pub peripherals: PeripheralsConfig,
-
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -220,10 +216,6 @@ pub struct Config {
     /// Each entry defines a co-equal agent hosted by the gateway, routed via `X-Agent-Id` header.
     #[serde(default)]
     pub gateway_agents: HashMap<String, GatewayAgentConfig>,
-
-    /// Hardware configuration (wizard-driven physical world setup).
-    #[serde(default)]
-    pub hardware: HardwareConfig,
 
     /// MCP servers managed by the runtime (`[mcp_servers.<name>]`).
     #[serde(default)]
@@ -344,75 +336,7 @@ pub struct GatewayAgentConfig {
     pub default: bool,
 }
 
-// ── Hardware Config (wizard-driven) ─────────────────────────────
-
-/// Hardware transport mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
-pub enum HardwareTransport {
-    #[default]
-    None,
-    Native,
-    Serial,
-    Probe,
-}
-
-impl std::fmt::Display for HardwareTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::None => write!(f, "none"),
-            Self::Native => write!(f, "native"),
-            Self::Serial => write!(f, "serial"),
-            Self::Probe => write!(f, "probe"),
-        }
-    }
-}
-
-/// Wizard-driven hardware configuration for physical world interaction.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct HardwareConfig {
-    /// Whether hardware access is enabled
-    #[serde(default)]
-    pub enabled: bool,
-    /// Transport mode
-    #[serde(default)]
-    pub transport: HardwareTransport,
-    /// Serial port path (e.g. "/dev/ttyACM0")
-    #[serde(default)]
-    pub serial_port: Option<String>,
-    /// Serial baud rate
-    #[serde(default = "default_baud_rate")]
-    pub baud_rate: u32,
-    /// Probe target chip (e.g. "STM32F401RE")
-    #[serde(default)]
-    pub probe_target: Option<String>,
-    /// Enable workspace datasheet RAG (index PDF schematics for AI pin lookups)
-    #[serde(default)]
-    pub workspace_datasheets: bool,
-}
-
-fn default_baud_rate() -> u32 {
-    115_200
-}
-
-impl HardwareConfig {
-    /// Return the active transport mode.
-    pub fn transport_mode(&self) -> HardwareTransport {
-        self.transport.clone()
-    }
-}
-
-impl Default for HardwareConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            transport: HardwareTransport::None,
-            serial_port: None,
-            baud_rate: default_baud_rate(),
-            probe_target: None,
-            workspace_datasheets: false,
-        }
-    }
-}
+// ── Hardware Config (retired in v36) ──────────────────────────────────────
 
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -795,59 +719,7 @@ impl Default for CostConfig {
     }
 }
 
-// ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
-
-/// Peripheral board integration configuration (`[peripherals]` section).
-///
-/// Boards become agent tools when enabled.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
-pub struct PeripheralsConfig {
-    /// Enable peripheral support (boards become agent tools)
-    #[serde(default)]
-    pub enabled: bool,
-    /// Board configurations (nucleo-f401re, rpi-gpio, etc.)
-    #[serde(default)]
-    pub boards: Vec<PeripheralBoardConfig>,
-    /// Path to datasheet docs (relative to workspace) for RAG retrieval.
-    /// Place .md/.txt files named by board (e.g. nucleo-f401re.md, rpi-gpio.md).
-    #[serde(default)]
-    pub datasheet_dir: Option<String>,
-}
-
-/// Configuration for a single peripheral board (e.g. STM32, RPi GPIO).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct PeripheralBoardConfig {
-    /// Board type: "nucleo-f401re", "rpi-gpio", "esp32", etc.
-    pub board: String,
-    /// Transport: "serial", "native", "websocket"
-    #[serde(default = "default_peripheral_transport")]
-    pub transport: String,
-    /// Path for serial: "/dev/ttyACM0", "/dev/ttyUSB0"
-    #[serde(default)]
-    pub path: Option<String>,
-    /// Baud rate for serial (default: 115200)
-    #[serde(default = "default_peripheral_baud")]
-    pub baud: u32,
-}
-
-fn default_peripheral_transport() -> String {
-    "serial".into()
-}
-
-fn default_peripheral_baud() -> u32 {
-    115_200
-}
-
-impl Default for PeripheralBoardConfig {
-    fn default() -> Self {
-        Self {
-            board: String::new(),
-            transport: default_peripheral_transport(),
-            path: None,
-            baud: default_peripheral_baud(),
-        }
-    }
-}
+// ── Peripherals (retired in v36) ──────────────────────────────────────────
 
 // ── Gateway security ─────────────────────────────────────────────
 
@@ -1175,18 +1047,9 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
-    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
+    /// Browser automation backend: "agent_browser" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
-    /// Headless mode for rust-native backend
-    #[serde(default = "default_true")]
-    pub native_headless: bool,
-    /// WebDriver endpoint URL for rust-native backend (e.g. http://127.0.0.1:9515)
-    #[serde(default = "default_browser_webdriver_url")]
-    pub native_webdriver_url: String,
-    /// Optional Chrome/Chromium executable path for rust-native backend
-    #[serde(default)]
-    pub native_chrome_path: Option<String>,
     /// Computer-use sidecar configuration
     #[serde(default)]
     pub computer_use: BrowserComputerUseConfig,
@@ -1196,10 +1059,6 @@ fn default_browser_backend() -> String {
     "agent_browser".into()
 }
 
-fn default_browser_webdriver_url() -> String {
-    "http://127.0.0.1:9515".into()
-}
-
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
@@ -1207,9 +1066,6 @@ impl Default for BrowserConfig {
             allowed_domains: Vec::new(),
             session_name: None,
             backend: default_browser_backend(),
-            native_headless: default_true(),
-            native_webdriver_url: default_browser_webdriver_url(),
-            native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
         }
     }
@@ -3545,10 +3401,8 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             gateway_agents: HashMap::new(),
-            hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             mcp_servers: HashMap::new(),
         }
@@ -6386,10 +6240,8 @@ default_temperature = 0.7
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             gateway_agents: HashMap::new(),
-            hardware: HardwareConfig::default(),
             mcp_servers: HashMap::new(),
         };
 
@@ -6601,10 +6453,8 @@ tool_dispatcher = "xml"
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             gateway_agents: HashMap::new(),
-            hardware: HardwareConfig::default(),
             mcp_servers: HashMap::new(),
         };
 
@@ -7669,9 +7519,6 @@ default_temperature = 0.7
         assert!(b.enabled);
         assert!(b.allowed_domains.is_empty());
         assert_eq!(b.backend, "agent_browser");
-        assert!(b.native_headless);
-        assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
-        assert!(b.native_chrome_path.is_none());
         assert_eq!(b.computer_use.endpoint, "http://127.0.0.1:8787/v1/actions");
         assert_eq!(b.computer_use.timeout_ms, 15_000);
         assert!(!b.computer_use.allow_remote_endpoint);
@@ -7687,9 +7534,6 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
-            native_headless: false,
-            native_webdriver_url: "http://localhost:4444".into(),
-            native_chrome_path: Some("/usr/bin/chromium".into()),
             computer_use: BrowserComputerUseConfig {
                 endpoint: "https://computer-use.example.com/v1/actions".into(),
                 api_key: Some("test-token".into()),
@@ -7706,12 +7550,6 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
-        assert!(!parsed.native_headless);
-        assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
-        assert_eq!(
-            parsed.native_chrome_path.as_deref(),
-            Some("/usr/bin/chromium")
-        );
         assert_eq!(
             parsed.computer_use.endpoint,
             "https://computer-use.example.com/v1/actions"
@@ -9424,42 +9262,8 @@ default_model = "legacy-model"
     }
 
     // ── Peripherals config ───────────────────────────────────────
-
-    #[test]
-    async fn peripherals_config_default_disabled() {
-        let p = PeripheralsConfig::default();
-        assert!(!p.enabled);
-        assert!(p.boards.is_empty());
-    }
-
-    #[test]
-    async fn peripheral_board_config_defaults() {
-        let b = PeripheralBoardConfig::default();
-        assert!(b.board.is_empty());
-        assert_eq!(b.transport, "serial");
-        assert!(b.path.is_none());
-        assert_eq!(b.baud, 115_200);
-    }
-
-    #[test]
-    async fn peripherals_config_toml_roundtrip() {
-        let p = PeripheralsConfig {
-            enabled: true,
-            boards: vec![PeripheralBoardConfig {
-                board: "nucleo-f401re".into(),
-                transport: "serial".into(),
-                path: Some("/dev/ttyACM0".into()),
-                baud: 115_200,
-            }],
-            datasheet_dir: None,
-        };
-        let toml_str = toml::to_string(&p).unwrap();
-        let parsed: PeripheralsConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.enabled);
-        assert_eq!(parsed.boards.len(), 1);
-        assert_eq!(parsed.boards[0].board, "nucleo-f401re");
-        assert_eq!(parsed.boards[0].path.as_deref(), Some("/dev/ttyACM0"));
-    }
+    //
+    // Removed with the `[peripherals]` section (plan 507).
 
     #[test]
     async fn lark_config_serde() {
