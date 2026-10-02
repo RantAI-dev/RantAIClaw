@@ -192,6 +192,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not send to-device messages. Default builds do not contain the crate. The fix needs
   `matrix-sdk` 0.19, which is blocked on a `rusqlite` upgrade. The advisory is recorded as accepted
   in `deny.toml` and the audit workflow, for review by 2026-11-15.
+- **RUSTSEC-2026-0319 accepted for the opt-in `channel-matrix` feature.** Builds with that feature
+  include `anymap2` 0.13.0, which is flagged unmaintained. It has no patched version and comes in
+  through `matrix-sdk` 0.18. Default builds do not contain the crate. The advisory is recorded as
+  accepted in `deny.toml` and the audit workflow, for review by 2026-11-15.
 
 ## [0.32.0-alpha] — 2026-09-26
 
