@@ -54,7 +54,7 @@ patterns = [
   "list_*",
 
   # Safe-write seeds — bookkeeping the agent must do to function.
-  "memory_write *",
+  "memory_store *",
   "skill_install *",
   "cron_*",
   "session_*",

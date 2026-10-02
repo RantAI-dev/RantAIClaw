@@ -275,7 +275,7 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 
 ## In-Chat Runtime Model Switching
 
-When running `rantaiclaw channel start` (or daemon mode), the four tier channels (Telegram, Discord, Slack and WhatsApp Web) support runtime switching, scoped to the conversation:
+When running `rantaiclaw channel start` (or daemon mode), the five tier channels (Telegram, Discord, Slack, WhatsApp and Lark) support runtime switching, scoped to the conversation:
 
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current conversation. Owner only. In a group that applies to everyone in it
@@ -432,6 +432,29 @@ That covers approval prompts, command replies, error texts, pairing and
 operator-approval messages, delivery-failure notices and the restart notice. It
 also covers a Telegram message that is only a file path, which uploads only when
 it is the model's reply.
+
+The guest reply filter runs `file_read`'s checks, in `file_read`'s order, on
+every attachment a guest's reply names. `file_read` must be in
+`guest_allowed_tools`. The target must not be a URL, must pass the security
+policy's path rule (so an absolute path is refused under the default
+`workspace_only`), must not be one of the owner's private files, must resolve
+inside the workspace and must not be a SQLite sidecar. It must also be a
+regular file of at most 10 MiB, the limit `file_read` applies, and not a SQLite
+database. The filter judges against the workspace the upload resolves, read
+for each reply, and refuses every attachment when that workspace cannot be
+resolved. A refused attachment becomes one closing line in the reply.
+
+The filter reads markers and path-only replies from the text and never asks
+the filesystem whether the file exists. An unclosed marker fragment is removed
+from a guest's reply, and a guest's reply that is only a file name with a known
+extension is withheld even when no such file exists. On Telegram a reply that
+is only a file path is judged and uploaded after the runtime's own `Noted:`
+line is set aside, for an owner and for a guest. The four error texts that end
+a failed turn (context window, provider capability, provider error and
+timeout) pass the same filter for a guest, on the draft and on the plain send.
+A guest's turn does not stream into a Telegram draft. The guest sees the
+placeholder until the filtered reply replaces it, while an owner's draft still
+streams. An owner's reply is not filtered.
 
 The instruction says what the runtime actually does, not only the syntax. It
 states that attaching a file needs no tool call and no approval, that a local

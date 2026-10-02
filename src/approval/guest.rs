@@ -310,9 +310,14 @@ const OWNER_PROMPT_FILES: &[&str] = &[
 /// for the same reason; this closes the file path to the same place.
 ///
 /// Names compare case-insensitively so a case-insensitive filesystem cannot
-/// reach `agents.md` through the same file. `canonical_workspace` must be
-/// canonicalised, as for [`is_private_owner_path_resolved`]. A path outside it
-/// is not judged here: the workspace containment check refuses it.
+/// reach `agents.md` through the same file, and without trailing dots and spaces
+/// or a `:stream` suffix, which Windows ignores. The rule compares the path, not
+/// the file: a second hard link to a prompt file under another name is not
+/// recognised.
+///
+/// `canonical_workspace` must be canonicalised, as for
+/// [`is_private_owner_path_resolved`]. A path outside it is not judged here: the
+/// workspace containment check refuses it.
 pub fn is_owner_prompt_path_resolved(resolved: &Path, canonical_workspace: &Path) -> bool {
     let Ok(rel) = resolved.strip_prefix(canonical_workspace) else {
         return false;
@@ -321,6 +326,11 @@ pub fn is_owner_prompt_path_resolved(resolved: &Path, canonical_workspace: &Path
     let Some(first) = parts.next().and_then(|c| c.as_os_str().to_str()) else {
         return false;
     };
+    // Windows drops trailing dots and spaces from a name and reads `name:stream`
+    // as a stream of `name`, so `AGENTS.md.` and `AGENTS.md:x` are the prompt
+    // file there. They compare as the file.
+    let first = first.split(':').next().unwrap_or(first);
+    let first = first.trim_end_matches(['.', ' ']);
     if first.eq_ignore_ascii_case("skills") {
         return true;
     }
@@ -766,6 +776,27 @@ mod tests {
             "IDENTITY.md",
             "HEARTBEAT.md",
             "agents.md",
+        ] {
+            assert!(
+                is_owner_prompt_path_resolved(&ws.join(rel), ws),
+                "{rel} must be a guest-unwritable prompt path"
+            );
+        }
+    }
+
+    /// Windows drops trailing dots and spaces from a name and reads
+    /// `name:stream` as a stream of the file, so each of these is the prompt file
+    /// there, whether or not the file exists yet.
+    #[test]
+    fn owner_prompt_rule_reads_windows_name_forms_as_the_file() {
+        let ws = Path::new("/ws");
+        for rel in [
+            "AGENTS.md.",
+            "AGENTS.md ",
+            "AGENTS.md:stream",
+            "agents.md:stream",
+            "skills.",
+            "skills:stream/x.md",
         ] {
             assert!(
                 is_owner_prompt_path_resolved(&ws.join(rel), ws),

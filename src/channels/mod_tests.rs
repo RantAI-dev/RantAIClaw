@@ -7831,8 +7831,8 @@ fn channel_prompt_for(ws: &TempDir, guest: bool) -> String {
 
 /// A guest prompt describes the guest's turn, not the host: no absolute
 /// workspace path (it carries the OS user name), no host name, no timezone
-/// of the machine, and no `TOOLS.md` (its scaffold asks the owner for SSH
-/// hosts and device nicknames).
+/// of the machine, no `TOOLS.md` (its scaffold asks the owner for SSH
+/// hosts and device nicknames) and no `AGENTS.md` (its scaffold names tools).
 #[test]
 fn guest_prompt_carries_no_host_or_workspace_details() {
     let ws = make_workspace();
@@ -7865,8 +7865,9 @@ fn guest_prompt_carries_no_host_or_workspace_details() {
         !guest.contains("### TOOLS.md") && !guest.contains("box-a.internal.example"),
         "TOOLS.md reached a guest prompt:\n{guest}"
     );
-    // The files that describe the bot stay.
-    assert!(guest.contains("### AGENTS.md"), "{guest}");
+    // `AGENTS.md` is the owner's operating manual, so it stays out of a guest's
+    // prompt. The files that describe the bot stay.
+    assert!(!guest.contains("### AGENTS.md"), "{guest}");
     assert!(guest.contains("### SOUL.md"), "{guest}");
     assert!(guest.contains("### IDENTITY.md"), "{guest}");
 }
@@ -7890,6 +7891,7 @@ fn owner_prompt_keeps_host_workspace_and_tools_file() {
         "{owner}"
     );
     assert!(owner.contains("### TOOLS.md"), "{owner}");
+    assert!(owner.contains("### AGENTS.md"), "{owner}");
 }
 
 #[test]
@@ -10884,6 +10886,47 @@ fn only_a_filtered_reply_and_a_configured_delivery_build_a_message_that_may_atta
             found.get(*file).map_or(0, Vec::len),
             *count,
             "{file} should turn the flag on {count} time(s) ({why})"
+        );
+    }
+}
+
+/// Every text a failed turn ends with leaves through `SenderText::end_failed_turn`,
+/// which runs it through the sender's filter. Two of those texts are constants and
+/// no case can tell whether a filter ran on them, so this reads the source: from
+/// the arm that handles a failed turn to the end of the function, nothing sends a
+/// message or finalizes a draft on its own, and the four endings call the one
+/// function.
+#[test]
+fn a_failed_turn_ends_only_through_the_one_function_that_filters_its_text() {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = std::fs::read_to_string(src_root.join("channels").join("dispatch.rs"))
+        .expect("read dispatch.rs");
+    let production = production_half(&src);
+
+    let start = production
+        .find("LlmExecutionResult::Completed(Ok(Err(e))) =>")
+        .expect("the arm that handles a failed turn");
+    let end = start
+        + production[start..]
+            .find("\n    if cancelled {")
+            .expect("the end of the function that runs a turn");
+    // Whitespace and comments cannot move a call out of the count.
+    let region: String = production[start..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
+        .collect();
+
+    assert_eq!(
+        region.matches(".end_failed_turn(").count(),
+        4,
+        "the context window, capability, provider error and timeout endings each call it"
+    );
+    for direct in [".send(", ".finalize_draft(", ".send_draft("] {
+        assert_eq!(
+            region.matches(direct).count(),
+            0,
+            "a failed turn calls `{direct}` itself, so its text skips the sender's filter"
         );
     }
 }

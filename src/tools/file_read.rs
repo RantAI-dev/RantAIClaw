@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+/// The largest file `file_read` returns. A guest's reply is sent no file larger
+/// than this either.
+pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Read file contents with path sandboxing
 pub struct FileReadTool {

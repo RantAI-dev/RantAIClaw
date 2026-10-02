@@ -361,10 +361,11 @@ fn noted_line(notes: &[String]) -> Option<String> {
         .filter(|note| !note.is_empty())
         .collect();
     if readable.is_empty() {
-        return Some("Noted: a note was saved.".to_string());
+        return Some(format!("{}a note was saved.", media::NOTED_LINE_PREFIX));
     }
     let mut line = format!(
-        "Noted: {}",
+        "{}{}",
+        media::NOTED_LINE_PREFIX,
         readable
             .iter()
             .take(NOTED_LINE_MAX_NOTES)
@@ -414,13 +415,22 @@ const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 /// runtime fetches it on the channels that upload bytes, which lets a guest aim
 /// the bot at an internal address. A local path passes only when the operator
 /// lets guests use `file_read` **and** the file is one a guest `file_read` could
-/// return: inside the workspace, not a private owner path by its name or after
-/// symlinks resolve, and not a SQLite database under any name or one of its
-/// journal files.
+/// return: a path the security policy allows, inside the workspace, not a
+/// private owner path by its name or after symlinks resolve, a regular file no
+/// larger than `file_read` returns, and not a SQLite database under any name or
+/// one of its journal files.
 ///
-/// On Telegram, a reply that is only the path of an existing file, or a URL, is
-/// uploaded without a marker. It is judged the same way. Other channels send
-/// that text as it is.
+/// `workspace` is the one the upload resolves a marker against, which is read
+/// again at every send (see [`media::active_workspace`]).
+///
+/// The reply is judged by its text alone, never by what is on disk now, because
+/// a file can appear between this judgement and the channel's read: an unclosed
+/// marker for an absolute path counts as an attachment whether or not the file
+/// exists, and so does a reply that is only a path.
+///
+/// On Telegram, a reply that is only a file path, or a URL, is uploaded without
+/// a marker. It is judged the same way, without the `Noted:` line the runtime
+/// may have added. Other channels send that text as it is.
 ///
 /// When nothing was refused the reply comes back as it was. Otherwise the reply
 /// is rebuilt from its text with every tool-call block removed, the attachments
@@ -435,8 +445,9 @@ pub(crate) async fn withhold_guest_attachments(
     channel: &str,
     workspace: &std::path::Path,
     file_read_permitted: bool,
+    security: &crate::security::SecurityPolicy,
 ) -> String {
-    let judged = judge_guest_reply(reply, channel, workspace, file_read_permitted).await;
+    let judged = judge_guest_reply(reply, channel, workspace, file_read_permitted, security).await;
     if judged.refused == 0 {
         return reply.to_string();
     }
@@ -457,17 +468,26 @@ pub(crate) async fn withhold_guest_attachments(
         }
         without_tags = stripped;
     }
-    let (cleaned, candidates) = media::parse_attachment_markers(&without_tags);
+    let (cleaned, candidates) = media::parse_attachment_candidates(&without_tags);
 
-    // A reply that was only a refused path has no other text to keep.
+    // A reply that was only a refused path has no other text to keep but the
+    // line that says what the turn stored.
     let mut rebuilt = if judged.path_only_refused {
-        String::new()
+        media::split_noted_line(&without_tags).1.to_string()
     } else {
         cleaned
     };
     let mut kept: Vec<media::OutboundAttachment> = Vec::new();
     for attachment in candidates {
-        if guest_may_receive(&attachment, channel, workspace, file_read_permitted).await {
+        if guest_may_receive(
+            &attachment,
+            channel,
+            workspace,
+            file_read_permitted,
+            security,
+        )
+        .await
+        {
             if !rebuilt.is_empty() {
                 rebuilt.push('\n');
             }
@@ -481,11 +501,80 @@ pub(crate) async fn withhold_guest_attachments(
     rebuilt.push_str(GUEST_ATTACHMENT_WITHHELD_LINE);
 
     // The joined text may read differently from the original. Fail closed.
-    let rejudged = judge_guest_reply(&rebuilt, channel, workspace, file_read_permitted).await;
+    let rejudged =
+        judge_guest_reply(&rebuilt, channel, workspace, file_read_permitted, security).await;
     if rejudged.refused > 0 || rejudged.attachments.iter().any(|a| !kept.contains(a)) {
         return GUEST_ATTACHMENT_WITHHELD_LINE.to_string();
     }
     rebuilt
+}
+
+/// The one filter every text that leaves for the sender of a turn passes: an
+/// owner's text as it is, a guest's text through [`withhold_guest_attachments`].
+///
+/// The model's reply and the text a failed turn ends with both go through it. A
+/// channel that edits a draft is handed a plain string, with no flag on a message
+/// that says it may not be read for attachments, so this does not rely on the
+/// flag.
+struct SenderText<'a> {
+    channel: &'a str,
+    is_owner: bool,
+    /// Whether the operator lets guests use `file_read`.
+    file_read_permitted: bool,
+    security: &'a crate::security::SecurityPolicy,
+}
+
+impl SenderText<'_> {
+    async fn filter(&self, text: String) -> String {
+        if self.is_owner {
+            return text;
+        }
+        // The upload resolves the active workspace at every send, so that is the
+        // one the filter judges in. With no workspace there is nothing to upload
+        // from, and the filter refuses every attachment.
+        let (workspace, file_read_permitted) = match media::active_workspace().await {
+            Ok(workspace) => (workspace, self.file_read_permitted),
+            Err(err) => {
+                tracing::warn!(
+                    channel = self.channel,
+                    "no active workspace for a guest reply: {err:#}"
+                );
+                (std::path::PathBuf::new(), false)
+            }
+        };
+        withhold_guest_attachments(
+            &text,
+            self.channel,
+            &workspace,
+            file_read_permitted,
+            self.security,
+        )
+        .await
+    }
+
+    /// End a failed turn with `text`, the one place that does. The text goes
+    /// through [`Self::filter`], then finalizes the draft when the turn has one
+    /// and goes out as a new message otherwise. A failed send is not retried:
+    /// the turn is already over.
+    async fn end_failed_turn(
+        &self,
+        channel: Option<&dyn traits::Channel>,
+        msg: &traits::ChannelMessage,
+        draft_message_id: Option<&str>,
+        text: String,
+    ) {
+        let Some(channel) = channel else {
+            return;
+        };
+        let text = self.filter(text).await;
+        if let Some(draft_id) = draft_message_id {
+            let _ = channel
+                .finalize_draft(&msg.reply_target, draft_id, &text)
+                .await;
+        } else {
+            let _ = channel.send(&msg.reply(text)).await;
+        }
+    }
 }
 
 /// What a guest's reply carries, read the ways the channels read it.
@@ -511,12 +600,13 @@ async fn judge_guest_reply(
     channel: &str,
     workspace: &std::path::Path,
     file_read_permitted: bool,
+    security: &crate::security::SecurityPolicy,
 ) -> GuestReplyJudgement {
     let telegram_view = super::telegram::strip_tool_call_tags(reply);
 
     let mut attachments: Vec<media::OutboundAttachment> = Vec::new();
     for view in [reply, telegram_view.as_str()] {
-        for attachment in media::parse_attachment_markers(view).1 {
+        for attachment in media::parse_attachment_candidates(view).1 {
             if !attachments.contains(&attachment) {
                 attachments.push(attachment);
             }
@@ -525,19 +615,41 @@ async fn judge_guest_reply(
 
     let mut refused = 0usize;
     for attachment in &attachments {
-        if !guest_may_receive(attachment, channel, workspace, file_read_permitted).await {
+        if !guest_may_receive(
+            attachment,
+            channel,
+            workspace,
+            file_read_permitted,
+            security,
+        )
+        .await
+        {
             refused += 1;
         }
     }
 
     // Telegram also uploads a reply that is nothing but the path of an existing
     // file, when it finds no marker in what is left after the removal. A marker
-    // found in the raw text does not change that. The other channels send such
-    // text as it is.
+    // found in the raw text does not change that. The line the runtime ends a
+    // reply with, when the turn stored a note, is not part of the reply. The
+    // other channels send such text as it is.
     let mut path_only_refused = false;
-    if channel == "telegram" && media::parse_attachment_markers(&telegram_view).1.is_empty() {
-        if let Some(attachment) = super::telegram::parse_path_only_attachment(&telegram_view) {
-            if !guest_may_receive(&attachment, channel, workspace, file_read_permitted).await {
+    if channel == "telegram"
+        && media::parse_attachment_candidates(&telegram_view)
+            .1
+            .is_empty()
+    {
+        let (model_reply, _) = media::split_noted_line(&telegram_view);
+        if let Some(attachment) = super::telegram::path_only_candidate(model_reply) {
+            if !guest_may_receive(
+                &attachment,
+                channel,
+                workspace,
+                file_read_permitted,
+                security,
+            )
+            .await
+            {
                 path_only_refused = true;
                 refused += 1;
             }
@@ -559,6 +671,7 @@ async fn guest_may_receive(
     channel: &str,
     workspace: &std::path::Path,
     file_read_permitted: bool,
+    security: &crate::security::SecurityPolicy,
 ) -> bool {
     use tokio::io::AsyncReadExt as _;
 
@@ -566,8 +679,12 @@ async fn guest_may_receive(
     if !file_read_permitted || media::is_http_url(target) {
         return false;
     }
-    // The two checks a guest `file_read` gets: the name as asked, then the
+    // The checks a guest `file_read` gets, in its order: the security policy on
+    // the path as asked, the owner's private names on the same string, then the
     // canonical path, which catches a symlink to a private file.
+    if !security.is_path_allowed(target) {
+        return false;
+    }
     if crate::approval::guest::is_private_owner_path(target) {
         return false;
     }
@@ -597,9 +714,11 @@ async fn guest_may_receive(
     if is_sqlite_sidecar {
         return false;
     }
-    // A regular file only: opening a FIFO to read its header would block.
+    // A regular file only: opening a FIFO to read its header would block. And
+    // no more than `file_read` returns.
     match tokio::fs::metadata(&canonical).await {
-        Ok(meta) if meta.is_file() => {}
+        Ok(meta)
+            if meta.is_file() && meta.len() <= crate::tools::file_read::MAX_FILE_SIZE_BYTES => {}
         _ => return false,
     }
     let Ok(mut file) = tokio::fs::File::open(&canonical).await else {
@@ -1073,7 +1192,10 @@ pub(crate) async fn process_channel_message(
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
 
-    let (delta_tx, delta_rx) = if use_streaming {
+    // A guest's reply is judged whole before anyone reads it, so nothing of it
+    // streams into the draft: the draft shows its placeholder until the filtered
+    // reply replaces it.
+    let (delta_tx, delta_rx) = if use_streaming && sender_is_owner {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
@@ -1180,6 +1302,12 @@ pub(crate) async fn process_channel_message(
         runtime_defaults.message_timeout_secs,
         runtime_defaults.max_tool_iterations,
     );
+    let sender_text = SenderText {
+        channel: msg.channel.as_str(),
+        is_owner: sender_is_owner,
+        file_read_permitted: guest_may_read_files,
+        security: ctx.security.as_ref(),
+    };
     // Chat audit identity: the trail must say WHO asked and whether they were
     // an owner, so a denial on a multi-user channel is attributable.
     let audit_actor = crate::security::AuditActor::chat(
@@ -1328,17 +1456,7 @@ pub(crate) async fn process_channel_message(
             // An attachment marker is uploaded with no tool call, so the guest
             // gate never sees it. A guest's reply is filtered here, before either
             // send path below.
-            let delivered_response = if sender_is_owner {
-                delivered_response
-            } else {
-                withhold_guest_attachments(
-                    &delivered_response,
-                    &msg.channel,
-                    ctx.workspace_dir.as_path(),
-                    guest_may_read_files,
-                )
-                .await
-            };
+            let delivered_response = sender_text.filter(delivered_response).await;
             // Moved verbatim in plan 121 row 10. `u64::try_from` rather than
             // the `as` cast the line carried: same value for any real elapsed
             // time, and the gate counts a moved line as a changed one.
@@ -1451,15 +1569,14 @@ pub(crate) async fn process_channel_message(
                     &history_key,
                     ChatMessage::assistant(FAILED_TURN_MARKER),
                 );
-                if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
-                            .await;
-                    } else {
-                        let _ = channel.send(&msg.reply(error_text)).await;
-                    }
-                }
+                sender_text
+                    .end_failed_turn(
+                        target_channel.as_deref(),
+                        &msg,
+                        draft_message_id.as_deref(),
+                        error_text,
+                    )
+                    .await;
                 return TurnEnd::Finished;
             }
 
@@ -1482,15 +1599,14 @@ pub(crate) async fn process_channel_message(
                     &history_key,
                     ChatMessage::assistant(FAILED_TURN_MARKER),
                 );
-                if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &reply)
-                            .await;
-                    } else {
-                        let _ = channel.send(&msg.reply(reply)).await;
-                    }
-                }
+                sender_text
+                    .end_failed_turn(
+                        target_channel.as_deref(),
+                        &msg,
+                        draft_message_id.as_deref(),
+                        reply,
+                    )
+                    .await;
                 return TurnEnd::Finished;
             }
 
@@ -1519,15 +1635,14 @@ pub(crate) async fn process_channel_message(
             );
             let safe_err = providers::sanitize_api_error(&format!("{e:#}"));
             let reply = with_noted_line(format!("⚠️ Error: {safe_err}"), &saved_notes);
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &reply)
-                        .await;
-                } else {
-                    let _ = channel.send(&msg.reply(reply)).await;
-                }
-            }
+            sender_text
+                .end_failed_turn(
+                    target_channel.as_deref(),
+                    &msg,
+                    draft_message_id.as_deref(),
+                    reply,
+                )
+                .await;
         }
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!(
@@ -1548,20 +1663,18 @@ pub(crate) async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(TIMED_OUT_TURN_MARKER),
             );
-            if let Some(channel) = target_channel.as_ref() {
-                let error_text = with_noted_line(
-                    "⚠️ Request timed out while waiting for the model. Please try again."
-                        .to_string(),
-                    &saved_notes,
-                );
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &error_text)
-                        .await;
-                } else {
-                    let _ = channel.send(&msg.reply(error_text)).await;
-                }
-            }
+            let error_text = with_noted_line(
+                "⚠️ Request timed out while waiting for the model. Please try again.".to_string(),
+                &saved_notes,
+            );
+            sender_text
+                .end_failed_turn(
+                    target_channel.as_deref(),
+                    &msg,
+                    draft_message_id.as_deref(),
+                    error_text,
+                )
+                .await;
         }
     }
 

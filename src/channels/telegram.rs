@@ -46,7 +46,7 @@ fn decorate_continuation(chunk: &str, index: usize, total: usize) -> String {
 /// deliver attachments; a second copy of the workspace check is the last thing
 /// this should grow.
 use crate::channels::media::{
-    is_http_url, split_outbound, AttachmentKind as TelegramAttachmentKind,
+    is_http_url, split_noted_line, split_outbound, AttachmentKind as TelegramAttachmentKind,
     OutboundAttachment as TelegramAttachment,
 };
 
@@ -75,7 +75,13 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
     }
 }
 
-pub(crate) fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
+/// The attachment a reply stands for when it is nothing but one file path or
+/// URL, judged by its text alone. Whether the file is there is not asked.
+///
+/// A reply that holds a line break or any whitespace in the path is not one, and
+/// neither is a path whose extension names no kind of attachment. Backticks and
+/// quotes around the path, and a `file://` prefix, are removed.
+pub(crate) fn path_only_candidate(message: &str) -> Option<TelegramAttachment> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
@@ -89,14 +95,28 @@ pub(crate) fn parse_path_only_attachment(message: &str) -> Option<TelegramAttach
     let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
     let kind = infer_attachment_kind_from_target(candidate)?;
 
-    if !is_http_url(candidate) && !Path::new(candidate).exists() {
-        return None;
-    }
-
     Some(TelegramAttachment {
         kind,
         target: candidate.to_string(),
     })
+}
+
+/// The attachment Telegram uploads for a reply that is only a file path or a
+/// URL, with no marker around it.
+///
+/// A path counts only when the file exists at the moment of the call, so plain
+/// text that happens to end in a known extension, such as a file name in an
+/// answer, is sent as text. A URL counts without that check. Anything that
+/// judges a reply before Telegram reads it must use [`path_only_candidate`]
+/// instead, because a file can appear between the judgement and this call.
+pub(crate) fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
+    let attachment = path_only_candidate(message)?;
+
+    if !is_http_url(&attachment.target) && !Path::new(&attachment.target).exists() {
+        return None;
+    }
+
+    Some(attachment)
 }
 
 /// What Telegram's `send` does with `message`: the text to send and the files
@@ -105,7 +125,8 @@ pub(crate) fn parse_path_only_attachment(message: &str) -> Option<TelegramAttach
 /// Tool-call tags are removed once, before anything is read. A message that did
 /// not ask for attachments comes back as that text with no files, so a marker or
 /// a bare file path in runtime-written text is sent as text. A reply that is
-/// nothing but the path of a file is uploaded without a marker and has no text.
+/// nothing but the path of a file is uploaded without a marker, and its text is
+/// the `Noted:` line the runtime added, if any.
 pub(crate) fn telegram_outbound(message: &SendMessage) -> (String, Vec<TelegramAttachment>) {
     let message = SendMessage {
         content: strip_tool_call_tags(&message.content),
@@ -116,8 +137,11 @@ pub(crate) fn telegram_outbound(message: &SendMessage) -> (String, Vec<TelegramA
         return (text, attachments);
     }
     if message.may_attach {
-        if let Some(attachment) = parse_path_only_attachment(&message.content) {
-            return (String::new(), vec![attachment]);
+        // The `Noted:` line the runtime adds is not part of what the model wrote,
+        // so a reply that is only a path is still one. The line is the text.
+        let (reply, noted_line) = split_noted_line(&message.content);
+        if let Some(attachment) = parse_path_only_attachment(reply) {
+            return (noted_line.to_string(), vec![attachment]);
         }
     }
     (message.content, Vec::new())
@@ -3197,6 +3221,48 @@ mod tests {
         assert_eq!(text, "see");
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].target, "notes/menu.txt");
+    }
+
+    /// The candidate is decided by the text alone, so it holds a path to a file
+    /// that is not there, which the upload reads only once the file exists.
+    #[test]
+    fn a_path_only_candidate_does_not_ask_whether_the_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let later = dir.path().join("later.txt");
+        let path = later.to_string_lossy().to_string();
+
+        assert_eq!(
+            path_only_candidate(&format!("`{path}`")).map(|a| a.target),
+            Some(path.clone())
+        );
+        assert!(parse_path_only_attachment(&path).is_none(), "not there yet");
+        std::fs::write(&later, b"soup").unwrap();
+        assert!(parse_path_only_attachment(&path).is_some(), "there now");
+
+        for not_a_path in ["see notes.txt", "two\nlines.txt", "no_extension", ""] {
+            assert!(path_only_candidate(not_a_path).is_none(), "{not_a_path:?}");
+        }
+    }
+
+    /// The line the runtime adds when the turn stored a note does not turn a path
+    /// into text: the file is uploaded and the line is what is sent beside it.
+    #[test]
+    fn a_path_only_reply_with_a_noted_line_is_uploaded_and_the_line_is_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("snap.png");
+        std::fs::write(&file, b"fake-png").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let reply = format!("{path}\nNoted: kept the photo");
+
+        let (text, attachments) =
+            telegram_outbound(&SendMessage::new(&reply, "123").allowing_attachments());
+        assert_eq!(text, "Noted: kept the photo");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].target, path);
+
+        let (text, attachments) = telegram_outbound(&SendMessage::new(&reply, "123"));
+        assert_eq!(text, reply, "a message that may not attach is only text");
+        assert!(attachments.is_empty());
     }
 
     #[test]

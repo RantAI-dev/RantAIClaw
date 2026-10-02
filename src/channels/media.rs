@@ -960,6 +960,56 @@ mod tests {
         );
     }
 
+    /// The candidates are what a channel could read at any moment, so an unclosed
+    /// marker for an absolute path is one whether or not the file exists, and a
+    /// marker a channel never recovers is not.
+    #[test]
+    fn candidates_hold_an_unclosed_marker_for_a_path_that_does_not_exist() {
+        let missing = "/tmp/rantaiclaw_missing_for_candidates/a.txt";
+        assert!(!std::path::Path::new(missing).exists(), "fixture");
+        let reply = format!("here [DOCUMENT:{missing}");
+
+        let (text, candidates) = parse_attachment_candidates(&reply);
+        assert_eq!(
+            candidates,
+            vec![OutboundAttachment {
+                kind: AttachmentKind::Document,
+                target: missing.to_string(),
+            }]
+        );
+        assert_eq!(text, "here");
+        assert_eq!(
+            parse_attachment_markers(&reply).1,
+            Vec::new(),
+            "a channel recovers it only when the file is there"
+        );
+
+        for never in [
+            "here [DOCUMENT:relative/a.txt",
+            "here [DOCUMENT:https://example.com/a.txt",
+            "here [DOCUMENT:...",
+            "here [DOCUMENT:",
+        ] {
+            assert_eq!(parse_attachment_candidates(never).1, Vec::new(), "{never}");
+        }
+    }
+
+    /// The line the runtime adds is split off the end of a reply, and only when it
+    /// is the last line.
+    #[test]
+    fn the_noted_line_is_split_off_the_end_of_a_reply() {
+        assert_eq!(
+            split_noted_line("/ws/a.txt\nNoted: kept it"),
+            ("/ws/a.txt", "Noted: kept it")
+        );
+        assert_eq!(split_noted_line("/ws/a.txt"), ("/ws/a.txt", ""));
+        assert_eq!(
+            split_noted_line("Noted: kept it\n/ws/a.txt"),
+            ("Noted: kept it\n/ws/a.txt", "")
+        );
+        assert_eq!(split_noted_line("Noted: kept it"), ("Noted: kept it", ""));
+    }
+
     /// The exact shape seen live: three dots standing in for a path.
     #[test]
     fn a_three_dot_placeholder_is_not_a_path() {
@@ -1258,6 +1308,40 @@ pub fn split_outbound(message: &SendMessage) -> (String, Vec<OutboundAttachment>
 /// delivered anyway. See [`recover_unclosed_marker`].
 #[must_use]
 pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachment>) {
+    parse_markers(message, recover_unclosed_marker)
+}
+
+/// Every attachment `message` can ever turn into for a channel that reads it with
+/// [`parse_attachment_markers`], whatever is on disk when this runs.
+///
+/// A channel recovers an unclosed marker only when its file exists at the moment
+/// it reads the reply, so the same text can hold no attachment now and one a
+/// moment later. This reads such a marker as an attachment whenever it names an
+/// absolute path, so a reader that has to judge the text before the channel
+/// reads it cannot be overtaken by a file that appears in between.
+pub(crate) fn parse_attachment_candidates(message: &str) -> (String, Vec<OutboundAttachment>) {
+    parse_markers(message, unclosed_marker_candidate)
+}
+
+/// The line the runtime ends a reply with when the turn stored a note, which
+/// starts with this prefix. It is not part of what the model wrote.
+pub(crate) const NOTED_LINE_PREFIX: &str = "Noted: ";
+
+/// `reply` without the `Noted:` line the runtime ended it with, and that line
+/// (empty when the reply has none). What the model wrote is the first part.
+pub(crate) fn split_noted_line(reply: &str) -> (&str, &str) {
+    match reply.rsplit_once('\n') {
+        Some((body, last)) if last.starts_with(NOTED_LINE_PREFIX) => (body, last),
+        _ => (reply, ""),
+    }
+}
+
+/// [`parse_attachment_markers`] with the decision about an unclosed marker
+/// passed in.
+fn parse_markers(
+    message: &str,
+    recover: impl Fn(&str) -> Option<OutboundAttachment>,
+) -> (String, Vec<OutboundAttachment>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
     let mut cursor = 0;
@@ -1291,7 +1375,7 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachmen
             .map_or(message.len(), |idx| open + idx);
         let Some(close_rel) = message[open..line_end].find(']') else {
             let fragment = &message[open..line_end];
-            match recover_unclosed_marker(fragment) {
+            match recover(fragment) {
                 Some(attachment) => attachments.push(attachment),
                 None => cleaned.push_str(fragment),
             }
@@ -1341,18 +1425,8 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<OutboundAttachmen
 /// rather than copying it into the parser. A URL is left alone: only a path can
 /// resolve.
 fn recover_unclosed_marker(fragment: &str) -> Option<OutboundAttachment> {
-    let (kind, target) = fragment.trim_start_matches('[').split_once(':')?;
-    let kind = AttachmentKind::from_marker(kind)?;
-    let target = target.trim();
-    // An example that happens to be unclosed is still an example. Warning about
-    // it would be noise, not the trace of a delivery that failed.
-    if is_placeholder_target(target) {
-        return None;
-    }
-    let resolvable = !target.is_empty()
-        && !is_http_url(target)
-        && std::path::Path::new(target).is_absolute()
-        && std::path::Path::new(target).exists();
+    let (kind, target) = unclosed_marker_parts(fragment)?;
+    let resolvable = names_a_local_absolute_path(target) && std::path::Path::new(target).exists();
     tracing::warn!(
         "unclosed attachment marker in a reply: kind={kind:?}, target={target}, \
          delivered_anyway={resolvable}"
@@ -1361,6 +1435,36 @@ fn recover_unclosed_marker(fragment: &str) -> Option<OutboundAttachment> {
         kind,
         target: target.to_string(),
     })
+}
+
+/// The attachment an unclosed marker becomes once its file is there, decided
+/// without asking the filesystem. See [`parse_attachment_candidates`].
+fn unclosed_marker_candidate(fragment: &str) -> Option<OutboundAttachment> {
+    let (kind, target) = unclosed_marker_parts(fragment)?;
+    names_a_local_absolute_path(target).then(|| OutboundAttachment {
+        kind,
+        target: target.to_string(),
+    })
+}
+
+/// The kind and target of `[KIND:target` with no closing bracket, or `None` when
+/// the kind is not one of the markers or the target is only an example.
+fn unclosed_marker_parts(fragment: &str) -> Option<(AttachmentKind, &str)> {
+    let (kind, target) = fragment.trim_start_matches('[').split_once(':')?;
+    let kind = AttachmentKind::from_marker(kind)?;
+    let target = target.trim();
+    // An example that happens to be unclosed is still an example. Warning about
+    // it would be noise, not the trace of a delivery that failed.
+    if is_placeholder_target(target) {
+        return None;
+    }
+    Some((kind, target))
+}
+
+/// Whether `target` is an absolute local path, the one form an unclosed marker
+/// is recovered from.
+fn names_a_local_absolute_path(target: &str) -> bool {
+    !target.is_empty() && !is_http_url(target) && std::path::Path::new(target).is_absolute()
 }
 
 /// Is this local path inside the workspace?
@@ -1446,11 +1550,25 @@ pub async fn resolve_attachment_path_in_workspace(
     channel: &str,
     target: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
+    let workspace_dir = active_workspace().await?;
+    resolve_attachment_path(channel, target, &workspace_dir)
+}
+
+/// The workspace a channel's upload resolves a marker's path against.
+///
+/// Read again at every upload, so it follows `profile use` while the daemon
+/// runs. A caller that judges a file before the upload must judge it in this
+/// workspace, not the one the runtime started with.
+///
+/// # Errors
+///
+/// When the active workspace cannot be resolved.
+pub async fn active_workspace() -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context as _;
     let (_config_path, workspace_dir) = crate::config::Config::resolve_active_paths()
         .await
         .context("cannot resolve workspace to validate attachment path")?;
-    resolve_attachment_path(channel, target, &workspace_dir)
+    Ok(workspace_dir)
 }
 
 /// What the model is told about attaching files, phrased for one platform.

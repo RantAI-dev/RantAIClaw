@@ -54,6 +54,56 @@ impl ScreenshotTool {
         }
     }
 
+    /// Why a guest's turn may not write the picture to `output_path`, or `None`
+    /// when it may. The same rule `file_write` applies: the owner's private files
+    /// and the files that feed the owner's prompt are refused, and so is a link at
+    /// the output name, which `file_write` never writes through. An owner's turn
+    /// is not refused.
+    ///
+    /// Judged where the write lands: the canonical workspace plus the file name,
+    /// and, when something is already at that name, where it resolves to, so a
+    /// link to a private file is refused too. A link that resolves to nothing
+    /// yet, such as one to a prompt file that does not exist, is refused as a
+    /// link, and a path with no file name is refused for it names no target.
+    async fn write_refusal(&self, output_path: &std::path::Path) -> Option<String> {
+        if !crate::approval::guest::current_turn_is_guest() {
+            return None;
+        }
+        let Some(file_name) = output_path.file_name() else {
+            return Some("The screenshot path has no file name.".to_string());
+        };
+        let workspace = &self.security.workspace_dir;
+        let canonical_workspace = tokio::fs::canonicalize(workspace)
+            .await
+            .unwrap_or_else(|_| workspace.clone());
+        let mut targets = vec![canonical_workspace.join(file_name)];
+        if let Ok(real) = tokio::fs::canonicalize(output_path).await {
+            targets.push(real);
+        }
+        for target in targets {
+            if let Some(denial) =
+                crate::tools::guest_private_file_write_denial(&target, workspace).await
+            {
+                return Some(denial);
+            }
+            if let Some(denial) =
+                crate::tools::guest_prompt_file_write_denial(&target, workspace, None).await
+            {
+                return Some(denial);
+            }
+        }
+        if tokio::fs::symlink_metadata(output_path)
+            .await
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Some(format!(
+                "Refusing to write through symlink: {}",
+                output_path.display()
+            ));
+        }
+        None
+    }
+
     /// Execute the screenshot capture and return the result.
     async fn capture(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
@@ -81,6 +131,13 @@ impl ScreenshotTool {
         }
 
         let output_path = self.security.workspace_dir.join(&safe_name);
+        if let Some(refusal) = self.write_refusal(&output_path).await {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(refusal),
+            });
+        }
         let output_str = output_path.to_string_lossy().to_string();
 
         let Some(mut cmd_args) = Self::screenshot_command(&output_str) else {
@@ -260,6 +317,109 @@ mod tests {
                 .with_autonomy(AutonomyLevel::Full)
                 .with_workspace_dir(std::env::temp_dir()),
         )
+    }
+
+    /// A guest's turn may not write a picture over a prompt file, whether the
+    /// file name is the prompt file's own or a link that already sits at the
+    /// name the guest chose. The suite of guest cases has the owner's side.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn screenshot_refuses_a_guest_a_name_that_leads_to_a_prompt_file() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "owner rules").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", workspace.path().join("shot.png")).unwrap();
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+        let tool = ScreenshotTool::new(security);
+
+        for name in ["AGENTS.md", "shot.png"] {
+            let result = crate::approval::guest::GUEST_TURN
+                .scope((), async {
+                    tool.execute(json!({ "filename": name })).await.unwrap()
+                })
+                .await;
+            assert!(!result.success, "{name}");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("owner's prompt"),
+                "{name}: {:?}",
+                result.error
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("AGENTS.md")).unwrap(),
+            "owner rules"
+        );
+    }
+
+    /// A link at the output name that points at a prompt file that does not exist
+    /// yet leads nowhere the checks can resolve, and the command that writes the
+    /// picture would create the file. `file_write` refuses a link at its target
+    /// at all, and so does a guest's screenshot. An owner's turn is not refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn screenshot_refuses_a_guest_a_dangling_link_at_the_output_name() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("HEARTBEAT.md", workspace.path().join("shot.png")).unwrap();
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+        let tool = ScreenshotTool::new(security);
+
+        let result = crate::approval::guest::GUEST_TURN
+            .scope((), async {
+                tool.execute(json!({ "filename": "shot.png" }))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Refusing to write through symlink"),
+            "{:?}",
+            result.error
+        );
+        assert!(
+            !workspace.path().join("HEARTBEAT.md").exists(),
+            "the guest's turn created the prompt file"
+        );
+
+        assert_eq!(
+            tool.write_refusal(&workspace.path().join("shot.png")).await,
+            None,
+            "control: an owner's turn is not refused"
+        );
+    }
+
+    /// A path with no file name names no target to judge, so a guest's turn is
+    /// refused rather than let through.
+    #[tokio::test]
+    async fn screenshot_refuses_a_guest_an_output_path_with_no_file_name() {
+        let tool = ScreenshotTool::new(test_security());
+
+        let guest = crate::approval::guest::GUEST_TURN
+            .scope((), async {
+                tool.write_refusal(std::path::Path::new("/")).await
+            })
+            .await;
+        assert!(guest.is_some());
+        assert_eq!(
+            tool.write_refusal(std::path::Path::new("/")).await,
+            None,
+            "control: an owner's turn is not refused"
+        );
     }
 
     #[test]
