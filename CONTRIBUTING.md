@@ -75,6 +75,11 @@ Or run the Docker-based CI mirror if Docker is available:
 ./dev/ci.sh all
 ```
 
+A debug or test build (`cargo build`, `cargo test`) does not talk to the
+service manager — `systemctl`/`launchctl`/`rc-service`/`rc-update`/`schtasks`
+spawns are short-circuited at the entry point, so a test on your workstation
+cannot restart your installed daemon.
+
 You are not blocked from opening a PR when local Docker CI is unavailable — run
 the most relevant subset and say in the PR what you ran and what you skipped.
 

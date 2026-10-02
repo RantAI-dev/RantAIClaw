@@ -456,3 +456,106 @@ fn version_reports_package_version() {
         .success()
         .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
+
+/// A debug or test build must never ask the operator's service manager whether
+/// a daemon is registered. Two fake `systemctl` programs disagree on the
+/// answer ("active" vs. "inactive") but the rendered `daemon.registration`
+/// line in `doctor --brief` is identical for both — the dev-build guard short-
+/// circuits `detect_registration` before either fake is consulted. Without the
+/// guard, the "active" fake would fold into `Registered` and the line would
+/// differ. The fake scripts only ever answer what their first positional
+/// argument asks; nothing the binary can spawn reaches the host's real
+/// `systemctl` because PATH points at a tempdir.
+#[test]
+fn doctor_brief_dev_build_skips_the_service_manager_regardless_of_fake_state() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+
+    // One fake says the unit is active; the other says it is not. The real
+    // systemctl is never reached because PATH is overridden on each call.
+    let fake_active = write_fake_systemctl(b"#!/bin/sh\necho active\nexit 0\n");
+    let fake_inactive = write_fake_systemctl(b"#!/bin/sh\necho inactive\nexit 3\n");
+
+    // A headless setup is required so the doctor's other checks don't fail on
+    // missing config; the test does not depend on what setup writes.
+    cmd(&home)
+        .args(["setup", "--non-interactive"])
+        .assert()
+        .success();
+
+    let run_with_fake = |fake_dir: &std::path::Path| {
+        let prepended = prepend_path(fake_dir);
+        let assert = cmd(&home)
+            .env("PATH", &prepended)
+            .args(["doctor", "--brief"])
+            .assert()
+            .success();
+        let out = assert.get_output();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        combined
+    };
+
+    let out_active = run_with_fake(fake_active.path());
+    let out_inactive = run_with_fake(fake_inactive.path());
+
+    let daemon_line = |combined: &str| -> String {
+        combined
+            .lines()
+            .find(|l| l.contains("daemon.registration"))
+            .unwrap_or_else(|| {
+                panic!("doctor --brief must print a daemon.registration line; got:\n{combined}")
+            })
+            .to_string()
+    };
+
+    let line_active = daemon_line(&out_active);
+    let line_inactive = daemon_line(&out_inactive);
+    assert_eq!(
+        line_active, line_inactive,
+        "doctor --brief must print the same daemon.registration line regardless of \
+         what a fake systemctl reports. With the dev-build guard both runs are \
+         identical; without it the 'active' fake would fold into 'Registered' \
+         and the line would differ. active={line_active:?}\ninactive={line_inactive:?}"
+    );
+    assert!(
+        line_active.contains("development build does not talk to the service manager"),
+        "the dev-build daemon.registration line must name the build mode; got: {line_active}"
+    );
+}
+
+/// Write a fake `systemctl` shell script into a fresh tempdir and chmod it
+/// executable. The script is pathologically simple on purpose — the binary
+/// under test never reaches it under the dev-build guard, so it just needs to
+/// exit 0 if it ever is invoked (so a regression that removes the guard
+/// produces a diagnosable result rather than a hung subprocess).
+fn write_fake_systemctl(body: &[u8]) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::Builder::new()
+        .prefix("rantaiclaw-fake-svcmgr-e2e-")
+        .tempdir()
+        .expect("fake svcmgr tempdir");
+    let path = dir.path().join("systemctl");
+    std::fs::write(&path, body).expect("write fake systemctl");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake systemctl");
+    dir
+}
+
+/// Build a `PATH` value with `dir` placed first, preserving the rest of the
+/// existing PATH so cargo-built binaries and shared libraries still resolve.
+fn prepend_path(dir: &std::path::Path) -> String {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts: Vec<std::path::PathBuf> = vec![dir.to_path_buf()];
+    for p in std::env::split_paths(&existing) {
+        parts.push(p);
+    }
+    std::env::join_paths(parts)
+        .expect("join PATH")
+        .into_string()
+        .expect("PATH is UTF-8")
+}

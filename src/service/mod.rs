@@ -8,6 +8,23 @@ use std::str::FromStr;
 const SERVICE_LABEL: &str = "com.rantaiclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "RantaiClaw Daemon";
 
+/// True for a debug or test build. Such builds skip every spawn of
+/// `systemctl`, `launchctl`, `rc-service`, `rc-update`, and `schtasks` so a
+/// test on a developer's workstation cannot restart the developer's installed
+/// daemon. A release build returns `false`; `if is_dev_build() { ... }` branches
+/// compile out, so the release code paths run unchanged.
+///
+/// `debug_assertions` is part of the guard because the integration tests under
+/// `tests/` compile the library without `cfg(test)`.
+pub(crate) const fn is_dev_build() -> bool {
+    cfg!(any(test, debug_assertions))
+}
+
+/// One-line message a guarded entry point prints when [`is_dev_build`] is
+/// true, in place of spawning one of the five service-manager programs.
+pub(crate) const DEV_BUILD_SKIP_MESSAGE: &str =
+    "development build does not talk to the service manager";
+
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitSystem {
@@ -129,6 +146,9 @@ fn decide_start_action(running: bool) -> StartAction {
 
 /// True when a service unit/plist/scheduled-task for rantaiclaw exists on disk.
 fn is_service_installed(config: &Config, init_system: InitSystem) -> bool {
+    if is_dev_build() {
+        return false;
+    }
     if cfg!(target_os = "macos") {
         macos_service_file().map(|p| p.exists()).unwrap_or(false)
     } else if cfg!(target_os = "linux") {
@@ -150,6 +170,9 @@ fn is_service_installed(config: &Config, init_system: InitSystem) -> bool {
 
 /// True when the service is currently active/running.
 fn is_service_running(config: &Config, init_system: InitSystem) -> bool {
+    if is_dev_build() {
+        return false;
+    }
     let _ = config;
     if cfg!(target_os = "macos") {
         run_capture(Command::new("launchctl").args(["list"]))
@@ -199,6 +222,9 @@ fn is_service_running(config: &Config, init_system: InitSystem) -> bool {
 /// (up to `TimeoutStopSec=30`). Async callers (the TUI provisioning overlay)
 /// must wrap this in `tokio::task::spawn_blocking` or they freeze the runtime.
 pub fn apply_channel_config(config: &Config, init_system: InitSystem) -> Result<String> {
+    if is_dev_build() {
+        return Ok(DEV_BUILD_SKIP_MESSAGE.to_string());
+    }
     let resolved = init_system.resolve().unwrap_or(InitSystem::Auto);
     if !cfg!(target_os = "linux") || resolved != InitSystem::Systemd {
         return Ok("run `rantaiclaw service restart` to apply the channel change".to_string());
@@ -241,6 +267,10 @@ pub fn handle_command(
 }
 
 fn install(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (install)");
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
         install_macos(config)
     } else if cfg!(target_os = "linux") {
@@ -256,6 +286,10 @@ fn install(config: &Config, init_system: InitSystem) -> Result<()> {
 /// `service start` entrypoint: when the unit is already active, restart it so
 /// edited config takes effect (instead of `systemctl start`'s silent no-op).
 fn start(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (start)");
+        return Ok(());
+    }
     if decide_start_action(is_service_running(config, init_system)) == StartAction::RestartToApply {
         println!("already running → restarting to apply latest config");
         return restart(config, init_system);
@@ -266,6 +300,10 @@ fn start(config: &Config, init_system: InitSystem) -> Result<()> {
 /// Perform the actual platform start (no running-state check). Used by `start`,
 /// `restart` (macOS/Windows), and `apply_channel_config`.
 fn start_inner(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (start)");
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
         run_checked(Command::new("launchctl").arg("load").arg("-w").arg(&plist))?;
@@ -287,6 +325,10 @@ fn start_inner(config: &Config, init_system: InitSystem) -> Result<()> {
 }
 
 fn start_linux(init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (start)");
+        return Ok(());
+    }
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
@@ -302,6 +344,10 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
 }
 
 fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (stop)");
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
         let _ = run_checked(Command::new("launchctl").arg("stop").arg(SERVICE_LABEL));
@@ -329,6 +375,9 @@ fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
 }
 
 fn stop_linux(init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        return Ok(());
+    }
     match init_system {
         InitSystem::Systemd => {
             let _ = run_checked(Command::new("systemctl").args([
@@ -347,6 +396,10 @@ fn stop_linux(init_system: InitSystem) -> Result<()> {
 }
 
 fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (restart)");
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
         stop(config, init_system)?;
         start_inner(config, init_system)?;
@@ -370,6 +423,9 @@ fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
 }
 
 fn restart_linux(init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        return Ok(());
+    }
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
@@ -389,6 +445,10 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
 }
 
 fn status(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (status)");
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
         let out = run_capture(Command::new("launchctl").arg("list"))?;
         let running = out.lines().any(|line| line.contains(SERVICE_LABEL));
@@ -438,6 +498,9 @@ fn status(config: &Config, init_system: InitSystem) -> Result<()> {
 }
 
 fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        return Ok(());
+    }
     match init_system {
         InitSystem::Systemd => {
             let out = run_capture(Command::new("systemctl").args([
@@ -461,6 +524,10 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
 }
 
 fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (uninstall)");
+        return Ok(());
+    }
     stop(config, init_system)?;
 
     if cfg!(target_os = "macos") {
@@ -499,6 +566,9 @@ fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
 }
 
 fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+    if is_dev_build() {
+        return Ok(());
+    }
     match init_system {
         InitSystem::Systemd => {
             let file = linux_service_file(config)?;
@@ -683,6 +753,10 @@ fn systemd_user_unit(
 }
 
 fn install_linux_systemd(config: &Config) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (install)");
+        return Ok(());
+    }
     let file = linux_service_file(config)?;
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent)?;
@@ -1129,6 +1203,10 @@ fn resolve_openrc_executable() -> Result<PathBuf> {
 }
 
 fn install_linux_openrc(config: &Config) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (install)");
+        return Ok(());
+    }
     if !is_root() {
         bail!(
             "OpenRC service installation requires root privileges.\n\
@@ -1262,6 +1340,10 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 }
 
 fn install_windows(config: &Config) -> Result<()> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE} (install)");
+        return Ok(());
+    }
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let logs_dir = config
         .config_path
@@ -1784,5 +1866,86 @@ mod tests {
         ] {
             assert!(unit.contains(needle), "missing {needle:?} in {unit}");
         }
+    }
+
+    /// A debug or test build must short-circuit every entry point that would
+    /// otherwise spawn one of the five service-manager programs. The fake on
+    /// PATH answers the systemd / OpenRC queries and writes a marker on
+    /// restart; the dev-build guard prevents the spawn, so the marker is
+    /// absent and the entry point returns the "nothing was restarted" answer.
+    ///
+    /// Linux + systemd covers the install/start/stop/restart/status paths
+    /// without needing root or OpenRC's `/etc/init.d/rantaiclaw` sentinel.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn service_command_dev_build_returns_ok_without_spawning() {
+        use crate::service::is_dev_build;
+        assert!(
+            is_dev_build(),
+            "this test only proves its point under a debug/test build"
+        );
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let fake = crate::test_env::FakeServiceManager::new();
+        let xdg = tempfile::tempdir().expect("xdg tempdir");
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", xdg.path());
+        let unit_dir = xdg.path().join("systemd").join("user");
+        std::fs::create_dir_all(&unit_dir).expect("systemd unit dir");
+        std::fs::write(
+            unit_dir.join("rantaiclaw.service"),
+            "[Unit]\nDescription=test\n",
+        )
+        .expect("write unit file");
+
+        let config = Config::default();
+        let init_system = InitSystem::Systemd;
+
+        // Each entry point must return Ok and never reach the fake.
+        for cmd in [
+            crate::ServiceCommands::Install,
+            crate::ServiceCommands::Start,
+            crate::ServiceCommands::Stop,
+            crate::ServiceCommands::Restart,
+            crate::ServiceCommands::Status,
+            crate::ServiceCommands::Uninstall,
+        ] {
+            handle_command(&cmd, &config, init_system)
+                .unwrap_or_else(|e| panic!("{cmd:?} failed in dev build: {e}"));
+        }
+        assert!(
+            !fake.restart_marker().exists(),
+            "fake systemctl must not be reached in dev build; marker at {}",
+            fake.restart_marker().display()
+        );
+    }
+
+    /// `apply_channel_config` is the helper called from the TUI's WhatsApp
+    /// provisioning path. In a dev build it must skip the spawn and return a
+    /// short message instead of crashing the worker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_channel_config_dev_build_skips_systemctl() {
+        use crate::service::is_dev_build;
+        assert!(
+            is_dev_build(),
+            "this test only proves its point under a debug/test build"
+        );
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let _fake = crate::test_env::FakeServiceManager::new();
+        let xdg = tempfile::tempdir().expect("xdg tempdir");
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", xdg.path());
+        let unit_dir = xdg.path().join("systemd").join("user");
+        std::fs::create_dir_all(&unit_dir).expect("systemd unit dir");
+        std::fs::write(
+            unit_dir.join("rantaiclaw.service"),
+            "[Unit]\nDescription=test\n",
+        )
+        .expect("write unit file");
+
+        let msg = apply_channel_config(&Config::default(), InitSystem::Systemd)
+            .expect("dev build returns Ok");
+        assert!(
+            msg.contains("does not talk to the service manager"),
+            "dev build must report the skip reason; got {msg:?}"
+        );
     }
 }
