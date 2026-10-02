@@ -565,25 +565,39 @@ async fn run_attachment_turn_on(
         .parent()
         .expect("the workspace sits in its config directory")
         .to_path_buf();
-    run_attachment_turn_resolving(platform, workspace, &config_dir, sender, guest_tools, reply)
-        .await
+    run_attachment_turn_resolving(
+        platform,
+        workspace,
+        Some(&config_dir),
+        sender,
+        guest_tools,
+        reply,
+    )
+    .await
 }
 
 /// [`run_attachment_turn_on`] for a runtime that started with `workspace` while
 /// the active workspace now resolves under `active_config_dir`, as it does in
 /// foreground mode after the operator switches profile. Channels resolve the
-/// active workspace again at every upload.
+/// active workspace again at every upload. With no `active_config_dir` no
+/// override is set, and the test isolation guard makes the resolution fail
+/// before it reads any configuration.
 async fn run_attachment_turn_resolving(
     platform: &str,
     workspace: &std::path::Path,
-    active_config_dir: &std::path::Path,
+    active_config_dir: Option<&std::path::Path>,
     sender: &str,
     guest_tools: &[&str],
     reply: &str,
 ) -> AttachmentTurn {
     let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
-    let _config_dir_env =
-        crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", active_config_dir);
+    let _config_dir_env = match active_config_dir {
+        Some(dir) => crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", dir),
+        None => crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR"),
+    };
+    let _workspace_env = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+    let _real_config_env =
+        crate::test_env::EnvGuard::unset("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR");
 
     let telegram_impl = Arc::new(TelegramRecordingChannel::default());
     let plain_impl = Arc::new(RecordingChannel::default());
@@ -1724,8 +1738,8 @@ struct Request {
 
 /// Scripted replies that make the provider fail the request instead of
 /// answering it: a plain failure, one whose message carries an attachment marker,
-/// a context window overflow, a capability error, and a request that never
-/// completes.
+/// a context window overflow, a capability error whose provider name carries an
+/// attachment marker, and a request that never completes.
 const FAIL_REQUEST: &str = "<<fail the request>>";
 const FAIL_CONTEXT_OVERFLOW: &str = "<<fail with a context window overflow>>";
 const FAIL_CAPABILITY: &str = "<<fail with a capability error>>";
@@ -1802,7 +1816,7 @@ impl ScriptedProvider {
             FAIL_WITH_MARKER => anyhow::bail!("upstream refused [DOCUMENT:memory/brain.db]"),
             FAIL_CONTEXT_OVERFLOW => anyhow::bail!("the prompt is too long for this model"),
             FAIL_CAPABILITY => Err(crate::providers::ProviderCapabilityError {
-                provider: "stub".to_string(),
+                provider: "stub [DOCUMENT:memory/brain.db]".to_string(),
                 capability: "vision".to_string(),
                 message: "this provider does not support vision input.".to_string(),
             }
@@ -5402,7 +5416,7 @@ async fn guest_reply_attachment_is_judged_in_the_workspace_the_upload_resolves()
     let turn = run_attachment_turn_resolving(
         "telegram",
         started_with.path(),
-        active.config_dir(),
+        Some(active.config_dir()),
         GUEST_SENDER,
         &["file_read"],
         reply,
@@ -5421,12 +5435,59 @@ async fn guest_reply_attachment_is_judged_in_the_workspace_the_upload_resolves()
     let owner = run_attachment_turn_resolving(
         "telegram",
         started_with.path(),
-        active.config_dir(),
+        Some(active.config_dir()),
         OWNER_SENDER,
         &[],
         reply,
     )
     .await;
+    assert_eq!(
+        owner.uploaded,
+        ["[DOCUMENT:notes/menu.txt]"],
+        "control: an owner's reply is not judged"
+    );
+}
+
+/// With no active workspace to resolve there is nothing the upload could read,
+/// so a guest's reply loses every attachment, even one `file_read` could return.
+/// The owner's reply is not judged.
+#[tokio::test]
+async fn guest_reply_attachment_is_withheld_when_no_active_workspace_resolves() {
+    let ws = attachment_workspace();
+    let reply = "The menu [DOCUMENT:notes/menu.txt]";
+
+    let resolved = run_attachment_turn_resolving(
+        "telegram",
+        ws.path(),
+        Some(ws.config_dir()),
+        GUEST_SENDER,
+        &["file_read"],
+        reply,
+    )
+    .await;
+    assert_eq!(
+        resolved.uploaded,
+        ["[DOCUMENT:notes/menu.txt]"],
+        "control: with an active workspace the note is sent"
+    );
+
+    let unresolved = run_attachment_turn_resolving(
+        "telegram",
+        ws.path(),
+        None,
+        GUEST_SENDER,
+        &["file_read"],
+        reply,
+    )
+    .await;
+    assert_eq!(unresolved.uploaded, Vec::<String>::new());
+    assert_eq!(
+        unresolved.sent,
+        vec![format!("The menu\n{GUEST_ATTACHMENT_WITHHELD_LINE}")]
+    );
+
+    let owner =
+        run_attachment_turn_resolving("telegram", ws.path(), None, OWNER_SENDER, &[], reply).await;
     assert_eq!(
         owner.uploaded,
         ["[DOCUMENT:notes/menu.txt]"],
@@ -5756,12 +5817,10 @@ async fn a_guest_draft_is_finalized_with_only_the_attachments_the_filter_kept() 
     assert_eq!(turn.uploaded, Vec::<String>::new());
 }
 
-/// The text a failed turn ends with is runtime text, and it goes out through the
-/// same filter as a reply: `finalize_draft` takes a string, so no flag on a
-/// message keeps a channel from reading it. A provider's message can carry a
-/// marker. The owner's text is not judged.
-#[tokio::test]
-async fn the_text_a_failed_guest_turn_ends_with_passes_the_guest_filter() {
+/// A guest's failed turn ends with `failure`'s text, which carries an attachment
+/// marker. In a draft and out of one, no marker reaches the guest and the
+/// refusal line closes the text. An owner reads the same text as it is.
+async fn assert_failed_turn_text_passes_the_guest_filter(failure: &str, opening: &str) {
     for drafts in [false, true] {
         let deployment = Deployment::start(Options::guest_tools(&[])).await;
         deployment
@@ -5770,16 +5829,11 @@ async fn the_text_a_failed_guest_turn_ends_with_passes_the_guest_filter() {
             .store(drafts, std::sync::atomic::Ordering::SeqCst);
 
         let turn = deployment
-            .turn(
-                GUEST_SENDER,
-                GUEST_CHAT,
-                "hello",
-                vec![FAIL_WITH_MARKER.to_string()],
-            )
+            .turn(GUEST_SENDER, GUEST_CHAT, "hello", vec![failure.to_string()])
             .await;
         assert_eq!(turn.sent.len(), 1, "drafts={drafts}: {:?}", turn.sent);
         let text = &turn.sent[0];
-        assert!(text.starts_with("⚠️ Error:"), "drafts={drafts}: {text}");
+        assert!(text.starts_with(opening), "drafts={drafts}: {text}");
         assert_eq!(
             markers_in_either_view(text),
             Vec::new(),
@@ -5789,30 +5843,42 @@ async fn the_text_a_failed_guest_turn_ends_with_passes_the_guest_filter() {
             text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE),
             "drafts={drafts}: {text}"
         );
-        assert_runtime_text_is_plain("guest llm error", &turn);
+        assert_runtime_text_is_plain("guest failed turn with a marker", &turn);
 
         let owner = deployment
-            .turn(
-                OWNER_SENDER,
-                OWNER_CHAT,
-                "hello",
-                vec![FAIL_WITH_MARKER.to_string()],
-            )
+            .turn(OWNER_SENDER, OWNER_CHAT, "hello", vec![failure.to_string()])
             .await;
         assert!(
             owner.sent[0].contains("DOCUMENT:memory/brain.db"),
-            "drafts={drafts}: control: an owner reads the provider's message: {:?}",
+            "drafts={drafts}: control: an owner reads the text as it is: {:?}",
             owner.sent
         );
     }
 }
 
-/// The three other texts a failed turn ends with carry no marker, so a guest is
+/// The text a failed turn ends with is runtime text, and it goes out through the
+/// same filter as a reply: `finalize_draft` takes a string, so no flag on a
+/// message keeps a channel from reading it. A provider's message can carry a
+/// marker. The owner's text is not judged.
+#[tokio::test]
+async fn the_text_a_failed_guest_turn_ends_with_passes_the_guest_filter() {
+    assert_failed_turn_text_passes_the_guest_filter(FAIL_WITH_MARKER, "⚠️ Error:").await;
+}
+
+/// The capability notice names the provider, and a provider's name can carry a
+/// marker.
+#[tokio::test]
+async fn a_capability_notice_naming_a_marker_passes_the_guest_filter() {
+    assert_failed_turn_text_passes_the_guest_filter(FAIL_CAPABILITY, "The current provider (")
+        .await;
+}
+
+/// The two other texts a failed turn ends with carry no marker, so a guest is
 /// shown them as they are, in a draft and out of one.
 #[tokio::test(start_paused = true)]
 async fn the_fixed_error_texts_reach_a_guest_as_they_reach_an_owner() {
     for drafts in [false, true] {
-        for failure in [FAIL_CONTEXT_OVERFLOW, FAIL_CAPABILITY, HANG] {
+        for failure in [FAIL_CONTEXT_OVERFLOW, HANG] {
             let deployment = Deployment::start(Options::guest_tools(&[])).await;
             deployment
                 .channel
@@ -5828,7 +5894,7 @@ async fn the_fixed_error_texts_reach_a_guest_as_they_reach_an_owner() {
 
             assert_eq!(guest.sent.len(), 1, "{failure} drafts={drafts}");
             assert!(
-                guest.sent[0].starts_with("⚠️") || guest.sent[0].starts_with("The current"),
+                guest.sent[0].starts_with("⚠️"),
                 "{failure} drafts={drafts}: {:?}",
                 guest.sent
             );

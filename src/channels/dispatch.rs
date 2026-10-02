@@ -551,6 +551,30 @@ impl SenderText<'_> {
         )
         .await
     }
+
+    /// End a failed turn with `text`, the one place that does. The text goes
+    /// through [`Self::filter`], then finalizes the draft when the turn has one
+    /// and goes out as a new message otherwise. A failed send is not retried:
+    /// the turn is already over.
+    async fn end_failed_turn(
+        &self,
+        channel: Option<&dyn traits::Channel>,
+        msg: &traits::ChannelMessage,
+        draft_message_id: Option<&str>,
+        text: String,
+    ) {
+        let Some(channel) = channel else {
+            return;
+        };
+        let text = self.filter(text).await;
+        if let Some(draft_id) = draft_message_id {
+            let _ = channel
+                .finalize_draft(&msg.reply_target, draft_id, &text)
+                .await;
+        } else {
+            let _ = channel.send(&msg.reply(text)).await;
+        }
+    }
 }
 
 /// What a guest's reply carries, read the ways the channels read it.
@@ -1529,7 +1553,6 @@ pub(crate) async fn process_channel_message(
                     "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
                 let error_text = with_noted_line(error_text.to_string(), &saved_notes);
-                let error_text = sender_text.filter(error_text).await;
                 tracing::warn!(
                     target: "channels",
                     channel = %msg.channel,
@@ -1546,22 +1569,20 @@ pub(crate) async fn process_channel_message(
                     &history_key,
                     ChatMessage::assistant(FAILED_TURN_MARKER),
                 );
-                if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
-                            .await;
-                    } else {
-                        let _ = channel.send(&msg.reply(error_text)).await;
-                    }
-                }
+                sender_text
+                    .end_failed_turn(
+                        target_channel.as_deref(),
+                        &msg,
+                        draft_message_id.as_deref(),
+                        error_text,
+                    )
+                    .await;
                 return TurnEnd::Finished;
             }
 
             if let Some(cap_err) = find_provider_capability_error(&e) {
                 let prefix = commands::command_prefix(&msg.channel);
                 let reply = with_noted_line(cap_err.user_facing_message(prefix), &saved_notes);
-                let reply = sender_text.filter(reply).await;
                 tracing::warn!(
                     target: "channels",
                     channel = %msg.channel,
@@ -1578,15 +1599,14 @@ pub(crate) async fn process_channel_message(
                     &history_key,
                     ChatMessage::assistant(FAILED_TURN_MARKER),
                 );
-                if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &reply)
-                            .await;
-                    } else {
-                        let _ = channel.send(&msg.reply(reply)).await;
-                    }
-                }
+                sender_text
+                    .end_failed_turn(
+                        target_channel.as_deref(),
+                        &msg,
+                        draft_message_id.as_deref(),
+                        reply,
+                    )
+                    .await;
                 return TurnEnd::Finished;
             }
 
@@ -1615,16 +1635,14 @@ pub(crate) async fn process_channel_message(
             );
             let safe_err = providers::sanitize_api_error(&format!("{e:#}"));
             let reply = with_noted_line(format!("⚠️ Error: {safe_err}"), &saved_notes);
-            let reply = sender_text.filter(reply).await;
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &reply)
-                        .await;
-                } else {
-                    let _ = channel.send(&msg.reply(reply)).await;
-                }
-            }
+            sender_text
+                .end_failed_turn(
+                    target_channel.as_deref(),
+                    &msg,
+                    draft_message_id.as_deref(),
+                    reply,
+                )
+                .await;
         }
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!(
@@ -1645,21 +1663,18 @@ pub(crate) async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(TIMED_OUT_TURN_MARKER),
             );
-            if let Some(channel) = target_channel.as_ref() {
-                let error_text = with_noted_line(
-                    "⚠️ Request timed out while waiting for the model. Please try again."
-                        .to_string(),
-                    &saved_notes,
-                );
-                let error_text = sender_text.filter(error_text).await;
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &error_text)
-                        .await;
-                } else {
-                    let _ = channel.send(&msg.reply(error_text)).await;
-                }
-            }
+            let error_text = with_noted_line(
+                "⚠️ Request timed out while waiting for the model. Please try again.".to_string(),
+                &saved_notes,
+            );
+            sender_text
+                .end_failed_turn(
+                    target_channel.as_deref(),
+                    &msg,
+                    draft_message_id.as_deref(),
+                    error_text,
+                )
+                .await;
         }
     }
 

@@ -194,13 +194,19 @@ These paths are known and not closed by the rules above.
   extension is withheld even when no such file exists. This follows from not
   asking the filesystem. A reply that names a real ordinary workspace file
   still passes.
+- **A link swapped after the reply filter.** The reply filter judges the
+  canonical path of an attachment, and the channel resolves the path again when
+  it uploads. A sender who can write in the workspace between the two steps can
+  swap a link in between. A guest needs `shell` for that, a tool the operator
+  granted, so the window is accepted.
 
 Two gaps have no fix yet, so treat them as operator guidance.
 
 - Do not grant `browser` to guests. Its `screenshot` action writes to the path
-  the model names, outside the workspace and the guest write rules, so a guest
-  with `browser` can overwrite a prompt file, a private file or the AIEOS file
-  with an image.
+  the model names, and that path is not confined to the workspace. It reaches
+  any file the process may write, the config file included, and it bypasses the
+  guest write rules, so a guest with `browser` can overwrite a prompt file, a
+  private file, the AIEOS file or the config file with an image.
 - `glob_search` lists the names of every workspace file, including those under
   `memory/` and `USER.md`. It never returns content, but the names are visible
   to a guest granted it.

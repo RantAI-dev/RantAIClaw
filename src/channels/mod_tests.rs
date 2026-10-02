@@ -10890,6 +10890,47 @@ fn only_a_filtered_reply_and_a_configured_delivery_build_a_message_that_may_atta
     }
 }
 
+/// Every text a failed turn ends with leaves through `SenderText::end_failed_turn`,
+/// which runs it through the sender's filter. Two of those texts are constants and
+/// no case can tell whether a filter ran on them, so this reads the source: from
+/// the arm that handles a failed turn to the end of the function, nothing sends a
+/// message or finalizes a draft on its own, and the four endings call the one
+/// function.
+#[test]
+fn a_failed_turn_ends_only_through_the_one_function_that_filters_its_text() {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = std::fs::read_to_string(src_root.join("channels").join("dispatch.rs"))
+        .expect("read dispatch.rs");
+    let production = production_half(&src);
+
+    let start = production
+        .find("LlmExecutionResult::Completed(Ok(Err(e))) =>")
+        .expect("the arm that handles a failed turn");
+    let end = start
+        + production[start..]
+            .find("\n    if cancelled {")
+            .expect("the end of the function that runs a turn");
+    // Whitespace and comments cannot move a call out of the count.
+    let region: String = production[start..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
+        .collect();
+
+    assert_eq!(
+        region.matches(".end_failed_turn(").count(),
+        4,
+        "the context window, capability, provider error and timeout endings each call it"
+    );
+    for direct in [".send(", ".finalize_draft(", ".send_draft("] {
+        assert_eq!(
+            region.matches(direct).count(),
+            0,
+            "a failed turn calls `{direct}` itself, so its text skips the sender's filter"
+        );
+    }
+}
+
 /// One indent level, `fn name(` or `async fn name(`, with any visibility. Used
 /// for both the trait's own declarations and a channel's definitions, so the two
 /// are read by the same rule. Nested `fn`s inside a body sit deeper and are not
