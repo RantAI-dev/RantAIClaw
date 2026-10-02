@@ -130,8 +130,14 @@ impl TuiAgentActor {
                                 .await;
                             continue;
                         };
-                        if let Err(e) = agent
-                            .compact_streaming(keep_last, Some(self.events_tx.clone()))
+                        // The memory flush before the fold reads memory through
+                        // its tools. The TUI is the operator's own surface, so
+                        // it reads all of memory.
+                        if let Err(e) = crate::memory::MEMORY_VIEW
+                            .scope(
+                                crate::memory::MemoryView::All,
+                                agent.compact_streaming(keep_last, Some(self.events_tx.clone())),
+                            )
                             .await
                         {
                             tracing::warn!("compaction failed: {e}");
@@ -178,10 +184,12 @@ impl TuiAgentActor {
                         // future borrows self.agent exclusively for its
                         // lifetime — confined to this inner block so
                         // self.agent is free for post-turn reload.
-                        let mut turn_fut = Box::pin(agent.turn_streaming(
-                            &text,
-                            Some(events),
-                            Some(token.clone()),
+                        //
+                        // The TUI is the operator's own surface, so its turn
+                        // reads all of memory.
+                        let mut turn_fut = Box::pin(crate::memory::MEMORY_VIEW.scope(
+                            crate::memory::MemoryView::All,
+                            agent.turn_streaming(&text, Some(events), Some(token.clone())),
                         ));
                         loop {
                             tokio::select! {
@@ -630,8 +638,7 @@ mod tests {
     }
 
     /// The seam this module owns: a `Submit` carrying a conversation id must
-    /// scope the agent's turn memory to it. Auto-save is the observable —
-    /// its `store` runs under the same scope `recall_layered` reads.
+    /// scope the agent's turn memory writes to it. Auto-save is the observable.
     #[tokio::test]
     async fn a_submitted_conversation_id_scopes_the_turns_memory_writes() {
         let scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -679,5 +686,232 @@ mod tests {
         );
         drop(req_tx);
         let _ = timeout(Duration::from_secs(1), handle).await;
+    }
+
+    // ── memory view ──────────────────────────────────────────────────────
+
+    /// A provider that keeps the messages of every request, and answers from a
+    /// script of responses (then with `ok`).
+    struct ScriptedChat {
+        script: std::sync::Mutex<std::collections::VecDeque<ChatResponse>>,
+        seen: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    impl ScriptedChat {
+        fn new(script: Vec<ChatResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                script: std::sync::Mutex::new(script.into()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Arc<ScriptedChat> {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.seen.lock().expect("seen mutex").push(
+                request
+                    .messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect(),
+            );
+            Ok(self
+                .script
+                .lock()
+                .expect("script mutex")
+                .pop_front()
+                .unwrap_or(ChatResponse {
+                    usage: None,
+                    text: Some("ok".to_string()),
+                    tool_calls: vec![],
+                }))
+        }
+    }
+
+    fn texts(provider: &ScriptedChat) -> (String, String) {
+        let seen = provider.seen.lock().expect("seen mutex").clone();
+        let join = |system: bool| {
+            seen.iter()
+                .flatten()
+                .filter(|(role, _)| (role == "system") == system)
+                .map(|(_, content)| content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        (join(true), join(false))
+    }
+
+    /// The TUI is the operator's own surface, so its turn reads all of memory:
+    /// every note, scoped to a conversation or not, reaches the model, and the
+    /// prompt carries `USER.md` and `MEMORY.md`.
+    #[tokio::test]
+    async fn the_tui_turn_door_reads_all_of_memory() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        std::fs::write(
+            workspace.path().join("USER.md"),
+            "# User\nprofile-canary-41c9",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("MEMORY.md"),
+            "# Memory\nnotes-canary-52d0",
+        )
+        .unwrap();
+        let sqlite = crate::memory::SqliteMemory::new(workspace.path()).unwrap();
+        for (key, word, scope) in [
+            ("shared_note", "saffronquartz", None),
+            ("session_note", "juniperquartz", Some("tui:s1")),
+            ("other_note", "marigoldquartz", Some("tui:other")),
+        ] {
+            sqlite
+                .store(
+                    key,
+                    &format!("A note about the lantern: {word}"),
+                    crate::memory::MemoryCategory::Core,
+                    scope,
+                )
+                .await
+                .unwrap();
+        }
+        let mem: Arc<dyn Memory> = Arc::new(sqlite);
+        let provider = ScriptedChat::new(vec![]);
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(Box::new(Arc::clone(&provider)))
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .memory_loader(Box::new(
+                crate::agent::memory_loader::DefaultMemoryLoader::new(5, 0.0),
+            ))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed");
+
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "what about the lantern".into(),
+                conversation_id: Some("tui:s1".into()),
+            })
+            .await
+            .unwrap();
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if matches!(ev, AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+
+        let (system, rest) = texts(&provider);
+        for word in ["saffronquartz", "juniperquartz", "marigoldquartz"] {
+            assert!(rest.contains(word), "{word} is missing:\n{rest}");
+        }
+        assert!(system.contains("profile-canary-41c9"), "{system}");
+        assert!(system.contains("notes-canary-52d0"), "{system}");
+    }
+
+    /// `/compress` runs a memory flush before the turns are folded into a
+    /// summary, and the flush reads memory through its tools. The TUI is the
+    /// operator's own surface, so the flush reads all of it: here `replaces`
+    /// finds the shared note it names and supersedes it.
+    #[tokio::test]
+    async fn the_tui_compaction_flush_reads_all_of_memory() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let sqlite = crate::memory::SqliteMemory::new(workspace.path()).unwrap();
+        sqlite
+            .store(
+                "shared_note",
+                "A note about the lantern: saffronquartz",
+                crate::memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(sqlite);
+
+        // 12 seeding turns, the flush turn's tool call, its wrap-up, the summary.
+        let text = |t: &str| ChatResponse {
+            usage: None,
+            text: Some(t.to_string()),
+            tool_calls: vec![],
+        };
+        let mut script: Vec<ChatResponse> = (0..12).map(|_| text("ok")).collect();
+        script.push(ChatResponse {
+            usage: None,
+            text: Some(String::new()),
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "call_1".into(),
+                name: "memory_store".into(),
+                arguments: serde_json::json!({
+                    "key": "lantern_update",
+                    "content": "The lantern note was rewritten",
+                    "replaces": "saffronquartz"
+                })
+                .to_string(),
+            }],
+        });
+        script.push(text("none"));
+        script.push(text("## Summary\nsummarised"));
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(ScriptedChat::new(script)))
+            .tools(vec![])
+            .memory(Arc::clone(&mem))
+            .observer(observer)
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .security(Arc::new(crate::security::SecurityPolicy::default()))
+            .auto_save(false)
+            .build()
+            .expect("agent builder should succeed");
+        for i in 0..12 {
+            let _ = agent.turn(&format!("turn {i}")).await;
+        }
+
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
+        req_tx
+            .send(TurnRequest::Compact { keep_last: 4 })
+            .await
+            .unwrap();
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if matches!(
+                ev,
+                AgentEvent::CompactionComplete { .. } | AgentEvent::Error(_)
+            ) {
+                break;
+            }
+        }
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+
+        assert!(
+            mem.get("shared_note").await.unwrap().is_none(),
+            "the flush's `replaces` found nothing to supersede"
+        );
+        assert!(mem.get("lantern_update").await.unwrap().is_some());
     }
 }

@@ -5,10 +5,10 @@ use async_trait::async_trait;
 pub trait MemoryLoader: Send + Sync {
     /// Build the `[Memory context]` block injected ahead of the user message.
     ///
-    /// `conversation_id` scopes the recall to the active conversation via the
-    /// layered-memory read (`recall_layered`): the conversation's own memory is
-    /// surfaced first, then shared/global memory backfills. `None` recalls
-    /// globally (unchanged prior behavior).
+    /// `conversation_id` is the conversation the turn's writes land in. It does
+    /// not scope the read: the default loader recalls under the turn's
+    /// [`memory::MemoryView`], which the door that started the turn sets, and a
+    /// turn with no view recalls nothing.
     async fn load_context(
         &self,
         memory: &dyn Memory,
@@ -46,7 +46,7 @@ impl MemoryLoader for DefaultMemoryLoader {
         &self,
         memory: &dyn Memory,
         user_message: &str,
-        conversation_id: Option<&str>,
+        _conversation_id: Option<&str>,
     ) -> anyhow::Result<memory::MemoryContext> {
         // One builder, shared with the CLI loop and the channel dispatcher. This
         // path used to render its own block with no cap on entry count, entry
@@ -55,7 +55,6 @@ impl MemoryLoader for DefaultMemoryLoader {
             memory,
             user_message,
             self.min_relevance_score,
-            conversation_id,
             memory::MemoryContextLimits {
                 max_entries: self.limit,
                 ..memory::MemoryContextLimits::default()
@@ -189,13 +188,28 @@ mod tests {
         }
     }
 
+    /// Runs `load_context` the way a door that serves the operator does: under
+    /// the `All` view.
+    async fn load_in_all_view(
+        loader: &DefaultMemoryLoader,
+        memory: &dyn Memory,
+        message: &str,
+        conversation_id: Option<&str>,
+    ) -> memory::MemoryContext {
+        memory::MEMORY_VIEW
+            .scope(
+                memory::MemoryView::All,
+                loader.load_context(memory, message, conversation_id),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn default_loader_formats_context() {
         let loader = DefaultMemoryLoader::default();
-        let context = loader
-            .load_context(&MockMemory, "hello", None)
+        let context = load_in_all_view(&loader, &MockMemory, "hello", None)
             .await
-            .unwrap()
             .block;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("- k: v"));
@@ -227,27 +241,48 @@ mod tests {
             ]),
         };
 
-        let context = loader
-            .load_context(&memory, "answer style", None)
+        let context = load_in_all_view(&loader, &memory, "answer style", None)
             .await
-            .unwrap()
             .block;
         assert!(context.contains("user_fact"));
         assert!(!context.contains("assistant_resp_legacy"));
         assert!(!context.contains("fabricated detail"));
     }
 
-    /// A conversation_id routes the loader through `recall_layered`; the mock
-    /// returns the same entry regardless of scope, so context still builds —
-    /// verifying the scoped path is wired and behaves.
+    /// A turn no door gave a view recalls nothing, even when the caller names a
+    /// conversation: the id says where writes land, not what may be read.
     #[tokio::test]
-    async fn loader_accepts_conversation_scope() {
+    async fn a_loader_turn_with_no_view_recalls_nothing() {
         let loader = DefaultMemoryLoader::default();
         let context = loader
             .load_context(&MockMemory, "hello", Some("telegram:123"))
             .await
-            .unwrap()
-            .block;
-        assert!(context.contains("- k: v"));
+            .unwrap();
+        assert!(
+            context.is_empty(),
+            "no view must recall nothing: {context:?}"
+        );
+    }
+
+    /// The loader follows the view and ignores the conversation id. The mock
+    /// holds one unscoped entry: the `All` view reads it, an `Only` view drops
+    /// it, whatever id the caller passes.
+    #[tokio::test]
+    async fn loader_follows_the_turns_view_and_not_the_conversation_id() {
+        let loader = DefaultMemoryLoader::default();
+        let all = load_in_all_view(&loader, &MockMemory, "hello", Some("telegram:123")).await;
+        assert!(all.block.contains("- k: v"));
+
+        let only = memory::MEMORY_VIEW
+            .scope(
+                memory::MemoryView::Only("telegram:123".into()),
+                loader.load_context(&MockMemory, "hello", Some("telegram:123")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            only.is_empty(),
+            "an unscoped entry reached an Only view: {only:?}"
+        );
     }
 }

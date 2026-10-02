@@ -555,26 +555,30 @@ prompts.
 
 ### Conversation scoping
 
-Memory reads and writes are scoped per conversation: each channel chat and each
-TUI session recalls its own rows first, then backfills from shared (unscoped)
-memory only. Entries another conversation stored never surface in this one's
-prompt. Unscoped entries are the shared tier: what an owner's `memory_store`
-writes, and what the CLI, the TUI and the one-time markdown import write.
-Owners see them, while a guest sees only its own conversation's notes.
+Every turn reads memory under a memory view that the door which started it
+sets. A view is either all of memory or one conversation's notes. There is no
+backfill: a conversation view never adds the shared (unscoped) tier. The view
+decides what `memory_recall`, the `[Memory context]` block in front of the
+user's message, and the lookups of `memory_store` and `memory_forget` may read.
 
-The explicit `memory_recall` tool follows the same scope on interactive
-surfaces (TUI, `agent run`, the console API): it reads the active
-conversation's rows plus the shared tier, never another conversation's.
-Surfaces that serve many conversations through one tool registry (channels,
-the gateway webhook) keep the tool's read global — a single shared scope
-would race across concurrent turns — and guests cannot invoke it at all
-unless an operator adds `memory_recall` to `guest_allowed_tools`.
+- A named owner in a direct chat, the TUI, `agent -m`, `chat -m`, the web
+  console chat, the daemon heartbeat and a cron job with no origin chat, whatever
+  its `session_target`, read all of memory.
+- A guest, an owner in a group or in a chat the platform did not mark as a
+  direct message, a sender who is an owner only through `approval_owners = ["*"]`,
+  and a cron job created from a chat read that conversation's notes only.
+- A turn that no door gave a view, such as a webhook turn, reads nothing: recall
+  finds no note and the context block is empty.
 
-On channels, a guest's `memory_recall` reads only rows that belong to the
-active conversation (matching `session_id`). The shared unscoped tier is never
-backfilled into a guest's prompt. Even when the operator lists `memory_recall`
-in `guest_allowed_tools`, a guest cannot see other conversations' memory or the
-owner's notes. An owner's memory read is unchanged.
+The table in
+[Per-role channel permissions](../security/per-role-permissions.md#memory-view-what-a-turn-may-read)
+lists every door. `USER.md` and `MEMORY.md` in the prompt follow the view on
+the doors that build the prompt for the turn: the CLI, a cron job, the
+heartbeat, the TUI, the console and the webhook. Only a turn that reads all of
+memory carries them. A channel's owner prompt is built once when the channel
+starts, outside any turn, and still carries them, so a named owner in a group
+and a wildcard owner have them in the prompt while their memory view is the
+conversation.
 
 A guest's writes stay in its own place too. `memory_store` under a guest turn
 stores with the guest's conversation as the session, and its `replaces` and
@@ -590,7 +594,11 @@ and so stays out of `MEMORY.md` and out of the owner's system prompt. The
 capacity notice of `memory_store` counts shared core notes only, and a guest
 does not get it. `file_write` under a guest turn refuses `skills/` and the
 workspace-root `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md` and
-`HEARTBEAT.md`, which load into owner prompts. These rules cover only the four file tools and the memory
+`HEARTBEAT.md`, which load into owner prompts, and the owner's private files.
+That write rule applies to a guest only. The read rule is wider: `file_read`,
+`pdf_read` and `image_info` refuse the owner's private files (`USER.md`,
+`MEMORY.md`, `memory/` and the rest) in every turn that does not read all of
+memory, a webhook turn included. These rules cover only the four file tools and the memory
 tools; `glob_search`, `shell` and MCP filesystem tools are not subject to them.
 
 ### Scores are absolute
@@ -753,7 +761,7 @@ Top-level channel options are configured under `channels_config`.
 | Key | Default | Purpose |
 |---|---|---|
 | `message_timeout_secs` | `600` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
-| `approval_owners` | `[]` | Senders who may approve privileged tool calls. Empty = **nobody** can approve, so approval-required tools auto-deny. `"*"` lets any allowed sender approve (insecure, opt-in) |
+| `approval_owners` | `[]` | Senders who may approve privileged tool calls. Empty = **nobody** can approve, so approval-required tools auto-deny. `"*"` lets any allowed sender approve (insecure, opt-in). A sender who is an owner only through `"*"` never reads the owner's notes: its turns read the conversation they are in, not the whole store. Private notes need an identity named in the list. |
 | `guest_allowed_tools` | `[]` | Capability ceiling for allowed senders who are not owners. Empty = the agent calls no tool on a guest's behalf; list names like `"shell"` or `"web_search_tool"` to widen. The owner's `autonomy.auto_approve` list is intentionally **not** unioned in — an operator who wants a guest to be able to read files or recall memory must list those tools here |
 | `guest_allowed_commands` | `[]` | Shell globs a guest may run (needs `"shell"` in `guest_allowed_tools`). Hard ceiling — a non-matching command is denied, never escalated |
 | `autonomous_tools` | `false` | `true` skips the approval gate entirely for this channel, for every sender |

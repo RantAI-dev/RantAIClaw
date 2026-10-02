@@ -667,6 +667,28 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The heartbeat runs on the host and its reply goes to the journal and the
+    /// observer, never to a chat, so it is a place private to the operator: it
+    /// reads all of memory. The worker is the real door. Its first tick is
+    /// immediate, so it reaches the local server without waiting for the interval.
+    #[tokio::test]
+    async fn the_heartbeat_door_reads_all_of_memory() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        std::fs::write(
+            fixture.workspace.join("HEARTBEAT.md"),
+            "# Periodic Tasks\n\n- check the lantern\n",
+        )
+        .unwrap();
+
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
+        let worker = tokio::spawn(run_heartbeat_worker(fixture.config.clone(), observer));
+        fixture.llm.wait_for_requests(1).await;
+        worker.abort();
+
+        fixture.assert_every_note_was_sent();
+    }
+
     /// Plan 353: the gateway and channels share one drain deadline instead of
     /// eight seconds each in turn. The gateway normally exits at once, and its
     /// unused eight seconds were lost, so channels were aborted eight seconds

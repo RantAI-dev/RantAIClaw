@@ -1,9 +1,11 @@
+use crate::channels::conversation::ConversationKey;
 use crate::channels::SendMessage;
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, remove_job, reschedule_after_run, update_job,
-    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
 };
+use crate::memory::MemoryView;
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -453,22 +455,31 @@ pub(crate) async fn refresh_working_config(
     }
 }
 
-/// The memory scope a job's run gets, which is the whole of what
-/// `session_target` selects.
+/// The memory view a job's run gets.
 ///
-/// `Isolated` (the default) scopes memory to `cron:<job_id>`, so the job's
-/// `memory_recall` returns its own rows plus the shared/global tier — not
-/// another conversation's scoped rows, which it could otherwise quote into the
-/// announced output (`memory_recall` is auto-approved).
+/// A job created from a chat reads that chat and nothing else, for `main` and
+/// `isolated` alike: the chat's conversation key, built the way channel
+/// dispatch builds it from the same channel and reply target, so the job reads
+/// the place the chat writes to. `origin_chat` is the reply target and carries
+/// no thread, so a job created in a thread reads the chat's own conversation.
 ///
-/// `Main` is the operator asking for the opposite: no scope, which is the
-/// global tier CLI and daemon runs use (`agent::run` passes `None`). A job set
-/// to `main` therefore shares context with those runs — the point of the
-/// setting, and the reason it is not the default.
-fn memory_scope_for(job: &CronJob) -> Option<String> {
-    match job.session_target {
-        SessionTarget::Isolated => Some(format!("cron:{}", job.id)),
-        SessionTarget::Main => None,
+/// A job with no origin was made by the operator from the TUI, the console or
+/// the CLI, so it reads all of memory whatever its `session_target`. That
+/// includes notes scoped to other conversations, and `USER.md` and `MEMORY.md`
+/// in its prompt. A narrower view for the default `isolated` target would strip
+/// them from every job the operator schedules.
+///
+/// A job with half an origin names no chat, so it reads nothing. That is the
+/// fail-closed answer for a row the tools do not write.
+fn memory_view_for(job: &CronJob) -> Option<MemoryView> {
+    let channel = job.origin_channel.as_deref().filter(|c| !c.is_empty());
+    let chat = job.origin_chat.as_deref().filter(|c| !c.is_empty());
+    match (channel, chat) {
+        (Some(channel), Some(chat)) => Some(MemoryView::Only(
+            ConversationKey::new(channel, chat).resolve(),
+        )),
+        (None, None) => Some(MemoryView::All),
+        (Some(_), None) | (None, Some(_)) => None,
     }
 }
 
@@ -504,7 +515,7 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
-    let memory_scope = memory_scope_for(job);
+    let memory_view = memory_view_for(job);
 
     // Box the agent future: `crate::agent::run_with_scope` is a ~27KB future and
     // is awaited transitively across the whole cron execution chain
@@ -518,7 +529,7 @@ async fn run_agent_job(
         model_override,
         config.default_temperature,
         "scheduler",
-        memory_scope,
+        memory_view,
         observer.cloned(),
         mcp.cloned(),
         // The scheduler runs under the daemon, where stdout is the journal;
@@ -1107,7 +1118,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::cron::{self, DeliveryConfig};
+    use crate::cron::{self, DeliveryConfig, SessionTarget};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
@@ -1152,35 +1163,189 @@ mod tests {
         }
     }
 
-    // ── session_target (plan 303) ───────────────────────────────────────────
+    // ── session_target and origin ───────────────────────────────────────────
     //
-    // One test per arm, not one aggregate: the two arms are the entire contract
-    // of the setting, and before this change both produced the same scope.
+    // One test per arm. A job with no origin reads all of memory and a job
+    // created from a chat reads that chat, for both targets.
 
+    /// A job no chat created reads all of memory, whichever target it has. An
+    /// operator makes such a job from the TUI, the console or the CLI, and
+    /// `isolated` is the default target, so a narrower view here would strip the
+    /// owner's files and notes from every job they schedule.
     #[test]
-    fn an_isolated_job_is_scoped_to_its_own_id() {
-        let mut job = test_job("echo hi");
-        job.id = "job-42".into();
-        job.session_target = SessionTarget::Isolated;
-        assert_eq!(memory_scope_for(&job).as_deref(), Some("cron:job-42"));
+    fn a_job_with_no_origin_reads_all_of_memory_for_either_target() {
+        for target in [SessionTarget::Main, SessionTarget::Isolated] {
+            let mut job = test_job("echo hi");
+            job.id = "job-42".into();
+            job.session_target = target;
+            assert_eq!(
+                memory_view_for(&job),
+                Some(MemoryView::All),
+                "target {:?}",
+                job.session_target
+            );
+        }
     }
 
+    /// A job created from a chat reads that chat, whichever target it has. A
+    /// `main` job used to read everything, and an `isolated` job its own id and
+    /// the shared tier.
     #[test]
-    fn a_main_job_shares_the_global_scope() {
+    fn a_job_created_from_a_chat_reads_only_that_chat_for_either_target() {
+        for target in [SessionTarget::Main, SessionTarget::Isolated] {
+            let mut job = test_job("echo hi");
+            job.id = "job-42".into();
+            job.session_target = target;
+            job.origin_channel = Some("telegram".into());
+            job.origin_chat = Some("chat-a".into());
+            assert_eq!(
+                memory_view_for(&job),
+                Some(MemoryView::Only("telegram:chat-a".into())),
+                "target {:?}",
+                job.session_target
+            );
+        }
+    }
+
+    /// The view a job reads and the scope channel dispatch writes a chat's rows
+    /// under must be one string, or the job reads a place nothing writes to.
+    /// Dispatch builds it from the message's channel, reply target and thread;
+    /// the job's `origin_chat` is the same reply target. A target with a colon
+    /// (a Telegram forum topic) is the case a plain join gets wrong.
+    #[test]
+    fn a_jobs_origin_view_equals_the_scope_dispatch_writes_for_that_chat() {
+        for (channel, reply_target) in [
+            ("telegram", "-100123456"),
+            ("telegram", "-100123456:77"),
+            ("discord", "C0123"),
+            ("matrix", "@rantaiclaw_user:example.org"),
+        ] {
+            let msg = crate::channels::traits::ChannelMessage {
+                sender_aliases: Vec::new(),
+                id: "m1".into(),
+                sender: "rantaiclaw_user".into(),
+                reply_target: reply_target.into(),
+                content: "hello".into(),
+                channel: channel.into(),
+                timestamp: 1,
+                thread_ts: None,
+                reply_anchor: None,
+                is_direct: false,
+            };
+            let dispatch_scope = crate::channels::dispatch::conversation_memory_scope(&msg);
+
+            let mut job = test_job("echo hi");
+            job.origin_channel = Some(channel.into());
+            job.origin_chat = Some(reply_target.into());
+
+            assert_eq!(
+                memory_view_for(&job),
+                Some(MemoryView::Only(dispatch_scope)),
+                "{channel} / {reply_target}"
+            );
+        }
+    }
+
+    /// An origin with one half names no chat. The job reads nothing rather than
+    /// falling back to a wider view.
+    #[test]
+    fn a_job_with_half_an_origin_reads_nothing() {
         let mut job = test_job("echo hi");
-        job.id = "job-42".into();
+        job.origin_chat = Some("chat-a".into());
+        assert_eq!(memory_view_for(&job), None);
+
+        let mut job = test_job("echo hi");
         job.session_target = SessionTarget::Main;
-        // `None` is what `agent::run` passes — the global tier CLI and daemon
-        // runs use. Sharing it is what `session_target = "main"` promises.
-        assert_eq!(memory_scope_for(&job), None);
+        job.origin_channel = Some("telegram".into());
+        assert_eq!(memory_view_for(&job), None);
     }
 
-    /// The two arms above are only worth anything if the agent call actually
+    // ── what the model receives, driven through `run_agent_job` ─────────────
+    //
+    // Each case runs the job against a local OpenAI-compatible server and reads
+    // the requests it recorded: the notes in front of the user's message, and the
+    // workspace files in the system prompt.
+
+    /// Runs an agent job, built the way `cron_add` stores one, through
+    /// `run_agent_job` over the fixture's workspace.
+    async fn run_door_job(
+        fixture: &crate::agent::door_test_support::DoorFixture,
+        target: SessionTarget,
+        origin: Option<(&str, &str)>,
+    ) {
+        let mut job = test_job("");
+        job.id = "door-job".into();
+        job.job_type = JobType::Agent;
+        job.prompt = Some("what about the lantern".into());
+        job.session_target = target;
+        job.origin_channel = origin.map(|(channel, _)| channel.to_string());
+        job.origin_chat = origin.map(|(_, chat)| chat.to_string());
+        let security =
+            SecurityPolicy::from_config(&fixture.config.autonomy, &fixture.config.workspace_dir);
+        let (ok, output) = run_agent_job(&fixture.config, &security, &job, None, None).await;
+        assert!(ok, "the job ran against the local server: {output}");
+    }
+
+    #[tokio::test]
+    async fn a_main_job_created_from_a_chat_reads_only_that_chat() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        run_door_job(&fixture, SessionTarget::Main, Some(("telegram", "chat-a"))).await;
+        fixture.assert_only_notes_were_sent(&[crate::agent::door_test_support::CHAT_WORD]);
+    }
+
+    #[tokio::test]
+    async fn an_isolated_job_created_from_a_chat_reads_only_that_chat() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        run_door_job(
+            &fixture,
+            SessionTarget::Isolated,
+            Some(("telegram", "chat-a")),
+        )
+        .await;
+        fixture.assert_only_notes_were_sent(&[crate::agent::door_test_support::CHAT_WORD]);
+    }
+
+    /// The control for the two above: the same fixture and the same job, with no
+    /// origin, reads all of memory under `main`. The origin is what narrowed it.
+    #[tokio::test]
+    async fn a_main_job_with_no_origin_reads_all_of_memory_through_the_door() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        run_door_job(&fixture, SessionTarget::Main, None).await;
+        fixture.assert_every_note_was_sent();
+    }
+
+    /// An isolated job no chat created sees what a `main` one does: every note,
+    /// including those scoped to other conversations, and the owner's files in
+    /// its prompt.
+    #[tokio::test]
+    async fn an_isolated_job_with_no_origin_reads_all_of_memory_through_the_door() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        run_door_job(&fixture, SessionTarget::Isolated, None).await;
+        fixture.assert_every_note_was_sent();
+    }
+
+    #[tokio::test]
+    async fn a_job_with_half_an_origin_reads_no_note_through_the_door() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        let mut job = test_job("");
+        job.id = "door-job".into();
+        job.job_type = JobType::Agent;
+        job.prompt = Some("what about the lantern".into());
+        job.session_target = SessionTarget::Main;
+        job.origin_chat = Some("chat-a".into());
+        let security =
+            SecurityPolicy::from_config(&fixture.config.autonomy, &fixture.config.workspace_dir);
+        let (ok, output) = run_agent_job(&fixture.config, &security, &job, None, None).await;
+        assert!(ok, "the job ran against the local server: {output}");
+        fixture.assert_no_note_was_sent();
+    }
+
+    /// The tests above are only worth anything if the agent call actually
     /// receives what they return. There is one `run_with_scope` call in this
-    /// module; assert it is handed `memory_scope` and not a literal, so a future
-    /// edit cannot quietly re-hardcode the scope and keep both tests green.
+    /// module; assert it is handed `memory_view` and not a literal, so a future
+    /// edit cannot quietly re-hardcode the view and keep every test green.
     #[test]
-    fn the_agent_call_is_handed_the_computed_scope() {
+    fn the_agent_call_is_handed_the_computed_view() {
         let src = include_str!("scheduler.rs");
         // Assembled at runtime: a verbatim literal here would be counted by the
         // scan it feeds, and the assertion would be measuring itself.
@@ -1189,13 +1354,13 @@ mod tests {
         assert_eq!(
             src.matches(call).count(),
             1,
-            "more than one agent call site — each needs the computed scope"
+            "more than one agent call site — each needs the computed view"
         );
         let after = src.split(call).nth(1).expect("call site present");
         let args = after.split("))").next().unwrap_or_default();
         assert!(
-            args.contains("memory_scope,"),
-            "the agent call must be passed memory_scope; args were: {args}"
+            args.contains("memory_view,"),
+            "the agent call must be passed memory_view; args were: {args}"
         );
     }
 

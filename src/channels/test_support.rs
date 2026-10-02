@@ -518,5 +518,6 @@ pub(super) fn startup_guest_prompt(workspace: &std::path::Path, tools: &[(&str, 
         false,
         crate::config::SkillsPromptInjectionMode::Full,
         true,
+        true,
     )
 }

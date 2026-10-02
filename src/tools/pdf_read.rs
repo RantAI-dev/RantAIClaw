@@ -132,7 +132,7 @@ impl Tool for PdfReadTool {
         }
 
         if let Some(denial) =
-            crate::tools::guest_private_path_denial(&resolved_path, &self.security.workspace_dir)
+            crate::tools::private_file_read_denial(&resolved_path, &self.security.workspace_dir)
                 .await
         {
             return Ok(ToolResult {
@@ -453,9 +453,11 @@ mod tests {
         );
     }
 
+    /// A turn no door gave a view (a webhook) is refused the owner's private
+    /// files, as a conversation-scoped turn is.
     #[cfg(unix)]
     #[tokio::test]
-    async fn pdf_read_allows_symlink_to_user_md_without_guest_view() {
+    async fn pdf_read_denies_symlink_to_user_md_with_no_view() {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
@@ -467,8 +469,40 @@ mod tests {
         let tool = PdfReadTool::new(test_security(tmp.path().to_path_buf()));
         let result = tool.execute(json!({"path": "notes.pdf"})).await.unwrap();
 
-        // Not denied for privacy reasons; it may still fail to extract text
-        // (it isn't a real PDF), but that is a different, unrelated error.
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("private to the owner"),
+            "{:?}",
+            result.error
+        );
+    }
+
+    /// The control: under the `All` view the same link is not refused for
+    /// privacy. It may still fail to extract text (it is not a real PDF), which
+    /// is a different error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pdf_read_allows_symlink_to_user_md_under_the_all_view() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        tokio::fs::write(tmp.path().join("USER.md"), "owner profile")
+            .await
+            .unwrap();
+        symlink(tmp.path().join("USER.md"), tmp.path().join("notes.pdf")).unwrap();
+
+        let tool = PdfReadTool::new(test_security(tmp.path().to_path_buf()));
+        let result = MEMORY_VIEW
+            .scope(MemoryView::All, async {
+                tool.execute(json!({"path": "notes.pdf"})).await.unwrap()
+            })
+            .await;
+
         assert!(
             !result
                 .error
