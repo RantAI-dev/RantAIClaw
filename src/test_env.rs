@@ -179,7 +179,7 @@ pub(crate) struct EnvAuditRedirect {
 ///
 /// The marker file lives next to the binary and is unique to this guard. The
 /// `ENV_LOCK` is NOT acquired here — every caller must hold it for the lifetime
-/// of the returned guard (see [`with_fake_service_manager`]).
+/// of the returned guard.
 #[must_use = "PATH is reverted the moment this drops; bind it to a named local"]
 pub(crate) struct FakeServiceManager {
     _env: EnvGuard,
@@ -228,20 +228,6 @@ impl FakeServiceManager {
     pub(crate) fn rc_service_restart_marker(&self) -> std::path::PathBuf {
         self.dir.path().join("rc-service.restarted.marker")
     }
-}
-
-/// Acquire [`ENV_LOCK`] and install a [`FakeServiceManager`]. Tests that use
-/// this helper cannot reach the host's real `systemctl`/`launchctl`/etc.
-///
-/// The lock is held by the lock guard passed in via the caller — `ENV_LOCK` is
-/// reentrant-aware (it's a `tokio::sync::Mutex` acquired once per process)
-/// and a sync test uses `blocking_lock`. We do not call `lock()` again here
-/// because the fake's `EnvGuard` only mutates `PATH` and we want to keep that
-/// critical section explicit at the test.
-pub(crate) fn with_fake_service_manager<F: FnOnce(&FakeServiceManager)>(f: F) {
-    let _lock = ENV_LOCK.blocking_lock();
-    let fake = FakeServiceManager::new();
-    f(&fake);
 }
 
 /// A single shell script that handles every program name in `$0`. Logs every
