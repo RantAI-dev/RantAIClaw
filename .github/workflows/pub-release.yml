@@ -33,17 +33,10 @@ concurrency:
     group: release-${{ github.ref || github.run_id }}
     cancel-in-progress: false
 
+# Only `publish` writes to the repository, packages, or releases; everything
+# else reads. The write scopes live on the `publish` job below.
 permissions:
-    contents: write
-    packages: write
-    actions: read
-    id-token: write # Required for cosign keyless signing via OIDC
-    # Required for GitHub's immutable-release attestation policy. Without it the
-    # release step aborts mid-upload with "Error creating policy" and leaves a
-    # draft with only some assets (v0.8.3-alpha's first two attempts: 18/20 then
-    # 4/20). v0.8.2-alpha predates the immutable-releases rollout, which is why
-    # the same pinned workflow published fine hours earlier.
-    attestations: write
+    contents: read
 
 env:
     CARGO_TERM_COLOR: always
@@ -181,6 +174,8 @@ jobs:
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ needs.prepare.outputs.release_ref }}
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
@@ -198,8 +193,11 @@ jobs:
                   # two silently broke this gate since v0.6.47. Run the two
                   # module filters as separate invocations so a regression
                   # in either store's migration logic actually fails the gate.
-                  cargo test --locked --lib config::migrations
-                  cargo test --locked --lib sessions::migrations
+                  # `run_filtered_lib_tests.sh` lists each filter first and
+                  # refuses to run when the selection is empty, so a typo in
+                  # either name fails the step instead of passing the gate.
+                  bash scripts/ci/run_filtered_lib_tests.sh test --locked --lib config::migrations
+                  bash scripts/ci/run_filtered_lib_tests.sh test --locked --lib sessions::migrations
 
     # No other workflow runs a test on Windows, and `build-release` only
     # compiles the Windows target. The markdown import backs up and rewrites
@@ -232,7 +230,10 @@ jobs:
                   # substring match and would also select `profile::migration`,
                   # whose tests read and write profile state under HOME; the
                   # skip keeps this job to the two modules named here.
-                  cargo test --locked --lib -- \
+                  # `run_filtered_lib_tests.sh` lists the selection first and
+                  # refuses to run on an empty list, so a typo here turns red
+                  # instead of silently passing the gate.
+                  bash scripts/ci/run_filtered_lib_tests.sh test --locked --lib -- \
                     migration:: memory::snapshot:: \
                     --skip profile::migration
 
@@ -451,6 +452,17 @@ jobs:
         needs: [prepare, verify-artifacts, windows-io-tests]
         runs-on: ubuntu-latest
         timeout-minutes: 90
+        permissions:
+            contents: write
+            packages: write
+            actions: read
+            id-token: write # Required for cosign keyless signing via OIDC
+            # Required for GitHub's immutable-release attestation policy. Without it the
+            # release step aborts mid-upload with "Error creating policy" and leaves a
+            # draft with only some assets (v0.8.3-alpha's first two attempts: 18/20 then
+            # 4/20). v0.8.2-alpha predates the immutable-releases rollout, which is why
+            # the same pinned workflow published fine hours earlier.
+            attestations: write
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:

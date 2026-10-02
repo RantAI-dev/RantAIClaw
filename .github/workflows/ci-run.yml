@@ -37,6 +37,15 @@ jobs:
               shell: bash
               run: bash ./scripts/ci/tests/test_detect_change_scope.sh
 
+            # Same shape as the self-test above: the wrapper script under
+            # test is used by every filtered lib-test step in this file and
+            # in pub-release.yml. A regression in the script silently
+            # turns a broken filter into a passing gate; the self-test
+            # fails instead.
+            - name: Self-test the filtered-lib-test gate
+              shell: bash
+              run: bash ./scripts/ci/tests/test_run_filtered_lib_tests.sh
+
             - name: Detect docs-only changes
               id: scope
               shell: bash
@@ -231,7 +240,7 @@ jobs:
               with:
                   key: channel-lark
             - name: Build and test channel-lark
-              run: cargo test --locked --features channel-lark --lib channels::lark
+              run: bash scripts/ci/run_filtered_lib_tests.sh test --locked --features channel-lark --lib channels::lark
 
     # `channel-matrix` gets its own job for the same reason `channel-lark` does,
     # and for a sharper one: until the pin moved to matrix-sdk 0.18 this channel
@@ -272,7 +281,7 @@ jobs:
               with:
                   key: channel-matrix
             - name: Build and test channel-matrix
-              run: cargo test --locked --features channel-matrix --lib channels::matrix
+              run: bash scripts/ci/run_filtered_lib_tests.sh test --locked --features channel-matrix --lib channels::matrix
             # `--lib` alone is not enough to claim the feature builds. Turning it
             # on pulls `decancer`, whose `impl Add<Translation> for String` makes
             # `String + &String` ambiguous — which broke two integration tests
