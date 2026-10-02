@@ -5202,7 +5202,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          - **Vibe:** Sharp, direct, resourceful. Not corporate. Not a chatbot.\n\
          - **Emoji:** \u{1f980}\n\n\
          ---\n\n\
-         Update this file as you evolve. Your identity is yours to shape.\n"
+         Update this file when the person asks you to change it. Your identity is yours to shape.\n"
     );
 
     let agents = format!(
@@ -5211,44 +5211,39 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          Before doing anything else:\n\n\
          1. Read `SOUL.md` — this is who you are\n\
          2. Read `USER.md` — this is who you're helping\n\
-         3. Use `memory_recall` for recent context (daily notes are on-demand)\n\
+         3. Use `memory_recall` for recent context (notes are on-demand)\n\
          4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected\n\n\
          Don't ask permission. Just do it.\n\n\
          ## Memory System\n\n\
-         You wake up fresh each session. These files ARE your continuity:\n\n\
-         - **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs (accessed via memory tools)\n\
+         You wake up fresh each session. Two things carry over:\n\n\
+         - **Notes:** `memory_recall` finds the notes the person asked you to keep\n\
          - **Long-term:** `MEMORY.md` — curated memories (auto-injected in main session)\n\n\
-         Capture what matters. Decisions, context, things to remember.\n\
+         Remember something only when the person asks you to.\n\
          Skip secrets unless asked to keep them.\n\n\
-         ### Write It Down — No Mental Notes!\n\
-         - Memory is limited — if you want to remember something, WRITE IT TO A FILE\n\
-         - \"Mental notes\" don't survive session restarts. Files do.\n\
-         - When someone says \"remember this\" -> update daily file or MEMORY.md\n\
-         - When you learn a lesson -> update AGENTS.md, TOOLS.md, or the relevant skill\n\n\
          ## Safety\n\n\
          - Don't exfiltrate private data. Ever.\n\
          - Don't run destructive commands without asking.\n\
          - `trash` > `rm` (recoverable beats gone forever)\n\
          - When in doubt, ask.\n\n\
          ## External vs Internal\n\n\
-         **Safe to do freely:** Read files, explore, organize, learn, search the web.\n\n\
+         **Safe to do freely:** Read files, explore, learn, search the web.\n\n\
          **Ask first:** Sending emails/tweets/posts, anything that leaves the machine.\n\n\
          ## Group Chats\n\n\
          Participate, don't dominate. Respond when mentioned or when you add genuine value.\n\
          Stay silent when it's casual banter or someone already answered.\n\n\
          ## Tools & Skills\n\n\
          Skills are listed in the system prompt. Use `read` on a skill's SKILL.md for details.\n\
-         Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.\n\n\
+         `TOOLS.md` holds the person's local specifics (SSH hosts, device names, etc.).\n\n\
          ## Crash Recovery\n\n\
          - If a run stops unexpectedly, recover context before acting.\n\
-         - Check `MEMORY.md` + latest `memory/*.md` notes to avoid duplicate work.\n\
+         - Check `MEMORY.md` and `memory_recall` to avoid duplicate work.\n\
          - Resume from the last confirmed step, not from scratch.\n\n\
          ## Sub-task Scoping\n\n\
          - Break complex work into focused sub-tasks with clear success criteria.\n\
          - Keep sub-tasks small, verify each output, then merge results.\n\
          - Prefer one clear objective per sub-task over broad \"do everything\" asks.\n\n\
          ## Make It Yours\n\n\
-         This is a starting point. Add your own conventions, style, and rules.\n"
+         This is a starting point. The person can add their own conventions, style, and rules.\n"
     );
 
     let heartbeat = format!(
@@ -5294,10 +5289,10 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          - When in doubt, ask before acting externally.\n\
          - You're not the user's voice — be careful in group chats.\n\n\
          ## Continuity\n\n\
-         Each session, you wake up fresh. These files ARE your memory.\n\
-         Read them. Update them. They're how you persist.\n\n\
+         Each session, you wake up fresh. These files carry who you are.\n\
+         Read them. Change them only when the person asks.\n\n\
          ---\n\n\
-         *This file is yours to evolve. As you learn who you are, update it.*\n"
+         *This file describes who you are. Change it when the person asks.*\n"
     );
 
     let user_md = format!(
@@ -5319,8 +5314,8 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
 
     let tools = "\
          # TOOLS.md — Local Notes\n\n\
-         Skills define HOW tools work. This file is for YOUR specifics —\n\
-         the stuff that's unique to your setup.\n\n\
+         Skills define HOW tools work. This file is for the person's specifics —\n\
+         the stuff that's unique to their setup.\n\n\
          ## What Goes Here\n\n\
          Things like:\n\
          - SSH hosts and aliases\n\
@@ -5331,7 +5326,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          The tools you can call, and what each one does, are listed under \"Tools\" in your system prompt. \
          This file does not repeat them, so it never disagrees with that list.\n\n\
          ---\n\
-         *Add whatever helps you do your job. This is your cheat sheet.*\n";
+         *The person edits this file. Change it only when they ask.*\n";
 
     let bootstrap = format!(
         "# BOOTSTRAP.md — Hello, World\n\n\
@@ -5342,7 +5337,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          Don't interrogate. Don't be robotic. Just... talk.\n\
          Introduce yourself as {agent} and get to know each other.\n\n\
          ## After You Know Each Other\n\n\
-         Update these files with what you learned:\n\
+         When the person asks you to, update these files with what you learned:\n\
          - `IDENTITY.md` — your name, vibe, emoji\n\
          - `USER.md` — their preferences, work context\n\
          - `SOUL.md` — boundaries and behavior\n\n\
@@ -6248,6 +6243,103 @@ mod tests {
         );
     }
 
+    /// The files a new workspace starts with reach the prompt of every turn, a
+    /// guest's included for `AGENTS.md`, `SOUL.md` and `IDENTITY.md`. None of
+    /// them tells the model to write a note or a file on its own, and none
+    /// names `memory_store`, which a guest may not hold. A person's request to
+    /// remember something is the only trigger the text names.
+    #[tokio::test]
+    async fn scaffold_files_never_tell_the_model_to_save_on_its_own() {
+        let tmp = TempDir::new().unwrap();
+        scaffold_workspace(tmp.path(), &ProjectContext::default()).unwrap();
+        let read = |name: &str| std::fs::read_to_string(tmp.path().join(name)).unwrap();
+
+        let agents = read("AGENTS.md");
+        assert!(
+            agents.contains("Remember something only when the person asks you to."),
+            "AGENTS.md does not say a note is kept when asked:\n{agents}"
+        );
+        for urging in [
+            "No Mental Notes",
+            "WRITE IT TO A FILE",
+            "update daily file or MEMORY.md",
+            "update AGENTS.md, TOOLS.md, or the relevant skill",
+            "Capture what matters",
+            "memory/YYYY-MM-DD.md",
+            "memory/*.md",
+        ] {
+            assert!(
+                !agents.contains(urging),
+                "AGENTS.md still tells the model to save on its own ({urging:?}):\n{agents}"
+            );
+        }
+
+        let soul = read("SOUL.md");
+        for urging in [
+            "Read them. Update them.",
+            "As you learn who you are, update it.",
+        ] {
+            assert!(
+                !soul.contains(urging),
+                "SOUL.md still tells the model to rewrite itself ({urging:?}):\n{soul}"
+            );
+        }
+        assert!(soul.contains("Change them only when the person asks."));
+
+        // Sentences that sent the model to write a note or a file on its own.
+        for (name, urging) in [
+            (
+                "AGENTS.md",
+                "Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.",
+            ),
+            ("AGENTS.md", "Add your own conventions, style, and rules."),
+            ("TOOLS.md", "Add whatever helps you do your job."),
+            ("TOOLS.md", "This file is for YOUR specifics"),
+            ("MEMORY.md", "Add important facts about your human here"),
+            ("MEMORY.md", "Record decisions and preferences here"),
+            ("MEMORY.md", "Document mistakes and insights here"),
+            ("MEMORY.md", "Track unfinished tasks and follow-ups here"),
+            ("MEMORY.md", "Keep it concise"),
+        ] {
+            assert!(
+                !read(name).contains(urging),
+                "{name} still tells the model to act on its own ({urging:?})"
+            );
+        }
+
+        let identity = read("IDENTITY.md");
+        assert!(
+            !identity.contains("Update this file as you evolve"),
+            "IDENTITY.md still tells the model to rewrite itself:\n{identity}"
+        );
+
+        let bootstrap = read("BOOTSTRAP.md");
+        assert!(
+            bootstrap.contains("When the person asks you to, update these files"),
+            "BOOTSTRAP.md still tells the model to write the person's files unasked:\n{bootstrap}"
+        );
+
+        for name in [
+            "AGENTS.md",
+            "SOUL.md",
+            "IDENTITY.md",
+            "USER.md",
+            "TOOLS.md",
+            "MEMORY.md",
+            "HEARTBEAT.md",
+            "BOOTSTRAP.md",
+        ] {
+            assert!(
+                !read(name).contains("memory_store"),
+                "{name} reaches a guest prompt and names a tool a guest may not hold"
+            );
+        }
+        assert!(
+            !read("MEMORY.md").contains("Daily files"),
+            "MEMORY.md still describes the daily files that no longer exist"
+        );
+    }
+
     // ── scaffold_workspace: MEMORY.md warns about token cost ────
 
     #[tokio::test]
@@ -6287,22 +6379,21 @@ mod tests {
             "# MEMORY.md — Long-Term Memory\n\n\
              *Your curated memories. The distilled essence, not raw logs.*\n\n\
              ## How This Works\n\
-             - Daily files (`memory/YYYY-MM-DD.md`) capture raw events (on-demand via tools)\n\
              - This file captures what's WORTH KEEPING long-term\n\
              - This file is auto-injected into your system prompt each session\n\
-             - Keep it concise — every character here costs tokens\n\n\
+             - Every character here costs tokens\n\n\
              ## Security\n\
              - ONLY loaded in main session (direct chat with your human)\n\
              - NEVER loaded in group chats or shared contexts\n\n\
              ---\n\n\
              ## Key Facts\n\
-             (Add important facts about your human here)\n\n\
+             (None yet)\n\n\
              ## Decisions & Preferences\n\
-             (Record decisions and preferences here)\n\n\
+             (None yet)\n\n\
              ## Lessons Learned\n\
-             (Document mistakes and insights here)\n\n\
+             (None yet)\n\n\
              ## Open Loops\n\
-             (Track unfinished tasks and follow-ups here)\n",
+             (None yet)\n",
             "the wizard must keep writing exactly this template after moving it into a shared constant"
         );
     }

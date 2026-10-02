@@ -311,6 +311,88 @@ pub(crate) fn clean_delivered_reply(text: &str) -> String {
     }
 }
 
+/// The most notes the `Noted:` line spells out; the rest are counted.
+const NOTED_LINE_MAX_NOTES: usize = 3;
+
+/// The longest a single note may run in the `Noted:` line, in characters.
+const NOTED_LINE_NOTE_MAX_CHARS: usize = 80;
+
+/// One stored note as it reads inside the `Noted:` line: a single line of plain
+/// text, cut to [`NOTED_LINE_NOTE_MAX_CHARS`].
+///
+/// The note is text the model chose, echoed into a chat. Every kind of
+/// whitespace and every control character becomes one space, so a note cannot
+/// start a second line, and square brackets become parentheses, so a note cannot
+/// spell an attachment marker (`[IMAGE:…]`, `[DOCUMENT:…]`) for a channel to
+/// upload.
+fn flatten_noted_text(note: &str) -> String {
+    let mut flat = String::with_capacity(note.len());
+    let mut after_space = true;
+    for ch in note.chars() {
+        let ch = match ch {
+            '[' => '(',
+            ']' => ')',
+            other => other,
+        };
+        if ch.is_whitespace() || ch.is_control() {
+            if !after_space {
+                flat.push(' ');
+            }
+            after_space = true;
+        } else {
+            flat.push(ch);
+            after_space = false;
+        }
+    }
+    let flat = flat.trim_end();
+    if flat.chars().count() > NOTED_LINE_NOTE_MAX_CHARS {
+        let cut: String = flat.chars().take(NOTED_LINE_NOTE_MAX_CHARS).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        flat.to_string()
+    }
+}
+
+/// The one line that tells a person what this turn stored, or `None` when it
+/// stored nothing. Names the content that was noted, never the key.
+fn noted_line(notes: &[String]) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    // Notes that read as nothing once flattened are neither shown nor counted.
+    let readable: Vec<String> = notes
+        .iter()
+        .map(|note| flatten_noted_text(note))
+        .filter(|note| !note.is_empty())
+        .collect();
+    if readable.is_empty() {
+        return Some("Noted: a note was saved.".to_string());
+    }
+    let mut line = format!(
+        "Noted: {}",
+        readable
+            .iter()
+            .take(NOTED_LINE_MAX_NOTES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    if readable.len() > NOTED_LINE_MAX_NOTES {
+        use std::fmt::Write as _;
+        let _ = write!(line, "; and {} more", readable.len() - NOTED_LINE_MAX_NOTES);
+    }
+    Some(line)
+}
+
+/// `reply` followed by the `Noted:` line of the notes this turn stored. The
+/// reply comes back as it was when the turn stored nothing.
+fn with_noted_line(reply: String, saved: &crate::memory::SavedNotes) -> String {
+    match noted_line(&saved.all()) {
+        Some(line) => format!("{reply}\n{line}"),
+        None => reply,
+    }
+}
+
 /// The line a guest reply ends with when an attachment it asked for was refused.
 /// One line however many were refused.
 const GUEST_ATTACHMENT_WITHHELD_LINE: &str =
@@ -1103,6 +1185,8 @@ pub(crate) async fn process_channel_message(
         msg.sender.clone(),
         if sender_is_owner { "owner" } else { "guest" },
     );
+    // What this turn stores through `memory_store`, so the reply can say so.
+    let saved_notes = crate::memory::SavedNotes::default();
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -1120,7 +1204,7 @@ pub(crate) async fn process_channel_message(
                 memory_view.clone(),
                 crate::security::TURN_SCOPE.scope(
                     (msg.channel.clone(), msg.reply_target.clone()),
-                    async {
+                    crate::memory::SAVED_NOTES.scope(saved_notes.clone(), async {
                         if sender_is_owner {
                             run_tool_call_loop(
                                 active_provider.as_ref(),
@@ -1175,7 +1259,7 @@ pub(crate) async fn process_channel_message(
                             ))
                             .await
                         }
-                    },
+                    }),
                 ),
             ),
         ) => LlmExecutionResult::Completed(result),
@@ -1235,6 +1319,11 @@ pub(crate) async fn process_channel_message(
             // empty bubble (e.g. when the model ends a turn after tool calls
             // without final text).
             let delivered_response = clean_delivered_reply(&delivered_response);
+            // Say what the turn stored. Added after `history_response` is built,
+            // so the line is shown to the person and never written into the
+            // history the model reads, where it would invite imitation. Added
+            // before the guest filter, so a guest's reply is judged with it.
+            let delivered_response = with_noted_line(delivered_response, &saved_notes);
             // An attachment marker is uploaded with no tool call, so the guest
             // gate never sees it. A guest's reply is filtered here, before either
             // send path below.
@@ -1339,6 +1428,7 @@ pub(crate) async fn process_channel_message(
                 } else {
                     "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
+                let error_text = with_noted_line(error_text.to_string(), &saved_notes);
                 tracing::warn!(
                     target: "channels",
                     channel = %msg.channel,
@@ -1358,7 +1448,7 @@ pub(crate) async fn process_channel_message(
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
                             .await;
                     } else {
                         let _ = channel.send(&msg.reply(error_text)).await;
@@ -1369,7 +1459,7 @@ pub(crate) async fn process_channel_message(
 
             if let Some(cap_err) = find_provider_capability_error(&e) {
                 let prefix = commands::command_prefix(&msg.channel);
-                let reply = cap_err.user_facing_message(prefix);
+                let reply = with_noted_line(cap_err.user_facing_message(prefix), &saved_notes);
                 tracing::warn!(
                     target: "channels",
                     channel = %msg.channel,
@@ -1422,7 +1512,7 @@ pub(crate) async fn process_channel_message(
                 ChatMessage::assistant(FAILED_TURN_MARKER),
             );
             let safe_err = providers::sanitize_api_error(&format!("{e:#}"));
-            let reply = format!("⚠️ Error: {safe_err}");
+            let reply = with_noted_line(format!("⚠️ Error: {safe_err}"), &saved_notes);
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
@@ -1453,11 +1543,14 @@ pub(crate) async fn process_channel_message(
                 ChatMessage::assistant(TIMED_OUT_TURN_MARKER),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = with_noted_line(
+                    "⚠️ Request timed out while waiting for the model. Please try again."
+                        .to_string(),
+                    &saved_notes,
+                );
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, &error_text)
                         .await;
                 } else {
                     let _ = channel.send(&msg.reply(error_text)).await;

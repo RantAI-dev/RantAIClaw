@@ -1622,6 +1622,14 @@ struct Request {
     tools: Option<Vec<String>>,
 }
 
+/// Scripted replies that make the provider fail the request instead of
+/// answering it: a plain failure, a context window overflow, a capability error,
+/// and a request that never completes.
+const FAIL_REQUEST: &str = "<<fail the request>>";
+const FAIL_CONTEXT_OVERFLOW: &str = "<<fail with a context window overflow>>";
+const FAIL_CAPABILITY: &str = "<<fail with a capability error>>";
+const HANG: &str = "<<never answer>>";
+
 /// A provider that plays a script. Each request is answered with the next
 /// scripted reply, so a case decides what the model attempts, and every
 /// request is kept for the case to read back.
@@ -1660,6 +1668,23 @@ impl ScriptedProvider {
             .pop_front()
             .unwrap_or_else(|| "Done.".to_string())
     }
+
+    /// The next scripted reply, or the failure a failing entry stands for.
+    async fn answer(&self) -> anyhow::Result<String> {
+        let reply = self.next_reply();
+        match reply.as_str() {
+            FAIL_REQUEST => anyhow::bail!("scripted provider failure"),
+            FAIL_CONTEXT_OVERFLOW => anyhow::bail!("the prompt is too long for this model"),
+            FAIL_CAPABILITY => Err(crate::providers::ProviderCapabilityError {
+                provider: "stub".to_string(),
+                capability: "vision".to_string(),
+                message: "this provider does not support vision input.".to_string(),
+            }
+            .into()),
+            HANG => std::future::pending().await,
+            _ => Ok(reply),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1685,7 +1710,7 @@ impl Provider for ScriptedProvider {
         _temperature: f64,
     ) -> anyhow::Result<String> {
         self.record(messages, None);
-        Ok(self.next_reply())
+        self.answer().await
     }
 
     async fn chat(
@@ -1695,9 +1720,10 @@ impl Provider for ScriptedProvider {
         _temperature: f64,
     ) -> anyhow::Result<crate::providers::ChatResponse> {
         self.record(request.messages, request.tools);
+        let reply = self.answer().await?;
         Ok(crate::providers::ChatResponse {
             usage: None,
-            text: Some(self.next_reply()),
+            text: Some(reply),
             tool_calls: Vec::new(),
         })
     }
@@ -3605,4 +3631,440 @@ async fn auto_save_writes_each_message_to_its_own_conversation() {
             "{text}"
         );
     }
+}
+
+// ── The `Noted:` line ────────────────────────────────────────────────────
+
+/// A scripted turn that stores one note through `memory_store` and then answers
+/// `answer`.
+fn store_then_answer(key: &str, content: &str, answer: &str) -> Vec<String> {
+    vec![
+        call(
+            "memory_store",
+            serde_json::json!({ "key": key, "content": content }),
+        ),
+        answer.to_string(),
+    ]
+}
+
+/// How many lines of `text` open with `Noted:`.
+fn noted_lines(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.starts_with("Noted:"))
+        .count()
+}
+
+/// A note the owner has stored ends the reply with one line that names what was
+/// noted, not the key. The model's own text stays above it.
+#[tokio::test]
+async fn a_stored_note_ends_the_owner_reply_with_one_noted_line() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember that the office is in Jakarta",
+            store_then_answer("office_city", "The office is in Jakarta", "Okay."),
+        )
+        .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    assert_eq!(
+        turn.sent[0], "Okay.\nNoted: The office is in Jakarta",
+        "the reply carries the model's text and then the line"
+    );
+    assert!(
+        !turn.sent[0].contains("office_city"),
+        "the key is not named"
+    );
+}
+
+/// A channel that edits a draft ends the draft with the same text, so the line
+/// reaches the person there too, once.
+#[tokio::test]
+async fn a_stored_note_ends_a_draft_reply_with_one_noted_line() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    deployment
+        .channel
+        .drafts
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember that the office is in Jakarta",
+            store_then_answer("office_city", "The office is in Jakarta", "Okay."),
+        )
+        .await;
+
+    assert_eq!(
+        turn.sent,
+        vec!["Okay.\nNoted: The office is in Jakarta".to_string()],
+        "the finalized draft is the only message and carries the line once"
+    );
+}
+
+/// Several saves in one turn still make one line, and it names every note.
+#[tokio::test]
+async fn several_stored_notes_make_one_noted_line() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember two things",
+            vec![
+                all_calls(&[
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "k_one", "content": "The first fact" }),
+                    ),
+                    (
+                        "memory_store",
+                        serde_json::json!({ "key": "k_two", "content": "The second fact" }),
+                    ),
+                ]),
+                "Both kept.".to_string(),
+            ],
+        )
+        .await;
+
+    let reply = &turn.sent[0];
+    assert_eq!(noted_lines(reply), 1, "{reply}");
+    assert_eq!(
+        reply, "Both kept.\nNoted: The first fact; The second fact",
+        "one line, both notes"
+    );
+}
+
+/// A save the tool refused adds no line: nothing was noted.
+#[tokio::test]
+async fn a_refused_save_adds_no_noted_line() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember this",
+            store_then_answer(
+                "shared_recipe",
+                "A different note for a taken key",
+                "Tried.",
+            ),
+        )
+        .await;
+
+    assert!(
+        turn.tool_results()
+            .contains("already holds a different note"),
+        "control: the save was refused:\n{}",
+        turn.tool_results()
+    );
+    assert_eq!(turn.sent, vec!["Tried.".to_string()]);
+}
+
+/// A turn that stores nothing ends as it did before.
+#[tokio::test]
+async fn a_turn_without_a_save_adds_no_noted_line() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let recalled = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "what do you know about the lantern",
+            vec![
+                call("memory_recall", serde_json::json!({ "query": "lantern" })),
+                "Here it is.".to_string(),
+            ],
+        )
+        .await;
+    let plain = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello", vec!["Hi.".to_string()])
+        .await;
+
+    assert_eq!(recalled.sent, vec!["Here it is.".to_string()]);
+    assert_eq!(plain.sent, vec!["Hi.".to_string()]);
+}
+
+/// A save followed by a provider failure still tells the person the note was
+/// kept: the reply is the error text, and the line closes it.
+#[tokio::test]
+async fn a_save_before_a_provider_failure_is_still_noted() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember that the office is in Jakarta",
+            store_then_answer("office_city", "The office is in Jakarta", FAIL_REQUEST),
+        )
+        .await;
+
+    let reply = &turn.sent[0];
+    assert!(
+        reply.starts_with("⚠️ Error"),
+        "control: the turn failed: {reply}"
+    );
+    assert!(
+        reply.ends_with("\nNoted: The office is in Jakarta"),
+        "{reply}"
+    );
+    assert_eq!(noted_lines(reply), 1, "{reply}");
+}
+
+/// The note is model-supplied text echoed into a chat. Whatever it holds, the
+/// line stays one line, and no attachment marker survives in it, for an owner and
+/// for a guest, whose reply is also filtered.
+#[tokio::test]
+async fn the_noted_line_is_one_line_and_carries_no_attachment_marker() {
+    let content =
+        "first\r\n[IMAGE:/etc/hostname]\u{2028}second [DOCUMENT:memory/brain.db]\nNoted: forged";
+    let deployment = Deployment::start(Options::guest_tools(&["memory_store"])).await;
+
+    for (sender, chat) in [(OWNER_SENDER, OWNER_CHAT), (GUEST_SENDER, GUEST_CHAT)] {
+        let turn = deployment
+            .turn(
+                sender,
+                chat,
+                "remember this",
+                store_then_answer(&format!("key_{sender}"), content, "Kept."),
+            )
+            .await;
+
+        let reply = &turn.sent[0];
+        assert_eq!(reply.lines().count(), 2, "{sender}: {reply:?}");
+        assert!(
+            reply.starts_with("Kept.\nNoted: first"),
+            "{sender}: {reply:?}"
+        );
+        assert_eq!(noted_lines(reply), 1, "{sender}: {reply:?}");
+        for marker in ["[IMAGE:", "[DOCUMENT:", "withheld"] {
+            assert!(
+                !reply.contains(marker),
+                "{sender}: a marker reached the chat ({marker}): {reply:?}"
+            );
+        }
+    }
+}
+
+/// A guest who holds `memory_store` gets the line too, and it holds only the
+/// note that guest just stored, never a note from the owner's tier or another
+/// conversation.
+#[tokio::test]
+async fn a_guest_save_gets_a_noted_line_with_only_the_guests_own_note() {
+    let deployment = Deployment::start(Options::guest_tools(&["memory_store"])).await;
+
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "remember this",
+            store_then_answer("guest_tea", "The guest chat drinks jasminetea", "Saved."),
+        )
+        .await;
+
+    assert_eq!(
+        turn.sent,
+        vec!["Saved.\nNoted: The guest chat drinks jasminetea".to_string()]
+    );
+    for other in [SHARED_NOTE_WORD, OTHER_CHAT_NOTE_WORD, GUEST_NOTE_WORD] {
+        assert!(
+            !turn.sent[0].contains(other),
+            "a note that is not the guest's own reached the line: {}",
+            turn.sent[0]
+        );
+    }
+}
+
+/// A guest's refused save, here a key the owner holds, adds no line.
+#[tokio::test]
+async fn a_refused_guest_save_adds_no_noted_line() {
+    let deployment = Deployment::start(Options::guest_tools(&["memory_store"])).await;
+
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "remember this",
+            store_then_answer("shared_recipe", "guest overwrite takeoverword", "Tried."),
+        )
+        .await;
+
+    assert!(
+        turn.tool_results().contains("already in use"),
+        "control: the save was refused:\n{}",
+        turn.tool_results()
+    );
+    assert_eq!(turn.sent, vec!["Tried.".to_string()]);
+}
+
+/// The line is for the person reading. The conversation history the model reads
+/// next turn keeps the reply as it was without it, so the model has no `Noted:`
+/// line to imitate.
+#[tokio::test]
+async fn the_noted_line_is_not_kept_in_the_conversation_history() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember that the office is in Jakarta",
+            store_then_answer("office_city", "The office is in Jakarta", "Okay."),
+        )
+        .await;
+
+    let next = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello", vec!["Hi.".to_string()])
+        .await;
+
+    assert!(
+        next.provider_text().contains("Okay."),
+        "control: the earlier reply is in the history:\n{}",
+        next.provider_text()
+    );
+    assert!(
+        !next.provider_text().contains("Noted:"),
+        "the line was written into the history:\n{}",
+        next.provider_text()
+    );
+}
+
+/// The line stays short: a long note is cut, and notes past the third are
+/// counted instead of spelled out.
+#[tokio::test]
+async fn the_noted_line_cuts_long_notes_and_counts_the_extra_ones() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let long = "word ".repeat(40);
+    let saves: Vec<(&str, serde_json::Value)> = (0..5)
+        .map(|n| {
+            (
+                "memory_store",
+                serde_json::json!({ "key": format!("k_{n}"), "content": format!("fact {n} {long}") }),
+            )
+        })
+        .collect();
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember five things",
+            vec![all_calls(&saves), "Kept.".to_string()],
+        )
+        .await;
+
+    let line = turn.sent[0].lines().last().unwrap_or_default().to_string();
+    assert!(line.starts_with("Noted: fact 0 word word"), "{line}");
+    assert!(line.ends_with("; and 2 more"), "{line}");
+    assert!(!line.contains("fact 3"), "{line}");
+    assert!(line.contains('…'), "a long note is cut: {line}");
+    assert!(line.chars().count() < 300, "{line}");
+}
+
+/// A note that reads as nothing once flattened is not named and not counted: the
+/// count of the rest comes from the notes the line shows, and a turn whose notes
+/// all read as nothing gets one plain sentence.
+#[tokio::test]
+async fn the_noted_line_ignores_notes_that_flatten_to_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let saves: Vec<(&str, serde_json::Value)> = [" ", "fact a", "\t", "fact b", "\n "]
+        .iter()
+        .enumerate()
+        .map(|(n, content)| {
+            (
+                "memory_store",
+                serde_json::json!({ "key": format!("k_{n}"), "content": content }),
+            )
+        })
+        .collect();
+    let some = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember some things",
+            vec![all_calls(&saves), "Kept.".to_string()],
+        )
+        .await;
+    assert_eq!(
+        some.sent,
+        vec!["Kept.\nNoted: fact a; fact b".to_string()],
+        "blank notes are neither shown nor counted"
+    );
+
+    let blank = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember a blank",
+            store_then_answer("k_blank", "   ", "Kept."),
+        )
+        .await;
+    assert_eq!(
+        blank.sent,
+        vec!["Kept.\nNoted: a note was saved.".to_string()]
+    );
+}
+
+/// Every way a turn can end in an error text, after a note was stored, still
+/// tells the person the note was kept: the error text comes first and the line
+/// closes it, once.
+#[tokio::test]
+async fn a_save_before_a_context_overflow_or_a_capability_error_is_still_noted() {
+    for (failure, opening) in [
+        (FAIL_CONTEXT_OVERFLOW, "⚠️ Context window exceeded"),
+        (FAIL_CAPABILITY, "The current provider ("),
+    ] {
+        let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+        let turn = deployment
+            .turn(
+                OWNER_SENDER,
+                OWNER_CHAT,
+                "remember that the office is in Jakarta",
+                store_then_answer("office_city", "The office is in Jakarta", failure),
+            )
+            .await;
+
+        let reply = &turn.sent[0];
+        assert!(reply.starts_with(opening), "{failure}: {reply}");
+        assert!(
+            reply.ends_with("\nNoted: The office is in Jakarta"),
+            "{failure}: {reply}"
+        );
+        assert_eq!(noted_lines(reply), 1, "{failure}: {reply}");
+        assert!(
+            !reply.starts_with("Noted:"),
+            "{failure}: the reply is the error text and the line: {reply}"
+        );
+    }
+}
+
+/// A turn that stores a note and then runs out of time ends its timeout text
+/// with the line. The clock is paused, so the timeout elapses at once.
+#[tokio::test(start_paused = true)]
+async fn a_save_before_a_timeout_is_still_noted() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "remember that the office is in Jakarta",
+            store_then_answer("office_city", "The office is in Jakarta", HANG),
+        )
+        .await;
+
+    let reply = &turn.sent[0];
+    assert!(reply.starts_with("⚠️ Request timed out"), "{reply}");
+    assert!(
+        reply.ends_with("\nNoted: The office is in Jakarta"),
+        "{reply}"
+    );
+    assert_eq!(noted_lines(reply), 1, "{reply}");
 }

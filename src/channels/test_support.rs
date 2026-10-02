@@ -19,6 +19,10 @@ use std::sync::Arc;
 #[derive(Default)]
 pub(super) struct RecordingChannel {
     pub(super) sent_messages: tokio::sync::Mutex<Vec<String>>,
+    /// When set, the channel behaves like one with editable drafts: dispatch
+    /// opens a draft and ends the reply with `finalize_draft`, which records
+    /// the final text in `sent_messages` the way `send` does.
+    pub(super) drafts: std::sync::atomic::AtomicBool,
     pub(super) start_typing_calls: AtomicUsize,
     pub(super) stop_typing_calls: AtomicUsize,
 }
@@ -96,6 +100,27 @@ impl Channel for TelegramRecordingChannel {
 impl Channel for RecordingChannel {
     fn name(&self) -> &str {
         "test-channel"
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.drafts.load(Ordering::SeqCst)
+    }
+
+    async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+        Ok(Some("draft-1".to_string()))
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        _message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.sent_messages
+            .lock()
+            .await
+            .push(format!("{recipient}:{text}"));
+        Ok(())
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {

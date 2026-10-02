@@ -9,7 +9,7 @@ share.
 ## Tools
 - name: file_read
   kind: builtin
-- name: memory_write
+- name: memory_store
   kind: builtin
 - name: cron_schedule
   kind: builtin
@@ -22,7 +22,8 @@ share.
 - Keep decisions terse: one sentence each, in the past tense.
 - Open questions are things the meeting did not resolve — list them so the
   user can chase follow-ups.
-- Save the rendered notes to `memory/meetings/<YYYY-MM-DD>-<slug>.md`.
+- Return the rendered notes in the reply. Store them with `memory_store` only when the user asks
+  to have the notes remembered.
 - Offer to schedule reminders for any action item that has a due date,
   using the scheduler-reminders skill.
 - Never paraphrase quotes or numbers. Quote them verbatim with attribution.

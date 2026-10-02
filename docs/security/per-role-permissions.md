@@ -127,7 +127,6 @@ empty. A door that forgets to set a view fails closed.
 | Channel turn, a sender who is an owner only through `approval_owners = ["*"]` | that conversation only, in a direct chat as well |
 | Channel turn, a guest | that conversation only |
 | TUI, `agent -m`, `chat -m`, the web console chat | all of memory |
-| The `/compress` memory flush of the TUI | all of memory |
 | Daemon heartbeat | all of memory (its reply goes to the journal and the observer, never to a chat) |
 | Cron job created from a chat | that chat's conversation, for `main` and `isolated` |
 | Cron job with no chat, `main` or `isolated` | all of memory |

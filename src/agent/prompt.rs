@@ -807,19 +807,14 @@ impl PromptSection for SkillsSection {
     }
 }
 
-/// Standing nudge to curate durable facts as they appear, instead of letting
-/// them die with the session. The pre-compaction flush
-/// (`Agent::flush_durable_memory`) is the safety net for facts that were never
-/// saved mid-conversation; this section is the first line — the model saves a
-/// fact the moment the user states it.
+/// States when a note is stored: only when the user asks for one. The model
+/// never saves on its own initiative, so nothing here urges a save.
 ///
 /// Self-gating, twice:
-///   * only on [`PromptSurface::Agent`] — channel prompts serve guests too,
-///     and a guest's words must not be nudged into durable memory (the same
-///     taint boundary that keeps the flush off the channel auto-compaction
-///     path);
-///   * only when a `memory_store` tool is actually registered — nudging a
-///     model toward a tool it does not have manufactures failed calls.
+///   * only on [`PromptSurface::Agent`], since channel prompts serve guests too
+///     and a guest's words are not steered toward durable memory;
+///   * only when a `memory_store` tool is actually registered, because naming a
+///     tool the model does not have manufactures failed calls.
 impl PromptSection for MemorySection {
     fn name(&self) -> &str {
         "memory"
@@ -832,9 +827,10 @@ impl PromptSection for MemorySection {
         if !ctx.tools.iter().any(|t| t.name() == "memory_store") {
             return Ok(String::new());
         }
-        Ok("## Memory
-            When the user states something durable — a preference, a standing             decision, a project fact, a correction — save it with `memory_store`             (category `core`, a descriptive snake_case key such as             `user_language`). Update the existing key, or pass `replaces` with a             phrase from the old entry, instead of piling up variants. Do not             save one-off conversational detail, secrets, or anything you are             unsure about — when in doubt, ask first.
-"
+        Ok("## Memory\n\n\
+            Store a note with `memory_store` only when the user asks you to remember \
+            something. Never store a note on your own initiative, and do not store \
+            secrets.\n"
             .to_string())
     }
 }
@@ -1131,10 +1127,12 @@ mod tests {
         assert!(prompt.contains("instr"));
     }
 
-    /// The nudge appears exactly when it can be acted on: Agent surface with a
-    /// registered `memory_store`. Each gate has its own control below.
+    /// The memory section appears exactly when it can be acted on: Agent
+    /// surface with a registered `memory_store`. Each gate has its own control
+    /// below. It says when a note is stored (the person asked) and never tells
+    /// the model to store one on its own.
     #[test]
-    fn memory_nudge_renders_on_agent_surface_with_memory_store() {
+    fn memory_section_renders_on_agent_surface_and_saves_only_when_asked() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(DescriptorTool::new(
             "memory_store",
             "store a memory",
@@ -1155,8 +1153,22 @@ mod tests {
             owner_files: OwnerFiles::Load,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
-        assert!(prompt.contains("## Memory"), "nudge missing: {prompt}");
+        assert!(prompt.contains("## Memory"), "section missing: {prompt}");
         assert!(prompt.contains("memory_store"));
+        assert!(
+            prompt.contains("only when the user asks"),
+            "the section must say a note is stored when asked: {prompt}"
+        );
+        for urging in [
+            "When the user states something durable",
+            "save it with",
+            "instead of piling up variants",
+        ] {
+            assert!(
+                !prompt.contains(urging),
+                "the prompt tells the model to save on its own ({urging:?}): {prompt}"
+            );
+        }
     }
 
     /// Channel prompts serve guests too — a guest's words must not be nudged

@@ -285,6 +285,33 @@ mod tests {
         }
     }
 
+    /// A persona reaches every prompt, a guest's included. Its workspace line
+    /// sends files the person asks for to the workspace, and does not steer a
+    /// note the person wants remembered into a file, and it names no tool.
+    #[test]
+    fn every_preset_sends_only_requested_files_to_the_workspace() {
+        for &preset in PresetId::ALL {
+            let line = template_for(preset)
+                .lines()
+                .find(|line| line.contains("profiles/<active>/workspace/"))
+                .unwrap_or_else(|| panic!("{preset:?} has no workspace line"));
+            assert!(
+                line.contains("the person asks you to create"),
+                "{preset:?} workspace line: {line}"
+            );
+            for steering in ["persistent files", "notes"] {
+                assert!(
+                    !line.contains(steering),
+                    "{preset:?} workspace line steers a note into a file ({steering:?}): {line}"
+                );
+            }
+            assert!(
+                !line.contains("memory_"),
+                "{preset:?} workspace line names a memory tool: {line}"
+            );
+        }
+    }
+
     #[test]
     fn default_for_round_trips_through_toml() {
         let persona = PersonaToml::default_for("Shiro", "Asia/Jakarta");

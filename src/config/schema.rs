@@ -5913,10 +5913,11 @@ fn is_template_scaffold_line(content: &str) -> bool {
     if trimmed == "---" {
         return true;
     }
-    crate::memory::MEMORY_MD_TEMPLATE.lines().any(|line| {
-        let line = line.trim();
-        line.strip_prefix("- ").unwrap_or(line) == trimmed
-    })
+    crate::memory::LEGACY_MEMORY_MD_SCAFFOLD_LINES.contains(&trimmed)
+        || crate::memory::MEMORY_MD_TEMPLATE.lines().any(|line| {
+            let line = line.trim();
+            line.strip_prefix("- ").unwrap_or(line) == trimmed
+        })
 }
 
 /// Map the in-process memory category to the on-disk sqlite string.
@@ -10185,6 +10186,45 @@ default_model = "legacy-model"
         assert_eq!(
             backed_up_content, "stale sqlite value",
             "the backed-up brain.db must hold the pre-import (stale) value"
+        );
+    }
+
+    /// A `MEMORY.md` an earlier wizard wrote still holds scaffold lines that
+    /// today's template no longer writes (the daily files line, the four
+    /// placeholders, the conciseness bullet). The import keeps recognizing them as
+    /// scaffold, so none becomes a stored note.
+    #[tokio::test]
+    async fn markdown_import_skips_the_scaffold_lines_an_earlier_wizard_wrote() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = markdown_workspace(&tmp);
+
+        super::import_markdown_memory_into_sqlite(&workspace).unwrap();
+
+        let conn = rusqlite::Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let mut stmt = conn.prepare("SELECT content FROM memories").unwrap();
+        let contents: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        drop(stmt);
+
+        for old_line in [
+            "capture raw events",
+            "Add important facts about your human here",
+            "Record decisions and preferences here",
+            "Document mistakes and insights here",
+            "Track unfinished tasks and follow-ups here",
+            "Keep it concise",
+        ] {
+            assert!(
+                !contents.iter().any(|c| c.contains(old_line)),
+                "the old scaffold line {old_line:?} became a stored note: {contents:?}"
+            );
+        }
+        assert!(
+            contents.iter().any(|c| c.contains("prefers Rust")),
+            "control: the operator's own line is imported: {contents:?}"
         );
     }
 

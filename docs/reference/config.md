@@ -544,14 +544,17 @@ Notes:
 ### The curated tier
 
 Durable facts live in `core` (and `daily`) categories, written via the
-`memory_store` tool. Two mechanisms fill this tier: the interactive agent's
-system prompt nudges the model to save a durable fact the moment the user
-states it (interactive surfaces only — channel prompts serve guests, whose
-words are never nudged into durable memory), and a pre-compaction flush
-(`/compress` and TUI auto-compaction) gives the model one last bounded turn to
-save facts before the turns carrying them are folded into a summary. Auto-saved
-`conversation` rows are not part of this tier and are never injected into
-prompts.
+`memory_store` tool. The agent writes one only when the person asks to have
+something remembered. No prompt on any surface tells the model to save on its
+own, and compaction (`/compress`) stores nothing. Auto-saved `conversation` rows
+are not part of this tier and are never injected into prompts.
+
+The `memory_store` description is one text that every surface shows the model.
+It asks for a fact about the person or the work ("The owner prefers short
+answers"), not an instruction to the agent ("Always answer briefly"), and says to
+use the tool when the user asks to have something remembered. A channel turn that
+stores a note ends its reply with a `Noted:` line; see
+[Channels](channels.md#the-noted-line).
 
 ### Conversation scoping
 
