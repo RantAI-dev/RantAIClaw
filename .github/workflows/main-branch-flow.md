@@ -87,6 +87,8 @@ Workflow: `.github/workflows/pub-release.yml`.
 6. In publish mode: SBOM (CycloneDX + SPDX), `SHA256SUMS`, keyless cosign signatures, GHCR release-tag check.
 7. In publish mode: creates/updates the GitHub Release.
 
+Every job except `publish` checks out the ref being released (`needs.prepare.outputs.release_ref`), so a manual run for an existing tag tests that tag and not the branch the workflow was dispatched from. Only `publish` holds write scopes (`contents: write`, `packages: write`, `id-token: write`, `attestations: write`); every other job inherits `contents: read`, so a step outside `publish` cannot write to the repository, packages, or attestations. The filtered lib-test steps in `verify-update-cycle` and `windows-io-tests` run `scripts/ci/run_filtered_lib_tests.sh`, which lists the selection first and refuses to run when the filter matches no test — a typo in a filter name fails the gate instead of passing silently.
+
 ## Merge/Policy Notes
 
 1. Branch protection should require only `CI Required Gate` — internal stages can change without touching protection settings.
