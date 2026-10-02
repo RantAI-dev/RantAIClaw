@@ -44,12 +44,6 @@ KNOWN_UNREAD=$(cat <<'EOF'
 sign_events	AuditConfig	audit-log signing is unimplemented; key surfaced but never read
 chunk_max_tokens	MemoryConfig	plan-261 grep baseline; verify against reader before deleting
 max_images	MultimodalConfig	plan-261 grep baseline; verify against reader before deleting
-max_memory_mb	ResourceLimitsConfig	part of the dead [security.sandbox] layer (deep-scan plans 196-219)
-max_cpu_time_seconds	ResourceLimitsConfig	part of the dead [security.sandbox] layer (deep-scan plans 196-219)
-max_subprocesses	ResourceLimitsConfig	part of the dead [security.sandbox] layer (deep-scan plans 196-219)
-memory_monitoring	ResourceLimitsConfig	part of the dead [security.sandbox] layer (deep-scan plans 196-219)
-firejail_args	SandboxConfig	part of the dead [security.sandbox] layer (deep-scan plans 196-219)
-resources	SecurityConfig	container for the dead ResourceLimitsConfig (deep-scan plans 196-219)
 EOF
 )
 

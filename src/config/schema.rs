@@ -3222,27 +3222,19 @@ pub struct LarkConfig {
     pub port: Option<u16>,
 }
 
-// ── Security Config ─────────────────────────────────────────────────
+// ── Audit logging ─────────────────────────────────────────────────
 
-/// Audit configuration holder.
+/// Audit logging configuration.
 ///
-/// It carried `sandbox` and `resources` until plan 305 deleted the layer they
-/// configured — neither had a reader, and `[security.sandbox]` selected between
-/// four backends nothing constructed. `audit` stays because the tool-call trail
-/// is real (wired in #723).
-///
-/// Note this whole struct is still NOT a field of [`Config`], so `[security.*]`
-/// remains an unknown top-level key that `warn_on_unknown_top_level_config_keys`
-/// reports at load. That is deliberate: the audit trail runs on defaults, and
-/// making the section parse would replace a warning with silence.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
-pub struct SecurityConfig {
-    /// Audit logging configuration
-    #[serde(default)]
-    pub audit: AuditConfig,
-}
-
-/// Audit logging configuration
+/// The audit-trail struct itself is real and in use (wired in #723): the
+/// gateway's config-API change logger and the runtime `AuditLogger` both
+/// build one with `AuditConfig::default()`. The container that used to hold
+/// this alongside the now-deleted `sandbox` and `resources` sections was
+/// removed; the `[security.*]` block stays an unknown top-level config key so
+/// `warn_on_unknown_top_level_config_keys` keeps reporting it at startup. That
+/// is the point: the audit trail runs on defaults today, and making the
+/// section parse would replace the unknown-key warning with silence. The
+/// `security_is_not_a_known_top_level_key` test exists to pin that.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AuditConfig {
     /// Enable audit logging
@@ -6130,17 +6122,19 @@ mod tests {
         warn_on_unknown_top_level_config_keys(&raw, Path::new("/tmp/config.toml"));
     }
 
-    /// The README and plan 305 both state that writing `[security.*]` produces
-    /// an unknown-key warning rather than silence. That is only true while
-    /// `security` is absent from the schema — the day `SecurityConfig` becomes a
-    /// field of `Config`, the section starts parsing quietly and the warning
-    /// disappears. Pin the claim so it cannot go stale unnoticed.
+    /// `[security.*]` has to stay an unknown top-level key so the
+    /// unknown-key warning keeps reporting the section at load — the audit
+    /// trail runs on `AuditConfig::default()` at the gateway's config-change
+    /// logger and the runtime `AuditLogger`, with no parsed `[security.*]`
+    /// block to source a per-deployment config from. The day `security`
+    /// becomes a known top-level key, the warning goes silent; revisit the
+    /// README's claim that operators see the warning when they put one in.
     #[test]
     async fn security_is_not_a_known_top_level_key() {
         let known = known_top_level_config_keys();
         assert!(
             !known.contains("security"),
-            "`[security.*]` now parses silently — update the README and plan 305"
+            "`[security.*]` now parses silently — update the README claim that the warning still fires"
         );
     }
 
@@ -9697,7 +9691,10 @@ default_model = "legacy-model"
 
     // ── Peripherals config ───────────────────────────────────────
     //
-    // Removed with the `[peripherals]` section (plan 507).
+    // The `[peripherals]` section was removed with the hardware/peripheral
+    // stack; nothing here parses into the new `Config` and the section is
+    // intentionally kept as an unknown top-level key so the warning path
+    // continues to fire on operator configs that still try to set it.
 
     #[test]
     async fn lark_config_serde() {

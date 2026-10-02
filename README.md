@@ -367,10 +367,12 @@ hardware you do not control, including aarch64 on-prem boxes.
 
 ## Build features
 
-`default = ["tui", "whatsapp-web", "remote-install", "kb"]`
+`default = ["tui", "whatsapp-web", "remote-install", "kb", "channel-lark"]`
 
-Notable optional features: `channel-matrix`, `channel-lark`, `observability-otel`,
-`rag-pdf`, `kb-office`, `legacy-providers`.
+Notable optional features: `channel-matrix`, `observability-otel`, `kb-office`,
+`legacy-providers`. `channel-lark` and `rag-pdf` are not listed as optional
+because both are already in the default build — `channel-lark` directly,
+`rag-pdf` indirectly through the default `kb` feature.
 
 The Landlock crate compiles in automatically on Linux with no feature flag, but see
 **What these controls do not cover** — the sandbox layer is not wired to command

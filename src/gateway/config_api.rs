@@ -486,10 +486,10 @@ async fn persist_and_swap(
 /// values — so no secret can leak. Best-effort; the blocking append runs off the
 /// async worker.
 ///
-/// `SecurityConfig` (which owns the operator-facing `[security.audit]` block) is not
-/// wired into `Config` today, so there is no reachable per-deployment audit config to
-/// read; config-change auditing therefore uses `AuditConfig::default()` (enabled). If
-/// a future change threads `SecurityConfig` into `Config`, source the config here.
+/// No `[security.*]` block is parsed by the current `Config`, so there is no
+/// reachable per-deployment audit config to read; config-change auditing
+/// therefore uses `AuditConfig::default()` (enabled). If a future change
+/// threads an audit config into `Config`, source the config here.
 fn audit_config_change(cfg: &crate::config::Config, change_summary: &str) {
     let Some(dir) = cfg.config_path.parent().map(std::path::Path::to_path_buf) else {
         return;

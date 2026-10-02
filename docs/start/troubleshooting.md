@@ -71,15 +71,16 @@ CARGO_BUILD_JOBS=1 cargo build --release --locked
 ```
 
 1. Drop optional default features you don't need. The default set is
-   `tui whatsapp-web remote-install kb`; build with `--no-default-features`
-   plus only what you need to cut compile cost:
+   `tui whatsapp-web remote-install kb channel-lark`; build with
+   `--no-default-features` plus only what you need to cut compile cost:
 
 ```bash
 cargo build --release --locked --no-default-features --features tui
 ```
 
-   Do **not** add `--features hardware` to shrink a build — the feature
-   no longer exists, and the build flags worth considering all add weight.
+   Nothing to add to shrink a build — the `hardware` feature was removed
+   with the peripherals stack, and the build flags worth considering all
+   add weight.
 
 1. Cross-compile on a stronger machine and copy the binary to the target host.
 
