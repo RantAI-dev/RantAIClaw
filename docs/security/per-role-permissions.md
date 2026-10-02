@@ -147,7 +147,9 @@ empty. A door that forgets to set a view fails closed.
   the turn's view puts it. It refuses a key that already holds a different note
   unless `replaces` names it, and identical content is not an error.
   `memory_forget` deletes only what the turn's view can see, by key and by
-  `contains`, and deletes nothing in a turn with no view. The console, the CLI
+  `contains`. A turn with no view, a webhook turn included, can neither store
+  nor delete a note: both tools refuse it before any lookup with one answer
+  that names no key. The console, the CLI
   `memory` commands and the TUI `/memory` commands are the operator's own
   surfaces: they run under the view of all of memory, may write to any place,
   and replace a note on purpose.

@@ -98,12 +98,23 @@ impl Tool for MemoryForgetTool {
             });
         }
 
+        // A turn with no view reads nothing and deletes nothing, so it is refused
+        // before any selector is resolved. Past this point the answer would name
+        // the key or say whether a phrase matched, and a caller outside every view
+        // must not learn that. The checks above do not depend on stored state.
+        if crate::memory::current_memory_view().is_none() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(crate::memory::NO_MEMORY_VIEW_REFUSAL.to_string()),
+            });
+        }
+
         // The turn's view decides what is deletable, whichever selector named it.
         // `Contains` resolves its target from the rows the view can list, and
         // `forget_in_view` repeats the check for the key it ends up with, so a
         // key addressed directly gets the same answer a missing key gets and
-        // confirms nothing about a row outside the view. A turn with no view
-        // reaches no row.
+        // confirms nothing about a row outside the view.
         let key: String = match selector {
             Selector::Key(k) => k.to_string(),
             Selector::Contains(needle) => {
@@ -208,7 +219,7 @@ mod tests {
     async fn forget_nonexistent() {
         let (tmp, mem) = test_mem();
         let tool = MemoryForgetTool::new(mem, test_security(), tmp.path().to_path_buf());
-        let result = tool.execute(json!({"key": "nope"})).await.unwrap();
+        let result = execute_in_all_view(&tool, json!({"key": "nope"})).await;
         assert!(result.success);
         assert!(result.output.contains("No memory found"));
     }
@@ -361,28 +372,133 @@ mod tests {
 
     // ── every selector reaches only what the view can see ─────────
 
-    /// A turn no door gave a view reads nothing, so it deletes nothing: a key
-    /// addressed directly is "not found", the same answer a missing key gets, and
-    /// the row survives. Before the view was required here the key was deleted.
+    const NO_VIEW_REFUSAL: &str = "Memory is not available in this conversation.";
+
+    /// A turn no door gave a view reads nothing and deletes nothing. Whichever
+    /// selector names the row, and whether it exists or not, the answer is the
+    /// same refusal, so the caller learns nothing about what is stored.
     #[tokio::test]
-    async fn forget_by_key_with_no_view_deletes_nothing() {
+    async fn forget_with_no_view_is_refused_with_one_text_whatever_the_selector() {
         let (tmp, mem) = test_mem();
-        mem.store("shared_key", "a shared note", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store(
+            "shared_key",
+            "The staging password rotates weekly",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
 
         let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool.execute(json!({"key": "shared_key"})).await.unwrap();
+        let calls = [
+            ("an existing key", json!({"key": "shared_key"})),
+            ("a missing key", json!({"key": "missing_key"})),
+            (
+                "a phrase that matches",
+                json!({"contains": "staging password"}),
+            ),
+            (
+                "a phrase that matches nothing",
+                json!({"contains": "no such phrase"}),
+            ),
+        ];
 
-        assert!(result.success, "{:?}", result.error);
-        assert!(
-            result.output.contains("No memory found"),
-            "{}",
-            result.output
-        );
+        for (what, args) in calls {
+            let result = tool.execute(args).await.unwrap();
+
+            assert!(!result.success, "{what}");
+            assert!(result.output.is_empty(), "{what}: {}", result.output);
+            assert_eq!(result.error.as_deref(), Some(NO_VIEW_REFUSAL), "{what}");
+        }
+
         assert!(
             mem.get("shared_key").await.unwrap().is_some(),
             "a turn with no view deleted a row"
+        );
+    }
+
+    /// The refusal comes before any lookup: the backend is not asked anything.
+    /// The answer text is what tells this layer from the one inside
+    /// `forget_in_view`, which also deletes nothing but answers "not found".
+    #[tokio::test]
+    async fn forget_with_no_view_never_reaches_the_backend() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CallCountingMemory {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Memory for CallCountingMemory {
+            fn name(&self) -> &str {
+                "call-counting"
+            }
+            async fn store(
+                &self,
+                _key: &str,
+                _content: &str,
+                _category: MemoryCategory,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _query: &str,
+                _limit: usize,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            async fn get(&self, _key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _category: Option<&MemoryCategory>,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let counting = Arc::new(CallCountingMemory {
+            calls: AtomicUsize::new(0),
+        });
+        let tool =
+            MemoryForgetTool::new(counting.clone(), test_security(), tmp.path().to_path_buf());
+
+        for args in [json!({"key": "any_key"}), json!({"contains": "any phrase"})] {
+            let result = tool.execute(args).await.unwrap();
+            assert_eq!(result.error.as_deref(), Some(NO_VIEW_REFUSAL));
+        }
+        assert_eq!(
+            counting.calls.load(Ordering::SeqCst),
+            0,
+            "a refused call reached the backend"
+        );
+
+        // Control: under the All view the same calls do reach it.
+        let _ = execute_in_all_view(&tool, json!({"contains": "any phrase"})).await;
+        assert!(
+            counting.calls.load(Ordering::SeqCst) > 0,
+            "control: a permitted call reads the store"
         );
     }
 
@@ -513,34 +629,6 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(mem.get("obscure_key_9f2").await.unwrap().is_none());
-    }
-
-    /// `contains` reads the store to find its target. A turn no door gave a
-    /// view reads nothing, so the phrase matches nothing and nothing is deleted.
-    #[tokio::test]
-    async fn forget_by_contains_with_no_view_finds_nothing() {
-        let (tmp, mem) = test_mem();
-        mem.store(
-            "obscure_key_9f2",
-            "The staging password rotates weekly",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
-        let result = tool
-            .execute(json!({"contains": "staging password"}))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("nothing to forget"));
-        assert!(mem.get("obscure_key_9f2").await.unwrap().is_some());
     }
 
     #[tokio::test]

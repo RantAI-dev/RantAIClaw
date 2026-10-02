@@ -28,6 +28,7 @@ pub use traits::{KeyInUse, Memory};
 pub use traits::{MemoryCategory, MemoryEntry};
 pub use view::{
     current_memory_view, forget_in_view, recall_in_view, store_in_view, MemoryView, MEMORY_VIEW,
+    NO_MEMORY_VIEW_REFUSAL,
 };
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig};

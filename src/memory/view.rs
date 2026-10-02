@@ -52,6 +52,13 @@ pub fn current_memory_view() -> Option<MemoryView> {
     MEMORY_VIEW.try_with(|v| v.clone()).ok()
 }
 
+/// The one answer `memory_store` and `memory_forget` give a turn with no view.
+///
+/// A turn with no view reads nothing and writes nothing, so a tool refuses it
+/// before it looks anything up. The text names no key and does not depend on the
+/// arguments, so the refusal is the same whether or not the key exists.
+pub const NO_MEMORY_VIEW_REFUSAL: &str = "Memory is not available in this conversation.";
+
 /// Recall under `view`. `Only(key)` is the hard filter: every entry whose
 /// `session_id` is not exactly `key` is dropped. `All` is the unchanged global
 /// read.

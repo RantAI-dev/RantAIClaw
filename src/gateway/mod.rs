@@ -3855,6 +3855,42 @@ mod tests {
         )
     }
 
+    /// A model asking to store a note.
+    fn store_call(key: &str, content: &str) -> String {
+        let call = serde_json::json!({
+            "name": "memory_store",
+            "arguments": {"key": key, "content": content, "category": "core"},
+        });
+        format!("<tool_call>\n{call}\n</tool_call>")
+    }
+
+    /// A model asking to forget a note by key.
+    fn forget_call(key: &str) -> String {
+        let call = serde_json::json!({"name": "memory_forget", "arguments": {"key": key}});
+        format!("<tool_call>\n{call}\n</tool_call>")
+    }
+
+    /// What the model was sent after a webhook turn, and the state the turn left
+    /// behind.
+    struct WebhookRun {
+        system: String,
+        rest: String,
+        memory: Arc<dyn Memory>,
+        workspace: tempfile::TempDir,
+    }
+
+    impl WebhookRun {
+        /// The tool-result message the model received, without the call that
+        /// produced it.
+        fn tool_results(&self) -> &str {
+            let start = self
+                .rest
+                .find("[Tool results]")
+                .expect("the model was sent a tool result");
+            &self.rest[start..]
+        }
+    }
+
     /// Drives a webhook door over a store that holds a note about the lantern,
     /// owner files in the workspace, and the real `memory_recall` tool. Returns
     /// the system prompt and the rest of what the model was sent. With
@@ -3865,6 +3901,14 @@ mod tests {
         all_view: bool,
         tool_call: &str,
     ) -> (String, String) {
+        let run = webhook_door_run(trigger, all_view, tool_call).await;
+        (run.system, run.rest)
+    }
+
+    /// The same drive, keeping the store and the workspace so a test reads what
+    /// the turn left in them. The tools are the real `memory_recall`,
+    /// `memory_store`, `memory_forget` and `file_read`.
+    async fn webhook_door_run(trigger: bool, all_view: bool, tool_call: &str) -> WebhookRun {
         let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
         let home = tempfile::tempdir().expect("temp home");
         let _home = crate::test_env::HomeGuard::set(home.path());
@@ -3895,14 +3939,22 @@ mod tests {
             .await
             .unwrap();
         let memory: Arc<dyn Memory> = Arc::new(sqlite);
+        let kept_memory = Arc::clone(&memory);
 
         let provider_impl = Arc::new(RecallingProvider::new(tool_call.to_string()));
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let tools_memory = Arc::clone(&memory);
-        let config = Config {
+        let mut config = Config {
             workspace_dir: workspace.path().to_path_buf(),
             ..Config::default()
         };
+        // A webhook turn has nobody to approve a tool call, so the two memory
+        // tools run only where the operator pre-approved them. Without this the
+        // approval gate answers first and the tools never run.
+        config
+            .autonomy
+            .auto_approve
+            .extend(["memory_store".to_string(), "memory_forget".to_string()]);
         let state = AppState {
             config: Arc::new(Mutex::new(config)),
             config_fingerprint: Arc::new(Mutex::new("test".to_string())),
@@ -3942,6 +3994,16 @@ mod tests {
                     Box::new(crate::tools::MemoryRecallTool::new(Arc::clone(
                         &tools_memory,
                     ))) as Box<dyn crate::tools::Tool>,
+                    Box::new(crate::tools::MemoryStoreTool::new(
+                        Arc::clone(&tools_memory),
+                        Arc::clone(&security),
+                        config.workspace_dir.clone(),
+                    )),
+                    Box::new(crate::tools::MemoryForgetTool::new(
+                        Arc::clone(&tools_memory),
+                        Arc::clone(&security),
+                        config.workspace_dir.clone(),
+                    )),
                     Box::new(crate::tools::FileReadTool::new(security)),
                 ]
             }),
@@ -3990,7 +4052,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        (flat(true), flat(false))
+        WebhookRun {
+            system: flat(true),
+            rest: flat(false),
+            memory: kept_memory,
+            workspace,
+        }
     }
 
     /// A webhook turn has no owner identity behind it, so no door sets a view
@@ -4064,6 +4131,118 @@ mod tests {
     async fn a_webhook_turn_under_the_all_view_would_read_the_note() {
         let (_system, rest) = webhook_door_over_a_note(false, true, RECALL_CALL).await;
         assert!(rest.contains(WEBHOOK_NOTE_WORD), "{rest}");
+    }
+
+    /// A webhook turn has no view, and a turn with no view writes nothing. A
+    /// `core` note stored here would land in the owner's `MEMORY.md` and prompt,
+    /// so the call must leave the store and the file as they were. A new key, a
+    /// shared key with other content and a shared key with the same content get
+    /// one answer, so the caller cannot tell what the store holds.
+    #[tokio::test]
+    async fn the_webhook_door_stores_nothing_and_answers_every_key_alike() {
+        let existing = format!("A note about the lantern: {WEBHOOK_NOTE_WORD}");
+        let calls = [
+            ("a new key", "fresh_note", "a planted fact"),
+            (
+                "a shared key, other content",
+                "shared_note",
+                "a planted fact",
+            ),
+            (
+                "a shared key, same content",
+                "shared_note",
+                existing.as_str(),
+            ),
+        ];
+
+        for trigger in [false, true] {
+            let mut answers = Vec::new();
+            for (what, key, content) in calls {
+                let run = webhook_door_run(trigger, false, &store_call(key, content)).await;
+
+                assert_eq!(
+                    run.memory.count().await.unwrap(),
+                    1,
+                    "{what} (trigger {trigger}): a row was written"
+                );
+                assert!(run.memory.get("fresh_note").await.unwrap().is_none());
+                assert_eq!(
+                    run.memory
+                        .get("shared_note")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .content,
+                    existing,
+                    "{what} (trigger {trigger}): the shared note changed"
+                );
+                let memory_md =
+                    std::fs::read_to_string(run.workspace.path().join("MEMORY.md")).unwrap();
+                assert_eq!(
+                    memory_md,
+                    format!("# Memory\n{WEBHOOK_MEMORY_CANARY}"),
+                    "{what} (trigger {trigger}): MEMORY.md was rewritten"
+                );
+                assert!(
+                    run.tool_results()
+                        .contains("Memory is not available in this conversation."),
+                    "{what} (trigger {trigger}): {}",
+                    run.tool_results()
+                );
+                answers.push(run.tool_results().to_string());
+            }
+            assert!(
+                answers.windows(2).all(|pair| pair[0] == pair[1]),
+                "trigger {trigger}: the answer depends on the key:\n{answers:#?}"
+            );
+        }
+    }
+
+    /// The same for `memory_forget`: a shared key that exists and one that does
+    /// not get one answer, and the shared row is still there.
+    #[tokio::test]
+    async fn the_webhook_door_forgets_nothing_and_answers_every_key_alike() {
+        for trigger in [false, true] {
+            let mut answers = Vec::new();
+            for key in ["shared_note", "missing_note"] {
+                let run = webhook_door_run(trigger, false, &forget_call(key)).await;
+
+                assert!(
+                    run.memory.get("shared_note").await.unwrap().is_some(),
+                    "{key} (trigger {trigger}): the shared note was deleted"
+                );
+                let memory_md =
+                    std::fs::read_to_string(run.workspace.path().join("MEMORY.md")).unwrap();
+                assert_eq!(
+                    memory_md,
+                    format!("# Memory\n{WEBHOOK_MEMORY_CANARY}"),
+                    "{key} (trigger {trigger}): MEMORY.md was rewritten"
+                );
+                assert!(
+                    run.tool_results()
+                        .contains("Memory is not available in this conversation."),
+                    "{key} (trigger {trigger}): {}",
+                    run.tool_results()
+                );
+                answers.push(run.tool_results().to_string());
+            }
+            assert!(
+                answers.windows(2).all(|pair| pair[0] == pair[1]),
+                "trigger {trigger}: the answer depends on the key:\n{answers:#?}"
+            );
+        }
+    }
+
+    /// The control for the two cases above: the same scripted calls under the
+    /// `All` view store and delete, so the refusals are the view and not a tool
+    /// that was never wired.
+    #[tokio::test]
+    async fn a_webhook_turn_under_the_all_view_would_store_and_forget() {
+        let run = webhook_door_run(false, true, &store_call("fresh_note", "a planted fact")).await;
+        assert!(run.memory.get("fresh_note").await.unwrap().is_some());
+
+        let run = webhook_door_run(false, true, &forget_call("shared_note")).await;
+        assert!(run.memory.get("shared_note").await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -568,7 +568,8 @@ user's message, and the lookups of `memory_store` and `memory_forget` may read.
   direct message, a sender who is an owner only through `approval_owners = ["*"]`,
   and a cron job created from a chat read that conversation's notes only.
 - A turn that no door gave a view, such as a webhook turn, reads nothing: recall
-  finds no note and the context block is empty.
+  finds no note and the context block is empty. It writes nothing either:
+  `memory_store` and `memory_forget` refuse it with one answer that names no key.
 
 The table in
 [Per-role channel permissions](../security/per-role-permissions.md#memory-view-what-a-turn-may-read)
