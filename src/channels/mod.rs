@@ -1901,3 +1901,6 @@ pub(crate) mod owner_dm;
 
 #[cfg(test)]
 mod guest_privacy_tests;
+
+#[cfg(test)]
+mod recall_door_tests;

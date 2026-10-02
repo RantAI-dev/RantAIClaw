@@ -26,7 +26,7 @@ impl Default for DefaultMemoryLoader {
     fn default() -> Self {
         Self {
             limit: 5,
-            min_relevance_score: 0.4,
+            min_relevance_score: 0.6,
         }
     }
 }
@@ -69,6 +69,15 @@ mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use std::sync::Arc;
+
+    /// A loader built without a config scores at the same floor a config does.
+    #[test]
+    fn default_loader_uses_the_default_relevance_floor() {
+        assert_eq!(
+            DefaultMemoryLoader::default().min_relevance_score,
+            crate::config::MemoryConfig::default().min_relevance_score
+        );
+    }
 
     struct MockMemory;
     struct MockMemoryWithEntries {

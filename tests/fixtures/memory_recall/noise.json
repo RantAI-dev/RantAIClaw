@@ -1,0 +1,14 @@
+[
+  {"content": "when is the mobile app release again, I forgot", "copies": 16},
+  {"content": "what day do production deployments happen, remind me", "copies": 16},
+  {"content": "what time is the daily standup tomorrow", "copies": 16},
+  {"content": "when do database backups run, and are they kept", "copies": 16},
+  {"content": "what is the API rate limit for the public token", "copies": 16},
+  {"content": "what is the budget for the conference trip this year", "copies": 16},
+  {"content": "kapan rilis aplikasi seluler berikutnya, lupa lagi", "copies": 16},
+  {"content": "hari apa deploy ke produksi dilakukan, tolong ingatkan", "copies": 16},
+  {"content": "jam berapa standup harian besok", "copies": 16},
+  {"content": "kapan cadangan basis data berjalan dan berapa lama disimpan", "copies": 16},
+  {"content": "berapa batas laju API publik per token", "copies": 16},
+  {"content": "berapa anggaran perjalanan konferensi tahun ini", "copies": 16}
+]

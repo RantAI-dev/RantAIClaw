@@ -8335,7 +8335,7 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
         // default threshold is what the echo's ranking pushed facts under.
         auto_save_memory: true,
         max_tool_iterations: 5,
-        min_relevance_score: 0.4,
+        min_relevance_score: crate::config::MemoryConfig::default().min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         history_store: None,
         ledger: None,

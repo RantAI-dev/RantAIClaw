@@ -10,20 +10,15 @@ pub struct MemoryEntry {
     pub category: MemoryCategory,
     pub timestamp: String,
     pub session_id: Option<String>,
-    /// Relevance, normalised to `[0, 1]` **within the returned result set**.
+    /// Absolute relevance in `[0, 1]`, comparable against
+    /// `min_relevance_score` directly: cosine similarity, query coverage (the
+    /// fraction of the query's meaningful words the row contains), or a
+    /// match-tier fraction, depending on the backend.
     ///
-    /// Absolute relevance in `[0, 1]`: cosine similarity, query coverage
-    /// (fraction of the query's terms the row contains), or a match-tier
-    /// fraction, depending on the backend. Comparable against
-    /// `min_relevance_score` directly — a set where every hit is weak scores
-    /// weak, so the floor can reject all of it. It used to be relative to the
-    /// best hit in the set, which rescaled the top hit to `1.0` however weak
-    /// it was and made the floor unable to reject anything.
+    /// The score does not depend on the other hits in the set: a set where
+    /// every hit is weak scores weak, so the floor can reject all of it.
     ///
-    /// One documented approximation: the lucid backend's *remote* results are
-    /// rank-derived (the service reports order, not relevance).
-    ///
-    /// `None` where the operation does not rank — [`Memory::get`] and
+    /// `None` where the operation does not rank: [`Memory::get`] and
     /// [`Memory::list`] return entries, not search results.
     pub score: Option<f64>,
 }
@@ -87,10 +82,11 @@ pub trait Memory: Send + Sync {
     /// Recall memories matching a query (keyword search), optionally scoped to a session.
     ///
     /// Implementations must satisfy the scoring contract on
-    /// [`MemoryEntry::score`]: whatever raw signal the backend ranks by, the
-    /// returned set is rescaled so its best hit is `1.0`. Every retrieval path
-    /// inside a backend has to join that rescale — a fallback path that skips it
-    /// will outrank the primary one.
+    /// [`MemoryEntry::score`]: whatever raw signal the backend ranks by, each
+    /// hit carries an absolute score in `[0, 1]` and nothing is rescaled
+    /// against the best hit. Every retrieval path inside a backend has to
+    /// follow it: a fallback path that scores on another scale will outrank
+    /// the primary one.
     async fn recall(
         &self,
         query: &str,

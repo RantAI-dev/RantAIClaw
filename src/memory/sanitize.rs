@@ -18,7 +18,7 @@ use crate::providers::scrub_secret_patterns;
 ///
 /// Content carrying it could close the real block and open a forged one, so a
 /// single stored memory could impersonate several.
-const CONTEXT_BLOCK_MARKER: &str = "[Memory context]";
+const CONTEXT_BLOCK_MARKER: &str = super::context::MEMORY_BLOCK_HEADER;
 
 /// Result of screening a memory write.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +72,33 @@ pub fn sanitize_memory_content(raw: &str) -> Result<SanitizedMemory, String> {
         content: scrubbed,
         notes,
     })
+}
+
+/// An error as a log line may carry it: what kind of failure it was, never the
+/// text it was handling.
+///
+/// The message of a recall or store error can quote the question, a stored note
+/// or a key: a provider echoes its input in an error body, and the keyword index
+/// names the token it could not parse. A SQLite failure is reduced to its code.
+/// Any other error keeps the part of its message before the first colon, which
+/// is the part this codebase writes ("Embedding API error 401"), and loses the
+/// part after it, which is the remote side's text.
+pub(crate) fn loggable_error(error: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 80;
+    if let Some(sqlite) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+    {
+        return match sqlite {
+            rusqlite::Error::SqliteFailure(failure, _) => {
+                format!("sqlite error {:?}", failure.code)
+            }
+            _ => "sqlite error".to_string(),
+        };
+    }
+    let message = error.to_string();
+    let kind = message.split(':').next().unwrap_or_default().trim();
+    kind.chars().take(MAX_CHARS).collect()
 }
 
 /// Drop characters that render as nothing, returning the text and how many went.
@@ -128,6 +155,35 @@ fn is_invisible_format(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_error_is_logged_without_the_text_after_its_prefix() {
+        let error = anyhow::anyhow!("Embedding API error 401 Unauthorized: echoed the note text");
+        assert_eq!(
+            loggable_error(&error),
+            "Embedding API error 401 Unauthorized"
+        );
+    }
+
+    #[test]
+    fn a_sqlite_error_is_logged_as_its_code_only() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING fts5(body);")
+            .unwrap();
+        let failure = conn
+            .query_row(
+                "SELECT body FROM t WHERE t MATCH 'secretword AND ('",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_err();
+        let error = anyhow::Error::from(failure).context("memory keyword search");
+
+        let logged = loggable_error(&error);
+
+        assert!(logged.starts_with("sqlite error"), "got {logged:?}");
+        assert!(!logged.contains("secretword"), "content leaked: {logged:?}");
+    }
 
     #[test]
     fn ordinary_content_passes_through_unchanged() {
