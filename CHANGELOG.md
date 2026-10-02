@@ -184,6 +184,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StackSlot::wait` and trigger a data race in safe code. 5.4.2 fixes the auto-trait bounds.
   Reached via `async-lock` ← `moka` ← `wa-rs`, so the default build (WhatsApp Web) is affected.
   `Cargo.lock` only.
+- **RUSTSEC-2026-0318 accepted for the opt-in `channel-matrix` feature.** Builds with that feature
+  carry `matrix-sdk-crypto` 0.18.0, where sending custom to-device messages may panic. RantaiClaw
+  does not send to-device messages. Default builds do not contain the crate. The fix needs
+  `matrix-sdk` 0.19, which is blocked on a `rusqlite` upgrade. The advisory is recorded as accepted
+  in `deny.toml` and the audit workflow, for review by 2026-11-15.
 
 ## [0.32.0-alpha] — 2026-09-26
 
