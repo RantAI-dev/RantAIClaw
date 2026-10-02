@@ -7831,8 +7831,8 @@ fn channel_prompt_for(ws: &TempDir, guest: bool) -> String {
 
 /// A guest prompt describes the guest's turn, not the host: no absolute
 /// workspace path (it carries the OS user name), no host name, no timezone
-/// of the machine, and no `TOOLS.md` (its scaffold asks the owner for SSH
-/// hosts and device nicknames).
+/// of the machine, no `TOOLS.md` (its scaffold asks the owner for SSH
+/// hosts and device nicknames) and no `AGENTS.md` (its scaffold names tools).
 #[test]
 fn guest_prompt_carries_no_host_or_workspace_details() {
     let ws = make_workspace();
@@ -7865,8 +7865,9 @@ fn guest_prompt_carries_no_host_or_workspace_details() {
         !guest.contains("### TOOLS.md") && !guest.contains("box-a.internal.example"),
         "TOOLS.md reached a guest prompt:\n{guest}"
     );
-    // The files that describe the bot stay.
-    assert!(guest.contains("### AGENTS.md"), "{guest}");
+    // `AGENTS.md` is the owner's operating manual, so it stays out of a guest's
+    // prompt. The files that describe the bot stay.
+    assert!(!guest.contains("### AGENTS.md"), "{guest}");
     assert!(guest.contains("### SOUL.md"), "{guest}");
     assert!(guest.contains("### IDENTITY.md"), "{guest}");
 }
@@ -7890,6 +7891,7 @@ fn owner_prompt_keeps_host_workspace_and_tools_file() {
         "{owner}"
     );
     assert!(owner.contains("### TOOLS.md"), "{owner}");
+    assert!(owner.contains("### AGENTS.md"), "{owner}");
 }
 
 #[test]

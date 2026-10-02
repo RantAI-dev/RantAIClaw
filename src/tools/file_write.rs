@@ -8,11 +8,25 @@ use std::sync::Arc;
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
+    /// The AIEOS identity file the owner's prompt reads, when the operator
+    /// configured one. A guest's turn may not write it.
+    identity_file: Option<std::path::PathBuf>,
 }
 
 impl FileWriteTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            identity_file: None,
+        }
+    }
+
+    /// Names the AIEOS identity file, which the owner's prompt reads at every
+    /// turn, as a file a guest's turn may not write.
+    #[must_use]
+    pub fn with_identity_file(mut self, identity_file: Option<std::path::PathBuf>) -> Self {
+        self.identity_file = identity_file;
+        self
     }
 }
 
@@ -41,8 +55,12 @@ impl FileWriteTool {
         {
             return Some(denial);
         }
-        crate::tools::guest_prompt_file_write_denial(&resolved_target, &self.security.workspace_dir)
-            .await
+        crate::tools::guest_prompt_file_write_denial(
+            &resolved_target,
+            &self.security.workspace_dir,
+            self.identity_file.as_deref(),
+        )
+        .await
     }
 }
 
@@ -741,6 +759,44 @@ mod tests {
             .await;
             assert!(!result.success, "{name} must be refused");
             assert!(!workspace.path().join(name).exists(), "{name} was written");
+        }
+    }
+
+    /// The AIEOS identity file is read into the owner's prompt, so a guest may
+    /// not write it, wherever in the workspace the operator put it, even when
+    /// its directory does not exist yet. The owner may.
+    #[tokio::test]
+    async fn file_write_denies_the_aieos_identity_file_under_guest_view() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        for relative in ["bot_identity.json", "config/ids/bot_identity.json"] {
+            let identity = workspace.path().join(relative);
+            let tool = FileWriteTool::new(test_security(workspace.path().to_path_buf()))
+                .with_identity_file(Some(identity.clone()));
+
+            let guest = as_guest(async {
+                tool.execute(json!({"path": relative, "content": "{}"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+            assert!(!guest.success, "{relative} must be refused");
+            assert!(
+                guest
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("owner's prompt"),
+                "{relative}: {:?}",
+                guest.error
+            );
+            assert!(!identity.exists(), "{relative} was written");
+
+            let owner = tool
+                .execute(json!({"path": relative, "content": "{}"}))
+                .await
+                .unwrap();
+            assert!(owner.success, "{relative}: {:?}", owner.error);
+            assert!(identity.exists());
         }
     }
 

@@ -107,22 +107,28 @@ pub(crate) async fn guest_private_file_write_denial(
 }
 
 /// Denial message for a **canonicalised** write target that feeds the owner's
-/// prompt (`skills/` and the workspace-root prompt files), or `None` when the
-/// turn is not a guest's or the path is not one of them.
+/// prompt (`skills/`, the workspace-root prompt files and the AIEOS identity
+/// file), or `None` when the turn is not a guest's or the path is not one of
+/// them.
 ///
-/// Keyed on the guest marker, as [`guest_private_file_write_denial`] is. Only
-/// `file_write` calls this. Reading these files stays allowed.
+/// `identity_file` is the AIEOS identity file the owner's prompt reads, when the
+/// operator configured one in the workspace.
+///
+/// Keyed on the guest marker, as [`guest_private_file_write_denial`] is. The
+/// tools that write a file call this, and the read tools do not. Reading these
+/// files stays allowed.
 pub(crate) async fn guest_prompt_file_write_denial(
     resolved_path: &std::path::Path,
     workspace_dir: &std::path::Path,
+    identity_file: Option<&std::path::Path>,
 ) -> Option<String> {
     if !crate::approval::guest::current_turn_is_guest() {
         return None;
     }
-    if crate::approval::guest::is_owner_prompt_path_resolved(
-        resolved_path,
-        &canonical_workspace(workspace_dir).await,
-    ) {
+    let canonical = canonical_workspace(workspace_dir).await;
+    if crate::approval::guest::is_owner_prompt_path_resolved(resolved_path, &canonical)
+        || is_identity_file(resolved_path, identity_file, workspace_dir, &canonical).await
+    {
         Some(
             "This file feeds the owner's prompt and cannot be written from this conversation."
                 .to_string(),
@@ -130,6 +136,33 @@ pub(crate) async fn guest_prompt_file_write_denial(
     } else {
         None
     }
+}
+
+/// Whether `resolved_path`, a **canonicalised** write target, is the AIEOS
+/// identity file. Compared where the file sits under the canonical workspace and
+/// where it resolves to now, since a write lands on the second, and ignoring
+/// ASCII case so a case-insensitive filesystem cannot reach it by another name.
+async fn is_identity_file(
+    resolved_path: &std::path::Path,
+    identity_file: Option<&std::path::Path>,
+    workspace_dir: &std::path::Path,
+    canonical_workspace: &std::path::Path,
+) -> bool {
+    let Some(identity) = identity_file else {
+        return false;
+    };
+    let mut locations = Vec::new();
+    if let Ok(relative) = identity.strip_prefix(workspace_dir) {
+        locations.push(canonical_workspace.join(relative));
+    }
+    if let Ok(real) = tokio::fs::canonicalize(identity).await {
+        locations.push(real);
+    }
+    locations.iter().any(|location| {
+        location
+            .as_os_str()
+            .eq_ignore_ascii_case(resolved_path.as_os_str())
+    })
 }
 
 pub mod author_skill;
@@ -268,6 +301,21 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
+/// The AIEOS identity file the owner's prompt reads, when the operator
+/// configured one by path. The path is relative to the workspace, as the prompt
+/// reads it.
+fn aieos_identity_file(config: &Config) -> Option<std::path::PathBuf> {
+    if !crate::identity::is_aieos_configured(&config.identity) {
+        return None;
+    }
+    let path = std::path::Path::new(config.identity.aieos_path.as_deref()?);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config.workspace_dir.join(path)
+    })
+}
+
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
@@ -341,7 +389,10 @@ pub fn all_tools_with_runtime(
             skill_env,
         )),
         Arc::new(FileReadTool::new(security.clone())),
-        Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(
+            FileWriteTool::new(security.clone())
+                .with_identity_file(aieos_identity_file(root_config)),
+        ),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),

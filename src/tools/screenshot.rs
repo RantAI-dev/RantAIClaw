@@ -54,6 +54,38 @@ impl ScreenshotTool {
         }
     }
 
+    /// Why a guest's turn may not write the picture to `output_path`, or `None`
+    /// when it may. The same rule `file_write` applies: the owner's private files
+    /// and the files that feed the owner's prompt are refused, and an owner's
+    /// turn is not refused.
+    ///
+    /// Judged where the write lands: the canonical workspace plus the file name,
+    /// and, when something is already at that name, where it resolves to, so a
+    /// link to a private file is refused too.
+    async fn write_refusal(&self, output_path: &std::path::Path) -> Option<String> {
+        let workspace = &self.security.workspace_dir;
+        let canonical_workspace = tokio::fs::canonicalize(workspace)
+            .await
+            .unwrap_or_else(|_| workspace.clone());
+        let mut targets = vec![canonical_workspace.join(output_path.file_name()?)];
+        if let Ok(real) = tokio::fs::canonicalize(output_path).await {
+            targets.push(real);
+        }
+        for target in targets {
+            if let Some(denial) =
+                crate::tools::guest_private_file_write_denial(&target, workspace).await
+            {
+                return Some(denial);
+            }
+            if let Some(denial) =
+                crate::tools::guest_prompt_file_write_denial(&target, workspace, None).await
+            {
+                return Some(denial);
+            }
+        }
+        None
+    }
+
     /// Execute the screenshot capture and return the result.
     async fn capture(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
@@ -81,6 +113,13 @@ impl ScreenshotTool {
         }
 
         let output_path = self.security.workspace_dir.join(&safe_name);
+        if let Some(refusal) = self.write_refusal(&output_path).await {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(refusal),
+            });
+        }
         let output_str = output_path.to_string_lossy().to_string();
 
         let Some(mut cmd_args) = Self::screenshot_command(&output_str) else {
@@ -260,6 +299,45 @@ mod tests {
                 .with_autonomy(AutonomyLevel::Full)
                 .with_workspace_dir(std::env::temp_dir()),
         )
+    }
+
+    /// A guest's turn may not write a picture over a prompt file, whether the
+    /// file name is the prompt file's own or a link that already sits at the
+    /// name the guest chose. The suite of guest cases has the owner's side.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn screenshot_refuses_a_guest_a_name_that_leads_to_a_prompt_file() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "owner rules").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", workspace.path().join("shot.png")).unwrap();
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+        let tool = ScreenshotTool::new(security);
+
+        for name in ["AGENTS.md", "shot.png"] {
+            let result = crate::approval::guest::GUEST_TURN
+                .scope((), async {
+                    tool.execute(json!({ "filename": name })).await.unwrap()
+                })
+                .await;
+            assert!(!result.success, "{name}");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("owner's prompt"),
+                "{name}: {:?}",
+                result.error
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("AGENTS.md")).unwrap(),
+            "owner rules"
+        );
     }
 
     #[test]

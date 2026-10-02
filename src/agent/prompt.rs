@@ -356,6 +356,13 @@ impl PromptSection for IdentitySection {
         if !ctx.loads_owner_files() {
             files.retain(|file| !matches!(*file, "TOOLS.md" | "USER.md"));
         }
+        // `AGENTS.md` is the owner's operating manual: it sends the model to the
+        // owner's files and names tools by their names, and an operator's own
+        // version can hold anything. A guest's tools come from its own gate, so
+        // its prompt does not carry the file.
+        if ctx.is_guest() {
+            files.retain(|file| *file != "AGENTS.md");
+        }
         for file in files {
             inject_workspace_file(
                 &mut prompt,

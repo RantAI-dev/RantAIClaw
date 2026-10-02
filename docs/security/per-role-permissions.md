@@ -64,8 +64,10 @@ run arbitrary privileged tools." This is the feature.
       tools among `file_read` and `memory_recall` that the guest has, and says
       nothing about reads for a guest that has neither.
 
-    It keeps `AGENTS.md`, `SOUL.md` and `IDENTITY.md`, since they describe the
-    bot, and the skill list without locations.
+    It keeps `SOUL.md` and `IDENTITY.md`, since they describe the bot, and the
+    skill list without locations. It leaves out `AGENTS.md`: that scaffold
+    names tools a guest may not have, and an operator's own copy can hold
+    anything.
   - A guest who is allowed `file_read`, `file_write`, `pdf_read`, or
     `image_info` is still denied access to `MEMORY.md`, `USER.md`,
     `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md`, `TOOLS.md`, and anything under
@@ -83,10 +85,16 @@ run arbitrary privileged tools." This is the feature.
     to tell that a key exists.
   - A guest's `file_write` refuses the files that feed the owner's prompt:
     anything under `skills/`, and `AGENTS.md`, `SOUL.md`, `TOOLS.md`,
-    `IDENTITY.md` and `HEARTBEAT.md` at the workspace root. Reading them is
-    unchanged. `file_write` also checks the target before it creates any
+    `IDENTITY.md` and `HEARTBEAT.md` at the workspace root, and the AIEOS identity
+    file when one is configured. The rule reads `AGENTS.md.`, `AGENTS.md:stream` and a
+    name with trailing spaces as `AGENTS.md`. The `screenshot` tool is under the same
+    two write rules, judged on where its file lands, so it cannot overwrite a
+    prompt file or a private file with an image. `file_write` also checks the target before it creates any
     directory, so a refused write leaves nothing behind. `image_info` refuses a
     path that resolves outside the workspace, as `file_read` does.
+    The prompt files stay readable with `file_read`, except `TOOLS.md`: the
+    private-file rule above refuses it for a guest, whatever the guest prompt
+    shows.
   - These guest rules cover only the four file tools (`file_read`,
     `file_write`, `pdf_read`, `image_info`) and the memory tools
     (`memory_store`, `memory_recall`, `memory_forget`). `glob_search` and
@@ -95,16 +103,32 @@ run arbitrary privileged tools." This is the feature.
 - **Attachments follow `file_read`.** A guest's reply carries an attachment only
   when `guest_allowed_tools` includes `file_read`, and then only a local file a
   guest `file_read` could return. The runtime filters the reply before it is
-  sent, since an attachment marker needs no tool call. It withholds a URL, a
-  file under `memory/`, `USER.md`, `MEMORY.md`, `BOOTSTRAP.md`,
-  `MEMORY_SNAPSHOT.md` and `TOOLS.md` (also through a symlink), and any SQLite database
-  under any name or its journal files (`-wal`, `-shm`, `-journal`). A reply
-  that is only a file path, which Telegram uploads without a marker, is judged
-  the same way. A refused attachment is replaced by one closing line in the reply.
-  The guest's prompt offers attachments only under the same grant, without the
-  absolute workspace path. Owner replies are not filtered.
-  Approval prompts, command replies and error texts never upload a file, for any
-  sender, because only the model's reply and a cron job's announced output may.
+  sent, since an attachment marker needs no tool call. The filter runs
+  `file_read`'s checks in `file_read`'s order. It withholds a URL, a path the
+  security policy refuses (so an absolute path under the default
+  `workspace_only`), a file under `memory/`, `USER.md`, `MEMORY.md`,
+  `BOOTSTRAP.md`, `MEMORY_SNAPSHOT.md` and `TOOLS.md` (also through a symlink),
+  a path that resolves outside the workspace, anything that is not a regular
+  file, a file larger than 10 MiB (`file_read`'s limit), and any SQLite
+  database under any name or its journal files (`-wal`, `-shm`, `-journal`).
+  The filter judges against the workspace the upload resolves, read for each
+  reply, and refuses every attachment when it cannot resolve that workspace.
+  It reads markers and path-only replies from the text alone and never asks the
+  filesystem whether the file exists. Two guest-visible effects follow. An
+  unclosed marker fragment is removed from the reply, and a reply that is only
+  a file name with a known extension is withheld even when no such file exists.
+  A reply that is only a file path, which Telegram uploads without a marker, is
+  judged the same way, after the runtime's `Noted:` line is set aside. A
+  refused attachment is replaced by one closing line in the reply. The four
+  error texts that end a failed turn (context window, provider capability,
+  provider error and timeout) pass the same filter, on the draft and on the
+  plain send. A guest's turn does not stream into a Telegram draft: the guest
+  sees the placeholder until the filtered reply replaces it. An owner's draft
+  still streams. The guest's prompt offers attachments only under the same
+  grant, without the absolute workspace path. Owner replies are not filtered.
+  Approval prompts, command replies and the other runtime messages never
+  upload a file, for any sender, because only the model's reply and a cron
+  job's announced output may.
   An approval prompt shows square brackets in a tool's name or arguments as
   parentheses and backticks as apostrophes, so an argument holding
   `[DOCUMENT:x]` reads `(DOCUMENT:x)` to the owner.
@@ -134,6 +158,52 @@ run arbitrary privileged tools." This is the feature.
 
 This subsumes the sharing case, removes the approval ping-pong for guests, and
 makes a `["*"]` chat allowlist safe (public for safe stuff, private for privileged).
+
+## What stays open
+
+These paths are known and not closed by the rules above.
+
+- **Cron announcements.** A cron job's announced output uploads the files it
+  names to the chat the owner chose, with no guest filter. If that chat holds
+  guests, they receive the file. Only an owner can create the job, and the
+  attachment must still resolve inside the workspace.
+- **`shell`.** A guest granted `shell` can write any file an allowed command
+  writes, create hard links and read private files. The operator names the
+  commands in `guest_allowed_commands`, and chaining, redirects and `$` are
+  refused. The grant is the capability.
+- **`git_operations`.** A guest granted it can run `checkout` and `stash`, which
+  rewrite tracked workspace files from content already committed, and `add`
+  and `commit`, which change history. The guest cannot author a committed
+  prompt file, because `file_write` and `screenshot` refuse it.
+- **Hard links.** The write rules compare paths, not inodes, so a second hard
+  link to a prompt file under another name is not recognised. Creating one
+  needs `shell`. Refusing every file with more than one link would refuse
+  ordinary files too.
+- **Windows short names.** A short name such as `AGENTS~1.MD` for a prompt file
+  that does not exist yet is not recognised. An existing file resolves to its
+  real name.
+- **Inbound image markers.** An `[IMAGE:path]` marker in a guest's message reads
+  a workspace image into the provider request. It stays inside the workspace
+  and the type comes from the extension, but the private-file rule does not
+  apply. Pointing it at a private file needs a link named like an image, which
+  needs `shell`. The data goes to the operator's provider, not to the chat.
+- **The AIEOS identity file through `screenshot` or `shell`.** `file_write`
+  refuses it. `screenshot` writes only an image, which breaks the load and
+  falls back to the workspace files. `shell` is covered above.
+- **A bare file name.** A guest's reply that is only a file name with a known
+  extension is withheld even when no such file exists. This follows from not
+  asking the filesystem. A reply that names a real ordinary workspace file
+  still passes.
+
+Two gaps have no fix yet, so treat them as operator guidance.
+
+- Do not grant `browser` to guests. Its `screenshot` action writes to the path
+  the model names, outside the workspace and the guest write rules, so a guest
+  with `browser` can overwrite a prompt file, a private file or the AIEOS file
+  with an image.
+- `glob_search` lists the names of every workspace file, including those under
+  `memory/` and `USER.md`. It never returns content, but the names are visible
+  to a guest granted it.
 
 ## Memory view: what a turn may read
 

@@ -6243,11 +6243,12 @@ mod tests {
         );
     }
 
-    /// The files a new workspace starts with reach the prompt of every turn, a
-    /// guest's included for `AGENTS.md`, `SOUL.md` and `IDENTITY.md`. None of
-    /// them tells the model to write a note or a file on its own, and none
-    /// names `memory_store`, which a guest may not hold. A person's request to
-    /// remember something is the only trigger the text names.
+    /// The files a new workspace starts with reach the prompt of every owner
+    /// turn, and a guest's for `SOUL.md` and `IDENTITY.md`. None of them tells
+    /// the model to write a note or a file on its own, and none names
+    /// `memory_store`, which a guest may not hold. A person's request to
+    /// remember something is the only trigger the text names. The two a guest
+    /// reads name no tool at all, since a guest's tools are its own.
     #[tokio::test]
     async fn scaffold_files_never_tell_the_model_to_save_on_its_own() {
         let tmp = TempDir::new().unwrap();
@@ -6338,6 +6339,21 @@ mod tests {
             !read("MEMORY.md").contains("Daily files"),
             "MEMORY.md still describes the daily files that no longer exist"
         );
+
+        for name in ["SOUL.md", "IDENTITY.md"] {
+            for tool in [
+                "memory_recall",
+                "memory_store",
+                "memory_forget",
+                "file_read",
+                "file_write",
+            ] {
+                assert!(
+                    !read(name).contains(tool),
+                    "{name} reaches a guest prompt and names the tool {tool}"
+                );
+            }
+        }
     }
 
     // ── scaffold_workspace: MEMORY.md warns about token cost ────

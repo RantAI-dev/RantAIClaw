@@ -31,6 +31,13 @@ pub(super) struct RecordingChannel {
     /// opens a draft and ends the reply with `finalize_draft`, which records
     /// the final text in `sent_messages` the way `send` does.
     pub(super) drafts: std::sync::atomic::AtomicBool,
+    /// The accumulated text of every `update_draft` call, in order.
+    pub(super) draft_updates: tokio::sync::Mutex<Vec<String>>,
+    /// When set, the channel is Telegram as far as dispatch can tell: it carries
+    /// Telegram's name and reads a reply the way Telegram's `send` does, which
+    /// includes a reply that is only the path of a file. Set before the channel
+    /// goes into a context, since the name is read there.
+    pub(super) telegram: std::sync::atomic::AtomicBool,
     pub(super) start_typing_calls: AtomicUsize,
     pub(super) stop_typing_calls: AtomicUsize,
 }
@@ -121,7 +128,11 @@ impl Channel for TelegramRecordingChannel {
 #[async_trait::async_trait]
 impl Channel for RecordingChannel {
     fn name(&self) -> &str {
-        "test-channel"
+        if self.telegram.load(Ordering::SeqCst) {
+            "telegram"
+        } else {
+            "test-channel"
+        }
     }
 
     fn supports_draft_updates(&self) -> bool {
@@ -133,6 +144,16 @@ impl Channel for RecordingChannel {
             self.attachable.lock().await.push(message.content.clone());
         }
         Ok(Some("draft-1".to_string()))
+    }
+
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.draft_updates.lock().await.push(text.to_string());
+        Ok(())
     }
 
     async fn finalize_draft(
@@ -156,7 +177,11 @@ impl Channel for RecordingChannel {
         if message.may_attach {
             self.attachable.lock().await.push(message.content.clone());
         }
-        let (_, attachments) = crate::channels::media::split_outbound(message);
+        let (_, attachments) = if self.telegram.load(Ordering::SeqCst) {
+            crate::channels::telegram::telegram_outbound(message)
+        } else {
+            crate::channels::media::split_outbound(message)
+        };
         self.uploaded
             .lock()
             .await
