@@ -25,6 +25,7 @@
 use super::dispatch::*;
 use super::test_support::*;
 use super::*;
+use crate::agent::door_test_support::{assert_prompt_lists, held_by};
 use crate::memory::{Memory, MemoryCategory, SqliteMemory};
 use crate::observability::NoopObserver;
 use crate::providers::{ChatMessage, Provider};
@@ -2133,11 +2134,11 @@ async fn guest_prompt_names_no_absolute_path_in_either_skills_mode() {
             .turn(GUEST_SENDER, GUEST_CHAT, "hello", Vec::new())
             .await;
 
-        let prompt = turn.system_prompt();
+        let prompt = slashes(turn.system_prompt());
         for (what, path) in [
-            ("workspace", deployment.workspace_path()),
-            ("home", deployment.home_path()),
-            ("config dir", deployment.config_dir_path()),
+            ("workspace", slashes(&deployment.workspace_path())),
+            ("home", slashes(&deployment.home_path())),
+            ("config dir", slashes(&deployment.config_dir_path())),
         ] {
             assert!(
                 !prompt.contains(&path),
@@ -2167,6 +2168,196 @@ async fn guest_prompt_has_no_host_line_and_states_utc() {
     let prompt = turn.system_prompt();
     assert!(!prompt.contains("Host:"), "{prompt}");
     assert!(prompt.contains("Timezone: UTC"), "{prompt}");
+}
+
+// ── The tools a prompt names ─────────────────────────────────────────────
+
+/// The owner's channel prompt lists the tools of the registry the runtime
+/// built, each as the tool describes itself, and no other.
+#[tokio::test]
+async fn owner_channel_prompt_lists_the_registry_tools_with_their_own_descriptions() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+
+    let turn = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello", Vec::new())
+        .await;
+
+    assert_prompt_lists(
+        "channel owner",
+        turn.system_prompt(),
+        &held_by(&deployment.ctx.tools_registry),
+    );
+}
+
+/// A guest's prompt names exactly the tools the operator granted, each as the
+/// tool describes itself. The registry holds many more.
+#[tokio::test]
+async fn guest_channel_prompt_names_exactly_the_guests_tools() {
+    let deployment =
+        Deployment::start(Options::guest_tools(&["file_read", "web_search_tool"])).await;
+
+    let turn = deployment
+        .turn(GUEST_SENDER, GUEST_CHAT, "hello", Vec::new())
+        .await;
+
+    let registry = held_by(&deployment.ctx.tools_registry);
+    let granted: Vec<(&str, &str)> = registry
+        .iter()
+        .copied()
+        .filter(|(name, _)| ["file_read", "web_search_tool"].contains(name))
+        .collect();
+    assert_eq!(granted.len(), 2, "control: the registry holds both tools");
+    assert_prompt_lists("channel guest", turn.system_prompt(), &granted);
+}
+
+/// A channel turn from `sender` on Telegram, over a registry of stub tools
+/// named `registry`, with `guest_tools` as the guest gate. Returns the system
+/// prompt the provider received. Telegram is a channel the scheduler can
+/// deliver to, so the cron instruction depends on the registry alone.
+async fn telegram_prompt_for(
+    sender: &str,
+    registry: &[&'static str],
+    guest_tools: &[&str],
+) -> String {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let provider_impl = Arc::new(ReplyAndPromptProvider {
+        reply: "ok".to_string(),
+        system_prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
+    let mut ctx = dispatch_ctx(
+        vec![channel],
+        provider_impl.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.tools_registry = Arc::new(
+            registry
+                .iter()
+                .map(|name| Box::new(NamedStubTool(name)) as Box<dyn Tool>)
+                .collect(),
+        );
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        let tools: Vec<String> = guest_tools.iter().map(|t| (*t).to_string()).collect();
+        inner.guest_gate = Arc::new(crate::approval::GuestGate::new(&tools, &[]));
+    }
+    process_channel_message(
+        ctx,
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "cron-msg-1".to_string(),
+            sender: sender.to_string(),
+            reply_target: "chat-cron".to_string(),
+            content: "hello".to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+    prompts_seen_by(&provider_impl)
+        .into_iter()
+        .next()
+        .expect("the provider saw one prompt")
+}
+
+/// A guest is never told to create a job with `cron_add`, whatever the channel:
+/// the gate treats the tool as owner-only, so it is not in a guest's list even
+/// when the operator names it. The owner on the same channel is told.
+#[tokio::test]
+async fn guest_prompt_has_no_cron_instruction_even_when_the_operator_lists_cron_add() {
+    let registry = ["cron_add", "file_read"];
+
+    for granted in [&["file_read"][..], &["cron_add", "file_read"][..]] {
+        let prompt = telegram_prompt_for(GUEST_SENDER, &registry, granted).await;
+        assert!(!prompt.contains("cron_add"), "{granted:?}: {prompt}");
+        assert!(
+            !prompt.contains("\"mode\": \"announce\""),
+            "{granted:?}: {prompt}"
+        );
+        assert!(
+            prompt.contains("**file_read**"),
+            "control: the guest's own tool is listed:\n{prompt}"
+        );
+    }
+
+    let owner = telegram_prompt_for(OWNER_SENDER, &registry, &[]).await;
+    assert!(
+        owner.contains("create it with the cron_add tool"),
+        "control: the owner is told how to use the tool:\n{owner}"
+    );
+}
+
+/// The owner's cron instruction follows the registry too: a registry without
+/// `cron_add` gets none, one with it gets the instruction.
+#[tokio::test]
+async fn owner_prompt_has_the_cron_instruction_only_when_the_registry_holds_cron_add() {
+    let without = telegram_prompt_for(OWNER_SENDER, &["file_read"], &[]).await;
+    assert!(!without.contains("cron_add"), "{without}");
+
+    let with = telegram_prompt_for(OWNER_SENDER, &["cron_add", "file_read"], &[]).await;
+    assert!(with.contains("create it with the cron_add tool"), "{with}");
+}
+
+/// Outside Strict, the safety text promises a guest the read-only tools it
+/// has and no others. A guest with none is promised none.
+#[tokio::test]
+async fn guest_safety_text_outside_strict_promises_only_the_reads_the_guest_has() {
+    use crate::approval::policy_writer::PolicyPreset::{Manual, Smart};
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let workspace = TempDir::new().expect("temp workspace");
+    // The guest prompt as the runtime builds it at start-up, which carries the
+    // safety section the turn then re-renders.
+    let base = startup_guest_prompt(workspace.path(), &[]);
+    for preset in [Smart, Manual] {
+        for (granted, id) in [
+            (Vec::new(), "guest-msg-1"),
+            (vec!["file_read"], "guest-msg-2"),
+        ] {
+            let provider_impl = Arc::new(ReplyAndPromptProvider {
+                reply: "ok".to_string(),
+                system_prompts: std::sync::Mutex::new(Vec::new()),
+            });
+            let ctx = guest_turn_context(
+                provider_impl.clone(),
+                &["file_read", "memory_recall", "shell"],
+                &granted,
+                &granted,
+                preset,
+                &base,
+            );
+            send_guest_message(&ctx, GUEST_SENDER, id).await;
+            let prompt = prompts_seen_by(&provider_impl).remove(0);
+
+            assert!(
+                prompt.contains(&format!("{preset:?} (messaging channel)")),
+                "control: the {preset:?} safety text is in the prompt:\n{prompt}"
+            );
+            assert!(
+                !prompt.contains("recalling memory") && !prompt.contains("memory_recall"),
+                "{preset:?}: a guest without `memory_recall` was promised it:\n{prompt}"
+            );
+            if granted.is_empty() {
+                for promise in ["reading files", "Read-only", "read-only"] {
+                    assert!(
+                        !prompt.contains(promise),
+                        "{preset:?}: a guest with no tool was promised {promise:?}:\n{prompt}"
+                    );
+                }
+            } else {
+                assert!(
+                    prompt.contains("(reading files)"),
+                    "{preset:?}: control: a guest with `file_read` is told it reads without a gate:\n{prompt}"
+                );
+            }
+        }
+    }
 }
 
 // ── Memory ───────────────────────────────────────────────────────────────

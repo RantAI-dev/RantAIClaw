@@ -982,6 +982,13 @@ pub(crate) async fn process_channel_message(
         sender_is_owner,
         msg.is_direct,
         delivery_instructions.as_deref(),
+        // The tools this turn runs on: the owner's registry, or the guest's
+        // permitted entries of it.
+        if sender_is_owner {
+            ctx.tools_registry.as_slice()
+        } else {
+            guest_turn_tools.as_slice()
+        },
     );
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);

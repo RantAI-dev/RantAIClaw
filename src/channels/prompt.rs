@@ -6,6 +6,7 @@
 
 use super::BOOTSTRAP_MAX_CHARS;
 pub use crate::agent::prompt::{OwnerFiles, PromptAudience};
+use crate::tools::Tool;
 
 /// Appended to a channel system prompt when the sender is an approval owner
 /// (`can_approve` is true for them). Without it, a cautious model self-refuses
@@ -32,12 +33,17 @@ pub fn channel_supports_announce_delivery(channel_name: &str) -> bool {
 /// Guidance so the agent, when the user asks for a scheduled/recurring message or
 /// reminder, creates a `cron_add` agent job whose `delivery` routes the output
 /// back to THIS chat — and nowhere else. Only emitted for channels the scheduler
-/// can actually deliver to.
+/// can actually deliver to, and only when `tools` (the registry of the turn it
+/// is for) holds `cron_add`: a guest the operator did not grant the tool is
+/// not told to call it.
 pub(crate) fn channel_cron_delivery_instructions(
     channel_name: &str,
     reply_target: &str,
+    tools: &[Box<dyn Tool>],
 ) -> Option<String> {
-    if !channel_supports_announce_delivery(channel_name) {
+    if !channel_supports_announce_delivery(channel_name)
+        || !tools.iter().any(|tool| tool.name() == "cron_add")
+    {
         return None;
     }
     Some(format!(
@@ -58,6 +64,7 @@ pub(crate) fn build_channel_system_prompt(
     is_owner: bool,
     is_direct: bool,
     delivery_instructions: Option<&str>,
+    tools: &[Box<dyn Tool>],
 ) -> String {
     let mut prompt = if let Some(instructions) = delivery_instructions {
         if base_prompt.is_empty() {
@@ -69,7 +76,7 @@ pub(crate) fn build_channel_system_prompt(
         base_prompt.to_string()
     };
 
-    if let Some(cron) = channel_cron_delivery_instructions(channel_name, reply_target) {
+    if let Some(cron) = channel_cron_delivery_instructions(channel_name, reply_target, tools) {
         if !prompt.is_empty() {
             prompt.push_str("\n\n");
         }
@@ -186,7 +193,6 @@ pub fn build_system_prompt_with_mode(
     // channels: the Layer-A approval manager gates non-read-only tools before
     // the Layer-B shell allowlist applies, so listing globs here would mislead.
     use crate::agent::prompt::{DescriptorTool, PromptContext, PromptSurface, SystemPromptBuilder};
-    use crate::tools::Tool;
 
     let autonomy_preset = crate::profile::ProfileManager::active()
         .ok()

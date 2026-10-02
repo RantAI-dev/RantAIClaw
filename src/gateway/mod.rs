@@ -1669,11 +1669,9 @@ async fn run_gateway_chat_with_multimodal(
         (state.tools_factory)(&config_guard)
     };
 
-    // Convert tool registry to (name, description) pairs for system prompt.
-    let tool_descs: Vec<(&str, &str)> = tools_registry
-        .iter()
-        .map(|t| (t.name(), t.description()))
-        .collect();
+    // The registry's own (name, description) pairs for the system prompt.
+    let tool_descs = crate::agent::prompt::tool_descriptions(&tools_registry);
+    let native_tools = state.provider.supports_native_tools();
 
     // Build system prompt with full tool + skill awareness.
     //
@@ -1693,8 +1691,11 @@ async fn run_gateway_chat_with_multimodal(
         )
     };
 
-    // Append tool use protocol and tool descriptions so the LLM knows how to call them.
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    // Append the tool use protocol and tool descriptions so the LLM knows how to
+    // call them, unless the provider takes tool specs natively.
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
 
     let mut history = Vec::with_capacity(2 + prior_history.len());
     history.push(ChatMessage::system(system_prompt));
@@ -6283,6 +6284,170 @@ mod tests {
             pair_block.contains("crate::channels::qr_terminal::stdout_is_interactive()"),
             "the pairing banner must print the code only when stdout is a terminal; \
              got: {pair_block}"
+        );
+    }
+
+    /// A provider that keeps the system prompt of every request and answers
+    /// with fixed text, with or without native tool calling.
+    struct SystemPromptRecorder {
+        native: bool,
+        system_prompts: Mutex<Vec<String>>,
+    }
+
+    impl SystemPromptRecorder {
+        fn new(native: bool) -> Self {
+            Self {
+                native,
+                system_prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, messages: &[crate::providers::ChatMessage]) {
+            self.system_prompts.lock().push(
+                messages
+                    .iter()
+                    .find(|m| m.role == "system")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
+    #[async_trait]
+    impl Provider for SystemPromptRecorder {
+        fn supports_native_tools(&self) -> bool {
+            self.native
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[crate::providers::ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.record(messages);
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            self.record(request.messages);
+            Ok(crate::providers::ChatResponse {
+                usage: None,
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    /// The tools of the registry the webhook door builds in these cases.
+    fn webhook_prompt_tools(config: &Config) -> Vec<Box<dyn crate::tools::Tool>> {
+        let security = Arc::new(crate::security::SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        vec![
+            Box::new(crate::tools::FileReadTool::new(Arc::clone(&security))),
+            Box::new(crate::tools::FileWriteTool::new(Arc::clone(&security))),
+            Box::new(crate::tools::GlobSearchTool::new(security)),
+        ]
+    }
+
+    /// Sends one webhook message to a gateway whose provider is `provider` and
+    /// returns the system prompt the provider received.
+    async fn webhook_system_prompt(provider: Arc<SystemPromptRecorder>) -> String {
+        let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let config = Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..Config::default()
+        };
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
+            provider: provider_dyn,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
+            tools_factory: Arc::new(webhook_prompt_tools),
+        };
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let prompts = provider.system_prompts.lock();
+        prompts.first().cloned().expect("the provider saw a prompt")
+    }
+
+    /// The webhook door lists the tools its registry holds, each as the tool
+    /// describes itself, and no other.
+    #[tokio::test]
+    async fn the_webhook_door_lists_the_registry_tools_with_their_own_descriptions() {
+        let prompt = webhook_system_prompt(Arc::new(SystemPromptRecorder::new(false))).await;
+
+        let registry = webhook_prompt_tools(&Config::default());
+        crate::agent::door_test_support::assert_prompt_lists(
+            "webhook",
+            &prompt,
+            &crate::agent::door_test_support::held_by(&registry),
+        );
+    }
+
+    /// A provider with native tool calling receives the tool specs with the
+    /// request, so the webhook prompt carries no XML tool-use protocol. A
+    /// provider without it does.
+    #[tokio::test]
+    async fn the_webhook_door_adds_the_xml_protocol_only_without_native_tool_calling() {
+        let native = webhook_system_prompt(Arc::new(SystemPromptRecorder::new(true))).await;
+        assert!(!native.contains("## Tool Use Protocol"), "{native}");
+
+        let guided = webhook_system_prompt(Arc::new(SystemPromptRecorder::new(false))).await;
+        assert!(
+            guided.contains("## Tool Use Protocol"),
+            "control: a provider without native tool calling is given the protocol:\n{guided}"
         );
     }
 }

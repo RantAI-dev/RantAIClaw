@@ -260,6 +260,13 @@ pub(super) fn dispatch_ctx(
     })
 }
 
+/// `text` with `/` as the only path separator. A path built from segments
+/// mixes `\` and `/` on Windows, so a test that looks for a path in a prompt
+/// compares both sides through this.
+pub(super) fn slashes(text: &str) -> String {
+    text.replace('\\', "/")
+}
+
 /// The part of `prompt` from the tool-use protocol on.
 pub(super) fn tool_protocol_block(prompt: &str) -> &str {
     prompt

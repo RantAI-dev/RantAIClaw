@@ -5327,25 +5327,9 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          - Device nicknames\n\
          - Preferred voices for TTS\n\
          - Anything environment-specific\n\n\
-         ## Built-in Tools\n\n\
-         - **shell** — Execute terminal commands\n\
-           - Use when: running local checks, build/test commands, or diagnostics.\n\
-           - Don't use when: a safer dedicated tool exists, or command is destructive without approval.\n\
-         - **file_read** — Read file contents\n\
-           - Use when: inspecting project files, configs, or logs.\n\
-           - Don't use when: you only need a quick string search (prefer targeted search first).\n\
-         - **file_write** — Write file contents\n\
-           - Use when: applying focused edits, scaffolding files, or updating docs/code.\n\
-           - Don't use when: unsure about side effects or when the file should remain user-owned.\n\
-         - **memory_store** — Save to memory\n\
-           - Use when: preserving durable preferences, decisions, or key context.\n\
-           - Don't use when: info is transient, noisy, or sensitive without explicit need.\n\
-         - **memory_recall** — Search memory\n\
-           - Use when: you need prior decisions, user preferences, or historical context.\n\
-           - Don't use when: the answer is already in current files/conversation.\n\
-         - **memory_forget** — Delete a memory entry\n\
-           - Use when: memory is incorrect, stale, or explicitly requested to be removed.\n\
-           - Don't use when: uncertain about impact; verify before deleting.\n\n\
+         ## Tool list\n\n\
+         The tools you can call, and what each one does, are listed under \"Tools\" in your system prompt. \
+         This file does not repeat them, so it never disagrees with that list.\n\n\
          ---\n\
          *Add whatever helps you do your job. This is your cheat sheet.*\n";
 
@@ -6323,10 +6307,12 @@ mod tests {
         );
     }
 
-    // ── scaffold_workspace: TOOLS.md lists memory_forget ────────
-
+    /// The tools a prompt lists come from the caller's registry, and `TOOLS.md`
+    /// goes into the owner's prompt as well. A second list written here would
+    /// describe the tools in other words and name the ones a registry may not
+    /// hold, so the scaffold lists none and points at the prompt's own list.
     #[tokio::test]
-    async fn tools_md_lists_all_builtin_tools() {
+    async fn tools_md_lists_no_tool_and_points_at_the_prompt() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
@@ -6343,17 +6329,17 @@ mod tests {
             "memory_forget",
         ] {
             assert!(
-                tools.contains(tool),
-                "TOOLS.md should list built-in tool: {tool}"
+                !tools.contains(tool),
+                "TOOLS.md should not list tool {tool}:\n{tools}"
             );
         }
         assert!(
-            tools.contains("Use when:"),
-            "TOOLS.md should include 'Use when' guidance"
+            !tools.contains("Use when:"),
+            "TOOLS.md should not carry a second set of tool descriptions:\n{tools}"
         );
         assert!(
-            tools.contains("Don't use when:"),
-            "TOOLS.md should include 'Don't use when' guidance"
+            tools.contains("system prompt"),
+            "TOOLS.md should say where the tool list is:\n{tools}"
         );
     }
 

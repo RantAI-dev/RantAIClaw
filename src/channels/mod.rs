@@ -1259,7 +1259,6 @@ pub(crate) type OwnerPromptBuilder = Arc<dyn Fn(OwnerFiles) -> String + Send + S
 fn owner_prompt_builder(
     workspace: PathBuf,
     model: String,
-    tool_descs: Vec<(&'static str, &'static str)>,
     skills: Vec<crate::skills::Skill>,
     identity: crate::config::IdentityConfig,
     bootstrap_max_chars: Option<usize>,
@@ -1268,6 +1267,9 @@ fn owner_prompt_builder(
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
 ) -> OwnerPromptBuilder {
     Arc::new(move |owner_files| {
+        // The list is the registry's own, read on every build, so it names the
+        // tools the turn runs on and words each as the tool does.
+        let tool_descs = crate::agent::prompt::tool_descriptions(tools_registry.as_ref());
         let mut prompt = build_system_prompt_with_mode(
             &workspace,
             &model,
@@ -1476,61 +1478,6 @@ pub(crate) async fn build_channel_runtime(
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
-    // Collect tool descriptions for the prompt
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
-    ];
-
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
-        ));
-    }
-    if config.composio.enabled {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
-        ));
-    }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
-    tool_descs.push((
-        "pushover",
-        "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
-    ));
-    if !config.agents.is_empty() {
-        tool_descs.push((
-            "delegate",
-            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
-        ));
-    }
-
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -1544,7 +1491,6 @@ pub(crate) async fn build_channel_runtime(
     let owner_prompt = owner_prompt_builder(
         workspace.clone(),
         model.clone(),
-        tool_descs.clone(),
         skills.clone(),
         config.identity.clone(),
         bootstrap_max_chars,

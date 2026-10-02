@@ -1204,97 +1204,6 @@ impl Agent {
             Err(e) => Err(e),
         }
     }
-
-    pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        self.turn(message).await
-    }
-
-    pub async fn run_interactive(&mut self) -> Result<()> {
-        println!("🦀 RantaiClaw Interactive Mode");
-        println!("Type /quit to exit.\n");
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let cli = crate::channels::CliChannel::new();
-
-        let listen_handle = tokio::spawn(async move {
-            let _ = crate::channels::Channel::listen(
-                &cli,
-                tx,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await;
-        });
-
-        while let Some(msg) = rx.recv().await {
-            let response = match self.turn(&msg.content).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("\nError: {e}\n");
-                    continue;
-                }
-            };
-            println!("\n{response}\n");
-        }
-
-        listen_handle.abort();
-        Ok(())
-    }
-}
-
-pub async fn run(
-    config: Config,
-    message: Option<String>,
-    provider_override: Option<String>,
-    model_override: Option<String>,
-    temperature: f64,
-) -> Result<()> {
-    let start = Instant::now();
-
-    let mut effective_config = config;
-    if let Some(p) = provider_override {
-        effective_config.default_provider = Some(p);
-    }
-    if let Some(m) = model_override {
-        effective_config.default_model = Some(m);
-    }
-    effective_config.default_temperature = temperature;
-
-    let mut agent = Agent::from_config(&effective_config).await?;
-
-    let provider_name = effective_config
-        .default_provider
-        .as_deref()
-        .unwrap_or("openrouter")
-        .to_string();
-    // `from_config` above already refused an empty model, so this is set; no
-    // hardcoded fallback (which would drift from the real default).
-    let model_name = effective_config
-        .default_model
-        .as_deref()
-        .unwrap_or_default()
-        .to_string();
-
-    agent.observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name.clone(),
-        model: model_name.clone(),
-    });
-
-    if let Some(msg) = message {
-        let response = agent.run_single(&msg).await?;
-        println!("{response}");
-    } else {
-        agent.run_interactive().await?;
-    }
-
-    agent.observer.record_event(&ObserverEvent::AgentEnd {
-        provider: provider_name,
-        model: model_name,
-        duration: start.elapsed(),
-        tokens_used: None,
-        cost_usd: None,
-    });
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1396,6 +1305,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The TUI and the console chat build their prompt from the agent's own
+    /// registry. The `## Tools` list names the tools that registry holds, each
+    /// as the tool describes itself, and no other.
+    #[tokio::test]
+    async fn the_agent_prompt_lists_the_registry_tools_with_their_own_descriptions() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.memory.backend = "none".into();
+        config.default_model = Some("anthropic/claude-sonnet-4.6".into());
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::from_config_with_observer(&config, observer)
+            .await
+            .expect("a modelled config builds an agent");
+
+        let prompt = agent.build_system_prompt().unwrap();
+
+        crate::agent::door_test_support::assert_prompt_lists(
+            "agent",
+            &prompt,
+            &crate::agent::door_test_support::held_by(&agent.tools),
+        );
     }
 
     /// Build the smallest agent `trim_history` needs: it only reads

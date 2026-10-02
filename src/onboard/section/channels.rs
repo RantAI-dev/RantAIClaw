@@ -107,7 +107,7 @@ fn prompt_owners_and_guest_ceiling(ctx: &mut SetupContext) -> Result<()> {
     if set_guest_now {
         eprintln!(
             "   Guests get skills and no tools by default. Add tool names to widen\n   \
-             that (comma-separated, e.g. `shell, web_search`). Blank to skip."
+             that (comma-separated, e.g. `shell, web_search_tool`). Blank to skip."
         );
         let tools: String = Input::with_theme(&theme)
             .with_prompt("  Guest tools to allow")

@@ -91,10 +91,12 @@ fn delivery_instructions_default_is_none() {
         false,
         false,
         Some(instructions.as_str()),
+        &[],
     );
     assert!(with.starts_with("BASE\n\n"));
     assert!(with.contains("[DOCUMENT:"));
-    let without = prompt::build_channel_system_prompt("BASE", "irc", "#room", false, false, None);
+    let without =
+        prompt::build_channel_system_prompt("BASE", "irc", "#room", false, false, None, &[]);
     assert!(!without.contains("[DOCUMENT:"));
 }
 
@@ -1252,10 +1254,24 @@ use tempfile::TempDir;
 /// not. The base prompt is preserved either way.
 #[test]
 fn channel_system_prompt_marks_owner_turns_only() {
-    let owner =
-        prompt::build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", true, false, None);
-    let guest =
-        prompt::build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", false, false, None);
+    let owner = prompt::build_channel_system_prompt(
+        "BASE-PROMPT",
+        "telegram",
+        "12345",
+        true,
+        false,
+        None,
+        &[],
+    );
+    let guest = prompt::build_channel_system_prompt(
+        "BASE-PROMPT",
+        "telegram",
+        "12345",
+        false,
+        false,
+        None,
+        &[],
+    );
 
     assert!(
         owner.to_lowercase().contains("verified owner"),
@@ -1270,8 +1286,16 @@ fn channel_system_prompt_marks_owner_turns_only() {
 
 #[test]
 fn cron_delivery_instruction_present_for_announce_channels() {
-    let p =
-        prompt::build_channel_system_prompt("BASE", "telegram", "123456789", false, false, None);
+    let registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedStubTool("cron_add"))];
+    let p = prompt::build_channel_system_prompt(
+        "BASE",
+        "telegram",
+        "123456789",
+        false,
+        false,
+        None,
+        &registry,
+    );
     assert!(p.contains("BASE"));
     assert!(
         p.contains("cron_add"),
@@ -1284,10 +1308,31 @@ fn cron_delivery_instruction_present_for_announce_channels() {
     assert!(p.contains("telegram"), "must name the origin channel");
 }
 
+/// The instruction tells the agent to call `cron_add`, so a registry without
+/// that tool gets none, on a channel the scheduler can deliver to.
+#[test]
+fn no_cron_delivery_instruction_when_the_registry_lacks_cron_add() {
+    let registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedStubTool("file_read"))];
+    let p = prompt::build_channel_system_prompt(
+        "BASE",
+        "telegram",
+        "123456789",
+        false,
+        false,
+        None,
+        &registry,
+    );
+    assert!(!p.contains("cron_add"), "{p}");
+    assert!(!p.contains("\"mode\": \"announce\""), "{p}");
+}
+
 #[test]
 fn no_cron_delivery_instruction_for_unsupported_channel() {
-    // A channel the scheduler can't deliver to must NOT promise delivery.
-    let p = prompt::build_channel_system_prompt("BASE", "irc", "#room", false, false, None);
+    // A channel the scheduler can't deliver to must NOT promise delivery, even
+    // when the registry holds `cron_add`.
+    let registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedStubTool("cron_add"))];
+    let p =
+        prompt::build_channel_system_prompt("BASE", "irc", "#room", false, false, None, &registry);
     assert!(
         !p.contains("route the output back"),
         "irc has no announce delivery"
@@ -1306,13 +1351,13 @@ fn no_cron_delivery_instruction_for_unsupported_channel() {
 fn channel_system_prompt_marks_dm_and_owner_in_all_four_combinations() {
     // Signature is `(base, channel, reply_target, is_owner, is_direct, delivery)`.
     let direct_owner =
-        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, true, None);
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, true, None, &[]);
     let direct_guest =
-        prompt::build_channel_system_prompt("BASE", "telegram", "1", false, true, None);
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", false, true, None, &[]);
     let group_owner =
-        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, false, None);
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, false, None, &[]);
     let group_guest =
-        prompt::build_channel_system_prompt("BASE", "telegram", "1", false, false, None);
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", false, false, None, &[]);
 
     // Exact lines as the plan names them; not a paraphrase.
     assert!(
@@ -1369,7 +1414,7 @@ fn only_an_owner_in_a_group_is_told_the_private_notes_are_in_a_direct_chat() {
     const HINT: &str =
         "The owner's private notes are available only in a direct chat with the bot.";
     let group_owner =
-        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, false, None);
+        prompt::build_channel_system_prompt("BASE", "telegram", "1", true, false, None, &[]);
     assert!(group_owner.contains(HINT), "{group_owner}");
     assert_eq!(group_owner.matches(HINT).count(), 1, "{group_owner}");
 
@@ -1378,8 +1423,15 @@ fn only_an_owner_in_a_group_is_told_the_private_notes_are_in_a_direct_chat() {
         ("direct+guest", false, true),
         ("group+guest", false, false),
     ] {
-        let prompt =
-            prompt::build_channel_system_prompt("BASE", "telegram", "1", is_owner, is_direct, None);
+        let prompt = prompt::build_channel_system_prompt(
+            "BASE",
+            "telegram",
+            "1",
+            is_owner,
+            is_direct,
+            None,
+            &[],
+        );
         assert!(!prompt.contains(HINT), "{label}: {prompt}");
     }
 }
@@ -11278,9 +11330,11 @@ fn normalise_prompt(
 ) -> String {
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-    prompt
-        .replace(&workspace.display().to_string(), "<WORKSPACE>")
-        .replace(&profile.display().to_string(), "<PROFILE>")
+    // A path joined from segments mixes `\` and `/` on Windows, so each path
+    // is compared with `/` separators on both sides.
+    slashes(prompt)
+        .replace(&slashes(&workspace.display().to_string()), "<WORKSPACE>")
+        .replace(&slashes(&profile.display().to_string()), "<PROFILE>")
         .replace(&format!("Host: {host} |"), "Host: <HOST> |")
         .replace(&format!("OS: {} |", std::env::consts::OS), "OS: <OS> |")
         .lines()
@@ -11334,10 +11388,6 @@ async fn owner_turn_prompt(mode: crate::config::SkillsPromptInjectionMode) -> St
             profile.path().join("skills/profile-skill/SKILL.md"),
         ),
     ];
-    let tool_descs: Vec<(&'static str, &'static str)> = vec![
-        ("shell", "Run a terminal command."),
-        ("file_read", "Read a file."),
-    ];
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
         Box::new(NamedStubTool("shell")),
         Box::new(NamedStubTool("file_read")),
@@ -11347,7 +11397,6 @@ async fn owner_turn_prompt(mode: crate::config::SkillsPromptInjectionMode) -> St
     let owner_prompt = owner_prompt_builder(
         workspace.path().to_path_buf(),
         "golden-model".to_string(),
-        tool_descs,
         skills,
         crate::config::IdentityConfig::default(),
         None,
@@ -11443,8 +11492,8 @@ fn guest_prompt_lists_skills_without_locations_in_both_modes() {
             profile.path().join("skills/profile-skill/SKILL.md"),
         ),
     ];
-    let profile_path = profile.path().display().to_string();
-    let workspace_path = ws.path().display().to_string();
+    let profile_path = slashes(&profile.path().display().to_string());
+    let workspace_path = slashes(&ws.path().display().to_string());
 
     for mode in [
         crate::config::SkillsPromptInjectionMode::Full,
@@ -11468,8 +11517,8 @@ fn guest_prompt_lists_skills_without_locations_in_both_modes() {
                 OwnerFiles::Load,
             )
         };
-        let guest = build(true);
-        let owner = build(false);
+        let guest = slashes(&build(true));
+        let owner = slashes(&build(false));
 
         assert!(
             !guest.contains("<location>"),
