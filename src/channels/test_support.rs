@@ -19,6 +19,14 @@ use std::sync::Arc;
 #[derive(Default)]
 pub(super) struct RecordingChannel {
     pub(super) sent_messages: tokio::sync::Mutex<Vec<String>>,
+    /// The marker of every file a real channel would have uploaded for the
+    /// messages `send` received, in order. `finalize_draft` uploads nothing, as
+    /// on Telegram, the only channel with drafts.
+    pub(super) uploaded: tokio::sync::Mutex<Vec<String>>,
+    /// The text of every message this channel received with permission to read
+    /// attachment markers out of it, `send_draft` and `send` alike. Runtime text
+    /// never shows up here, whether or not it holds a marker.
+    pub(super) attachable: tokio::sync::Mutex<Vec<String>>,
     /// When set, the channel behaves like one with editable drafts: dispatch
     /// opens a draft and ends the reply with `finalize_draft`, which records
     /// the final text in `sent_messages` the way `send` does.
@@ -30,6 +38,12 @@ pub(super) struct RecordingChannel {
 #[derive(Default)]
 pub(super) struct TelegramRecordingChannel {
     pub(super) sent_messages: tokio::sync::Mutex<Vec<String>>,
+    /// The marker of every file a real Telegram channel would have uploaded for
+    /// the messages `send` received, in order.
+    pub(super) uploaded: tokio::sync::Mutex<Vec<String>>,
+    /// The text of every message this channel received with permission to read
+    /// attachment markers out of it.
+    pub(super) attachable: tokio::sync::Mutex<Vec<String>>,
     /// Every `apply_allowed_senders` call, in order. A `std::sync::Mutex`
     /// because the trait method is sync.
     pub(super) applied_allowlists: std::sync::Mutex<Vec<Vec<String>>>,
@@ -76,6 +90,14 @@ impl Channel for TelegramRecordingChannel {
             .lock()
             .await
             .push(format!("{}:{}", message.recipient, message.content));
+        if message.may_attach {
+            self.attachable.lock().await.push(message.content.clone());
+        }
+        let (_, attachments) = crate::channels::telegram::telegram_outbound(message);
+        self.uploaded
+            .lock()
+            .await
+            .extend(attachments.iter().map(|a| a.to_marker()));
         Ok(())
     }
 
@@ -106,7 +128,10 @@ impl Channel for RecordingChannel {
         self.drafts.load(Ordering::SeqCst)
     }
 
-    async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if message.may_attach {
+            self.attachable.lock().await.push(message.content.clone());
+        }
         Ok(Some("draft-1".to_string()))
     }
 
@@ -128,6 +153,14 @@ impl Channel for RecordingChannel {
             .lock()
             .await
             .push(format!("{}:{}", message.recipient, message.content));
+        if message.may_attach {
+            self.attachable.lock().await.push(message.content.clone());
+        }
+        let (_, attachments) = crate::channels::media::split_outbound(message);
+        self.uploaded
+            .lock()
+            .await
+            .extend(attachments.iter().map(|a| a.to_marker()));
         Ok(())
     }
 

@@ -1019,8 +1019,7 @@ impl Channel for WhatsAppWebChannel {
 
             // Attachments come out of the text before rendering, or the markers
             // reach the reader as literal `[IMAGE:…]`.
-            let (text, attachments) =
-                crate::channels::media::parse_attachment_markers(&message.content);
+            let (text, attachments) = crate::channels::media::split_outbound(message);
             if !attachments.is_empty() {
                 if !text.is_empty() {
                     let rendered =

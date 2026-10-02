@@ -121,6 +121,7 @@ mod tests {
                 subject: None,
                 thread_ts: None,
                 reply_anchor: None,
+                may_attach: false,
             })
             .await;
         assert!(result.is_ok());
@@ -136,6 +137,7 @@ mod tests {
                 subject: None,
                 thread_ts: None,
                 reply_anchor: None,
+                may_attach: false,
             })
             .await;
         assert!(result.is_ok());

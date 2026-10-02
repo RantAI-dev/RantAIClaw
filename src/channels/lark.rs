@@ -1716,8 +1716,7 @@ impl Channel for LarkChannel {
         // Attachments first: the markers must come out of the text before it
         // is rendered, or they reach the reader as literal `[IMAGE:…]`. Same
         // shape Discord and Slack's `send` use.
-        let (text, attachments) =
-            crate::channels::media::parse_attachment_markers(&message.content);
+        let (text, attachments) = crate::channels::media::split_outbound(message);
         if !attachments.is_empty() {
             if !text.is_empty() {
                 self.send_text_message(&text, &message.recipient).await?;

@@ -328,12 +328,7 @@ const NOTED_LINE_NOTE_MAX_CHARS: usize = 80;
 fn flatten_noted_text(note: &str) -> String {
     let mut flat = String::with_capacity(note.len());
     let mut after_space = true;
-    for ch in note.chars() {
-        let ch = match ch {
-            '[' => '(',
-            ']' => ')',
-            other => other,
-        };
+    for ch in media::defuse_markers(note).chars() {
         if ch.is_whitespace() || ch.is_control() {
             if !after_space {
                 flat.push(' ');
@@ -1356,6 +1351,11 @@ pub(crate) async fn process_channel_message(
                 "channel reply"
             );
 
+            // The model's own reply, after the guest filter above, is the one
+            // message here that may carry attachment markers. Every other send
+            // in this file is runtime text and stays plain.
+            let outbound = msg.reply(&delivered_response).allowing_attachments();
+
             // Deliver FIRST, record after. The append used to run before the
             // send, so a failed delivery left the model believing it had
             // answered — on the next turn it would reference a reply the user
@@ -1369,11 +1369,11 @@ pub(crate) async fn process_channel_message(
                         Ok(()) => true,
                         Err(e) => {
                             tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                            channel.send(&msg.reply(&delivered_response)).await.is_ok()
+                            channel.send(&outbound).await.is_ok()
                         }
                     }
                 } else {
-                    match channel.send(&msg.reply(&delivered_response)).await {
+                    match channel.send(&outbound).await {
                         Ok(()) => true,
                         Err(e) => {
                             tracing::error!(channel = %channel.name(), "failed to reply: {e}");

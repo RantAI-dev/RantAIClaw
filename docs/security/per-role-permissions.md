@@ -103,6 +103,11 @@ run arbitrary privileged tools." This is the feature.
   the same way. A refused attachment is replaced by one closing line in the reply.
   The guest's prompt offers attachments only under the same grant, without the
   absolute workspace path. Owner replies are not filtered.
+  Approval prompts, command replies and error texts never upload a file, for any
+  sender, because only the model's reply and a cron job's announced output may.
+  An approval prompt shows square brackets in a tool's name or arguments as
+  parentheses and backticks as apostrophes, so an argument holding
+  `[DOCUMENT:x]` reads `(DOCUMENT:x)` to the owner.
 - **Runtime commands follow who the command changes.** A command that spends
   the owner's keys or changes what another person sees runs only for an owner,
   and a command that changes only the sender's own conversation runs for the

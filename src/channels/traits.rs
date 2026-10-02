@@ -71,6 +71,11 @@ pub struct SendMessage {
     pub thread_ts: Option<String>,
     /// The message to quote (e.g. a Telegram or Discord message id).
     pub reply_anchor: Option<String>,
+    /// Whether the channel may read attachment markers out of `content` and
+    /// upload the files they name. Off unless the sender of the message asks
+    /// for it with [`allowing_attachments`](Self::allowing_attachments): a
+    /// marker in any other text is sent as the text it is.
+    pub may_attach: bool,
 }
 
 impl SendMessage {
@@ -82,6 +87,7 @@ impl SendMessage {
             subject: None,
             thread_ts: None,
             reply_anchor: None,
+            may_attach: false,
         }
     }
 
@@ -97,6 +103,7 @@ impl SendMessage {
             subject: Some(subject.into()),
             thread_ts: None,
             reply_anchor: None,
+            may_attach: false,
         }
     }
 
@@ -109,6 +116,21 @@ impl SendMessage {
     /// Set the message this one quotes.
     pub fn replying_to(mut self, reply_anchor: Option<String>) -> Self {
         self.reply_anchor = reply_anchor;
+        self
+    }
+
+    /// Let the channel upload the files that attachment markers in `content`
+    /// name.
+    ///
+    /// Only for text the model wrote that went through the turn's reply filter,
+    /// and for a delivery the owner configured. Text the runtime writes itself
+    /// carries words chosen by the model or by a sender (an argument, a
+    /// command, a file name), so a marker in it must not become an upload. A
+    /// test walks the source and fails on a call to this outside the places
+    /// that decide the text is a reply.
+    #[must_use]
+    pub fn allowing_attachments(mut self) -> Self {
+        self.may_attach = true;
         self
     }
 }
@@ -405,6 +427,30 @@ mod tests {
         assert_eq!(reply.recipient, "chat-1");
         assert_eq!(reply.thread_ts.as_deref(), Some("thread-1"));
         assert_eq!(reply.reply_anchor.as_deref(), Some("383"));
+    }
+
+    /// A message is plain text until its sender says otherwise. Every way the
+    /// runtime builds one starts plain, and the builders that set a thread or a
+    /// quote do not change that.
+    #[test]
+    fn a_message_may_not_attach_unless_it_says_so() {
+        let inbound = ChannelMessage::default();
+
+        assert!(!SendMessage::new("text", "bob").may_attach);
+        assert!(!SendMessage::with_subject("text", "bob", "subject").may_attach);
+        assert!(!inbound.reply("text").may_attach);
+        assert!(
+            !SendMessage::new("text", "bob")
+                .in_thread(Some("1".into()))
+                .replying_to(Some("2".into()))
+                .may_attach
+        );
+
+        let attaching = inbound
+            .reply("text")
+            .allowing_attachments()
+            .in_thread(Some("1".into()));
+        assert!(attaching.may_attach, "the builders after it keep the flag");
     }
 
     #[tokio::test]

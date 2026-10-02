@@ -5459,6 +5459,7 @@ async fn a_turn_still_running_at_the_drain_deadline_gets_one_restart_notice() {
     let sent = channel_impl.sent.lock().await;
     assert_eq!(sent.len(), 1, "exactly one message: {sent:?}");
     assert_eq!(sent[0].content, RESTART_NOTICE);
+    assert!(!sent[0].may_attach, "the restart notice is runtime text");
     assert_eq!(sent[0].recipient, "chat-1");
     assert_eq!(sent[0].thread_ts.as_deref(), Some("thread-chat-1"));
     assert_eq!(sent[0].reply_anchor.as_deref(), Some("anchor-chat-1"));
@@ -5874,8 +5875,7 @@ impl Channel for AttachmentFailingChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         self.attempts.lock().await.push(message.clone());
-        let (_text, attachments) =
-            crate::channels::media::parse_attachment_markers(&message.content);
+        let (_text, attachments) = crate::channels::media::split_outbound(message);
         if attachments.is_empty() {
             Ok(())
         } else {
@@ -5952,7 +5952,15 @@ async fn a_failed_attachment_tells_the_conversation_and_history_keeps_what_was_r
         attempts[0].content.contains("[DOCUMENT:"),
         "the first attempt is the reply itself: {attempts:?}"
     );
+    assert!(
+        attempts[0].may_attach,
+        "the reply may attach, which is why the channel tried to upload: {attempts:?}"
+    );
     let notice = &attempts[1];
+    assert!(
+        !notice.may_attach,
+        "the delivery notice is runtime text and names a file the model chose: {notice:?}"
+    );
     assert!(
         notice.content.contains("catatan.txt"),
         "the notice must name the file: {notice:?}"
@@ -10603,6 +10611,281 @@ fn every_channel_that_sends_an_attachment_tells_the_model_how() {
         "found only {checked} channel(s) with `send_attachment` — expected at least the 5 known \
          to upload (telegram, discord, slack, whatsapp_web, lark); the scan may be broken"
     );
+}
+
+/// Every channel that uploads a file reads the markers in a message through
+/// `media::split_outbound`, which honours `SendMessage::may_attach`. A channel
+/// that parsed `message.content` itself would upload for runtime text, so no
+/// production code in `src/channels` other than `media.rs` and the dispatch
+/// reply filter calls `parse_attachment_markers`.
+#[test]
+fn every_uploading_channel_reads_markers_through_split_outbound() {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Reads replies it did not write: the guest reply filter and the delivery
+    // failure notice classify a reply the model wrote. Neither sends.
+    const READS_REPLIES: &[&str] = &["media.rs", "dispatch.rs"];
+
+    let mut uploading = 0;
+    for path in channel_source_files(&src_root) {
+        let src = std::fs::read_to_string(&path).expect("read a channel source file");
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let production = production_half(&src);
+        if !READS_REPLIES.contains(&file.as_str()) {
+            assert!(
+                !production.contains("parse_attachment_markers("),
+                "{file}: reads attachment markers itself, so a message that may not attach would \
+                 still upload; go through `media::split_outbound`"
+            );
+        }
+        if !production.contains("async fn send_attachment(") {
+            continue;
+        }
+        uploading += 1;
+        let body = channel_impl_method_body(production, "async fn send(")
+            .unwrap_or_else(|| panic!("{file}: uploads files but `impl Channel` has no `send`"))
+            .join("\n");
+        assert!(
+            body.contains("split_outbound(") || body.contains("telegram_outbound("),
+            "{file}: `send` uploads files without reading the markers through \
+             `media::split_outbound`: {body}"
+        );
+    }
+    assert!(
+        uploading >= 5,
+        "found only {uploading} channel(s) with `send_attachment`; expected telegram, discord, \
+         slack, whatsapp_web and lark, so the scan may be broken"
+    );
+
+    // Telegram reads a bare file path as an upload as well, and only a message
+    // that may attach is allowed to.
+    let telegram = production_half(include_str!("telegram.rs"));
+    // A free function, so it ends at the first `}` in column zero.
+    let outbound = telegram
+        .split("pub(crate) fn telegram_outbound(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("telegram_outbound is gone, update this guard");
+    assert!(
+        outbound.contains("split_outbound(")
+            && outbound.contains("if message.may_attach")
+            && outbound.contains("parse_path_only_attachment("),
+        "a message that may not attach must not reach the bare-path upload: {outbound}"
+    );
+    assert_eq!(
+        telegram.matches("parse_path_only_attachment(").count(),
+        2,
+        "the bare-path upload is read in one place, `telegram_outbound` (plus its definition)"
+    );
+}
+
+/// Whether a source file only holds tests.
+fn is_test_only_file(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    name == "tests.rs"
+        || name.ends_with("_tests.rs")
+        || name.contains("test_support")
+        || name == "test_env.rs"
+}
+
+/// Every `.rs` file under `dir`.
+fn rust_files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// `line` without a trailing `//` comment. A `//` after a colon is a URL.
+fn without_line_comment(line: &str) -> &str {
+    line.match_indices("//")
+        .find(|&(at, _)| !line[..at].ends_with(':'))
+        .map_or(line, |(at, _)| &line[..at])
+}
+
+/// The 1-based lines of `src` where it builds a message that may attach: a call
+/// to `allowing_attachments`, or a `may_attach` that is not declared, read, or
+/// set to `false`.
+///
+/// Reads the text rather than the lines, so a builder call split across lines,
+/// with the dot at the start of the next one, is found the same as one on a
+/// single line. A struct literal, a field assignment and a shorthand field are
+/// found too.
+fn attachment_flag_on_lines(src: &str) -> Vec<usize> {
+    let code = src
+        .lines()
+        .map(without_line_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    let mut lines = Vec::new();
+    for name in ["allowing_attachments", "may_attach"] {
+        for (at, _) in code.match_indices(name) {
+            let end = at + name.len();
+            if code[..at].chars().next_back().is_some_and(is_word_char)
+                || code[end..].chars().next().is_some_and(is_word_char)
+            {
+                continue;
+            }
+            let before = code[..at].trim_end();
+            let after: String = code[end..]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .take(6)
+                .collect();
+            let turns_it_on = if name == "allowing_attachments" {
+                !before.ends_with("fn")
+            } else {
+                let declared_or_off = after.starts_with(":bool") || after.starts_with(":false");
+                let read =
+                    after.starts_with("==") || (before.ends_with('.') && !after.starts_with('='));
+                !(declared_or_off || read)
+            };
+            if turns_it_on {
+                lines.push(code[..at].matches('\n').count() + 1);
+            }
+        }
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+/// The finder reads the shapes a flag-on site takes, and nothing else.
+#[test]
+fn the_attachment_flag_finder_reads_every_shape_of_a_flag_on_site() {
+    let on = |src: &str| attachment_flag_on_lines(src);
+    assert_eq!(on("let m = msg.reply(x).allowing_attachments();"), [1]);
+    assert_eq!(
+        on("let m = msg.reply(x)\n    .allowing_attachments()\n    .in_thread(t);"),
+        [2]
+    );
+    assert_eq!(
+        on("let m = msg\n    .reply(x)\n    .\n    allowing_attachments ();"),
+        [4]
+    );
+    assert_eq!(on("SendMessage { content, may_attach: true, ..m }"), [1]);
+    assert_eq!(on("SendMessage {\n    may_attach:\n        true,\n}"), [2]);
+    assert_eq!(on("m.may_attach = true;"), [1]);
+    assert_eq!(on("m.may_attach\n    = true;"), [1]);
+    assert_eq!(on("SendMessage { may_attach, ..m }"), [1]);
+
+    assert_eq!(
+        on("pub fn allowing_attachments(mut self) -> Self {"),
+        Vec::<usize>::new()
+    );
+    assert_eq!(on("pub may_attach: bool,"), Vec::<usize>::new());
+    assert_eq!(on("Self { may_attach: false }"), Vec::<usize>::new());
+    assert_eq!(
+        on("if message.may_attach { 1 } else { 2 }"),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        on("if !message.may_attach && m.may_attach == b {}"),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        on("// m.allowing_attachments()\nlet x = 1; // may_attach: true"),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        on("let a = may_attachment; let b = my_allowing_attachments();"),
+        Vec::<usize>::new()
+    );
+    assert_eq!(on("let url = \"https://x\"; m.allowing_attachments()"), [1]);
+}
+
+/// Only text the model wrote that went through the turn's reply filter, and a
+/// delivery the owner configured, may carry attachment markers. Everything else
+/// the runtime sends stays plain, so a marker a model or a sender put into an
+/// argument, a command or an error is sent as the text it is.
+///
+/// This walks every production source file under `src` and fails when a place
+/// that turns the flag on appears outside the list below. Adding a site is a
+/// decision about who may make the bot upload a file, so it is made here, in
+/// review, with a reason.
+#[test]
+fn only_a_filtered_reply_and_a_configured_delivery_build_a_message_that_may_attach() {
+    // (file under `src`, how many places in it turn the flag on, why)
+    const ALLOWED: &[(&str, usize, &str)] = &[
+        (
+            "channels/traits.rs",
+            1,
+            "the builder that sets the field, `SendMessage::allowing_attachments`",
+        ),
+        (
+            "channels/dispatch.rs",
+            1,
+            "the delivered reply, after the guest filter, on the owner's or the guest's turn",
+        ),
+        (
+            "cron/scheduler.rs",
+            1,
+            "the output of a job the owner configured to be announced",
+        ),
+    ];
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut scanned = 0_usize;
+    for path in rust_files_under(&src_root) {
+        if is_test_only_file(&path) {
+            continue;
+        }
+        scanned += 1;
+        let src = std::fs::read_to_string(&path).expect("read a source file");
+        let lines = attachment_flag_on_lines(production_half(&src));
+        if !lines.is_empty() {
+            let relative = path
+                .strip_prefix(&src_root)
+                .expect("a path under src")
+                .to_string_lossy()
+                .replace('\\', "/");
+            found.insert(relative, lines);
+        }
+    }
+    // A control on the walk: it reaches the whole tree and finds the sites that
+    // exist, so a broken walk cannot pass for a clean one.
+    assert!(scanned > 200, "only {scanned} source files scanned");
+
+    for (file, lines) in &found {
+        let allowed = ALLOWED
+            .iter()
+            .find(|(name, _, _)| name == file)
+            .map_or(0, |(_, count, _)| *count);
+        assert_eq!(
+            lines.len(),
+            allowed,
+            "{file} turns the attachment flag on at line(s) {lines:?}, and {allowed} are \
+             allowed. A message may attach only when it is the model's reply after the guest \
+             filter or a delivery the owner configured; anything else is runtime text and \
+             stays plain"
+        );
+    }
+    for (file, count, why) in ALLOWED {
+        assert_eq!(
+            found.get(*file).map_or(0, Vec::len),
+            *count,
+            "{file} should turn the flag on {count} time(s) ({why})"
+        );
+    }
 }
 
 /// One indent level, `fn name(` or `async fn name(`, with any visibility. Used
