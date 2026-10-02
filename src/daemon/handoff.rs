@@ -20,6 +20,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::profile::sentinel;
+use crate::service::{is_dev_build, DEV_BUILD_SKIP_MESSAGE};
 
 /// Pluggable init-system control surface. Tests inject a stub; production
 /// uses `Systemd`, `Launchd`, or `None`.
@@ -42,6 +43,10 @@ impl DaemonControl for Systemd {
     }
 
     fn restart(&self, unit: &str) -> Result<()> {
+        if is_dev_build() {
+            tracing::debug!("{DEV_BUILD_SKIP_MESSAGE}");
+            return Ok(());
+        }
         // daemon-reload first so a freshly-edited unit file is picked up;
         // ignore its exit since `restart` will surface real errors.
         let _ = Command::new("systemctl")
@@ -58,6 +63,10 @@ impl DaemonControl for Systemd {
     }
 
     fn is_active(&self, unit: &str) -> Result<bool> {
+        if is_dev_build() {
+            tracing::debug!("{DEV_BUILD_SKIP_MESSAGE}");
+            return Ok(false);
+        }
         let output = Command::new("systemctl")
             .args(["--user", "is-active", unit])
             .output()
@@ -76,6 +85,10 @@ impl DaemonControl for Launchd {
     }
 
     fn restart(&self, unit: &str) -> Result<()> {
+        if is_dev_build() {
+            tracing::debug!("{DEV_BUILD_SKIP_MESSAGE}");
+            return Ok(());
+        }
         // launchd has no first-class "restart"; kickstart -k cycles a
         // running service. Caller passes the launchd label
         // (`com.rantaiclaw.daemon`) here; the gui/<uid> domain prefix is
@@ -97,6 +110,10 @@ impl DaemonControl for Launchd {
     }
 
     fn is_active(&self, unit: &str) -> Result<bool> {
+        if is_dev_build() {
+            tracing::debug!("{DEV_BUILD_SKIP_MESSAGE}");
+            return Ok(false);
+        }
         let output = Command::new("launchctl")
             .args(["list"])
             .output()
@@ -401,5 +418,42 @@ mod tests {
                 "rantaiclaw@b.service".to_string()
             ],
         );
+    }
+
+    /// A debug or test build never reaches `systemctl`. The fake on PATH would
+    /// write a restart marker on `restart` and answer `active` for `is-active`;
+    /// the dev-build guard short-circuits before either is asked.
+    #[test]
+    fn systemd_dev_build_skips_restart_and_is_active() {
+        use crate::service::is_dev_build;
+        assert!(
+            is_dev_build(),
+            "this test only proves its point under a debug/test build"
+        );
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let fake = crate::test_env::FakeServiceManager::new();
+        let ctrl = Systemd;
+        ctrl.restart("rantaiclaw.service").unwrap();
+        assert!(
+            !fake.restart_marker().exists(),
+            "fake systemctl must not be reached; marker at {}",
+            fake.restart_marker().display()
+        );
+        assert!(!ctrl.is_active("rantaiclaw.service").unwrap());
+    }
+
+    /// Same guarantee for the launchd impl.
+    #[test]
+    fn launchd_dev_build_skips_restart_and_is_active() {
+        use crate::service::is_dev_build;
+        assert!(
+            is_dev_build(),
+            "this test only proves its point under a debug/test build"
+        );
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let _fake = crate::test_env::FakeServiceManager::new();
+        let ctrl = Launchd;
+        ctrl.restart("com.rantaiclaw.daemon").unwrap();
+        assert!(!ctrl.is_active("com.rantaiclaw.daemon").unwrap());
     }
 }

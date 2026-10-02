@@ -9266,6 +9266,187 @@ fn gateway_does_not_call_blocking_reload() {
     );
 }
 
+/// A debug or test build must never spawn `systemctl`/`launchctl`/
+/// `rc-service`/`rc-update`/`schtasks` — the existing scan
+/// (`gateway_does_not_call_blocking_reload`, above) only covers `src/gateway/`.
+/// This one walks every `.rs` file under `src/`, finds every
+/// `Command::new("<one of the five>")` site, and fails unless the enclosing
+/// function's body carries an `is_dev_build()` guard. A new call site without
+/// a guard then fails a test instead of restarting the developer's installed
+/// daemon. The test runs in the same `cargo test --lib` invocation as the
+/// rest of this module, so it picks up the guarantee automatically.
+#[test]
+fn service_manager_spawns_are_all_in_guarded_functions() {
+    use std::path::Path;
+
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    assert!(src_dir.is_dir(), "src/ must exist at {}", src_dir.display());
+
+    let programs = [
+        "systemctl",
+        "launchctl",
+        "rc-service",
+        "rc-update",
+        "schtasks",
+    ];
+    let mut offenders: Vec<String> = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut dir_stack = vec![src_dir];
+    while let Some(d) = dir_stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("read_dir") {
+            let entry = entry.expect("dir entry");
+            let p = entry.path();
+            if p.is_dir() {
+                dir_stack.push(p);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+
+    for path in &files {
+        let content = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => panic!("read_to_string({}) failed: {e}", path.display()),
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        // Function stack: each entry is (fn_name, depth_when_body_opened, has_guard).
+        // A function body is considered guarded when ANY line between its opening
+        // `{` and the matching `}` mentions `is_dev_build()`. The guard can sit
+        // anywhere in the body — top of the function, after an `if cfg!(...)`
+        // arm, after a match arm — the test does not care about its position.
+        let mut fn_stack: Vec<(String, i32, bool)> = Vec::new();
+        let mut depth: i32 = 0;
+        let mut pending_fn: Option<String> = None;
+
+        for (i, raw) in lines.iter().enumerate() {
+            let line = raw;
+
+            // Detect a function signature in this line so that the `{` later in
+            // the line (or on a continuation line) carries the right name.
+            if let Some(name) = parse_fn_name(line) {
+                pending_fn = Some(name);
+            }
+
+            let opens = count_unquoted(line, '{');
+            let closes = count_unquoted(line, '}');
+
+            for _ in 0..opens {
+                depth += 1;
+                if let Some(name) = pending_fn.take() {
+                    fn_stack.push((name, depth, false));
+                }
+            }
+
+            if line.contains("is_dev_build()") {
+                for (_, _, hg) in &mut fn_stack {
+                    *hg = true;
+                }
+            }
+
+            for prog in &programs {
+                let needle = format!("Command::new(\"{prog}\"");
+                if line.contains(&needle) {
+                    // Find the innermost non-fn-decorating entry that has a guard.
+                    // A fn-decorating entry is the actual function; the body's
+                    // helper blocks (if/match/closure) don't carry their own name,
+                    // so they don't appear in the stack.
+                    let guarded = fn_stack.iter().any(|(_, _, hg)| *hg);
+                    if !guarded {
+                        offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                    }
+                }
+            }
+
+            for _ in 0..closes {
+                // If the function's body was just closed (its recorded depth ==
+                // current depth before the decrement), pop it.
+                if let Some((_, d, _)) = fn_stack.last() {
+                    if *d == depth {
+                        fn_stack.pop();
+                    }
+                }
+                depth -= 1;
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "every spawn of `systemctl`/`launchctl`/`rc-service`/`rc-update`/`schtasks` \
+         in src/ must live inside a function whose body calls `is_dev_build()`. \
+         A debug/test build never reaches the service manager; a new unguarded \
+         call site must not slip through review. Offenders:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// Pull a function name out of a line that looks like a Rust fn signature.
+/// Returns `None` for non-fn lines. Generic parameters stop at `<`, so
+/// `fn foo<T>(...)` returns `"foo"`. Attribute lines (`#[test]`) are skipped
+/// because they don't contain `fn`.
+fn parse_fn_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    // Find `fn ` after stripping any `pub(...)`, `pub`, `async`, `const`, `unsafe`, etc.
+    let after_kw = if let Some(rest) = trimmed.strip_prefix("pub(crate) ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("pub async ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("pub ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("async ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("const ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("unsafe ") {
+        rest
+    } else {
+        trimmed
+    };
+    let after_fn = after_kw.strip_prefix("fn ")?;
+    let name: String = after_fn
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Count occurrences of `needle` on `line`, ignoring anything inside a
+/// double-quoted string literal or a `//` line comment. Brace counts are
+/// approximate (good enough for production code; the scan only flags
+/// `Command::new("...")` sites, which are never inside a string).
+fn count_unquoted(line: &str, needle: char) -> usize {
+    let mut count = 0usize;
+    let mut in_string = false;
+    let mut in_line_comment = false;
+    let mut prev = '\0';
+    for ch in line.chars() {
+        if in_line_comment {
+            break;
+        }
+        if in_string {
+            if ch == '"' && prev != '\\' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+        } else if ch == '/' && prev == '/' {
+            in_line_comment = true;
+            // The first `/` of `//` is already consumed; do not count it
+            // again. `prev == '/'` is now stale.
+        } else if ch == needle {
+            count += 1;
+        }
+        prev = ch;
+    }
+    count
+}
+
 /// Plan 121's closing invariant: the module's public **function** surface is
 /// exactly the symbols that were reachable from outside `src/channels/` before
 /// the decomposition started. Ten modules now exist where one did; without this

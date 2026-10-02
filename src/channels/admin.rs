@@ -17,6 +17,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::doctor::checks::channels::{probe_whatsapp_web, ProbeWebResult};
+use crate::service::{is_dev_build, DEV_BUILD_SKIP_MESSAGE};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
@@ -251,6 +252,10 @@ pub(crate) fn systemd_restart_args(blocking: bool) -> &'static [&'static str] {
 }
 
 pub(crate) fn maybe_restart_managed_daemon_service(blocking: bool) -> Result<bool> {
+    if is_dev_build() {
+        println!("{DEV_BUILD_SKIP_MESSAGE}");
+        return Ok(false);
+    }
     if cfg!(target_os = "macos") {
         let home = directories::UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
@@ -1031,5 +1036,52 @@ mod doctor_channels_tests {
                 "{key} does not recognise DMs and the row must say so"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dev_build_skip_tests {
+    //! A debug or test build must never spawn `systemctl`/`launchctl`/
+    //! `rc-service`/`rc-update`/`schtasks` — a test on a developer's workstation
+    //! would otherwise restart the developer's installed daemon. The guard lives
+    //! in `crate::service::is_dev_build`; these tests verify the wrapper around
+    //! it returns the right "nothing was restarted" answer without ever reaching
+    //! the host's service manager, even when one would answer `active`.
+
+    use crate::channels::admin::maybe_restart_managed_daemon_service;
+    use crate::service::is_dev_build;
+
+    /// Linux + systemd: a unit file present under the resolved XDG unit dir +
+    /// `is-active` returns `active` would normally trigger a `systemctl --user
+    /// restart`. The fake `systemctl` answers `active` and writes a marker on
+    /// restart. The dev-build guard must short-circuit before the fake is
+    /// reached.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dev_build_does_not_restart_a_managed_systemd_daemon() {
+        assert!(
+            is_dev_build(),
+            "this test only proves its point under a debug/test build"
+        );
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let fake = crate::test_env::FakeServiceManager::new();
+        let xdg = tempfile::tempdir().expect("xdg tempdir");
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", xdg.path());
+        let unit_dir = xdg.path().join("systemd").join("user");
+        std::fs::create_dir_all(&unit_dir).expect("systemd unit dir");
+        std::fs::write(
+            unit_dir.join("rantaiclaw.service"),
+            "[Unit]\nDescription=test\n",
+        )
+        .expect("write unit file");
+
+        let outcome = maybe_restart_managed_daemon_service(true)
+            .expect("dev build returns Ok(false), never an error");
+        assert!(!outcome, "dev build returns Ok(false) — no managed restart");
+        assert!(
+            !fake.restart_marker().exists(),
+            "fake systemctl must not be reached in a dev build; marker at {}",
+            fake.restart_marker().display()
+        );
     }
 }
