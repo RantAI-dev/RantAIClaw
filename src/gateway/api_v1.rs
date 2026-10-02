@@ -2016,9 +2016,21 @@ async fn memory_create(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    state
-        .mem
-        .store(&key, &sanitized.content, category, session)
+    // The console is the operator's private place: it may write a note to any
+    // place, and says so with the `All` view instead of an unchecked call. An
+    // edit under an existing key replaces the note on purpose, so the refusal
+    // `memory_store` gives the agent does not apply here.
+    crate::memory::MEMORY_VIEW
+        .scope(
+            crate::memory::MemoryView::All,
+            crate::memory::store_in_view(
+                state.mem.as_ref(),
+                &key,
+                &sanitized.content,
+                category,
+                session,
+            ),
+        )
         .await
         .map_err(|e| match e.downcast_ref::<crate::memory::KeyInUse>() {
             Some(in_use) => err_409(in_use.to_string()),
@@ -2090,7 +2102,14 @@ async fn memory_delete(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let removed = state.mem.forget(&key).await.map_err(err_500)?;
+    // The console may delete any note, under the `All` view it sets here.
+    let removed = crate::memory::MEMORY_VIEW
+        .scope(
+            crate::memory::MemoryView::All,
+            crate::memory::forget_in_view(state.mem.as_ref(), &key),
+        )
+        .await
+        .map_err(err_500)?;
     if removed {
         refresh_memory_projection(&state);
     }
@@ -3865,6 +3884,57 @@ mod tests {
         assert_eq!(row.session_id, None);
     }
 
+    /// The console edits a note on purpose: a second create under the same key
+    /// replaces the content, which the agent's own tool refuses without
+    /// `replaces`.
+    #[tokio::test]
+    async fn memory_create_replaces_a_note_on_purpose() {
+        let (_tmp, state) = state_with_real_memory();
+        for content in ["the drive code is alpha", "the drive code is bravo"] {
+            let (status, _body) = memory_create(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(MemoryCreateBody {
+                    content: content.into(),
+                    key: Some("drive_code".into()),
+                    category: None,
+                    session_id: None,
+                }),
+            )
+            .await
+            .expect("an operator edit should succeed");
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        assert_eq!(
+            state.mem.get("drive_code").await.unwrap().unwrap().content,
+            "the drive code is bravo"
+        );
+    }
+
+    /// The console may write a note into a conversation's place. The place is the
+    /// operator's choice, made under the `All` view the handler sets.
+    #[tokio::test]
+    async fn memory_create_can_write_a_note_into_a_conversation() {
+        let (_tmp, state) = state_with_real_memory();
+        let (status, _body) = memory_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(MemoryCreateBody {
+                content: "a conversation note".into(),
+                key: Some("chat_note".into()),
+                category: None,
+                session_id: Some("chat:one".into()),
+            }),
+        )
+        .await
+        .expect("the console may pick the place");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let row = state.mem.get("chat_note").await.unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("chat:one"));
+    }
+
     #[tokio::test]
     async fn memory_create_rejects_empty_content() {
         let err = memory_create(
@@ -3994,6 +4064,75 @@ mod tests {
         .await
         .expect("absent key is not an error");
         assert_eq!(resp.0["removed"], false);
+    }
+
+    /// The console deletes a note in any place, a conversation's included.
+    #[tokio::test]
+    async fn memory_delete_reaches_a_note_kept_in_a_conversation() {
+        let (_tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "chat_note",
+                "a conversation note",
+                MemoryCategory::Core,
+                Some("chat:one"),
+            )
+            .await
+            .unwrap();
+
+        let resp = memory_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("chat_note".to_string()),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(resp.0["removed"], true);
+        assert!(state.mem.get("chat_note").await.unwrap().is_none());
+    }
+
+    /// The console deletes a core note, and the next message of the owner in a
+    /// direct chat, in the same running channel runtime, no longer carries it.
+    /// The owner prompt is read from `MEMORY.md` at the turn that uses it, so the
+    /// operator's delete takes effect without a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_note_deleted_in_the_console_is_gone_from_the_next_owner_prompt() {
+        let (tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "lantern_note",
+                "The lantern is kept in the saffronquartz cabinet",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        crate::memory::snapshot::refresh_projection(state.mem.as_ref(), tmp.path());
+        let owner_dm = crate::channels::owner_dm::OwnerDm::start(tmp.path()).await;
+
+        let before = owner_dm.turn().await;
+        assert!(
+            before.contains("saffronquartz"),
+            "control: the owner prompt carries the note:\n{before}"
+        );
+
+        let resp = memory_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("lantern_note".to_string()),
+        )
+        .await
+        .expect("delete should succeed");
+        assert_eq!(resp.0["removed"], true);
+
+        let after = owner_dm.turn().await;
+        assert!(
+            !after.contains("saffronquartz"),
+            "a deleted note reached the next owner prompt:\n{after}"
+        );
     }
 
     /// The CLI and TUI could both open one entry directly; the API could only

@@ -340,9 +340,9 @@ instruction, and no hint quotes a menu label.
 
 ### What a reset does not clear
 
-`/new` and `/clear` remove the conversation's history and nothing else. Long-term memory stays:
-facts the model saved with `memory_store`, such as a name, remain available in every conversation.
-To see and remove those, run on the host:
+`/new` and `/clear` remove the conversation's history and nothing else. Saved notes stay, each in
+the place it was written: the owner's private notes in the owner's direct chats and on the host, a
+conversation's notes in that conversation. To see and remove them, run on the host:
 
 - `rantaiclaw memory list` shows stored entries; `--category core|daily|conversation` narrows it.
 - `rantaiclaw memory clear --key <key>` removes entries whose key starts with `<key>`. It is a

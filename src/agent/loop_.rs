@@ -292,6 +292,27 @@ async fn in_memory_view<T>(
     }
 }
 
+/// Delete the conversation and daily notes the run's view can see, and return
+/// how many were removed. A run with no view removes none.
+async fn clear_conversation_memory(mem: &dyn Memory, view: Option<&memory::MemoryView>) -> usize {
+    in_memory_view(view, async {
+        let mut cleared = 0;
+        for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
+            let entries = mem.list(Some(&category), None).await.unwrap_or_default();
+            for entry in entries {
+                if memory::forget_in_view(mem, &entry.key)
+                    .await
+                    .unwrap_or(false)
+                {
+                    cleared += 1;
+                }
+            }
+        }
+        cleared
+    })
+    .await
+}
+
 /// Find a tool by name in the registry.
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
@@ -2618,10 +2639,10 @@ pub async fn run_with_scope(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-        false,
-        // `USER.md` and `MEMORY.md` are memory read into the prompt: only a run
-        // that sees all of memory carries them.
-        matches!(memory_view, Some(memory::MemoryView::All)),
+        crate::channels::PromptAudience::Owner,
+        // The owner files are memory read into the prompt: only a run that sees
+        // all of memory carries them.
+        crate::channels::OwnerFiles::for_view(memory_view.as_ref()),
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -2808,15 +2829,8 @@ pub async fn run_with_scope(
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
                     // Clear conversation and daily memory
-                    let mut cleared = 0;
-                    for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                        let entries = mem.list(Some(&category), None).await.unwrap_or_default();
-                        for entry in entries {
-                            if mem.forget(&entry.key).await.unwrap_or(false) {
-                                cleared += 1;
-                            }
-                        }
-                    }
+                    let cleared =
+                        clear_conversation_memory(mem.as_ref(), memory_view.as_ref()).await;
                     if cleared > 0 {
                         println!("Conversation cleared ({cleared} memory entries removed).\n");
                     } else {
@@ -3060,10 +3074,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-        false,
+        crate::channels::PromptAudience::Owner,
         // No door sets a view for this entry point, and a turn with no view
         // reads nothing from memory.
-        false,
+        crate::channels::OwnerFiles::Omit,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -5841,8 +5855,8 @@ Let me check the result."#;
             None, // no bootstrap_max_chars
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
-            false,
-            true,
+            crate::channels::PromptAudience::Owner,
+            crate::channels::OwnerFiles::Load,
         );
 
         // Must contain zero XML protocol artifacts
@@ -6345,5 +6359,51 @@ Let me check the result."#;
                 panic!("no provider reported usage, yet a Usage event was emitted: {u:?}");
             }
         }
+    }
+
+    /// The interactive `/clear` deletes conversation and daily notes. It reaches
+    /// what the run's view can see: every place under `All`, one conversation
+    /// under `Only`, nothing without a view. Core notes are never touched.
+    #[tokio::test]
+    async fn clear_conversation_memory_follows_the_runs_view() {
+        let seed = || async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            for (key, category, place) in [
+                ("shared_chat", MemoryCategory::Conversation, None),
+                ("own_chat", MemoryCategory::Conversation, Some("chat:one")),
+                ("other_daily", MemoryCategory::Daily, Some("chat:two")),
+                ("core_note", MemoryCategory::Core, None),
+            ] {
+                mem.store(key, "a note", category, place).await.unwrap();
+            }
+            (tmp, mem)
+        };
+        let (_tmp, mem) = seed().await;
+        let all = clear_conversation_memory(&mem, Some(&memory::MemoryView::All)).await;
+        assert_eq!(all, 3);
+        let left: Vec<String> = mem
+            .list(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(left, vec!["core_note".to_string()]);
+
+        let (_tmp, mem) = seed().await;
+        let own = clear_conversation_memory(
+            &mem,
+            Some(&memory::MemoryView::Only("chat:one".to_string())),
+        )
+        .await;
+        assert_eq!(own, 1);
+        assert!(mem.get("own_chat").await.unwrap().is_none());
+        assert!(mem.get("shared_chat").await.unwrap().is_some());
+        assert!(mem.get("other_daily").await.unwrap().is_some());
+
+        let (_tmp, mem) = seed().await;
+        assert_eq!(clear_conversation_memory(&mem, None).await, 0);
+        assert_eq!(mem.count().await.unwrap(), 4);
     }
 }

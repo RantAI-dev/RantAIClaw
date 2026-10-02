@@ -19,6 +19,9 @@ where
 {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| anyhow::anyhow!("memory command must run inside a tokio runtime"))?;
+    // `/memory` is the operator's own surface: its writes and deletes reach any
+    // place, and say so with the `All` view.
+    let future = crate::memory::MEMORY_VIEW.scope(crate::memory::MemoryView::All, future);
     tokio::task::block_in_place(|| handle.block_on(future))
 }
 
@@ -236,9 +239,14 @@ fn add_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     let stored_category = category.clone();
     let store_handle = memory.clone();
     run_blocking(async move {
-        store_handle
-            .store(&key_owned, &content_owned, stored_category, None)
-            .await
+        crate::memory::store_in_view(
+            store_handle.as_ref(),
+            &key_owned,
+            &content_owned,
+            stored_category,
+            None,
+        )
+        .await
     })?;
     refresh_projection(ctx, memory.as_ref());
     Ok(CommandResult::Message(format!(
@@ -272,7 +280,9 @@ fn remove_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     };
     let key_owned = key.to_string();
     let forget_handle = memory.clone();
-    let removed = run_blocking(async move { forget_handle.forget(&key_owned).await })?;
+    let removed = run_blocking(async move {
+        crate::memory::forget_in_view(forget_handle.as_ref(), &key_owned).await
+    })?;
     if removed {
         refresh_projection(ctx, memory.as_ref());
         Ok(CommandResult::Message(format!("Forgot '{key}'.")))
@@ -598,6 +608,73 @@ mod tests {
         assert!(
             !after_remove.contains("rotation_note"),
             "the projected file still holds the removed entry:\n{after_remove}"
+        );
+    }
+
+    /// `/memory` is the operator's own surface: `remove` reaches a note kept in a
+    /// conversation, and a second `add` under a key replaces the note on purpose.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_remove_reaches_any_place_and_add_replaces_on_purpose() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+        mem.store(
+            "chat_note",
+            "a conversation note",
+            MemoryCategory::Core,
+            Some("chat:one"),
+        )
+        .await
+        .unwrap();
+        let mut ctx = ctx_with_memory(mem.clone());
+
+        MemoryCommand.execute("remove chat_note", &mut ctx).unwrap();
+        assert!(mem.get("chat_note").await.unwrap().is_none());
+
+        MemoryCommand
+            .execute("add drive_code the drive code is alpha", &mut ctx)
+            .unwrap();
+        MemoryCommand
+            .execute("add drive_code the drive code is bravo", &mut ctx)
+            .unwrap();
+        assert_eq!(
+            mem.get("drive_code").await.unwrap().unwrap().content,
+            "the drive code is bravo"
+        );
+    }
+
+    /// `/memory remove` deletes a core note, and the next message of the owner in
+    /// a direct chat, in the same running channel runtime, no longer carries it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_note_removed_in_the_tui_is_gone_from_the_next_owner_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+        mem.store(
+            "lantern_note",
+            "The lantern is kept in the saffronquartz cabinet",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::memory::snapshot::refresh_projection(mem.as_ref(), tmp.path());
+        let mut ctx = ctx_with_memory(mem.clone());
+        ctx.workspace_dir = Some(tmp.path().to_path_buf());
+        let owner_dm = crate::channels::owner_dm::OwnerDm::start(tmp.path()).await;
+
+        let before = owner_dm.turn().await;
+        assert!(
+            before.contains("saffronquartz"),
+            "control: the owner prompt carries the note:\n{before}"
+        );
+
+        MemoryCommand
+            .execute("remove lantern_note", &mut ctx)
+            .unwrap();
+
+        let after = owner_dm.turn().await;
+        assert!(
+            !after.contains("saffronquartz"),
+            "a removed note reached the next owner prompt:\n{after}"
         );
     }
 

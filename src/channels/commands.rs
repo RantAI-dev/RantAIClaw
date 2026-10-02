@@ -353,9 +353,10 @@ fn unknown_command_message(command: &str, prefix: &str) -> String {
 /// to remove the rest.
 const RESET_MESSAGE: &str =
     "Cleared this conversation's history. The model chosen here stays until the daemon restarts. \
-     Long-term memory stays too: facts the bot saved with its memory tools remain available in \
-     every conversation. To remove those, the operator runs `rantaiclaw memory list` and then \
-     `rantaiclaw memory clear --key <key>` on the host.";
+     Saved notes stay too, each in the place it was written: the owner's private notes in the \
+     owner's direct chats and on the host, a conversation's notes in that conversation. To remove \
+     them, the operator runs `rantaiclaw memory list` and then `rantaiclaw memory clear --key \
+     <key>` on the host.";
 
 /// [`RESET_MESSAGE`], plus what the chat app still shows when we know the
 /// answer for this channel.
@@ -748,6 +749,26 @@ mod tests {
             parse_runtime_command("slack", "/frobnicate", None),
             None,
             "Slack has no slash commands, so this is chat, not an unknown command"
+        );
+    }
+
+    /// A saved note stays in the place it was written, so the reply must not say
+    /// that every conversation can use it. It names the two places and keeps the
+    /// host commands that remove notes.
+    #[test]
+    fn the_reset_reply_says_a_note_stays_in_the_place_it_was_written() {
+        assert!(
+            !RESET_MESSAGE.contains("every conversation"),
+            "a note no longer reaches every conversation: {RESET_MESSAGE}"
+        );
+        assert!(
+            RESET_MESSAGE.contains("in the place it was written"),
+            "{RESET_MESSAGE}"
+        );
+        assert!(RESET_MESSAGE.contains("direct chats"), "{RESET_MESSAGE}");
+        assert!(
+            RESET_MESSAGE.ends_with("`rantaiclaw memory clear --key <key>` on the host."),
+            "the host commands stay at the end: {RESET_MESSAGE}"
         );
     }
 

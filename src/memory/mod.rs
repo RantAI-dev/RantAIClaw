@@ -26,7 +26,10 @@ pub use sqlite::SqliteMemory;
 pub use traits::{KeyInUse, Memory};
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
-pub use view::{current_memory_view, recall_in_view, MemoryView, MEMORY_VIEW};
+pub use view::{
+    current_memory_view, forget_in_view, recall_in_view, store_in_view, MemoryView, MEMORY_VIEW,
+    NO_MEMORY_VIEW_REFUSAL,
+};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig};
 use std::path::Path;
@@ -323,16 +326,6 @@ pub fn create_memory_with_storage_and_routes(
         tracing::warn!("memory hygiene skipped: {e}");
     }
 
-    // If snapshot_on_hygiene is enabled, export core memories during hygiene.
-    if config.snapshot_enabled
-        && config.snapshot_on_hygiene
-        && matches!(backend_kind, MemoryBackendKind::Sqlite)
-    {
-        if let Err(e) = snapshot::export_snapshot(workspace_dir) {
-            tracing::warn!("memory snapshot skipped: {e}");
-        }
-    }
-
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
     if config.auto_hydrate
@@ -383,6 +376,20 @@ pub fn create_memory_with_storage_and_routes(
         "",
     )?;
 
+    // If snapshot_on_hygiene is enabled, export core memories during hygiene.
+    // After the backend is built: opening it migrates the schema, and the export
+    // selects on `session_id`, a column a database from before session ids lacks
+    // until then. Hydration above has already run, so a cold boot exports the
+    // restored rows back unchanged.
+    if config.snapshot_enabled
+        && config.snapshot_on_hygiene
+        && matches!(backend_kind, MemoryBackendKind::Sqlite)
+    {
+        if let Err(e) = snapshot::export_snapshot(workspace_dir) {
+            tracing::warn!("memory snapshot skipped: {e}");
+        }
+    }
+
     // Project core memory into `MEMORY.md`, which the system prompt injects.
     //
     // On these backends nothing else writes that file, so the tier guaranteed to
@@ -390,9 +397,10 @@ pub fn create_memory_with_storage_and_routes(
     // lived in `brain.db`. `MarkdownMemory` is excluded because it owns the file
     // directly — projecting there too would write it twice.
     //
-    // The prompt is built once per session, so a memory stored mid-session lands
-    // in the file now and in the prompt next session. Within-session freshness is
-    // the recall tier's job; it runs every turn.
+    // A channel reads the file for each message it answers. The interactive
+    // session builds its prompt once, so a memory stored mid-session lands in the
+    // file now and in that prompt next session; there, within-session freshness is
+    // the recall tier's job, which runs every turn.
     if matches!(backend_kind, MemoryBackendKind::Sqlite) {
         if let Err(e) = snapshot::project_core_memories(workspace_dir) {
             tracing::warn!("memory projection skipped: {e}");
@@ -527,6 +535,51 @@ mod tests {
         async fn health_check(&self) -> bool {
             true
         }
+    }
+
+    /// A database written before the `session_id` column existed has no such
+    /// column until the backend opens it. The snapshot export selects on that
+    /// column, so it has to run after the backend has migrated the schema, or the
+    /// first start after an upgrade skips the export with "no such column".
+    #[tokio::test]
+    async fn the_snapshot_export_runs_after_the_schema_is_migrated() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(db_dir.join("brain.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY,
+                    key TEXT NOT NULL UNIQUE,
+                    content TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'core',
+                    embedding BLOB,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO memories (id, key, content, category, created_at, updated_at)
+                VALUES ('1', 'legacy_note', 'written before session ids', 'core',
+                        '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');",
+            )
+            .unwrap();
+        }
+        let config = MemoryConfig {
+            backend: "sqlite".to_string(),
+            snapshot_enabled: true,
+            snapshot_on_hygiene: true,
+            auto_hydrate: false,
+            ..MemoryConfig::default()
+        };
+
+        let _memory = create_memory_with_storage(&config, tmp.path(), None).unwrap();
+
+        let snapshot = std::fs::read_to_string(tmp.path().join(snapshot::SNAPSHOT_FILENAME))
+            .unwrap_or_default();
+        assert!(
+            snapshot.contains("legacy_note"),
+            "the export did not run on a database from before session ids:\n{snapshot}"
+        );
     }
 
     /// A credential typed into a chat used to land verbatim in `brain.db`, be

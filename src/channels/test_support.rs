@@ -232,7 +232,7 @@ pub(super) fn dispatch_ctx(
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        system_prompt: Arc::new("test-system-prompt".to_string()),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),
         temperature: 0.0,
@@ -517,7 +517,7 @@ pub(super) fn startup_guest_prompt(workspace: &std::path::Path, tools: &[(&str, 
         None,
         false,
         crate::config::SkillsPromptInjectionMode::Full,
-        true,
-        true,
+        PromptAudience::Guest,
+        OwnerFiles::Load,
     )
 }

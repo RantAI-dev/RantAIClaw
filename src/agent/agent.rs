@@ -989,13 +989,12 @@ impl Agent {
             // The interactive TUI / CLI / console / cron surface is the
             // owner's path; guest-scoping applies only to channel turns and
             // does not apply here.
-            skip_owner_files: false,
-            // `USER.md` and `MEMORY.md` are memory read into the prompt, so only
-            // a turn that sees all of memory carries them. The door sets the
-            // view before the turn starts, and this runs inside the turn.
-            inject_memory_files: matches!(
-                crate::memory::current_memory_view(),
-                Some(crate::memory::MemoryView::All)
+            audience: crate::agent::prompt::PromptAudience::Owner,
+            // The owner files are memory read into the prompt, so only a turn
+            // that sees all of memory carries them. The door sets the view
+            // before the turn starts, and this runs inside the turn.
+            owner_files: crate::agent::prompt::OwnerFiles::for_view(
+                crate::memory::current_memory_view().as_ref(),
             ),
         };
         self.prompt_builder.build(&ctx)
@@ -1344,6 +1343,59 @@ mod tests {
             msg.contains("no model") && msg.contains("setup provider"),
             "the error must name the problem and the fix: {msg}"
         );
+    }
+
+    /// The agent surface builds its prompt inside the turn, so the owner files
+    /// follow the view the door set: `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and
+    /// `TOOLS.md` are in under `All` and out under one conversation and with no
+    /// view.
+    #[tokio::test]
+    async fn the_agent_prompt_carries_the_owner_files_only_under_the_all_view() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let canaries = [
+            ("USER.md", "AGENT_PROFILE_CANARY_11"),
+            ("MEMORY.md", "AGENT_NOTES_CANARY_22"),
+            ("BOOTSTRAP.md", "AGENT_BOOTSTRAP_CANARY_33"),
+            ("TOOLS.md", "AGENT_TOOLS_CANARY_44"),
+        ];
+        for (file, canary) in canaries {
+            std::fs::write(workspace.path().join(file), canary).unwrap();
+        }
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.memory.backend = "none".into();
+        config.default_model = Some("anthropic/claude-sonnet-4.6".into());
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::from_config_with_observer(&config, observer)
+            .await
+            .expect("a modelled config builds an agent");
+
+        let under = |view: Option<crate::memory::MemoryView>| match view {
+            Some(view) => {
+                crate::memory::MEMORY_VIEW.sync_scope(view, || agent.build_system_prompt().unwrap())
+            }
+            None => agent.build_system_prompt().unwrap(),
+        };
+
+        let all = under(Some(crate::memory::MemoryView::All));
+        for (file, canary) in canaries {
+            assert!(all.contains(canary), "{file} missing under All:\n{all}");
+        }
+        for (label, view) in [
+            (
+                "one conversation",
+                Some(crate::memory::MemoryView::Only("conversation-a".into())),
+            ),
+            ("no view", None),
+        ] {
+            let prompt = under(view);
+            for (file, canary) in canaries {
+                assert!(
+                    !prompt.contains(canary),
+                    "{file} reached the agent prompt under {label}:\n{prompt}"
+                );
+            }
+        }
     }
 
     /// Build the smallest agent `trim_history` needs: it only reads

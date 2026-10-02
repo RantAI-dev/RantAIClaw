@@ -914,4 +914,67 @@ mod tests {
         );
         assert!(mem.get("lantern_update").await.unwrap().is_some());
     }
+
+    /// The compaction flush stores through the same tool as a turn, so a note it
+    /// writes lands in the place of the view it runs under: a flush under one
+    /// conversation's view writes into that conversation and not the shared place.
+    #[tokio::test]
+    async fn the_compaction_flush_writes_into_the_place_of_its_view() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let mem: Arc<dyn Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+
+        let text = |t: &str| ChatResponse {
+            usage: None,
+            text: Some(t.to_string()),
+            tool_calls: vec![],
+        };
+        let mut script: Vec<ChatResponse> = (0..12).map(|_| text("ok")).collect();
+        script.push(ChatResponse {
+            usage: None,
+            text: Some(String::new()),
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "call_1".into(),
+                name: "memory_store".into(),
+                arguments: serde_json::json!({
+                    "key": "flushed_fact",
+                    "content": "The lantern note was kept by the flush"
+                })
+                .to_string(),
+            }],
+        });
+        script.push(text("none"));
+        script.push(text("## Summary\nsummarised"));
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(ScriptedChat::new(script)))
+            .tools(vec![])
+            .memory(Arc::clone(&mem))
+            .observer(observer)
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .security(Arc::new(crate::security::SecurityPolicy::default()))
+            .auto_save(false)
+            .build()
+            .expect("agent builder should succeed");
+        for i in 0..12 {
+            let _ = agent.turn(&format!("turn {i}")).await;
+        }
+
+        crate::memory::MEMORY_VIEW
+            .scope(
+                crate::memory::MemoryView::Only("tui:flush".to_string()),
+                agent.compact_streaming(4, None),
+            )
+            .await
+            .expect("compaction completes");
+
+        let row = mem
+            .get("flushed_fact")
+            .await
+            .unwrap()
+            .expect("the flush stored the note");
+        assert_eq!(row.session_id.as_deref(), Some("tui:flush"));
+    }
 }

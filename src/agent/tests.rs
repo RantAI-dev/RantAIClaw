@@ -1565,7 +1565,15 @@ async fn compaction_flush_stores_durable_facts() {
     let mut agent = agent_with_security(Box::new(ScriptedProvider::new(script)), mem.clone());
     seed_history(&mut agent).await;
 
-    agent.compact_streaming(4, None).await.unwrap();
+    // The TUI runs compaction under the `All` view, the operator's own place.
+    // With no view the flush's `memory_store` call is refused.
+    crate::memory::MEMORY_VIEW
+        .scope(
+            crate::memory::MemoryView::All,
+            agent.compact_streaming(4, None),
+        )
+        .await
+        .unwrap();
 
     let stored = mem.get("operator_office").await.unwrap();
     assert!(

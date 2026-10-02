@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::MemoryCategory;
 
@@ -291,7 +292,11 @@ pub(crate) fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<()
         .file_name()
         .context("path to replace has no file name")?
         .to_string_lossy();
-    let temp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    // The pid tells two processes apart and the counter two calls in one
+    // process, so no two writers of one file share a temp file.
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = fs::File::create(&temp)?;
         let existing = fs::metadata(path).ok();
@@ -1094,6 +1099,50 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert_eq!(leftovers, vec![std::ffi::OsString::from("MEMORY.md")]);
+    }
+
+    /// Two writers of one file in one process, as two projections are when a
+    /// tool call and a console edit land together. A temp name shared by both
+    /// lets one truncate the other's temp file, and the second rename then fails
+    /// because the first already moved it. Each call gets its own temp name, so
+    /// every write succeeds and the file holds one writer's whole content.
+    #[test]
+    fn concurrent_replacements_of_one_file_all_succeed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let note = tmp.path().join("MEMORY.md");
+        fs::write(&note, "old").unwrap();
+        let contents: Vec<Vec<u8>> = (b'a'..=b'd').map(|byte| vec![byte; 64 * 1024]).collect();
+
+        let results: Vec<Result<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = contents
+                .iter()
+                .map(|content| {
+                    let note = &note;
+                    scope.spawn(move || {
+                        (0..40)
+                            .map(|_| replace_file_atomically(note, content))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for result in &results {
+            assert!(
+                result.is_ok(),
+                "a concurrent replacement failed: {result:?}"
+            );
+        }
+        assert!(
+            contents.contains(&fs::read(&note).unwrap()),
+            "the file is not one writer's whole content"
+        );
+        let leftovers = fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "a temp file was left behind");
     }
 
     /// A filesystem that cannot fsync a directory answers EINVAL or ENOTSUP.

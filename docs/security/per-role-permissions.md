@@ -125,20 +125,34 @@ empty. A door that forgets to set a view fails closed.
 | Daemon heartbeat | all of memory (its reply goes to the journal and the observer, never to a chat) |
 | Cron job created from a chat | that chat's conversation, for `main` and `isolated` |
 | Cron job with no chat, `main` or `isolated` | all of memory |
-| Webhook (`POST /webhook`, `POST /triggers/{path}`) | none: reads nothing |
+| Webhook (`POST /webhook`, `POST /triggers/{path}`) | none: reads nothing and writes nothing |
 | A delegated sub-agent | the view of the turn that delegated |
 
 - **A named owner** is an identity written in `approval_owners`. The `"*"` entry
   lets any allowed sender approve tool calls and names nobody, so a sender who is
   an owner only through it keeps approval rights and never gets the view of all
   of memory. This needs no new key.
-- **`USER.md` and `MEMORY.md` in the prompt follow the view** on the doors that
-  build the prompt for the turn: the CLI, a cron job, the heartbeat, the TUI, the
-  console and the webhook. Only a turn that sees all of memory carries them. A
-  channel's owner prompt is built once when the channel starts, outside any turn,
-  and still carries them. Until that prompt is built for each turn, a named owner
-  in a group gets the conversation as the memory view and a prompt that holds
-  `MEMORY.md`, and a wildcard owner gets the same.
+- **`USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md` in the prompt follow
+  the view.** Only a turn that sees all of memory carries them. A turn under one
+  conversation or with no view does not: an owner in a group, a wildcard owner, a
+  cron job created from a chat and a webhook turn get a prompt without them. Such
+  an owner keeps the owner persona, the workspace path and the host line, and the
+  chat-kind line tells an owner in a group that the owner's private notes are
+  available only in a direct chat with the bot. A channel builds the owner prompt
+  on every message and reads those files then, so a note deleted since the last
+  message is gone from the next one without a restart. The guest prompt carries
+  none of them and is built once when the channel starts. The prompt of the
+  interactive TUI or CLI session is built when the session starts.
+- **A note keeps the place it was written in.** `memory_store` puts a note where
+  the turn's view puts it. It refuses a key that already holds a different note
+  unless `replaces` names it, and identical content is not an error.
+  `memory_forget` deletes only what the turn's view can see, by key and by
+  `contains`. A turn with no view, a webhook turn included, can neither store
+  nor delete a note: both tools refuse it before any lookup with one answer
+  that names no key. The console, the CLI
+  `memory` commands and the TUI `/memory` commands are the operator's own
+  surfaces: they run under the view of all of memory, may write to any place,
+  and replace a note on purpose.
 - **The file tools split their rules by what they do.** The read rule follows
   the view: `file_read`, `pdf_read` and `image_info` refuse the owner's private
   files (`USER.md`, `MEMORY.md`, `memory/` and the rest) in every turn that does
