@@ -1,6 +1,8 @@
 //! Slash command for inspecting and switching the approval-policy preset
-//! without leaving the TUI. The same write path is used by Shift+Tab
-//! (which cycles) and by `rantaiclaw autonomy <preset>` on the CLI.
+//! without leaving the TUI. This path forces the write (regenerates the
+//! policy files wholesale, overwriting hand-edited `command_allowlist.toml`
+//! and `forbidden_paths.toml`); Shift+Tab is the path that preserves hand
+//! edits — see `app.rs::cycle_autonomy_preset` for the contrast.
 //!
 //! - `/autonomy` — print the active preset plus the four options.
 //! - `/autonomy <preset>` — switch to `manual`, `smart`, `strict`, `off`,

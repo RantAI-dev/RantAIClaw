@@ -390,10 +390,10 @@ fn migrate_subcommand_is_removed_and_fails_as_unknown() {
     );
 }
 
-/// `rantaiclaw hardware` was removed in plan 506. The CLI no longer accepts
-/// the subcommand, so clap exits non-zero and surfaces an "unrecognized
-/// subcommand" error. This pins the removal so a future PR cannot quietly
-/// reintroduce the command.
+/// `rantaiclaw hardware` was removed with the hardware/peripheral stack. The
+/// CLI no longer accepts the subcommand, so clap exits non-zero and surfaces an
+/// "unrecognized subcommand" error. This pins the removal so a future PR cannot
+/// quietly reintroduce the command.
 #[test]
 fn hardware_subcommand_is_removed_and_fails_as_unknown() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -416,10 +416,10 @@ fn hardware_subcommand_is_removed_and_fails_as_unknown() {
     );
 }
 
-/// `rantaiclaw peripheral` was removed in plan 506. The CLI no longer accepts
-/// the subcommand, so clap exits non-zero and surfaces an "unrecognized
-/// subcommand" error. This pins the removal so a future PR cannot quietly
-/// reintroduce the command.
+/// `rantaiclaw peripheral` was removed with the hardware/peripheral stack.
+/// The CLI no longer accepts the subcommand, so clap exits non-zero and
+/// surfaces an "unrecognized subcommand" error. This pins the removal so a
+/// future PR cannot quietly reintroduce the command.
 #[test]
 fn peripheral_subcommand_is_removed_and_fails_as_unknown() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());

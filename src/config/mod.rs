@@ -16,9 +16,9 @@ pub use schema::{
     IMessageConfig, IdentityConfig, KnowledgeConfig, LarkConfig, MatrixConfig, MemoryConfig,
     ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig, ProxyConfig,
     ProxyScope, QueryClassificationConfig, ReliabilityConfig, RuntimeConfig, SchedulerConfig,
-    SecretsConfig, SecurityConfig, SkillApiKey, SkillEntryConfig, SkillsConfig,
-    SkillsInstallConfig, SkillsPromptInjectionMode, SlackConfig, StreamMode, TasksConfig,
-    TelegramConfig, TunnelConfig, UiConfig, WebSearchConfig, WebhookConfig, WhatsAppWebConfig,
+    SecretsConfig, SkillApiKey, SkillEntryConfig, SkillsConfig, SkillsInstallConfig,
+    SkillsPromptInjectionMode, SlackConfig, StreamMode, TasksConfig, TelegramConfig, TunnelConfig,
+    UiConfig, WebSearchConfig, WebhookConfig, WhatsAppWebConfig,
 };
 
 #[cfg(test)]

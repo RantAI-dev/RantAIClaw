@@ -580,16 +580,10 @@ can opt back out of it, the same way `channel-matrix` opts in.
   Lark does not have this gap any more: a release binary's default features
   include `channel-lark`, so `[channels_config.lark]` runs out of the box.
   Running Matrix means building from source.
-- Typical local check with only hardware support:
-
-```bash
-cargo check --features hardware
-```
-
 - Enable Matrix explicitly when needed:
 
 ```bash
-cargo check --features hardware,channel-matrix
+cargo check --features channel-matrix
 ```
 
   To actually **run** it, build the binary rather than checking it, and note the
@@ -606,7 +600,7 @@ cargo +1.93.0 build --release --features channel-matrix
   it (a smaller binary that cannot run Lark at all):
 
 ```bash
-cargo check --no-default-features --features tui,whatsapp-web,remote-install,kb,hardware
+cargo check --no-default-features --features tui,whatsapp-web,remote-install,kb
 ```
 
 If `[channels_config.matrix]` is present but the feature is not compiled in — or `[channels_config.lark]` on a build that deliberately dropped `channel-lark` — `rantaiclaw channel list`, `rantaiclaw channel doctor`, and `rantaiclaw channel start` will report that the channel is intentionally skipped for this build.

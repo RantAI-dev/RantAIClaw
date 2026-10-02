@@ -50,8 +50,9 @@ pub enum ListPickerKind {
     /// filters these locally instead — there are only ever a handful.
     ClawhubPublisher,
     /// Approval-policy preset picker opened via `/autonomy` (no arg).
-    /// Selecting a row force-writes the policy files for that preset —
-    /// same write path as Shift+Tab and `rantaiclaw autonomy <preset>`.
+    /// Selecting a row force-writes the policy files for that preset — same
+    /// write path as `/autonomy <preset>` on the CLI. Shift+Tab is the path
+    /// that preserves hand edits (force = false).
     Autonomy,
     /// Scheduled-jobs browser opened via `/cron` (no arg). Enter opens a detail
     /// panel whose action-keys run/pause/delete the selected job.
