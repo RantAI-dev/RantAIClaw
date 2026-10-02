@@ -23,6 +23,9 @@ from cron, performs these steps in order:
    `config.toml` + `persona/`, into
    `~/.rantaiclaw/.update-snapshots/<UTC-timestamp>/`. Always runs;
    never aborts the update on failure (logged as a warning instead).
+   A snapshot or `--backup` archive restored under a different root
+   resolves to that root's own profile (the marker is set aside when the
+   local root has its own config for the named profile).
 6. **Optional `--backup`** — full-profile tarball of the rantaiclaw
    home directory. Slower; opt-in for production / shared installs.
 7. **Download archive + SHA256SUMS** from the release.
@@ -150,6 +153,12 @@ rantaiclaw rollback --snapshot ~/.rantaiclaw/.update-snapshots/2026-05-09T03-21-
   active_profile, persona/, active profile's config.toml).
 - The daemon service is restarted again so the rolled-back binary is
   what's running.
+
+A snapshot restored under a different root than the one it was created
+on resolves to that root's own profile for the active name (the carried
+`active_workspace.toml` is set aside when the local root has its own
+config for the named profile); `RANTAICLAW_CONFIG_DIR` selects the
+original directory explicitly if needed.
 
 What `rollback` doesn't restore by default:
 

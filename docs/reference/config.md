@@ -8,7 +8,7 @@ Config path resolution at startup:
 
 1. `RANTAICLAW_CONFIG_DIR` override (if set) — the whole config directory; the workspace becomes `<dir>/workspace`
 2. `RANTAICLAW_WORKSPACE` override (if set)
-3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present)
+3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present) — unless the marker names the `profiles/<name>` directory of a different root while the local root has its own `config.toml` for that profile (a tree that was copied, moved or restored to another path); in that case the marker is set aside and the local profile wins, and a single warning names the marker, the directory it pointed at, and the directory used instead
 4. default: the **active profile's directory** — `~/.rantaiclaw/profiles/<name>/config.toml` (profile `default` unless `RANTAICLAW_PROFILE` or the `~/.rantaiclaw/active_profile` marker selects another). A flat `~/.rantaiclaw/config.toml` is used only as a fallback if profile resolution fails.
 
 `RANTAICLAW_CONFIG_DIR` moves **config and workspace only**. The profile root —
