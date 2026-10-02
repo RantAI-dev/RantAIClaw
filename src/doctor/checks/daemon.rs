@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 
 use crate::doctor::{CheckResult, DoctorCheck, DoctorContext};
+use crate::service::{is_dev_build, DEV_BUILD_SKIP_MESSAGE};
 
 pub struct DaemonRegistrationCheck;
 
@@ -44,6 +45,10 @@ impl DoctorCheck for DaemonRegistrationCheck {
                 CheckResult::info(self.name(), "init system not detected (skipped)")
                     .with_category(cat)
             }
+            #[cfg(any(test, debug_assertions))]
+            DaemonState::DevBuild => {
+                CheckResult::info(self.name(), DEV_BUILD_SKIP_MESSAGE).with_category(cat)
+            }
         }
     }
 }
@@ -63,6 +68,12 @@ pub enum DaemonState {
         backend: &'static str,
     },
     Unsupported,
+    /// A debug or test build — never queried the service manager. Distinct from
+    /// `Unsupported` so the rendered line points at the build mode, not the init
+    /// system detection. Exists only under `cfg(any(test, debug_assertions))`;
+    /// release builds never construct it.
+    #[cfg(any(test, debug_assertions))]
+    DevBuild,
 }
 
 /// Map a `systemctl --user status` result to a [`DaemonState`].
@@ -86,6 +97,12 @@ fn classify_systemctl(success: bool, code: Option<i32>) -> DaemonState {
 }
 
 pub fn detect_registration() -> DaemonState {
+    #[cfg(any(test, debug_assertions))]
+    {
+        if is_dev_build() {
+            return DaemonState::DevBuild;
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         if which::which("systemctl").is_ok() {
@@ -179,5 +196,23 @@ mod tests {
         };
         let r = DaemonRegistrationCheck.run(&ctx).await;
         assert_eq!(r.category, "system");
+    }
+
+    /// A debug or test build must short-circuit `detect_registration` to a
+    /// state distinct from `Unsupported` so the rendered line points at the
+    /// build mode, not at the init-system detection. The fake on PATH answers
+    /// `active` and would otherwise fold into `Registered` — the guard must
+    /// prevent the spawn.
+    #[test]
+    fn detect_registration_dev_build_skips_the_service_manager() {
+        use crate::service::is_dev_build;
+        assert!(
+            is_dev_build(),
+            "this test only proves its point under a debug/test build"
+        );
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let _fake = crate::test_env::FakeServiceManager::new();
+        let state = detect_registration();
+        assert_eq!(state, DaemonState::DevBuild);
     }
 }

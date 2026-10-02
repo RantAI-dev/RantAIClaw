@@ -163,9 +163,138 @@ pub(crate) async fn redirect_audit_temp() -> (EnvAuditRedirect, EnvGuard) {
 /// Carries the `ENV_LOCK` guard and the temp directory
 /// `RANTAICLAW_AUDIT_DIR_OVERRIDE` points at, so the helper can return a
 /// tuple `(env_guard, audit_guard)` without leaking the lock type, and the
-/// directory is deleted when the test drops this guard.
+/// directory is deleted when the test drops the guard.
 #[must_use = "the ENV_LOCK is released the moment this drops; bind it to a named local"]
 pub(crate) struct EnvAuditRedirect {
     _env: tokio::sync::MutexGuard<'static, ()>,
     _dir: tempfile::TempDir,
 }
+
+/// A temp directory holding fake binaries named `systemctl`, `launchctl`,
+/// `rc-service`, `rc-update`, and `schtasks`. Prepending the directory to
+/// `PATH` lets a test prove that production code does not spawn one of the
+/// five service-manager programs: if the guard is in place, the fake is never
+/// reached; if the guard is removed (mutation check), the fake answers the
+/// query and writes a marker on restart so the failing test can be diagnosed.
+///
+/// The marker file lives next to the binary and is unique to this guard. The
+/// `ENV_LOCK` is NOT acquired here — every caller must hold it for the lifetime
+/// of the returned guard (see [`with_fake_service_manager`]).
+#[must_use = "PATH is reverted the moment this drops; bind it to a named local"]
+pub(crate) struct FakeServiceManager {
+    _env: EnvGuard,
+    pub(crate) dir: tempfile::TempDir,
+}
+
+impl FakeServiceManager {
+    pub(crate) fn new() -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("rantaiclaw-fake-svcmgr-")
+            .tempdir()
+            .expect("fake service-manager dir");
+        for name in [
+            "systemctl",
+            "launchctl",
+            "rc-service",
+            "rc-update",
+            "schtasks",
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, FAKE_SERVICE_MANAGER_SCRIPT)
+                .unwrap_or_else(|e| panic!("write fake {name}: {e}"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .unwrap_or_else(|e| panic!("chmod fake {name}: {e}"));
+            }
+        }
+        let prev = std::env::var_os("PATH");
+        let bin = dir.path().to_string_lossy();
+        let new_path = match prev.as_ref().map(|p| p.to_string_lossy().into_owned()) {
+            Some(p) => format!("{bin}:{p}"),
+            None => bin.into_owned(),
+        };
+        let env = EnvGuard::set("PATH", &new_path);
+        Self { _env: env, dir }
+    }
+
+    /// Path of the marker file the `systemctl` fake writes on restart.
+    pub(crate) fn restart_marker(&self) -> std::path::PathBuf {
+        self.dir.path().join("systemctl.restarted.marker")
+    }
+
+    /// Path of the marker file the `rc-service` fake writes on restart.
+    pub(crate) fn rc_service_restart_marker(&self) -> std::path::PathBuf {
+        self.dir.path().join("rc-service.restarted.marker")
+    }
+}
+
+/// Acquire [`ENV_LOCK`] and install a [`FakeServiceManager`]. Tests that use
+/// this helper cannot reach the host's real `systemctl`/`launchctl`/etc.
+///
+/// The lock is held by the lock guard passed in via the caller — `ENV_LOCK` is
+/// reentrant-aware (it's a `tokio::sync::Mutex` acquired once per process)
+/// and a sync test uses `blocking_lock`. We do not call `lock()` again here
+/// because the fake's `EnvGuard` only mutates `PATH` and we want to keep that
+/// critical section explicit at the test.
+pub(crate) fn with_fake_service_manager<F: FnOnce(&FakeServiceManager)>(f: F) {
+    let _lock = ENV_LOCK.blocking_lock();
+    let fake = FakeServiceManager::new();
+    f(&fake);
+}
+
+/// A single shell script that handles every program name in `$0`. Logs every
+/// call, writes a marker on restart, and answers the queries the production
+/// code sends so the test takes the "active / will restart" branch when the
+/// guard is removed (the mutation scenario).
+const FAKE_SERVICE_MANAGER_SCRIPT: &str = r#"#!/bin/sh
+PROG="$(basename "$0")"
+DIR="$(dirname "$0")"
+MARKER="$DIR/$PROG.restarted.marker"
+LOG="$DIR/$PROG.log"
+
+echo "$@" >> "$LOG"
+
+case "$PROG" in
+  systemctl)
+    # Strip option flags so the first positional arg is the action.
+    ACTION=""
+    for arg in "$@"; do
+      case "$arg" in
+        --user|--no-block|--no-pager) continue ;;
+      esac
+      ACTION="$arg"
+      break
+    done
+    case "$ACTION" in
+      restart) echo "restarted $(date +%s.%N)" >> "$MARKER"; exit 0 ;;
+      is-active) echo "active"; exit 0 ;;
+      status) echo "active"; exit 0 ;;
+      cat) cat <<'EOF'
+[Unit]
+Description=test
+EOF
+        exit 0 ;;
+    esac
+    exit 0
+    ;;
+  launchctl)
+    case "$1" in
+      list) exit 0 ;;
+    esac
+    exit 0
+    ;;
+  rc-service)
+    case "$2" in
+      status) echo "started"; exit 0 ;;
+      restart) echo "restarted $(date +%s.%N)" >> "$MARKER"; exit 0 ;;
+    esac
+    exit 0
+    ;;
+  rc-update|schtasks)
+    exit 0
+    ;;
+esac
+exit 0
+"#;
