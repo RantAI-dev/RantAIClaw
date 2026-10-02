@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 36;
+pub const CURRENT_VERSION: u32 = 37;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -477,7 +477,16 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v36(raw);
     }
 
-    // Future migrations (v37, …) inserted here in order.
+    // v36 → v37: the default of `[memory].min_relevance_score` moves from
+    // 0.4 to 0.6, because recall now scores whole words on an absolute scale.
+    // `Config::save()` writes the key into almost every config, so the new
+    // default alone would move nothing on an existing install; an exact 0.4
+    // is rewritten and any other value is kept.
+    if from < 37 {
+        migrate_v37(raw);
+    }
+
+    // Future migrations (v38, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -893,6 +902,35 @@ fn set_schema_version(raw: &mut Value, version: u32) -> Result<()> {
         Value::Integer(i64::from(version)),
     );
     Ok(())
+}
+
+/// v36 → v37: `[memory].min_relevance_score` moves from 0.4 to 0.6.
+///
+/// The old default was written into nearly every config by `save()` and by the
+/// wizard, so a changed default reaches no existing install on its own. This
+/// step rewrites the old default and nothing else.
+///
+/// "Exact" means a TOML float that equals the f64 the literal `0.4` parses to,
+/// so `0.4`, `0.40` and `4e-1` all match. An integer, a string, or any other
+/// float is the operator's value and stays. An absent key stays absent, so the
+/// serde default applies, and no `[memory]` table is invented.
+///
+/// The step cannot tell a 0.4 the operator chose from a 0.4 the old default
+/// wrote. An operator who chose 0.4 on purpose must set it again.
+///
+/// A pure `toml::Value` transform with no I/O, like every other `migrate_vN`.
+fn migrate_v37(raw: &mut Value) {
+    let Some(score) = raw
+        .as_table_mut()
+        .and_then(|root| root.get_mut("memory"))
+        .and_then(Value::as_table_mut)
+        .and_then(|memory| memory.get_mut("min_relevance_score"))
+    else {
+        return;
+    };
+    if matches!(score, Value::Float(f) if *f == 0.4) {
+        *score = Value::Float(0.6);
+    }
 }
 
 #[cfg(test)]
@@ -2275,6 +2313,144 @@ allowed_users = ["*"]
             cfg.is_ok(),
             "post-v36 config must deserialise into Config: {:?}",
             cfg.err()
+        );
+    }
+
+    // ── v37: the relevance floor moves from 0.4 to 0.6 ──────────────────────
+    //
+    // `Config::save()` writes `min_relevance_score` into almost every config,
+    // so the new default alone would move nothing on an existing install. The
+    // step rewrites an exact `0.4` and nothing else.
+
+    fn min_relevance_score_of(v: &Value) -> Option<&Value> {
+        v.get("memory")?.get("min_relevance_score")
+    }
+
+    /// A config carrying the old default gets the new one, and the stamp moves.
+    #[test]
+    fn v37_rewrites_the_old_default_relevance_score() {
+        let mut v = parse(
+            "schema_version = 36\n\
+             [memory]\n\
+             backend = \"sqlite\"\n\
+             min_relevance_score = 0.4\n",
+        );
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(version_of(&v), Some(37));
+        assert_eq!(
+            min_relevance_score_of(&v).and_then(Value::as_float),
+            Some(0.6)
+        );
+        assert_eq!(
+            v.get("memory")
+                .and_then(|m| m.get("backend"))
+                .and_then(Value::as_str),
+            Some("sqlite"),
+            "the other [memory] keys must survive"
+        );
+    }
+
+    /// Any other value is the operator's choice and is kept as written.
+    #[test]
+    fn v37_keeps_a_relevance_score_that_is_not_the_old_default() {
+        for kept in ["0.55", "0.0", "0.8", "0.41", "0.6"] {
+            let mut v = parse(&format!(
+                "schema_version = 36\n[memory]\nmin_relevance_score = {kept}\n"
+            ));
+            assert!(migrate(&mut v).expect("migration runs"));
+            let expected: f64 = kept.parse().expect("a float literal");
+            assert_eq!(
+                min_relevance_score_of(&v).and_then(Value::as_float),
+                Some(expected),
+                "{kept} must be kept as written"
+            );
+        }
+    }
+
+    /// "Exact" means the float the literal `0.4` parses to, whatever way the
+    /// TOML spells it. An integer or a string is a different value and stays.
+    #[test]
+    fn v37_matches_the_float_but_not_other_types() {
+        for spelled in ["0.4", "0.40", "4e-1", "+0.4"] {
+            let mut v = parse(&format!(
+                "schema_version = 36\n[memory]\nmin_relevance_score = {spelled}\n"
+            ));
+            migrate(&mut v).expect("migration runs");
+            assert_eq!(
+                min_relevance_score_of(&v).and_then(Value::as_float),
+                Some(0.6),
+                "{spelled} is the old default"
+            );
+        }
+        for other in ["0", "\"0.4\"", "true"] {
+            let mut v = parse(&format!(
+                "schema_version = 36\n[memory]\nmin_relevance_score = {other}\n"
+            ));
+            let before = min_relevance_score_of(&v).cloned();
+            migrate(&mut v).expect("migration runs");
+            assert_eq!(
+                min_relevance_score_of(&v).cloned(),
+                before,
+                "{other} is not the float 0.4 and must be left alone"
+            );
+        }
+    }
+
+    /// A config without the key stays without it, so the serde default (0.6)
+    /// applies. Writing the key would freeze today's default into the file.
+    #[test]
+    fn v37_leaves_an_absent_key_absent_and_loads_the_new_default() {
+        let mut v = parse("schema_version = 36\n[memory]\nbackend = \"sqlite\"\n");
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert!(
+            min_relevance_score_of(&v).is_none(),
+            "the key must not be invented: {v:?}"
+        );
+        let cfg: crate::config::Config = v.try_into().expect("the migrated config loads");
+        assert_eq!(cfg.memory.min_relevance_score, 0.6);
+    }
+
+    /// A config with no `[memory]` section gets no `[memory]` section.
+    #[test]
+    fn v37_does_not_invent_a_memory_section() {
+        let mut v = parse("schema_version = 36\n[agent]\nmax_tool_iterations = 25\n");
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert!(v.get("memory").is_none(), "no [memory] table: {v:?}");
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+    }
+
+    /// Running the chain again changes nothing: the second run sees the new
+    /// stamp and skips, and the step itself maps its own output to itself.
+    #[test]
+    fn v37_is_idempotent() {
+        let mut v = parse("schema_version = 36\n[memory]\nmin_relevance_score = 0.4\n");
+        assert!(migrate(&mut v).expect("first run"));
+        let after_first = v.clone();
+        assert!(!migrate(&mut v).expect("second run"), "already current");
+        assert_eq!(v, after_first);
+
+        migrate_v37(&mut v);
+        assert_eq!(v, after_first, "the step maps its own output to itself");
+    }
+
+    /// An older config walks the whole chain and the old default still lands
+    /// on the new one.
+    #[test]
+    fn v37_applies_to_a_config_older_than_36() {
+        let mut v = parse("schema_version = 20\n[memory]\nmin_relevance_score = 0.4\n");
+        assert!(migrate(&mut v).expect("migration runs"));
+        assert_eq!(
+            min_relevance_score_of(&v).and_then(Value::as_float),
+            Some(0.6)
+        );
+    }
+
+    /// The default a fresh install gets is the value the step migrates to.
+    #[test]
+    fn v37_target_is_the_default_a_fresh_install_gets() {
+        assert_eq!(
+            crate::config::Config::default().memory.min_relevance_score,
+            0.6
         );
     }
 }

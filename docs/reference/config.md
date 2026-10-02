@@ -525,7 +525,7 @@ Notes:
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `none`. An unrecognised value is a startup error, not a fallback |
 | `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded). Auto-saved turns are stored under the `conversation` category: retained, searchable via `memory_recall`, but **never auto-injected into prompts** |
-| `min_relevance_score` | `0.4` | drop recalled entries scoring below this. See _Scores are relative_ below |
+| `min_relevance_score` | `0.6` | drop recalled entries scoring below this. See _Scores are absolute_ below. Config schema 37 moved the default from `0.4` (see [v37](#v37-the-relevance-floor-moves-from-04-to-06)) |
 | `embedding_provider` | `none` | `none`, `openai`, `openrouter`, `minimax`, or `custom:<base-url>` |
 | `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` to use an `[[embedding_routes]]` entry |
 | `embedding_dimensions` | `1536` | vector size the model emits. A mismatch disables vector search — see below |
@@ -618,7 +618,9 @@ corpus-dependent magnitude is not the score. Hybrid recall averages over the
 signals a document actually has.
 
 So `min_relevance_score` is a real floor: a result set where every hit is weak
-is rejected **whole**, and a query with no relevant memory injects nothing.
+is rejected **whole**, and a query with no relevant memory injects nothing. At
+the default `0.6`, a note must hold at least three in five of the question's
+meaningful words to reach the prompt (keyword-only recall).
 (Scores used to be relative to the best hit in the set — the top hit was always
 rescaled to `1.0`, so the floor could trim the tail but never say "nothing here
 is relevant", and something was injected on nearly every turn.)
@@ -948,6 +950,26 @@ is refused rather than half-understood.
 
 Migrations only move forward. There is no automatic downgrade, so reverting to a
 binary older than your config's `schema_version` needs a manual edit.
+
+### v37: the relevance floor moves from 0.4 to 0.6
+
+`[memory].min_relevance_score` defaults to `0.6` instead of `0.4`. Recall now
+scores whole words on an absolute scale and drops common English and Indonesian
+words from the question. On a fixed set of 28 wanted and 62 unwanted notes, `0.4`
+keeps 27 wanted notes and lets 9 unwanted ones through, and `0.6` keeps 26 and
+lets 2 through.
+
+`Config::save()` wrote `0.4` into almost every config, so the default alone
+would move no existing install. Existing configs rewrite a `min_relevance_score`
+of exactly `0.4` to `0.6` on load (config schema **36 → 37**). Any other value
+is kept as written, and a config without the key gets the new default. The
+migration cannot tell a `0.4` the operator chose from a `0.4` the old default
+wrote, so **an operator who chose `0.4` on purpose must set it again** after the
+upgrade.
+
+A config written by this schema is refused by a binary that knows only schema
+36. Keep `config.toml.bak`, which the migrator leaves next to `config.toml`, to
+go back.
 
 ### v36: hardware sections and native browser keys retired
 

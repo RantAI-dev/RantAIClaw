@@ -18,6 +18,7 @@
 //! `recall_threshold_sweep` prints how many wanted notes survive and how many
 //! unwanted ones leak at each `min_relevance_score`, for choosing the default.
 
+use rantaiclaw::config::MemoryConfig;
 use rantaiclaw::memory::{
     build_memory_context_in_view, Memory, MemoryCategory, MemoryContextLimits, MemoryView,
     SqliteMemory,
@@ -26,8 +27,12 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-/// The `min_relevance_score` the fixture is judged at.
-const THRESHOLD: f64 = 0.6;
+/// The `min_relevance_score` the fixture is judged at: the one a fresh install
+/// gets. The recorded baseline names the threshold it was taken at, so a change
+/// of the default fails here until the baseline is recorded again.
+fn threshold() -> f64 {
+    MemoryConfig::default().min_relevance_score
+}
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -152,7 +157,7 @@ fn baseline_of(outcomes: &[Outcome]) -> Value {
             )
         })
         .collect();
-    json!({ "threshold": THRESHOLD, "questions": questions })
+    json!({ "threshold": threshold(), "questions": questions })
 }
 
 #[test]
@@ -166,9 +171,9 @@ fn the_fixture_has_thirty_questions_and_half_are_indonesian() {
 
 #[tokio::test]
 async fn recall_quality_does_not_regress_against_the_baseline() {
-    let outcomes = run(THRESHOLD).await;
+    let outcomes = run(threshold()).await;
 
-    eprintln!("threshold {THRESHOLD}");
+    eprintln!("threshold {}", threshold());
     for o in &outcomes {
         eprintln!(
             "{} [{}] kept {}/{} leaked {}/{} injected {:?}  {}",
@@ -192,7 +197,7 @@ async fn recall_quality_does_not_regress_against_the_baseline() {
     let baseline = read_json("baseline.json");
     assert_eq!(
         baseline["threshold"].as_f64().unwrap(),
-        THRESHOLD,
+        threshold(),
         "the baseline was recorded at another threshold"
     );
     let mut regressions = Vec::new();

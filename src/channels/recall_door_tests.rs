@@ -33,7 +33,7 @@ impl Door {
         );
         let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
         inner.memory = Arc::new(memory);
-        inner.min_relevance_score = 0.4;
+        inner.min_relevance_score = crate::config::MemoryConfig::default().min_relevance_score;
         inner.approval_owners = Arc::new(vec![owner.to_string()]);
         Self {
             ctx,
