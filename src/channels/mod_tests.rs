@@ -2361,7 +2361,7 @@ async fn process_channel_message_handles_models_command_without_llm_call() {
         multimodal: crate::config::MultimodalConfig::default(),
         security: Arc::new(crate::security::SecurityPolicy::default()),
         channel_approval: None,
-        approval_owners: Arc::new(Vec::new()),
+        approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
@@ -6497,11 +6497,15 @@ async fn a_model_switch_in_a_telegram_dm_reaches_the_next_message() {
     let channel_impl = Arc::new(TelegramRecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
     let provider_impl = Arc::new(ModelCaptureProvider::default());
-    let ctx = dispatch_ctx(
+    let mut ctx = dispatch_ctx(
         vec![channel],
         provider_impl.clone(),
         routing::RuntimeConfigSlot::default(),
     );
+    // Switching the model runs on the owner's keys, so the sender is the owner.
+    Arc::get_mut(&mut ctx)
+        .expect("the context is not shared yet")
+        .approval_owners = Arc::new(vec!["555".to_string()]);
 
     for (message_id, text) in [
         (383, "/model switched-model"),
@@ -6776,11 +6780,17 @@ async fn every_slash_command_gets_the_runtime_answer_its_channel_owes() {
         ));
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(ModelCaptureProvider::default());
-        let ctx = dispatch_ctx(
+        let mut ctx = dispatch_ctx(
             vec![channel],
             provider_impl.clone(),
             routing::RuntimeConfigSlot::default(),
         );
+        // Every channel's parser names a different sender. Only an owner is
+        // offered every command, so the sender is an owner here to check how
+        // each listing and reply spells the commands it names.
+        Arc::get_mut(&mut ctx)
+            .expect("the context is not shared yet")
+            .approval_owners = Arc::new(vec!["*".to_string()]);
 
         for ((id, text), want) in (1u32..).zip(inputs).zip(expected) {
             let calls_before = provider_impl.call_count.load(Ordering::SeqCst);
@@ -6914,11 +6924,17 @@ async fn every_command_a_runtime_reply_names_is_one_its_channel_accepts() {
         let channel_impl = Arc::new(AddressRecordingChannel::named(channel_name));
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(ModelCaptureProvider::default());
-        let ctx = dispatch_ctx(
+        let mut ctx = dispatch_ctx(
             vec![channel],
             provider_impl.clone(),
             routing::RuntimeConfigSlot::default(),
         );
+        // Every channel's parser names a different sender. A refused switch
+        // names no command, so the sender is an owner here to check how the
+        // switch replies spell the commands they name.
+        Arc::get_mut(&mut ctx)
+            .expect("the context is not shared yet")
+            .approval_owners = Arc::new(vec!["*".to_string()]);
 
         let commands = ["model", "models", "models no-such-provider", "model x"];
         for (id, command) in (1u32..).zip(commands) {

@@ -818,14 +818,29 @@ pub(crate) async fn process_channel_message(
             return TurnEnd::NotStarted;
         }
     }
-    if commands::handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await
+    // Owner status decides the runtime commands (switching the route spends the
+    // owner's keys, clearing a group's history changes what others see) and
+    // drives the prompt, the memory-context view, the tool registry, the persona
+    // and safety text and the capability ceiling below. Computed once, before
+    // the commands, so they never disagree.
+    let runtime_defaults = routing::runtime_defaults_snapshot(ctx.as_ref());
+    let sender_is_owner = crate::approval::can_approve_any(
+        &runtime_defaults.approval_owners,
+        msg.sender_identities(),
+    );
+    if commands::handle_runtime_command_if_needed(
+        ctx.as_ref(),
+        &msg,
+        target_channel.as_ref(),
+        sender_is_owner,
+    )
+    .await
     {
         return TurnEnd::Finished;
     }
 
     let history_key = conversation_history_key(&msg);
     let route = routing::get_route_selection(ctx.as_ref(), &history_key);
-    let runtime_defaults = routing::runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match routing::get_or_create_provider(ctx.as_ref(), &route.provider).await
     {
         Ok(provider) => provider,
@@ -874,15 +889,6 @@ pub(crate) async fn process_channel_message(
 
     tracing::info!("processing channel message");
     let started_at = Instant::now();
-
-    // Owner status drives the prompt (tell the model the sender is an owner so
-    // it doesn't self-refuse owner-only tools), the memory-context view, the
-    // tool registry, the persona and safety text, and the capability ceiling,
-    // all below. Compute once so they never disagree.
-    let sender_is_owner = crate::approval::can_approve_any(
-        &runtime_defaults.approval_owners,
-        msg.sender_identities(),
-    );
 
     // What this turn may read from memory. Only a named owner in a chat the
     // platform marked as a direct message sees all of it. Everyone else, an

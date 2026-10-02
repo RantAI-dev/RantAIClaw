@@ -229,10 +229,50 @@ fn addressed_to_this_bot(addressed_to: &str, bot_username: Option<&str>) -> bool
     bot_username.is_some_and(|own| own.eq_ignore_ascii_case(addressed_to))
 }
 
+/// What a sender may run in the chat a command arrived in.
+///
+/// A command that spends the owner's keys or changes what other people see is
+/// the owner's. A command that changes only the sender's own conversation is
+/// the sender's, and the only conversation that is the sender's alone is a
+/// direct chat: a group, or a chat the platform did not mark as direct, shares
+/// one history and one route between everyone in it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommandAccess {
+    sender_is_owner: bool,
+    is_direct: bool,
+}
+
+impl CommandAccess {
+    /// Switching the provider or the model, which runs on the owner's keys.
+    fn may_switch_route(self) -> bool {
+        self.sender_is_owner
+    }
+
+    /// Clearing the conversation's history.
+    fn may_reset(self) -> bool {
+        self.sender_is_owner || self.is_direct
+    }
+
+    fn may_run(self, command: &ChannelRuntimeCommand) -> bool {
+        match command {
+            ChannelRuntimeCommand::SetProvider(_) | ChannelRuntimeCommand::SetModel(_) => {
+                self.may_switch_route()
+            }
+            ChannelRuntimeCommand::Reset => self.may_reset(),
+            ChannelRuntimeCommand::ShowProviders
+            | ChannelRuntimeCommand::ShowModel
+            | ChannelRuntimeCommand::Welcome
+            | ChannelRuntimeCommand::UnknownCommand(_)
+            | ChannelRuntimeCommand::AddressedElsewhere => true,
+        }
+    }
+}
+
 pub(crate) fn build_models_help_response(
     current: &ChannelRouteSelection,
     workspace_dir: &Path,
     prefix: &str,
+    access: CommandAccess,
 ) -> String {
     let mut response = String::new();
     let _ = writeln!(
@@ -240,7 +280,9 @@ pub(crate) fn build_models_help_response(
         "Current provider: `{}`\nCurrent model: `{}`",
         current.provider, current.model
     );
-    let _ = writeln!(response, "\nSwitch model with `{prefix}model <model-id>`.");
+    if access.may_switch_route() {
+        let _ = writeln!(response, "\nSwitch model with `{prefix}model <model-id>`.");
+    }
 
     let cached_models = routing::load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
@@ -266,6 +308,7 @@ pub(crate) fn build_models_help_response(
 pub(crate) fn build_providers_help_response(
     current: &ChannelRouteSelection,
     prefix: &str,
+    access: CommandAccess,
 ) -> String {
     let mut response = String::new();
     let _ = writeln!(
@@ -273,11 +316,15 @@ pub(crate) fn build_providers_help_response(
         "Current provider: `{}`\nCurrent model: `{}`",
         current.provider, current.model
     );
-    let _ = writeln!(
-        response,
-        "\nSwitch provider with `{prefix}models <provider>`."
-    );
-    let _ = writeln!(response, "Switch model with `{prefix}model <model-id>`.\n");
+    if access.may_switch_route() {
+        let _ = writeln!(
+            response,
+            "\nSwitch provider with `{prefix}models <provider>`."
+        );
+        let _ = writeln!(response, "Switch model with `{prefix}model <model-id>`.\n");
+    } else {
+        response.push('\n');
+    }
     response.push_str("Available providers:\n");
     for provider in providers::list_providers() {
         if provider.aliases.is_empty() {
@@ -319,33 +366,53 @@ fn model_switched_message(model: &str, provider: &str) -> String {
     )
 }
 
-/// The runtime commands a slash channel answers, one line each. Every reply
-/// that lists commands uses this, so a new command is listed everywhere or
-/// nowhere.
-fn command_list(prefix: &str) -> String {
-    format!(
-        "- `{prefix}model` shows the model; `{prefix}model <model-id>` switches it for this conversation.\n\
-         - `{prefix}models` lists providers; `{prefix}models <provider>` switches the provider.\n\
-         - `{prefix}new` or `{prefix}clear` clears this conversation's history. Long-term memory stays.\n"
-    )
+/// The reply to a command the sender may not run. It changes nothing and the
+/// message does not go on to the model.
+const OWNER_ONLY_MESSAGE: &str = "That command is for the owner of this bot, so nothing changed.";
+
+/// The runtime commands a slash channel answers, one line each, limited to the
+/// ones `access` lets the sender run. Every reply that lists commands uses
+/// this, so a new command is listed everywhere or nowhere, and a listing never
+/// advertises a command the sender would be refused.
+fn command_list(prefix: &str, access: CommandAccess) -> String {
+    let mut list = String::new();
+    if access.may_switch_route() {
+        let _ = writeln!(
+            list,
+            "- `{prefix}model` shows the model; `{prefix}model <model-id>` switches it for this conversation.\n\
+             - `{prefix}models` lists providers; `{prefix}models <provider>` switches the provider."
+        );
+    } else {
+        let _ = writeln!(
+            list,
+            "- `{prefix}model` shows the model.\n- `{prefix}models` lists providers."
+        );
+    }
+    if access.may_reset() {
+        let _ = writeln!(
+            list,
+            "- `{prefix}new` or `{prefix}clear` clears this conversation's history. Long-term memory stays."
+        );
+    }
+    list
 }
 
 /// The reply to `/start`, which Telegram sends when someone first opens the
 /// bot, and to `/help`.
-fn welcome_message(prefix: &str) -> String {
+fn welcome_message(prefix: &str, access: CommandAccess) -> String {
     format!(
         "Hi. Send a message and I will answer it. Commands:\n{}",
-        command_list(prefix)
+        command_list(prefix, access)
     )
 }
 
 /// The reply to a slash command that does not exist. It used to reach the
 /// model, which invented a result: `/clear` was answered "session cleared"
 /// while the conversation kept every turn.
-fn unknown_command_message(command: &str, prefix: &str) -> String {
+fn unknown_command_message(command: &str, prefix: &str, access: CommandAccess) -> String {
     format!(
         "`{command}` is not a command here, so nothing ran. Commands:\n{}",
-        command_list(prefix)
+        command_list(prefix, access)
     )
 }
 
@@ -371,6 +438,7 @@ pub(crate) async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
+    sender_is_owner: bool,
 ) -> bool {
     // Asked before parsing, because whether this is a command at all depends on
     // whose name it carries — but only when it carries one. Telegram caches the
@@ -398,9 +466,18 @@ pub(crate) async fn handle_runtime_command_if_needed(
     let mut current = routing::get_route_selection(ctx, &sender_key);
     // Every command a reply names is spelled the way this channel can send it.
     let prefix = command_prefix(&msg.channel);
+    let access = CommandAccess {
+        sender_is_owner,
+        is_direct: msg.is_direct,
+    };
 
     let response = match command {
-        ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current, prefix),
+        // Decided before any arm acts, so a refused command looks no provider up
+        // and touches neither the route nor the history.
+        _ if !access.may_run(&command) => OWNER_ONLY_MESSAGE.to_string(),
+        ChannelRuntimeCommand::ShowProviders => {
+            build_providers_help_response(&current, prefix, access)
+        }
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match routing::resolve_provider_alias(&raw_provider) {
                 Some(provider_name) => {
@@ -428,7 +505,7 @@ pub(crate) async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path(), prefix)
+            build_models_help_response(&current, ctx.workspace_dir.as_path(), prefix, access)
         }
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
@@ -442,14 +519,16 @@ pub(crate) async fn handle_runtime_command_if_needed(
                 model_switched_message(&model, &current.provider)
             }
         }
-        ChannelRuntimeCommand::Welcome => welcome_message(prefix),
+        ChannelRuntimeCommand::Welcome => welcome_message(prefix, access),
         ChannelRuntimeCommand::Reset => {
             // This conversation's key only: another chat, topic or thread
             // keeps its history.
             history::clear_sender_history(ctx, &sender_key);
             reset_message(&msg.channel)
         }
-        ChannelRuntimeCommand::UnknownCommand(command) => unknown_command_message(&command, prefix),
+        ChannelRuntimeCommand::UnknownCommand(command) => {
+            unknown_command_message(&command, prefix, access)
+        }
         ChannelRuntimeCommand::AddressedElsewhere => return true,
     };
 
@@ -523,6 +602,83 @@ mod tests {
                 n + 1
             );
         }
+    }
+
+    /// The owner's listing is the full set, spelled as it always was, and a
+    /// sender's listing drops what the sender would be refused. The expected text
+    /// is written out, not built from the function under test.
+    #[test]
+    fn a_command_listing_is_the_full_set_for_an_owner_and_the_allowed_set_for_a_guest() {
+        let owner = CommandAccess {
+            sender_is_owner: true,
+            is_direct: false,
+        };
+        assert_eq!(
+            command_list("/", owner),
+            "- `/model` shows the model; `/model <model-id>` switches it for this conversation.\n\
+             - `/models` lists providers; `/models <provider>` switches the provider.\n\
+             - `/new` or `/clear` clears this conversation's history. Long-term memory stays.\n"
+        );
+
+        let guest_in_a_dm = CommandAccess {
+            sender_is_owner: false,
+            is_direct: true,
+        };
+        assert_eq!(
+            command_list("/", guest_in_a_dm),
+            "- `/model` shows the model.\n\
+             - `/models` lists providers.\n\
+             - `/new` or `/clear` clears this conversation's history. Long-term memory stays.\n"
+        );
+
+        let guest_in_a_group = CommandAccess {
+            sender_is_owner: false,
+            is_direct: false,
+        };
+        assert_eq!(
+            command_list("/", guest_in_a_group),
+            "- `/model` shows the model.\n- `/models` lists providers.\n"
+        );
+    }
+
+    /// The read-only replies keep the owner's text as it was, and drop only the
+    /// "Switch ... with" hints for a sender who would be refused the switch. The
+    /// expected text is written out, not built from the functions under test.
+    #[test]
+    fn the_read_only_replies_hint_a_switch_only_to_an_owner() {
+        let owner = CommandAccess {
+            sender_is_owner: true,
+            is_direct: true,
+        };
+        let guest = CommandAccess {
+            sender_is_owner: false,
+            is_direct: true,
+        };
+        let current = ChannelRouteSelection {
+            provider: "p".to_string(),
+            model: "m".to_string(),
+        };
+        let empty_workspace = tempfile::TempDir::new().expect("temp workspace");
+
+        assert_eq!(
+            build_models_help_response(&current, empty_workspace.path(), "/", owner),
+            "Current provider: `p`\nCurrent model: `m`\n\nSwitch model with `/model <model-id>`.\n\n\
+             No cached model list found for `p`. Ask the operator to run `rantaiclaw models refresh --provider p`.\n"
+        );
+        assert_eq!(
+            build_models_help_response(&current, empty_workspace.path(), "/", guest),
+            "Current provider: `p`\nCurrent model: `m`\n\n\
+             No cached model list found for `p`. Ask the operator to run `rantaiclaw models refresh --provider p`.\n"
+        );
+        assert!(
+            build_providers_help_response(&current, "/", owner).starts_with(
+                "Current provider: `p`\nCurrent model: `m`\n\n\
+             Switch provider with `/models <provider>`.\nSwitch model with `/model <model-id>`.\n\n\
+             Available providers:\n"
+            )
+        );
+        assert!(build_providers_help_response(&current, "/", guest)
+            .starts_with("Current provider: `p`\nCurrent model: `m`\n\nAvailable providers:\n"));
     }
 
     /// F-23, the red-first test: a known command carrying someone else's name

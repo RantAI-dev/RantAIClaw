@@ -278,9 +278,22 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 When running `rantaiclaw channel start` (or daemon mode), the four tier channels (Telegram, Discord, Slack and WhatsApp Web) support runtime switching, scoped to the conversation:
 
 - `/models` — show available providers and current selection
-- `/models <provider>` — switch provider for the current conversation. In a group that applies to everyone in it
+- `/models <provider>` — switch provider for the current conversation. Owner only. In a group that applies to everyone in it
 - `/model` — show current model and cached model IDs (if available)
-- `/model <model-id>` — switch model for the current conversation. In a group that applies to everyone in it
+- `/model <model-id>` — switch model for the current conversation. Owner only. In a group that applies to everyone in it
+
+**Who may run what.** A switch runs on the owner's provider keys, so only an owner may make one.
+An owner is a sender listed in `approval_owners` (`["*"]` makes everyone an owner); with an empty
+list nobody can switch from chat, so add the operator's identity to `approval_owners` in
+`[channels_config]`. A guest who sends `/models <provider>` or `/model <model-id>` gets
+one line saying the command is for the owner, and the route and the history stay as they were. The
+read-only forms `/models`, `/model`, `/start` and `/help` answer everyone. `/new` and `/clear` are
+open in a direct chat, where they clear only the sender's own conversation, and owner only in a group
+or in a chat the platform did not mark as direct. WhatsApp Cloud never marks a chat as direct, so
+`/new` there is owner only even in a one-to-one chat. Telegram, Discord, Lark and WhatsApp Web mark
+direct chats, and Slack has no reset command. `/start`, `/help`, `/models`, `/model` and the
+unknown-command reply list only the commands the sender can run in that chat, and offer a switch only
+to an owner.
 
 **Slack takes the same commands without the slash:** `models`, `models <provider>`, `model` and
 `model <model-id>`. Slack's client treats a message that starts with `/` as one of its own slash

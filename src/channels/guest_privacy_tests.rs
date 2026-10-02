@@ -4068,3 +4068,475 @@ async fn a_save_before_a_timeout_is_still_noted() {
     );
     assert_eq!(noted_lines(reply), 1, "{reply}");
 }
+
+// ── Routing commands ─────────────────────────────────────────────────────
+
+const REFUSAL: &str = "That command is for the owner of this bot, so nothing changed.";
+const DIRECT_CHAT: &str = "chat-direct";
+const OTHER_DIRECT_CHAT: &str = "chat-other-direct";
+const GROUP_CHAT: &str = "chat-group";
+
+/// A chat the runtime commands are on for: a Telegram-named channel, one
+/// provider that counts its calls, and a second provider (`openrouter`) a
+/// switch can move to.
+///
+/// The runtime defaults are seeded the way a daemon that has loaded its config
+/// has them, so the owner list a command sees is the one the rest of the turn
+/// sees.
+struct CommandChat {
+    ctx: Arc<ChannelRuntimeContext>,
+    channel: Arc<TelegramRecordingChannel>,
+    provider: Arc<HistoryCaptureProvider>,
+    next_message: std::sync::atomic::AtomicUsize,
+    _audit: crate::test_env::EnvGuard,
+    _lock: crate::test_env::EnvAuditRedirect,
+}
+
+/// What one conversation holds: the route it runs on and the turns it keeps.
+#[derive(Debug, PartialEq)]
+struct ChatState {
+    route: ChannelRouteSelection,
+    history: Vec<(String, String)>,
+}
+
+impl CommandChat {
+    async fn start(owners: &[&str]) -> Self {
+        let (lock, audit) = crate::test_env::redirect_audit_temp().await;
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let provider = Arc::new(HistoryCaptureProvider::default());
+        let as_channel: Arc<dyn Channel> = channel.clone();
+        let ctx = dispatch_ctx(
+            vec![as_channel],
+            provider.clone(),
+            seeded_defaults_slot(
+                crate::approval::policy_writer::PolicyPreset::Manual,
+                gate_of(&[]),
+            ),
+        );
+        ctx.runtime_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .as_mut()
+            .expect("the slot is seeded")
+            .defaults
+            .approval_owners = Arc::new(owners.iter().map(|o| (*o).to_string()).collect());
+        let as_provider: Arc<dyn Provider> = provider.clone();
+        ctx.provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("openrouter".to_string(), as_provider);
+        Self {
+            ctx,
+            channel,
+            provider,
+            next_message: std::sync::atomic::AtomicUsize::new(0),
+            _audit: audit,
+            _lock: lock,
+        }
+    }
+
+    fn message(
+        &self,
+        sender: &str,
+        chat: &str,
+        is_direct: bool,
+        content: &str,
+    ) -> traits::ChannelMessage {
+        let id = self
+            .next_message
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            ..channel_message_in(sender, chat, content, &format!("cmd-{id}"), is_direct)
+        }
+    }
+
+    /// Sends `content` and returns the text of every reply it produced.
+    async fn say(&self, sender: &str, chat: &str, is_direct: bool, content: &str) -> Vec<String> {
+        let before = self.channel.sent_messages.lock().await.len();
+        process_channel_message(
+            Arc::clone(&self.ctx),
+            self.message(sender, chat, is_direct, content),
+            CancellationToken::new(),
+        )
+        .await;
+        self.channel.sent_messages.lock().await[before..]
+            .iter()
+            .map(|line| {
+                line.split_once(':')
+                    .map_or(line.clone(), |(_, text)| text.to_string())
+            })
+            .collect()
+    }
+
+    /// Gives `chat` a conversation to lose: one ordinary exchange.
+    async fn seed(&self, sender: &str, chat: &str, is_direct: bool) {
+        let replies = self
+            .say(sender, chat, is_direct, "remember the colour blue")
+            .await;
+        assert_eq!(replies.len(), 1, "control: the exchange was answered");
+        assert!(
+            !self.state(chat, is_direct).history.is_empty(),
+            "control: the exchange is in the history"
+        );
+    }
+
+    fn state(&self, chat: &str, is_direct: bool) -> ChatState {
+        let key = conversation_history_key(&self.message("probe", chat, is_direct, "probe"));
+        let history = self
+            .ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .map(|turns| {
+                turns
+                    .iter()
+                    .map(|turn| (turn.role.clone(), turn.content.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ChatState {
+            route: routing::get_route_selection(self.ctx.as_ref(), &key),
+            history,
+        }
+    }
+
+    fn model_calls(&self) -> usize {
+        self.provider
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+}
+
+/// The two chat kinds a command can arrive in.
+const DIRECT_AND_GROUP: [(&str, bool); 2] = [(DIRECT_CHAT, true), (GROUP_CHAT, false)];
+
+/// Sends `command` as `sender` in a conversation that already has a history and
+/// asserts it was refused: the reply is the refusal alone, the model was not
+/// called, and neither the route nor the history moved.
+async fn assert_refused(sender: &str, owners: &[&str], is_direct: bool, command: &str) {
+    let chat = if is_direct { DIRECT_CHAT } else { GROUP_CHAT };
+    let fixture = CommandChat::start(owners).await;
+    fixture.seed(sender, chat, is_direct).await;
+    let before = fixture.state(chat, is_direct);
+    let calls_before = fixture.model_calls();
+
+    let replies = fixture.say(sender, chat, is_direct, command).await;
+
+    assert_eq!(
+        replies,
+        [REFUSAL],
+        "{command:?} in a chat with is_direct={is_direct}"
+    );
+    assert_eq!(
+        fixture.state(chat, is_direct),
+        before,
+        "{command:?} in a chat with is_direct={is_direct} changed the conversation"
+    );
+    assert_eq!(
+        fixture.model_calls(),
+        calls_before,
+        "{command:?} reached the model"
+    );
+}
+
+#[tokio::test]
+async fn a_guest_model_switch_is_refused_and_changes_nothing_in_a_dm_and_a_group() {
+    for (_, is_direct) in DIRECT_AND_GROUP {
+        assert_refused(GUEST_SENDER, &[OWNER_SENDER], is_direct, "/model gpt-5").await;
+    }
+}
+
+#[tokio::test]
+async fn a_guest_provider_switch_is_refused_and_changes_nothing_in_a_dm_and_a_group() {
+    for (_, is_direct) in DIRECT_AND_GROUP {
+        // A valid provider and one that does not exist: the refusal comes before
+        // either is looked up.
+        for command in ["/models openrouter", "/models no-such-provider"] {
+            assert_refused(GUEST_SENDER, &[OWNER_SENDER], is_direct, command).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_owner_model_switch_takes_effect_in_a_dm_and_a_group() {
+    for (chat, is_direct) in DIRECT_AND_GROUP {
+        let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+        fixture.seed(OWNER_SENDER, chat, is_direct).await;
+
+        let replies = fixture
+            .say(OWNER_SENDER, chat, is_direct, "/model gpt-5")
+            .await;
+
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert!(
+            replies[0].starts_with("Model switched to `gpt-5`"),
+            "{replies:?}"
+        );
+        let after = fixture.state(chat, is_direct);
+        assert_eq!(after.route.model, "gpt-5", "is_direct={is_direct}");
+        assert!(after.history.is_empty(), "the switch clears the history");
+    }
+}
+
+#[tokio::test]
+async fn an_owner_provider_switch_takes_effect_in_a_dm_and_a_group() {
+    for (chat, is_direct) in DIRECT_AND_GROUP {
+        let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+        fixture.seed(OWNER_SENDER, chat, is_direct).await;
+
+        let replies = fixture
+            .say(OWNER_SENDER, chat, is_direct, "/models openrouter")
+            .await;
+
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert!(
+            replies[0].starts_with("Provider switched to `openrouter`"),
+            "{replies:?}"
+        );
+        let after = fixture.state(chat, is_direct);
+        assert_eq!(after.route.provider, "openrouter", "is_direct={is_direct}");
+        assert!(after.history.is_empty(), "the switch clears the history");
+    }
+}
+
+/// An owner through `approval_owners = ["*"]` has approval rights, and the
+/// commands follow the same answer as the rest of the turn.
+#[tokio::test]
+async fn a_sender_who_is_an_owner_through_the_wildcard_may_switch_the_model() {
+    for (chat, is_direct) in DIRECT_AND_GROUP {
+        let fixture = CommandChat::start(&["*"]).await;
+
+        let replies = fixture
+            .say(GUEST_SENDER, chat, is_direct, "/model gpt-5")
+            .await;
+
+        assert!(
+            replies
+                .first()
+                .is_some_and(|reply| reply.starts_with("Model switched to `gpt-5`")),
+            "{replies:?}"
+        );
+        assert_eq!(fixture.state(chat, is_direct).route.model, "gpt-5");
+    }
+}
+
+/// With no owner configured everyone is a guest, so the commands that spend
+/// the operator's keys are refused to everyone.
+#[tokio::test]
+async fn with_no_owner_configured_nobody_may_switch_the_model() {
+    assert_refused(OWNER_SENDER, &[], true, "/model gpt-5").await;
+}
+
+/// The read-only forms answer everyone, in a DM and in a group, and change
+/// nothing.
+#[tokio::test]
+async fn the_read_only_model_commands_answer_a_guest_and_an_owner_everywhere() {
+    for sender in [GUEST_SENDER, OWNER_SENDER] {
+        for (chat, is_direct) in DIRECT_AND_GROUP {
+            let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+            fixture.seed(sender, chat, is_direct).await;
+            let before = fixture.state(chat, is_direct);
+            let calls_before = fixture.model_calls();
+
+            for command in ["/model", "/models"] {
+                let replies = fixture.say(sender, chat, is_direct, command).await;
+                assert_eq!(replies.len(), 1, "{sender} {command}: {replies:?}");
+                assert!(
+                    replies[0].contains("Current model: `default-model`"),
+                    "{sender} {command}: {replies:?}"
+                );
+                assert_ne!(replies[0], REFUSAL);
+            }
+
+            assert_eq!(fixture.state(chat, is_direct), before);
+            assert_eq!(fixture.model_calls(), calls_before);
+        }
+    }
+}
+
+/// In a direct chat the conversation is the sender's own, so a guest clears it,
+/// and only it.
+#[tokio::test]
+async fn a_guest_new_in_a_dm_clears_only_that_conversation() {
+    for command in ["/new", "/clear"] {
+        let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+        fixture.seed(GUEST_SENDER, DIRECT_CHAT, true).await;
+        fixture.seed(GUEST_SENDER, OTHER_DIRECT_CHAT, true).await;
+        fixture.seed(OWNER_SENDER, GROUP_CHAT, false).await;
+        let other_dm = fixture.state(OTHER_DIRECT_CHAT, true);
+        let group = fixture.state(GROUP_CHAT, false);
+        let calls_before = fixture.model_calls();
+
+        let replies = fixture.say(GUEST_SENDER, DIRECT_CHAT, true, command).await;
+
+        assert_eq!(replies.len(), 1, "{command}: {replies:?}");
+        assert!(
+            replies[0].starts_with("Cleared this conversation's history."),
+            "{command}: {replies:?}"
+        );
+        assert!(
+            fixture.state(DIRECT_CHAT, true).history.is_empty(),
+            "{command}: the guest's own conversation is cleared"
+        );
+        assert_eq!(
+            fixture.state(OTHER_DIRECT_CHAT, true),
+            other_dm,
+            "{command}"
+        );
+        assert_eq!(fixture.state(GROUP_CHAT, false), group, "{command}");
+        assert_eq!(fixture.model_calls(), calls_before, "{command}");
+    }
+}
+
+/// A group, or a chat the platform did not mark as direct, shares one history,
+/// so clearing it is the owner's.
+#[tokio::test]
+async fn a_guest_new_in_a_group_or_an_unmarked_chat_is_refused() {
+    for command in ["/new", "/clear"] {
+        assert_refused(GUEST_SENDER, &[OWNER_SENDER], false, command).await;
+    }
+}
+
+#[tokio::test]
+async fn an_owner_new_clears_the_history_in_a_dm_and_in_a_group() {
+    for (chat, is_direct) in DIRECT_AND_GROUP {
+        for command in ["/new", "/clear"] {
+            let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+            fixture.seed(GUEST_SENDER, chat, is_direct).await;
+
+            let replies = fixture.say(OWNER_SENDER, chat, is_direct, command).await;
+
+            assert_eq!(replies.len(), 1, "{command}: {replies:?}");
+            assert!(
+                replies[0].starts_with("Cleared this conversation's history."),
+                "{command}: {replies:?}"
+            );
+            assert!(
+                fixture.state(chat, is_direct).history.is_empty(),
+                "{command} is_direct={is_direct}: the owner clears the history"
+            );
+        }
+    }
+}
+
+/// A command another bot owns is nobody's here, so it is not answered with a
+/// refusal either.
+#[tokio::test]
+async fn a_command_addressed_to_another_bot_gets_a_guest_no_refusal() {
+    let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+
+    for command in ["/model@otherbot gpt-5", "/models@otherbot openrouter"] {
+        let replies = fixture.say(GUEST_SENDER, GROUP_CHAT, false, command).await;
+        assert!(replies.is_empty(), "{command}: {replies:?}");
+    }
+    assert_eq!(fixture.model_calls(), 0);
+}
+
+/// `/start`, `/help` and the answer to an unknown command list what the sender
+/// can run in that chat, so none of them advertises a refusal.
+#[tokio::test]
+async fn a_command_listing_names_only_what_the_sender_can_run_in_that_chat() {
+    for command in ["/start", "/help", "/frobnicate"] {
+        let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+        fixture.seed(GUEST_SENDER, DIRECT_CHAT, true).await;
+        fixture.seed(GUEST_SENDER, GROUP_CHAT, false).await;
+        let dm_before = fixture.state(DIRECT_CHAT, true);
+        let group_before = fixture.state(GROUP_CHAT, false);
+        let calls_before = fixture.model_calls();
+
+        let guest_dm = fixture.say(GUEST_SENDER, DIRECT_CHAT, true, command).await;
+        let guest_group = fixture.say(GUEST_SENDER, GROUP_CHAT, false, command).await;
+        assert_eq!(
+            fixture.state(DIRECT_CHAT, true),
+            dm_before,
+            "{command} changed the DM"
+        );
+        assert_eq!(
+            fixture.state(GROUP_CHAT, false),
+            group_before,
+            "{command} changed the group"
+        );
+        assert_eq!(
+            fixture.model_calls(),
+            calls_before,
+            "{command} reached the model"
+        );
+        let owner_dm = fixture.say(OWNER_SENDER, DIRECT_CHAT, true, command).await;
+        let owner_group = fixture.say(OWNER_SENDER, GROUP_CHAT, false, command).await;
+
+        for reply in [&guest_dm, &guest_group, &owner_dm, &owner_group] {
+            assert_eq!(reply.len(), 1, "{command}: {reply:?}");
+            assert!(reply[0].contains("`/model`"), "{command}: {reply:?}");
+            assert!(reply[0].contains("`/models`"), "{command}: {reply:?}");
+        }
+
+        let guest_dm = &guest_dm[0];
+        assert!(guest_dm.contains("`/new`"), "{command}: {guest_dm}");
+        assert!(
+            !guest_dm.contains("switches"),
+            "{command}: a guest's DM listing offers a switch it would be refused: {guest_dm}"
+        );
+
+        let guest_group = &guest_group[0];
+        assert!(
+            !guest_group.contains("`/new`") && !guest_group.contains("`/clear`"),
+            "{command}: a guest's group listing offers a reset it would be refused: {guest_group}"
+        );
+        assert!(
+            !guest_group.contains("switches"),
+            "{command}: {guest_group}"
+        );
+
+        for owner_listing in [&owner_dm[0], &owner_group[0]] {
+            assert!(
+                owner_listing.contains("`/model <model-id>`")
+                    && owner_listing.contains("`/models <provider>`")
+                    && owner_listing.contains("`/new`"),
+                "{command}: the owner's listing keeps every command: {owner_listing}"
+            );
+        }
+    }
+}
+
+/// A read-only reply offers a switch only to a sender who may make one, so a
+/// guest is never pointed at a command that would be refused.
+#[tokio::test]
+async fn a_read_only_model_reply_offers_a_switch_only_to_an_owner() {
+    for (chat, is_direct) in DIRECT_AND_GROUP {
+        let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+
+        for (command, hint) in [
+            ("/models", "`/models <provider>`"),
+            ("/models", "`/model <model-id>`"),
+            ("/model", "`/model <model-id>`"),
+        ] {
+            let guest = fixture.say(GUEST_SENDER, chat, is_direct, command).await;
+            let owner = fixture.say(OWNER_SENDER, chat, is_direct, command).await;
+
+            assert_eq!(guest.len(), 1, "{command}: {guest:?}");
+            assert!(
+                guest[0].contains("Current model: `default-model`"),
+                "control: the guest still gets the answer: {}",
+                guest[0]
+            );
+            for placeholder in ["<provider>", "<model-id>", "Switch"] {
+                assert!(
+                    !guest[0].contains(placeholder),
+                    "{command} is_direct={is_direct}: a guest was offered a switch: {}",
+                    guest[0]
+                );
+            }
+            assert_eq!(owner.len(), 1, "{command}: {owner:?}");
+            assert!(
+                owner[0].contains(hint),
+                "{command} is_direct={is_direct}: the owner keeps the hint {hint}: {}",
+                owner[0]
+            );
+        }
+    }
+}
