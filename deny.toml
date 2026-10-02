@@ -102,6 +102,25 @@ ignore = [
     #
     # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
     "RUSTSEC-2024-0388",
+    # matrix-sdk-crypto v0.18.0 — RUSTSEC-2026-0318, "Sending custom to-device
+    # messages may panic", patched in >=0.19.0 (upstream fix
+    # matrix-org/matrix-rust-sdk#6670). Chain: matrix-sdk-crypto 0.18.0 ←
+    # matrix-sdk-base 0.18.0 ← matrix-sdk 0.18.0 ← rantaiclaw, so it is only
+    # reachable through the opt-in `channel-matrix` feature;
+    # `cargo tree -i matrix-sdk-crypto` matches no package with default
+    # features, so no default or released build contains it. The impact is a
+    # panic (availability), triggered when sending custom to-device messages.
+    # Nothing under `src/` calls `Device::encrypt_event_raw`,
+    # `OlmMachine::encrypt_content_for_devices` or `IdentityBasedStrategy`, and
+    # nothing sends a to-device message. The upgrade is blocked:
+    # matrix-sdk-sqlite 0.19 needs `rusqlite ^0.40`, while `Cargo.toml` pins
+    # `rusqlite = "0.37"` with `bundled`, and both link the native `sqlite3`
+    # library, so the two cannot resolve together. Moving rusqlite to 0.40 also
+    # pulls a RustCrypto chain (`rsa`, `pkcs8`, `russh`) that does not compile
+    # today.
+    #
+    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
+    "RUSTSEC-2026-0318",
     # ttf-parser v0.25 via lopdf 0.42 → pdf-extract (KB PDF text extraction) —
     # font parser flagged unmaintained; parse-only path over operator-supplied
     # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.
