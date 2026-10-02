@@ -46,7 +46,7 @@ fn decorate_continuation(chunk: &str, index: usize, total: usize) -> String {
 /// deliver attachments; a second copy of the workspace check is the last thing
 /// this should grow.
 use crate::channels::media::{
-    is_http_url, parse_attachment_markers, AttachmentKind as TelegramAttachmentKind,
+    is_http_url, split_outbound, AttachmentKind as TelegramAttachmentKind,
     OutboundAttachment as TelegramAttachment,
 };
 
@@ -97,6 +97,30 @@ pub(crate) fn parse_path_only_attachment(message: &str) -> Option<TelegramAttach
         kind,
         target: candidate.to_string(),
     })
+}
+
+/// What Telegram's `send` does with `message`: the text to send and the files
+/// to upload.
+///
+/// Tool-call tags are removed once, before anything is read. A message that did
+/// not ask for attachments comes back as that text with no files, so a marker or
+/// a bare file path in runtime-written text is sent as text. A reply that is
+/// nothing but the path of a file is uploaded without a marker and has no text.
+pub(crate) fn telegram_outbound(message: &SendMessage) -> (String, Vec<TelegramAttachment>) {
+    let message = SendMessage {
+        content: strip_tool_call_tags(&message.content),
+        ..message.clone()
+    };
+    let (text, attachments) = split_outbound(&message);
+    if !attachments.is_empty() {
+        return (text, attachments);
+    }
+    if message.may_attach {
+        if let Some(attachment) = parse_path_only_attachment(&message.content) {
+            return (String::new(), vec![attachment]);
+        }
+    }
+    (message.content, Vec::new())
 }
 
 /// Strip tool_call XML-style tags from message text.
@@ -2239,48 +2263,31 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        // Strip tool_call tags before processing to prevent Markdown parsing failures
-        let content = strip_tool_call_tags(&message.content);
-
         // Parse recipient: "chat_id" or "chat_id:thread_id" format
         let (chat_id, thread_id) = match message.recipient.split_once(':') {
             Some((chat, thread)) => (chat, Some(thread)),
             None => (message.recipient.as_str(), None),
         };
 
-        let (text_without_markers, attachments) = parse_attachment_markers(&content);
+        // Tool-call tags come out first to prevent Markdown parsing failures.
+        let (text, attachments) = telegram_outbound(message);
 
-        if !attachments.is_empty() {
-            if !text_without_markers.is_empty() {
-                self.send_text_chunks(
-                    &text_without_markers,
-                    chat_id,
-                    thread_id,
-                    message.reply_anchor.as_deref(),
-                )
-                .await?;
-            }
-
-            for attachment in &attachments {
-                self.send_attachment(chat_id, thread_id, attachment).await?;
-            }
-
-            return Ok(());
+        if attachments.is_empty() {
+            return self
+                .send_text_chunks(&text, chat_id, thread_id, message.reply_anchor.as_deref())
+                .await;
         }
 
-        if let Some(attachment) = parse_path_only_attachment(&content) {
-            self.send_attachment(chat_id, thread_id, &attachment)
+        if !text.is_empty() {
+            self.send_text_chunks(&text, chat_id, thread_id, message.reply_anchor.as_deref())
                 .await?;
-            return Ok(());
         }
 
-        self.send_text_chunks(
-            &content,
-            chat_id,
-            thread_id,
-            message.reply_anchor.as_deref(),
-        )
-        .await
+        for attachment in &attachments {
+            self.send_attachment(chat_id, thread_id, attachment).await?;
+        }
+
+        Ok(())
     }
 
     async fn listen(
@@ -2514,6 +2521,7 @@ Ensure only one `rantaiclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::media::parse_attachment_markers;
 
     /// The startup pairing code grants approval-owner rights through `/claim`,
     /// and a managed daemon's stdout is the journal, so only a terminal gets it.
@@ -3145,6 +3153,50 @@ mod tests {
     #[test]
     fn parse_path_only_attachment_rejects_sentence_text() {
         assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
+    }
+
+    /// A message that did not ask for attachments is sent as text: neither a
+    /// marker nor a message that is only the path of a file uploads anything.
+    #[test]
+    fn a_plain_message_is_sent_as_text_even_when_it_is_only_a_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("snap.png");
+        std::fs::write(&file, b"fake-png").unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        for content in [
+            path.clone(),
+            "see [DOCUMENT:notes/menu.txt]".to_string(),
+            format!("see [IMAGE:{path}]"),
+        ] {
+            let (text, attachments) = telegram_outbound(&SendMessage::new(&content, "123"));
+            assert_eq!(text, content);
+            assert_eq!(attachments, Vec::new(), "{content}");
+        }
+    }
+
+    /// The control for the case above: the same texts on a message that may
+    /// attach upload what they name, and a message that is only a path has no
+    /// text left to send.
+    #[test]
+    fn a_reply_that_may_attach_uploads_a_marker_or_a_bare_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("snap.png");
+        std::fs::write(&file, b"fake-png").unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let (text, attachments) =
+            telegram_outbound(&SendMessage::new(&path, "123").allowing_attachments());
+        assert_eq!(text, "");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].target, path);
+
+        let (text, attachments) = telegram_outbound(
+            &SendMessage::new("see [DOCUMENT:notes/menu.txt]", "123").allowing_attachments(),
+        );
+        assert_eq!(text, "see");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].target, "notes/menu.txt");
     }
 
     #[test]

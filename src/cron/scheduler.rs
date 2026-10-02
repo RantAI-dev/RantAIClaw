@@ -857,7 +857,11 @@ async fn deliver_if_configured(
         };
         channel_impl
     };
-    channel_impl.send(&SendMessage::new(output, target)).await?;
+    // The job's output is what the owner configured to be announced, so a
+    // marker in it is an attachment the owner asked for.
+    channel_impl
+        .send(&SendMessage::new(output, target).allowing_attachments())
+        .await?;
 
     Ok(())
 }
@@ -2356,6 +2360,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    /// A channel registered under the name `telegram` that keeps what it was
+    /// asked to send.
+    #[derive(Default)]
+    struct SentRecorder {
+        sent: tokio::sync::Mutex<Vec<SendMessage>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channels::Channel for SentRecorder {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.lock().await.push(message.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A job's output is delivered where the owner configured, and a marker in
+    /// it is an attachment the owner asked for: the channel is allowed to read
+    /// it and uploads the file.
+    #[tokio::test]
+    async fn a_cron_delivery_with_a_marker_still_uploads() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("123".into()),
+            best_effort: false,
+        };
+        let recorder = Arc::new(SentRecorder::default());
+        let registry = crate::channels::ChannelsRegistry::new();
+        registry.replace(std::collections::HashMap::from([(
+            "telegram".to_string(),
+            recorder.clone() as Arc<dyn crate::channels::Channel>,
+        )]));
+
+        deliver_if_configured(&config, &job, "Report [DOCUMENT:notes/menu.txt]", &registry)
+            .await
+            .unwrap();
+
+        let sent = recorder.sent.lock().await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let (text, attachments) = crate::channels::media::split_outbound(&sent[0]);
+        assert_eq!(text, "Report");
+        assert_eq!(
+            attachments
+                .iter()
+                .map(crate::channels::media::OutboundAttachment::to_marker)
+                .collect::<Vec<_>>(),
+            ["[DOCUMENT:notes/menu.txt]"]
+        );
     }
 
     /// A job whose `delivery.channel` names a locked channel reaching this

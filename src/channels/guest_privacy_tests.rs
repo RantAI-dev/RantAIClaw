@@ -523,6 +523,8 @@ const GUEST_ATTACHMENT_WITHHELD_LINE: &str =
 /// system prompt the model started from.
 struct AttachmentTurn {
     sent: Vec<String>,
+    /// The marker of every file the channel would have uploaded.
+    uploaded: Vec<String>,
     system_prompt: String,
 }
 
@@ -604,6 +606,11 @@ async fn run_attachment_turn_on(
                 .map_or(line.clone(), |(_, text)| text.to_string())
         })
         .collect();
+    let uploaded = if platform == "telegram" {
+        telegram_impl.uploaded.lock().await.clone()
+    } else {
+        plain_impl.uploaded.lock().await.clone()
+    };
     let system_prompt = provider_impl
         .system_prompts
         .lock()
@@ -613,6 +620,7 @@ async fn run_attachment_turn_on(
         .expect("the provider saw one prompt");
     AttachmentTurn {
         sent,
+        uploaded,
         system_prompt,
     }
 }
@@ -659,6 +667,7 @@ async fn guest_reply_marker_for_the_owner_database_is_withheld() {
     );
     assert!(text.starts_with("Here you go"), "{text}");
     assert!(text.ends_with(GUEST_ATTACHMENT_WITHHELD_LINE), "{text}");
+    assert_eq!(turn.uploaded, Vec::<String>::new(), "{text}");
 }
 
 /// The parser also recovers a marker that never closed, when it names a file
@@ -755,6 +764,11 @@ async fn guest_with_file_read_receives_an_ordinary_workspace_file() {
     assert!(
         !text.contains(GUEST_ATTACHMENT_WITHHELD_LINE),
         "nothing was refused: {text}"
+    );
+    assert_eq!(
+        turn.uploaded,
+        ["[DOCUMENT:notes/menu.txt]"],
+        "the file the guest may read is uploaded"
     );
 }
 
@@ -1112,7 +1126,12 @@ async fn owner_path_only_reply_is_unchanged() {
     let user_md = ws.path().join("USER.md").display().to_string();
     let turn = run_attachment_turn(ws.path(), OWNER_SENDER, &[], &user_md).await;
 
-    assert_eq!(turn.sent, vec![user_md]);
+    assert_eq!(turn.sent, vec![user_md.clone()]);
+    assert_eq!(
+        turn.uploaded,
+        vec![format!("[DOCUMENT:{user_md}]")],
+        "an owner's path-only reply is still uploaded on Telegram"
+    );
 }
 
 /// A SQLite write-ahead log, shared-memory file or rollback journal holds
@@ -1144,6 +1163,14 @@ async fn owner_reply_marker_reaches_the_channel_unchanged() {
     let turn = run_attachment_turn(ws.path(), OWNER_SENDER, &[], reply).await;
 
     assert_eq!(turn.sent, vec![reply.to_string()]);
+    assert_eq!(
+        turn.uploaded,
+        [
+            "[DOCUMENT:memory/brain.db]",
+            "[IMAGE:https://example.com/a.png]"
+        ],
+        "an owner's reply still uploads what it names"
+    );
 }
 
 #[tokio::test]
@@ -1623,11 +1650,13 @@ struct Request {
 }
 
 /// Scripted replies that make the provider fail the request instead of
-/// answering it: a plain failure, a context window overflow, a capability error,
-/// and a request that never completes.
+/// answering it: a plain failure, one whose message carries an attachment marker,
+/// a context window overflow, a capability error, and a request that never
+/// completes.
 const FAIL_REQUEST: &str = "<<fail the request>>";
 const FAIL_CONTEXT_OVERFLOW: &str = "<<fail with a context window overflow>>";
 const FAIL_CAPABILITY: &str = "<<fail with a capability error>>";
+const FAIL_WITH_MARKER: &str = "<<fail with a marker in the error>>";
 const HANG: &str = "<<never answer>>";
 
 /// A provider that plays a script. Each request is answered with the next
@@ -1674,6 +1703,7 @@ impl ScriptedProvider {
         let reply = self.next_reply();
         match reply.as_str() {
             FAIL_REQUEST => anyhow::bail!("scripted provider failure"),
+            FAIL_WITH_MARKER => anyhow::bail!("upstream refused [DOCUMENT:memory/brain.db]"),
             FAIL_CONTEXT_OVERFLOW => anyhow::bail!("the prompt is too long for this model"),
             FAIL_CAPABILITY => Err(crate::providers::ProviderCapabilityError {
                 provider: "stub".to_string(),
@@ -1734,6 +1764,11 @@ impl Provider for ScriptedProvider {
 struct Turn {
     requests: Vec<Request>,
     sent: Vec<String>,
+    /// The marker of every file the channel would have uploaded.
+    uploaded: Vec<String>,
+    /// The text of every message the channel received with permission to read
+    /// attachment markers out of it.
+    attachable: Vec<String>,
 }
 
 impl Turn {
@@ -1777,6 +1812,7 @@ struct Options {
     crowded_core_memory: bool,
     skills_mode: crate::config::SkillsPromptInjectionMode,
     owners: Vec<&'static str>,
+    autonomous_tools: bool,
 }
 
 impl Options {
@@ -1786,7 +1822,15 @@ impl Options {
             crowded_core_memory: false,
             skills_mode: crate::config::SkillsPromptInjectionMode::Full,
             owners: vec![OWNER_SENDER],
+            autonomous_tools: true,
         }
+    }
+
+    /// Arms the in-chat approval prompt, so a tool call that needs approval
+    /// posts its prompt to the chat.
+    fn gated(mut self) -> Self {
+        self.autonomous_tools = false;
+        self
     }
 
     /// Replaces the owner list (`approval_owners`).
@@ -1939,8 +1983,9 @@ async fn seed_owner_workspace(root: &std::path::Path, crowded: bool) {
 /// case can script and read. The tools, the gate, the prompts and the memory
 /// are the ones a daemon builds.
 ///
-/// `autonomous_tools` is on so no owner approval prompt sits between a tool
-/// call and the tool. Guests are still held by the guest gate.
+/// `autonomous_tools` is on unless the options say `gated()`, so by default no
+/// owner approval prompt sits between a tool call and the tool. Guests are
+/// still held by the guest gate.
 struct Deployment {
     ctx: Arc<ChannelRuntimeContext>,
     provider: Arc<ScriptedProvider>,
@@ -2006,7 +2051,7 @@ impl Deployment {
                     .iter()
                     .map(|t| (*t).to_string())
                     .collect(),
-                autonomous_tools: true,
+                autonomous_tools: options.autonomous_tools,
                 ..crate::config::schema::ChannelsConfig::default()
             },
             ..Config::default()
@@ -2043,6 +2088,13 @@ impl Deployment {
             .expect("the runtime builds")
             .expect("a configured channel means a runtime");
         let ctx = Arc::get_mut(&mut runtime.ctx).expect("the context is not shared yet");
+        if !config.channels_config.autonomous_tools {
+            // An approval prompt nobody answers is denied after this long, so a
+            // gated turn ends instead of waiting out the production deadline.
+            ctx.tool_approvals = Arc::new(crate::security::PendingApprovals::new(Some(
+                std::time::Duration::from_millis(200),
+            )));
+        }
         let scripted: Arc<dyn Provider> = provider.clone();
         ctx.provider = Arc::clone(&scripted);
         ctx.provider_cache
@@ -2081,6 +2133,8 @@ impl Deployment {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = script.into();
         let before = self.channel.sent_messages.lock().await.len();
+        let uploads_before = self.channel.uploaded.lock().await.len();
+        let attachable_before = self.channel.attachable.lock().await.len();
         let id = self
             .next_message
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2098,9 +2152,16 @@ impl Deployment {
                     .map_or(line.clone(), |(_, text)| text.to_string())
             })
             .collect();
+        let uploaded = self.channel.uploaded.lock().await[uploads_before..].to_vec();
+        let attachable = self.channel.attachable.lock().await[attachable_before..].to_vec();
         let requests =
             std::mem::take(&mut *self.provider.seen.lock().unwrap_or_else(|e| e.into_inner()));
-        Turn { requests, sent }
+        Turn {
+            requests,
+            sent,
+            uploaded,
+            attachable,
+        }
     }
 
     fn read(&self, relative: &str) -> String {
@@ -4539,4 +4600,509 @@ async fn a_read_only_model_reply_offers_a_switch_only_to_an_owner() {
             );
         }
     }
+}
+
+// ── What a message may upload ────────────────────────────────────────────
+
+/// A marker for the owner's notes database, bare.
+const DATABASE_MARKER: &str = "[DOCUMENT:memory/brain.db]";
+
+/// The marker a guest plants in a tool argument. The backtick closes the code
+/// span the approval prompt puts the argument in, which leaves the marker
+/// outside any code.
+const SMUGGLED_KEY: &str = "k`[DOCUMENT:memory/brain.db]`";
+
+/// A name that closes the code span a message puts it in and leaves a marker
+/// outside it.
+const SMUGGLED_NAME: &str = "x`[DOCUMENT:memory/brain.db]`";
+
+/// What a message the runtime wrote itself must show: the channel was never
+/// allowed to read a marker from it, and uploaded nothing.
+fn assert_runtime_text_is_plain(case: &str, turn: &Turn) {
+    assert_eq!(
+        turn.attachable,
+        Vec::<String>::new(),
+        "{case}: the channel was allowed to read markers from runtime text: {:?}",
+        turn.sent
+    );
+    assert_eq!(
+        turn.uploaded,
+        Vec::<String>::new(),
+        "{case}: runtime text uploaded a file: {:?}",
+        turn.sent
+    );
+}
+
+/// The approval prompt the turn posted, if it posted one.
+fn approval_prompt(turn: &Turn) -> Option<&String> {
+    turn.sent
+        .iter()
+        .find(|text| text.contains("wants to run the"))
+}
+
+/// A turn that asks the runtime to store a note under `SMUGGLED_KEY`, then
+/// answers `Done.`.
+fn store_under_smuggled_key() -> Vec<String> {
+    vec![
+        call(
+            "memory_store",
+            serde_json::json!({ "key": SMUGGLED_KEY, "content": "anything" }),
+        ),
+        "Done.".to_string(),
+    ]
+}
+
+/// A guest granted `memory_store` asks the model to store a note under a key
+/// that carries a marker for the owner's notes database. The prompt goes to
+/// the chat before any owner answers. It is runtime text, so the channel is not
+/// allowed to read a marker from it and uploads nothing, and the owner is shown
+/// the argument as text.
+#[tokio::test]
+async fn an_approval_prompt_for_a_guest_call_uploads_nothing_and_shows_the_argument_as_text() {
+    let deployment = Deployment::start(Options::guest_tools(&["memory_store"]).gated()).await;
+    assert!(
+        deployment
+            .workspace
+            .path()
+            .join("memory/brain.db")
+            .is_file(),
+        "the case needs a real notes database in the workspace"
+    );
+
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "remember this",
+            store_under_smuggled_key(),
+        )
+        .await;
+
+    let prompt = approval_prompt(&turn).unwrap_or_else(|| panic!("no prompt in {:?}", turn.sent));
+    assert!(
+        prompt.contains("DOCUMENT:memory/brain.db"),
+        "the owner is shown the argument: {prompt}"
+    );
+    assert_eq!(
+        turn.uploaded,
+        Vec::<String>::new(),
+        "the prompt uploaded a file: {prompt}"
+    );
+    assert!(
+        !turn.attachable.contains(prompt),
+        "the channel was allowed to read markers from the prompt: {prompt}"
+    );
+}
+
+/// The same prompt on an owner's turn in a group. The owner is not the one at
+/// risk here, but a group is read by others, and the prompt is runtime text
+/// whoever asked.
+#[tokio::test]
+async fn an_approval_prompt_on_an_owner_turn_in_a_group_uploads_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&[]).gated()).await;
+
+    let turn = deployment
+        .turn_in(
+            OWNER_SENDER,
+            GROUP_CHAT,
+            false,
+            "remember this",
+            store_under_smuggled_key(),
+        )
+        .await;
+
+    let prompt = approval_prompt(&turn).unwrap_or_else(|| panic!("no prompt in {:?}", turn.sent));
+    assert!(
+        prompt.contains("DOCUMENT:memory/brain.db"),
+        "the owner is shown the argument: {prompt}"
+    );
+    assert_eq!(
+        turn.uploaded,
+        Vec::<String>::new(),
+        "the prompt uploaded a file: {prompt}"
+    );
+    assert!(
+        !turn.attachable.contains(prompt),
+        "the channel was allowed to read markers from the prompt: {prompt}"
+    );
+}
+
+/// The `commands.rs` send. `/models` and `/model` echo what the owner typed
+/// into a code span, and a backtick in it closes the span.
+#[tokio::test]
+async fn command_reply_echoing_the_senders_text_uploads_nothing() {
+    let fixture = CommandChat::start(&[OWNER_SENDER]).await;
+
+    for command in [
+        format!("/models {SMUGGLED_NAME}"),
+        format!("/model {SMUGGLED_NAME}"),
+    ] {
+        let replies = fixture.say(OWNER_SENDER, DIRECT_CHAT, true, &command).await;
+        assert_eq!(replies.len(), 1, "{command}: {replies:?}");
+        assert!(
+            replies[0].contains("DOCUMENT:memory/brain.db"),
+            "{command}: the reply echoes the argument: {}",
+            replies[0]
+        );
+    }
+
+    assert_eq!(
+        fixture.channel.attachable.lock().await.clone(),
+        Vec::<String>::new(),
+        "the channel was allowed to read markers from a command reply"
+    );
+    assert_eq!(
+        fixture.channel.uploaded.lock().await.clone(),
+        Vec::<String>::new(),
+        "a command reply uploaded a file"
+    );
+}
+
+/// The provider-initialisation failure text, which names the provider the
+/// conversation is routed to.
+#[tokio::test]
+async fn provider_init_failure_text_uploads_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let key = conversation_history_key(&channel_message(OWNER_SENDER, OWNER_CHAT, "hi", "probe"));
+    routing::set_route_selection(
+        deployment.ctx.as_ref(),
+        &key,
+        ChannelRouteSelection {
+            provider: SMUGGLED_NAME.to_string(),
+            model: "model".to_string(),
+        },
+    );
+
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "hello",
+            vec!["unused".to_string()],
+        )
+        .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    assert!(
+        turn.sent[0].contains("Failed to initialize provider"),
+        "{}",
+        turn.sent[0]
+    );
+    assert!(
+        turn.sent[0].contains("DOCUMENT:memory/brain.db"),
+        "the case needs the provider name in the text: {}",
+        turn.sent[0]
+    );
+    assert_runtime_text_is_plain("provider init failure", &turn);
+}
+
+/// The error texts a failed turn ends with. Each is runtime text, so none may
+/// be read for markers: the context window notice, the provider capability
+/// notice, the error text with the provider's message in it, and the timeout
+/// notice.
+#[tokio::test]
+async fn context_overflow_text_uploads_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "hello",
+            vec![FAIL_CONTEXT_OVERFLOW.to_string()],
+        )
+        .await;
+
+    assert!(
+        turn.sent[0].starts_with("⚠️ Context window exceeded"),
+        "{:?}",
+        turn.sent
+    );
+    assert_runtime_text_is_plain("context overflow", &turn);
+}
+
+#[tokio::test]
+async fn capability_error_text_uploads_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "hello",
+            vec![FAIL_CAPABILITY.to_string()],
+        )
+        .await;
+
+    assert!(
+        turn.sent[0].starts_with("The current provider ("),
+        "{:?}",
+        turn.sent
+    );
+    assert_runtime_text_is_plain("capability error", &turn);
+}
+
+#[tokio::test]
+async fn llm_error_text_uploads_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let turn = deployment
+        .turn(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            "hello",
+            vec![FAIL_WITH_MARKER.to_string()],
+        )
+        .await;
+
+    assert!(turn.sent[0].starts_with("⚠️ Error:"), "{:?}", turn.sent);
+    assert!(
+        turn.sent[0].contains("DOCUMENT:memory/brain.db"),
+        "the case needs the provider's message in the text: {:?}",
+        turn.sent
+    );
+    assert_runtime_text_is_plain("llm error", &turn);
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_text_uploads_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let turn = deployment
+        .turn(OWNER_SENDER, OWNER_CHAT, "hello", vec![HANG.to_string()])
+        .await;
+
+    assert!(
+        turn.sent[0].starts_with("⚠️ Request timed out"),
+        "{:?}",
+        turn.sent
+    );
+    assert_runtime_text_is_plain("timeout", &turn);
+}
+
+/// The acknowledgement to `/approve` names the tool of the request it answers,
+/// and the model chose that name.
+#[tokio::test]
+async fn approval_acknowledgement_uploads_nothing() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let request_id = uuid::Uuid::new_v4();
+    let handle = crate::security::PendingApprovals::handle_for(request_id);
+    let approvals = Arc::clone(&deployment.ctx.tool_approvals);
+    let pending = tokio::spawn(async move {
+        approvals
+            .request_decision_in(
+                request_id,
+                SMUGGLED_NAME,
+                "arguments",
+                "test-channel",
+                OWNER_CHAT,
+            )
+            .await
+    });
+    // Wait until the request is registered, so the reply finds it.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while deployment.ctx.tool_approvals.list().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the request was registered");
+
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let shutdown = CancellationToken::new();
+    let dispatch = tokio::spawn(run_message_dispatch_loop(
+        rx,
+        Arc::clone(&deployment.ctx),
+        4,
+        shutdown.clone(),
+    ));
+    tx.send(channel_message(
+        OWNER_SENDER,
+        OWNER_CHAT,
+        &format!("/approve {handle}"),
+        "approve-1",
+    ))
+    .await
+    .expect("queued");
+    let decision = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+        .await
+        .expect("the approval was answered")
+        .expect("the waiting task finished");
+    assert_eq!(decision, crate::security::Decision::Once);
+    // The acknowledgement is sent right after the request resolves.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while deployment.channel.sent_messages.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the acknowledgement was sent");
+    shutdown.cancel();
+    drop(tx);
+    dispatch.await.expect("the dispatch loop finished");
+
+    let sent = deployment.channel.sent_messages.lock().await.clone();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("Approved"), "{sent:?}");
+    assert!(
+        sent[0].contains("DOCUMENT:memory/brain.db"),
+        "the case needs the tool name in the text: {sent:?}"
+    );
+    assert_eq!(
+        deployment.channel.attachable.lock().await.clone(),
+        Vec::<String>::new(),
+        "the channel was allowed to read markers from an acknowledgement"
+    );
+    assert_eq!(
+        deployment.channel.uploaded.lock().await.clone(),
+        Vec::<String>::new(),
+        "an acknowledgement uploaded a file"
+    );
+}
+
+/// On a channel with editable drafts, the placeholder that opens the draft is
+/// runtime text, and the reply that closes it is read for markers by the
+/// channel's draft edit, which uploads nothing. An owner's turn keeps that.
+#[tokio::test]
+async fn draft_placeholder_uploads_nothing_and_an_owner_reply_through_a_draft_is_unchanged() {
+    let ws = attachment_workspace();
+    let channel = {
+        let channel = Arc::new(RecordingChannel::default());
+        channel
+            .drafts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let as_channel: Arc<dyn Channel> = channel.clone();
+        let provider = Arc::new(ReplyAndPromptProvider {
+            reply: "Here you go [DOCUMENT:notes/menu.txt]".to_string(),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+        let mut ctx = dispatch_ctx(
+            vec![as_channel],
+            provider,
+            routing::RuntimeConfigSlot::default(),
+        );
+        {
+            let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+            inner.workspace_dir = Arc::new(ws.path().to_path_buf());
+            inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+        }
+        process_channel_message(
+            ctx,
+            channel_message(OWNER_SENDER, OWNER_CHAT, "the menu please", "draft-1"),
+            CancellationToken::new(),
+        )
+        .await;
+        channel
+    };
+
+    assert_eq!(
+        channel.sent_messages.lock().await.clone(),
+        [format!(
+            "{OWNER_CHAT}:Here you go [DOCUMENT:notes/menu.txt]"
+        )],
+        "the draft was finalised with the reply as text"
+    );
+    assert_eq!(
+        channel.attachable.lock().await.clone(),
+        Vec::<String>::new(),
+        "the placeholder was readable for markers"
+    );
+    assert_eq!(
+        channel.uploaded.lock().await.clone(),
+        Vec::<String>::new(),
+        "finalising a draft uploads nothing"
+    );
+}
+
+/// A channel with drafts whose edits all fail, so dispatch falls back to
+/// sending the reply as a new message.
+#[derive(Default)]
+struct DraftEditFailsChannel {
+    sent: tokio::sync::Mutex<Vec<traits::SendMessage>>,
+}
+
+#[async_trait::async_trait]
+impl Channel for DraftEditFailsChannel {
+    fn name(&self) -> &str {
+        "test-channel"
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, _message: &traits::SendMessage) -> anyhow::Result<Option<String>> {
+        Ok(Some("draft-1".to_string()))
+    }
+
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("the edit was refused")
+    }
+
+    async fn send(&self, message: &traits::SendMessage) -> anyhow::Result<()> {
+        self.sent.lock().await.push(message.clone());
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        _cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Control: when the draft edit fails, the owner's reply goes out as a new
+/// message, which uploads what it names, as it did before.
+#[tokio::test]
+async fn an_owner_reply_sent_after_a_failed_draft_edit_still_uploads() {
+    let ws = attachment_workspace();
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let channel = Arc::new(DraftEditFailsChannel::default());
+    let as_channel: Arc<dyn Channel> = channel.clone();
+    let mut ctx = dispatch_ctx(
+        vec![as_channel],
+        Arc::new(ReplyAndPromptProvider {
+            reply: "Here you go [DOCUMENT:notes/menu.txt]".to_string(),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        }),
+        routing::RuntimeConfigSlot::default(),
+    );
+    {
+        let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+        inner.workspace_dir = Arc::new(ws.path().to_path_buf());
+        inner.approval_owners = Arc::new(vec![OWNER_SENDER.to_string()]);
+    }
+
+    process_channel_message(
+        ctx,
+        channel_message(OWNER_SENDER, OWNER_CHAT, "the menu please", "draft-2"),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let sent = channel.sent.lock().await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let (_, attachments) = media::split_outbound(&sent[0]);
+    assert_eq!(
+        attachments
+            .iter()
+            .map(|a| a.to_marker())
+            .collect::<Vec<_>>(),
+        ["[DOCUMENT:notes/menu.txt]"],
+        "{sent:?}"
+    );
+}
+
+/// Control: an owner's reply with a marker is the message that may attach.
+#[tokio::test]
+async fn an_owner_reply_with_a_marker_is_the_one_message_that_may_attach() {
+    let ws = attachment_workspace();
+    let reply = format!("Here you go {DATABASE_MARKER}");
+    let turn = run_attachment_turn_on("other", ws.path(), OWNER_SENDER, &[], &reply).await;
+
+    assert_eq!(turn.uploaded, [DATABASE_MARKER], "{:?}", turn.sent);
 }

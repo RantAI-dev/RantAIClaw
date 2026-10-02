@@ -6,6 +6,7 @@
 //! `docs/security/inbound-media-policy.md` and implemented here **once**, so a
 //! channel added later inherits them instead of inventing its own answers.
 
+use super::traits::SendMessage;
 use base64::Engine as _;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -346,6 +347,41 @@ pub async fn fetch_image_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message that did not ask for attachments comes back verbatim, whatever
+    /// markers it holds. One that did is read the way a reply is.
+    #[test]
+    fn split_outbound_reads_markers_only_from_a_message_that_may_attach() {
+        let content = "see [DOCUMENT:notes/menu.txt] and [IMAGE:/w/a.png]";
+        let plain = SendMessage::new(content, "chat");
+
+        let (text, attachments) = split_outbound(&plain);
+        assert_eq!(text, content);
+        assert_eq!(attachments, Vec::new());
+
+        let (text, attachments) = split_outbound(&plain.clone().allowing_attachments());
+        assert_eq!(text, "see  and");
+        assert_eq!(
+            attachments
+                .iter()
+                .map(OutboundAttachment::to_marker)
+                .collect::<Vec<_>>(),
+            ["[DOCUMENT:notes/menu.txt]", "[IMAGE:/w/a.png]"]
+        );
+    }
+
+    /// Square brackets become parentheses, so the text cannot spell a marker.
+    #[test]
+    fn defuse_markers_removes_the_square_brackets() {
+        assert_eq!(
+            defuse_markers("a [DOCUMENT:x] b"),
+            "a (DOCUMENT:x) b",
+            "brackets become parentheses"
+        );
+        assert_eq!(defuse_markers("no brackets"), "no brackets");
+        let (_, attachments) = parse_attachment_markers(&defuse_markers("[IMAGE:/w/a.png]"));
+        assert_eq!(attachments, Vec::new());
+    }
 
     /// The budget is process-global, so every test that charges it uses a key
     /// of its own. Sharing one would make a result depend on test ordering.
@@ -1174,6 +1210,38 @@ impl CodeScanner {
 
     fn in_code(&self) -> bool {
         self.in_fence || self.in_span
+    }
+}
+
+/// `text` with square brackets turned into parentheses, so it cannot spell an
+/// attachment marker (`[IMAGE:…]`, `[DOCUMENT:…]`) for a channel to upload.
+///
+/// For runtime text that carries words chosen by the model or by a sender and
+/// has to read as plain text even on a message that may attach files.
+#[must_use]
+pub(crate) fn defuse_markers(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '[' => '(',
+            ']' => ')',
+            other => other,
+        })
+        .collect()
+}
+
+/// What a channel's `send` reads out of `message`: the text a human reads and
+/// the attachments to upload.
+///
+/// A message that did not ask for attachments (`SendMessage::may_attach`) comes
+/// back verbatim with none, so a marker in runtime-written text is sent as text.
+/// Every channel that uploads calls this instead of parsing `message.content`
+/// itself, so none of them can forget the check.
+#[must_use]
+pub fn split_outbound(message: &SendMessage) -> (String, Vec<OutboundAttachment>) {
+    if message.may_attach {
+        parse_attachment_markers(&message.content)
+    } else {
+        (message.content.clone(), Vec::new())
     }
 }
 

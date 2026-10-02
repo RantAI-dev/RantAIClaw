@@ -424,6 +424,15 @@ local path or an `http(s)` URL. One vocabulary for every channel, built by
 `media::delivery_instructions_for`, so a reply written on one channel does not
 leak literal markers on another.
 
+Only two kinds of message may upload a file. One is the model's delivered
+reply, which for a guest has already passed the guest reply filter. The other
+is the announced output of a cron job, which the owner configured. Every other
+message the bot sends is plain text, and a marker in it is shown as written.
+That covers approval prompts, command replies, error texts, pairing and
+operator-approval messages, delivery-failure notices and the restart notice. It
+also covers a Telegram message that is only a file path, which uploads only when
+it is the model's reply.
+
 The instruction says what the runtime actually does, not only the syntax. It
 states that attaching a file needs no tool call and no approval, that a local
 path must be absolute and inside the workspace and names that path, that the

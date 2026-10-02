@@ -171,6 +171,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Only a filtered model reply or a cron job's announced output can upload a file to a chat.**
+  Until now a message the runtime wrote itself could carry an attachment marker (`[DOCUMENT:…]`,
+  `[IMAGE:…]` and the other kinds) chosen by the model or by a sender, and the channel uploaded the
+  named file to that chat. The memory database `memory/brain.db` was reachable this way, because it
+  sits inside the workspace, which was the only path rule on that side. Two ways are known. The
+  approval prompt shows a tool's arguments inside a code span, a backtick in an argument closed the
+  span, and a marker after it was uploaded to the chat that asked, before any owner answered. That
+  needs an owner configured, tools that ask for approval and a guest granted such a tool. A command
+  reply that echoes the sender's own argument (`Unknown provider …`) was the second way. On current
+  `main` only an owner reaches that command, but in 0.32.0-alpha every allowed sender does. Both
+  were found by reading the code and by a test that drives the approval prompt. They were not
+  reproduced against a released binary. Uploads are now opt-in per message. A channel reads markers
+  only from the model's delivered reply (for a guest, after the guest reply filter withheld what the
+  guest may not receive) and from a cron job's announced output, which the owner configured. Every
+  other message is plain text with the marker shown as written: approval prompts, command replies,
+  error texts, pairing and operator-approval messages, delivery-failure notices and the restart
+  notice. A Telegram message that is only a file path follows the same rule. The approval prompt also
+  shows `[` and `]` in the tool name and arguments as `(` and `)`, and a backtick as `'`, so an
+  owner sees `(DOCUMENT:x)` for an argument that held `[DOCUMENT:x]` and `ls (a-z)*` for
+  `ls [a-z]*`. 0.32.0-alpha and earlier releases carry the same marker parsing and approval prompt.
+  Operators who allow senders other than the owner should upgrade.
 - **SSH tools on russh 0.60.3, for RUSTSEC-2026-0153 and RUSTSEC-2026-0154.** The `remote-install`
   tools moved from russh 0.45 to 0.60.3, which fixes both advisories (unchecked allocation from a
   peer-supplied frame length in the SSH agent code, in `russh` and `russh-cryptovec`). Their ignores
