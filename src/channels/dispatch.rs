@@ -793,13 +793,6 @@ pub(crate) async fn process_channel_message(
     tracing::info!("processing channel message");
     let started_at = Instant::now();
 
-    let had_prior_history = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .is_some_and(|turns| !turns.is_empty());
-
     // Owner status drives the prompt (tell the model the sender is an owner so
     // it doesn't self-refuse owner-only tools), the memory-context view, the
     // tool registry, the persona and safety text, and the capability ceiling,
@@ -844,25 +837,26 @@ pub(crate) async fn process_channel_message(
         .unwrap_or_default();
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
+    // Recall runs on every turn: a note is recalled when the question's words
+    // match it, wherever the turn sits in the conversation. The history holds
+    // each user turn as it was said, so the block goes onto this turn alone and
+    // the request carries one block however long the conversation is.
     //
     // The read goes through the turn's memory view, so a view limited to one
     // conversation never lets the shared tier or another chat's auto-save rows
     // reach the prompt. The view key is the conversation scope, not the bare
     // sender, so two senders in the same chat cannot see each other's words.
-    if !had_prior_history {
-        let memory_context = build_memory_context(
-            ctx.memory.as_ref(),
-            &msg.content,
-            runtime_defaults.min_relevance_score,
-            &memory_view,
-        )
-        .await;
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
-            }
+    let memory_context = build_memory_context(
+        ctx.memory.as_ref(),
+        &msg.content,
+        runtime_defaults.min_relevance_score,
+        &memory_view,
+    )
+    .await;
+    if let Some(last_turn) = prior_turns.last_mut() {
+        if last_turn.role == "user" && !memory_context.is_empty() {
+            last_turn.content =
+                crate::memory::prepend_memory_block(&memory_context, &last_turn.content);
         }
     }
     // The registry a guest's loop runs on is the entries that gate permits, so

@@ -238,13 +238,13 @@ fn v32_leaves_a_cloud_only_config_alone() {
 /// The version the migration chain claims to reach. If this drifts from
 /// `CURRENT_VERSION` the three cases above are testing a migration nobody runs.
 #[test]
-fn v36_is_the_current_version() {
-    assert_eq!(CURRENT_VERSION, 36);
+fn v37_is_the_current_version() {
+    assert_eq!(CURRENT_VERSION, 37);
     let mut v = v31_with_whatsapp("session_path = \"/tmp/wa.db\"");
     migrate(&mut v).expect("migrate runs");
     assert_eq!(
         v.get(SCHEMA_VERSION_KEY).and_then(toml::Value::as_integer),
-        Some(36),
+        Some(37),
         "the migrated config must be stamped with the version it reached"
     );
 }
@@ -265,4 +265,31 @@ fn v32_leaves_a_web_config_without_an_allowlist_denying_everyone() {
         "an absent allowlist must stay empty, not become a wildcard: {:?}",
         web.allowed_numbers
     );
+}
+
+/// A config saved by the previous schema carries `min_relevance_score = 0.4`,
+/// because `Config::save()` wrote it into every file. It loads at the new
+/// default, and a value the operator set differently loads as written.
+#[test]
+fn v37_moves_a_saved_old_default_and_keeps_a_chosen_value() {
+    let saved_at = |score: f64| {
+        let mut cfg = Config::default();
+        cfg.memory.min_relevance_score = score;
+        let mut v: toml::Value =
+            toml::from_str(&toml::to_string(&cfg).expect("config serialises")).expect("re-parse");
+        v.as_table_mut()
+            .expect("a table")
+            .insert(SCHEMA_VERSION_KEY.to_string(), toml::Value::Integer(36));
+        v
+    };
+
+    let mut old_default = saved_at(0.4);
+    assert!(migrate(&mut old_default).expect("migrate runs"));
+    let cfg: Config = old_default.try_into().expect("migrated config loads");
+    assert_eq!(cfg.memory.min_relevance_score, 0.6);
+
+    let mut chosen = saved_at(0.55);
+    assert!(migrate(&mut chosen).expect("migrate runs"));
+    let cfg: Config = chosen.try_into().expect("migrated config loads");
+    assert_eq!(cfg.memory.min_relevance_score, 0.55);
 }

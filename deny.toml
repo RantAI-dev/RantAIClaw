@@ -121,6 +121,19 @@ ignore = [
     #
     # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
     "RUSTSEC-2026-0318",
+    # anymap2 v0.13.0 — RUSTSEC-2026-0319, flagged unmaintained, not a
+    # vulnerability; there is no patched version, and the recommended
+    # replacement is `anymap3`. Chain: anymap2 0.13.0 ← matrix-sdk 0.18.0 ←
+    # rantaiclaw, so it is only reachable through the opt-in `channel-matrix`
+    # feature; `cargo tree -i anymap2` matches no package with default
+    # features, so no default or released build contains it. An unmaintained
+    # type-map crate has no known flaw to trigger, and switching to `anymap3`
+    # is matrix-sdk's choice, not ours. Dropping it needs a newer matrix-sdk,
+    # which is blocked for the reason given in the RUSTSEC-2026-0318 entry
+    # above (matrix-sdk 0.19 needs `rusqlite ^0.40`).
+    #
+    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
+    "RUSTSEC-2026-0319",
     # ttf-parser v0.25 via lopdf 0.42 → pdf-extract (KB PDF text extraction) —
     # font parser flagged unmaintained; parse-only path over operator-supplied
     # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.

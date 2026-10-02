@@ -735,8 +735,9 @@ should check the encoded size and say so plainly rather than surfacing a bare
   - `category` — one category only. Unknown names are treated as custom
     categories, matching what `POST /api/v1/memory` accepts on write.
   - `q` — keyword search. When present and non-empty the read is served by
-    the backend's ranked recall instead of a plain list, so entries come back
-    ordered by relevance and carry a `score`. Composes with `category`.
+    the backend's ranked recall instead of a plain list, so entries carry a
+    `score`. Saved notes come first, then conversation rows. Composes with
+    `category`.
 - **Response** `200`:
   ```json
   {
@@ -763,9 +764,12 @@ should check the encoded size and say so plainly rather than surfacing a bare
   current inconsistency across resource groups worth knowing about if you're
   writing a client that parses both.
 
-  `score` is relevance in `0.0..=1.0`, **relative to the best hit in the same
-  result set** rather than an absolute measure. Only a `q` search ranks, so
-  the field is `null` on a plain list.
+  `score` is relevance in `0.0..=1.0`, an **absolute** measure: the share of
+  the query's words the entry holds as whole words, blended with vector
+  similarity when an embedding provider is set. It does not depend on the other
+  hits in the result set. An entry that holds the query's words only inside
+  longer words scores at most `0.25`. Only a `q` search ranks, so the field is
+  `null` on a plain list.
 
   Counts are three different things and it is worth keeping them apart:
   `count` is how many entries this response carries, `listed` is how many the

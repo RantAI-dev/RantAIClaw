@@ -587,7 +587,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         embedding_dimensions: 1536,
         vector_weight: 0.7,
         keyword_weight: 0.3,
-        min_relevance_score: 0.4,
+        min_relevance_score: 0.6,
         embedding_cache_size: if profile.uses_sqlite_hygiene {
             10000
         } else {
@@ -7316,6 +7316,20 @@ mod tests {
         assert_eq!(config.archive_after_days, 7);
         assert_eq!(config.purge_after_days, 30);
         assert_eq!(config.embedding_cache_size, 10000);
+    }
+
+    /// The wizard writes the same relevance floor a fresh `Config` carries, for
+    /// every backend, so a new install is not born on the old default.
+    #[test]
+    fn memory_config_defaults_use_the_default_relevance_floor() {
+        let default_floor = MemoryConfig::default().min_relevance_score;
+        for backend in ["sqlite", "none"] {
+            assert_eq!(
+                memory_config_defaults_for_backend(backend).min_relevance_score,
+                default_floor,
+                "{backend}"
+            );
+        }
     }
 
     #[test]

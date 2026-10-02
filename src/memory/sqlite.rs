@@ -1,4 +1,5 @@
 use super::embeddings::EmbeddingProvider;
+use super::terms;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use anyhow::Context;
@@ -17,6 +18,11 @@ use uuid::Uuid;
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 
+/// Highest score a row earns when the query's words appear in it only inside
+/// longer words ("log" in "catalog"). It sits well under the default relevance
+/// floor, so such a row is found by a search and not injected into a turn.
+const FRAGMENT_ONLY_CEILING: f64 = 0.25;
+
 /// Re-render an RFC3339 timestamp in UTC, whatever offset it carries.
 ///
 /// Returns `None` for anything that is not RFC3339 so callers can keep the
@@ -25,6 +31,39 @@ fn to_utc_rfc3339(raw: &str) -> Option<String> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|ts| ts.with_timezone(&Utc).to_rfc3339())
+}
+
+/// Which rows one retrieval pass may select.
+///
+/// `recall` runs a pass over the saved notes first and a second over the raw
+/// conversation rows only if the first left room. The split sits in the
+/// queries because the limit is spent there: a row dropped afterwards has
+/// already cost a place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CategoryScope {
+    /// Every category except `conversation`.
+    Notes,
+    /// Only `conversation` rows.
+    Conversation,
+}
+
+impl CategoryScope {
+    /// The `AND` clause that limits `column` to this scope.
+    fn clause(self, column: &str) -> String {
+        match self {
+            Self::Notes => format!(" AND {column} <> 'conversation'"),
+            Self::Conversation => format!(" AND {column} = 'conversation'"),
+        }
+    }
+}
+
+/// What one `recall` asks, shared by both of its passes.
+struct RecallQuery<'a> {
+    text: &'a str,
+    session: Option<&'a str>,
+    embedding: Option<&'a [f32]>,
+    vector_weight: f32,
+    keyword_weight: f32,
 }
 
 /// SQLite-backed persistent memory — the brain
@@ -391,6 +430,7 @@ impl SqliteMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+        scope: CategoryScope,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let fts_query = Self::build_fts_query(query);
         if fts_query.is_empty() {
@@ -402,23 +442,22 @@ impl SqliteMemory {
         // findable when they happen to outrank every other conversation's — on a
         // busy database a scoped recall came back empty while matching rows sat
         // in the table.
-        let sql = if session_id.is_some() {
-            "SELECT m.id, m.key, m.content
-             FROM memories_fts f
-             JOIN memories m ON m.rowid = f.rowid
-             WHERE memories_fts MATCH ?1 AND m.session_id = ?3
-             ORDER BY bm25(memories_fts)
-             LIMIT ?2"
+        let category_clause = scope.clause("m.category");
+        let session_clause = if session_id.is_some() {
+            " AND m.session_id = ?3"
         } else {
+            ""
+        };
+        let sql = format!(
             "SELECT m.id, m.key, m.content
              FROM memories_fts f
              JOIN memories m ON m.rowid = f.rowid
-             WHERE memories_fts MATCH ?1
+             WHERE memories_fts MATCH ?1{session_clause}{category_clause}
              ORDER BY bm25(memories_fts)
              LIMIT ?2"
-        };
+        );
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         #[allow(clippy::cast_possible_wrap)]
         let limit_i64 = limit as i64;
 
@@ -427,13 +466,13 @@ impl SqliteMemory {
         // stores, where most rows share the query's terms. Query coverage is
         // the absolute [0, 1] relevance — the same measure the LIKE fallback
         // and the markdown backend already use.
-        let terms = Self::coverage_terms(query);
+        let terms = terms::search_terms(query);
         let map_row = |row: &rusqlite::Row| -> rusqlite::Result<(String, f32)> {
             let id: String = row.get(0)?;
             let key: String = row.get(1)?;
             let content: String = row.get(2)?;
             #[allow(clippy::cast_possible_truncation)]
-            Ok((id, Self::query_coverage(&terms, &key, &content) as f32))
+            Ok((id, Self::word_coverage(&terms, &key, &content) as f32))
         };
 
         let mut results = Vec::new();
@@ -454,45 +493,53 @@ impl SqliteMemory {
         Ok(results)
     }
 
-    /// Query terms used for coverage scoring — lowercased whitespace tokens,
-    /// capped like the LIKE fallback's keyword list.
-    fn coverage_terms(query: &str) -> Vec<String> {
-        const MAX_COVERAGE_TERMS: usize = 8;
-        query
-            .split_whitespace()
-            .take(MAX_COVERAGE_TERMS)
-            .map(str::to_lowercase)
-            .collect()
-    }
-
-    /// Fraction of the query's terms present in `key`/`content` — the absolute
-    /// keyword relevance shared by the FTS path and the LIKE fallback. `1.0`
-    /// means the row covers the whole query, not "best of its set".
-    #[allow(clippy::cast_precision_loss)]
-    fn query_coverage(terms: &[String], key: &str, content: &str) -> f64 {
+    /// Fraction of the query's terms that are whole words of `key`/`content`.
+    /// `1.0` means the row covers the whole query, not "best of its set". A key
+    /// reads as words too: `deploy_window` holds "deploy" and "window".
+    fn word_coverage(terms: &[String], key: &str, content: &str) -> f64 {
         if terms.is_empty() {
             return 0.0;
         }
+        let present: std::collections::HashSet<String> = terms::words(key)
+            .into_iter()
+            .chain(terms::words(content))
+            .collect();
+        // A query holds at most `MAX_QUERY_TERMS` terms, so both counts fit a u32.
+        let matched = terms.iter().filter(|term| present.contains(*term)).count();
+        f64::from(u32::try_from(matched).unwrap_or(u32::MAX))
+            / f64::from(u32::try_from(terms.len()).unwrap_or(u32::MAX))
+    }
+
+    /// Score of a row the LIKE fallback found. The fallback exists to find a
+    /// word by a part of it, so a row that holds no whole word of the query is
+    /// still returned, but it scores at most [`FRAGMENT_ONLY_CEILING`] (the
+    /// share of the query's terms found inside longer words, times the
+    /// ceiling). A row that holds a whole word scores by whole words, as the
+    /// keyword path does, so a fragment never lifts a row over the relevance
+    /// floor.
+    fn fallback_coverage(terms: &[String], key: &str, content: &str) -> f64 {
+        let whole = Self::word_coverage(terms, key, content);
+        if whole > 0.0 {
+            return whole;
+        }
         let haystack = format!("{key} {content}").to_lowercase();
-        let matched = terms
+        let inside = terms
             .iter()
             .filter(|term| haystack.contains(term.as_str()))
             .count();
-        matched as f64 / terms.len() as f64
+        // A query holds at most `MAX_QUERY_TERMS` terms, so both counts fit a u32.
+        FRAGMENT_ONLY_CEILING * f64::from(u32::try_from(inside).unwrap_or(u32::MAX))
+            / f64::from(u32::try_from(terms.len().max(1)).unwrap_or(u32::MAX))
     }
 
     /// Build the FTS5 MATCH expression for a free-text query.
     ///
-    /// Each term becomes a quoted string literal so punctuation cannot be read
-    /// as FTS5 syntax. A `"` inside a term is escaped by doubling it, per FTS5's
-    /// string-literal rules — left raw it closed the literal early and produced
-    /// an expression the parser rejected, which silently demoted the whole query
-    /// to the substring fallback.
+    /// Each term becomes a quoted string literal. A term is letters, digits and
+    /// inner apostrophes only, so it cannot carry FTS5 syntax or a `"` that
+    /// would close the literal early.
     fn build_fts_query(query: &str) -> String {
-        query
-            .split_whitespace()
-            .map(|w| w.replace('"', "\"\""))
-            .filter(|w| !w.is_empty())
+        terms::search_terms(query)
+            .iter()
             .map(|w| format!("\"{w}\""))
             .collect::<Vec<_>>()
             .join(" OR ")
@@ -508,10 +555,12 @@ impl SqliteMemory {
         limit: usize,
         category: Option<&str>,
         session_id: Option<&str>,
+        scope: CategoryScope,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let mut sql =
             "SELECT id, embedding, embedding_dims FROM memories WHERE embedding IS NOT NULL"
                 .to_string();
+        sql.push_str(&scope.clause("category"));
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
@@ -647,6 +696,215 @@ impl SqliteMemory {
 
         Ok(count)
     }
+
+    /// One retrieval pass over the rows `scope` selects: keyword and vector
+    /// search merged, with the substring scan as the fallback. At most `limit`
+    /// entries come back.
+    fn recall_pass(
+        conn: &Connection,
+        q: &RecallQuery<'_>,
+        limit: usize,
+        scope: CategoryScope,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FTS5 BM25 keyword search. A failure here is a real failure — an
+        // unparseable MATCH expression, a damaged index — and used to be
+        // indistinguishable from "nothing matched", which quietly demoted the
+        // query to the substring fallback. Say so, then degrade as before.
+        let keyword_results = match Self::fts5_search(conn, q.text, limit * 2, q.session, scope) {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(
+                    "memory keyword search failed, falling back: {}",
+                    super::sanitize::loggable_error(&e)
+                );
+                Vec::new()
+            }
+        };
+
+        // Vector similarity search (if embeddings available)
+        let vector_results = if let Some(qe) = q.embedding {
+            match Self::vector_search(conn, qe, limit * 2, None, q.session, scope) {
+                Ok(hits) => hits,
+                Err(e) => {
+                    tracing::warn!(
+                        "memory vector search failed, using keyword results: {}",
+                        super::sanitize::loggable_error(&e)
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Hybrid merge
+        let merged = if vector_results.is_empty() {
+            // `fts5_search` already scored each hit by query coverage —
+            // absolute [0, 1], the same scale the hybrid path uses.
+            keyword_results
+                .iter()
+                .map(|(id, score)| vector::ScoredResult {
+                    id: id.clone(),
+                    vector_score: None,
+                    keyword_score: Some(*score),
+                    final_score: *score,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vector::hybrid_merge(
+                &vector_results,
+                &keyword_results,
+                q.vector_weight,
+                q.keyword_weight,
+                limit,
+            )
+        };
+
+        // Fetch full entries for merged results in a single query
+        // instead of N round-trips (N+1 pattern).
+        let mut results = Vec::new();
+        if !merged.is_empty() {
+            let placeholders: String = (1..=merged.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, key, content, category, created_at, session_id \
+                 FROM memories WHERE id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
+                .iter()
+                .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                id_params.iter().map(AsRef::as_ref).collect();
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+
+            let mut entry_map = std::collections::HashMap::new();
+            for row in rows {
+                let (id, key, content, cat, ts, sid) = row?;
+                entry_map.insert(id, (key, content, cat, ts, sid));
+            }
+
+            for scored in &merged {
+                if let Some((key, content, cat, ts, sid)) = entry_map.remove(&scored.id) {
+                    let entry = MemoryEntry {
+                        id: scored.id.clone(),
+                        key,
+                        content,
+                        category: Self::str_to_category(&cat),
+                        timestamp: ts,
+                        session_id: sid,
+                        score: Some(f64::from(scored.final_score)),
+                    };
+                    if let Some(filter_sid) = q.session {
+                        if entry.session_id.as_deref() != Some(filter_sid) {
+                            continue;
+                        }
+                    }
+                    results.push(entry);
+                }
+            }
+        }
+
+        // If hybrid returned nothing, fall back to LIKE search.
+        // `search_terms` caps the keyword count so there are not too many SQL
+        // shapes, which helps prepared-statement cache efficiency.
+        if results.is_empty() {
+            // Kept alongside the `%…%` patterns so each row can be scored by
+            // how many of these terms it actually contains.
+            let keyword_terms = terms::search_terms(q.text);
+            let keywords: Vec<String> = keyword_terms.iter().map(|w| format!("%{w}%")).collect();
+            if !keywords.is_empty() {
+                let conditions: Vec<String> = keywords
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        format!("(content LIKE ?{} OR key LIKE ?{})", i * 2 + 1, i * 2 + 2)
+                    })
+                    .collect();
+                let where_clause = conditions.join(" OR ");
+                // Scope in SQL here too, for the same reason as the FTS path:
+                // `ORDER BY updated_at DESC LIMIT n` applied globally can fill
+                // the whole limit with other sessions' rows before the filter
+                // ever runs.
+                let limit_idx = keywords.len() * 2 + 1;
+                let (scope_clause, session_idx) = if q.session.is_some() {
+                    (
+                        format!(" AND session_id = ?{}", limit_idx + 1),
+                        Some(limit_idx + 1),
+                    )
+                } else {
+                    (String::new(), None)
+                };
+                let category_clause = scope.clause("category");
+                let sql = format!(
+                    "SELECT id, key, content, category, created_at, session_id FROM memories
+                     WHERE ({where_clause}){scope_clause}{category_clause}
+                     ORDER BY updated_at DESC
+                     LIMIT ?{limit_idx}"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                for kw in &keywords {
+                    param_values.push(Box::new(kw.clone()));
+                    param_values.push(Box::new(kw.clone()));
+                }
+                #[allow(clippy::cast_possible_wrap)]
+                param_values.push(Box::new(limit as i64));
+                if session_idx.is_some() {
+                    if let Some(sid) = q.session {
+                        param_values.push(Box::new(sid.to_string()));
+                    }
+                }
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                    param_values.iter().map(AsRef::as_ref).collect();
+                let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                    let key: String = row.get(1)?;
+                    let content: String = row.get(2)?;
+                    // A substring scan has no ranking of its own. Score it on
+                    // the same absolute scale as the FTS path, with a row that
+                    // matches only by a fragment held under the ceiling.
+                    let coverage = Self::fallback_coverage(&keyword_terms, &key, &content);
+                    Ok(MemoryEntry {
+                        id: row.get(0)?,
+                        key,
+                        content,
+                        category: Self::str_to_category(&row.get::<_, String>(3)?),
+                        timestamp: row.get(4)?,
+                        session_id: row.get(5)?,
+                        score: Some(coverage),
+                    })
+                })?;
+                for row in rows {
+                    let entry = row?;
+                    if let Some(sid) = q.session {
+                        if entry.session_id.as_deref() != Some(sid) {
+                            continue;
+                        }
+                    }
+                    results.push(entry);
+                }
+            }
+        }
+
+        // Every path out of `recall` now yields absolute [0, 1] scores —
+        // saturated BM25, cosine, query coverage — so there is nothing to
+        // rescale: a set of weak hits stays weak, which is what lets the
+        // relevance floor reject it whole.
+        results.truncate(limit);
+        Ok(results)
+    }
 }
 
 #[async_trait]
@@ -674,7 +932,10 @@ impl Memory for SqliteMemory {
         let embedding_bytes = match self.get_or_compute_embedding(content).await {
             Ok(emb) => emb.map(|e| vector::vec_to_bytes(&e)),
             Err(e) => {
-                tracing::warn!("embedding unavailable, storing memory without a vector: {e}");
+                tracing::warn!(
+                    "embedding unavailable, storing memory without a vector: {}",
+                    super::sanitize::loggable_error(&e)
+                );
                 None
             }
         };
@@ -757,7 +1018,10 @@ impl Memory for SqliteMemory {
         let query_embedding = match self.get_or_compute_embedding(query).await {
             Ok(emb) => emb,
             Err(e) => {
-                tracing::warn!("embedding unavailable, recalling by keyword only: {e}");
+                tracing::warn!(
+                    "embedding unavailable, recalling by keyword only: {}",
+                    super::sanitize::loggable_error(&e)
+                );
                 None
             }
         };
@@ -770,204 +1034,27 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
-            let session_ref = sid.as_deref();
-
-            // FTS5 BM25 keyword search. A failure here is a real failure — an
-            // unparseable MATCH expression, a damaged index — and used to be
-            // indistinguishable from "nothing matched", which quietly demoted the
-            // query to the substring fallback. Say so, then degrade as before.
-            let keyword_results = match Self::fts5_search(&conn, &query, limit * 2, session_ref) {
-                Ok(hits) => hits,
-                Err(e) => {
-                    tracing::warn!("memory keyword search failed, falling back: {e}");
-                    Vec::new()
-                }
+            let q = RecallQuery {
+                text: &query,
+                session: sid.as_deref(),
+                embedding: query_embedding.as_deref(),
+                vector_weight,
+                keyword_weight,
             };
 
-            // Vector similarity search (if embeddings available)
-            let vector_results = if let Some(ref qe) = query_embedding {
-                match Self::vector_search(&conn, qe, limit * 2, None, session_ref) {
-                    Ok(hits) => hits,
-                    Err(e) => {
-                        tracing::warn!("memory vector search failed, using keyword results: {e}");
-                        Vec::new()
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-
-            // Hybrid merge
-            let merged = if vector_results.is_empty() {
-                // `fts5_search` already scored each hit by query coverage —
-                // absolute [0, 1], the same scale the hybrid path uses.
-                keyword_results
-                    .iter()
-                    .map(|(id, score)| vector::ScoredResult {
-                        id: id.clone(),
-                        vector_score: None,
-                        keyword_score: Some(*score),
-                        final_score: *score,
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                vector::hybrid_merge(
-                    &vector_results,
-                    &keyword_results,
-                    vector_weight,
-                    keyword_weight,
-                    limit,
-                )
-            };
-
-            // Fetch full entries for merged results in a single query
-            // instead of N round-trips (N+1 pattern).
-            let mut results = Vec::new();
-            if !merged.is_empty() {
-                let placeholders: String = (1..=merged.len())
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT id, key, content, category, created_at, session_id \
-                     FROM memories WHERE id IN ({placeholders})"
-                );
-                let mut stmt = conn.prepare(&sql)?;
-                let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
-                    .iter()
-                    .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
-                    .collect();
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                    id_params.iter().map(AsRef::as_ref).collect();
-                let rows = stmt.query_map(params_ref.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                    ))
-                })?;
-
-                let mut entry_map = std::collections::HashMap::new();
-                for row in rows {
-                    let (id, key, content, cat, ts, sid) = row?;
-                    entry_map.insert(id, (key, content, cat, ts, sid));
-                }
-
-                for scored in &merged {
-                    if let Some((key, content, cat, ts, sid)) = entry_map.remove(&scored.id) {
-                        let entry = MemoryEntry {
-                            id: scored.id.clone(),
-                            key,
-                            content,
-                            category: Self::str_to_category(&cat),
-                            timestamp: ts,
-                            session_id: sid,
-                            score: Some(f64::from(scored.final_score)),
-                        };
-                        if let Some(filter_sid) = session_ref {
-                            if entry.session_id.as_deref() != Some(filter_sid) {
-                                continue;
-                            }
-                        }
-                        results.push(entry);
-                    }
-                }
+            // Saved notes first. Raw conversation rows come second and only
+            // fill the room the notes leave, so a busy chat never spends the
+            // limit on its own transcript before a note is reached.
+            let mut results = Self::recall_pass(&conn, &q, limit, CategoryScope::Notes)?;
+            if results.len() < limit {
+                let room = limit - results.len();
+                results.extend(Self::recall_pass(
+                    &conn,
+                    &q,
+                    room,
+                    CategoryScope::Conversation,
+                )?);
             }
-
-            // If hybrid returned nothing, fall back to LIKE search.
-            // Cap keyword count so we don't create too many SQL shapes,
-            // which helps prepared-statement cache efficiency.
-            if results.is_empty() {
-                const MAX_LIKE_KEYWORDS: usize = 8;
-                // Kept alongside the `%…%` patterns so each row can be scored by
-                // how many of these terms it actually contains.
-                let keyword_terms: Vec<String> = query
-                    .split_whitespace()
-                    .take(MAX_LIKE_KEYWORDS)
-                    .map(str::to_lowercase)
-                    .collect();
-                let keywords: Vec<String> =
-                    keyword_terms.iter().map(|w| format!("%{w}%")).collect();
-                if !keywords.is_empty() {
-                    let conditions: Vec<String> = keywords
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| {
-                            format!("(content LIKE ?{} OR key LIKE ?{})", i * 2 + 1, i * 2 + 2)
-                        })
-                        .collect();
-                    let where_clause = conditions.join(" OR ");
-                    // Scope in SQL here too, for the same reason as the FTS path:
-                    // `ORDER BY updated_at DESC LIMIT n` applied globally can fill
-                    // the whole limit with other sessions' rows before the filter
-                    // ever runs.
-                    let limit_idx = keywords.len() * 2 + 1;
-                    let (scope_clause, session_idx) = if session_ref.is_some() {
-                        (
-                            format!(" AND session_id = ?{}", limit_idx + 1),
-                            Some(limit_idx + 1),
-                        )
-                    } else {
-                        (String::new(), None)
-                    };
-                    let sql = format!(
-                        "SELECT id, key, content, category, created_at, session_id FROM memories
-                         WHERE ({where_clause}){scope_clause}
-                         ORDER BY updated_at DESC
-                         LIMIT ?{limit_idx}"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    for kw in &keywords {
-                        param_values.push(Box::new(kw.clone()));
-                        param_values.push(Box::new(kw.clone()));
-                    }
-                    #[allow(clippy::cast_possible_wrap)]
-                    param_values.push(Box::new(limit as i64));
-                    if session_idx.is_some() {
-                        if let Some(sid) = session_ref {
-                            param_values.push(Box::new(sid.to_string()));
-                        }
-                    }
-                    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                        param_values.iter().map(AsRef::as_ref).collect();
-                    let rows = stmt.query_map(params_ref.as_slice(), |row| {
-                        let key: String = row.get(1)?;
-                        let content: String = row.get(2)?;
-                        // A substring scan has no ranking of its own. Score it
-                        // by query coverage — the same absolute measure the
-                        // FTS path uses, so the two paths share one scale.
-                        let coverage = Self::query_coverage(&keyword_terms, &key, &content);
-                        Ok(MemoryEntry {
-                            id: row.get(0)?,
-                            key,
-                            content,
-                            category: Self::str_to_category(&row.get::<_, String>(3)?),
-                            timestamp: row.get(4)?,
-                            session_id: row.get(5)?,
-                            score: Some(coverage),
-                        })
-                    })?;
-                    for row in rows {
-                        let entry = row?;
-                        if let Some(sid) = session_ref {
-                            if entry.session_id.as_deref() != Some(sid) {
-                                continue;
-                            }
-                        }
-                        results.push(entry);
-                    }
-                }
-            }
-
-            // Every path out of `recall` now yields absolute [0, 1] scores —
-            // saturated BM25, cosine, query coverage — so there is nothing to
-            // rescale: a set of weak hits stays weak, which is what lets the
-            // relevance floor reject it whole.
-            results.truncate(limit);
             Ok(results)
         })
         .await?
@@ -2106,7 +2193,14 @@ mod tests {
         .unwrap();
 
         let conn = mem.conn.lock();
-        let hits = SqliteMemory::fts5_search(&conn, "shared topic", 10, Some("session-b")).unwrap();
+        let hits = SqliteMemory::fts5_search(
+            &conn,
+            "shared topic",
+            10,
+            Some("session-b"),
+            CategoryScope::Conversation,
+        )
+        .unwrap();
 
         assert_eq!(
             hits.len(),
@@ -2165,8 +2259,11 @@ mod tests {
     }
 
     #[test]
-    fn build_fts_query_escapes_embedded_quotes() {
-        assert_eq!(SqliteMemory::build_fts_query("a\"b"), "\"a\"\"b\"");
+    fn build_fts_query_splits_on_embedded_quotes() {
+        assert_eq!(
+            SqliteMemory::build_fts_query("foo\"bar"),
+            "\"foo\" OR \"bar\""
+        );
         assert_eq!(
             SqliteMemory::build_fts_query("one two"),
             "\"one\" OR \"two\""
@@ -2265,7 +2362,8 @@ mod tests {
 
     /// The LIKE fallback is an unranked substring scan. It used to claim a flat
     /// 1.0, which made the weakest retrieval path outrank every BM25 hit. Score
-    /// it by how much of the query each row actually covers.
+    /// it by how much of the query each row actually covers, with a row that
+    /// holds only fragments capped at the fragment ceiling.
     #[tokio::test]
     async fn like_fallback_ranks_by_query_coverage() {
         let (_tmp, mem) = temp_sqlite();
@@ -2287,8 +2385,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {key}"))
         };
         assert!(
-            (score_of("both") - 1.0).abs() < 1e-6,
-            "row covering both fragments should be the best hit, got {}",
+            (score_of("both") - FRAGMENT_ONLY_CEILING).abs() < 1e-6,
+            "row covering both fragments should be the best hit, at the fragment ceiling, got {}",
             score_of("both")
         );
         assert!(
@@ -2297,6 +2395,173 @@ mod tests {
             score_of("one"),
             score_of("both")
         );
+    }
+
+    // ── What a question's words select ────────────────────────────
+
+    /// A busy chat stores every message as a `Conversation` row, and a short
+    /// row repeating the question's words outranks a longer saved note. The
+    /// limit was spent on those rows before the note was reached.
+    #[tokio::test]
+    async fn conversation_rows_never_crowd_a_saved_note_out_of_the_limit() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..30 {
+            mem.store(
+                &format!("telegram_chat_{i}"),
+                "deployment window",
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        mem.store(
+            "deploy_window",
+            "The deployment window for rantaiclaw_project is Friday afternoons after the freeze check passes",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hits = mem.recall("deployment window", 3, None).await.unwrap();
+
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].key, "deploy_window", "the saved note comes first");
+    }
+
+    /// The operator surfaces search with `recall` and expect raw conversation
+    /// rows among the results, so they stay reachable: they fill whatever room
+    /// the saved notes leave.
+    #[tokio::test]
+    async fn conversation_rows_still_fill_the_room_saved_notes_leave() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("note", "deployment window", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            mem.store(
+                &format!("telegram_chat_{i}"),
+                "deployment window again",
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let hits = mem.recall("deployment window", 10, None).await.unwrap();
+
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].key, "note");
+        assert!(hits[1..]
+            .iter()
+            .all(|e| e.category == MemoryCategory::Conversation));
+    }
+
+    /// Both passes honour the session filter: a conversation's saved note is
+    /// found under its own scope even when another scope holds the rows.
+    #[tokio::test]
+    async fn the_saved_note_pass_keeps_the_session_filter() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("mine", "deployment window", MemoryCategory::Core, Some("a"))
+            .await
+            .unwrap();
+        mem.store(
+            "theirs",
+            "deployment window",
+            MemoryCategory::Core,
+            Some("b"),
+        )
+        .await
+        .unwrap();
+
+        let hits = mem.recall("deployment window", 5, Some("a")).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "mine");
+    }
+
+    /// Punctuation is not part of a word: "release?" is the word "release".
+    #[tokio::test]
+    async fn punctuation_does_not_cost_a_word_its_match() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("rel", "release schedule", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let hits = mem.recall("release? schedule!", 5, None).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].score.unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    /// A word covers a note only as a whole word: "log" is not in "catalog".
+    #[tokio::test]
+    async fn a_fragment_of_a_longer_word_is_not_a_match() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("cat", "catalog rotation", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let hits = mem.recall("log rotation", 5, None).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].score.unwrap() - 0.5).abs() < 1e-6,
+            "only 'rotation' is a word of the note, got {:?}",
+            hits[0].score
+        );
+    }
+
+    /// An explicit search still finds a note by part of a word, but the score
+    /// of that hit stays under the default relevance floor, so the same hit is
+    /// never injected into a turn.
+    #[tokio::test]
+    async fn a_search_by_part_of_a_word_finds_the_row_below_the_default_floor() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("cat", "catalog rotation", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let hits = mem.recall("log", 5, None).await.unwrap();
+
+        assert_eq!(hits.len(), 1, "the row holds the letters of the search");
+        let score = hits[0].score.unwrap();
+        assert!(
+            score < crate::config::MemoryConfig::default().min_relevance_score,
+            "a fragment-only hit must score under the floor, got {score}"
+        );
+    }
+
+    /// The common words of a question do not count towards the score.
+    #[tokio::test]
+    async fn stopwords_do_not_count_towards_the_score() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("rel", "release schedule", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let hits = mem
+            .recall("what is the release schedule", 5, None)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].score.unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    /// An explicit search for a stopword still finds the notes that hold it.
+    #[tokio::test]
+    async fn a_search_for_a_stopword_alone_still_finds_it() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("w", "who owns the build", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let hits = mem.recall("who", 5, None).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
     }
 
     // ── Embedding provenance + UTC timestamp migration ────────────
@@ -2487,7 +2752,8 @@ mod tests {
             .expect("stub embedder should produce a vector");
 
         let conn = large.conn.lock();
-        let hits = SqliteMemory::vector_search(&conn, &query, 10, None, None).unwrap();
+        let hits = SqliteMemory::vector_search(&conn, &query, 10, None, None, CategoryScope::Notes)
+            .unwrap();
 
         let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(

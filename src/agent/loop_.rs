@@ -2631,11 +2631,7 @@ pub async fn run_with_scope(
             build_context(mem.as_ref(), &msg, config.memory.min_relevance_score),
         )
         .await;
-        let enriched = if mem_context.is_empty() {
-            msg.clone()
-        } else {
-            format!("{mem_context}{msg}")
-        };
+        let enriched = memory::prepend_memory_block(&mem_context, &msg);
 
         let mut history = vec![
             ChatMessage::system(&system_prompt),
@@ -2787,11 +2783,7 @@ pub async fn run_with_scope(
                 build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score),
             )
             .await;
-            let enriched = if mem_context.is_empty() {
-                user_input.clone()
-            } else {
-                format!("{mem_context}{user_input}")
-            };
+            let enriched = memory::prepend_memory_block(&mem_context, &user_input);
 
             history.push(ChatMessage::user(&enriched));
 

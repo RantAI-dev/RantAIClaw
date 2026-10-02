@@ -8,6 +8,7 @@ pub mod none;
 pub mod sanitize;
 pub mod snapshot;
 pub mod sqlite;
+pub(crate) mod terms;
 pub mod traits;
 pub mod vector;
 pub mod view;
@@ -18,7 +19,8 @@ pub use backend::{
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
 pub use context::{
-    build_memory_context, build_memory_context_in_view, MemoryContext, MemoryContextLimits,
+    build_memory_context, build_memory_context_in_view, prepend_memory_block, MemoryContext,
+    MemoryContextLimits,
 };
 pub use none::NoneMemory;
 pub use sanitize::sanitize_memory_content;
@@ -172,7 +174,10 @@ pub async fn autosave_screened(
                         "skipped auto-saving a message: the key is held by another memory place"
                     );
                 } else {
-                    tracing::warn!("skipped auto-saving a message: {e}");
+                    tracing::warn!(
+                        "skipped auto-saving a message: {}",
+                        sanitize::loggable_error(&e)
+                    );
                 }
             }
         }

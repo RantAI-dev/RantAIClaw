@@ -1887,9 +1887,12 @@ pub struct MemoryConfig {
     /// Weight for keyword BM25 in hybrid search (0.0–1.0)
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f64,
-    /// Minimum hybrid score (0.0–1.0) for a memory to be included in context.
-    /// Memories scoring below this threshold are dropped to prevent irrelevant
-    /// context from bleeding into conversations. Default: 0.4
+    /// Minimum score (0.0–1.0) for a memory to be included in context. The
+    /// score is absolute: the share of the question's meaningful words (whole
+    /// words, stopwords dropped) that the memory contains, blended with the
+    /// vector score when embeddings are on. Memories scoring below this
+    /// threshold are dropped to prevent irrelevant context from bleeding into
+    /// conversations. Default: 0.6
     #[serde(default = "default_min_relevance_score")]
     pub min_relevance_score: f64,
     /// Max embedding cache entries before LRU eviction
@@ -1947,7 +1950,7 @@ fn default_keyword_weight() -> f64 {
     0.3
 }
 fn default_min_relevance_score() -> f64 {
-    0.4
+    0.6
 }
 fn default_cache_size() -> usize {
     10_000

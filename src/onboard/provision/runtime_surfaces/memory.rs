@@ -100,7 +100,7 @@ impl TuiProvisioner for MemoryProvisioner {
             embedding_dimensions: 1536,
             vector_weight: 0.5,
             keyword_weight: 0.5,
-            min_relevance_score: 0.4,
+            min_relevance_score: MemoryConfig::default().min_relevance_score,
             embedding_cache_size: 10000,
             snapshot_enabled: false,
             snapshot_on_hygiene: true,
