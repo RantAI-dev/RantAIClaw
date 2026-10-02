@@ -635,12 +635,17 @@ paraphrased or cross-language questions will miss. Configure an
 Recall runs on every user turn, not only the first of a conversation. A note
 reaches the prompt when the words of the question match it, and the turn's place
 in the conversation plays no part. The stored history keeps each user turn as it
-was said, so a request holds one `[Memory context]` block, in front of the
-question being answered. A message that already carries a block is not given a
+was said, so a channel request holds one `[Memory context]` block, in front of
+the question being answered. The TUI, the console and the interactive CLI keep
+each enriched user turn in their session history, so a request there holds one
+block per user turn. A message that already carries a block is not given a
 second one.
 
 - Words are letters and digits. Punctuation separates them and case does not
-  matter. A word matches only as a whole word: `log` does not match `catalog`.
+  matter. A note counts as matching only when a whole word of the question is a
+  word of the note: `log` is not a word of `catalog`. An explicit search can
+  still find a note by part of a word, but a note that matches only that way
+  scores at most 0.25, so a floor above 0.25 (the default is 0.6) never injects it.
   A stored key counts as words too, so `deploy_window` holds `deploy` and `window`.
 - Common English and Indonesian words (`what`, `the`, `kapan`, `yang`) are
   dropped from the question before scoring. A question with no other word recalls

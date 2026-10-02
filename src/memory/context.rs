@@ -963,6 +963,60 @@ mod tests {
         assert_eq!(ctx.keys, vec!["deploy_window"]);
     }
 
+    /// The injection path takes a note only for a whole word of the question.
+    /// When no note holds any whole word, the substring scan still finds notes
+    /// by a fragment, and its score must stay under the default floor.
+    #[tokio::test]
+    async fn a_fragment_of_a_longer_word_injects_no_note() {
+        let floor = crate::config::MemoryConfig::default().min_relevance_score;
+        for (question, note) in [
+            ("log", "catalog rotation"),
+            ("2", "lunch at 12:00"),
+            ("ok", "the token is rotated monthly"),
+            ("hi", "this ship leaves on Friday"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+            mem.store("saved_note", note, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+
+            let ctx = build_memory_context_in_view(
+                &mem,
+                question,
+                floor,
+                &MemoryView::All,
+                MemoryContextLimits::default(),
+            )
+            .await;
+
+            assert!(ctx.is_empty(), "{question:?} injected {note:?}: {ctx:?}");
+        }
+    }
+
+    /// The control for the test above: the same question as a whole word of the
+    /// note injects it.
+    #[tokio::test]
+    async fn a_whole_word_of_a_note_injects_it() {
+        let floor = crate::config::MemoryConfig::default().min_relevance_score;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        mem.store("saved_note", "catalog rotation", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let ctx = build_memory_context_in_view(
+            &mem,
+            "catalog",
+            floor,
+            &MemoryView::All,
+            MemoryContextLimits::default(),
+        )
+        .await;
+
+        assert_eq!(ctx.keys, vec!["saved_note"]);
+    }
+
     #[test]
     fn a_block_goes_in_front_of_a_turn_that_has_none() {
         let turn = prepend_memory_block("[Memory context]\n- k: v\n\n", "what is the plan");

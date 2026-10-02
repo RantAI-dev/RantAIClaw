@@ -18,6 +18,11 @@ use uuid::Uuid;
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 
+/// Highest score a row earns when the query's words appear in it only inside
+/// longer words ("log" in "catalog"). It sits well under the default relevance
+/// floor, so such a row is found by a search and not injected into a turn.
+const FRAGMENT_ONLY_CEILING: f64 = 0.25;
+
 /// Re-render an RFC3339 timestamp in UTC, whatever offset it carries.
 ///
 /// Returns `None` for anything that is not RFC3339 so callers can keep the
@@ -505,20 +510,26 @@ impl SqliteMemory {
             / f64::from(u32::try_from(terms.len()).unwrap_or(u32::MAX))
     }
 
-    /// Fraction of the query's terms present as substrings of `key`/`content`.
-    /// The LIKE fallback uses it because that path exists to find a word by a
-    /// part of it.
-    #[allow(clippy::cast_precision_loss)]
-    fn query_coverage(terms: &[String], key: &str, content: &str) -> f64 {
-        if terms.is_empty() {
-            return 0.0;
+    /// Score of a row the LIKE fallback found. The fallback exists to find a
+    /// word by a part of it, so a row that holds no whole word of the query is
+    /// still returned, but it scores at most [`FRAGMENT_ONLY_CEILING`] (the
+    /// share of the query's terms found inside longer words, times the
+    /// ceiling). A row that holds a whole word scores by whole words, as the
+    /// keyword path does, so a fragment never lifts a row over the relevance
+    /// floor.
+    fn fallback_coverage(terms: &[String], key: &str, content: &str) -> f64 {
+        let whole = Self::word_coverage(terms, key, content);
+        if whole > 0.0 {
+            return whole;
         }
         let haystack = format!("{key} {content}").to_lowercase();
-        let matched = terms
+        let inside = terms
             .iter()
             .filter(|term| haystack.contains(term.as_str()))
             .count();
-        matched as f64 / terms.len() as f64
+        // A query holds at most `MAX_QUERY_TERMS` terms, so both counts fit a u32.
+        FRAGMENT_ONLY_CEILING * f64::from(u32::try_from(inside).unwrap_or(u32::MAX))
+            / f64::from(u32::try_from(terms.len().max(1)).unwrap_or(u32::MAX))
     }
 
     /// Build the FTS5 MATCH expression for a free-text query.
@@ -861,10 +872,10 @@ impl SqliteMemory {
                 let rows = stmt.query_map(params_ref.as_slice(), |row| {
                     let key: String = row.get(1)?;
                     let content: String = row.get(2)?;
-                    // A substring scan has no ranking of its own. Score it
-                    // by query coverage — the same absolute measure the
-                    // FTS path uses, so the two paths share one scale.
-                    let coverage = Self::query_coverage(&keyword_terms, &key, &content);
+                    // A substring scan has no ranking of its own. Score it on
+                    // the same absolute scale as the FTS path, with a row that
+                    // matches only by a fragment held under the ceiling.
+                    let coverage = Self::fallback_coverage(&keyword_terms, &key, &content);
                     Ok(MemoryEntry {
                         id: row.get(0)?,
                         key,
@@ -2351,7 +2362,8 @@ mod tests {
 
     /// The LIKE fallback is an unranked substring scan. It used to claim a flat
     /// 1.0, which made the weakest retrieval path outrank every BM25 hit. Score
-    /// it by how much of the query each row actually covers.
+    /// it by how much of the query each row actually covers, with a row that
+    /// holds only fragments capped at the fragment ceiling.
     #[tokio::test]
     async fn like_fallback_ranks_by_query_coverage() {
         let (_tmp, mem) = temp_sqlite();
@@ -2373,8 +2385,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {key}"))
         };
         assert!(
-            (score_of("both") - 1.0).abs() < 1e-6,
-            "row covering both fragments should be the best hit, got {}",
+            (score_of("both") - FRAGMENT_ONLY_CEILING).abs() < 1e-6,
+            "row covering both fragments should be the best hit, at the fragment ceiling, got {}",
             score_of("both")
         );
         assert!(
@@ -2499,6 +2511,26 @@ mod tests {
             (hits[0].score.unwrap() - 0.5).abs() < 1e-6,
             "only 'rotation' is a word of the note, got {:?}",
             hits[0].score
+        );
+    }
+
+    /// An explicit search still finds a note by part of a word, but the score
+    /// of that hit stays under the default relevance floor, so the same hit is
+    /// never injected into a turn.
+    #[tokio::test]
+    async fn a_search_by_part_of_a_word_finds_the_row_below_the_default_floor() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("cat", "catalog rotation", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let hits = mem.recall("log", 5, None).await.unwrap();
+
+        assert_eq!(hits.len(), 1, "the row holds the letters of the search");
+        let score = hits[0].score.unwrap();
+        assert!(
+            score < crate::config::MemoryConfig::default().min_relevance_score,
+            "a fragment-only hit must score under the floor, got {score}"
         );
     }
 

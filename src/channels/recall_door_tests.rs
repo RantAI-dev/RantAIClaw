@@ -237,6 +237,36 @@ async fn a_question_of_only_stopwords_recalls_nothing() {
     assert_eq!(blocks_in(&request), 1, "{request:#?}");
 }
 
+/// A short reply mid-conversation ("ok", "hi") is a fragment of longer words in
+/// the saved notes ("token", "this", "ship"), and a fragment is not a match.
+#[tokio::test]
+async fn a_short_reply_carries_no_note_that_holds_its_letters_inside_longer_words() {
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    for (key, note) in [
+        ("token_policy", "The deploy token is rotated every month"),
+        (
+            "ship_day",
+            "This ship leaves on Friday, which is release day",
+        ),
+    ] {
+        mem.store(key, note, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+    }
+    let door = Door::new(tmp, mem, OWNER_SENDER);
+
+    let request = door
+        .turn(Door::message(OWNER_SENDER, true, "when is ship day"))
+        .await;
+    assert!(last_user(&request).contains("- ship_day:"), "{request:#?}");
+
+    for reply in ["ok", "hi"] {
+        let request = door.turn(Door::message(OWNER_SENDER, true, reply)).await;
+        assert_eq!(blocks_in(&request), 0, "{reply:?}: {request:#?}");
+    }
+}
+
 /// A guest keeps reading only its own conversation, from the second turn on as
 /// on the first: the shared tier and another chat's notes stay out.
 #[tokio::test]

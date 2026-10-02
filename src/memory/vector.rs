@@ -66,7 +66,7 @@ pub struct ScoredResult {
 /// Hybrid merge: combine vector and keyword results with weighted fusion.
 ///
 /// Every score is **absolute**: cosine similarity is `[0, 1]`, keyword scores
-/// arrive as query coverage in `[0, 1]` (see `SqliteMemory::query_coverage`),
+/// arrive as query coverage in `[0, 1]` (see `SqliteMemory::word_coverage`),
 /// and `final_score` is the weighted average over the signals a document
 /// actually has. Two properties follow, both deliberate:
 ///

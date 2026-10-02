@@ -216,8 +216,8 @@ async fn handle_recall(config: &Config, query: &str, limit: usize) -> Result<()>
 
     println!("{} match(es) for '{}':\n", hits.len(), query);
     for entry in &hits {
-        // Scores are relevance relative to the best hit in this set, so render
-        // them as a percentage of it rather than as a bare fraction.
+        // Scores are absolute relevance in [0, 1], so render them as a
+        // percentage rather than as a bare fraction.
         let relevance = entry
             .score
             .map_or_else(String::new, |s| format!("  [{:.0}%]", s * 100.0));
