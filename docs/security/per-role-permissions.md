@@ -103,6 +103,25 @@ run arbitrary privileged tools." This is the feature.
   the same way. A refused attachment is replaced by one closing line in the reply.
   The guest's prompt offers attachments only under the same grant, without the
   absolute workspace path. Owner replies are not filtered.
+- **Runtime commands follow who the command changes.** A command that spends
+  the owner's keys or changes what another person sees runs only for an owner,
+  and a command that changes only the sender's own conversation runs for the
+  sender. The owner answer is the one the rest of the turn uses
+  (`approval_owners`, so `["*"]` makes everyone an owner). A guest who sends an
+  owner-only command gets one line saying it is for the owner. Nothing changes
+  and the message does not reach the model.
+
+  | Command | Changes | Guest | Owner |
+  |---|---|---|---|
+  | `/models`, `/model` with no argument, `/start`, `/help`, an unknown command | nothing | runs | runs |
+  | `/models <provider>`, `/model <model-id>` | the conversation's provider or model, and its history | refused | runs |
+  | `/new`, `/clear` in a direct chat | the sender's own history | runs | runs |
+  | `/new`, `/clear` in a group, or in a chat the platform did not mark as direct | a history several people share | refused | runs |
+
+  `/start`, `/help` and the unknown-command reply list only the commands the
+  sender can run in that chat. Pairing and approval replies (`/bind`, `/claim`,
+  `/approve`, `/deny`) are handled before these commands and keep their own
+  checks.
 - **Secure default:** empty `approval_owners` ⇒ everyone is a guest; empty
   `guest_allowed_*` ⇒ guests get only chat, the agent calls no tool on a
   guest's behalf. Nobody gets privileged capability until an owner opts them
