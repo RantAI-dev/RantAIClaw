@@ -125,7 +125,7 @@ empty. A door that forgets to set a view fails closed.
 | Daemon heartbeat | all of memory (its reply goes to the journal and the observer, never to a chat) |
 | Cron job created from a chat | that chat's conversation, for `main` and `isolated` |
 | Cron job with no chat, `main` or `isolated` | all of memory |
-| Webhook (`POST /webhook`, `POST /triggers/{path}`) | none: reads nothing |
+| Webhook (`POST /webhook`, `POST /triggers/{path}`) | none: reads nothing and writes nothing |
 | A delegated sub-agent | the view of the turn that delegated |
 
 - **A named owner** is an identity written in `approval_owners`. The `"*"` entry

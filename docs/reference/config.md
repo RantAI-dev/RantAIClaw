@@ -591,7 +591,7 @@ that failure with `409`.
 The agent's `memory_store` also refuses a key that already holds a different note
 unless `replaces` names it, so a second save under a model-chosen key cannot drop
 the first note; identical content succeeds. `memory_forget` deletes only rows the
-turn's view can see, by key and by `contains`, and nothing in a turn with no view.
+turn's view can see, by key and by `contains`, and refuses a turn with no view.
 An operator's own surfaces, `POST` and `DELETE /api/v1/memory`, `rantaiclaw
 memory add` and `clear`, and the TUI `/memory` commands, run under the view of all
 of memory and replace a note on purpose.
