@@ -106,7 +106,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context (kept for explicit recall only; never auto-injected into prompts), or a custom category name. A key that already holds a different note is refused: choose another key, or to correct that note pass 'replaces' with a distinctive phrase from the old one so it is superseded instead of piling up beside the correction."
+        "Store a fact about the person or the work in long-term memory, for example 'The owner prefers short answers' (a fact), not 'Always answer briefly' (an instruction to yourself). Use it when the user asks to have something remembered. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context (kept for explicit recall only; never auto-injected into prompts), or a custom category name. A key that already holds a different note is refused: choose another key, or to correct that note pass 'replaces' with a distinctive phrase from the old one so it is superseded instead of piling up beside the correction."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -119,7 +119,7 @@ impl Tool for MemoryStoreTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "The information to remember"
+                    "description": "The fact to store, written as a statement about the person or the work"
                 },
                 "category": {
                     "type": "string",
@@ -319,6 +319,10 @@ impl Tool for MemoryStoreTool {
             }
         }
 
+        // Tell the door that ran the turn what was kept, so it can say so. Only
+        // a write that succeeded gets here, and the content is what was stored.
+        crate::memory::record_saved_note(content);
+
         Ok(ToolResult {
             success: true,
             output,
@@ -340,7 +344,8 @@ impl MemoryStoreTool {
     ///
     /// So the write succeeds and the result carries the signal, which is the part
     /// that was missing — the file already says `… N more not shown`, but the
-    /// agent, the one thing that could consolidate, never saw it.
+    /// agent never saw it. The text states the fact and says to tell the person,
+    /// since a tool result is read by the model and must not urge a write.
     async fn core_capacity_notice(&self) -> Option<String> {
         // The block holds shared notes only, so notes kept in a conversation do
         // not count against it.
@@ -372,8 +377,8 @@ impl MemoryStoreTool {
         Some(format!(
             "Note: core memory is {} characters over the {budget}-character block that is \
              injected into the prompt, so {omitted} of {} core memories are no longer \
-             carried there (they remain searchable). Consider consolidating — store with \
-             'replaces' to supersede an entry, or memory_forget one that is no longer true.",
+             carried there. They are still found by memory_recall. Tell the person; do not \
+             store or forget notes on your own.",
             used - budget,
             entries.len()
         ))
@@ -497,6 +502,83 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["key"].is_object());
         assert!(schema["properties"]["content"].is_object());
+    }
+
+    /// The description is the one text every door shows the model. It asks for a
+    /// fact about the person or the work, says when to use the tool (the person
+    /// asked to have something remembered), and keeps the sentences the refused
+    /// key and `replaces` behavior depend on.
+    #[test]
+    fn description_asks_for_a_fact_and_for_use_when_the_user_asks() {
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security(), tmp.path().to_path_buf());
+        let description = tool.description();
+
+        assert!(
+            description.contains("fact about the person or the work"),
+            "{description}"
+        );
+        assert!(
+            description.contains("when the user asks to have something remembered"),
+            "{description}"
+        );
+        assert!(
+            !description.contains("Store a fact, preference, or note in long-term memory"),
+            "the old opening is back: {description}"
+        );
+        for kept in [
+            "Use category 'core' for permanent facts",
+            "A key that already holds a different note is refused",
+            "pass 'replaces' with a distinctive phrase",
+        ] {
+            assert!(description.contains(kept), "lost {kept:?}: {description}");
+        }
+
+        let content = tool.parameters_schema()["properties"]["content"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(content.contains("fact"), "{content}");
+        assert!(
+            !content.contains("The information to remember"),
+            "the old parameter text is back: {content}"
+        );
+    }
+
+    /// A door that collects the notes a turn stored sees the ones the tool kept:
+    /// the content as stored, once per successful write, and nothing for a
+    /// refused write. A door that sets no collector is unaffected.
+    #[tokio::test]
+    async fn a_successful_store_is_recorded_for_the_turn_and_a_refused_one_is_not() {
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let notes = crate::memory::SavedNotes::default();
+
+        let (kept, refused, outside) = crate::memory::SAVED_NOTES
+            .scope(notes.clone(), async {
+                let kept =
+                    execute_in_all_view(&tool, json!({"key": "k", "content": "Prefers tea"})).await;
+                let refused =
+                    execute_in_all_view(&tool, json!({"key": "k", "content": "Prefers coffee"}))
+                        .await;
+                let outside = tool
+                    .execute(json!({"key": "other", "content": "no view, refused"}))
+                    .await
+                    .unwrap();
+                (kept, refused, outside)
+            })
+            .await;
+
+        assert!(kept.success, "control: {:?}", kept.error);
+        assert!(!refused.success, "control: the second write is refused");
+        assert!(!outside.success, "control: a turn with no view is refused");
+        assert_eq!(notes.all(), vec!["Prefers tea".to_string()]);
+
+        // No collector: the same call still works and records nowhere.
+        let alone =
+            execute_in_all_view(&tool, json!({"key": "alone", "content": "Prefers rice"})).await;
+        assert!(alone.success);
+        assert_eq!(notes.all().len(), 1);
     }
 
     #[tokio::test]
@@ -787,10 +869,21 @@ mod tests {
 
         assert!(result.success, "the write must still succeed");
         assert!(
-            result.output.contains("over the") && result.output.contains("consolidat"),
+            result.output.contains("over the")
+                && result.output.contains("are still found by memory_recall")
+                && result.output.contains("Tell the person"),
             "expected a capacity notice, got: {}",
             result.output
         );
+        // A tool result is read by the model, so the notice states a fact and
+        // does not urge a store or a forget.
+        for urging in ["consolidat", "store with", "memory_forget"] {
+            assert!(
+                !result.output.contains(urging),
+                "the notice urges an unprompted write ({urging:?}): {}",
+                result.output
+            );
+        }
     }
 
     /// A guest's core note stays in the guest's conversation, so the file the

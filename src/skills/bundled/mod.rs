@@ -244,6 +244,41 @@ mod tests {
         }
     }
 
+    /// A bundled skill names only tools that exist, and none of them saves a
+    /// note or a file on the model's own initiative. `memory_write` is not a
+    /// tool; `memory_store` is, and the two skills that offer to keep their
+    /// output say it happens when the user asks.
+    #[test]
+    fn bundled_skills_store_a_note_only_when_the_user_asks() {
+        for skill in STARTER_PACK.iter().chain(CORE_PACK) {
+            assert!(
+                !skill.skill_md.contains("memory_write"),
+                "{} names a tool that does not exist",
+                skill.slug
+            );
+        }
+
+        for slug in ["research-assistant", "meeting-notes"] {
+            let skill = find_by_slug(slug).expect("the skill is in the starter pack");
+            assert!(
+                skill.skill_md.contains("- name: memory_store"),
+                "{slug} does not list the tool that exists"
+            );
+            assert!(
+                skill
+                    .skill_md
+                    .contains("with `memory_store` only when the user asks"),
+                "{slug} does not say a note is stored only when asked"
+            );
+            for urging in ["Save the final brief", "Save the rendered notes", "memory/"] {
+                assert!(
+                    !skill.skill_md.contains(urging),
+                    "{slug} still tells the model to save on its own: {urging:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn install_pack_records_bundled_origin_and_leaves_existing_dirs_alone() {
         let tmp = tempfile::TempDir::new().unwrap();

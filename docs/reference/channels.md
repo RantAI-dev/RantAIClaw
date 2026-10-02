@@ -677,6 +677,30 @@ Notes:
   `text` message type (plain); richer Lark `post`/`interactive` rendering, and an
   HTML email part, are deferred upgrades.
 
+### The `Noted:` line
+
+A note is stored only when the person asks for it. When a channel turn stores one
+through `memory_store`, the reply ends with a single line:
+
+```text
+Noted: The office is in Jakarta
+```
+
+- The line names the content that was stored, not its key. It is one line however
+  many notes the turn stored: it spells out the first three, separated by `;`,
+  and counts the rest (`; and 2 more`). A note longer than 80 characters is cut
+  with `…`.
+- A refused save adds no line, and a turn that stores nothing adds none. A turn
+  that stored a note and then failed or timed out ends its error text with the line.
+- The text is flattened to one line, and square brackets become parentheses, so a
+  note cannot start a second line or spell an attachment marker.
+- A guest who holds `memory_store` gets the line too. It names only the note that
+  guest's own turn stored.
+- The line goes to the person only. The conversation history that the model reads
+  on the next turn keeps the reply without it.
+- Only channel turns add the line. The TUI, the CLI, the web console, cron jobs and
+  webhooks reply as before.
+
 ---
 
 ## 3. Allowlist Semantics

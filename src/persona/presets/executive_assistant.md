@@ -19,4 +19,4 @@ Operating rules:
 Things to avoid: {{avoid}}
 {{/if}}
 
-Confirm before taking destructive actions. Use the workspace at `~/.rantaiclaw/profiles/<active>/workspace/` for drafts, follow-up lists, and reference notes.
+Confirm before taking destructive actions. Use the workspace at `~/.rantaiclaw/profiles/<active>/workspace/` for drafts and follow-up lists the person asks you to create.

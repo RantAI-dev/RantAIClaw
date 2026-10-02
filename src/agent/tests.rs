@@ -105,6 +105,34 @@ impl Provider for ScriptedProvider {
     }
 }
 
+/// A [`ScriptedProvider`] the test keeps a handle to, so it can read the
+/// requests after the agent has taken ownership of its provider.
+struct SharedProvider(Arc<ScriptedProvider>);
+
+#[async_trait]
+impl Provider for SharedProvider {
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> Result<String> {
+        self.0
+            .chat_with_system(system_prompt, message, model, temperature)
+            .await
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> Result<ChatResponse> {
+        self.0.chat(request, model, temperature).await
+    }
+}
+
 /// A mock provider that always returns an error.
 struct FailingProvider;
 
@@ -1501,7 +1529,7 @@ async fn clear_history_resets_conversation() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 21. Memory flush before compaction
+// 21. Compaction stores nothing
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn agent_with_security(provider: Box<dyn Provider>, mem: Arc<dyn Memory>) -> Agent {
@@ -1525,32 +1553,20 @@ async fn seed_history(agent: &mut Agent) {
     }
 }
 
-/// The compacted summary lives only in this session's history, so a fact the
-/// conversation established is gone when the session ends unless it was stored.
+/// Compaction folds older turns into a summary and does nothing else: it asks
+/// the model for no memory write, so a note is stored only when the person asked
+/// for one. Exactly one request is made (the summary) and nothing is stored.
 #[tokio::test]
-async fn compaction_flush_stores_durable_facts() {
+async fn compaction_asks_for_a_summary_and_stores_nothing() {
     let (mem, _tmp) = make_sqlite_memory();
-
-    // 12 seeding turns, then the flush turn's tool call, then its wrap-up, then
-    // the summary. Anything past the script falls back to plain text.
     let mut script: Vec<ChatResponse> = (0..12).map(|_| text_response("ok")).collect();
-    script.push(tool_response(vec![ToolCall {
-        id: "call_1".into(),
-        name: "memory_store".into(),
-        arguments: serde_json::json!({
-            "key": "operator_office",
-            "content": "The operator works from the Jakarta office"
-        })
-        .to_string(),
-    }]));
-    script.push(text_response("none"));
     script.push(text_response("## Summary\nsummarised"));
 
-    let mut agent = agent_with_security(Box::new(ScriptedProvider::new(script)), mem.clone());
+    let provider = Arc::new(ScriptedProvider::new(script));
+    let mut agent = agent_with_security(Box::new(SharedProvider(provider.clone())), mem.clone());
     seed_history(&mut agent).await;
+    let requests_before = provider.request_count();
 
-    // The TUI runs compaction under the `All` view, the operator's own place.
-    // With no view the flush's `memory_store` call is refused.
     crate::memory::MEMORY_VIEW
         .scope(
             crate::memory::MemoryView::All,
@@ -1559,30 +1575,13 @@ async fn compaction_flush_stores_durable_facts() {
         .await
         .unwrap();
 
-    let stored = mem.get("operator_office").await.unwrap();
-    assert!(
-        stored.is_some(),
-        "the flush turn's memory write must survive compaction"
+    assert_eq!(
+        provider.request_count() - requests_before,
+        1,
+        "compaction made a request besides the summary"
     );
-}
-
-/// The flush runs over a scratch history that is thrown away. Only the summary
-/// envelope belongs in the agent's own history.
-#[tokio::test]
-async fn compaction_flush_leaves_no_trace_in_history() {
-    let (mem, _tmp) = make_sqlite_memory();
-    let mut script: Vec<ChatResponse> = (0..12).map(|_| text_response("ok")).collect();
-    script.push(text_response("none"));
-    script.push(text_response("## Summary\nsummarised"));
-
-    let mut agent = agent_with_security(Box::new(ScriptedProvider::new(script)), mem);
-    seed_history(&mut agent).await;
-
-    agent.compact_streaming(4, None).await.unwrap();
-
-    let rendered = format!("{:?}", agent.history());
     assert!(
-        !rendered.contains("outlive this session"),
-        "the flush prompt must not leak into the agent's history"
+        mem.list(None, None).await.unwrap().is_empty(),
+        "compaction stored a note nobody asked for"
     );
 }

@@ -6,6 +6,7 @@ pub mod embeddings;
 pub mod hygiene;
 pub mod none;
 pub mod sanitize;
+pub mod saved;
 pub mod snapshot;
 pub mod sqlite;
 pub(crate) mod terms;
@@ -24,6 +25,7 @@ pub use context::{
 };
 pub use none::NoneMemory;
 pub use sanitize::sanitize_memory_content;
+pub use saved::{record_saved_note, SavedNotes, SAVED_NOTES};
 pub use sqlite::SqliteMemory;
 pub use traits::{KeyInUse, Memory};
 #[allow(unused_imports)]
@@ -47,22 +49,36 @@ pub(crate) const MEMORY_MD_TEMPLATE: &str = "\
     # MEMORY.md — Long-Term Memory\n\n\
     *Your curated memories. The distilled essence, not raw logs.*\n\n\
     ## How This Works\n\
-    - Daily files (`memory/YYYY-MM-DD.md`) capture raw events (on-demand via tools)\n\
     - This file captures what's WORTH KEEPING long-term\n\
     - This file is auto-injected into your system prompt each session\n\
-    - Keep it concise — every character here costs tokens\n\n\
+    - Every character here costs tokens\n\n\
     ## Security\n\
     - ONLY loaded in main session (direct chat with your human)\n\
     - NEVER loaded in group chats or shared contexts\n\n\
     ---\n\n\
     ## Key Facts\n\
-    (Add important facts about your human here)\n\n\
+    (None yet)\n\n\
     ## Decisions & Preferences\n\
-    (Record decisions and preferences here)\n\n\
+    (None yet)\n\n\
     ## Lessons Learned\n\
-    (Document mistakes and insights here)\n\n\
+    (None yet)\n\n\
     ## Open Loops\n\
-    (Track unfinished tasks and follow-ups here)\n";
+    (None yet)\n";
+
+/// Lines earlier wizards wrote into `MEMORY.md` that [`MEMORY_MD_TEMPLATE`] no
+/// longer holds: the line about daily files that no longer exist, the four
+/// placeholders that told the model to write into the file, and the bullet that
+/// told it to keep the file short. A `MEMORY.md` written then still holds them,
+/// so the importer keeps treating them as scaffold, not as notes. Compared after
+/// trimming and without a leading `- `, like the template lines.
+pub(crate) const LEGACY_MEMORY_MD_SCAFFOLD_LINES: &[&str] = &[
+    "Daily files (`memory/YYYY-MM-DD.md`) capture raw events (on-demand via tools)",
+    "Keep it concise — every character here costs tokens",
+    "(Add important facts about your human here)",
+    "(Record decisions and preferences here)",
+    "(Document mistakes and insights here)",
+    "(Track unfinished tasks and follow-ups here)",
+];
 
 fn create_memory_with_builders<F>(
     backend_name: &str,
