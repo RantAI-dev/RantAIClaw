@@ -367,3 +367,94 @@ impl DoorFixture {
         );
     }
 }
+
+/// The registry a door builds from `config`: `all_tools_with_runtime` over the
+/// same arguments the CLI door passes. A test reads what each tool says about
+/// itself from here and compares it with what the door's prompt says.
+pub(crate) fn registry_for(config: &Config) -> Vec<Box<dyn crate::tools::Tool>> {
+    let runtime: Arc<dyn crate::runtime::RuntimeAdapter> = Arc::from(
+        crate::runtime::create_runtime(&config.runtime).expect("the native runtime builds"),
+    );
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let memory: Arc<dyn Memory> = Arc::from(
+        crate::memory::create_memory_with_storage(
+            &config.memory,
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )
+        .expect("the notes database opens"),
+    );
+    crate::tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        memory,
+        None,
+        None,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        config,
+    )
+}
+
+/// The `(name, description)` entries of the `## Tools` list in `prompt`, in
+/// order. An entry opens with `- **name**: ` and runs to the next entry, so a
+/// description that spans lines stays whole. A `Parameters:` line the agent
+/// surface adds is not part of the description.
+pub(crate) fn tools_section_entries(prompt: &str) -> Vec<(String, String)> {
+    let Some((_, rest)) = prompt.split_once("## Tools\n\n") else {
+        return Vec::new();
+    };
+    let section = rest.split("\n## ").next().unwrap_or(rest).trim_end();
+    section
+        .split("\n- **")
+        .map(|entry| entry.strip_prefix("- **").unwrap_or(entry))
+        .filter_map(|entry| entry.split_once("**: "))
+        .map(|(name, description)| {
+            let description = description
+                .split("\n  Parameters: `")
+                .next()
+                .unwrap_or(description);
+            (name.to_string(), description.trim_end().to_string())
+        })
+        .collect()
+}
+
+/// What a registry says about its tools: `(name, description)` per tool, read
+/// from the tools themselves.
+pub(crate) fn held_by(registry: &[Box<dyn crate::tools::Tool>]) -> Vec<(&str, &str)> {
+    registry
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect()
+}
+
+/// Asserts that `prompt` lists exactly the tools in `held`: the set of names is
+/// equal in both directions, and no entry is worded differently from the tool.
+pub(crate) fn assert_prompt_lists(door: &str, prompt: &str, held: &[(&str, &str)]) {
+    let listed = tools_section_entries(prompt);
+    let mut listed_names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
+    listed_names.sort_unstable();
+    let mut held_names: Vec<&str> = held.iter().map(|(name, _)| *name).collect();
+    held_names.sort_unstable();
+    assert_eq!(
+        listed_names, held_names,
+        "{door}: the prompt names a different set of tools than the registry holds"
+    );
+    for (name, description) in held {
+        let entry = listed
+            .iter()
+            .find(|(listed_name, _)| listed_name == name)
+            .unwrap_or_else(|| panic!("{door}: {name} is not listed"));
+        assert_eq!(
+            entry.1, *description,
+            "{door}: the prompt words {name} differently from the tool"
+        );
+    }
+}

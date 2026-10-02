@@ -60,6 +60,18 @@ impl Tool for DescriptorTool {
     }
 }
 
+/// The `(name, description)` pairs a prompt lists for `tools`, read from the
+/// tools themselves. Every door that lists tools takes its list from here, so
+/// a tool is worded the same way in each prompt and a prompt names only the
+/// tools its caller's registry holds.
+#[must_use]
+pub fn tool_descriptions(tools: &[Box<dyn Tool>]) -> Vec<(&str, &str)> {
+    tools
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect()
+}
+
 /// Who a prompt is written for. See [`PromptContext::audience`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptAudience {
@@ -502,6 +514,23 @@ fn render_safety(
     SafetySection.build(&ctx).unwrap_or_default()
 }
 
+/// The read-only tools among `tools` that run without an approval gate, as the
+/// phrase a safety text uses (`reading files, recalling memory`), or `None`
+/// when `tools` holds none of them. A guest's tools are the operator's choice,
+/// so the owner's fixed promise would claim reads the guest cannot make.
+fn ungated_reads(tools: &[Box<dyn Tool>]) -> Option<String> {
+    const READS: [(&str, &str); 2] = [
+        ("file_read", "reading files"),
+        ("memory_recall", "recalling memory"),
+    ];
+    let held: Vec<&str> = READS
+        .iter()
+        .filter(|(name, _)| tools.iter().any(|tool| tool.name() == *name))
+        .map(|(_, what)| *what)
+        .collect();
+    (!held.is_empty()).then(|| held.join(", "))
+}
+
 /// The Strict-policy line that says what a guest can still do: the read tools
 /// it has, and none it lacks. The operator sets a guest's tools, so the owner's
 /// fixed list would promise reads the guest cannot make.
@@ -552,13 +581,24 @@ pub fn render_guest_turn_sections(guest_tools: &[Box<dyn Tool>], native_tools: b
 /// Heading of the persona section, as emitted by [`render_persona_section`].
 pub const PERSONA_SECTION_HEADING: &str = "## Persona";
 
+/// Byte offset of the line that is exactly `heading`. A heading that only
+/// begins a longer one, such as `## Persona` in `## Personality`, is not it.
+fn find_heading_line(prompt: &str, heading: &str) -> Option<usize> {
+    prompt.match_indices(heading).map(|(at, _)| at).find(|&at| {
+        let starts_line = at == 0 || prompt[..at].ends_with('\n');
+        let rest = &prompt[at + heading.len()..];
+        let ends_line = rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n");
+        starts_line && ends_line
+    })
+}
+
 /// Swap the section opened by `heading` in an already-built prompt for
 /// `replacement`. Returns `prompt` unchanged when it carries no such section,
 /// so a caller cannot silently lose the rest of the prompt if section
 /// composition changes.
 #[must_use]
 fn replace_section(prompt: &str, heading: &str, replacement: &str) -> String {
-    let Some(start) = prompt.find(heading) else {
+    let Some(start) = find_heading_line(prompt, heading) else {
         return prompt.to_string();
     };
     // Sections are joined with a blank line and each opens with `## `, so the
@@ -667,11 +707,12 @@ impl PromptSection for SafetySection {
                 );
             }
             Some(PolicyPreset::Smart) if is_channel => {
+                out.push_str("**Active approval policy: Smart (messaging channel).**\n\n");
+                if let Some(reads) = ungated_reads(ctx.tools) {
+                    let _ = writeln!(out, "- Read-only tools ({reads}) run automatically.");
+                }
                 out.push_str(
-                    "**Active approval policy: Smart (messaging channel).**\n\n\
-                     - Read-only tools (reading files, recalling memory) run \
-                     automatically.\n\
-                     - Any tool that runs commands or changes state requires \
+                    "- Any tool that runs commands or changes state requires \
                      approval from an authorized **owner** of this channel. When \
                      an owner is configured the agent posts the request in chat \
                      and waits for their `/approve`; without an approving owner \
@@ -705,7 +746,13 @@ impl PromptSection for SafetySection {
                     "**Active approval policy: Manual (messaging channel).**\n\n\
                      - Every tool that runs commands or changes state requires \
                      an authorized **owner**'s in-chat approval (`/approve`) on \
-                     this channel; read-only file/memory tools are not gated.\n\
+                     this channel",
+                );
+                if let Some(reads) = ungated_reads(ctx.tools) {
+                    let _ = write!(out, "; read-only tools ({reads}) are not gated");
+                }
+                out.push_str(
+                    ".\n\
                      - Without an approving owner the action is declined — say \
                      so rather than pretending it ran.\n",
                 );
@@ -1234,6 +1281,29 @@ mod tests {
             1,
             "must not duplicate the heading: {out}"
         );
+    }
+
+    /// `## Persona` is a prefix of the AIEOS heading `## Personality`. With no
+    /// persona to swap in, a match on the prefix cuts the AIEOS block out of
+    /// the prompt, so a heading matches only as a whole line.
+    #[test]
+    fn replace_persona_section_leaves_the_aieos_personality_heading_alone() {
+        let prompt = "## Identity\n\nname\n\n## Personality\n\nbold\n\n## Skills\n\nskill list\n";
+        assert_eq!(replace_persona_section(prompt, ""), prompt);
+    }
+
+    /// The whole-line match still finds the real section when an AIEOS
+    /// `## Personality` block comes first.
+    #[test]
+    fn replace_persona_section_swaps_the_persona_block_after_a_personality_block() {
+        let prompt =
+            "## Personality\n\nbold\n\n## Persona\n\nold persona\n\n## Skills\n\nskill list\n";
+        let out = replace_persona_section(prompt, "## Persona\n\nnew persona");
+
+        assert!(out.contains("## Personality\n\nbold"), "{out}");
+        assert!(out.contains("new persona"), "{out}");
+        assert!(!out.contains("old persona"), "{out}");
+        assert!(out.contains("skill list"), "{out}");
     }
 
     /// A prompt with no safety block must come back untouched rather than

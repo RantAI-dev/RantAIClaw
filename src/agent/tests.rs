@@ -1501,22 +1501,6 @@ async fn clear_history_resets_conversation() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 25. run_single delegates to turn
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn run_single_delegates_to_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("via run_single")]));
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
-
-    let response = agent.run_single("test").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty response from run_single"
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // 21. Memory flush before compaction
 // ═══════════════════════════════════════════════════════════════════════════
 

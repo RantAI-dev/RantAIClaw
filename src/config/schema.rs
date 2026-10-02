@@ -2671,7 +2671,7 @@ pub struct ChannelsConfig {
     ///
     /// Empty (default) ⇒ the agent calls no tool on a guest's behalf; the
     /// guest can still chat. List specific tool names (e.g. `"shell"`,
-    /// `"web_search"`) to widen what guests may use. The owner's
+    /// `"web_search_tool"`) to widen what guests may use. The owner's
     /// `autonomy.auto_approve` list is intentionally **not** unioned in — an
     /// operator who wants a guest to be able to read files or recall memory
     /// must list those tools here.

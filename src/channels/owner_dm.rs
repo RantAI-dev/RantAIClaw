@@ -56,7 +56,6 @@ impl OwnerDm {
                 workspace.to_path_buf(),
                 "owner-dm-model".to_string(),
                 Vec::new(),
-                Vec::new(),
                 crate::config::IdentityConfig::default(),
                 None,
                 false,

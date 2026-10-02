@@ -41,9 +41,11 @@ run arbitrary privileged tools." This is the feature.
       and in Full mode its instructions and tools;
     - the owner's name and timezone in the persona. The persona calls the
       person in the chat "the user";
-    - every tool the guest may not call, and every instruction to use one. The
-      guest prompt built at start-up has no tool list, no task section and no
-      tool-use protocol. Each message adds them from the ceiling as reloaded,
+    - every tool the guest may not call, and every instruction to use one. That
+      includes the instruction to schedule a reminder with `cron_add`: a prompt
+      carries it only when the caller's tools hold `cron_add`, and the gate
+      treats it as owner-only, so a guest never gets it. The guest prompt built
+      at start-up has no tool list, no task section and no tool-use protocol. Each message adds them from the ceiling as reloaded,
       so an edit to `guest_allowed_tools` applies to the next message. The
       tool list is the tools `guest_allowed_tools` permits, each with its
       description. The task section tells the guest to use them, or, when the
@@ -56,7 +58,11 @@ run arbitrary privileged tools." This is the feature.
       safety section promises a guest only the reads it has among `file_read`,
       `memory_recall` and `web_search_tool`. A guest with no tool is told none
       of its tools run, and a guest whose tools are none of those three reads
-      is promised nothing. The `shell` line follows the guest's tools.
+      is promised nothing. The `shell` line follows the guest's tools. Under
+      the Smart and Manual presets on a channel, the safety section says that
+      reading files and recalling memory run without a gate only for the
+      tools among `file_read` and `memory_recall` that the guest has, and says
+      nothing about reads for a guest that has neither.
 
     It keeps `AGENTS.md`, `SOUL.md` and `IDENTITY.md`, since they describe the
     bot, and the skill list without locations.
