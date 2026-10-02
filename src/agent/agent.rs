@@ -1126,7 +1126,7 @@ impl Agent {
                     })
                     .await;
             }
-            format!("{}{user_message}", context.block)
+            crate::memory::prepend_memory_block(&context.block, user_message)
         };
 
         self.history

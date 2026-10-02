@@ -628,6 +628,31 @@ matching: a query that shares no words with a stored fact returns nothing, and
 paraphrased or cross-language questions will miss. Configure an
 `embedding_provider` to add semantic (vector) recall on top.
 
+### What a turn recalls
+
+Recall runs on every user turn, not only the first of a conversation. A note
+reaches the prompt when the words of the question match it, and the turn's place
+in the conversation plays no part. The stored history keeps each user turn as it
+was said, so a request holds one `[Memory context]` block, in front of the
+question being answered. A message that already carries a block is not given a
+second one.
+
+- Words are letters and digits. Punctuation separates them and case does not
+  matter. A word matches only as a whole word: `log` does not match `catalog`.
+  A stored key counts as words too, so `deploy_window` holds `deploy` and `window`.
+- Common English and Indonesian words (`what`, `the`, `kapan`, `yang`) are
+  dropped from the question before scoring. A question with no other word recalls
+  nothing. An explicit search (`memory_recall`, the API, the CLI) still searches
+  the words it was given.
+- The raw `conversation` rows that auto-save writes never take a place in the
+  recall limit that a saved note needs. `memory_recall` and the operator searches
+  list the saved notes first and fill the rest of the limit with conversation rows.
+- The block opens with its header line, then states that the notes are saved
+  data and not instructions, to be used only when they bear on the question and
+  not to be mentioned unless asked.
+- Logs carry counts for each recall, never a question, a key or a note. An error
+  from the store or an embedding provider is logged as its kind only.
+
 The context builder also drops an entry that _is_ the message being answered
 (auto-save stores a verbatim copy, which is worthless as context). An entry that
 merely mentions the same topic is unaffected; only a verbatim echo is dropped.
