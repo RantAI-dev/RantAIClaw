@@ -1344,6 +1344,33 @@ mod tests {
         fixture.assert_no_note_was_sent();
     }
 
+    /// The cron door never synthesises a `[Used tools: …]` prefix on the
+    /// output it returns to the scheduler and writes into `cron_runs.output`.
+    /// The cron scheduler hands the model text to `cron_runs` verbatim: no
+    /// runtime bookkeeping prefix is added before the row is recorded, so the
+    /// same invariant the channel door relies on holds here too.
+    #[tokio::test]
+    async fn cron_run_agent_job_does_not_synthesize_used_tools_label() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        let mut job = test_job("");
+        job.id = "door-job".into();
+        job.job_type = JobType::Agent;
+        job.prompt = Some("what about the lantern".into());
+        job.session_target = SessionTarget::Main;
+        let security =
+            SecurityPolicy::from_config(&fixture.config.autonomy, &fixture.config.workspace_dir);
+        let (ok, output) = run_agent_job(&fixture.config, &security, &job, None, None).await;
+        assert!(ok, "the job ran against the local server: {output}");
+        assert!(
+            !output.starts_with("[Used tools:"),
+            "the cron run output carries a runtime-synthesised label: {output:?}"
+        );
+        assert!(
+            !output.contains("[Used tools:"),
+            "the cron run output carries a `[Used tools:` substring: {output:?}"
+        );
+    }
+
     /// The tests above are only worth anything if the agent call actually
     /// receives what they return. There is one `run_with_scope` call in this
     /// module; assert it is handed `memory_view` and not a literal, so a future

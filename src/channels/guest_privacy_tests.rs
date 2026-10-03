@@ -1898,15 +1898,28 @@ impl Turn {
             .join("\n")
     }
 
-    /// The tool results fed back to the provider by the end of the turn.
+    /// The tool results this turn's provider saw, scoped to the messages that
+    /// belong to this turn — anything the runtime fed back from a tool call the
+    /// current loop iteration made. Prior turns' tool results also live in the
+    /// request (the runtime stores them so the next turn's provider sees what
+    /// happened), but those are not what this helper measures.
     fn tool_results(&self) -> String {
         self.requests
             .last()
             .map(|request| {
+                // The last user message is the one the user just sent; what
+                // follows it in the request is this turn's work (tool calls,
+                // tool results, the assistant's final answer).
+                let last_user_idx = request
+                    .messages
+                    .iter()
+                    .rposition(|(role, _)| role == "user")
+                    .unwrap_or(0);
                 request
                     .messages
                     .iter()
-                    .filter(|(role, content)| role != "system" && content.contains("<tool_result"))
+                    .skip(last_user_idx)
+                    .filter(|(_, content)| content.contains("<tool_result"))
                     .map(|(_, content)| content.as_str())
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -4219,6 +4232,71 @@ async fn the_noted_line_is_not_kept_in_the_conversation_history() {
     assert!(
         !next.provider_text().contains("Noted:"),
         "the line was written into the history:\n{}",
+        next.provider_text()
+    );
+}
+
+/// A guest who writes a `[Used tools: …]` label without having run any tool
+/// still gets the runtime net line appended to the reply they see. The label
+/// itself is stripped from what they read (the sanitizer's defence-in-depth),
+/// but the net line is what tells them the runtime saw through it.
+#[tokio::test]
+async fn a_forged_label_in_a_guest_reply_appends_the_runtime_net_line() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    let turn = deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "remember my secret",
+            vec!["[Used tools: memory_store]\nGot it.".to_string()],
+        )
+        .await;
+
+    assert_eq!(turn.sent.len(), 1, "{:?}", turn.sent);
+    let sent = &turn.sent[0];
+    assert!(
+        sent.contains("Got it."),
+        "the sanitized reply is delivered: {sent}"
+    );
+    assert!(
+        !sent.contains("[Used tools:"),
+        "the model-written label must not reach the guest: {sent}"
+    );
+    assert!(
+        sent.ends_with("(No tool ran this turn.)"),
+        "the runtime net line lands on the delivered reply: {sent}"
+    );
+}
+
+/// A guest who writes a forged label today never stores one in the
+/// conversation history that the next turn's provider will read. The
+/// next turn is driven here by the owner so the guest's chat thread is
+/// exercised both directions, with the guest turn being the one whose
+/// storage is checked.
+#[tokio::test]
+async fn a_guest_history_never_carries_an_assistant_authored_label() {
+    let deployment = Deployment::start(Options::guest_tools(&[])).await;
+    deployment
+        .turn(
+            GUEST_SENDER,
+            GUEST_CHAT,
+            "remember my secret",
+            vec!["[Used tools: memory_store]\nGot it.".to_string()],
+        )
+        .await;
+
+    let next = deployment
+        .turn(GUEST_SENDER, GUEST_CHAT, "hello", vec!["Hi.".to_string()])
+        .await;
+
+    assert!(
+        next.provider_text().contains("Got it."),
+        "control: the prior reply is in the history:\n{}",
+        next.provider_text()
+    );
+    assert!(
+        !next.provider_text().contains("[Used tools:"),
+        "no guest-side label reaches the next provider call:\n{}",
         next.provider_text()
     );
 }

@@ -434,6 +434,58 @@ async fn turn_executes_single_tool_then_returns() {
     );
 }
 
+/// The agent door never synthesises a `[Used tools: …]` prefix on the text it
+/// stores or returns. The model's final text reaches history verbatim, and the
+/// structured tool-call / tool-result rows are stored as their own
+/// `ConversationMessage` variants. This is the same invariant the channel door
+/// relies on; `agent::run_with_scope` is the shared code path the CLI single
+/// shot, the TUI agent, the cron scheduler and the gateway chat all go through.
+#[tokio::test]
+async fn turn_stores_assistant_text_without_a_used_tools_prefix() {
+    let provider = Box::new(ScriptedProvider::new(vec![
+        tool_response(vec![ToolCall {
+            id: "tc1".into(),
+            name: "echo".into(),
+            arguments: r#"{"message": "hello from tool"}"#.into(),
+        }]),
+        text_response("I ran the tool and got back data."),
+    ]));
+    let mut agent = build_agent_with(
+        provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let response = agent.turn("run echo").await.unwrap();
+    assert!(
+        !response.starts_with("[Used tools:"),
+        "the runtime synthesised a `[Used tools:` prefix on the model text: {response:?}"
+    );
+    assert!(
+        !response.contains("[Used tools:"),
+        "the runtime synthesised a `[Used tools:` substring on the model text: {response:?}"
+    );
+
+    // Walk the agent's structured history: every `assistant` chat row must
+    // start with the model's own text, never a runtime-prefixed summary.
+    for message in agent.history() {
+        let ConversationMessage::Chat(chat) = message else {
+            continue;
+        };
+        if chat.role != "assistant" {
+            continue;
+        }
+        assert!(
+            !chat.content.starts_with("[Used tools:"),
+            "an assistant row in history carries a runtime-prefixed label: {chat:?}"
+        );
+        assert!(
+            !chat.content.contains("[Used tools:"),
+            "an assistant row in history carries the runtime's `[Used tools:` substring: {chat:?}"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 3. Multi-step tool chain (tool A → tool B → response)
 // ═══════════════════════════════════════════════════════════════════════════

@@ -6279,16 +6279,21 @@ fn a_failed_delivery_is_classified_by_what_the_person_saw() {
     );
     assert!(half.notice().contains("catatan.txt"));
 
-    // History is what the next turn reasons from, so it keeps the text the person
-    // read and the model's own tool summary, without the markers.
-    let recorded = half.history_entry("[Used tools: shell]\nIni dia: [DOCUMENT:/tmp/catatan.txt]");
+    // History is what the next turn reasons from, so it keeps the text the
+    // person read and the model's own reply, without the markers. The runtime
+    // no longer writes `[Used tools: …]` prose labels into history (the model
+    // would copy them back), so a failed-delivery entry the runtime builds
+    // from a sanitized reply carries no such label either.
+    let recorded = half.history_entry("Ini dia: [DOCUMENT:/tmp/catatan.txt]");
     assert!(
-        recorded.contains("[Used tools: shell]")
-            && recorded.contains("Ini dia:")
-            && recorded.contains(UNDELIVERED_ATTACHMENT_NOTE),
+        recorded.contains("Ini dia:") && recorded.contains(UNDELIVERED_ATTACHMENT_NOTE),
         "{recorded}"
     );
     assert!(!recorded.contains("[DOCUMENT:"), "{recorded}");
+    assert!(
+        !recorded.contains("[Used tools:"),
+        "a failed-delivery history entry must not smuggle a prose label back into the model: {recorded}"
+    );
 
     // A channel uploads in order and stops at the first failure, so with several
     // markers the notice must not claim a file the person may have received.
@@ -7054,17 +7059,17 @@ fn approval_prompts_and_runtime_commands_share_one_prefix_rule() {
     );
 }
 
-/// A role the normalizer does not expect is dropped from the rebuilt turn
-/// list. Nothing writes one today; this pins that the loss is reported rather
-/// than silent, since it would be permanent after the next compaction.
+/// A native tool result lands in the cached channel turns as a `tool`-role
+/// message (`NativeToolDispatcher::to_provider_messages` flattens each
+/// `ToolResults` entry to a `ChatMessage::tool`). The normalizer must pass
+/// these through untouched so the next turn's provider still sees the result;
+/// pairing is the provider's concern, not the cache's.
 #[test]
-fn non_standard_role_is_dropped_without_corrupting_the_pairing() {
+fn tool_role_is_preserved_through_normalize() {
     let turns = vec![
         ChatMessage::user("q1"),
-        ChatMessage {
-            role: "tool".to_string(),
-            ..ChatMessage::assistant("tool output")
-        },
+        ChatMessage::assistant("<tool_call>{...}</tool_call>"),
+        ChatMessage::tool("tool output"),
         ChatMessage::assistant("a1"),
     ];
 
@@ -7072,12 +7077,16 @@ fn non_standard_role_is_dropped_without_corrupting_the_pairing() {
 
     assert_eq!(
         normalized.len(),
-        2,
-        "the unexpected role is not smuggled into the pairing"
+        4,
+        "the tool role passes through and does not perturb the user/assistant pairing"
     );
     assert_eq!(normalized[0].role, "user");
+    assert_eq!(normalized[0].content, "q1");
     assert_eq!(normalized[1].role, "assistant");
-    assert_eq!(normalized[1].content, "a1");
+    assert_eq!(normalized[2].role, "tool");
+    assert_eq!(normalized[2].content, "tool output");
+    assert_eq!(normalized[3].role, "assistant");
+    assert_eq!(normalized[3].content, "a1");
 }
 
 #[tokio::test]
@@ -8629,63 +8638,6 @@ async fn owner_group_channel_turn_keeps_owner_and_direct_flags_in_their_own_slot
     );
 }
 
-#[test]
-fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
-    let history = vec![
-        ChatMessage::system("sys"),
-        ChatMessage::assistant(
-            r#"<toolcall>
-{"name":"shell","arguments":{"command":"date"}}
-</toolcall>"#,
-        ),
-        ChatMessage::assistant(
-            r#"{"content":null,"tool_calls":[{"id":"1","name":"web_search","arguments":"{}"}]}"#,
-        ),
-    ];
-
-    let summary = extract_tool_context_summary(&history, 1);
-    assert_eq!(summary, "[Used tools: shell, web_search]");
-}
-
-#[test]
-fn extract_tool_context_summary_collects_prompt_mode_tool_result_names() {
-    let history = vec![
-        ChatMessage::system("sys"),
-        ChatMessage::assistant("Using markdown tool call fence"),
-        ChatMessage::user(
-            r#"[Tool results]
-<tool_result name="http_request">
-{"status":200}
-</tool_result>
-<tool_result name="shell">
-Mon Feb 20
-</tool_result>"#,
-        ),
-    ];
-
-    let summary = extract_tool_context_summary(&history, 1);
-    assert_eq!(summary, "[Used tools: http_request, shell]");
-}
-
-#[test]
-fn extract_tool_context_summary_respects_start_index() {
-    let history = vec![
-        ChatMessage::assistant(
-            r#"<tool_call>
-{"name":"stale_tool","arguments":{}}
-</tool_call>"#,
-        ),
-        ChatMessage::assistant(
-            r#"<tool_call>
-{"name":"fresh_tool","arguments":{}}
-</tool_call>"#,
-        ),
-    ];
-
-    let summary = extract_tool_context_summary(&history, 1);
-    assert_eq!(summary, "[Used tools: fresh_tool]");
-}
-
 /// F-24, Telegram 2026-09-12. Two replies reached the chat carrying
 /// `[Used tools: shell]` at 06:38:11 and `[Used tools: file_read]` at 12:20:14,
 /// and the audit holds no tool call in either turn: the model typed them. The
@@ -8786,6 +8738,542 @@ fn clean_delivered_reply_passes_through_normal_text() {
     assert_eq!(
         clean_delivered_reply("Here is your answer."),
         "Here is your answer."
+    );
+}
+
+/// Provider that returns one fixed text reply to every `chat_with_history`
+/// call, no matter what its history held. The reply is whatever the test
+/// scripts it to be — useful for a turn the model is meant to forge a tool
+/// label on, or any other "model just answers" path.
+struct FixedTextProvider {
+    reply: String,
+}
+
+#[async_trait::async_trait]
+impl Provider for FixedTextProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(self.reply.clone())
+    }
+
+    async fn chat_with_history(
+        &self,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(self.reply.clone())
+    }
+}
+
+/// Provider that scripts a different reply per call (in call order) and
+/// captures every history the agent loop hands it. Lets a test pin both
+/// what the model was told and what the channel saw.
+struct ScriptedTwoTurnProvider {
+    /// Reply for the first call.
+    first_reply: String,
+    /// Reply for the second and any later call.
+    later_reply: String,
+    calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for ScriptedTwoTurnProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("fallback".to_string())
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let snapshot = messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect::<Vec<_>>();
+        let call_index = {
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            calls.push(snapshot);
+            calls.len() - 1
+        };
+        if call_index == 0 {
+            Ok(self.first_reply.clone())
+        } else {
+            Ok(self.later_reply.clone())
+        }
+    }
+}
+
+/// A turn the model finishes with a forged `[Used tools: …]` label and
+/// without calling any tool ends with one runtime line saying so. The
+/// journal still records the forgery (sanitize counts it; the count is
+/// already covered by the sanitizer tests, so the integration test only
+/// pins the visible behaviour: the net line on the delivered reply).
+#[tokio::test]
+async fn forged_label_without_tool_call_appends_runtime_net_line() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let provider: Arc<dyn Provider> = Arc::new(FixedTextProvider {
+        reply: "[Used tools: memory_store]\nSaved your note.".to_string(),
+    });
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider,
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(Vec::new()),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        ctx.clone(),
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "msg-forge-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-forge".to_string(),
+            content: "save my note".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let sent_messages = channel_impl.sent_messages.lock().await;
+    assert_eq!(sent_messages.len(), 1);
+    let delivered = &sent_messages[0];
+    assert!(delivered.starts_with("chat-forge:"), "{delivered}");
+    assert!(delivered.contains("Saved your note."), "{delivered}");
+    assert!(
+        !delivered.contains("[Used tools:"),
+        "the reply that reaches the user must never carry the label: {delivered}"
+    );
+    assert!(
+        delivered.ends_with(NO_TOOL_RUN_NOTICE)
+            || delivered.contains(&format!("\n{NO_TOOL_RUN_NOTICE}")),
+        "the reply must end with the runtime net line: {delivered}"
+    );
+
+    let history_key = conversation_history_key(&traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "msg-forge-1".to_string(),
+        sender: "alice".to_string(),
+        reply_target: "chat-forge".to_string(),
+        content: "save my note".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: false,
+    });
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .cloned()
+        .unwrap_or_default();
+    for turn in &stored {
+        assert!(
+            !turn.content.contains("[Used tools:"),
+            "no stored assistant message may carry the label: {turn:?}"
+        );
+    }
+}
+
+/// A turn that actually calls a tool stores the tool call and result as
+/// their own messages (the dispatcher's own shape), not a prose label, and
+/// the delivered reply carries no runtime net line — the tool ran.
+#[tokio::test]
+async fn real_tool_call_keeps_structured_history_and_skips_net_line() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: Arc::new(ToolCallingProvider),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(Vec::new()),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        ctx.clone(),
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "msg-real-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-real".to_string(),
+            content: "What is the BTC price now?".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let sent_messages = channel_impl.sent_messages.lock().await;
+    assert_eq!(sent_messages.len(), 1);
+    let delivered = &sent_messages[0];
+    assert!(delivered.starts_with("chat-real:"), "{delivered}");
+    assert!(delivered.contains("BTC is currently around"), "{delivered}");
+    assert!(
+        !delivered.contains("[Used tools:"),
+        "the delivered reply must never carry a label: {delivered}"
+    );
+    assert!(
+        !delivered.contains(NO_TOOL_RUN_NOTICE),
+        "a turn that ran a tool must not carry the runtime net line: {delivered}"
+    );
+
+    let history_key = conversation_history_key(&traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "msg-real-1".to_string(),
+        sender: "alice".to_string(),
+        reply_target: "chat-real".to_string(),
+        content: "What is the BTC price now?".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: false,
+    });
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        stored
+            .iter()
+            .any(|t| t.role == "user" && t.content.contains("What is the BTC price")),
+        "the user turn is stored: {stored:?}"
+    );
+    let saw_tool_artifact = stored.iter().any(|t| {
+        t.content.contains("mock_price")
+            || t.content.contains("[Tool results]")
+            || t.content.contains("tool_call_id")
+            || t.content.contains("\"tool_calls\"")
+    });
+    assert!(
+        saw_tool_artifact,
+        "the structured tool-call or result form is stored, not a prose label: {stored:?}"
+    );
+    for turn in &stored {
+        assert!(
+            !turn.content.contains("[Used tools:"),
+            "no stored message may carry the prose label: {turn:?}"
+        );
+    }
+}
+
+/// A history persisted by an older build holds prose `[Used tools: …]`
+/// labels as assistant turns. Loading such a history through the runtime's
+/// store and then driving a fresh turn must hand the next turn's provider a
+/// list with every label gone, so the model no longer sees the pattern it
+/// can copy.
+#[tokio::test]
+async fn a_persisted_history_with_old_labels_strips_them_on_load() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let workspace = tempfile::tempdir().expect("workspace");
+
+    // Persist a legacy conversation with the runtime's old `[Used tools: …]`
+    // label baked into an assistant turn, the way the runtime used to write
+    // it.
+    let seed_store = crate::channels::history_store::ChannelHistoryStore::open(workspace.path())
+        .expect("seed store opens");
+    seed_store
+        .save(
+            "test-channel:chat-load",
+            &[
+                ChatMessage::user("save my note"),
+                ChatMessage::assistant("[Used tools: memory_store]\nSaved your note."),
+                ChatMessage::user("what was last saved?"),
+            ],
+        )
+        .expect("save legacy row");
+
+    // Fresh store the way a daemon restart sees one, then load the rows the
+    // runtime would have seeded into the in-memory map at boot.
+    let runtime_store = crate::channels::history_store::ChannelHistoryStore::open(workspace.path())
+        .expect("runtime store reopens");
+    let loaded = runtime_store.load_all().expect("load_all");
+
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let msg = traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "msg-load-1".to_string(),
+        sender: "alice".to_string(),
+        reply_target: "chat-load".to_string(),
+        content: "what was last saved?".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: false,
+    };
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(loaded)),
+        history_store: Some(Arc::new(runtime_store)),
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(Vec::new()),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(ctx, msg, CancellationToken::new()).await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 1, "the provider was called once");
+    for (role, content) in &calls[0] {
+        assert!(
+            !content.contains("[Used tools:"),
+            "the provider must not see a prose label it could copy: role={role}, content={content:?}"
+        );
+    }
+}
+
+/// Two consecutive save requests in one chat: turn 1 makes a real tool
+/// call, turn 2 forges a label. The provider on turn 2 must not see any
+/// `[Used tools:` text from turn 1's storage, and the delivered reply
+/// still ends with the runtime net line because turn 2 ran no tool.
+#[tokio::test]
+async fn two_consecutive_save_requests_keep_structured_form_and_append_net_line() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let provider_impl = Arc::new(ScriptedTwoTurnProvider {
+        first_reply: tool_call_payload(),
+        later_reply: "[Used tools: memory_store]\nAlready stored.".to_string(),
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(Vec::new()),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        ctx.clone(),
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "msg-save-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-save".to_string(),
+            content: "save it for me".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+    process_channel_message(
+        ctx.clone(),
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "msg-save-2".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-save".to_string(),
+            content: "save it again".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert!(
+        calls.len() >= 2,
+        "each turn calls the provider at least once: got {} calls",
+        calls.len()
+    );
+    for (call_idx, call) in calls.iter().enumerate() {
+        for (role, content) in call {
+            assert!(
+                !content.contains("[Used tools:"),
+                "no provider call may see a prose label it could copy (call {call_idx}, role={role}): {content:?}"
+            );
+        }
+    }
+
+    let sent_messages = channel_impl.sent_messages.lock().await;
+    assert_eq!(sent_messages.len(), 2);
+    let second_delivered = &sent_messages[1];
+    assert!(
+        second_delivered.contains("Already stored."),
+        "{second_delivered}"
+    );
+    assert!(
+        !second_delivered.contains("[Used tools:"),
+        "{second_delivered}"
+    );
+    assert!(
+        second_delivered.contains(NO_TOOL_RUN_NOTICE),
+        "turn 2 forged a label and ran no tool, so the reply ends with the runtime net line: {second_delivered}"
     );
 }
 
