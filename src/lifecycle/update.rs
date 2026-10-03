@@ -30,6 +30,20 @@ use std::path::{Path, PathBuf};
 use crate::lifecycle::artifact::{self, CosignOutcome};
 use crate::lifecycle::binary_path::{require_self_modifiable, BinaryInfo, InstallKind};
 
+/// What `swap_binary` actually did to disk. On Unix the swap renames the
+/// running binary into place in one transaction; on Windows the running
+/// `.exe` cannot be replaced, so the new binary is staged as `<exe>.new.exe`
+/// and the real swap happens on the next launch via
+/// `apply_pending_windows_update`. Reporting which case happened stops `run`
+/// from spawning the still-old binary for a first-launch verify that can
+/// only ever say "version mismatch" — the bug that turned every Windows
+/// update into a false failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapOutcome {
+    Installed,
+    Staged { path: PathBuf },
+}
+
 const REPO: &str = "RantAI-dev/RantAIClaw";
 
 /// Expected cosign signing identity for RantAIClaw binary releases — the
@@ -255,67 +269,16 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
         let extracted = extract_binary(&archive_path, &work_dir)?;
         println!("✓ extracted {}", extracted.display());
 
-        swap_binary(&info.path, &extracted)?;
+        let outcome = swap_binary(&info.path, &extracted)?;
 
-        // First-launch verification. Spawn the freshly-installed
-        // binary in a short-timeout `update verify` mode. If it
-        // crashes, hangs, or returns the wrong version, restore the
-        // `.old` backup in-place so the user is never left with a
-        // broken install. This is the "auto-rollback on bad swap"
-        // guard — the snapshot rollback path stays available for
-        // post-update issues but doesn't need to be invoked here.
-        match verify_installed_binary(&info.path, &target_version) {
-            Ok(()) => println!("✓ updated to {target_version}"),
-            Err(e) => {
-                eprintln!("⚠ first-launch verification failed: {e:#}");
-                let backup = info.path.with_extension("old");
-                if backup.is_file() {
-                    if let Err(restore_err) = fs::rename(&backup, &info.path) {
-                        bail!(
-                            "first-launch verify failed AND auto-rollback failed: \
-                             {restore_err:#}. Restore manually: `mv {} {}`",
-                            backup.display(),
-                            info.path.display()
-                        );
-                    }
-                    eprintln!("↺ rolled back to {}", current);
-                    bail!("update aborted: new binary failed first-launch verify");
-                }
-                bail!(
-                    "first-launch verify failed and no .old backup exists \
-                     (snapshot at {}). Restore from snapshot or reinstall.",
-                    snapshot_summary
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<missing>".into())
-                );
-            }
-        }
-
-        // Post-swap: restart managed daemon service so the running
-        // process picks up the new binary instead of staying on the
-        // old in-memory code. Best-effort.
-        match crate::lifecycle::update_service_restart::restart_managed_service() {
-            Ok(true) => println!("✓ daemon service restarted"),
-            Ok(false) => {} // no managed service — nothing to do
-            Err(e) => eprintln!("⚠ daemon restart failed: {e:#}"),
-        }
-
-        // Print rollback hint so users don't have to remember the
-        // command.
-        if snapshot_summary.is_some() {
-            println!(
-                "  rollback: `rantaiclaw rollback` (latest snapshot) \
-                 or `rantaiclaw rollback --list` to inspect"
-            );
-        } else if bak_binary.is_file() {
-            println!(
-                "  rollback: `mv {} {}` then re-run rantaiclaw",
-                bak_binary.display(),
-                info.path.display()
-            );
-        }
-        Ok(())
+        finalize_after_swap(
+            outcome,
+            &info.path,
+            &target_version,
+            &current,
+            snapshot_summary.as_deref(),
+            &bak_binary,
+        )
     })();
 
     cleanup();
@@ -618,7 +581,7 @@ fn extract_binary(archive: &Path, work_dir: &Path) -> Result<PathBuf> {
     )
 }
 
-fn swap_binary(running: &Path, new_bin: &Path) -> Result<()> {
+fn swap_binary(running: &Path, new_bin: &Path) -> Result<SwapOutcome> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -676,22 +639,114 @@ fn swap_binary(running: &Path, new_bin: &Path) -> Result<()> {
         // The backup is one binary's worth of disk; the next successful
         // update overwrites it via the `let _ = fs::remove_file(&backup)`
         // up-stack, so it doesn't accumulate across multiple updates.
-        Ok(())
+        Ok(SwapOutcome::Installed)
     }
     #[cfg(windows)]
     {
-        // Cannot replace a running .exe. Stage as <exe>.new; the next launch
-        // detects the file and self-swaps before doing anything.
+        // Cannot replace a running .exe. Stage as <exe>.new.exe and let the
+        // next launch (`apply_pending_windows_update`) self-swap before it
+        // does anything else. The activation message is printed by
+        // `finalize_after_swap` so it can use the staged path the caller
+        // already has, and so a helper here can't say "Restart your shell"
+        // — restarting the shell does nothing, the swap is applied by the
+        // next `rantaiclaw` invocation.
         let staged = running.with_extension("new.exe");
         let _ = fs::remove_file(&staged);
         fs::copy(new_bin, &staged)
             .with_context(|| format!("stage new binary at {}", staged.display()))?;
-        println!(
-            "Update staged at {}.\n\
-             Restart your shell or run rantaiclaw once more to activate it.",
-            staged.display()
-        );
-        Ok(())
+        Ok(SwapOutcome::Staged { path: staged })
+    }
+}
+
+/// What `run` does once the swap is on disk. Verifies, auto-rolls back, and
+/// prints the operator-facing summary. The installed arm runs the
+/// first-launch verify / rollback / service-restart / hint sequence
+/// unchanged. The staged arm does none of that — the binary on disk is
+/// still the old one, so verifying it can only report a mismatch and a
+/// rollback would have no backup to restore. The staged print names a real
+/// activation step (`rantaiclaw --version` or any other `rantaiclaw`
+/// invocation) because `apply_pending_windows_update` runs on every
+/// launch. Returns `Ok(())` so the command exits zero on the operator's
+/// machine; the previous behaviour bailed with a false "first-launch
+/// verify failed" on every Windows update.
+fn finalize_after_swap(
+    outcome: SwapOutcome,
+    installed: &Path,
+    target_version: &str,
+    current: &str,
+    snapshot_summary: Option<&Path>,
+    bak_binary: &Path,
+) -> Result<()> {
+    match outcome {
+        SwapOutcome::Staged { path } => {
+            println!(
+                "Update staged at {}.\n\
+                 Run `rantaiclaw --version` (or any other `rantaiclaw` command) \
+                 to activate it.",
+                path.display()
+            );
+            Ok(())
+        }
+        SwapOutcome::Installed => {
+            // First-launch verification. Spawn the freshly-installed
+            // binary in a short-timeout `update verify` mode. If it
+            // crashes, hangs, or returns the wrong version, restore the
+            // `.old` backup in-place so the user is never left with a
+            // broken install. This is the "auto-rollback on bad swap"
+            // guard — the snapshot rollback path stays available for
+            // post-update issues but doesn't need to be invoked here.
+            match verify_installed_binary(installed, target_version) {
+                Ok(()) => println!("✓ updated to {target_version}"),
+                Err(e) => {
+                    eprintln!("⚠ first-launch verification failed: {e:#}");
+                    let backup = installed.with_extension("old");
+                    if backup.is_file() {
+                        if let Err(restore_err) = fs::rename(&backup, installed) {
+                            bail!(
+                                "first-launch verify failed AND auto-rollback failed: \
+                                 {restore_err:#}. Restore manually: `mv {} {}`",
+                                backup.display(),
+                                installed.display()
+                            );
+                        }
+                        eprintln!("↺ rolled back to {}", current);
+                        bail!("update aborted: new binary failed first-launch verify");
+                    }
+                    bail!(
+                        "first-launch verify failed and no .old backup exists \
+                         (snapshot at {}). Restore from snapshot or reinstall.",
+                        snapshot_summary
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<missing>".into())
+                    );
+                }
+            }
+
+            // Post-swap: restart managed daemon service so the running
+            // process picks up the new binary instead of staying on the
+            // old in-memory code. Best-effort.
+            match crate::lifecycle::update_service_restart::restart_managed_service() {
+                Ok(true) => println!("✓ daemon service restarted"),
+                Ok(false) => {} // no managed service — nothing to do
+                Err(e) => eprintln!("⚠ daemon restart failed: {e:#}"),
+            }
+
+            // Print rollback hint so users don't have to remember the
+            // command.
+            if snapshot_summary.is_some() {
+                println!(
+                    "  rollback: `rantaiclaw rollback` (latest snapshot) \
+                     or `rantaiclaw rollback --list` to inspect"
+                );
+            } else if bak_binary.is_file() {
+                println!(
+                    "  rollback: `mv {} {}` then re-run rantaiclaw",
+                    bak_binary.display(),
+                    installed.display()
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -837,9 +892,13 @@ pub fn run_verify() -> Result<()> {
 }
 
 /// Apply a previously staged Windows update before doing anything else.
-/// Called early on every launch.
+/// Called early on every launch. Returns `true` when this invocation
+/// swapped a pending staged file into place. The notice on stderr names
+/// the running process's version so the operator is not surprised that the
+/// next line reports the old number — the new binary does not start until
+/// the operator runs `rantaiclaw` again.
 #[cfg(windows)]
-pub fn apply_pending_windows_update() -> Result<()> {
+pub fn apply_pending_windows_update() -> Result<bool> {
     let exe = std::env::current_exe()?;
     let staged = exe.with_extension("new.exe");
     if staged.exists() {
@@ -851,15 +910,21 @@ pub fn apply_pending_windows_update() -> Result<()> {
                 let _ = fs::rename(&backup, &exe);
             } else {
                 let _ = fs::remove_file(&backup);
+                eprintln!(
+                    "applied staged update; this process is still running the previous \
+                     version ({}) — run `rantaiclaw --version` to confirm the new binary.",
+                    current_version()
+                );
+                return Ok(true);
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(not(windows))]
-pub fn apply_pending_windows_update() -> Result<()> {
-    Ok(())
+pub fn apply_pending_windows_update() -> Result<bool> {
+    Ok(false)
 }
 
 fn platform_target() -> Result<&'static str> {
@@ -1276,5 +1341,79 @@ mod tests {
         verify_installed_binary(&bin, "0.7.5-alpha")
             .expect("verify should retry through a transient ETXTBSY and then succeed");
         releaser.join().unwrap();
+    }
+
+    // `update` cannot tell a staged Windows swap from an installed one without
+    // this signal: a staged update must NOT spawn the running binary for a
+    // first-launch verify, because the binary is still the old version. The
+    // stub at the installed path is wired to touch a marker the moment it is
+    // spawned; if the marker exists after the call, the staged arm leaked
+    // through and the function verified (or tried to verify) the wrong binary.
+    #[cfg(unix)]
+    #[test]
+    fn staged_outcome_skips_first_launch_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("rantaiclaw-stub");
+        let marker = dir.path().join("spawned.marker");
+        let staged = dir.path().join("rantaiclaw-stub.new.exe");
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\necho '0.7.5-alpha'\n",
+            marker.display()
+        );
+        write_version_stub(&installed, &script);
+
+        let outcome = SwapOutcome::Staged {
+            path: staged.clone(),
+        };
+        let snap: Option<&Path> = None;
+        let bak = PathBuf::from("/nonexistent/.old");
+        let result = finalize_after_swap(
+            outcome,
+            &installed,
+            "0.32.0-alpha",
+            "0.31.0-alpha",
+            snap,
+            &bak,
+        );
+        assert!(
+            result.is_ok(),
+            "staged outcome must return Ok, got {result:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "stub binary was spawned for verify; staged arm must not verify"
+        );
+    }
+
+    // A `#[cfg(windows)]` test for the swap branch that ships the staged file.
+    // The Unix build never reaches this code; keeping it compiling-only means a
+    // future Windows CI run will execute the assertion.
+    #[cfg(windows)]
+    #[test]
+    fn swap_binary_windows_returns_staged_outcome_and_leaves_running_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = dir.path().join("rantaiclaw.exe");
+        let new_bin = dir.path().join("new-rantaiclaw.exe");
+        let running_bytes = b"old-binary-bytes";
+        let new_bytes = b"new-binary-bytes";
+        fs::write(&running, running_bytes).unwrap();
+        fs::write(&new_bin, new_bytes).unwrap();
+
+        let outcome = swap_binary(&running, &new_bin).expect("swap_binary must succeed on Windows");
+        let staged_path = match outcome {
+            SwapOutcome::Staged { path } => path,
+            SwapOutcome::Installed => panic!("expected staged outcome, got installed"),
+        };
+        assert_eq!(staged_path, running.with_extension("new.exe"));
+        assert_eq!(
+            fs::read(&staged_path).unwrap(),
+            new_bytes,
+            "staged file must hold the new binary's bytes"
+        );
+        assert_eq!(
+            fs::read(&running).unwrap(),
+            running_bytes,
+            "running binary must be byte-identical to the original"
+        );
     }
 }

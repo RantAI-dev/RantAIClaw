@@ -86,6 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <code>`. A guest on a provider without native tool calling now also gets
   the `## Tool Use Protocol` section in its system prompt, which previously
   reached only the owner prompt.
+- `rantaiclaw update` on Windows no longer reports a false first-launch verification failure. The staged-binary swap could not replace the running `.exe`, so the verify step spawned the still-old binary, read a version mismatch, looked for a `.old` backup the Windows branch never writes, and bailed with `first-launch verify failed and no .old backup exists ... Restore from snapshot or reinstall` on every successful Windows update. `swap_binary` now reports whether it installed the new binary or staged it at `<exe>.new.exe`; the staged path skips the verify, the auto-rollback, the managed-service restart and the rollback hint, prints a one-line activation message that names a command that actually applies the swap (`rantaiclaw --version` or any other `rantaiclaw` command), and returns `Ok(())` so the command exits zero. The Windows self-apply now runs on every launch, including `--version` and `--help`, because the call moved above `Cli::parse()` in `src/main.rs`; when the call actually swaps a file it prints one stderr line saying the staged update was applied and that this process is still running the previous version, so the next line that reports a version number is not a surprise. `src/main.rs` and `docs/start/troubleshooting.md` are updated accordingly.
 
 ### Removed
 
