@@ -137,9 +137,13 @@ fn strict_uses_strict_mode_with_safe_write_seeds() {
         let allowlist =
             std::fs::read_to_string(profile.policy_dir().join("command_allowlist.toml")).unwrap();
         // Strict keeps the read-only seeds *and* adds safe-write entries.
-        assert!(allowlist.contains("\"memory_store *\""));
-        assert!(allowlist.contains("\"skill_install *\""));
+        // `memory_*` already covers `memory_store`, so it must not get its own
+        // line; `skill_install` is not a tool and must not be auto-approved.
+        assert!(allowlist.contains("\"memory_*\""));
         assert!(allowlist.contains("\"cron_*\""));
+        assert!(allowlist.contains("\"session_*\""));
+        assert!(!allowlist.contains("\"memory_store *\""));
+        assert!(!allowlist.contains("\"skill_install *\""));
     });
 }
 

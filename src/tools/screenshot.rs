@@ -18,11 +18,27 @@ const MAX_BASE64_BYTES: usize = 2_097_152;
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
 pub struct ScreenshotTool {
     security: Arc<SecurityPolicy>,
+    /// The AIEOS identity file the owner's prompt reads, when the operator
+    /// configured one. A guest's turn may not write it (the file feeds the
+    /// owner's prompt, the same rule `file_write` carries).
+    identity_file: Option<std::path::PathBuf>,
 }
 
 impl ScreenshotTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            identity_file: None,
+        }
+    }
+
+    /// Names the AIEOS identity file, which the owner's prompt reads at every
+    /// turn, as a file a guest's turn may not write. Mirrors the builder
+    /// [`FileWriteTool::with_identity_file`](crate::tools::file_write::FileWriteTool::with_identity_file).
+    #[must_use]
+    pub fn with_identity_file(mut self, identity_file: Option<std::path::PathBuf>) -> Self {
+        self.identity_file = identity_file;
+        self
     }
 
     /// Determine the screenshot command for the current platform.
@@ -86,8 +102,12 @@ impl ScreenshotTool {
             {
                 return Some(denial);
             }
-            if let Some(denial) =
-                crate::tools::guest_prompt_file_write_denial(&target, workspace, None).await
+            if let Some(denial) = crate::tools::guest_prompt_file_write_denial(
+                &target,
+                workspace,
+                self.identity_file.as_deref(),
+            )
+            .await
             {
                 return Some(denial);
             }
@@ -417,6 +437,75 @@ mod tests {
         assert!(guest.is_some());
         assert_eq!(
             tool.write_refusal(std::path::Path::new("/")).await,
+            None,
+            "control: an owner's turn is not refused"
+        );
+    }
+
+    /// The AIEOS identity file feeds the owner's prompt at every turn, so a
+    /// guest granted `screenshot` must not overwrite it, even by a name that
+    /// only resolves to the identity file. `file_write` carries the same rule
+    /// via `with_identity_file`; the screenshot tool must carry the same.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn screenshot_refuses_a_guest_the_aieos_identity_file() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            workspace.path().join("bot_identity.json"),
+            "{\"identity\":{}}",
+        )
+        .unwrap();
+        let identity = workspace.path().join("bot_identity.json");
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+        let tool = ScreenshotTool::new(security).with_identity_file(Some(identity.clone()));
+
+        // A direct link at the identity filename resolves to the identity file,
+        // and the guest's turn is refused with the prompt-file wording (the
+        // identity file feeds the owner's prompt).
+        std::os::unix::fs::symlink("bot_identity.json", workspace.path().join("shot.png")).unwrap();
+        let result = crate::approval::guest::GUEST_TURN
+            .scope((), async {
+                tool.execute(json!({ "filename": "shot.png" }))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(
+            !result.success,
+            "a guest's overwrite of the identity file must be refused"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("owner's prompt"),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(&identity).unwrap(),
+            "{\"identity\":{}}",
+            "the identity file must not be touched"
+        );
+
+        // The exact identity file name is refused too. A guest could otherwise
+        // pick the name directly.
+        let result2 = crate::approval::guest::GUEST_TURN
+            .scope((), async {
+                tool.execute(json!({ "filename": "bot_identity.json" }))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(!result2.success);
+
+        assert_eq!(
+            tool.write_refusal(&identity).await,
             None,
             "control: an owner's turn is not refused"
         );

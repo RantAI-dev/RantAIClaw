@@ -499,7 +499,9 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
     // Vision tools are always available
-    tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
+    tool_arcs.push(Arc::new(
+        ScreenshotTool::new(security.clone()).with_identity_file(aieos_identity_file(root_config)),
+    ));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
     // Remote-install transport + tmux driver (feature-gated).

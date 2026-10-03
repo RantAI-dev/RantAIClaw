@@ -138,8 +138,11 @@ pub struct PromptContext<'a> {
     ///   * the host's timezone, replaced by `UTC`;
     ///   * the owner's name in the persona, and the location of each skill.
     ///
-    /// `AGENTS.md`, `SOUL.md` and `IDENTITY.md` render for both audiences: they
-    /// describe the agent, not the operator.
+    /// `SOUL.md` and `IDENTITY.md` render for both audiences: they describe the
+    /// agent, not the operator. `AGENTS.md` renders for the owner only; a
+    /// guest prompt takes the operator's instructions from `SOUL.md` instead,
+    /// because `AGENTS.md`'s scaffold names tools a guest may not hold
+    /// (plan 523 took it off the guest prompt).
     pub audience: PromptAudience,
     /// Whether `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md` go into
     /// the prompt. The door that builds the prompt sets it from the memory view
@@ -775,12 +778,25 @@ impl PromptSection for SafetySection {
                 );
             }
             Some(PolicyPreset::Off) => {
-                out.push_str(
-                    "**Active approval policy: Off (CI / trusted-env only).**\n\n\
-                     - Shell commands execute without prompts. Be deliberate — \
-                     this preset is meant for unattended automation.\n\
-                     - Forbidden-path checks still apply (secrets dirs).\n",
-                );
+                // The shell line names a tool the registry may not hold for a
+                // guest: a guest without `shell` reads the line and tries to call
+                // it. Build the line from the guest's tools, so a guest with no
+                // shell sees an Off section that doesn't promise one.
+                let has_shell = ctx.tools.iter().any(|t| t.name() == "shell");
+                if !ctx.is_guest() || has_shell {
+                    out.push_str(
+                        "**Active approval policy: Off (CI / trusted-env only).**\n\n\
+                         - Shell commands execute without prompts. Be deliberate — \
+                         this preset is meant for unattended automation.\n\
+                         - Forbidden-path checks still apply (secrets dirs).\n",
+                    );
+                } else {
+                    out.push_str(
+                        "**Active approval policy: Off (CI / trusted-env only).**\n\n\
+                         - This preset is meant for unattended automation; \
+                         forbidden-path checks still apply (secrets dirs).\n",
+                    );
+                }
             }
             None => {
                 // No policy provisioned yet (fresh install pre-onboarding).
@@ -1487,6 +1503,163 @@ mod tests {
         assert!(out.contains("Manual (messaging channel)"), "{out}");
         assert!(out.contains("owner"), "{out}");
         assert!(out.contains("declined"), "{out}");
+    }
+
+    /// The Off preset tells a guest "Shell commands execute without prompts"
+    /// whether or not it holds `shell`. Build the line from the guest's tools:
+    /// only name shell when shell is in the registry.
+    #[test]
+    fn safety_section_off_for_a_guest_without_shell_does_not_mention_shell() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> =
+            vec![Box::new(DescriptorTool::new("file_read", "Read a file"))];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Channel { native_tools: true },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Off),
+            allowed_commands: &[],
+            audience: PromptAudience::Guest,
+            owner_files: OwnerFiles::Omit,
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(out.contains("Active approval policy: Off"), "{out}");
+        assert!(
+            !out.contains("Shell commands execute without prompts"),
+            "Off preset for a guest without shell must not promise shell: {out}"
+        );
+        assert!(
+            !out.contains("`shell`"),
+            "Off preset for a guest without shell must not name the shell tool: {out}"
+        );
+    }
+
+    /// The shell line stays when the guest actually has shell.
+    #[test]
+    fn safety_section_off_for_a_guest_with_shell_keeps_the_shell_line() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(DescriptorTool::new(
+            "shell",
+            "Run a shell command",
+        ))];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Channel { native_tools: true },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Off),
+            allowed_commands: &[],
+            audience: PromptAudience::Guest,
+            owner_files: OwnerFiles::Omit,
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(
+            out.contains("Shell commands execute without prompts"),
+            "Off preset for a guest with shell must keep the shell line: {out}"
+        );
+    }
+
+    /// An owner under Off always gets the shell line, with or without shell.
+    #[test]
+    fn safety_section_off_for_an_owner_keeps_the_shell_line() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Channel { native_tools: true },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Off),
+            allowed_commands: &[],
+            audience: PromptAudience::Owner,
+            owner_files: OwnerFiles::Load,
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(
+            out.contains("Shell commands execute without prompts"),
+            "Off preset for an owner must keep the shell line: {out}"
+        );
+    }
+
+    /// A guest's `skills_to_prompt_for_guest` rendering — what a peer dispatch
+    /// builds — carries no instructions and no tools block for each skill, in
+    /// either mode. See `skills::tests::skills_to_prompt_for_guest_in_full_mode_keeps_only_name_and_description`
+    /// for the inner test; this is the prompt-builder end of the same rule.
+    #[test]
+    fn skills_section_for_guest_omits_instructions_and_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "release_checklist".into(),
+                description: "Validate release readiness".into(),
+                kind: "shell".into(),
+                command: "echo ok".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
+            requires: crate::skills::SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: false,
+            origin: None,
+        }];
+
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp/workspace"),
+            model_name: "test-model",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &skills,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
+            audience: PromptAudience::Guest,
+            owner_files: OwnerFiles::Load,
+        };
+
+        let output = SkillsSection.build(&ctx).unwrap();
+        assert!(output.contains("<name>deploy</name>"));
+        assert!(output.contains("<description>Release safely</description>"));
+        assert!(
+            !output.contains("<instruction>Run smoke tests before deploy.</instruction>"),
+            "a guest's prompt must not carry the owner's prose: {output}"
+        );
+        assert!(
+            !output.contains("<tools>"),
+            "a guest's prompt must not carry the skill's tool list: {output}"
+        );
+        assert!(
+            !output.contains("<location>"),
+            "a guest's prompt must not carry a `<location>` (host path): {output}"
+        );
+        assert!(
+            !output.contains("<name>release_checklist</name>"),
+            "a guest's prompt must not name the skill's tools: {output}"
+        );
     }
 
     #[test]

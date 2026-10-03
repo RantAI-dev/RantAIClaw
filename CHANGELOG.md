@@ -172,6 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`browser` is owner-only, and an operator who listed it in `guest_allowed_tools` loses it.** The `screenshot` action passes a model-chosen `path` straight to the browser CLI with no workspace bound, so a guest granted the tool could overwrite `config.toml`, `MEMORY.md` or `memory/brain.db`; the tool can also navigate anywhere and act on the owner's behalf. `docs/security/per-role-permissions.md` already tells operators not to grant it.
 - **Only a filtered model reply or a cron job's announced output can upload a file to a chat.**
   Until now a message the runtime wrote itself could carry an attachment marker (`[DOCUMENT:…]`,
   `[IMAGE:…]` and the other kinds) chosen by the model or by a sender, and the channel uploaded the
@@ -191,8 +192,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notice. A Telegram message that is only a file path follows the same rule. The approval prompt also
   shows `[` and `]` in the tool name and arguments as `(` and `)`, and a backtick as `'`, so an
   owner sees `(DOCUMENT:x)` for an argument that held `[DOCUMENT:x]` and `ls (a-z)*` for
-  `ls [a-z]*`. 0.32.0-alpha and earlier releases carry the same marker parsing and approval prompt.
-  Operators who allow senders other than the owner should upgrade.
+  `ls [a-z]*`. Telegram has parsed attachment markers since v0.1.0, and the command echo that
+  reaches any allowed sender on Telegram has been reachable since v0.1.0; Discord, Slack, Lark
+  and WhatsApp Web parse them from 0.32.0-alpha onward. The approval-prompt path needs a guest
+  granted an approval-gated tool, which only became possible with the per-role capability
+  ceiling in v0.6.75-alpha. Operators who allow senders other than the owner on any of these
+  channels should upgrade.
 - **SSH tools on russh 0.60.3, for RUSTSEC-2026-0153 and RUSTSEC-2026-0154.** The `remote-install`
   tools moved from russh 0.45 to 0.60.3, which fixes both advisories (unchecked allocation from a
   peer-supplied frame length in the SSH agent code, in `russh` and `russh-cryptovec`). Their ignores
