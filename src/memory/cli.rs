@@ -167,9 +167,12 @@ fn print_entry(entry: &super::traits::MemoryEntry) {
 /// Delegates to `snapshot::refresh_projection`, which every other write path now
 /// shares. The backend gate moved with it: gating on `mem.name()` is the same
 /// decision this used to make from config, because `create_cli_memory` builds the
-/// instance from exactly that classification.
+/// instance from exactly that classification. Best-effort here: the command
+/// already succeeded; a projection failure is logged and ignored.
 fn refresh_projection(mem: &dyn Memory, config: &Config) {
-    super::snapshot::refresh_projection(mem, &config.workspace_dir);
+    if let Err(e) = super::snapshot::refresh_projection(mem, &config.workspace_dir) {
+        tracing::warn!("memory projection skipped: {e}");
+    }
 }
 
 /// Store a memory from the command line.

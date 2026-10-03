@@ -340,8 +340,9 @@ with `Accept: text/event-stream` or `?stream=1`; see
 characters are stripped, credential-shaped tokens are redacted, and content
 carrying the `[Memory context]` header is refused.
 
-`recall` shows relevance as a percentage of the best hit in that result set, not
-as an absolute quality score.
+`recall` shows relevance as an absolute quality score, not as a percentage of
+the best hit in that result set. Notes you saved rank before the raw
+conversation rows.
 
 `reindex` re-embeds memories the current embedding model cannot use — rows stored
 while the embedding provider was unavailable, and rows embedded by a previous

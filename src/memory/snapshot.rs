@@ -201,15 +201,18 @@ pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
 /// `none` has no `brain.db` to project from. (`postgres` was retired
 /// together with the `[storage]` section.)
 ///
-/// Best-effort, like the projection everywhere else: a failure here must not
-/// fail the write that already succeeded.
-pub fn refresh_projection(memory: &dyn Memory, workspace_dir: &Path) {
+/// Best-effort, like the projection everywhere else — except when an
+/// operation explicitly needs to know whether the projection landed.
+/// `memory_forget` answers "Forgot" to the model based on whether the note was
+/// removed; the operator's owner prompt should not see a note the projection
+/// failed to drop. Returns `Err` so the caller can choose what to do. The
+/// `usize` count returned by `project_core_memories` is intentionally discarded
+/// here — callers that need it can call `project_core_memories` directly.
+pub fn refresh_projection(memory: &dyn Memory, workspace_dir: &Path) -> anyhow::Result<()> {
     if !matches!(memory.name(), "sqlite") {
-        return;
+        return Ok(());
     }
-    if let Err(e) = project_core_memories(workspace_dir) {
-        tracing::warn!("memory projection skipped: {e}");
-    }
+    project_core_memories(workspace_dir).map(|_| ())
 }
 
 /// Render entries as list lines, stopping at the character ceiling.
@@ -1091,7 +1094,7 @@ Rule 3: Protect the user.
         let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
         let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
 
-        refresh_projection(&mem, tmp.path());
+        refresh_projection(&mem, tmp.path()).expect("projection should succeed");
 
         let out = memory_md(tmp.path());
         assert!(out.contains(PROJECTION_BEGIN), "nothing projected:\n{out}");
@@ -1103,7 +1106,7 @@ Rule 3: Protect the user.
         let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
         let mem = crate::memory::NoneMemory::new();
 
-        refresh_projection(&mem, tmp.path());
+        refresh_projection(&mem, tmp.path()).expect("disabled backend returns Ok");
 
         assert!(
             !tmp.path().join(MEMORY_FILE).exists(),

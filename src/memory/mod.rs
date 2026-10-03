@@ -145,6 +145,23 @@ pub fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4())
 }
 
+/// Choose the `session_id` for an auto-save, given the turn's `MemoryView`.
+///
+/// Returns `None` when the caller has no view — matching the broader "no
+/// view, no write" invariant — so an interactive webhook or cron turn with no
+/// scope behind it does not leak into the shared conversation memory. Returns
+/// `Some(None)` under `All` (the operator's shared session) and
+/// `Some(Some(place))` under `Only(place)` so the note stays in the chat's
+/// own session.
+#[allow(clippy::option_option)]
+pub fn autosave_session_for_view(view: Option<&MemoryView>) -> Option<Option<String>> {
+    match view {
+        None => None,
+        Some(MemoryView::All) => Some(None),
+        Some(MemoryView::Only(place)) => Some(Some(place.clone())),
+    }
+}
+
 /// Auto-save `content` under `key`, screened first.
 ///
 /// Auto-save is the path where untrusted text reaches the one store that is
@@ -715,6 +732,32 @@ mod tests {
         );
         let row = mem.get("user_msg_taken").await.unwrap().unwrap();
         assert_eq!(row.content, "the owner's own note");
+    }
+
+    /// `None` view → `None` (caller must skip the autosave). Without this the
+    /// rule "no view, no write" would leak shared memory into a turn with no
+    /// scope behind it (a webhook, an unscheduled run, etc.).
+    #[test]
+    fn autosave_session_for_none_view_skips() {
+        assert!(autosave_session_for_view(None).is_none());
+    }
+
+    #[test]
+    fn autosave_session_for_all_view_returns_shared() {
+        assert_eq!(
+            autosave_session_for_view(Some(&MemoryView::All)),
+            Some(None)
+        );
+    }
+
+    /// Under `Only(place)`, the autosave session follows the chat — so the
+    /// note does not leak into another chat's recall.
+    #[test]
+    fn autosave_session_for_only_view_returns_place() {
+        assert_eq!(
+            autosave_session_for_view(Some(&MemoryView::Only("telegram:chat-a".into()))),
+            Some(Some("telegram:chat-a".to_string()))
+        );
     }
 
     #[test]

@@ -89,9 +89,22 @@ impl Tool for CronRunTool {
             }
         };
 
-        // A chat may only run a job it created. Un-scoped callers (TUI / CLI
-        // / console) pass — they own every job.
-        let origin_owned = crate::tools::cron_schema::origin_filter(&args);
+        // A chat may only run a job it created; the scope comes from the
+        // turn's memory view, not from `args`. A turn with no view is
+        // refused before any lookup.
+        let origin_owned = match crate::tools::cron_schema::cron_origin_for_view(
+            crate::memory::current_memory_view().as_ref(),
+            &args,
+        ) {
+            Ok(o) => o,
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                });
+            }
+        };
         let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
         if let Err(reason) = cron::ensure_visible_to_origin(&job, origin_ref) {
             return Ok(ToolResult {
@@ -149,6 +162,7 @@ impl Tool for CronRunTool {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::memory::{MemoryView, MEMORY_VIEW};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -171,6 +185,19 @@ mod tests {
         ))
     }
 
+    /// Wraps the operator's `All` view path around the call so the existing
+    /// assertions stay focused on the scheduling and approval flow. View-based
+    /// refusal is asserted separately by `cron_origin_for_view`'s own
+    /// tests; `no_view_run_is_refused` below covers the cron_run side.
+    async fn execute_under_all_view(tool: &CronRunTool, args: serde_json::Value) -> ToolResult {
+        MEMORY_VIEW
+            .scope(
+                MemoryView::All,
+                async move { tool.execute(args).await.unwrap() },
+            )
+            .await
+    }
+
     #[tokio::test]
     async fn force_runs_job_and_records_history() {
         let tmp = TempDir::new().unwrap();
@@ -178,7 +205,7 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        let result = execute_under_all_view(&tool, json!({ "job_id": job.id })).await;
         assert!(result.success, "{:?}", result.error);
 
         let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
@@ -215,7 +242,7 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "true").unwrap();
         let tool = CronRunTool::new(cfg.clone(), security);
 
-        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        let result = execute_under_all_view(&tool, json!({ "job_id": job.id })).await;
         assert!(
             result.success,
             "a runtime /allow grant must reach the manual run: {:?} / {}",
@@ -229,10 +256,7 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({ "job_id": "missing-job-id" }))
-            .await
-            .unwrap();
+        let result = execute_under_all_view(&tool, json!({ "job_id": "missing-job-id" })).await;
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not found"));
     }
@@ -251,7 +275,7 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        let result = execute_under_all_view(&tool, json!({ "job_id": job.id })).await;
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
     }
@@ -278,10 +302,8 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "touch cron-run-smuggled").unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
-        let out = tool
-            .execute(json!({ "job_id": job.id, "approved": true }))
-            .await
-            .unwrap();
+        let out =
+            execute_under_all_view(&tool, json!({ "job_id": job.id, "approved": true })).await;
         assert!(
             !out.success,
             "a model-supplied approval must not unlock the gate"
@@ -304,11 +326,99 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "touch cron-run-approval").unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
-        let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        let denied = execute_under_all_view(&tool, json!({ "job_id": job.id })).await;
         assert!(!denied.success);
         assert!(denied
             .error
             .unwrap_or_default()
             .contains("explicit approval"));
+    }
+
+    /// A turn with no memory view cannot run any cron job — refusing here
+    /// matches `cron_origin_for_view`'s contract.
+    #[tokio::test]
+    async fn no_view_run_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        // No MEMORY_VIEW scope at all — the helper sees None.
+        let out = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(!out.success, "no view must refuse cron_run");
+        assert!(out.error.unwrap_or_default().contains("no memory view"));
+    }
+
+    /// The plan's group-turn guard: under an `Only` view, a chat cannot run a
+    /// job scheduled in another chat. The refusal carries no trace of the
+    /// foreign job's name, so the chat cannot probe what the other chat
+    /// scheduled. Control: the same view still runs the chat's own job.
+    #[tokio::test]
+    async fn under_an_only_view_a_foreign_job_cannot_be_run() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        // chat-b creates a job with a distinctive name — the refusal must
+        // not surface it.
+        let job_b = cron::add_shell_job(
+            &cfg,
+            Some("chat-b-private-name".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo from-b",
+            None,
+            false,
+            Some("agent-tool"),
+            Some("telegram"),
+            Some("chat-b"),
+        )
+        .unwrap();
+
+        // chat-a asks to run chat-b's job under its own view: refused, and
+        // the sentence does not carry the foreign job's name.
+        let result_a = MEMORY_VIEW
+            .scope(MemoryView::Only("telegram:chat-a".into()), async {
+                tool.execute(json!({ "job_id": job_b.id })).await.unwrap()
+            })
+            .await;
+        assert!(!result_a.success, "chat-a must not run chat-b's job");
+        let err = result_a.error.unwrap_or_default();
+        assert!(
+            !err.contains("chat-b-private-name"),
+            "the refusal must not reveal the job name: {err}"
+        );
+
+        // Control: chat-a creates its own job and runs it under the same
+        // view. A shell job needs no provider and runs successfully, so the
+        // visibility check (the one this test exercises) is the only gate
+        // the call passes through.
+        let job_a = cron::add_shell_job(
+            &cfg,
+            Some("chat-a-own-name".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo from-a",
+            None,
+            false,
+            Some("agent-tool"),
+            Some("telegram"),
+            Some("chat-a"),
+        )
+        .unwrap();
+        let result_own = MEMORY_VIEW
+            .scope(MemoryView::Only("telegram:chat-a".into()), async {
+                tool.execute(json!({ "job_id": job_a.id })).await.unwrap()
+            })
+            .await;
+        assert!(
+            result_own.success,
+            "chat-a must run its own job under its view: {:?} / {}",
+            result_own.error, result_own.output
+        );
     }
 }

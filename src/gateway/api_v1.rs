@@ -2057,9 +2057,13 @@ async fn memory_create(
 /// same process.
 ///
 /// The lock is taken for the path alone and released before the projection runs.
+/// Best-effort: a projection failure here is a log line, not a failed request.
 fn refresh_memory_projection(state: &AppState) {
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    crate::memory::snapshot::refresh_projection(state.mem.as_ref(), &workspace_dir);
+    if let Err(e) = crate::memory::snapshot::refresh_projection(state.mem.as_ref(), &workspace_dir)
+    {
+        tracing::warn!("memory projection skipped: {e}");
+    }
 }
 
 /// Fetch one memory by key.
@@ -4110,7 +4114,8 @@ mod tests {
             )
             .await
             .unwrap();
-        crate::memory::snapshot::refresh_projection(state.mem.as_ref(), tmp.path());
+        crate::memory::snapshot::refresh_projection(state.mem.as_ref(), tmp.path())
+            .expect("projection should succeed in test");
         let owner_dm = crate::channels::owner_dm::OwnerDm::start(tmp.path()).await;
 
         let before = owner_dm.turn().await;

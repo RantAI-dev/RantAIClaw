@@ -118,10 +118,12 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        // A chat may only patch a job it created. Un-scoped callers (TUI /
-        // CLI / console) pass — they own every job. The refused call has the
-        // same shape as `cron_remove` / `cron_run`, so an operator who hits
-        // it from a chat knows exactly where the job lives.
+        // A chat may only patch a job it created; the scope comes from the
+        // turn's memory view, not from `args`. Un-scoped callers (TUI /
+        // CLI / console) run under `All` and own every job. The refused
+        // call has the same shape as `cron_remove` / `cron_run`, so an
+        // operator who hits it from a chat knows exactly where the job
+        // lives.
         let job = match cron::get_job(&self.config, job_id) {
             Ok(j) => j,
             Err(e) => {
@@ -132,7 +134,19 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
-        let origin_owned = crate::tools::cron_schema::origin_filter(&args);
+        let origin_owned = match crate::tools::cron_schema::cron_origin_for_view(
+            crate::memory::current_memory_view().as_ref(),
+            &args,
+        ) {
+            Ok(o) => o,
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                });
+            }
+        };
         let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
         if let Err(reason) = cron::ensure_visible_to_origin(&job, origin_ref) {
             return Ok(ToolResult {
@@ -175,6 +189,7 @@ impl Tool for CronUpdateTool {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::memory::{MemoryView, MEMORY_VIEW};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -195,6 +210,18 @@ mod tests {
             &cfg.autonomy,
             &cfg.workspace_dir,
         ))
+    }
+
+    /// Operator's `All` view path; keeps the existing assertions focused on the
+    /// patch / autonomy flow. View-based refusal has its own unit tests in
+    /// `cron_origin_for_view`'s module.
+    async fn execute_under_all_view(tool: &CronUpdateTool, args: serde_json::Value) -> ToolResult {
+        MEMORY_VIEW
+            .scope(
+                MemoryView::All,
+                async move { tool.execute(args).await.unwrap() },
+            )
+            .await
     }
 
     /// `patch` was a bare object with no description: a model could see the
@@ -243,13 +270,14 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "job_id": job.id,
                 "patch": { "enabled": false }
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("\"enabled\": false"));
@@ -271,13 +299,14 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "job_id": job.id,
                 "patch": { "command": "curl https://example.com" }
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not allowed"));
     }
@@ -296,13 +325,14 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "job_id": job.id,
                 "patch": { "enabled": false }
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
     }
@@ -322,17 +352,38 @@ mod tests {
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
 
-        let denied = tool
-            .execute(json!({
+        let denied = execute_under_all_view(
+            &tool,
+            json!({
                 "job_id": job.id,
                 "patch": { "command": "touch cron-update-approval-test" }
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(!denied.success);
         assert!(denied
             .error
             .unwrap_or_default()
             .contains("explicit approval"));
+    }
+
+    /// A turn with no memory view cannot update any cron job — refusing here
+    /// matches `cron_origin_for_view`'s contract.
+    #[tokio::test]
+    async fn no_view_update_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let out = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+        assert!(!out.success, "no view must refuse cron_update");
+        assert!(out.error.unwrap_or_default().contains("no memory view"));
     }
 }

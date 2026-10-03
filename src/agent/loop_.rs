@@ -1127,55 +1127,16 @@ fn should_execute_tools_in_parallel(
 /// console / delegate paths pass `reply_target = None` and the call is
 /// returned unchanged — those callers see every job.
 ///
-/// The four cron tools accept `origin_channel` / `origin_chat` as optional
-/// parameters; this helper sets them when both are known. Adding the params
-/// to the call is safe because every cron_* tool's schema declares them.
-fn maybe_inject_cron_origin(
-    call: &ParsedToolCall,
-    channel_name: &str,
-    reply_target: Option<&str>,
-) -> Option<ParsedToolCall> {
-    let reply_target = reply_target?;
-    const CRON_TOOLS: &[&str] = &[
-        "cron_add",
-        "cron_list",
-        "cron_remove",
-        "cron_update",
-        "cron_run",
-        "cron_runs",
-    ];
-    if !CRON_TOOLS.contains(&call.name.as_str()) {
-        return None;
-    }
-    let mut arguments = call.arguments.clone();
-    let obj = arguments.as_object_mut()?;
-    obj.insert(
-        "origin_channel".to_string(),
-        serde_json::Value::String(channel_name.to_string()),
-    );
-    obj.insert(
-        "origin_chat".to_string(),
-        serde_json::Value::String(reply_target.to_string()),
-    );
-    Some(ParsedToolCall {
-        name: call.name.clone(),
-        arguments,
-        tool_call_id: call.tool_call_id.clone(),
-    })
-}
-
-/// Compose the origin injection (for all cron_* tools) and the default delivery
-/// injection (for bare `cron_add`) so a chat turn gets both without one shadowing
-/// the other.
+/// Compose the default delivery injection for bare `cron_add` so a chat turn
+/// gets an announce-channel deliverer without one having to spell it out.
+/// The cron tools' origin scope now comes from the turn's memory view, so
+/// nothing here injects an origin — see `cron_origin_for_view`.
 fn inject_chat_cron_parameters(
     call: &ParsedToolCall,
     channel_name: &str,
     reply_target: Option<&str>,
 ) -> Option<ParsedToolCall> {
-    let with_origin = maybe_inject_cron_origin(call, channel_name, reply_target);
-    let base = with_origin.as_ref().unwrap_or(call);
-    let with_delivery = maybe_inject_channel_delivery(base, channel_name, reply_target);
-    with_delivery.or(with_origin)
+    maybe_inject_channel_delivery(call, channel_name, reply_target)
 }
 
 /// tools, non-announce channels, or an already-set delivery).
@@ -1435,8 +1396,10 @@ pub(crate) async fn execute_tool_calls_collecting(
     // A guest turn must run serially so every call passes the gate below; the
     // parallel fast-path skips per-call checks.
     if parallel && guest_gate.is_none() {
-        // Materialize any channel-delivery / cron-origin injection so the owned
-        // modified calls outlive the joined futures (which borrow them).
+        // Materialize any channel-delivery injection so the owned modified
+        // calls outlive the joined futures (which borrow them). The cron
+        // tools' origin scope now comes from the turn's memory view, so
+        // nothing is injected here for the origin.
         let effective: Vec<ParsedToolCall> = calls
             .iter()
             .map(|call| {
@@ -1642,10 +1605,11 @@ pub(crate) async fn execute_tool_calls_collecting(
             }
         }
 
-        // Inject the origin chat for cron_* tools, then the default delivery
-        // for a bare channel `cron_add` (gating/approval above intentionally
-        // ran on the original call — the operator approved THIS call, not the
-        // rewritten one).
+        // Inject the default delivery for a bare channel `cron_add`
+        // (gating/approval above intentionally ran on the original call —
+        // the operator approved THIS call, not the rewritten one). The cron
+        // tools' origin scope comes from the turn's memory view, so nothing
+        // here injects an origin.
         let injected = inject_chat_cron_parameters(call, channel_name, channel_reply_target);
         let exec_call = injected.as_ref().unwrap_or(call);
         results.push(
@@ -2598,15 +2562,21 @@ pub async fn run_with_scope(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory (skip short/trivial messages)
+        // Auto-save user message to memory (skip short/trivial messages).
+        // The session_id follows the turn's memory view: nothing on no view,
+        // shared under `All`, chat-scoped under `Only(place)` — so a chat
+        // never leaks its note into another chat's recall.
         if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-            crate::memory::autosave_screened(
-                mem.as_ref(),
-                &autosave_memory_key("user_msg"),
-                &msg,
-                None,
-            )
-            .await;
+            if let Some(session_id) = crate::memory::autosave_session_for_view(memory_view.as_ref())
+            {
+                crate::memory::autosave_screened(
+                    mem.as_ref(),
+                    &autosave_memory_key("user_msg"),
+                    &msg,
+                    session_id.as_deref(),
+                )
+                .await;
+            }
         }
 
         // Open the same SessionStore the TUI uses so headless `agent -m`
@@ -2955,6 +2925,39 @@ mod tests {
         assert_eq!(d["to"], "12345");
         // The rest of the call is untouched.
         assert_eq!(out.arguments["prompt"], "morning pep talk");
+    }
+
+    /// The cron tools' origin scope is now read from the turn's memory view,
+    /// not from `args`. This helper must NOT inject `origin_channel` /
+    /// `origin_chat`; otherwise the helper would shadow the view and let one
+    /// chat's call act on another chat's jobs.
+    #[test]
+    fn chat_injector_does_not_set_origin() {
+        for name in [
+            "cron_add",
+            "cron_list",
+            "cron_run",
+            "cron_runs",
+            "cron_update",
+            "cron_remove",
+        ] {
+            let call = ParsedToolCall {
+                name: name.into(),
+                arguments: serde_json::json!({"job_id": "abc"}),
+                tool_call_id: None,
+            };
+            let out = inject_chat_cron_parameters(&call, "telegram", Some("12345"));
+            if let Some(rewritten) = out {
+                assert!(
+                    rewritten.arguments.get("origin_channel").is_none(),
+                    "{name}: must not inject origin_channel"
+                );
+                assert!(
+                    rewritten.arguments.get("origin_chat").is_none(),
+                    "{name}: must not inject origin_chat"
+                );
+            }
+        }
     }
 
     #[test]

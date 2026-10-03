@@ -1910,7 +1910,11 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
-    if state.auto_save {
+    // Webhooks have no chat turn behind them, so they don't carry a
+    // `MemoryView`. Skipping the autosave keeps the rule "no view, no write"
+    // — without it, an unscoped webhook caller could leave a note in the
+    // shared conversation memory. The body still reaches the model.
+    if state.auto_save && crate::memory::current_memory_view().is_some() {
         let key = webhook_memory_key();
         let _ = state
             .mem
@@ -4351,23 +4355,34 @@ mod tests {
 
         let headers = HeaderMap::new();
 
+        // The handler only autosaves when a memory view is in scope. Wrap each
+        // call so the existing assertions stay focused on the key uniqueness
+        // contract.
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
         }));
-        let first = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            headers.clone(),
-            body1,
-        )
-        .await
-        .into_response();
+        let first = crate::memory::MEMORY_VIEW
+            .scope(
+                crate::memory::MemoryView::All,
+                handle_webhook(
+                    State(state.clone()),
+                    test_connect_info(),
+                    headers.clone(),
+                    body1,
+                ),
+            )
+            .await
+            .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
         }));
-        let second = handle_webhook(State(state), test_connect_info(), headers, body2)
+        let second = crate::memory::MEMORY_VIEW
+            .scope(
+                crate::memory::MemoryView::All,
+                handle_webhook(State(state), test_connect_info(), headers, body2),
+            )
             .await
             .into_response();
         assert_eq!(second.status(), StatusCode::OK);
@@ -4378,6 +4393,67 @@ mod tests {
         assert!(keys[0].starts_with("webhook_msg_"));
         assert!(keys[1].starts_with("webhook_msg_"));
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Webhooks have no chat turn behind them, so they don't carry a
+    /// `MemoryView`. Without a view the handler must still serve the model
+    /// request, but it must NOT persist the body to shared conversation
+    /// memory — a webhook would otherwise be able to leave a note visible to
+    /// every chat.
+    #[tokio::test]
+    async fn webhook_with_no_view_does_not_autosave() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let tracking_impl = Arc::new(TrackingMemory::default());
+        let memory: Arc<dyn Memory> = tracking_impl.clone();
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: true,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+        };
+
+        let headers = HeaderMap::new();
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+        }));
+
+        // No `MEMORY_VIEW.scope(...)` at all — the handler sees None.
+        let resp = handle_webhook(State(state), test_connect_info(), headers, body)
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let keys = tracking_impl.keys.lock().clone();
+        assert!(
+            keys.is_empty(),
+            "no-view webhook must NOT autosave; got {keys:?}"
+        );
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

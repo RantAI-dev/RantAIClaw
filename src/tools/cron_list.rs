@@ -48,7 +48,22 @@ impl Tool for CronListTool {
             });
         }
 
-        let origin_owned = crate::tools::cron_schema::origin_filter(&args);
+        // The scope comes from the turn's memory view: a chat lists only its
+        // own jobs, the TUI/CLI/web console lists every job, and a turn with
+        // no view is refused.
+        let origin_owned = match crate::tools::cron_schema::cron_origin_for_view(
+            crate::memory::current_memory_view().as_ref(),
+            &args,
+        ) {
+            Ok(o) => o,
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                });
+            }
+        };
         let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
         match cron::list_jobs_for_origin(&self.config, origin_ref) {
             Ok(jobs) => Ok(ToolResult {
@@ -70,6 +85,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::cron::{Schedule, SessionTarget};
+    use crate::memory::{MemoryView, MEMORY_VIEW};
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -90,7 +106,13 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let tool = CronListTool::new(cfg);
 
-        let result = tool.execute(json!({})).await.unwrap();
+        // Under the unscoped `All` view (TUI / CLI / web console), an empty
+        // store lists nothing.
+        let result = MEMORY_VIEW
+            .scope(MemoryView::All, async {
+                tool.execute(json!({})).await.unwrap()
+            })
+            .await;
         assert!(result.success);
         assert_eq!(result.output.trim(), "[]");
     }
@@ -102,7 +124,11 @@ mod tests {
         cfg.cron.enabled = false;
         let tool = CronListTool::new(Arc::new(cfg));
 
-        let result = tool.execute(json!({})).await.unwrap();
+        let result = MEMORY_VIEW
+            .scope(MemoryView::All, async {
+                tool.execute(json!({})).await.unwrap()
+            })
+            .await;
         assert!(!result.success);
         assert!(result
             .error
@@ -113,8 +139,15 @@ mod tests {
     /// Two chats create a job each; each chat lists only its own. An
     /// un-scoped caller (CLI/TUI/console) sees both, plus the legacy
     /// origin-less rows that pre-date the scope column.
+    ///
+    /// The scope now comes from the turn's memory view, not from `args`. A
+    /// chat runs under `Only(<surface>:<reply_target>)` and sees only its
+    /// own jobs; the TUI / CLI / web console run under `All` and see every
+    /// job (legacy origin-less rows included).
     #[tokio::test]
     async fn filters_jobs_to_their_origin_chat() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let tool = CronListTool::new(cfg.clone());
@@ -171,14 +204,12 @@ mod tests {
         )
         .unwrap();
 
-        // Chat-A lists: sees only its own job.
-        let list_a = tool
-            .execute(json!({
-                "origin_channel": "telegram",
-                "origin_chat": "chat-a",
-            }))
-            .await
-            .unwrap();
+        // Chat-A lists: under its `Only` view, sees only its own job.
+        let list_a = MEMORY_VIEW
+            .scope(MemoryView::Only("telegram:chat-a".into()), async {
+                tool.execute(json!({})).await.unwrap()
+            })
+            .await;
         assert!(list_a.success);
         let parsed_a: Vec<serde_json::Value> = serde_json::from_str(&list_a.output).unwrap();
         let names_a: Vec<&str> = parsed_a
@@ -198,14 +229,12 @@ mod tests {
             "an origin-less job is managed only from the TUI / CLI / console — a chat must not list it: {names_a:?}"
         );
 
-        // Chat-B lists: sees only its own + legacy.
-        let list_b = tool
-            .execute(json!({
-                "origin_channel": "discord",
-                "origin_chat": "chat-b",
-            }))
-            .await
-            .unwrap();
+        // Chat-B lists: under its `Only` view, sees only its own job.
+        let list_b = MEMORY_VIEW
+            .scope(MemoryView::Only("discord:chat-b".into()), async {
+                tool.execute(json!({})).await.unwrap()
+            })
+            .await;
         let parsed_b: Vec<serde_json::Value> = serde_json::from_str(&list_b.output).unwrap();
         let names_b: Vec<&str> = parsed_b
             .iter()
@@ -215,8 +244,12 @@ mod tests {
         assert!(!names_b.contains(&"chat-a"));
         assert!(!names_b.contains(&"legacy"));
 
-        // An un-scoped caller (no origin) sees every job.
-        let list_all = tool.execute(json!({})).await.unwrap();
+        // An un-scoped caller (All view) sees every job.
+        let list_all = MEMORY_VIEW
+            .scope(MemoryView::All, async {
+                tool.execute(json!({})).await.unwrap()
+            })
+            .await;
         let parsed_all: Vec<serde_json::Value> = serde_json::from_str(&list_all.output).unwrap();
         let names_all: Vec<&str> = parsed_all
             .iter()
@@ -225,5 +258,82 @@ mod tests {
         assert!(names_all.contains(&"chat-a"));
         assert!(names_all.contains(&"chat-b"));
         assert!(names_all.contains(&"legacy"));
+    }
+
+    /// A model that tries to widen the chat's `Only` view by passing a foreign
+    /// `origin_channel` / `origin_chat` in the args must still see only the
+    /// chat's own jobs. The view is the authority; the args are ignored when
+    /// the view is set.
+    #[tokio::test]
+    async fn under_an_only_view_args_origin_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronListTool::new(cfg.clone());
+
+        let _ = cron::add_agent_job(
+            &cfg,
+            Some("chat-a".into()),
+            Schedule::At {
+                at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            },
+            "remind A",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some("agent-tool"),
+            Some("telegram"),
+            Some("chat-a"),
+        )
+        .unwrap();
+        let _ = cron::add_agent_job(
+            &cfg,
+            Some("chat-b".into()),
+            Schedule::At {
+                at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            },
+            "remind B",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some("agent-tool"),
+            Some("discord"),
+            Some("chat-b"),
+        )
+        .unwrap();
+
+        // Chat-A is the view, but the args claim chat-B. The view wins.
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("telegram:chat-a".into()), async {
+                tool.execute(json!({
+                    "origin_channel": "discord",
+                    "origin_chat": "chat-b",
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result.output).unwrap();
+        let names: Vec<&str> = parsed.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["chat-a"]);
+    }
+
+    /// A turn with no view (a webhook, an unset door) is refused before any
+    /// query runs. The text names no job, so a caller cannot probe what is
+    /// scheduled.
+    #[tokio::test]
+    async fn under_no_view_cron_list_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronListTool::new(cfg);
+
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("no memory view"),
+            "the refusal names the view, not a job: {err}"
+        );
     }
 }
