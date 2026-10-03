@@ -275,7 +275,7 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 
 ## In-Chat Runtime Model Switching
 
-When running `rantaiclaw channel start` (or daemon mode), the five tier channels (Telegram, Discord, Slack, WhatsApp and Lark) support runtime switching, scoped to the conversation:
+When running `rantaiclaw channel start` (or daemon mode), the five tier channels (Telegram, Discord, Slack, WhatsApp Web and Lark) support runtime switching, scoped to the conversation:
 
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current conversation. Owner only. In a group that applies to everyone in it

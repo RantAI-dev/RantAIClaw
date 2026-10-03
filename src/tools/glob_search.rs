@@ -135,6 +135,21 @@ impl Tool for GlobSearchTool {
                 continue; // silently filter symlink escapes
             }
 
+            // On a guest turn, the private-file read rule applies: a guest's
+            // `glob_search` would otherwise list the names of files a guest
+            // could then ask `file_read` for, leaking the owner's profile
+            // (`USER.md`), notes (`MEMORY.md`), the days under `memory/` and
+            // the editor backups that name them. Same rule `file_read` runs,
+            // keyed on `current_turn_is_guest()` rather than the memory view
+            // because the model's prompt at this door is opaque to the caller.
+            if crate::approval::guest::current_turn_is_guest()
+                && crate::tools::private_file_read_denial(&resolved, &self.security.workspace_dir)
+                    .await
+                    .is_some()
+            {
+                continue;
+            }
+
             // Only include files, not directories
             if resolved.is_dir() {
                 continue;
@@ -338,6 +353,68 @@ mod tests {
         assert!(result.output.contains("legit.txt"));
         assert!(!result.output.contains("escape.txt"));
         assert!(!result.output.contains("secret.txt"));
+    }
+
+    /// `glob_search` shows a guest the names of private owner files
+    /// (`MEMORY.md`, `USER.md`, anything under `memory/`) on its own turn: the
+    /// workspace filter (`is_resolved_path_allowed`) only stops a path leaving
+    /// the workspace, and `glob_search`'s results list names the model can ask
+    /// `file_read` for. Filter the results with the private-path read check on
+    /// a guest turn so a guest sees only what it could `file_read` anyway.
+    #[tokio::test]
+    async fn glob_search_hides_private_files_on_a_guest_turn() {
+        let dir = TempDir::new().unwrap();
+        // Public file the guest can see.
+        std::fs::write(dir.path().join("notes.txt"), "ok").unwrap();
+        // Owner-private files the guest must not see listed.
+        std::fs::write(dir.path().join("MEMORY.md"), "owner memory").unwrap();
+        std::fs::write(dir.path().join("USER.md"), "owner user").unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(dir.path().join("memory/2026-09-26.md"), "daily").unwrap();
+
+        let tool = GlobSearchTool::new(test_security(dir.path().to_path_buf()));
+
+        let guest_result = crate::approval::guest::GUEST_TURN
+            .scope((), async {
+                tool.execute(json!({"pattern": "*"})).await.unwrap()
+            })
+            .await;
+        assert!(guest_result.success, "{:?}", guest_result.error);
+        assert!(
+            guest_result.output.contains("notes.txt"),
+            "a guest can see a public file: {}",
+            guest_result.output
+        );
+        assert!(
+            !guest_result.output.contains("MEMORY.md"),
+            "a guest must not see MEMORY.md in the listing: {}",
+            guest_result.output
+        );
+        assert!(
+            !guest_result.output.contains("USER.md"),
+            "a guest must not see USER.md in the listing: {}",
+            guest_result.output
+        );
+        assert!(
+            !guest_result.output.contains("memory/2026-09-26.md"),
+            "a guest must not see anything under `memory/` in the listing: {}",
+            guest_result.output
+        );
+
+        // Owner is not filtered.
+        let owner_result = tool.execute(json!({"pattern": "*"})).await.unwrap();
+        assert!(owner_result.success, "{:?}", owner_result.error);
+        assert!(owner_result.output.contains("notes.txt"));
+        assert!(
+            owner_result.output.contains("MEMORY.md"),
+            "control: the owner sees the file: {}",
+            owner_result.output
+        );
+        assert!(
+            owner_result.output.contains("USER.md"),
+            "control: the owner sees the file: {}",
+            owner_result.output
+        );
     }
 
     #[tokio::test]

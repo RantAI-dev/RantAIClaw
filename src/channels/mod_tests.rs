@@ -355,7 +355,7 @@ fn production_half(src: &str) -> &str {
             !item.is_some_and(|line| line.starts_with("mod ") && line.ends_with(';'))
         })
         .min()
-        .unwrap_or(src.len());
+        .unwrap_or(0);
     &src[..cut]
 }
 
@@ -10107,7 +10107,7 @@ fn wizard_discord_step_calls_print_step_block_with_the_constant() {
         let cut = include_str!("../onboard/wizard.rs")
             .match_indices(TEST_MODULE_MARKER)
             .map(|(at, _)| at)
-            .min()
+            .max()
             .unwrap_or(usize::MAX);
         &include_str!("../onboard/wizard.rs")[..cut]
     };
@@ -10727,8 +10727,13 @@ fn without_line_comment(line: &str) -> &str {
 ///
 /// Reads the text rather than the lines, so a builder call split across lines,
 /// with the dot at the start of the next one, is found the same as one on a
-/// single line. A struct literal, a field assignment and a shorthand field are
-/// found too.
+/// single line. A struct literal, a field assignment, a compound assignment
+/// (`|=`, `&=`, `+=`, etc.), a `mem::replace(&mut m.may_attach, _)` and a
+/// shorthand field are found too. The `read` check is careful with two false
+/// positives the first version had: `m.may_attach |= true` (the after-string
+/// starts with `|`, not `=`, but it is still a write) and
+/// `&mut m.may_attach` (the before-string ends with `.`, but it is a write,
+/// not a read).
 fn attachment_flag_on_lines(src: &str) -> Vec<usize> {
     let code = src
         .lines()
@@ -10755,8 +10760,24 @@ fn attachment_flag_on_lines(src: &str) -> Vec<usize> {
                 !before.ends_with("fn")
             } else {
                 let declared_or_off = after.starts_with(":bool") || after.starts_with(":false");
-                let read =
-                    after.starts_with("==") || (before.ends_with('.') && !after.starts_with('='));
+                // `m.may_attach |= true` writes through `|=` (and the other
+                // compound-assignment operators). The plain-assignment arm
+                // below only catches `=` itself, so treat compound assignments
+                // the same as a plain one and not as a read.
+                let compound_assign = ["", "=", "&", "^", "+", "-", "*", "/", "%", "<<", ">>"]
+                    .iter()
+                    .any(|op| after.starts_with(&format!("|{op}")));
+                // `&mut m.may_attach` writes (e.g. to `mem::replace`'s first
+                // argument), but the `before` ends with `.` so the plain
+                // `before.ends_with('.')` arm wrongly treats it as a read.
+                // A plain `.may_attach` read has no `&mut` anywhere in the
+                // expression leading up to it.
+                let mut_borrow = before.contains("&mut ") && before.ends_with('.');
+                let read = after.starts_with("==")
+                    || (!compound_assign
+                        && !mut_borrow
+                        && before.ends_with('.')
+                        && !after.starts_with('='));
                 !(declared_or_off || read)
             };
             if turns_it_on {
@@ -10811,7 +10832,27 @@ fn the_attachment_flag_finder_reads_every_shape_of_a_flag_on_site() {
         Vec::<usize>::new()
     );
     assert_eq!(on("let url = \"https://x\"; m.allowing_attachments()"), [1]);
+
+    // Plan 529: shape blind spots the original scanner missed. Each is a real
+    // flag-on site; the catchers must turn into future additions to the
+    // `only_a_filtered_reply_and_a_configured_delivery_build_a_message_that_may_attach`
+    // ALLOWED list, not a quiet regression.
+    assert_eq!(on("m.may_attach |= true;"), [1]);
+    assert_eq!(
+        on("let _ = std::mem::replace(&mut m.may_attach, true);"),
+        [1]
+    );
+    assert_eq!(
+        on("SendMessage { content, may_attach: m.may_attach, ..m }"),
+        [1]
+    );
 }
+
+// TODO(plan-529): `production_half` only keeps the code before the FIRST
+// `#[cfg(test)]` test module, so a file that puts production code between
+// two test modules silently misses flag-on sites in the trailing production
+// block. The simpler fix would scan each block separately and is left for a
+// future change; the current tree has no such file, so it is not blocking.
 
 /// Only text the model wrote that went through the turn's reply filter, and a
 /// delivery the owner configured, may carry attachment markers. Everything else

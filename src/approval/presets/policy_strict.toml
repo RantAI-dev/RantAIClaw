@@ -54,8 +54,9 @@ patterns = [
   "list_*",
 
   # Safe-write seeds — bookkeeping the agent must do to function.
-  "memory_store *",
-  "skill_install *",
+  # (`memory_*` covers memory_store, so it does not get its own line;
+  # `skill_install` is not a tool — the writer used to auto-approve installs
+  # under Strict, which the audit fixed in plan 529.)
   "cron_*",
   "session_*",
 ]

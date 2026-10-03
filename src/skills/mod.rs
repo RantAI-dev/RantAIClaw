@@ -1369,17 +1369,21 @@ pub fn skills_to_prompt_with_mode(
     workspace_dir: &Path,
     mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
-    render_skills_prompt(skills, workspace_dir, mode, true)
+    render_skills_prompt(skills, workspace_dir, mode, true, false)
 }
 
 /// The "Available Skills" section for a guest's prompt: the same list, without
-/// a `<location>` per skill. A location is a path on the host, and outside the
-/// workspace it is absolute and carries the OS user name.
+/// a `<location>` per skill and without each skill's `<instructions>` and
+/// `<tools>` blocks. A `<location>` is a path on the host, and outside the
+/// workspace it is absolute and carries the OS user name. A `<instructions>`
+/// block is text the owner wrote under `workspace/skills/`, and a `<tools>`
+/// block names tools a guest may not be granted — both leak owner-written
+/// prose into a guest's prompt, whatever the skills mode.
 pub fn skills_to_prompt_for_guest(
     skills: &[Skill],
     mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
-    render_skills_prompt(skills, Path::new(""), mode, false)
+    render_skills_prompt(skills, Path::new(""), mode, false, true)
 }
 
 fn render_skills_prompt(
@@ -1387,6 +1391,7 @@ fn render_skills_prompt(
     workspace_dir: &Path,
     mode: crate::config::SkillsPromptInjectionMode,
     with_locations: bool,
+    is_guest: bool,
 ) -> String {
     use std::fmt::Write;
 
@@ -1394,20 +1399,30 @@ fn render_skills_prompt(
         return String::new();
     }
 
-    let mut prompt = match mode {
-        crate::config::SkillsPromptInjectionMode::Full => String::from(
+    // A guest prompt carries name and description only. The mode-specific
+    // header is misleading either way ("Skill instructions are preloaded
+    // below" / "loaded on demand") — a guest gets neither — but the no-location
+    // Compact header already says "Skill summaries are preloaded below", which
+    // describes the guest rendering too. Use it for every guest mode.
+    let mut prompt = match (mode, with_locations) {
+        (_, _) if is_guest => String::from(
+            "## Available Skills\n\n\
+             Skill summaries are preloaded below to keep context compact.\n\n\
+             <available_skills>\n",
+        ),
+        (crate::config::SkillsPromptInjectionMode::Full, _) => String::from(
             "## Available Skills\n\n\
              Skill instructions and tool metadata are preloaded below.\n\
              Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
              <available_skills>\n",
         ),
-        crate::config::SkillsPromptInjectionMode::Compact if with_locations => String::from(
+        (crate::config::SkillsPromptInjectionMode::Compact, true) => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
              Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\n\
              <available_skills>\n",
         ),
-        crate::config::SkillsPromptInjectionMode::Compact => String::from(
+        (crate::config::SkillsPromptInjectionMode::Compact, false) => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\n\
              <available_skills>\n",
@@ -1423,9 +1438,14 @@ fn render_skills_prompt(
         // Full-mode injection, even when the global mode is Full — its body
         // is untrusted input, not an authoritative instruction. It still gets
         // the on-demand relative-location rendering the Compact path uses.
-        let render_full =
-            matches!(mode, crate::config::SkillsPromptInjectionMode::Full) && !skill.remote;
-        if with_locations {
+        // A guest never gets either: the `<location>` is a host path that
+        // carries the OS user name, and the `<instructions>` / `<tools>`
+        // blocks leak owner-written prose and the names of tools a guest may
+        // not be granted.
+        let render_full = !is_guest
+            && matches!(mode, crate::config::SkillsPromptInjectionMode::Full)
+            && !skill.remote;
+        if with_locations && !is_guest {
             let location = render_skill_location(skill, workspace_dir, !render_full);
             write_xml_text_element(&mut prompt, 4, "location", &location);
         }
@@ -2528,6 +2548,100 @@ command = "echo hello"
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
         assert!(!prompt.contains("<tools>"));
+    }
+
+    /// A guest's prompt must never carry the text the owner wrote under
+    /// `workspace/skills/`: every `<instructions>` and `<tools>` block a skill's
+    /// body holds leaks owner-written prose and the names of tools a guest may
+    /// not have. The guest's skill list is name and description only, in every
+    /// mode (Full is the default — see `src/config/schema.rs:~395`).
+    #[test]
+    fn skills_to_prompt_for_guest_in_full_mode_keeps_only_name_and_description() {
+        let skills = vec![Skill {
+            name: "owner-skill".to_string(),
+            description: "Skill the owner wrote".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![SkillTool {
+                name: "manage_permissions".to_string(),
+                description: "Owner-only tool the skill names".to_string(),
+                kind: "shell".to_string(),
+                command: "echo hi".to_string(),
+                args: HashMap::new(),
+            }],
+            prompts: vec!["The owner wrote this instruction text.".to_string()],
+            location: Some(PathBuf::from("/tmp/workspace/skills/owner-skill/SKILL.md")),
+            requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: false,
+            origin: None,
+        }];
+        let prompt =
+            skills_to_prompt_for_guest(&skills, crate::config::SkillsPromptInjectionMode::Full);
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>owner-skill</name>"));
+        assert!(prompt.contains("<description>Skill the owner wrote</description>"));
+        // The owner's prose must not reach a guest's prompt.
+        assert!(
+            !prompt.contains("<instructions>"),
+            "a guest's prompt must not carry the owner's `<instructions>` block: {prompt}"
+        );
+        assert!(
+            !prompt.contains("<instruction>The owner wrote this instruction text.</instruction>"),
+            "a guest's prompt must not carry the owner's prose: {prompt}"
+        );
+        // The `<tools>` block names tools a guest may not be granted.
+        assert!(
+            !prompt.contains("<tools>"),
+            "a guest's prompt must not carry the skill's `<tools>` block: {prompt}"
+        );
+        assert!(
+            !prompt.contains("<name>manage_permissions</name>"),
+            "a guest's prompt must not name an owner-only tool: {prompt}"
+        );
+        // A `<location>` is an absolute path on the host.
+        assert!(
+            !prompt.contains("<location>"),
+            "a guest's prompt must not carry a `<location>` (absolute host path): {prompt}"
+        );
+    }
+
+    /// A guest in Full mode renders the same name-and-description-only list as a
+    /// guest in Compact mode, so the header that introduces it must not promise
+    /// instructions or preloaded tool metadata. `Full` is the default skills
+    /// mode (`src/config/schema.rs:~395`), so this is what every guest sees
+    /// unless an operator explicitly switched to Compact. A guest never gets
+    /// instructions or tool metadata, so the Full owner header ("Skill
+    /// instructions and tool metadata are preloaded below. Follow these
+    /// instructions directly...") is a lie for a guest and must never reach
+    /// one.
+    #[test]
+    fn skills_to_prompt_for_guest_in_full_mode_header_does_not_promise_preloaded_metadata() {
+        let skills = vec![Skill {
+            name: "any-skill".to_string(),
+            description: "Any skill".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: Some(PathBuf::from("/tmp/workspace/skills/any-skill/SKILL.md")),
+            requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: false,
+            origin: None,
+        }];
+        let prompt =
+            skills_to_prompt_for_guest(&skills, crate::config::SkillsPromptInjectionMode::Full);
+        assert!(
+            !prompt.contains("Skill instructions and tool metadata are preloaded below"),
+            "a guest's Full-mode header must not claim instructions/tool metadata are preloaded: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Follow these instructions directly"),
+            "a guest's Full-mode header must not tell the model to follow preloaded instructions: {prompt}"
+        );
     }
 
     #[test]

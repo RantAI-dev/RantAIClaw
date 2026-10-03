@@ -103,6 +103,15 @@ impl GuestGate {
         // tampering / denial of the owner's schedule) — read-only cron_list /
         // cron_runs stay allowed.
         "cron_remove",
+        // The `screenshot` action passes a model-chosen `path` straight to the
+        // browser CLI (`src/tools/browser.rs:490-498`, `:1054-1055`), with no
+        // workspace bound, so a guest granted `browser` could overwrite
+        // `config.toml`, `MEMORY.md` or `memory/brain.db`. The tool is also
+        // free to navigate to any URL and submit credentials / execute
+        // commands on the owner's behalf. `docs/security/per-role-permissions.md`
+        // already tells operators not to grant it; the gate adds the hard
+        // deny so an operator who listed it in `guest_allowed_tools` loses it.
+        "browser",
     ];
 
     /// Whether a guest may invoke `tool` at all. Owner-only tools are always
@@ -520,6 +529,34 @@ mod tests {
         // Read-only cron tools must remain usable by guests when allowlisted.
         assert!(g.tool_permitted("cron_list"));
         assert!(g.tool_permitted("cron_runs"));
+    }
+
+    /// `browser`'s `screenshot` action passes a model-chosen `path` straight to
+    /// the browser CLI (`src/tools/browser.rs:490-498`, `:1054-1055`), with no
+    /// workspace bound, so a guest granted `browser` could overwrite
+    /// `config.toml`, `MEMORY.md` or `memory/brain.db` from outside the
+    /// workspace. `docs/security/per-role-permissions.md` already tells
+    /// operators not to grant it; the gate adds the hard deny, so an operator
+    /// who listed it in `guest_allowed_tools` loses it.
+    #[test]
+    fn guest_denied_browser_even_when_allowlisted() {
+        let g = GuestGate::new(&["browser".to_string()], &[]);
+        assert!(
+            !g.tool_permitted("browser"),
+            "browser must stay owner-only when an operator allowlists it"
+        );
+        let reason = g
+            .deny_reason("browser", &json!({}))
+            .expect("browser must be denied for a guest");
+        assert!(reason.contains("owner-only"), "{reason}");
+        assert!(
+            reason.contains("channels pair"),
+            "browser denial must name the owner-pair flow: {reason}"
+        );
+        assert!(
+            reason.contains("/claim"),
+            "browser denial must name /claim: {reason}"
+        );
     }
 
     #[test]
