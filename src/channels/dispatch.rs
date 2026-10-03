@@ -79,36 +79,56 @@ pub(crate) fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
 }
 
 pub(crate) fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut normalized = Vec::with_capacity(turns.len());
-    let mut expecting_user = true;
+    let mut normalized: Vec<ChatMessage> = Vec::with_capacity(turns.len());
+    let mut has_any_user = false;
 
     for turn in turns {
-        match (expecting_user, turn.role.as_str()) {
-            (true, "user") => {
-                normalized.push(turn);
-                expecting_user = false;
+        match turn.role.as_str() {
+            "user" => {
+                if matches!(normalized.last().map(|t| t.role.as_str()), Some("user")) {
+                    // Interrupted channel turns can produce consecutive user
+                    // messages (no assistant persisted yet). Merge instead of
+                    // dropping.
+                    merge_into_last(&mut normalized, &turn);
+                } else {
+                    normalized.push(turn);
+                }
+                has_any_user = true;
             }
-            (false, "assistant") => {
+            // `tool` roles come from native-tool-call responses: each `ToolResults`
+            // entry in the structured history flattens to a `ChatMessage::tool`
+            // by `NativeToolDispatcher::to_provider_messages`, and the channel
+            // door stores that as its own turn so the next turn's provider sees
+            // the result. Pass it through untouched; pairing is the provider's
+            // concern, not the cache's.
+            "tool" => {
                 normalized.push(turn);
-                expecting_user = true;
             }
-            // Interrupted channel turns can produce consecutive user messages
-            // (no assistant persisted yet). Merge instead of dropping.
-            (false, "user") | (true, "assistant") => {
-                if let Some(last_turn) = normalized.last_mut() {
-                    if !turn.content.is_empty() {
-                        if !last_turn.content.is_empty() {
-                            last_turn.content.push_str("\n\n");
-                        }
-                        last_turn.content.push_str(&turn.content);
-                    }
+            "assistant" => {
+                if !has_any_user {
+                    // Orphan: no user turn in the conversation to anchor this
+                    // assistant reply. Drop and say so — the cache is a
+                    // general message vector, and a silent drop here would be
+                    // permanent after the next compaction.
+                    tracing::debug!(
+                        "dropping assistant turn with no preceding user in the conversation"
+                    );
+                    continue;
+                }
+                if matches!(
+                    normalized.last().map(|t| t.role.as_str()),
+                    Some("assistant")
+                ) {
+                    merge_into_last(&mut normalized, &turn);
+                } else {
+                    normalized.push(turn);
                 }
             }
-            // Any other role (`system`, `tool`, …). Nothing writes one to this
-            // store today, so this is a trap rather than a live bug — but the
-            // store is a general message vector, and a silent drop here would be
+            // Any other role (`system`, …). Nothing writes one to this store
+            // today, so this is a trap rather than a live bug — but the store is
+            // a general message vector, and a silent drop here would be
             // permanent after the next compaction. Say what was lost.
-            (_, role) => {
+            role => {
                 tracing::debug!(
                     role = %role,
                     "dropping cached channel turn with an unexpected role"
@@ -118,6 +138,17 @@ pub(crate) fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<Cha
     }
 
     normalized
+}
+
+fn merge_into_last(normalized: &mut [ChatMessage], turn: &ChatMessage) {
+    if let Some(last_turn) = normalized.last_mut() {
+        if !turn.content.is_empty() {
+            if !last_turn.content.is_empty() {
+                last_turn.content.push_str("\n\n");
+            }
+            last_turn.content.push_str(&turn.content);
+        }
+    }
 }
 
 pub(crate) fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
@@ -174,100 +205,6 @@ pub(crate) async fn build_memory_context(
     .block
 }
 
-/// Extract a compact summary of tool interactions from history messages added
-/// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
-/// or native tool-call JSON to collect tool names used.
-/// Returns an empty string when no tools were invoked.
-pub(crate) fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
-    fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
-        let candidate = name.trim();
-        if candidate.is_empty() {
-            return;
-        }
-        if !tool_names.iter().any(|existing| existing == candidate) {
-            tool_names.push(candidate.to_string());
-        }
-    }
-
-    fn collect_tool_names_from_tool_call_tags(content: &str, tool_names: &mut Vec<String>) {
-        const TAG_PAIRS: [(&str, &str); 4] = [
-            ("<tool_call>", "</tool_call>"),
-            ("<toolcall>", "</toolcall>"),
-            ("<tool-call>", "</tool-call>"),
-            ("<invoke>", "</invoke>"),
-        ];
-
-        for (open_tag, close_tag) in TAG_PAIRS {
-            for segment in content.split(open_tag) {
-                if let Some(json_end) = segment.find(close_tag) {
-                    let json_str = segment[..json_end].trim();
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
-                            push_unique_tool_name(tool_names, name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn collect_tool_names_from_native_json(content: &str, tool_names: &mut Vec<String>) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
-            if let Some(calls) = val.get("tool_calls").and_then(|c| c.as_array()) {
-                for call in calls {
-                    let name = call
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .or_else(|| call.get("name").and_then(|n| n.as_str()));
-                    if let Some(name) = name {
-                        push_unique_tool_name(tool_names, name);
-                    }
-                }
-            }
-        }
-    }
-
-    fn collect_tool_names_from_tool_results(content: &str, tool_names: &mut Vec<String>) {
-        let marker = "<tool_result name=\"";
-        let mut remaining = content;
-        while let Some(start) = remaining.find(marker) {
-            let name_start = start + marker.len();
-            let after_name_start = &remaining[name_start..];
-            if let Some(name_end) = after_name_start.find('"') {
-                let name = &after_name_start[..name_end];
-                push_unique_tool_name(tool_names, name);
-                remaining = &after_name_start[name_end + 1..];
-            } else {
-                break;
-            }
-        }
-    }
-
-    let mut tool_names: Vec<String> = Vec::new();
-
-    for msg in history.iter().skip(start_index) {
-        match msg.role.as_str() {
-            "assistant" => {
-                collect_tool_names_from_tool_call_tags(&msg.content, &mut tool_names);
-                collect_tool_names_from_native_json(&msg.content, &mut tool_names);
-            }
-            "user" => {
-                // Prompt-mode tool calls are always followed by [Tool results] entries
-                // containing `<tool_result name="...">` tags with canonical tool names.
-                collect_tool_names_from_tool_results(&msg.content, &mut tool_names);
-            }
-            _ => {}
-        }
-    }
-
-    if tool_names.is_empty() {
-        return String::new();
-    }
-
-    format!("[Used tools: {}]", tool_names.join(", "))
-}
-
 /// Shown when the model finishes a turn (often after tool calls) without any
 /// final answer text, so the user never receives an empty or annotation-only
 /// bubble.
@@ -292,9 +229,10 @@ pub(crate) fn provider_init_failure_message(
 }
 
 /// Make a reply safe to deliver to a human: strip a leading internal
-/// `[Used tools: …]` annotation (that belongs in history, not the chat) and
-/// substitute a graceful message when nothing meaningful remains. The tool
-/// summary is still recorded separately in conversation history.
+/// `[Used tools: …]` annotation if the sanitizer missed one and substitute a
+/// graceful message when nothing meaningful remains. The runtime no longer
+/// writes labels of its own into replies, so this is the defensive layer for
+/// the journal's forgery counter, not a normal-case pass.
 pub(crate) fn clean_delivered_reply(text: &str) -> String {
     let mut s = text.trim_start();
     if s.starts_with("[Used tools:") {
@@ -310,6 +248,12 @@ pub(crate) fn clean_delivered_reply(text: &str) -> String {
         s.to_string()
     }
 }
+
+/// Net line the runtime appends once when a reply claimed a `[Used tools: …]`
+/// label but no tool actually ran. Parenthesised like the other runtime
+/// notices (`(An attachment was withheld: …)`, `(the previous attempt failed)`)
+/// so the user reads it as a system note rather than a tool claim.
+pub(crate) const NO_TOOL_RUN_NOTICE: &str = "(No tool ran this turn.)";
 
 /// The most notes the `Noted:` line spells out; the rest are counted.
 const NOTED_LINE_MAX_NOTES: usize = 3;
@@ -1426,37 +1370,44 @@ pub(crate) async fn process_channel_message(
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
             let sanitized_response =
                 sanitize::sanitize_channel_response(&response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty()
+            let mut delivered_response = if sanitized_response.is_empty()
+                && !response.trim().is_empty()
             {
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
             } else {
                 sanitized_response
             };
 
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() {
-                delivered_response.clone()
-            } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
+            // The runtime no longer writes `[Used tools: …]` labels of its own
+            // into replies. Anything the model wrote in that shape is by
+            // definition a forgery, and a forged label on a turn where the
+            // model did not actually run any tool is the specific case the
+            // previous synthesis papered over. Append one runtime net line so
+            // the user is told what the system saw; the journal's `forged` count
+            // already covers how often it happens.
+            let forged_label_count = response.matches("[Used tools:").count();
+            let tools_ran = history.len().saturating_sub(history_len_before_tools) > 1;
+            if forged_label_count > 0 && !tools_ran {
+                if !delivered_response.is_empty() {
+                    delivered_response.push('\n');
+                }
+                delivered_response.push_str(NO_TOOL_RUN_NOTICE);
+            }
 
-            // Deliver the model's answer only: history keeps the tool summary,
-            // but the user must never receive a bare `[Used tools: …]` line or an
-            // empty bubble (e.g. when the model ends a turn after tool calls
-            // without final text).
-            let delivered_response = clean_delivered_reply(&delivered_response);
-            // Say what the turn stored. Added after `history_response` is built,
-            // so the line is shown to the person and never written into the
-            // history the model reads, where it would invite imitation. Added
-            // before the guest filter, so a guest's reply is judged with it.
-            let delivered_response = with_noted_line(delivered_response, &saved_notes);
+            // Deliver the model's answer only: history stores the dispatcher's
+            // structured form (tool call / tool result / final assistant), not
+            // a prose summary, so the model never sees a pattern it can copy.
+            // `clean_delivered_reply` is the defensive strip in case sanitize
+            // missed something.
+            let reply_for_history = clean_delivered_reply(&delivered_response);
+            // Say what the turn stored. The line is added only to the reply
+            // the user reads; history keeps `reply_for_history` so the model
+            // never sees a `Noted:` line to imitate.
+            let reply_for_user = with_noted_line(reply_for_history.clone(), &saved_notes);
             // An attachment marker is uploaded with no tool call, so the guest
             // gate never sees it. A guest's reply is filtered here, before either
             // send path below.
-            let delivered_response = sender_text.filter(delivered_response).await;
+            let reply_for_user = sender_text.filter(reply_for_user).await;
             // Moved verbatim in plan 121 row 10. `u64::try_from` rather than
             // the `as` cast the line carried: same value for any real elapsed
             // time, and the gate counts a moved line as a changed one.
@@ -1465,14 +1416,14 @@ pub(crate) async fn process_channel_message(
                 channel = %msg.channel,
                 message_id = %msg.id,
                 ms = elapsed_ms,
-                chars = delivered_response.chars().count(),
+                chars = reply_for_user.chars().count(),
                 "channel reply"
             );
 
             // The model's own reply, after the guest filter above, is the one
             // message here that may carry attachment markers. Every other send
             // in this file is runtime text and stays plain.
-            let outbound = msg.reply(&delivered_response).allowing_attachments();
+            let outbound = msg.reply(&reply_for_user).allowing_attachments();
 
             // Deliver FIRST, record after. The append used to run before the
             // send, so a failed delivery left the model believing it had
@@ -1481,7 +1432,7 @@ pub(crate) async fn process_channel_message(
             let delivered = if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     match channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                        .finalize_draft(&msg.reply_target, draft_id, &reply_for_user)
                         .await
                     {
                         Ok(()) => true,
@@ -1513,19 +1464,27 @@ pub(crate) async fn process_channel_message(
             // after, so a blanket "not delivered" would make the model answer a
             // question the user had already been answered.
             let recorded = if delivered {
-                history_response
+                reply_for_history.clone()
             } else {
-                let failure = DeliveryFailure::classify(&delivered_response);
+                let failure = DeliveryFailure::classify(&reply_for_user);
                 if let Some(channel) = target_channel.as_ref() {
                     send_delivery_failure_notice(channel.as_ref(), &msg, &failure).await;
                 }
-                failure.history_entry(&history_response)
+                failure.history_entry(&reply_for_history)
             };
-            history::append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(recorded),
-            );
+
+            // History stores the structured form the dispatcher produced: each
+            // tool call and tool result as its own message, the final assistant
+            // message as the recorded turn (with the failure note when the
+            // delivery did not land). The runtime no longer prepends a prose
+            // `[Used tools: …]` summary, so the model can no longer copy that
+            // pattern to fake tool work.
+            let new_turns = history[history_len_before_tools..].to_vec();
+            let mut to_store = new_turns;
+            if let Some(last) = to_store.last_mut() {
+                *last = ChatMessage::assistant(recorded);
+            }
+            history::append_sender_turns(ctx.as_ref(), &history_key, &to_store);
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()

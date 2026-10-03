@@ -95,3 +95,30 @@ pub(crate) fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, 
     drop(histories);
     persist_sender_turns(ctx, sender_key, &snapshot);
 }
+
+/// Append a batch of turns the dispatch just produced (tool call, tool result,
+/// and the recorded final assistant message), and persist the resulting snapshot
+/// once. Used in place of repeated [`append_sender_turn`] calls when several
+/// turns land in the same atomic dispatch, so the store writes once instead of
+/// `turns.len()` times.
+pub(crate) fn append_sender_turns(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turns: &[ChatMessage],
+) {
+    if turns.is_empty() {
+        return;
+    }
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = histories.entry(sender_key.to_string()).or_default();
+    entry.extend(turns.iter().cloned());
+    while entry.len() > MAX_CHANNEL_HISTORY {
+        entry.remove(0);
+    }
+    let snapshot = entry.clone();
+    drop(histories);
+    persist_sender_turns(ctx, sender_key, &snapshot);
+}

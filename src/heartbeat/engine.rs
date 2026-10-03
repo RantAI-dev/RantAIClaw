@@ -298,4 +298,84 @@ mod tests {
         let result = engine.run().await;
         assert!(result.is_ok());
     }
+
+    /// The heartbeat is a periodic file reader, not a model call: it must not
+    /// reach into the agent loop, must not call a provider, and must not write
+    /// to `sessions.db` or `brain.db`. A run that any of those would be a
+    /// regression of the door separation — the heartbeat's only model-relevant
+    /// output is `HEARTBEAT.md` text the operator already owns.
+    #[tokio::test]
+    async fn heartbeat_engine_does_not_call_the_model_or_persist_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+
+        // Plant a `sessions.db` and a `memory/brain.db` so the engine could in
+        // principle write to them, then capture the mtime of each.
+        std::fs::create_dir_all(workspace.join("memory")).unwrap();
+        let sessions_path = workspace.join("sessions.db");
+        let brain_path = workspace.join("memory").join("brain.db");
+        std::fs::write(&sessions_path, b"").unwrap();
+        std::fs::write(&brain_path, b"").unwrap();
+        let sessions_mtime = std::fs::metadata(&sessions_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let brain_mtime = std::fs::metadata(&brain_path).unwrap().modified().unwrap();
+
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig {
+                enabled: true,
+                interval_minutes: 30,
+            },
+            workspace.to_path_buf(),
+            observer,
+        );
+
+        // A tick reads HEARTBEAT.md and counts tasks. With no file present it
+        // returns zero and must do nothing else.
+        let count = engine.tick().await.unwrap();
+        assert_eq!(count, 0);
+
+        let sessions_mtime_after = std::fs::metadata(&sessions_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let brain_mtime_after = std::fs::metadata(&brain_path).unwrap().modified().unwrap();
+        assert_eq!(
+            sessions_mtime, sessions_mtime_after,
+            "heartbeat tick rewrote sessions.db"
+        );
+        assert_eq!(
+            brain_mtime, brain_mtime_after,
+            "heartbeat tick rewrote memory/brain.db"
+        );
+    }
+
+    /// Structural counterpart to the file-mtime test above: the heartbeat
+    /// engine source must not call into the agent loop, must not name any
+    /// `sessions::` module, and must not add a `[Used tools:` line of its
+    /// own. A future edit that wires it into the model would re-introduce
+    /// a model history path this door is supposed to be absent from.
+    ///
+    /// The check is scoped to the production portion of the file (everything
+    /// before `#[cfg(test)]`), so the strings the test code itself contains
+    /// do not trigger their own assertions.
+    #[test]
+    fn heartbeat_engine_source_does_not_depend_on_the_model_or_sessions() {
+        let src = include_str!("engine.rs");
+        let production = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        for forbidden in [
+            "Provider",
+            "run_with_scope",
+            "sessions::",
+            "Message::assistant",
+            "[Used tools",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "the heartbeat engine source mentions `{forbidden}` — the heartbeat must not touch the model or session history"
+            );
+        }
+    }
 }

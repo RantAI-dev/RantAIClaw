@@ -130,6 +130,13 @@ impl ChannelHistoryStore {
     /// Rows whose `turns_json` fails to deserialize are skipped (with a warning)
     /// rather than aborting the whole load, so one corrupt row can't wipe the
     /// rest of the live state.
+    ///
+    /// Each loaded assistant turn is walked for `[Used tools: …]` labels the
+    /// runtime used to write there. The runtime no longer writes them, but a
+    /// row persisted by an older build carries them — and the next turn's
+    /// provider would read them straight back as a pattern to copy. Strip them
+    /// on load so a daemon upgrade doesn't ship stale forgery patterns into the
+    /// model.
     pub fn load_all(&self) -> anyhow::Result<HashMap<String, Vec<ChatMessage>>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT history_key, turns_json FROM channel_history")?;
@@ -144,7 +151,16 @@ impl ChannelHistoryStore {
             let (key, json) = row?;
             match serde_json::from_str::<Vec<ChatMessage>>(&json) {
                 Ok(turns) => {
-                    out.insert(key, turns);
+                    let cleaned: Vec<ChatMessage> = turns
+                        .into_iter()
+                        .map(|mut turn| {
+                            if turn.role == "assistant" {
+                                turn.content = strip_legacy_tool_label(&turn.content);
+                            }
+                            turn
+                        })
+                        .collect();
+                    out.insert(key, cleaned);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -202,6 +218,23 @@ impl ChannelHistoryStore {
             params![history_key],
         )?;
         Ok(())
+    }
+}
+
+/// Strip a leading `[Used tools: …]` label the runtime used to write into
+/// persisted assistant turns, plus its trailing newline if any. The label is
+/// on its own line by the runtime's old contract, so a leading-only scan is
+/// enough and a global scan would also edit any prose the model happened to
+/// write with that exact shape (the runtime's vocabulary, not the model's).
+/// Returns the original string unchanged when no leading label is found.
+fn strip_legacy_tool_label(content: &str) -> String {
+    let trimmed_start = content.trim_start();
+    if !trimmed_start.starts_with("[Used tools:") {
+        return content.to_string();
+    }
+    match trimmed_start.find('\n') {
+        Some(nl) => trimmed_start[nl + 1..].to_string(),
+        None => String::new(),
     }
 }
 
@@ -347,5 +380,41 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.get("telegram_123").unwrap().len(), 1);
         assert_eq!(loaded.get("discord_456").unwrap().len(), 2);
+    }
+
+    /// Rows persisted by an older build carry the runtime's own `[Used tools: …]`
+    /// label as the assistant turn. The runtime no longer writes that, but the
+    /// next turn's provider would read it back as a pattern to copy. Strip it
+    /// on load so an upgrade doesn't ship stale forgery patterns into the model.
+    #[test]
+    fn load_all_strips_legacy_assistant_authored_labels() {
+        let tmp = TempDir::new().unwrap();
+        let store = ChannelHistoryStore::open(tmp.path()).unwrap();
+        store
+            .save(
+                "telegram:chat-1",
+                &[
+                    ChatMessage::user("save it"),
+                    ChatMessage::assistant("[Used tools: memory_store]\nSaved your note."),
+                    ChatMessage::user("what was last saved?"),
+                ],
+            )
+            .unwrap();
+
+        let loaded = store.load_all().unwrap();
+        let turns = loaded
+            .get("telegram:chat-1")
+            .expect("persisted conversation");
+        assert_eq!(turns.len(), 3);
+        for turn in turns {
+            assert!(
+                !turn.content.contains("[Used tools:"),
+                "no loaded assistant turn may carry the legacy label: {turn:?}"
+            );
+        }
+        assert!(
+            turns[1].content.contains("Saved your note."),
+            "the reply text survives the strip: {turns:?}"
+        );
     }
 }

@@ -3413,6 +3413,68 @@ mod tests {
         );
     }
 
+    /// The gateway chat door writes the model's reply text to `sessions.db`
+    /// verbatim. The runtime never prepends a `[Used tools: …]` summary on the
+    /// stored assistant turn — the same invariant the channel door relies on,
+    /// because both paths share the `record_api_turn` writer and the
+    /// underlying agent pipeline. This test pins that on the non-streaming
+    /// route.
+    #[tokio::test]
+    async fn agent_chat_sync_persists_assistant_text_without_used_tools_label() {
+        // Same HOME pin as the sibling tests: `record_api_turn` reads the
+        // active profile from `HOME`, so the temp `sessions.db` lives under
+        // `tmp.path()` and the operator's real store stays untouched.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let db = crate::profile::ProfileManager::active()
+            .expect("active profile")
+            .sessions_db_path();
+        assert!(
+            db.starts_with(tmp.path()),
+            "test must own its sessions.db; resolved {db:?} outside {:?}",
+            tmp.path()
+        );
+
+        let response = agent_chat_dispatch(
+            State(test_state()),
+            HeaderMap::new(),
+            Query(ChatQuery::default()),
+            Json(ChatRequestBody {
+                message: "hello".to_string(),
+                model: None,
+                provider: None,
+                temperature: None,
+                session_id: None,
+                context: None,
+                render_mode: None,
+            }),
+        )
+        .await
+        .expect("sync response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let session_id = json["session_id"].as_str().expect("session_id");
+
+        let store = crate::sessions::SessionStore::open(&db).expect("session store");
+        let msgs = store.get_messages(session_id).expect("messages");
+        let assistant = msgs
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant turn");
+        assert!(
+            !assistant.content.starts_with("[Used tools:"),
+            "the gateway chat persisted a runtime-synthesised label: {assistant:?}"
+        );
+        assert!(
+            !assistant.content.contains("[Used tools:"),
+            "the gateway chat persisted a `[Used tools:` substring: {assistant:?}"
+        );
+    }
+
     #[test]
     fn forwarder_only_matches_its_own_turn_scope() {
         // The forwarder must forward only requests scoped to its own turn, so
