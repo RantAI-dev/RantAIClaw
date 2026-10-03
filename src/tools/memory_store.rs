@@ -305,8 +305,14 @@ impl Tool for MemoryStoreTool {
         }
 
         // After both mutations, so the projection reflects the new entry *and*
-        // the superseded one's removal in a single rewrite.
-        crate::memory::snapshot::refresh_projection(self.memory.as_ref(), &self.workspace_dir);
+        // the superseded one's removal in a single rewrite. Best-effort:
+        // the write already succeeded, so a projection failure here is a
+        // log line, not a failed turn.
+        if let Err(e) =
+            crate::memory::snapshot::refresh_projection(self.memory.as_ref(), &self.workspace_dir)
+        {
+            tracing::warn!("memory projection skipped: {e}");
+        }
 
         // The notice counts the shared notes, so it is a read of memory. It goes
         // to a turn that sees all of it: not to a guest, whose notes are not in

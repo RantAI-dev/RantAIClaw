@@ -198,3 +198,131 @@ pub(crate) fn origin_filter(args: &Value) -> Option<(String, String)> {
     }
     Some((channel.to_string(), chat.to_string()))
 }
+
+/// The scope the cron_* tools work under, decided by the turn's memory view.
+///
+/// Cron tools always serve one — every `cron_add` writes an `origin` for later
+/// visibility checks, and every `cron_list` / `cron_runs` / `cron_run` /
+/// `cron_update` / `cron_remove` reads the rows it can reach through that
+/// origin. The view is the only authority on which place that is:
+///
+/// * `None` view ⇒ the cron tools refuse with one answer that names no job.
+///   A turn with no view has no place to scope to, and a cron tool that
+///   accepted it would expose every job, including jobs an owner created
+///   from their console.
+/// * `Some(All)` ⇒ an unscoped caller (the TUI, the CLI, the web console,
+///   and a `delegate` sub-agent that ran with `All`). The args'
+///   `origin_channel` / `origin_chat` are honored when both are present;
+///   without them the tools see and manage every job, as today.
+/// * `Some(Only(place))` ⇒ a turn from one conversation (a guest, an owner
+///   in a group, a `delegate` sub-agent inherited from a turn in one
+///   conversation). The place is split into `channel:chat` and used as the
+///   origin; whatever the args say is dropped. A model that sets a foreign
+///   `origin_channel` / `origin_chat` to reach another chat's jobs cannot.
+///
+/// The place is built by `ConversationKey::new(channel, chat).resolve()`, so
+/// it is always `surface:encoded_sender`; splitting on the first `:` is
+/// correct because the encoder escapes `:` to `%3A` inside the components.
+pub(crate) fn cron_origin_for_view(
+    view: Option<&crate::memory::MemoryView>,
+    args: &Value,
+) -> Result<Option<(String, String)>, String> {
+    use crate::memory::MemoryView;
+    match view {
+        None => Err("Cron tools are unavailable: this turn has no memory view.".to_string()),
+        Some(MemoryView::All) => Ok(origin_filter(args)),
+        Some(MemoryView::Only(place)) => {
+            let (channel, chat) = place
+                .split_once(':')
+                .ok_or_else(|| format!("Cannot parse view place as cron origin: {place}"))?;
+            Ok(Some((channel.to_string(), chat.to_string())))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryView;
+    use serde_json::json;
+
+    /// A turn with no view has no place to scope to; the helper refuses rather
+    /// than expose every job, the same way `memory_forget` refuses without a
+    /// view. The error text names no job so a caller cannot probe.
+    #[test]
+    fn cron_origin_for_view_with_no_view_is_refused() {
+        let result = cron_origin_for_view(
+            None,
+            &json!({"origin_channel": "telegram", "origin_chat": "1"}),
+        );
+        let err = result.expect_err("a no-view caller must be refused");
+        assert!(err.contains("no memory view"), "{err}");
+    }
+
+    /// `All` is the unscoped caller: `args` decide. With both
+    /// `origin_channel` and `origin_chat` set, the helper passes them through.
+    #[test]
+    fn cron_origin_for_view_with_all_uses_args_origin_when_set() {
+        let args = json!({"origin_channel": "telegram", "origin_chat": "1"});
+        let got =
+            cron_origin_for_view(Some(&MemoryView::All), &args).expect("All view does not refuse");
+        assert_eq!(got, Some(("telegram".to_string(), "1".to_string())));
+    }
+
+    /// `All` without an `origin` is the TUI / CLI / web console: the helper
+    /// returns `Ok(None)` and the tool sees every job.
+    #[test]
+    fn cron_origin_for_view_with_all_and_no_args_origin_returns_none() {
+        let got = cron_origin_for_view(Some(&MemoryView::All), &json!({}))
+            .expect("All view does not refuse");
+        assert_eq!(got, None);
+    }
+
+    /// `All` ignores a `origin` whose channel is empty (the legacy origin-less
+    /// shape) the way `origin_filter` already does.
+    #[test]
+    fn cron_origin_for_view_with_all_drops_empty_origin_channel() {
+        let args = json!({"origin_channel": "", "origin_chat": "1"});
+        let got =
+            cron_origin_for_view(Some(&MemoryView::All), &args).expect("All view does not refuse");
+        assert_eq!(got, None);
+    }
+
+    /// `Only(place)` ignores whatever the args say — a `delegate` sub-agent
+    /// running with the inherited view cannot widen by passing a foreign one.
+    /// The split is on the FIRST `:` because the encoded components do not
+    /// contain a raw `:`.
+    #[test]
+    fn cron_origin_for_view_with_only_ignores_args_and_uses_the_place() {
+        let args = json!({"origin_channel": "discord", "origin_chat": "elsewhere"});
+        let got = cron_origin_for_view(Some(&MemoryView::Only("telegram:chat-a".into())), &args)
+            .expect("Only view does not refuse with a parsable place");
+        assert_eq!(got, Some(("telegram".to_string(), "chat-a".to_string())));
+    }
+
+    /// The same split holds when the chat id is a Matrix sender
+    /// (`@localpart:homeserver`) — the encoder turns the `:` into `%3A`,
+    /// so the first `:` is still the surface separator.
+    #[test]
+    fn cron_origin_for_view_with_only_splits_an_encoded_sender() {
+        let place =
+            crate::channels::conversation::ConversationKey::new("matrix", "@bob:example.org")
+                .resolve();
+        let got = cron_origin_for_view(Some(&MemoryView::Only(place.clone())), &json!({}))
+            .expect("Only view does not refuse");
+        assert_eq!(
+            got,
+            Some(("matrix".to_string(), "@bob%3Aexample.org".to_string())),
+            "place: {place}"
+        );
+    }
+
+    /// A place that has no `:` is malformed: ConversationKey always produces
+    /// `surface:rest`, so this only happens on a misconfigured view. Refused
+    /// rather than silently widened.
+    #[test]
+    fn cron_origin_for_view_with_only_refuses_a_place_with_no_separator() {
+        let result = cron_origin_for_view(Some(&MemoryView::Only("noplace".into())), &json!({}));
+        assert!(result.is_err(), "a malformed place must be refused");
+    }
+}

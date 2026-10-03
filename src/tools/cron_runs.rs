@@ -77,8 +77,9 @@ impl Tool for CronRunsTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
-        // A chat may only see run history of a job it created. Un-scoped
-        // callers (TUI / CLI / console) pass — they own every job.
+        // A chat may only see run history of a job it created; the scope
+        // comes from the turn's memory view, not from `args`. A turn with
+        // no view is refused before any lookup.
         let job = match cron::get_job(&self.config, job_id) {
             Ok(j) => j,
             Err(e) => {
@@ -89,7 +90,19 @@ impl Tool for CronRunsTool {
                 });
             }
         };
-        let origin_owned = crate::tools::cron_schema::origin_filter(&args);
+        let origin_owned = match crate::tools::cron_schema::cron_origin_for_view(
+            crate::memory::current_memory_view().as_ref(),
+            &args,
+        ) {
+            Ok(o) => o,
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                });
+            }
+        };
         let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
         if let Err(reason) = cron::ensure_visible_to_origin(&job, origin_ref) {
             return Ok(ToolResult {
@@ -142,6 +155,7 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::memory::{MemoryView, MEMORY_VIEW};
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
 
@@ -155,6 +169,18 @@ mod tests {
             .await
             .unwrap();
         Arc::new(config)
+    }
+
+    /// The operator's `All` view path, so the existing assertions stay focused
+    /// on the truncation logic. The view-based refusal contract has its own
+    /// unit tests in `cron_origin_for_view`'s module.
+    async fn execute_under_all_view(tool: &CronRunsTool, args: serde_json::Value) -> ToolResult {
+        MEMORY_VIEW
+            .scope(
+                MemoryView::All,
+                async move { tool.execute(args).await.unwrap() },
+            )
+            .await
     }
 
     #[tokio::test]
@@ -177,10 +203,7 @@ mod tests {
         .unwrap();
 
         let tool = CronRunsTool::new(cfg.clone());
-        let result = tool
-            .execute(json!({ "job_id": job.id, "limit": 5 }))
-            .await
-            .unwrap();
+        let result = execute_under_all_view(&tool, json!({ "job_id": job.id, "limit": 5 })).await;
 
         assert!(result.success);
         assert!(result.output.contains("..."));
@@ -191,11 +214,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let tool = CronRunsTool::new(cfg);
-        let result = tool.execute(json!({})).await.unwrap();
+        let result = execute_under_all_view(&tool, json!({})).await;
         assert!(!result.success);
         assert!(result
             .error
             .unwrap_or_default()
             .contains("Missing 'job_id'"));
+    }
+
+    /// A turn with no memory view cannot read any run history — refusing here
+    /// matches `cron_origin_for_view`'s contract.
+    #[tokio::test]
+    async fn no_view_runs_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronRunsTool::new(cfg);
+
+        let out = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(!out.success, "no view must refuse cron_runs");
+        assert!(out.error.unwrap_or_default().contains("no memory view"));
     }
 }

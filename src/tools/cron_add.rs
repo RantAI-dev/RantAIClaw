@@ -103,6 +103,28 @@ ask which configured channel to deliver to — do not imply a message will arriv
             });
         }
 
+        // The scope comes from the turn's memory view, not from the call: an
+        // `Only(place)` turn records `place` as the job's origin whatever the
+        // arguments say, an `All` turn honors `args`, and a no-view turn is
+        // refused — a turn with no place has no job to scope to.
+        let origin_owned = match crate::tools::cron_schema::cron_origin_for_view(
+            crate::memory::current_memory_view().as_ref(),
+            &args,
+        ) {
+            Ok(o) => o,
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                });
+            }
+        };
+        let (origin_channel, origin_chat) = match origin_owned.as_ref() {
+            Some((c, h)) => (Some(c.as_str()), Some(h.as_str())),
+            None => (None, None),
+        };
+
         let schedule = match args.get("schedule") {
             Some(v) => match crate::tools::cron_schema::parse_schedule(v) {
                 Ok(schedule) => schedule,
@@ -198,11 +220,6 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     return Ok(blocked);
                 }
 
-                let origin_channel = args
-                    .get("origin_channel")
-                    .and_then(serde_json::Value::as_str);
-                let origin_chat = args.get("origin_chat").and_then(serde_json::Value::as_str);
-
                 cron::add_shell_job(
                     &self.config,
                     name,
@@ -287,11 +304,6 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     "cron_add: creating a scheduled agent job"
                 );
 
-                let origin_channel = args
-                    .get("origin_channel")
-                    .and_then(serde_json::Value::as_str);
-                let origin_chat = args.get("origin_chat").and_then(serde_json::Value::as_str);
-
                 cron::add_agent_job(
                     &self.config,
                     name,
@@ -334,6 +346,7 @@ ask which configured channel to deliver to — do not imply a message will arriv
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::memory::{MemoryView, MEMORY_VIEW};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -356,6 +369,19 @@ mod tests {
         ))
     }
 
+    /// Runs a tool call under the operator's `All` view (the TUI / CLI / web
+    /// console path). Wrapping each test here keeps the existing assertions
+    /// focused on the schedule / dispatch logic, with the view check held
+    /// separately by `cron_origin_for_view`'s own tests.
+    async fn execute_under_all_view(tool: &CronAddTool, args: serde_json::Value) -> ToolResult {
+        MEMORY_VIEW
+            .scope(
+                MemoryView::All,
+                async move { tool.execute(args).await.unwrap() },
+            )
+            .await
+    }
+
     /// The reported failure: a model sent `every_ms` as `"600000"` and the tool
     /// refused. There was no machine-readable type for the field, so a provider
     /// doing structured decoding had nothing to constrain against — the model
@@ -366,14 +392,15 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "every", "every_ms": "600000" },
                 "job_type": "shell",
                 "command": "echo ok"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(result.success, "{:?}", result.error);
     }
@@ -389,14 +416,15 @@ mod tests {
 
         let mut ids = Vec::new();
         for value in [json!(600_000), json!("600000")] {
-            let result = tool
-                .execute(json!({
+            let result = execute_under_all_view(
+                &tool,
+                json!({
                     "schedule": { "kind": "every", "every_ms": value },
                     "job_type": "shell",
                     "command": "echo ok"
-                }))
-                .await
-                .unwrap();
+                }),
+            )
+            .await;
             assert!(result.success, "{:?}", result.error);
             let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
             ids.push(v["id"].as_str().unwrap().to_string());
@@ -424,14 +452,15 @@ mod tests {
         // schedule validation and has its own message. Only the values that
         // fail to PARSE go through the new error path.
         for bad in [json!("ten minutes"), json!(-1), json!(0)] {
-            let result = tool
-                .execute(json!({
+            let result = execute_under_all_view(
+                &tool,
+                json!({
                     "schedule": { "kind": "every", "every_ms": bad },
                     "job_type": "shell",
                     "command": "echo ok"
-                }))
-                .await
-                .unwrap();
+                }),
+            )
+            .await;
 
             assert!(!result.success, "{bad} must be refused");
             let err = result.error.unwrap_or_default();
@@ -439,14 +468,15 @@ mod tests {
         }
 
         for unparseable in [json!("ten minutes"), json!(-1)] {
-            let result = tool
-                .execute(json!({
+            let result = execute_under_all_view(
+                &tool,
+                json!({
                     "schedule": { "kind": "every", "every_ms": unparseable },
                     "job_type": "shell",
                     "command": "echo ok"
-                }))
-                .await
-                .unwrap();
+                }),
+            )
+            .await;
 
             let err = result.error.unwrap_or_default();
             assert!(
@@ -509,14 +539,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "shell",
                 "command": "echo ok"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
@@ -529,14 +560,15 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
         let at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "at", "at": at },
                 "job_type": "agent",
                 "prompt": "remind me"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.success, "{:?}", result.error);
 
         let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
@@ -555,15 +587,16 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
         let at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "at", "at": at },
                 "job_type": "agent",
                 "prompt": "remind me",
                 "delivery": { "mode": "announce", "channel": "telegram", "to": "123" }
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.success, "{:?}", result.error);
 
         let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
@@ -591,14 +624,15 @@ mod tests {
         let cfg = Arc::new(config);
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "shell",
                 "command": "curl https://example.com"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not allowed"));
@@ -617,14 +651,15 @@ mod tests {
         let cfg = Arc::new(config);
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "shell",
                 "command": "echo ok"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(!result.success);
         let error = result.error.unwrap_or_default();
@@ -645,14 +680,15 @@ mod tests {
         let cfg = Arc::new(config);
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let denied = tool
-            .execute(json!({
+        let denied = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "shell",
                 "command": "touch cron-approval-test"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(!denied.success);
         assert!(denied
             .error
@@ -666,14 +702,15 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "every", "every_ms": 0 },
                 "job_type": "shell",
                 "command": "echo nope"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
 
         assert!(!result.success);
         assert!(result
@@ -688,17 +725,90 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let result = tool
-            .execute(json!({
+        let result = execute_under_all_view(
+            &tool,
+            json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "agent"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(!result.success);
         assert!(result
             .error
             .unwrap_or_default()
             .contains("Missing 'prompt'"));
+    }
+
+    /// The contract the plan's group-turn guard enforces: a job created from a
+    /// chat turn is scoped to that turn's chat whatever the args say. A
+    /// sub-agent (`delegate`) that inherited an `Only` view and tries to widen
+    /// it by passing a foreign `origin_channel` / `origin_chat` cannot — the
+    /// view wins, the args are dropped, and the recorded origin matches the
+    /// chat the turn was running in.
+    #[tokio::test]
+    async fn under_an_only_view_the_job_records_the_view_place_as_its_origin() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        // The view says telegram:chat-a; the args claim discord:chat-b.
+        let under_only = MEMORY_VIEW
+            .scope(MemoryView::Only("telegram:chat-a".into()), async {
+                tool.execute(json!({
+                    "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                    "job_type": "shell",
+                    "command": "echo ok",
+                    "origin_channel": "discord",
+                    "origin_chat": "chat-b",
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+        assert!(
+            under_only.success,
+            "create must succeed: {:?}",
+            under_only.error
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&under_only.output).unwrap();
+        let id_only = v["id"].as_str().unwrap().to_string();
+        let stored_only = crate::cron::get_job(&cfg, &id_only).unwrap();
+        assert_eq!(
+            stored_only.origin_channel.as_deref(),
+            Some("telegram"),
+            "Only view must pin origin_channel to the view, dropping the foreign arg"
+        );
+        assert_eq!(
+            stored_only.origin_chat.as_deref(),
+            Some("chat-a"),
+            "Only view must pin origin_chat to the view, dropping the foreign arg"
+        );
+
+        // Control: under the unscoped `All` view (the TUI / CLI / web
+        // console), the args' origin is honored — the view does not invent
+        // one and does not overwrite the one the caller passed.
+        let under_all = execute_under_all_view(
+            &tool,
+            json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "origin_channel": "discord",
+                "origin_chat": "chat-b",
+            }),
+        )
+        .await;
+        assert!(
+            under_all.success,
+            "All view must succeed: {:?}",
+            under_all.error
+        );
+        let v: serde_json::Value = serde_json::from_str(&under_all.output).unwrap();
+        let id_all = v["id"].as_str().unwrap().to_string();
+        let stored_all = crate::cron::get_job(&cfg, &id_all).unwrap();
+        assert_eq!(stored_all.origin_channel.as_deref(), Some("discord"));
+        assert_eq!(stored_all.origin_chat.as_deref(), Some("chat-b"));
     }
 }

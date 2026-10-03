@@ -265,7 +265,11 @@ fn refresh_projection(ctx: &TuiContext, memory: &dyn Memory) {
     let Some(workspace_dir) = ctx.workspace_dir.as_deref() else {
         return;
     };
-    crate::memory::snapshot::refresh_projection(memory, workspace_dir);
+    // Best-effort: the TUI command already succeeded; a projection failure
+    // here is a log line, not a failed command.
+    if let Err(e) = crate::memory::snapshot::refresh_projection(memory, workspace_dir) {
+        tracing::warn!("memory projection skipped: {e}");
+    }
 }
 
 fn remove_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
@@ -656,7 +660,8 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::memory::snapshot::refresh_projection(mem.as_ref(), tmp.path());
+        crate::memory::snapshot::refresh_projection(mem.as_ref(), tmp.path())
+            .expect("projection should succeed in test");
         let mut ctx = ctx_with_memory(mem.clone());
         ctx.workspace_dir = Some(tmp.path().to_path_buf());
         let owner_dm = crate::channels::owner_dm::OwnerDm::start(tmp.path()).await;

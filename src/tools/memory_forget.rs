@@ -140,10 +140,22 @@ impl Tool for MemoryForgetTool {
 
         match crate::memory::forget_in_view(self.memory.as_ref(), key).await {
             Ok(true) => {
-                crate::memory::snapshot::refresh_projection(
+                // The note is gone from `brain.db`, but the projection in
+                // `MEMORY.md` is what the next owner prompt reads. Tell the
+                // caller about a projection failure so the operator does not
+                // learn from the next prompt that "Forgot" was a half-truth.
+                if let Err(e) = crate::memory::snapshot::refresh_projection(
                     self.memory.as_ref(),
                     &self.workspace_dir,
-                );
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Forgot the note in brain.db, but the projection did not refresh: {e}"
+                        )),
+                    });
+                }
                 Ok(ToolResult {
                     success: true,
                     output: format!("Forgot memory: {key}"),
@@ -171,6 +183,8 @@ mod tests {
     use super::*;
     use crate::memory::{MemoryCategory, SqliteMemory};
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -212,6 +226,46 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("Forgot"));
 
+        assert!(mem.get("temp").await.unwrap().is_none());
+    }
+
+    /// When the projection fails to refresh after the note was removed from
+    /// `brain.db`, the tool must report that — otherwise the owner prompt would
+    /// keep showing a note the operator was told was forgotten.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn forget_propagates_projection_failure() {
+        // Make the workspace read-only AFTER the seed, so the projection's
+        // `fs::write` fails while the `brain.db` write still succeeds.
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&workspace).unwrap());
+        mem.store("temp", "temporary", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+
+        // Pre-create `MEMORY.md` so the projector writes to it; chmod the dir
+        // read-only afterwards so the projection write fails.
+        std::fs::write(workspace.join("MEMORY.md"), "").unwrap();
+        let perms = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&workspace, perms).unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), workspace.clone());
+        let result = execute_in_all_view(&tool, json!({"key": "temp"})).await;
+
+        // Restore the permissions so the test cleanup (TempDir drop) doesn't
+        // refuse to remove files it cannot delete.
+        let restore = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&workspace, restore).unwrap();
+
+        assert!(!result.success, "projection failure must fail the tool");
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("projection did not refresh"),
+            "the error must name the projection: {err}"
+        );
+        // The note IS gone from `brain.db` — the projection failure is the
+        // only thing left.
         assert!(mem.get("temp").await.unwrap().is_none());
     }
 
