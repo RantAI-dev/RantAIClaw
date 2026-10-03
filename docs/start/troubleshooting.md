@@ -383,6 +383,27 @@ Caveat: the shell tool forwards only an allowlist of environment variables. A de
 `~/.kube/config` is found via `HOME` and works; a custom `KUBECONFIG` path is **not** currently
 forwarded to shell commands — point kubectl at the default location or symlink your config there.
 
+### `update` says "`cosign` is not on PATH" although winget shows it installed
+
+Symptom:
+
+- `rantaiclaw update` exits with `` `cosign` is not on PATH, so the signature could not be checked ``, but `winget list sigstore.cosign` shows the package installed.
+
+Check:
+
+```powershell
+where.exe cosign
+```
+
+If `where.exe cosign` finds nothing even though the package is listed, look in the winget package directory for `cosign-windows-amd64.exe` and put a copy named `cosign.exe` on PATH:
+
+```powershell
+$pkg = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter "cosign-windows-amd64.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+Copy-Item $pkg.FullName "$env:LOCALAPPDATA\Microsoft\WindowsApps\cosign.exe"
+```
+
+The fix is a `cosign.exe` on PATH, not `--allow-unverified` (which only skips verification).
+
 ## Web Console (`ui`)
 
 ### `ui start` says node is required
@@ -411,11 +432,11 @@ Symptom:
 
 Why this happens:
 
-- `ui install` verifies SHA256 then cosign, in that order, before extracting anything. claw-ui is signed from its first release, so — unlike the binary self-updater, which tolerates missing signatures on releases published before it started signing — a missing cosign bundle fails closed here.
+- `ui install` verifies SHA256 then cosign, in that order, before extracting anything. claw-ui is signed from its first release, and the binary self-updater's signing history is irrelevant: every release this project has ever made carries a cosign bundle, so a missing bundle fails closed on both paths. `enforce_cosign` also refuses `cosign` not being on `PATH`; the only way past is `--allow-unverified`.
 
 Fix:
 
-- Do not bypass this check. Confirm you're pulling the intended `--ref` (release tag) and that no proxy/mirror is altering the download. If `cosign` itself isn't installed locally, `ui install` only warns and continues with SHA-only verification — install cosign (<https://docs.sigstore.dev/system_config/installation/>) for the full guarantee.
+- Do not bypass this check. Confirm you're pulling the intended `--ref` (release tag) and that no proxy/mirror is altering the download. If `cosign` itself isn't installed locally, install cosign (<https://docs.sigstore.dev/system_config/installation/>) for the full guarantee — `--allow-unverified` skips verification only because the operator explicitly asked for an unsafe SHA-only run.
 
 ### Every panel says `Gateway unreachable … — unexpected_host`
 

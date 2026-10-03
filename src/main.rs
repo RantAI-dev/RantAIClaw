@@ -1314,12 +1314,14 @@ async fn main() -> Result<()> {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
 
-    let cli = Cli::parse();
-
     // Apply any pending Windows update from a prior `rantaiclaw update` run
-    // before doing anything else (no-op on Unix). Best-effort; failure is
-    // not fatal — the staged file just stays put for next time.
+    // before clap parses, so `--version` / `--help` / everything else picks
+    // up the new binary. No-op on Unix. Best-effort; failure is not fatal —
+    // the staged file just stays put for next time. The Windows implementation
+    // prints a stderr notice when it actually swaps a file.
     let _ = rantaiclaw::lifecycle::update::apply_pending_windows_update();
+
+    let cli = Cli::parse();
 
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {

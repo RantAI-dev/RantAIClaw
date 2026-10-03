@@ -234,7 +234,7 @@ jobs:
                   # refuses to run on an empty list, so a typo here turns red
                   # instead of silently passing the gate.
                   bash scripts/ci/run_filtered_lib_tests.sh test --locked --lib -- \
-                    migration:: memory::snapshot:: \
+                    migration:: memory::snapshot:: lifecycle::update:: \
                     --skip profile::migration
 
     build-release:
