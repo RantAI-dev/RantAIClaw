@@ -4780,6 +4780,39 @@ Done."#;
         assert!(instructions.contains("file_write"));
     }
 
+    /// Each tool's description appears exactly once in the rendered XML
+    /// tool-instruction block. Plan 531 makes the `## Tools` section names only;
+    /// the descriptions travel here for non-native providers and into the
+    /// native tool specs for native providers, never both. This test pins the
+    /// non-native side: each description lands in `build_tool_instructions`
+    /// exactly once.
+    #[test]
+    fn build_tool_instructions_describes_each_tool_exactly_once() {
+        use crate::security::SecurityPolicy;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let tools = tools::default_tools(security);
+        let instructions = build_tool_instructions(&tools);
+
+        for tool in &tools {
+            let description = tool.description();
+            if description.is_empty() {
+                continue;
+            }
+            let occurrences = instructions.matches(description).count();
+            assert_eq!(
+                occurrences,
+                1,
+                "{} description {:?} appears {} times in the rendered XML block",
+                tool.name(),
+                description,
+                occurrences
+            );
+        }
+    }
+
     #[test]
     fn tools_to_openai_format_produces_valid_schema() {
         use crate::security::SecurityPolicy;

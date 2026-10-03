@@ -7,9 +7,9 @@ research question that benefits from multiple sources, comparison, and a
 written brief rather than a one-shot answer.
 
 ## Tools
-- name: web_search
+- name: web_search_tool
   kind: builtin
-- name: fetch_url
+- name: http_request
   kind: builtin
 - name: memory_store
   kind: builtin

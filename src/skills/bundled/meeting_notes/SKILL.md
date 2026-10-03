@@ -11,7 +11,7 @@ share.
   kind: builtin
 - name: memory_store
   kind: builtin
-- name: cron_schedule
+- name: cron_add
   kind: builtin
 
 ## Instructions

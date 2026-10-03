@@ -7,11 +7,11 @@ schedule something at a specific time. Time-zone aware: always interpret
 times in the user's configured timezone unless they explicitly say otherwise.
 
 ## Tools
-- name: cron_schedule
+- name: cron_add
   kind: builtin
 - name: cron_list
   kind: builtin
-- name: cron_cancel
+- name: cron_remove
   kind: builtin
 - name: memory_recall
   kind: builtin

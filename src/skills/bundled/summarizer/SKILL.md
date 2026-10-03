@@ -6,7 +6,7 @@ skill when the user pastes or links to a long document, transcript, or set
 of articles and wants the key points distilled.
 
 ## Tools
-- name: fetch_url
+- name: http_request
   kind: builtin
 - name: file_read
   kind: builtin

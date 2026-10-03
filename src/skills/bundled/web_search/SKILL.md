@@ -6,9 +6,9 @@ about current events, factual queries, recent news, or wants deeper context
 than the model's training data provides.
 
 ## Tools
-- name: web_search
+- name: web_search_tool
   kind: builtin
-- name: fetch_url
+- name: http_request
   kind: builtin
 
 ## Instructions
