@@ -7480,8 +7480,9 @@ fn prompt_injects_tools() {
     let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None, true);
 
     assert!(prompt.contains("**shell**"));
-    assert!(prompt.contains("Run commands"));
     assert!(prompt.contains("**memory_recall**"));
+    // Descriptions reach the model via native specs / the XML tool block; the
+    // `## Tools` section is names only after plan 531.
 }
 
 #[test]
@@ -12095,8 +12096,11 @@ async fn guest_turn_tools_and_task_follow_a_reloaded_grant() {
     use crate::approval::policy_writer::PolicyPreset::Manual;
     for native in [true, false] {
         let prompt = guest_prompt_when_gates_differ(native, &[], &["file_read"], Manual).await;
+        // `## Tools` is names only after plan 531: the description travels in
+        // the tool specs (native) or the XML tool-instruction block
+        // (non-native), not in the section.
         assert!(
-            prompt.contains("## Tools\n\n- **file_read**: stub tool"),
+            prompt.contains("## Tools\n\n- **file_read**\n"),
             "native={native}: the granted tool is not listed:\n{prompt}"
         );
         assert!(
@@ -12153,7 +12157,10 @@ async fn guest_strict_line_does_not_deny_a_read_tool_it_does_not_know() {
         !prompt.contains("None of your tools run"),
         "a guest with `pdf_read` was told none of its tools run:\n{prompt}"
     );
-    assert!(prompt.contains("- **pdf_read**: stub tool"), "{prompt}");
+    // `## Tools` is names only after plan 531; the description travels in the
+    // XML tool-instruction block (non-native provider), so the section itself
+    // names `pdf_read` without its description.
+    assert!(prompt.contains("- **pdf_read**"), "{prompt}");
 
     // Control: a guest with no tool at all is told so.
     let none = guest_prompt_when_gates_differ(false, &[], &[], Strict).await;

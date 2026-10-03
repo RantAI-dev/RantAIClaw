@@ -403,25 +403,20 @@ pub(crate) fn registry_for(config: &Config) -> Vec<Box<dyn crate::tools::Tool>> 
     )
 }
 
-/// The `(name, description)` entries of the `## Tools` list in `prompt`, in
-/// order. An entry opens with `- **name**: ` and runs to the next entry, so a
-/// description that spans lines stays whole. A `Parameters:` line the agent
-/// surface adds is not part of the description.
+/// The names of the `## Tools` list in `prompt`, in order. The listing is names
+/// only after plan 531 (each request describes each tool once, in the tool's
+/// own words, so the descriptions reach the model via native specs or the XML
+/// tool-instruction block, not the `## Tools` block).
 pub(crate) fn tools_section_entries(prompt: &str) -> Vec<(String, String)> {
     let Some((_, rest)) = prompt.split_once("## Tools\n\n") else {
         return Vec::new();
     };
     let section = rest.split("\n## ").next().unwrap_or(rest).trim_end();
     section
-        .split("\n- **")
-        .map(|entry| entry.strip_prefix("- **").unwrap_or(entry))
-        .filter_map(|entry| entry.split_once("**: "))
-        .map(|(name, description)| {
-            let description = description
-                .split("\n  Parameters: `")
-                .next()
-                .unwrap_or(description);
-            (name.to_string(), description.trim_end().to_string())
+        .lines()
+        .filter_map(|line| {
+            let name = line.strip_prefix("- **")?.strip_suffix("**")?;
+            Some((name.to_string(), String::new()))
         })
         .collect()
 }
@@ -436,7 +431,10 @@ pub(crate) fn held_by(registry: &[Box<dyn crate::tools::Tool>]) -> Vec<(&str, &s
 }
 
 /// Asserts that `prompt` lists exactly the tools in `held`: the set of names is
-/// equal in both directions, and no entry is worded differently from the tool.
+/// equal in both directions. The `## Tools` block is names only after plan
+/// 531; description equality is asserted against the tool specs (native
+/// providers) or the XML tool-instruction block (non-native providers) by the
+/// door tests, not against this section.
 pub(crate) fn assert_prompt_lists(door: &str, prompt: &str, held: &[(&str, &str)]) {
     let listed = tools_section_entries(prompt);
     let mut listed_names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
@@ -447,14 +445,4 @@ pub(crate) fn assert_prompt_lists(door: &str, prompt: &str, held: &[(&str, &str)
         listed_names, held_names,
         "{door}: the prompt names a different set of tools than the registry holds"
     );
-    for (name, description) in held {
-        let entry = listed
-            .iter()
-            .find(|(listed_name, _)| listed_name == name)
-            .unwrap_or_else(|| panic!("{door}: {name} is not listed"));
-        assert_eq!(
-            entry.1, *description,
-            "{door}: the prompt words {name} differently from the tool"
-        );
-    }
 }

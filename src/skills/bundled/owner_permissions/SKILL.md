@@ -36,7 +36,7 @@ There are two roles on every multi-user channel:
 `manage_permissions` edits three lists:
 - `target: owner` — a sender identity (e.g. a Telegram numeric user id, or a
   Slack/Discord/Matrix username).
-- `target: tool` — a tool name a guest may use (e.g. `shell`, `web_search`).
+- `target: tool` — a tool name a guest may use (e.g. `shell`, `web_search_tool`).
 - `target: command` — a shell-command glob a guest may run (e.g.
   `kubectl get *`). `*` matches any run of characters; the pattern is anchored,
   so `kubectl get *` allows `kubectl get pods` but not `kubectl delete pods`.

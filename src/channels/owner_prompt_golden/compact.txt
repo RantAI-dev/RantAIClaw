@@ -33,8 +33,8 @@ Name: Test User
 
 ## Tools
 
-- **shell**: stub tool
-- **file_read**: stub tool
+- **shell**
+- **file_read**
 
 ## Your Task
 

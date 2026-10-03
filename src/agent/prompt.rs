@@ -433,23 +433,14 @@ impl PromptSection for ToolsSection {
         if ctx.is_guest() {
             return Ok(String::new());
         }
+        // Owner doors (`run_with_scope`, channel owner prompt, gateway chat)
+        // also send the tool specs as native tools, or as an XML tool-instruction
+        // block. Either carries the tool descriptions, so the `## Tools`
+        // listing in the prompt is names only — a tool is described once per
+        // request, in the tool's own words.
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
-            let schema = tool.parameters_schema();
-            // Omit the `Parameters:` line for an empty schema (e.g. the
-            // channel path's description-only tools), so those surfaces keep
-            // the compact `- **name**: description` listing.
-            if is_empty_schema(&schema) {
-                let _ = writeln!(out, "- **{}**: {}", tool.name(), tool.description());
-            } else {
-                let _ = writeln!(
-                    out,
-                    "- **{}**: {}\n  Parameters: `{}`",
-                    tool.name(),
-                    tool.description(),
-                    schema
-                );
-            }
+            let _ = writeln!(out, "- **{}**", tool.name());
         }
         if !ctx.dispatcher_instructions.is_empty() {
             out.push('\n');
@@ -573,13 +564,18 @@ fn guest_strict_reads_line(tools: &[Box<dyn Tool>]) -> String {
 /// tools the reloaded gate permits (`guest_tools`). A guest prompt built at
 /// start-up omits both, so an edit to `guest_allowed_tools` reaches the next
 /// message. A guest with no tool gets no list and the task framing that says so.
+///
+/// `## Tools` is names only here too: a guest's turn sends the tool specs as
+/// native tools, or as an XML tool-instruction block, and the descriptions
+/// travel there. Listing names without descriptions keeps the per-request
+/// invariant that a tool is described once.
 #[must_use]
 pub fn render_guest_turn_sections(guest_tools: &[Box<dyn Tool>], native_tools: bool) -> String {
     let mut out = String::new();
     if !guest_tools.is_empty() {
         out.push_str("## Tools\n\n");
         for tool in guest_tools {
-            let _ = writeln!(out, "- **{}**: {}", tool.name(), tool.description());
+            let _ = writeln!(out, "- **{}**", tool.name());
         }
         out.push('\n');
     }
@@ -930,15 +926,6 @@ impl PromptSection for DateTimeSection {
             now.format("%Y-%m-%d %H:%M:%S"),
             now.format("%Z")
         ))
-    }
-}
-
-/// True for a schema that carries no useful parameter info (`{}` or null).
-fn is_empty_schema(schema: &serde_json::Value) -> bool {
-    match schema {
-        serde_json::Value::Null => true,
-        serde_json::Value::Object(map) => map.is_empty(),
-        _ => false,
     }
 }
 
