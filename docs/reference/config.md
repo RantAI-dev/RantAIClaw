@@ -525,7 +525,7 @@ Notes:
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `none`. An unrecognised value is a startup error, not a fallback |
 | `min_relevance_score` | `0.6` | drop recalled entries scoring below this. See _Scores are absolute_ below. Config schema 37 moved the default from `0.4` (see [v37](#v37-the-relevance-floor-moves-from-04-to-06)) |
-| `embedding_provider` | `none` | `none`, `openai`, `openrouter`, `minimax`, or `custom:<base-url>` |
+| `embedding_provider` | `none` | `none`, `openai`, `openrouter`, `minimax`, or `custom:<base-url>`. An unknown value does not stop the daemon — it is logged at start as a `WARN` and reported by `rantaiclaw doctor` as a `✗`, with a hint listing the valid values. The runtime falls back to keyword search in that case |
 | `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` to use an `[[embedding_routes]]` entry |
 | `embedding_dimensions` | `1536` | vector size the model emits. A mismatch disables vector search — see below |
 | `embedding_cache_size` | `10000` | embeddings cached before LRU eviction |

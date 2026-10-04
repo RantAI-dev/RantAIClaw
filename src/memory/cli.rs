@@ -210,14 +210,15 @@ async fn handle_add(config: &Config, key: &str, content: &str, category: &str) -
 /// checking what the agent knows had to page through `list`.
 async fn handle_recall(config: &Config, query: &str, limit: usize) -> Result<()> {
     let mem = create_cli_memory(config)?;
+    let mode = super::search_mode_label(&resolved_embedding_provider(config));
     let hits = mem.recall(query, limit.max(1), None).await?;
 
     if hits.is_empty() {
-        println!("No memory entries matched '{query}'.");
+        println!("No memory entries matched '{query}' (mode: {mode}).");
         return Ok(());
     }
 
-    println!("{} match(es) for '{}':\n", hits.len(), query);
+    println!("{} match(es) for '{}' (mode: {mode}):\n", hits.len(), query);
     for entry in &hits {
         // Scores are absolute relevance in [0, 1], so render them as a
         // percentage rather than as a bare fraction.
@@ -289,6 +290,10 @@ async fn handle_stats(config: &Config) -> Result<()> {
             style("unhealthy").yellow().bold().to_string()
         }
     );
+    println!(
+        "  Mode:     {}",
+        super::search_mode_label(&resolved_embedding_provider(config))
+    );
     println!("  Total:    {}", render_total(counted.as_ref()));
 
     let all = mem.list(None, None).await.unwrap_or_default();
@@ -298,6 +303,15 @@ async fn handle_stats(config: &Config) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Resolve the provider the active embedding config names, honouring the
+/// `hint:` route the daemon would honour, without actually constructing a
+/// network provider. The CLI surfaces (`stats`, `recall`) name the mode in
+/// use; the gateway builds it once. They read the same field so the three
+/// labels cannot drift.
+fn resolved_embedding_provider(config: &Config) -> String {
+    super::resolve_embedding_config(&config.memory, &config.embedding_routes, None).provider
 }
 
 /// Render the `Total:` value.

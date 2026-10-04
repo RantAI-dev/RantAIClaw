@@ -2171,6 +2171,7 @@ async fn memory_stats(
         "backend": mem.name(),
         "total_entries": total,
         "healthy": healthy,
+        "mode": state.memory_search_mode.as_str(),
     })))
 }
 
@@ -2664,6 +2665,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             webhook_secret_hash: None,
@@ -4432,6 +4434,43 @@ mod tests {
             first.0["entries"][0]["key"], second.0["entries"][0]["key"],
             "a second page must not repeat the first"
         );
+    }
+
+    /// `GET /api/v1/memory/stats` carries the resolved search mode the same way
+    /// the CLI's `memory stats` line and `memory recall` header do. All three
+    /// surfaces read `state.memory_search_mode` so the label cannot drift.
+    /// The test pins each known value end-to-end through the HTTP handler.
+    #[tokio::test]
+    async fn memory_stats_reports_mode() {
+        use axum::body::Body;
+        use tower::ServiceExt as _;
+
+        async fn stats_with_mode(mode: &str) -> serde_json::Value {
+            let (tmp, mut state) = state_with_real_memory();
+            state.memory_search_mode = Arc::new(mode.to_string());
+            let app = router().with_state(state);
+            let res = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/v1/memory/stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let _ = tmp;
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let keyword = stats_with_mode("keyword").await;
+        assert_eq!(keyword["mode"], "keyword");
+
+        let hybrid = stats_with_mode("keyword + semantic (openai)").await;
+        assert_eq!(hybrid["mode"], "keyword + semantic (openai)");
     }
 
     // ────────────────────────────────────────────────────────────────────

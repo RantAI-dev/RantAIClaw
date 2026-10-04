@@ -842,8 +842,12 @@ should check the encoded size and say so plainly rather than surfacing a bare
 - **Request**: none.
 - **Response** `200`:
   ```json
-  { "backend": "...", "total_entries": 100, "healthy": true }
+  { "backend": "...", "total_entries": 100, "healthy": true, "mode": "keyword" }
   ```
+  `mode` names the search mode the runtime is using: `keyword` when the
+  embedding provider is `none` (or empty), `keyword + semantic (<provider>)`
+  otherwise — e.g. `keyword + semantic (openai)`. The same value appears on
+  `rantaiclaw memory stats` and the header of `rantaiclaw memory recall`.
 - **Status codes**: `200`, `401`.
 
 ---
