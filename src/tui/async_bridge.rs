@@ -632,9 +632,20 @@ mod tests {
     }
 
     /// The seam this module owns: a `Submit` carrying a conversation id must
-    /// scope the agent's turn memory writes to it. Auto-save is the observable.
+    /// not cause the TUI actor to write a row on its own.
+    ///
+    /// The conversation id once scoped the headless autosave the door used to
+    /// run. That writer is retired — every entry in `memories` now arrives only
+    /// because someone asked (a `memory_store` tool call, the CLI, the console,
+    /// or a TUI command bound to the same actor). With the autosave gone, the
+    /// submitted id stays on the agent for read-side scope only; the door's
+    /// own `MEMORY_VIEW` remains `All` because the TUI is the operator's
+    /// surface, and that read-scope invariant is covered by the neighbouring
+    /// `the_tui_turn_door_reads_all_of_memory` test. This test pins the
+    /// write-side half: a row reaches memory only when the operator (or a
+    /// tool they trust) asks — never from the inbound submit itself.
     #[tokio::test]
-    async fn a_submitted_conversation_id_scopes_the_turns_memory_writes() {
+    async fn a_submitted_conversation_id_does_not_write_memory_on_its_own() {
         let scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mem: Arc<dyn Memory> = Arc::new(ScopeRecordingMemory {
             scopes: scopes.clone(),
@@ -674,8 +685,10 @@ mod tests {
 
         let seen = scopes.lock().expect("scope mutex").clone();
         assert!(
-            seen.contains(&Some("tui:s1".to_string())),
-            "auto-save must run under the submitted conversation scope, saw {seen:?}"
+            seen.is_empty(),
+            "the TUI actor must not write a memory row from inbound input alone; \
+             a row enters memory only via an explicit tool call, CLI, console, or \
+             TUI command. Saw {seen:?} store call(s) under the submitted scope."
         );
         drop(req_tx);
         let _ = timeout(Duration::from_secs(1), handle).await;
