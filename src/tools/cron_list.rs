@@ -64,7 +64,9 @@ impl Tool for CronListTool {
                 });
             }
         };
-        let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
+        let origin_ref = origin_owned
+            .as_ref()
+            .map(|(c, h, t)| (c.as_str(), h.as_str(), t.as_deref()));
         match cron::list_jobs_for_origin(&self.config, origin_ref) {
             Ok(jobs) => Ok(ToolResult {
                 success: true,
@@ -167,6 +169,7 @@ mod tests {
             Some("agent-tool"),
             Some("telegram"),
             Some("chat-a"),
+            None,
         )
         .unwrap();
         // Chat-B creates its job.
@@ -184,6 +187,7 @@ mod tests {
             Some("agent-tool"),
             Some("discord"),
             Some("chat-b"),
+            None,
         )
         .unwrap();
         // A legacy origin-less row — a job written before this column
@@ -198,6 +202,7 @@ mod tests {
             "echo legacy",
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -284,6 +289,7 @@ mod tests {
             Some("agent-tool"),
             Some("telegram"),
             Some("chat-a"),
+            None,
         )
         .unwrap();
         let _ = cron::add_agent_job(
@@ -300,6 +306,7 @@ mod tests {
             Some("agent-tool"),
             Some("discord"),
             Some("chat-b"),
+            None,
         )
         .unwrap();
 

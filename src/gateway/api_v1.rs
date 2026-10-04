@@ -2117,7 +2117,22 @@ async fn memory_delete(
     if removed {
         refresh_memory_projection(&state);
     }
-    Ok(Json(serde_json::json!({ "key": key, "removed": removed })))
+    // The note is gone from `brain.db`, but a chat that previously read it
+    // into a turn still holds that copy until its history is cleared (`/new`
+    // or the equivalent for the channel). Surface that here too, so the
+    // console does not appear to have wiped a note a chat still shows. The
+    // `note` field is the same sentence every other delete path prints.
+    let mut body = serde_json::json!({
+        "key": key,
+        "removed": removed,
+    });
+    if removed {
+        body.as_object_mut().unwrap().insert(
+            "note".to_string(),
+            serde_json::Value::String(crate::memory::DELETED_NOTE_HELD_BY_HISTORY.to_string()),
+        );
+    }
+    Ok(Json(body))
 }
 
 async fn memory_stats(
@@ -4130,6 +4145,48 @@ mod tests {
         .await
         .expect("absent key is not an error");
         assert_eq!(resp.0["removed"], false);
+    }
+
+    /// The plan's contract: every delete path returns the same sentence that
+    /// names what the delete did NOT take. The console surfaces it as a
+    /// `note` field on the success body. A failed delete (no entry) does
+    /// NOT carry the sentence — nothing was deleted, nothing was held back.
+    #[tokio::test]
+    async fn memory_delete_surfaces_the_shared_note_on_success() {
+        let (_tmp, state) = paired_state_with_real_memory("tok");
+        state
+            .mem
+            .store("note_to_delete", "x", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let resp = memory_delete(
+            State(state.clone()),
+            bearer("tok"),
+            Path("note_to_delete".to_string()),
+        )
+        .await
+        .expect("delete should succeed");
+        assert_eq!(resp.0["removed"], true);
+        let note = resp.0["note"]
+            .as_str()
+            .expect("a successful delete carries the shared note");
+        assert_eq!(note, crate::memory::DELETED_NOTE_HELD_BY_HISTORY);
+
+        // A delete that found nothing is not the success path the note belongs
+        // to — the chat was never told about a note that was never there.
+        let resp = memory_delete(
+            State(state.clone()),
+            bearer("tok"),
+            Path("never_there".to_string()),
+        )
+        .await
+        .expect("absent key is not an error");
+        assert_eq!(resp.0["removed"], false);
+        assert!(
+            resp.0.get("note").is_none(),
+            "the note belongs to a successful delete, not a successful nothing-found request"
+        );
     }
 
     /// The console deletes a note in any place, a conversation's included.

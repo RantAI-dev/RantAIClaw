@@ -158,7 +158,10 @@ impl Tool for MemoryForgetTool {
                 }
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Forgot memory: {key}"),
+                    output: format!(
+                        "Forgot memory: {key}\n{}",
+                        crate::memory::DELETED_NOTE_HELD_BY_HISTORY,
+                    ),
                     error: None,
                 })
             }
@@ -227,6 +230,29 @@ mod tests {
         assert!(result.output.contains("Forgot"));
 
         assert!(mem.get("temp").await.unwrap().is_none());
+    }
+
+    /// The plan's contract: every delete path surfaces the same sentence that
+    /// names what the delete did NOT take — the copy a chat already read.
+    /// `memory_forget` includes it on success. Pinned here so a future
+    /// refactor that drops the sentence fails this test.
+    #[tokio::test]
+    async fn forget_success_output_includes_what_the_delete_did_not_take() {
+        let (tmp, mem) = test_mem();
+        mem.store("temp", "temporary", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = execute_in_all_view(&tool, json!({"key": "temp"})).await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result
+                .output
+                .contains(crate::memory::DELETED_NOTE_HELD_BY_HISTORY),
+            "the shared sentence must ride along with the forget: {:?}",
+            result.output
+        );
     }
 
     /// When the projection fails to refresh after the note was removed from

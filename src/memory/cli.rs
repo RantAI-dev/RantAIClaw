@@ -398,14 +398,22 @@ async fn handle_clear(
         }
     }
 
-    println!(
-        "{} Cleared {deleted}/{} entries.",
-        style("✓").green().bold(),
-        entries.len(),
-    );
+    println!("{}", format_clear_summary(deleted, entries.len()));
 
     refresh_projection(&*mem, config);
     Ok(())
+}
+
+/// Build the two-line message `handle_clear` prints after a batch delete —
+/// the count line plus the shared sentence that names what the delete did
+/// not take (the copy a chat already read). Extracted from the I/O path so
+/// the test for the contract does not have to capture stdout.
+fn format_clear_summary(deleted: usize, total: usize) -> String {
+    format!(
+        "{} Cleared {deleted}/{total} entries.\n{}",
+        style("✓").green().bold(),
+        super::DELETED_NOTE_HELD_BY_HISTORY,
+    )
 }
 
 /// Delete a single entry by exact key or prefix match.
@@ -449,10 +457,22 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
     }
 
     if super::forget_in_view(mem, &target).await? {
-        println!("{} Deleted key: {target}", style("✓").green().bold());
+        println!("{}", format_key_deleted(&target));
     }
 
     Ok(())
+}
+
+/// Build the two-line message `handle_clear_key` prints after a single-key
+/// delete. Same shape as `format_clear_summary`, kept as its own helper so a
+/// regression that drops the sentence from one path fails the corresponding
+/// test even if the other path's helper still reads correctly.
+fn format_key_deleted(target: &str) -> String {
+    format!(
+        "{} Deleted key: {target}\n{}",
+        style("✓").green().bold(),
+        super::DELETED_NOTE_HELD_BY_HISTORY,
+    )
 }
 
 fn parse_category(s: &str) -> MemoryCategory {
@@ -520,6 +540,31 @@ mod tests {
         assert!(
             !after_clear.contains("user_lang"),
             "a cleared memory must leave the block too:\n{after_clear}"
+        );
+    }
+
+    /// The plan's contract: every delete path surfaces the same sentence that
+    /// names what the delete did NOT take — the copy a chat already read.
+    /// The single-key path and the batch path each print it. Extracted
+    /// into helpers so this test does not have to capture stdout.
+    #[test]
+    fn clear_by_key_prints_what_the_delete_did_not_take() {
+        let out = format_key_deleted("user_lang");
+        assert!(out.contains("Deleted key: user_lang"), "{out}");
+        assert!(
+            out.contains(super::super::DELETED_NOTE_HELD_BY_HISTORY),
+            "the shared sentence must ride along with the single-key delete: {out}"
+        );
+    }
+
+    /// And the batch path: `memory clear --category` carries the same line.
+    #[test]
+    fn clear_by_category_prints_what_the_delete_did_not_take() {
+        let out = format_clear_summary(3, 5);
+        assert!(out.contains("Cleared 3/5 entries"), "{out}");
+        assert!(
+            out.contains(super::super::DELETED_NOTE_HELD_BY_HISTORY),
+            "the shared sentence must ride along with the batch delete: {out}"
         );
     }
 

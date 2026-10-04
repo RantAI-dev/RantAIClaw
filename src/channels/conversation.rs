@@ -84,6 +84,36 @@ fn encode_component(value: &str) -> String {
     value.replace('%', "%25").replace(':', "%3A")
 }
 
+/// Reverse of [`encode_component`]. The encoder writes `%` before `:`, so the
+/// inverse reads `%3A` before `%25` — undoing a percent sign otherwise leaves a
+/// `3A` next to a colon and the join round-trips wrong. Inverse is part of the
+/// same tested module so the encode/decode pair cannot drift.
+pub fn decode_component(value: &str) -> String {
+    value.replace("%3A", ":").replace("%25", "%")
+}
+
+/// Parse a place string produced by [`ConversationKey::resolve`] back into the
+/// three parts the key was built from. The place is `surface:sender[:thread]`
+/// with `:` and `%` percent-encoded inside the components, so a literal `:`
+/// always means a separator.
+///
+/// Returns an error on a string that does not start with `surface:` — every
+/// resolved place has at least one separator, so the absence is a misconfigured
+/// input the caller (cron origin / dispatch key test) should refuse rather than
+/// silently widen.
+pub fn parse_place(place: &str) -> Result<(String, String, Option<String>), String> {
+    let (surface, rest) = place.split_once(':').ok_or_else(|| {
+        format!("cannot parse view place as cron origin: no surface separator in '{place}'")
+    })?;
+    // A literal `:` in `rest` is the sender/thread separator. `%3A` inside an
+    // encoded component is not a separator, so `split_once` only catches it.
+    let (sender, thread) = match rest.split_once(':') {
+        Some((s, t)) => (s.to_string(), Some(decode_component(t))),
+        None => (decode_component(rest), None),
+    };
+    Ok((surface.to_string(), sender, thread))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +194,129 @@ mod tests {
             .resolve();
         let b = ConversationKey::new("slack", "u1").resolve();
         assert_eq!(a, b);
+    }
+
+    // ── parse_place: inverse of resolve ───────────────────────────────
+    //
+    // The cron scheduler rebuilds the per-job view from origin columns; the
+    // columns come from `cron_origin_for_view`, which in turn comes from the
+    // dispatcher-built place string. If `parse_place` does not undo
+    // `resolve`, the job reads a place nothing writes to and the chat's
+    // notes are gone. These tests pin the round trip for every shape the
+    // dispatcher actually produces.
+
+    /// A plain chat: the place is `surface:sender`. Parse returns the two
+    /// parts and no thread.
+    #[test]
+    fn parse_place_for_a_plain_chat() {
+        let place = ConversationKey::new("telegram", "12345").resolve();
+        let (surface, sender, thread) = parse_place(&place).expect("plain chat parses");
+        assert_eq!(surface, "telegram");
+        assert_eq!(sender, "12345");
+        assert_eq!(thread, None);
+    }
+
+    /// A threaded chat: the place is `surface:sender:thread`. Parse splits at
+    /// the second literal `:` and decodes the thread.
+    #[test]
+    fn parse_place_for_a_threaded_chat() {
+        let place = ConversationKey::new("slack", "C0CHAN")
+            .in_thread(Some("1700000000.000500"))
+            .resolve();
+        let (surface, sender, thread) = parse_place(&place).expect("threaded chat parses");
+        assert_eq!(surface, "slack");
+        assert_eq!(sender, "C0CHAN");
+        assert_eq!(thread.as_deref(), Some("1700000000.000500"));
+    }
+
+    /// A sender containing `:` (Matrix `@bob:example.org`, or a Telegram forum
+    /// topic that the channel packs into reply_target) is percent-encoded by
+    /// `resolve`, so the only literal `:` is the surface separator. Parse must
+    /// decode the sender, not split it.
+    #[test]
+    fn parse_place_for_a_sender_with_colon() {
+        let place = ConversationKey::new("matrix", "@bob:example.org").resolve();
+        let (surface, sender, thread) = parse_place(&place).expect("encoded sender parses");
+        assert_eq!(surface, "matrix");
+        assert_eq!(sender, "@bob:example.org");
+        assert_eq!(thread, None);
+    }
+
+    /// A sender containing `%` (e.g. `100%`) is encoded with `%25`, and parse
+    /// must undo that without confusing it with the encoded form of a colon.
+    #[test]
+    fn parse_place_for_a_sender_with_percent() {
+        let place = ConversationKey::new("telegram", "100%").resolve();
+        let (surface, sender, thread) = parse_place(&place).expect("percent sender parses");
+        assert_eq!(surface, "telegram");
+        assert_eq!(sender, "100%");
+        assert_eq!(thread, None);
+    }
+
+    /// A thread containing `%` round-trips too.
+    #[test]
+    fn parse_place_for_a_thread_with_percent() {
+        let place = ConversationKey::new("slack", "C")
+            .in_thread(Some("100%"))
+            .resolve();
+        let (_, sender, thread) = parse_place(&place).expect("percent thread parses");
+        assert_eq!(sender, "C");
+        assert_eq!(thread.as_deref(), Some("100%"));
+    }
+
+    /// A thread containing `:` round-trips too — the encoded form is `%3A`,
+    /// not a literal `:` that would be mistaken for a separator.
+    #[test]
+    fn parse_place_for_a_thread_with_colon() {
+        let place = ConversationKey::new("slack", "C")
+            .in_thread(Some("a:b"))
+            .resolve();
+        let (_, sender, thread) = parse_place(&place).expect("colon thread parses");
+        assert_eq!(sender, "C");
+        assert_eq!(thread.as_deref(), Some("a:b"));
+    }
+
+    /// A string with no `:` is not a valid place. Parse refuses rather than
+    /// silently widening into `("", input, None)`.
+    #[test]
+    fn parse_place_refuses_a_string_without_a_separator() {
+        let result = parse_place("noseparator");
+        assert!(result.is_err(), "a string without `:` must be refused");
+    }
+
+    /// The whole point of the inverse: rebuild from the parsed parts and the
+    /// resolved place is exactly the original. Pinned for every shape the
+    /// dispatcher produces, so a regression in either side of the round trip
+    /// fails here.
+    #[test]
+    fn parse_place_round_trips_through_resolve() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("telegram", "12345", None),
+            ("slack", "C0CHAN", Some("1700000000.000500")),
+            ("matrix", "@bob:example.org", None),
+            ("telegram", "100%", None),
+            ("discord", "chan99", Some("100%")),
+            ("slack", "C", Some("a:b")),
+            ("telegram", "-100123456:77", None), // Telegram forum topic
+        ];
+        for (surface, sender, thread) in cases {
+            let place = ConversationKey::new(surface, sender)
+                .in_thread(*thread)
+                .resolve();
+            let (s2, sender2, thread2) =
+                parse_place(&place).unwrap_or_else(|e| panic!("place {place:?} must parse, {e}"));
+            assert_eq!(s2, *surface, "surface round-trip for {place:?}");
+            assert_eq!(sender2, *sender, "sender round-trip for {place:?}");
+            assert_eq!(
+                thread2.as_deref(),
+                *thread,
+                "thread round-trip for {place:?}"
+            );
+            // And rebuilding via the parsed parts gives the same string.
+            let rebuilt = ConversationKey::new(&s2, &sender2)
+                .in_thread(thread2.as_deref())
+                .resolve();
+            assert_eq!(rebuilt, place, "rebuild round-trip for {place:?}");
+        }
     }
 }

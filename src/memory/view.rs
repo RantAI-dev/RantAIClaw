@@ -59,6 +59,19 @@ pub fn current_memory_view() -> Option<MemoryView> {
 /// arguments, so the refusal is the same whether or not the key exists.
 pub const NO_MEMORY_VIEW_REFUSAL: &str = "Memory is not available in this conversation.";
 
+/// Appended to the success output of every memory-delete path (the CLI
+/// `rantaiclaw memory clear` / `clear --key`, the `memory_forget` tool, the
+/// gateway `memory_delete`, and the TUI `/memory remove`). The delete
+/// reaches the stored note but not the conversation that previously read it
+/// into a turn — that copy lives until `/new` (or its equivalent) clears
+/// the chat's history. Without this line a successful delete can look
+/// total to the operator and leave a stale note visible from the same
+/// chat a moment later; pinning the same sentence in every path keeps
+/// the operator's mental model of what was and was not removed aligned
+/// across surfaces.
+pub const DELETED_NOTE_HELD_BY_HISTORY: &str =
+    "A conversation that mentioned the note still holds it until /new in that chat.";
+
 /// Recall under `view`. `Only(key)` is the hard filter: every entry whose
 /// `session_id` is not exactly `key` is dropped. `All` is the unchanged global
 /// read.

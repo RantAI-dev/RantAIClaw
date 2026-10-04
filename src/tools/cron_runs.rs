@@ -103,7 +103,9 @@ impl Tool for CronRunsTool {
                 });
             }
         };
-        let origin_ref = origin_owned.as_ref().map(|(c, h)| (c.as_str(), h.as_str()));
+        let origin_ref = origin_owned
+            .as_ref()
+            .map(|(c, h, t)| (c.as_str(), h.as_str(), t.as_deref()));
         if let Err(reason) = cron::ensure_visible_to_origin(&job, origin_ref) {
             return Ok(ToolResult {
                 success: false,

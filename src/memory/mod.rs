@@ -31,8 +31,8 @@ pub use traits::{KeyInUse, Memory};
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 pub use view::{
-    current_memory_view, forget_in_view, recall_in_view, store_in_view, MemoryView, MEMORY_VIEW,
-    NO_MEMORY_VIEW_REFUSAL,
+    current_memory_view, forget_in_view, recall_in_view, store_in_view, MemoryView,
+    DELETED_NOTE_HELD_BY_HISTORY, MEMORY_VIEW, NO_MEMORY_VIEW_REFUSAL,
 };
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig};

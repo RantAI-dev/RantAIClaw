@@ -289,7 +289,10 @@ fn remove_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     })?;
     if removed {
         refresh_projection(ctx, memory.as_ref());
-        Ok(CommandResult::Message(format!("Forgot '{key}'.")))
+        Ok(CommandResult::Message(format!(
+            "Forgot '{key}'.\n{}",
+            crate::memory::DELETED_NOTE_HELD_BY_HISTORY,
+        )))
     } else {
         Ok(CommandResult::Message(format!(
             "No entry with key '{key}' to remove."
@@ -780,6 +783,26 @@ mod tests {
         let res = ForgetCommand.execute("temp", &mut ctx).unwrap();
         match res {
             CommandResult::Message(msg) => assert!(msg.contains("Forgot 'temp'")),
+            _ => panic!("expected Message"),
+        }
+    }
+
+    /// The plan's contract: every delete path surfaces the same sentence that
+    /// names what the delete did NOT take. The TUI's `/memory remove`
+    /// (aliased by `/memory forget`) prints it on success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_remove_output_includes_what_the_delete_did_not_take() {
+        let mem = StubMemory::arc();
+        let mut ctx = ctx_with_memory(mem);
+        MemoryCommand
+            .execute("add temp delete-me", &mut ctx)
+            .unwrap();
+        let res = ForgetCommand.execute("temp", &mut ctx).unwrap();
+        match res {
+            CommandResult::Message(msg) => assert!(
+                msg.contains(crate::memory::DELETED_NOTE_HELD_BY_HISTORY),
+                "the shared sentence must ride along with the TUI delete: {msg:?}"
+            ),
             _ => panic!("expected Message"),
         }
     }
