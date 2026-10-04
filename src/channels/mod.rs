@@ -193,6 +193,7 @@ const RESTART_NOTICE: &str =
 /// for those notices to be sent: a turn that the daemon aborts instead sends
 /// nothing and leaves Slack's working notice posted.
 const CHANNEL_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(12);
+const CHANNEL_SESSION_RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
 
 /// Bound on sending one restart notice, so a platform that does not answer
 /// cannot use up the drain that the other conversations' notices need.
@@ -500,6 +501,12 @@ pub(crate) struct ChannelRuntimeContext {
     /// is disabled (non-sqlite memory backends, or an open failure) and history
     /// stays in-memory only, exactly as before.
     pub(crate) history_store: Option<Arc<history_store::ChannelHistoryStore>>,
+    /// Where every channel turn lands as one `source='channel'` session row.
+    /// Mirrors `history_store` exactly: opened at runtime build, gracefully
+    /// disabled on failure (channel sessions just stop recording), and shared
+    /// by the dispatch loop and the daily retention sweep. `None` means
+    /// recording is off — the turn and the reply still go through.
+    pub(crate) session_store: Option<Arc<Mutex<crate::sessions::SessionStore>>>,
     /// The process's token ledger: the daily ceiling every channel turn is
     /// checked against, and the operator's optional prices used to report money.
     /// `None` when `[cost] enabled = false`.
@@ -1611,6 +1618,49 @@ pub(crate) async fn build_channel_runtime(
             None
         };
 
+    // The recording-side store lives next to history_store. Sessions go in a
+    // separate sqlite file the rest of the codebase already opens on demand
+    // (`profiles/<name>/sessions/sessions.db`); that file has WAL +
+    // `busy_timeout = 5000` set on open, so concurrent writers from the
+    // gateway / API surface retry instead of erroring with "database is
+    // locked". On open failure the runtime keeps running, just without a
+    // session transcript: a turn's reply still goes through, with a warn.
+    let session_store: Option<Arc<Mutex<crate::sessions::SessionStore>>> =
+        match crate::profile::ProfileManager::active() {
+            Ok(profile) => {
+                let path = profile.sessions_db_path();
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::warn!(
+                            "channel session persistence disabled (mkdir failed): {e}; \
+                             channel turns will not be recorded"
+                        );
+                        None
+                    } else {
+                        match crate::sessions::SessionStore::open(&path) {
+                            Ok(store) => Some(Arc::new(Mutex::new(store))),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "channel session persistence disabled (open failed): {e}; \
+                                     channel turns will not be recorded"
+                                );
+                                None
+                            }
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "channel session persistence disabled (no active profile): {e}; \
+                     channel turns will not be recorded"
+                );
+                None
+            }
+        };
+
     // Seed the in-memory map from disk so a restart resumes live threads.
     let mut seeded_histories: HashMap<String, Vec<ChatMessage>> = HashMap::new();
     if let Some(store) = history_store.as_ref() {
@@ -1636,6 +1686,21 @@ pub(crate) async fn build_channel_runtime(
         }
     }
 
+    // Drop channel sessions past the 30-day retention. The history_store
+    // maintenance above is in-memory-reseed only; the channel sessions live
+    // in their own db and need their own. Failures here are non-fatal:
+    // a record fail on the next turn is fine, and the next daily sweep will
+    // catch it.
+    if let Some(store) = session_store.as_ref() {
+        if let Ok(mut store) = store.lock() {
+            if let Err(e) =
+                store.prune_channel_sessions(crate::sessions::SessionStore::CHANNEL_RETENTION_SECS)
+            {
+                tracing::warn!("channel session maintenance failed (non-fatal): {e}");
+            }
+        }
+    }
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         runtime_config,
         channels_by_name,
@@ -1653,6 +1718,7 @@ pub(crate) async fn build_channel_runtime(
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(seeded_histories)),
         history_store,
+        session_store: session_store.clone(),
         ledger: crate::cost::ledger_for(&config),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -1827,6 +1893,49 @@ fn spawn_config_watch_refresh(
     }))
 }
 
+/// One sweep every 24 hours: drop channel sessions past their retention
+/// window so the table does not grow without bound. Cancellable via
+/// `shutdown`. `None` when recording is off; the runtime still works, it
+/// simply has nothing to clean up.
+///
+/// The first sleep is the full 24h — `build_channel_runtime` already runs
+/// `prune_channel_sessions` at startup, so a tick at construction time would
+/// be redundant.
+fn spawn_channel_session_retention(
+    ctx: Arc<ChannelRuntimeContext>,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let store = ctx.session_store.as_ref()?.clone();
+    Some(tokio::spawn(async move {
+        let interval = CHANNEL_SESSION_RETENTION_INTERVAL;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = shutdown.cancelled() => break,
+            }
+            let outcome = match store.lock() {
+                Ok(mut store) => store
+                    .prune_channel_sessions(crate::sessions::SessionStore::CHANNEL_RETENTION_SECS)
+                    .map(|removed| removed as i64)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("daily channel session sweep failed (non-fatal): {e}");
+                        -1
+                    }),
+                Err(e) => {
+                    tracing::warn!("daily channel session sweep lock failed (non-fatal): {e}");
+                    -1
+                }
+            };
+            if outcome > 0 {
+                tracing::info!(
+                    removed = outcome,
+                    "Daily channel session sweep removed aged-out sessions"
+                );
+            }
+        }
+    }))
+}
+
 /// Supervise the listeners and run the dispatch loop for an already-built runtime.
 pub(crate) async fn run_channel_runtime(
     runtime: ChannelRuntime,
@@ -1854,6 +1963,7 @@ pub(crate) async fn run_channel_runtime(
         ));
     }
     let config_watch_handle = spawn_config_watch_refresh(ctx.clone(), shutdown.clone());
+    let session_retention_handle = spawn_channel_session_retention(ctx.clone(), shutdown.clone());
     // Publish before dropping our copy: the bus keeps its own clone, so the
     // gateway can enqueue for as long as this runtime lives. Cleared on exit so
     // an inbound webhook during a restart is refused rather than accepted into a
@@ -1873,6 +1983,10 @@ pub(crate) async fn run_channel_runtime(
     }
 
     if let Some(h) = config_watch_handle {
+        let _ = h.await;
+    }
+
+    if let Some(h) = session_retention_handle {
         let _ = h.await;
     }
 

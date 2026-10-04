@@ -330,6 +330,57 @@ Approval replies (`/approve`, `/deny`) and pairing (`/bind`, `/claim`) are handl
 these and behave as before. Slack has no reset command: a new top-level message already starts a new
 conversation.
 
+## Channel Session Recording
+
+Every addressed message on a connected channel is recorded as an open session in
+`sessions.db`, alongside the TUI and API sessions. The point is the same as
+for those surfaces: the operator can review what was said and ask follow-up questions
+later.
+
+How it lands in the store:
+
+- Storage path: `<profile root>/sessions/sessions.db`, defaulting to
+  `~/.rantaiclaw/profiles/default/sessions/sessions.db`, in the same SQLite
+  database as the TUI and API sessions. Channel sessions are tagged with
+  `source = "channel"`; TUI sessions are `source = "tui"`; API sessions are
+  `source = "api"`.
+- Conversation key: `<channel>:<chat-id>` (e.g. `telegram:chat-42`). One
+  conversation is one session; consecutive turns in the same chat append to
+  the same session, until the sender runs `/new` or `/clear` (Telegram,
+  Discord, WhatsApp Web).
+- What's recorded: the sender's message text and the assistant's final reply.
+  Draft streaming chunks and tool calls/results are not stored. Secret-shaped
+  patterns (`sk-...`, `ghp_...`, bearer tokens, and the broader regex list at
+  `src/providers/mod.rs`) are scrubbed before the row is written. A secret
+  written as a plain sentence is not recognised.
+- Retention: channel sessions are pruned 30 days after the last turn. The
+  daily prune runs alongside the channel runtime and one extra time at
+  startup so a long-down daemon catches up immediately on restart.
+
+Visibility on the operator surfaces:
+
+| Surface | Default | To see channel sessions |
+|---|---|---|
+| CLI | `rantaiclaw session list` hides them | add `--source channel` |
+| TUI | `/sessions` and `/resume` hide them | pass `/sessions channel` (or `tui`/`api`) |
+| API | `GET /api/v1/sessions` hides them | pass `?source=channel` |
+
+Deleting a channel session:
+
+- API: `GET /api/v1/sessions?source=channel` to discover the id, then
+  `DELETE /api/v1/sessions/{id}`.
+- `/new` and `/clear` (Telegram, Discord, WhatsApp Web) close the open
+  session so the next message starts a fresh one.
+
+Guests and the recording layer:
+
+- A guest turn is recorded the same way an owner's is — there is no
+  ownership check on the recording path. The operator can still review the
+  guest's transcript through the surfaces above.
+- A guest cannot read sessions. Guest turns run under a tool gate that does
+  not include any session-reading tool, and the recording layer does not
+  hand a session id back to the guest.
+
 ## Clearing a Conversation
 
 A conversation keeps its history, in memory and in `brain.db`, so the bot can follow what was said

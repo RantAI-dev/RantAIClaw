@@ -524,6 +524,21 @@ pub(crate) async fn handle_runtime_command_if_needed(
             // This conversation's key only: another chat, topic or thread
             // keeps its history.
             history::clear_sender_history(ctx, &sender_key);
+            // Close the open channel session for this conversation so the
+            // next recorded turn lands in a fresh one. Done on the runtime
+            // command path, not on `/model` — the plan explicitly keeps the
+            // model switch off the session lifecycle.
+            if let Some(store) = ctx.session_store.as_ref() {
+                let _ = store
+                    .lock()
+                    .map(|mut s| s.close_channel_session(&sender_key))
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "channel session store lock poisoned during /new|clear: {e}"
+                        );
+                        e
+                    });
+            }
             reset_message(&msg.channel)
         }
         ChannelRuntimeCommand::UnknownCommand(command) => {
@@ -1083,6 +1098,195 @@ mod tests {
                 None,
                 "{text}"
             );
+        }
+    }
+
+    /// `/new` and `/clear` close the open channel session for the
+    /// conversation. The next recorded turn opens a fresh one — that's the
+    /// session-lifecycle contract the channel recording layer depends on.
+    /// Verified end-to-end: a pre-opened session is recorded, the command is
+    /// dispatched, the open session has `ended_at` set and no new rows.
+    #[tokio::test]
+    async fn new_and_clear_close_the_open_channel_session() {
+        use super::super::dispatch::conversation_history_key;
+        use super::super::test_support::RecordingChannel;
+        use crate::sessions::SessionStore;
+        use std::sync::Arc;
+
+        let channel = Arc::new(RecordingChannel::default());
+        channel
+            .telegram
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let channel_dyn: Arc<dyn super::super::Channel> = channel.clone();
+        let provider_impl = Arc::new(super::super::test_support::ReplyAndPromptProvider {
+            reply: "stub".to_string(),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let ctx = super::super::test_support::dispatch_ctx(
+            vec![channel_dyn.clone()],
+            provider_impl.clone(),
+            super::super::test_support::seeded_defaults_slot(
+                crate::approval::policy_writer::PolicyPreset::Strict,
+                crate::approval::GuestGate::new(&[], &[]),
+            ),
+        );
+        let store = Arc::new(std::sync::Mutex::new(
+            SessionStore::in_memory().expect("in-memory session store"),
+        ));
+        let mut ctx_mut = Arc::try_unwrap(ctx).unwrap_or_else(|_| panic!("fresh ctx"));
+        ctx_mut.session_store = Some(store.clone());
+        let ctx = Arc::new(ctx_mut);
+
+        // Pre-record one turn so an open session exists.
+        let msg_for_key = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "reset-pre-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-reset".to_string(),
+            content: "first turn".to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        };
+        let key = conversation_history_key(&msg_for_key);
+        {
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            s.record_channel_turn("m", &key, "hi", "hello", None)
+                .expect("record first turn");
+        }
+        // Sanity: the session is open.
+        {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(s.open_channel_session_id(&key).unwrap().is_some());
+        }
+
+        // /new
+        let new_msg = traits::ChannelMessage {
+            id: "reset-cmd-1".to_string(),
+            content: "/new".to_string(),
+            ..msg_for_key.clone()
+        };
+        let handled = super::handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &new_msg,
+            Some(&channel_dyn),
+            true,
+        )
+        .await;
+        assert!(handled, "/new was a command");
+
+        // The session for this conversation_key is now closed.
+        {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                s.open_channel_session_id(&key).unwrap().is_none(),
+                "/new must close the open session"
+            );
+            // The row itself stays — closed, not deleted. The user can still
+            // look it up by id; the row count is still one.
+            let total = s.count_sessions().unwrap();
+            assert_eq!(total, 1, "the closed session row is still there");
+        }
+
+        // /clear (the same path) closes again — idempotent.
+        let clear_msg = traits::ChannelMessage {
+            id: "reset-cmd-2".to_string(),
+            content: "/clear".to_string(),
+            ..msg_for_key.clone()
+        };
+        let handled = super::handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &clear_msg,
+            Some(&channel_dyn),
+            true,
+        )
+        .await;
+        assert!(handled, "/clear was a command");
+        {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(s.open_channel_session_id(&key).unwrap().is_none());
+        }
+    }
+
+    /// `/model` is explicitly OUT of the channel-session lifecycle: it
+    /// clears the in-memory history but must NOT close the open channel
+    /// session. The plan brief draws the line at `/new` and `/clear`.
+    #[tokio::test]
+    async fn model_does_not_close_the_open_channel_session() {
+        use super::super::dispatch::conversation_history_key;
+        use super::super::test_support::RecordingChannel;
+        use crate::sessions::SessionStore;
+        use std::sync::Arc;
+
+        let channel = Arc::new(RecordingChannel::default());
+        channel
+            .telegram
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let channel_dyn: Arc<dyn super::super::Channel> = channel.clone();
+        let provider_impl = Arc::new(super::super::test_support::ReplyAndPromptProvider {
+            reply: "stub".to_string(),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let ctx = super::super::test_support::dispatch_ctx(
+            vec![channel_dyn.clone()],
+            provider_impl.clone(),
+            super::super::test_support::seeded_defaults_slot(
+                crate::approval::policy_writer::PolicyPreset::Strict,
+                crate::approval::GuestGate::new(&[], &[]),
+            ),
+        );
+        let store = Arc::new(std::sync::Mutex::new(
+            SessionStore::in_memory().expect("in-memory session store"),
+        ));
+        let mut ctx_mut = Arc::try_unwrap(ctx).unwrap_or_else(|_| panic!("fresh ctx"));
+        ctx_mut.session_store = Some(store.clone());
+        let ctx = Arc::new(ctx_mut);
+
+        let msg_for_key = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "model-pre-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-model".to_string(),
+            content: "first turn".to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        };
+        let key = conversation_history_key(&msg_for_key);
+        {
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            s.record_channel_turn("m", &key, "hi", "hello", None)
+                .expect("record");
+        }
+        let open_id_before = {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            s.open_channel_session_id(&key).unwrap().expect("open")
+        };
+
+        let model_msg = traits::ChannelMessage {
+            id: "model-cmd-1".to_string(),
+            content: "/model some-other-model".to_string(),
+            ..msg_for_key.clone()
+        };
+        let handled = super::handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &model_msg,
+            Some(&channel_dyn),
+            true,
+        )
+        .await;
+        assert!(handled, "/model was a command");
+        {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let open_id_after = s
+                .open_channel_session_id(&key)
+                .unwrap()
+                .expect("still open after /model");
+            assert_eq!(open_id_before, open_id_after);
         }
     }
 }

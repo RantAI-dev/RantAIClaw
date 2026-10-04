@@ -2,8 +2,32 @@ use anyhow::Result;
 use chrono::{TimeZone, Utc};
 
 use super::{CommandHandler, CommandResult};
+use crate::sessions::SessionMeta;
 use crate::tui::context::TuiContext;
 use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+
+/// Resolve the session list for `/sessions [prefix]` and `/resume [prefix]`.
+///
+/// Default view hides channel transcripts so the operator's picker matches the
+/// CLI and API surface; the user can opt in with `/sessions channel` (a
+/// single-token argument that names the source). Any other argument is
+/// treated as a session-id prefix for `/resume` and falls back to the
+/// default visible list.
+fn picker_sessions(ctx: &mut TuiContext, args: &str) -> Result<Vec<SessionMeta>> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return ctx.session_store.list_sessions_paged_visible(200, 0);
+    }
+    match trimmed {
+        "channel" | "tui" | "api" => {
+            ctx.session_store
+                .list_sessions_paged_with_source(200, 0, Some(trimmed))
+        }
+        // Anything else is a session-id prefix; defer to the default visible
+        // list and let the resume preselect match against it.
+        _ => ctx.session_store.list_sessions_paged_visible(200, 0),
+    }
+}
 
 /// Build picker items from a list of session metas. Skips the current
 /// session so the user doesn't accidentally "resume" it onto itself.
@@ -50,11 +74,11 @@ impl CommandHandler for SessionsCommand {
     }
 
     fn usage(&self) -> &str {
-        "/sessions"
+        "/sessions [channel|tui|api]"
     }
 
-    fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let sessions = ctx.session_store.list_sessions(200)?;
+    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        let sessions = picker_sessions(ctx, args)?;
         let items = build_session_items(&sessions, ctx.session_id.as_deref());
         let picker = ListPicker::new(
             ListPickerKind::Session,
@@ -87,7 +111,7 @@ impl CommandHandler for ResumeCommand {
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let prefix = args.trim();
-        let sessions = ctx.session_store.list_sessions(200)?;
+        let sessions = picker_sessions(ctx, args)?;
         let items = build_session_items(&sessions, ctx.session_id.as_deref());
         let preselect = if prefix.is_empty() {
             None
@@ -292,5 +316,79 @@ mod tests {
             .expect("session bound by first message");
         let session = ctx.session_store.get_session(&sid).unwrap().unwrap();
         assert_eq!(session.title.as_deref(), Some("my-session-title"));
+    }
+
+    /// The default `/sessions` picker hides channel transcripts so the
+    /// operator's view matches the CLI and API surface. Pass `channel` as
+    /// the argument to opt in.
+    #[test]
+    fn sessions_command_hides_channel_sessions_by_default() {
+        let mut ctx = test_context();
+        // A TUI session exists from appending — gives us something to filter
+        // against.
+        ctx.append_user_message("open a tui session").unwrap();
+        let tui_id = ctx
+            .session_id
+            .clone()
+            .expect("tui session is bound after first message");
+        // A channel session is also in the store, recorded via the dispatch
+        // path's helper.
+        ctx.session_store
+            .record_channel_turn(
+                "mock-model",
+                "telegram:chat-1",
+                "hi",
+                "the bot's reply",
+                None,
+            )
+            .unwrap();
+        let channels = ctx
+            .session_store
+            .list_sessions_paged_with_source(200, 0, Some("channel"))
+            .unwrap();
+        assert_eq!(channels.len(), 1, "the channel session was recorded");
+
+        // Default `/sessions` — channel hidden.
+        let cmd = SessionsCommand;
+        let result = cmd.execute("", &mut ctx).unwrap();
+        let entries = match result {
+            CommandResult::OpenListPicker(p) => p.entries().to_vec(),
+            other => panic!("expected OpenListPicker, got {other:?}"),
+        };
+        let keys: Vec<String> = entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::tui::widgets::ListPickerEntry::Item(i) => Some(i.key.clone()),
+                _ => None,
+            })
+            .collect();
+        // Current session filtered out by `build_session_items`; remaining
+        // is empty because channel is hidden.
+        assert!(
+            !keys.contains(&channels[0].id),
+            "channel session id is not in the default picker; got {keys:?}"
+        );
+
+        // Explicit `/sessions channel` shows it.
+        let result = cmd.execute("channel", &mut ctx).unwrap();
+        let entries = match result {
+            CommandResult::OpenListPicker(p) => p.entries().to_vec(),
+            other => panic!("expected OpenListPicker, got {other:?}"),
+        };
+        let keys: Vec<String> = entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::tui::widgets::ListPickerEntry::Item(i) => Some(i.key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.contains(&channels[0].id),
+            "channel session id is in the channel picker; got {keys:?}"
+        );
+        // The TUI session id may or may not appear (it's the current
+        // session and gets filtered out); assert nothing here other than
+        // the channel session presence.
+        let _ = tui_id;
     }
 }

@@ -1149,6 +1149,11 @@ enum SessionCommands {
     List {
         #[arg(long, default_value = "50")]
         limit: usize,
+        /// Show only sessions from one place. Default is every row except
+        /// `channel` — channel transcripts are recorded but live in their
+        /// own bucket; pass `--source channel` to view them.
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Show messages for a session (id prefix accepted)
     Get {
@@ -2161,7 +2166,9 @@ async fn main() -> Result<()> {
         Some(Commands::Skills { skill_command }) => skills::handle_command(skill_command, &config),
 
         Some(Commands::Session { cmd }) => match cmd {
-            SessionCommands::List { limit } => rantaiclaw::sessions::cli::list(limit),
+            SessionCommands::List { limit, source } => {
+                rantaiclaw::sessions::cli::list(limit, source.as_deref())
+            }
             SessionCommands::Get { id, limit } => rantaiclaw::sessions::cli::get(&id, limit),
             SessionCommands::Search { query, limit } => {
                 rantaiclaw::sessions::cli::search(&query, limit)

@@ -159,6 +159,20 @@ run arbitrary privileged tools." This is the feature.
 This subsumes the sharing case, removes the approval ping-pong for guests, and
 makes a `["*"]` chat allowlist safe (public for safe stuff, private for privileged).
 
+## Channel session storage
+
+Every addressed message on a connected channel is recorded as an open session
+in `sessions.db`, alongside the TUI and API sessions. Channel sessions are
+private to the daemon; the recording path has no ownership check, so a guest
+turn produces the same row as an owner's, but a guest cannot read any
+session. Guest turns run under a tool gate that does not include a session
+reader, and no session id or URL-shaped value is handed back to the guest.
+The operator's review surfaces (CLI `--source channel`, TUI
+`/sessions channel`, `GET /api/v1/sessions?source=channel`) require the
+operator path, which guests do not have. See
+[Channel Session Recording](../reference/channels.md#channel-session-recording)
+for storage location, retention, and the deletion paths.
+
 ## What stays open
 
 These paths are known and not closed by the rules above.

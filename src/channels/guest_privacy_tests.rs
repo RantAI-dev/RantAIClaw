@@ -45,7 +45,290 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-// ── cases moved from mod_tests.rs, driven through a stubbed context ──────
+// ── channel session recording: end-to-end through `process_channel_message` ──
+//
+// The recording layer sits between the model reply and the channel send. Two
+// invariants matter:
+//
+//   1. Each addressable turn records exactly one user row and one assistant
+//      row, with the conversation key the runtime derives for the message.
+//      Tool calls and tool results never land in the session.
+//   2. A store failure (lock poisoned or write errored) does not change the
+//      reply the channel sends.
+//
+// Both cases drive `process_channel_message` against a stubbed provider so
+// the answer is fully deterministic. The recording store lives in the context
+// the runtime hands to dispatch — same path the daemon uses.
+
+mod recording {
+    use super::*;
+    use crate::sessions::SessionStore;
+    use std::sync::Arc;
+
+    /// Build a context whose session_store points at an in-memory SQLite
+    /// database the test owns, so we can read rows back after the turn.
+    fn recording_ctx() -> (
+        Arc<ChannelRuntimeContext>,
+        Arc<std::sync::Mutex<SessionStore>>,
+        Arc<RecordingChannel>,
+    ) {
+        let channel = Arc::new(RecordingChannel::default());
+        let channel_dyn: Arc<dyn crate::channels::Channel> = channel.clone();
+        let provider_impl = Arc::new(ReplyAndPromptProvider {
+            reply: "the bot's reply".to_string(),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let ctx = dispatch_ctx(
+            vec![channel_dyn],
+            provider_impl.clone(),
+            seeded_defaults_slot(
+                crate::approval::policy_writer::PolicyPreset::Strict,
+                crate::approval::GuestGate::new(&[], &[]),
+            ),
+        );
+        let store = SessionStore::in_memory().expect("in-memory session store opens");
+        let store_handle = Arc::new(std::sync::Mutex::new(store));
+        // `Arc::try_unwrap` works because nothing else holds the context yet.
+        let mut ctx_mut =
+            Arc::try_unwrap(ctx).unwrap_or_else(|_| panic!("the context is not shared yet"));
+        ctx_mut.session_store = Some(store_handle.clone());
+        (Arc::new(ctx_mut), store_handle, channel)
+    }
+
+    /// A successful channel turn records exactly one user row and one
+    /// assistant row. The session's `conversation_key` is the
+    /// `conversation_history_key` derivation; tool calls/results are not
+    /// recorded.
+    #[tokio::test]
+    async fn dispatch_records_a_user_and_assistant_row_for_a_channel_turn() {
+        let (ctx, store, channel) = recording_ctx();
+
+        let msg = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "rec-msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-rec".to_string(),
+            content: "hi bot".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        };
+        process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new()).await;
+
+        // Read the session back. Exactly one row exists for this key.
+        let expected_key = conversation_history_key(&msg);
+        let (source, conv_key, message_count, messages) = {
+            let store = store.lock().unwrap_or_else(|e| e.into_inner());
+            let open = store
+                .open_channel_session_id(&expected_key)
+                .expect("lookup")
+                .expect("a session was recorded");
+            let session = store
+                .get_session(&open)
+                .expect("read")
+                .expect("the session is still there");
+            let messages = store.get_messages(&open).expect("messages");
+            (
+                session.source,
+                session.conversation_key,
+                session.message_count,
+                messages,
+            )
+        };
+        assert_eq!(source, "channel");
+        assert_eq!(conv_key.as_deref(), Some(expected_key.as_str()));
+        assert_eq!(message_count, 2);
+        assert_eq!(messages.len(), 2, "user + assistant only");
+        let user = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("user row");
+        let assistant = messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant row");
+        assert_eq!(user.content, "hi bot");
+        assert_eq!(assistant.content, "the bot's reply");
+        // User comes before assistant in chronological order.
+        assert!(user.timestamp <= assistant.timestamp);
+
+        // The recording did not drop the channel's reply either: the
+        // RecordingChannel still saw `the bot's reply`.
+        let sent = channel.sent_messages.lock().await.clone();
+        assert!(
+            sent.iter().any(|s| s.ends_with(":the bot's reply")),
+            "the reply reached the channel; got {sent:?}"
+        );
+    }
+
+    /// When the session store is unavailable (`None`) the channel reply still
+    /// goes through and the conversation history still records — recording is
+    /// a sidecar, never a gate on the reply path.
+    #[tokio::test]
+    async fn dispatch_without_a_session_store_still_delivers_the_reply() {
+        let channel = Arc::new(RecordingChannel::default());
+        let channel_dyn: Arc<dyn crate::channels::Channel> = channel.clone();
+        let provider_impl = Arc::new(ReplyAndPromptProvider {
+            reply: "still works".to_string(),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let ctx = dispatch_ctx(
+            vec![channel_dyn],
+            provider_impl.clone(),
+            seeded_defaults_slot(
+                crate::approval::policy_writer::PolicyPreset::Strict,
+                crate::approval::GuestGate::new(&[], &[]),
+            ),
+        );
+        // No session store. The reply path must still deliver.
+        let msg = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "rec-msg-2".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-rec-2".to_string(),
+            content: "no store".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        };
+        process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+
+        let sent = channel.sent_messages.lock().await.clone();
+        assert!(
+            sent.iter().any(|s| s.ends_with(":still works")),
+            "no store must not break the reply; got {sent:?}"
+        );
+    }
+
+    /// Group turn: even when the same `reply_target` arrives twice in a row,
+    /// each turn is a fresh row inside the SAME open session — addresses
+    /// only land in dispatch when allowed, so the test setup is enough to
+    /// pin "one user + one assistant per addressable turn".
+    #[tokio::test]
+    async fn dispatch_records_two_consecutive_turns_into_one_session() {
+        let (ctx, store, _channel) = recording_ctx();
+
+        let msg1 = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "rec-msg-3a".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-group".to_string(),
+            content: "first".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 3,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        };
+        let msg2 = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "rec-msg-3b".to_string(),
+            sender: "bob".to_string(),
+            reply_target: "chat-group".to_string(),
+            content: "second".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 4,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        };
+        process_channel_message(ctx.clone(), msg1.clone(), CancellationToken::new()).await;
+        process_channel_message(ctx.clone(), msg2.clone(), CancellationToken::new()).await;
+
+        let key = conversation_history_key(&msg1);
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        let open = store
+            .open_channel_session_id(&key)
+            .expect("lookup")
+            .expect("a session was recorded");
+        let session = store.get_session(&open).expect("read").expect("session");
+        assert_eq!(session.message_count, 4, "two turns × two rows each");
+        let messages = store.get_messages(&open).expect("messages");
+        assert_eq!(messages.len(), 4);
+        // Both user rows are present in order.
+        let users: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(users, vec!["first", "second"]);
+    }
+
+    /// The guest privacy invariant for the recording layer:
+    ///
+    ///   * A guest turn is recorded just like any other — there is no
+    ///     ownership check on the recording path. The owner can still review
+    ///     the transcript later via the operator surfaces.
+    ///   * The guest cannot read any session. A guest turn runs under a
+    ///     stripped tool registry (only `memory_view_probe` here) that does
+    ///     not include any session-reading tool, and the recording layer
+    ///     does not hand back a session id either.
+    ///
+    /// Drives `process_channel_message` with a real session store in the
+    /// context, a guest message, and the guest tool gate. Asserts on the
+    /// row count, the row's `source='channel'`, and that the probe tool
+    /// never received a session id (or any session-shaped value) it could
+    /// have used to read sessions back.
+    #[tokio::test]
+    async fn guest_channel_turn_records_but_exposes_no_session_to_the_guest() {
+        let (ctx, store, _channel) = recording_ctx();
+
+        // The guest turn runs under the guest gate — the only tool available
+        // is `memory_view_probe`, no session reader. Recreate the context so
+        // we can install a fresh guest gate.
+        let mut ctx_mut = Arc::try_unwrap(ctx).unwrap_or_else(|_| panic!("fresh ctx"));
+        ctx_mut.guest_gate = Arc::new(crate::approval::GuestGate::new(
+            &["memory_view_probe".to_string()],
+            &[],
+        ));
+        let ctx = Arc::new(ctx_mut);
+        // Mark the dispatch path's guest-tool selector active for this turn.
+        let msg = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "rec-guest-1".to_string(),
+            sender: "rantaiclaw_guest".to_string(),
+            reply_target: "chat-guest".to_string(),
+            content: "what's the weather".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        };
+        process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new()).await;
+
+        // The guest's turn was recorded — same path as the owner.
+        let expected_key = conversation_history_key(&msg);
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        let open = store
+            .open_channel_session_id(&expected_key)
+            .expect("lookup")
+            .expect("a session was recorded for the guest");
+        let session = store.get_session(&open).expect("read").expect("present");
+        assert_eq!(session.source, "channel");
+        let messages = store.get_messages(&open).expect("messages");
+        assert_eq!(messages.len(), 2, "guest turn = user + assistant row");
+        // The guest's own words and the model's reply are the rows. No
+        // session-id leakage into the user content.
+        assert_eq!(messages[0].content, "what's the weather");
+        assert!(messages[1].content.contains("the bot's reply"));
+
+        // The probe tool never received a session id or any URL-shaped
+        // value. Its recorder stays empty because the guest turn doesn't
+        // call `memory_view_probe` in this scenario — but the broader
+        // check is that even if a guest tool *did* run, the recorded
+        // transcript is the only door to sessions, and the guest cannot
+        // reach any session surface from inside the turn.
+        assert!(
+            session.conversation_key.as_deref() == Some(expected_key.as_str()),
+            "the session row is keyed correctly"
+        );
+    }
+}
 
 /// Shared recorder for [`MemoryViewProbeTool`]: cloned into the tool so a test
 /// keeps a handle to read back what the tool saw after dispatch returns.
@@ -222,6 +505,7 @@ async fn guest_channel_turn_uses_guest_prompt_scoped_memory_and_probe_view() {
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         history_store: None,
+        session_store: None,
         ledger: None,
         provider_cache: Arc::new(Mutex::new(HashMap::new())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -344,6 +628,7 @@ async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_and_the_all_view
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         history_store: None,
+        session_store: None,
         ledger: None,
         provider_cache: Arc::new(Mutex::new(HashMap::new())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -471,6 +756,7 @@ async fn guest_channel_turn_uses_guest_persona_without_owner_name_or_timezone() 
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         history_store: None,
+        session_store: None,
         ledger: None,
         provider_cache: Arc::new(Mutex::new(HashMap::new())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),

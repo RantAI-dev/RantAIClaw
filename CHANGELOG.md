@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `NOTICE` file and the upstream MIT and Apache-2.0 texts under `licenses/`,
   restoring the ZeroClaw copyright attribution that was dropped by commit
   `caa0ef55` (2026-03-17). The RantaiClaw license itself stays AGPL-3.0-only.
+- Every addressed message on a connected channel is now recorded as an open
+  session in `sessions.db`, alongside the TUI and API sessions. The session
+  for a channel conversation is keyed `<channel>:<chat-id>`, so consecutive
+  turns in the same chat append to the same session until the sender runs
+  `/new` or `/clear`. Recording writes the sender's message and the model's
+  final reply only — draft streaming chunks and tool calls/results are not
+  stored, and secret-shaped patterns are scrubbed before the row is written.
+  Channel sessions are pruned 30 days after the last turn; the daily prune
+  runs alongside the channel runtime and an extra time at startup. The
+  default operator view hides them: `rantaiclaw session list`,
+  `/sessions`/`/resume`, and `GET /api/v1/sessions` skip channel rows by
+  default and accept `--source channel` / `/sessions channel` /
+  `?source=channel` to opt in. `docs/reference/channels.md` documents the
+  storage location, retention, and deletion paths; the guest layer records
+  like an owner but cannot read any session.
 
 ### Fixed
 

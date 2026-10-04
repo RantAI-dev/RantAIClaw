@@ -1473,6 +1473,20 @@ pub(crate) async fn process_channel_message(
                 failure.history_entry(&reply_for_history)
             };
 
+            // Session recording: land this turn as one user row + one assistant row in
+            // the channel session for `history_key`. Only the model's final
+            // text is recorded — tool calls, tool results, and the in-progress
+            // draft stream are deliberately excluded. A recording failure logs
+            // and never touches the reply path. Done BEFORE the move into
+            // `to_store` so `recorded` is still a fresh `String` here.
+            record_channel_turn(
+                ctx.as_ref(),
+                &history_key,
+                route.model.as_str(),
+                &msg,
+                &recorded,
+            );
+
             // History stores the structured form the dispatcher produced: each
             // tool call and tool result as its own message, the final assistant
             // message as the recorded turn (with the failure note when the
@@ -1975,6 +1989,72 @@ pub(crate) async fn run_message_dispatch_loop(
             () = &mut deadline, if !stop_running_turns.is_cancelled() => stop_running_turns.cancel(),
         }
     }
+}
+
+/// Record one channel turn in the session store.
+///
+/// Reads `ctx.session_store` (if any), derives a default title from the
+/// conversation key when no chat title is on hand — none of the channel
+/// parsers carry the chat title today; this is the backlog the brief flags.
+/// Locks the store, calls `record_channel_turn`, and lets every error path
+/// log + ignore. The reply has already been delivered by the time we run,
+/// and a missing or broken store must not change that.
+fn record_channel_turn(
+    ctx: &super::ChannelRuntimeContext,
+    conversation_key: &str,
+    model: &str,
+    msg: &traits::ChannelMessage,
+    reply_text: &str,
+) {
+    let Some(store) = ctx.session_store.as_ref() else {
+        return;
+    };
+    let title = default_channel_session_title(conversation_key);
+    let result = match store.lock() {
+        Ok(mut store) => store.record_channel_turn(
+            model,
+            conversation_key,
+            &msg.content,
+            reply_text,
+            Some(&title),
+        ),
+        Err(poisoned) => {
+            tracing::warn!(
+                conversation_key = %conversation_key,
+                "channel session store lock poisoned; turn not recorded"
+            );
+            // Recover by recording into the inner state — the lock guard's
+            // `IntoInner` is the safe way.
+            poisoned.into_inner().record_channel_turn(
+                model,
+                conversation_key,
+                &msg.content,
+                reply_text,
+                Some(&title),
+            )
+        }
+    };
+    if let Err(err) = result {
+        tracing::warn!(
+            conversation_key = %conversation_key,
+            "channel session record failed (non-fatal): {err}"
+        );
+    }
+}
+
+/// The fallback title for a channel session: the channel name and the chat
+/// id side by side. No channel parser currently exposes the chat title, so
+/// we use the conversation key's two stable parts: the channel (e.g.
+/// `telegram`) and the `reply_target` (chat id, possibly `chat_id:thread_id`).
+/// The brief flags "carry chat title from the parser" as a backlog item.
+fn default_channel_session_title(conversation_key: &str) -> String {
+    // `conversation_history_key` builds the key from `channel:reply_target`
+    // optionally followed by `:thread_ts`. We split on `:` and keep the first
+    // two pieces; a thread id at the end is dropped from the title.
+    let mut parts = conversation_key.splitn(3, ':');
+    let channel = parts.next().unwrap_or("channel");
+    let chat = parts.next().unwrap_or("chat");
+    format!("{channel} {chat}")
 }
 
 #[cfg(test)]
