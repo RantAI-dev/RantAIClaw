@@ -1,5 +1,6 @@
 pub mod cli;
 mod migrations;
+mod scrub;
 mod store;
 mod types;
 

@@ -5,6 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::migrations::run_migrations;
+use super::scrub::scrub_channel_message;
 use super::types::{Message, SearchResult, Session, SessionMeta};
 
 /// Maximum displayable length of an auto-derived session title.
@@ -187,6 +188,7 @@ impl SessionStore {
             message_count: 0,
             token_count: 0,
             source: source.to_string(),
+            conversation_key: None,
         })
     }
 
@@ -194,7 +196,8 @@ impl SessionStore {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, parent_session_id, model, started_at, ended_at, \
-             message_count, token_count, source FROM sessions WHERE id = ?1",
+             message_count, token_count, source, conversation_key \
+             FROM sessions WHERE id = ?1",
         )?;
 
         let result = stmt.query_row(params![id], |row| {
@@ -208,6 +211,7 @@ impl SessionStore {
                 message_count: row.get(6)?,
                 token_count: row.get(7)?,
                 source: row.get(8)?,
+                conversation_key: row.get(9)?,
             })
         });
 
@@ -526,6 +530,260 @@ impl SessionStore {
         Ok(id)
     }
 
+    // ── Channel recording ────────────────────────────────────────────────────
+
+    /// How long a channel session is kept after the last turn before the daily
+    /// retention sweep removes it. Matches the `channel_history` retention in
+    /// `src/channels/history_store.rs`.
+    pub const CHANNEL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
+    /// Record a user + assistant turn for a channel conversation, reusing the
+    /// open `source='channel'` session for `conversation_key` if one exists, or
+    /// opening a fresh one otherwise.
+    ///
+    /// `title` is the chat title the channel parser already held (Telegram
+    /// `chat.title`); the session row gets it on the first turn only. When the
+    /// parser did not have one, the caller passes `None` and the title stays
+    /// `NULL` until something else sets it.
+    ///
+    /// Both scrubbers run on every recorded message — `scrub_secret_patterns`
+    /// for known token prefixes, `scrub_credentials` for `key=value` style
+    /// secrets — before the INSERT. A secret written as a plain sentence is
+    /// not recognised; that's the limit the docs spell out.
+    ///
+    /// All four writes — open-or-find, two messages, the counter and the
+    /// title — run in one `IMMEDIATE` transaction so a contention on the same
+    /// key cannot leave a half-recorded turn. The caller treats a write
+    /// failure as log-and-ignore; it never blocks the channel reply.
+    pub fn record_channel_turn(
+        &mut self,
+        model: &str,
+        conversation_key: &str,
+        user_message: &str,
+        assistant_message: &str,
+        title: Option<&str>,
+    ) -> Result<String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let (id, is_new) = match tx.query_row(
+            "SELECT id FROM sessions \
+                 WHERE conversation_key = ?1 \
+                   AND source = 'channel' \
+                   AND ended_at IS NULL \
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+            params![conversation_key],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(id) => (id, false),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let id = Uuid::new_v4().to_string();
+                let started_at = chrono::Utc::now().timestamp();
+                tx.execute(
+                    "INSERT INTO sessions \
+                        (id, model, started_at, source, conversation_key) \
+                     VALUES (?1, ?2, ?3, 'channel', ?4)",
+                    params![id, model, started_at, conversation_key],
+                )?;
+                (id, true)
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let scrubbed_user = scrub_channel_message(user_message);
+        let scrubbed_reply = scrub_channel_message(assistant_message);
+
+        let now = chrono::Utc::now().timestamp();
+        for (role, content) in [
+            ("user", scrubbed_user.as_str()),
+            ("assistant", scrubbed_reply.as_str()),
+        ] {
+            tx.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) \
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![id, role, content, now],
+            )?;
+        }
+        // Bump `message_count` only. `ended_at` is set only by
+        // `close_channel_session`; flipping it on every turn would defeat the
+        // reuse-by-`ended_at IS NULL` lookup and break the "same conversation
+        // stays in one session" contract the plan tests for.
+        tx.execute(
+            "UPDATE sessions SET message_count = message_count + 2 WHERE id = ?1",
+            params![id],
+        )?;
+
+        if is_new {
+            if let Some(title) = title.map(str::trim).filter(|t| !t.is_empty()) {
+                tx.execute(
+                    "UPDATE sessions SET title = ?1 WHERE id = ?2",
+                    params![title, id],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Close every open `source='channel'` session for `conversation_key`.
+    /// Returns the number of rows closed. Idempotent: a second call is a no-op.
+    /// Called by `/new` and `/clear` so the next recorded turn opens a fresh
+    /// session for the same conversation.
+    pub fn close_channel_session(&mut self, conversation_key: &str) -> Result<usize> {
+        let ended_at = chrono::Utc::now().timestamp();
+        let closed = self.conn.execute(
+            "UPDATE sessions SET ended_at = ?1 \
+             WHERE conversation_key = ?2 \
+               AND source = 'channel' \
+               AND ended_at IS NULL",
+            params![ended_at, conversation_key],
+        )?;
+        Ok(closed)
+    }
+
+    /// The id of the open channel session for `conversation_key`, or `None`
+    /// when there is none. Used by callers that want to attach metadata to
+    /// the existing session rather than mint a new one.
+    pub fn open_channel_session_id(&self, conversation_key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM sessions \
+             WHERE conversation_key = ?1 \
+               AND source = 'channel' \
+               AND ended_at IS NULL \
+             ORDER BY started_at DESC, id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![conversation_key])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remove every `source='channel'` session whose `started_at` is older
+    /// than `now - retention_secs`. Non-channel sessions are untouched. The
+    /// caller decides how often to run it (startup + once a day).
+    ///
+    /// Returns the number of sessions removed.
+    pub fn prune_channel_sessions(&mut self, retention_secs: i64) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now.saturating_sub(retention_secs);
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Delete child messages first — `messages.session_id` has no
+        // `ON DELETE CASCADE`, so removing the session row first would fail
+        // the foreign-key check under `PRAGMA foreign_keys=ON`. The subquery
+        // matches the prune criteria exactly so non-channel sessions are
+        // untouched.
+        tx.execute(
+            "DELETE FROM messages \
+             WHERE session_id IN ( \
+                 SELECT id FROM sessions \
+                 WHERE source = 'channel' AND started_at < ?1 \
+             )",
+            params![cutoff],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM sessions \
+             WHERE source = 'channel' \
+               AND started_at < ?1",
+            params![cutoff],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// One page of sessions, optionally filtered by `source`. `None` keeps the
+    /// pre-existing default (no filter); the channel recording pass is the only
+    /// surface that calls `Some(...)` and the operator-facing callers pass
+    /// `None` today so their lists are unchanged.
+    pub fn list_sessions_paged_with_source(
+        &self,
+        limit: usize,
+        offset: usize,
+        source: Option<&str>,
+    ) -> Result<Vec<SessionMeta>> {
+        let limit_v = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset_v = i64::try_from(offset).unwrap_or(i64::MAX);
+        let mut stmt = match source {
+            Some(_src) => self.conn.prepare(
+                "SELECT id, title, model, started_at, message_count, source \
+                 FROM sessions WHERE source = ?1 \
+                 ORDER BY started_at DESC, id DESC LIMIT ?2 OFFSET ?3",
+            )?,
+            None => self.conn.prepare(
+                "SELECT id, title, model, started_at, message_count, source \
+                 FROM sessions \
+                 ORDER BY started_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+            )?,
+        };
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SessionMeta> {
+            Ok(SessionMeta {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                model: row.get(2)?,
+                started_at: row.get(3)?,
+                message_count: row.get(4)?,
+                source: row.get(5)?,
+            })
+        };
+        let sessions = match source {
+            Some(src) => stmt
+                .query_map(params![src, limit_v, offset_v], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![limit_v, offset_v], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(sessions)
+    }
+
+    /// One page of sessions visible to an operator by default: every row
+    /// except `source='channel'`. The channel recording layer keeps its own
+    /// sessions in this database but the operator's `/sessions` and CLI list
+    /// never show them unless the caller explicitly asks (typically with
+    /// `--source channel`).
+    pub fn list_sessions_paged_visible(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SessionMeta>> {
+        let limit_v = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset_v = i64::try_from(offset).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, model, started_at, message_count, source \
+             FROM sessions WHERE source != 'channel' \
+             ORDER BY started_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+        )?;
+        let sessions = stmt
+            .query_map(params![limit_v, offset_v], |row| {
+                Ok(SessionMeta {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    model: row.get(2)?,
+                    started_at: row.get(3)?,
+                    message_count: row.get(4)?,
+                    source: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sessions)
+    }
+
+    /// Count of sessions that would appear in `list_sessions_paged_visible`.
+    /// Pairs with [`Self::count_sessions`] for the operator-facing pages.
+    pub fn count_sessions_visible(&self) -> Result<usize> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source != 'channel'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(total).unwrap_or(0))
+    }
+
     /// Retrieve all messages for a session, ordered by timestamp ascending.
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
@@ -632,7 +890,7 @@ impl SessionStore {
     /// anything older was invisible in the console with no way to reach it.
     pub fn list_sessions_paged(&self, limit: usize, offset: usize) -> Result<Vec<SessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, model, started_at, message_count \
+            "SELECT id, title, model, started_at, message_count, source \
              FROM sessions ORDER BY started_at DESC, id DESC LIMIT ?1 OFFSET ?2",
         )?;
 
@@ -646,6 +904,7 @@ impl SessionStore {
                     model: row.get(2)?,
                     started_at: row.get(3)?,
                     message_count: row.get(4)?,
+                    source: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -751,6 +1010,7 @@ impl SessionStore {
             message_count: 1,
             token_count: 0,
             source,
+            conversation_key: None,
         })
     }
 
@@ -793,6 +1053,7 @@ impl SessionStore {
             message_count: 1,
             token_count: 0,
             source: parent.source,
+            conversation_key: parent.conversation_key,
         })
     }
 }
@@ -1510,5 +1771,270 @@ mod tests {
         let mut s = store();
         let removed = s.delete_session("no-such-id").unwrap();
         assert!(!removed);
+    }
+
+    // ── Channel recording ──────────────────────────────────────────────────
+
+    /// The first channel turn for a key opens a new `source='channel'` session.
+    /// Subsequent turns for the same key reuse it. `/new`-style close + reopen
+    /// gives the next turn a fresh session.
+    #[test]
+    fn record_channel_turn_reuses_open_session_for_same_conversation() {
+        let mut s = store();
+
+        let first = s
+            .record_channel_turn("m", "telegram:chat-1", "first user", "first reply", None)
+            .unwrap();
+        let second = s
+            .record_channel_turn("m", "telegram:chat-1", "second user", "second reply", None)
+            .unwrap();
+
+        assert_eq!(first, second, "second turn reuses the open session");
+        let sess = s.get_session(&first).unwrap().unwrap();
+        assert_eq!(sess.source, "channel");
+        assert_eq!(sess.conversation_key.as_deref(), Some("telegram:chat-1"));
+        assert_eq!(sess.message_count, 4, "two user + two assistant");
+        let msgs = s.get_messages(&first).unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].content, "first user");
+        assert_eq!(msgs[1].content, "first reply");
+        assert_eq!(msgs[2].content, "second user");
+        assert_eq!(msgs[3].content, "second reply");
+    }
+
+    /// `/new` and `/clear` close the open session for the conversation. The
+    /// next recorded message opens a fresh one — the session id must change.
+    #[test]
+    fn record_channel_turn_opens_a_new_session_after_close() {
+        let mut s = store();
+
+        let before = s
+            .record_channel_turn("m", "telegram:chat-1", "u1", "r1", None)
+            .unwrap();
+        let removed = s.close_channel_session("telegram:chat-1").unwrap();
+        assert_eq!(removed, 1, "the open session was closed");
+        let after = s
+            .record_channel_turn("m", "telegram:chat-1", "u2", "r2", None)
+            .unwrap();
+        assert_ne!(before, after);
+        // The closed session keeps its message_count; the new one starts at 2.
+        let old = s.get_session(&before).unwrap().unwrap();
+        assert!(old.ended_at.is_some());
+        assert_eq!(old.message_count, 2);
+        let new = s.get_session(&after).unwrap().unwrap();
+        assert_eq!(new.message_count, 2);
+        assert!(new.ended_at.is_none());
+        // Only the new session has no `ended_at` for this conversation key.
+        let open = s
+            .open_channel_session_id("telegram:chat-1")
+            .unwrap()
+            .expect("a fresh open session exists");
+        assert_eq!(open, after);
+    }
+
+    /// Two different conversation keys get two different sessions — keys must
+    /// not collapse across chats. The pin test for the per-conversation key
+    /// semantics.
+    #[test]
+    fn record_channel_turn_keeps_keys_isolated() {
+        let mut s = store();
+
+        let a = s
+            .record_channel_turn("m", "telegram:chat-1", "ua", "ra", None)
+            .unwrap();
+        let b = s
+            .record_channel_turn("m", "telegram:chat-2", "ub", "rb", None)
+            .unwrap();
+        assert_ne!(a, b);
+
+        let sess_a = s.get_session(&a).unwrap().unwrap();
+        let sess_b = s.get_session(&b).unwrap().unwrap();
+        assert_eq!(sess_a.conversation_key.as_deref(), Some("telegram:chat-1"));
+        assert_eq!(sess_b.conversation_key.as_deref(), Some("telegram:chat-2"));
+    }
+
+    /// Both scrubbers run on every recorded message before the INSERT.
+    /// `scrub_secret_patterns` redacts known-prefix tokens; `scrub_credentials`
+    /// redacts known KV-style secrets. A token-shaped secret in user text and
+    /// a KV-style secret in the reply must both come back as `[REDACTED]` on
+    /// read.
+    #[test]
+    fn record_channel_turn_scrubs_secrets_in_both_messages() {
+        let mut s = store();
+
+        // A token with the `sk-` prefix in the user text, a JSON credential
+        // pair in the reply text. Both scrubbers run, so both are redacted.
+        let user_text = "here is my key: sk-abcdef1234567890XYZ";
+        let reply_text = r#"saved with api_key: "supersecretvalue1234""#;
+
+        let id = s
+            .record_channel_turn("m", "telegram:chat-1", user_text, reply_text, None)
+            .unwrap();
+        let msgs = s.get_messages(&id).unwrap();
+        let stored_user = msgs[0].content.clone();
+        let stored_reply = msgs[1].content.clone();
+
+        assert!(
+            !stored_user.contains("abcdef1234567890"),
+            "token-shaped value must be scrubbed: {stored_user}"
+        );
+        assert!(
+            !stored_reply.contains("supersecretvalue1234"),
+            "KV secret must be scrubbed: {stored_reply}"
+        );
+        assert!(
+            stored_user.contains("REDACTED"),
+            "the redacted marker must be present: {stored_user}"
+        );
+        assert!(
+            stored_reply.contains("REDACTED"),
+            "the redacted marker must be present: {stored_reply}"
+        );
+    }
+
+    /// A title carried on the first turn becomes the session title. The
+    /// second turn does not overwrite it. Channels carry the title directly
+    /// when the parser already has it (e.g. Telegram `chat.title`); without
+    /// one, the caller passes `None` and the title is `NULL` until set.
+    #[test]
+    fn record_channel_turn_first_turn_carries_chat_title() {
+        let mut s = store();
+
+        let id = s
+            .record_channel_turn("m", "telegram:chat-1", "hi", "hello", Some("Family Chat"))
+            .unwrap();
+        let sess = s.get_session(&id).unwrap().unwrap();
+        assert_eq!(sess.title.as_deref(), Some("Family Chat"));
+
+        // Subsequent turns don't overwrite the title.
+        s.record_channel_turn("m", "telegram:chat-1", "another", "reply", None)
+            .unwrap();
+        let after = s.get_session(&id).unwrap().unwrap();
+        assert_eq!(after.title.as_deref(), Some("Family Chat"));
+    }
+
+    /// Channel sessions older than the retention window are removed. Sessions
+    /// younger than it stay. Non-channel sessions are untouched no matter how
+    /// old.
+    #[test]
+    fn prune_channel_sessions_removes_only_source_channel_past_retention() {
+        let mut s = store();
+
+        // A channel session aged past retention.
+        let old_id = s
+            .record_channel_turn("m", "telegram:chat-old", "u", "r", None)
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE sessions SET started_at = 1 WHERE id = ?1",
+                params![old_id],
+            )
+            .unwrap();
+
+        // A fresh channel session (now() within retention).
+        s.record_channel_turn("m", "telegram:chat-fresh", "u", "r", None)
+            .unwrap();
+
+        // A TUI session aged past retention — must NOT be removed.
+        let tui_id = s.new_session("m", "tui").unwrap();
+        s.conn
+            .execute(
+                "UPDATE sessions SET started_at = 1 WHERE id = ?1",
+                params![&tui_id.id],
+            )
+            .unwrap();
+
+        let cutoff = 31_i64 * 24 * 60 * 60;
+        let removed = s.prune_channel_sessions(cutoff).unwrap();
+        assert_eq!(removed, 1, "only the aged channel session");
+
+        assert!(s.get_session(&old_id).unwrap().is_none());
+        // The fresh channel session and the TUI session both survive.
+        assert!(s.count_sessions().unwrap() >= 2);
+        assert!(s.get_session(&tui_id.id).unwrap().is_some());
+    }
+
+    /// A TUI session of any age must never be removed by
+    /// `prune_channel_sessions`. Pin test for the source filter.
+    #[test]
+    fn prune_channel_sessions_leaves_tui_sessions_untouched() {
+        let mut s = store();
+        let tui_id = s.new_session("m", "tui").unwrap();
+        s.conn
+            .execute(
+                "UPDATE sessions SET started_at = 0 WHERE id = ?1",
+                params![&tui_id.id],
+            )
+            .unwrap();
+        // 31-day retention in seconds; the row's started_at is 0.
+        let removed = s.prune_channel_sessions(31_i64 * 24 * 60 * 60).unwrap();
+        assert_eq!(removed, 0);
+        assert!(s.get_session(&tui_id.id).unwrap().is_some());
+    }
+
+    /// `close_channel_session` returns the number of sessions it closed. A
+    /// second call is a no-op (the open session is gone).
+    #[test]
+    fn close_channel_session_is_idempotent() {
+        let mut s = store();
+        s.record_channel_turn("m", "telegram:chat-1", "u", "r", None)
+            .unwrap();
+        let first = s.close_channel_session("telegram:chat-1").unwrap();
+        let second = s.close_channel_session("telegram:chat-1").unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
+    }
+
+    /// `list_sessions_paged_visible` is the operator-facing default list: it
+    /// excludes every row whose `source = 'channel'`, so channel transcripts
+    /// stay out of the standard `/sessions`, CLI `session list`, and
+    /// `GET /api/v1/sessions` calls until the caller asks for them
+    /// explicitly. The other `source` values (tui, api, …) are unaffected.
+    #[test]
+    fn list_sessions_paged_visible_excludes_channel_sessions() {
+        let mut s = store();
+        let tui_id = s.new_session("m", "tui").unwrap();
+        let api_id = s.new_session("m", "api").unwrap();
+        s.record_channel_turn("m", "telegram:chat-1", "u", "r", None)
+            .unwrap();
+
+        let visible = s.list_sessions_paged_visible(50, 0).unwrap();
+        let visible_ids: Vec<&str> = visible.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            visible_ids.contains(&tui_id.id.as_str()),
+            "tui session must remain visible"
+        );
+        assert!(
+            visible_ids.contains(&api_id.id.as_str()),
+            "api session must remain visible"
+        );
+        assert!(
+            !visible_ids
+                .iter()
+                .any(|id| s.get_session(id).unwrap().unwrap().source == "channel"),
+            "no channel row in the visible list"
+        );
+
+        // And the total count agrees with the page count.
+        assert_eq!(s.count_sessions_visible().unwrap(), 2);
+    }
+
+    /// `list_sessions_paged_with_source(_, _, Some("channel"))` returns
+    /// channel sessions and nothing else, which is the surface-level
+    /// `?source=channel` filter.
+    #[test]
+    fn list_sessions_paged_with_source_returns_only_channel_rows() {
+        let mut s = store();
+        s.new_session("m", "tui").unwrap();
+        s.record_channel_turn("m", "telegram:chat-1", "u", "r", None)
+            .unwrap();
+        s.record_channel_turn("m", "discord:chat-2", "u", "r", None)
+            .unwrap();
+
+        let only_channel = s
+            .list_sessions_paged_with_source(50, 0, Some("channel"))
+            .unwrap();
+        assert_eq!(only_channel.len(), 2);
+        assert!(only_channel.iter().all(|s| s.source == "channel"));
     }
 }

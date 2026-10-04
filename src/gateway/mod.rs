@@ -4919,6 +4919,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(std::sync::Mutex::new(HashMap::new())),
             history_store,
+            session_store: None,
             ledger: None,
             provider_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             route_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),

@@ -25,11 +25,20 @@ fn fmt_ts(ts: i64) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-pub fn list(limit: usize) -> Result<()> {
+pub fn list(limit: usize, source: Option<&str>) -> Result<()> {
     let store = open_store()?;
-    let sessions = store.list_sessions(limit)?;
+    // The default `list` excludes `source='channel'` rows so the operator's
+    // routine scan does not surface transcripts that already live in their
+    // own place. Pass `--source channel` (and friends) to view them.
+    let sessions = match source {
+        Some(src) => store.list_sessions_paged_with_source(limit, 0, Some(src))?,
+        None => store.list_sessions_paged_visible(limit, 0)?,
+    };
     if sessions.is_empty() {
-        println!("No sessions yet.");
+        match source {
+            Some(_) => println!("No sessions match this filter."),
+            None => println!("No sessions yet."),
+        }
         return Ok(());
     }
     crate::cli_style::section(&format!("sessions ({})", sessions.len()));
@@ -40,10 +49,11 @@ pub fn list(limit: usize) -> Result<()> {
         println!(
             "            {}",
             crate::cli_style::dim(&format!(
-                "{}  ·  {} msgs  ·  {}",
+                "{}  ·  {} msgs  ·  {}  ·  {}",
                 fmt_ts(s.started_at),
                 s.message_count,
-                s.model
+                s.model,
+                s.source
             ))
         );
     }

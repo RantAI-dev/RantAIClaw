@@ -324,6 +324,7 @@ pub(super) fn dispatch_ctx(
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         history_store: None,
+        session_store: None,
         ledger: None,
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),

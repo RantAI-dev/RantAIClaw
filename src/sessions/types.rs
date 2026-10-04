@@ -12,6 +12,12 @@ pub struct Session {
     pub message_count: i64,
     pub token_count: i64,
     pub source: String,
+    /// The chat this session records for. `None` on every session written
+    /// before v2 or by a path that does not key on a chat (TUI, gateway). Only
+    /// rows the channel recording path writes carry a value, and only they are
+    /// pruned by [`crate::sessions::SessionStore::prune_channel_sessions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_key: Option<String>,
 }
 
 /// Minimal session info for listing
@@ -22,6 +28,12 @@ pub struct SessionMeta {
     pub model: String,
     pub started_at: i64,
     pub message_count: i64,
+    /// The session's `source` column. Set on every listing path now, since
+    /// the source filter the channel recording pass uses reads it; the
+    /// pre-existing lists at the CLI/TUI/API surfaces read it too even
+    /// though they never display it.
+    #[allow(dead_code)]
+    pub source: String,
 }
 
 /// A message within a session

@@ -1,11 +1,13 @@
 ---
 source: tests/schema_drift.rs
-assertion_line: 64
 description: "sessions.db DDL fingerprint. If this test fails, you changed the SQLite schema. Bump sessions::migrations::CURRENT_VERSION, add a migrate_vN function, write a unit test, then `cargo insta accept` here."
 expression: ddl
 ---
 -- index idx_messages_session
 CREATE INDEX idx_messages_session ON messages(session_id, timestamp)
+
+-- index idx_sessions_conversation_key
+CREATE INDEX idx_sessions_conversation_key ON sessions(conversation_key, started_at DESC)
 
 -- index idx_sessions_started
 CREATE INDEX idx_sessions_started ON sessions(started_at DESC)
@@ -32,7 +34,7 @@ CREATE TABLE 'messages_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WIT
 CREATE TABLE schema_version (version INTEGER PRIMARY KEY)
 
 -- table sessions
-CREATE TABLE sessions ( id TEXT PRIMARY KEY, title TEXT, parent_session_id TEXT, model TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, message_count INTEGER DEFAULT 0, token_count INTEGER DEFAULT 0, source TEXT DEFAULT 'tui', FOREIGN KEY (parent_session_id) REFERENCES sessions(id) )
+CREATE TABLE sessions ( id TEXT PRIMARY KEY, title TEXT, parent_session_id TEXT, model TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, message_count INTEGER DEFAULT 0, token_count INTEGER DEFAULT 0, source TEXT DEFAULT 'tui', conversation_key TEXT, FOREIGN KEY (parent_session_id) REFERENCES sessions(id) )
 
 -- trigger messages_ad
 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content); END
