@@ -1884,14 +1884,7 @@ async fn main() -> Result<()> {
             );
             let effective_memory_backend =
                 memory::effective_memory_backend_name(&config.memory.backend);
-            cli_style::field(
-                "Memory",
-                W,
-                &format!(
-                    "{effective_memory_backend} · auto-save {}",
-                    if config.memory.auto_save { "on" } else { "off" }
-                ),
-            );
+            cli_style::field("Memory", W, &effective_memory_backend);
 
             cli_style::section("channels");
             cli_style::status_row(true, "CLI", CH_W, "always");

@@ -28,10 +28,6 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
-/// Minimum user-message length (in chars) for auto-save to memory.
-/// Matches the channel-side constant in `channels/mod.rs`.
-const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
-
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)token",
@@ -144,8 +140,6 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
         })
         .collect()
 }
-
-use crate::memory::autosave_memory_key;
 
 /// Open the same `sessions.db` the TUI uses so single-shot CLI agent
 /// turns (`agent -m`) get recorded alongside TUI sessions. Returns
@@ -2562,23 +2556,6 @@ pub async fn run_with_scope(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory (skip short/trivial messages).
-        // The session_id follows the turn's memory view: nothing on no view,
-        // shared under `All`, chat-scoped under `Only(place)` — so a chat
-        // never leaks its note into another chat's recall.
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-            if let Some(session_id) = crate::memory::autosave_session_for_view(memory_view.as_ref())
-            {
-                crate::memory::autosave_screened(
-                    mem.as_ref(),
-                    &autosave_memory_key("user_msg"),
-                    &msg,
-                    session_id.as_deref(),
-                )
-                .await;
-            }
-        }
-
         // Open the same SessionStore the TUI uses so headless `agent -m`
         // calls show up in `session list`, `session search`, and the
         // `/api/v1/sessions*` endpoints. Pre-fix, sessions.db only saw
@@ -2734,17 +2711,6 @@ pub async fn run_with_scope(
                     continue;
                 }
                 _ => {}
-            }
-
-            // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                crate::memory::autosave_screened(
-                    mem.as_ref(),
-                    &autosave_memory_key("user_msg"),
-                    &user_input,
-                    None,
-                )
-                .await;
             }
 
             // Inject memory context into user message
@@ -4084,6 +4050,78 @@ mod tests {
         );
     }
 
+    /// The headless `agent -m` door used to write the user's input message
+    /// into the `memories` table as a Conversation row, before any reply
+    /// existed. A row enters that table only when someone asks — through the
+    /// `memory_store` tool, the CLI, the console or the TUI. This guard pins
+    /// the writer's absence at the source so a regression that re-adds the
+    /// call fires this assertion immediately.
+    ///
+    /// Why source-pinned rather than a runtime test:
+    ///   * `run_with_scope` constructs a real provider before reaching the
+    ///     writer. A test that reaches the writer end-to-end needs a live
+    ///     provider, network, and timer.
+    ///   * The cron scheduler, the daemon heartbeat, the CLI single-shot and
+    ///     the gateway chat all flow through this same code path. Pinning
+    ///     the writer's presence covers every caller at once.
+    ///   * Runtime coverage for the same invariant lives at the agent door:
+    ///     `agent::tests::agent_turn_does_not_write_a_conversation_row` and
+    ///     its siblings prove a real turn leaves the `memories` table
+    ///     untouched when nobody asked.
+    #[test]
+    fn headless_agent_message_writer_is_removed() {
+        let src = include_str!("loop_.rs");
+        let test_module = format!("\n#[cfg({})]\nmod tests {{", "test");
+        let (runtime, _) = src
+            .split_once(test_module.as_str())
+            .expect("the test module marker is still in loop_.rs; update this guard");
+        // The headless writer token: `autosave_screened(` reached from
+        // `config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS`.
+        // The helper itself is being retired, so its presence anywhere in
+        // the production code of `loop_.rs` means a regression.
+        let call = "autosave_screened(";
+        let sites: Vec<usize> = runtime.match_indices(call).map(|(i, _)| i).collect();
+        assert!(
+            sites.is_empty(),
+            "the headless `agent -m` door must not call `autosave_screened`; \
+             the writer was retired. Found {} site(s) in loop_.rs at byte offsets \
+             {:?}. The agent door only writes to memory when the operator (or the \
+             model they trust) asks — never on inbound input.",
+            sites.len(),
+            sites
+        );
+    }
+
+    /// The interactive REPL door used to write the user's input message into
+    /// the `memories` table as a Conversation row at the top of every loop
+    /// iteration. The same rule applies as the headless door: a row enters
+    /// only when someone asks. This guard pins the writer's absence.
+    ///
+    /// Same source-pinning rationale as `headless_agent_message_writer_is_removed`:
+    /// the REPL drives the same future as the CLI's headless path, and a
+    /// regression that re-adds the writer fires this assertion.
+    #[test]
+    fn repl_writer_is_removed() {
+        let src = include_str!("loop_.rs");
+        let test_module = format!("\n#[cfg({})]\nmod tests {{", "test");
+        let (runtime, _) = src
+            .split_once(test_module.as_str())
+            .expect("the test module marker is still in loop_.rs; update this guard");
+        // The REPL writer token: same helper as the headless door. The
+        // production code must not contain it.
+        let call = "autosave_screened(";
+        let sites: Vec<usize> = runtime.match_indices(call).map(|(i, _)| i).collect();
+        assert!(
+            sites.is_empty(),
+            "the REPL door must not call `autosave_screened`; \
+             the writer was retired. Found {} site(s) in loop_.rs at byte offsets \
+             {:?}. The REPL turn only writes to memory when the operator (or the \
+             model they trust) asks — never on inbound input.",
+            sites.len(),
+            sites
+        );
+    }
+
     #[tokio::test]
     async fn injected_backend_overrides_non_cli_auto_deny() {
         // This test drives the executor, and the executor appends to the
@@ -4901,37 +4939,6 @@ Done."#;
         assert!(history[1].content.contains("Compacted summary"));
         assert!(history[2].content.contains("recent 1"));
         assert!(history[3].content.contains("recent 2"));
-    }
-
-    #[test]
-    fn autosave_memory_key_has_prefix_and_uniqueness() {
-        let key1 = autosave_memory_key("user_msg");
-        let key2 = autosave_memory_key("user_msg");
-
-        assert!(key1.starts_with("user_msg_"));
-        assert!(key2.starts_with("user_msg_"));
-        assert_ne!(key1, key2);
-    }
-
-    #[tokio::test]
-    async fn autosave_memory_keys_preserve_multiple_turns() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
-
-        let key1 = autosave_memory_key("user_msg");
-        let key2 = autosave_memory_key("user_msg");
-
-        mem.store(&key1, "I'm Paul", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-        mem.store(&key2, "I'm 45", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-
-        assert_eq!(mem.count().await.unwrap(), 2);
-
-        let recalled = mem.recall("45", 5, None).await.unwrap();
-        assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
     #[tokio::test]

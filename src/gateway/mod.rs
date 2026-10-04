@@ -17,7 +17,7 @@ use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::approval::ApprovalManager;
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
-use crate::memory::{self, Memory, MemoryCategory};
+use crate::memory::{self, Memory};
 use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
@@ -41,7 +41,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
-use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -55,10 +54,6 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
-
-fn webhook_memory_key() -> String {
-    format!("webhook_msg_{}", Uuid::new_v4())
-}
 
 fn hash_webhook_secret(value: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -483,7 +478,6 @@ pub struct AppState {
     pub model: String,
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
-    pub auto_save: bool,
     /// Builds the tool registry for one webhook / channel-relay turn. See
     /// [`ToolsFactory`].
     ///
@@ -805,7 +799,6 @@ pub fn build_gateway_router(
         model,
         temperature,
         mem,
-        auto_save: config.memory.auto_save,
         tools_factory,
         webhook_secret_hash,
         pairing,
@@ -1909,18 +1902,6 @@ async fn handle_webhook(
     }
 
     let message = &webhook_body.message;
-
-    // Webhooks have no chat turn behind them, so they don't carry a
-    // `MemoryView`. Skipping the autosave keeps the rule "no view, no write"
-    // — without it, an unscoped webhook caller could leave a note in the
-    // shared conversation memory. The body still reaches the model.
-    if state.auto_save && crate::memory::current_memory_view().is_some() {
-        let key = webhook_memory_key();
-        let _ = state
-            .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
-            .await;
-    }
 
     let provider_label = state
         .config
@@ -3142,7 +3123,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -3195,7 +3176,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -3565,7 +3546,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(true, &[])),
             trust_forwarded_headers: false,
@@ -3650,16 +3631,6 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
-    }
-
-    #[test]
-    fn webhook_memory_key_is_unique() {
-        let key1 = webhook_memory_key();
-        let key2 = webhook_memory_key();
-
-        assert!(key1.starts_with("webhook_msg_"));
-        assert!(key2.starts_with("webhook_msg_"));
-        assert_ne!(key1, key2);
     }
 
     #[derive(Default)]
@@ -3967,7 +3938,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4263,7 +4234,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4317,7 +4288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_autosave_stores_distinct_keys_per_request() {
+    async fn webhook_turn_does_not_store_a_memory_row() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
 
@@ -4331,7 +4302,6 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: true,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4355,9 +4325,10 @@ mod tests {
 
         let headers = HeaderMap::new();
 
-        // The handler only autosaves when a memory view is in scope. Wrap each
-        // call so the existing assertions stay focused on the key uniqueness
-        // contract.
+        // The body still reaches the model — the test asserts the body is
+        // served, not that the writer is the only path. A regression that
+        // re-adds the writer with `auto_save: true` and a view in scope
+        // would push a key here and fail the assertion below.
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
         }));
@@ -4388,11 +4359,16 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
 
         let keys = tracking_impl.keys.lock().clone();
-        assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0], keys[1]);
-        assert!(keys[0].starts_with("webhook_msg_"));
-        assert!(keys[1].starts_with("webhook_msg_"));
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            keys.is_empty(),
+            "the webhook door must not store any memory row; got {} key(s): {keys:?}",
+            keys.len()
+        );
+        assert_eq!(
+            provider_impl.calls.load(Ordering::SeqCst),
+            2,
+            "the body still reaches the provider twice"
+        );
     }
 
     /// Webhooks have no chat turn behind them, so they don't carry a
@@ -4415,7 +4391,6 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: true,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4483,7 +4458,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4535,7 +4510,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4592,7 +4567,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4680,7 +4655,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4914,7 +4889,6 @@ mod tests {
             guest_system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
-            auto_save_memory: false,
             max_tool_iterations: 4,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -5457,7 +5431,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -5516,7 +5490,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -5578,7 +5552,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -5651,7 +5625,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -6463,7 +6437,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
-            auto_save: false,
+
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,

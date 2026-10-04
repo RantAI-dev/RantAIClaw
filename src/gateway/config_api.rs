@@ -4006,7 +4006,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(crate::memory::NoneMemory::new()),
-            auto_save: false,
+
             tools_factory: Arc::new(|_: &Config| Vec::new()),
             webhook_secret_hash: None,
             pairing: Arc::new(crate::security::pairing::PairingGuard::new(false, &[])),

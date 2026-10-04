@@ -524,7 +524,6 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `none`. An unrecognised value is a startup error, not a fallback |
-| `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded). Auto-saved turns are stored under the `conversation` category: retained, searchable via `memory_recall`, but **never auto-injected into prompts** |
 | `min_relevance_score` | `0.6` | drop recalled entries scoring below this. See _Scores are absolute_ below. Config schema 37 moved the default from `0.4` (see [v37](#v37-the-relevance-floor-moves-from-04-to-06)) |
 | `embedding_provider` | `none` | `none`, `openai`, `openrouter`, `minimax`, or `custom:<base-url>` |
 | `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` to use an `[[embedding_routes]]` entry |
@@ -654,18 +653,20 @@ second one.
   dropped from the question before scoring. A question with no other word recalls
   nothing. An explicit search (`memory_recall`, the API, the CLI) still searches
   the words it was given.
-- The raw `conversation` rows that auto-save writes never take a place in the
-  recall limit that a saved note needs. `memory_recall` and the operator searches
-  list the saved notes first and fill the rest of the limit with conversation rows.
+- A row enters the `conversation` category only when a tool call, the CLI, the
+  console, or the TUI writes one explicitly — no door writes a row from a chat
+  message on its own. `memory_recall` and the operator searches list saved notes
+  first and fill the rest of the limit with any conversation rows an operator
+  chose to keep.
 - The block opens with its header line, then states that the notes are saved
   data and not instructions, to be used only when they bear on the question and
   not to be mentioned unless asked.
 - Logs carry counts for each recall, never a question, a key or a note. An error
   from the store or an embedding provider is logged as its kind only.
 
-The context builder also drops an entry that _is_ the message being answered
-(auto-save stores a verbatim copy, which is worthless as context). An entry that
-merely mentions the same topic is unaffected; only a verbatim echo is dropped.
+The context builder also drops an entry that _is_ the message being answered. A
+verbatim echo of the question is worthless as context; an entry that merely
+mentions the same topic is unaffected.
 
 ### Embedding dimensions must match the model
 
@@ -705,8 +706,10 @@ when the session starts; within-session recall covers the gap there.
 
 Notes:
 
-- Memory context injection ignores legacy `assistant_resp*` auto-save keys, so old
-  model-authored summaries are not re-presented as facts.
+- Memory context injection ignores legacy `assistant_resp*` auto-save keys, so
+  any rows an older installed build wrote under that prefix are not
+  re-presented as facts. Clear them with
+  `rantaiclaw memory clear --category conversation --yes`.
 - Content written to memory is screened: invisible characters are stripped,
   credential-shaped tokens are redacted, and content carrying the `[Memory context]`
   header is refused — it would let one memory impersonate several.

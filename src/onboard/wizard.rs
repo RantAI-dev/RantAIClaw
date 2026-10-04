@@ -433,10 +433,9 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         style("Supervised").green()
     );
     println!(
-        "  {} Memory: {} (auto-save: {})",
+        "  {} Memory: {}",
         style("✓").green().bold(),
         style(&config.memory.backend).green(),
-        if config.memory.auto_save { "on" } else { "off" }
     );
 
     config.save().await?;
@@ -577,7 +576,6 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
 
     MemoryConfig {
         backend: backend.to_string(),
-        auto_save: profile.auto_save_default,
         hygiene_enabled: profile.uses_sqlite_hygiene,
         archive_after_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
         purge_after_days: if profile.uses_sqlite_hygiene { 30 } else { 0 },
@@ -3366,24 +3364,14 @@ fn setup_memory() -> Result<MemoryConfig> {
         .interact()?;
 
     let backend = backend_key_from_choice(choice);
-    let profile = memory_backend_profile(backend);
-
-    let auto_save = profile.auto_save_default
-        && Confirm::new()
-            .with_prompt("  Auto-save conversations to memory?")
-            .default(true)
-            .interact()?;
 
     println!(
-        "  {} Memory: {} (auto-save: {})",
+        "  {} Memory: {}",
         style("✓").green().bold(),
         style(backend).green(),
-        if auto_save { "on" } else { "off" }
     );
 
-    let mut config = memory_config_defaults_for_backend(backend);
-    config.auto_save = auto_save;
-    Ok(config)
+    Ok(memory_config_defaults_for_backend(backend))
 }
 
 // ── Step 3: Channels ────────────────────────────────────────────
@@ -5454,10 +5442,9 @@ fn print_summary(config: &Config) {
         config.autonomy.level
     );
     println!(
-        "    {} Memory:        {} (auto-save: {})",
+        "    {} Memory:        {}",
         style("🧠").cyan(),
         config.memory.backend,
-        if config.memory.auto_save { "on" } else { "off" }
     );
 
     // Channels summary
@@ -7400,17 +7387,14 @@ mod tests {
     fn memory_backend_profile_marks_sqlite_and_none() {
         let sqlite = memory_backend_profile("sqlite");
         assert_eq!(sqlite.key, "sqlite");
-        assert!(sqlite.auto_save_default);
         assert!(sqlite.uses_sqlite_hygiene);
         assert!(sqlite.sqlite_based);
         assert!(!sqlite.optional_dependency);
 
         let none = memory_backend_profile("none");
-        assert!(!none.auto_save_default);
         assert!(!none.uses_sqlite_hygiene);
 
         let custom = memory_backend_profile("custom-memory");
-        assert!(custom.auto_save_default);
         assert!(!custom.uses_sqlite_hygiene);
     }
 
@@ -7418,7 +7402,6 @@ mod tests {
     fn memory_config_defaults_for_sqlite_enable_sqlite_hygiene() {
         let config = memory_config_defaults_for_backend("sqlite");
         assert_eq!(config.backend, "sqlite");
-        assert!(config.auto_save);
         assert!(config.hygiene_enabled);
         assert_eq!(config.archive_after_days, 7);
         assert_eq!(config.purge_after_days, 30);
@@ -7443,7 +7426,6 @@ mod tests {
     fn memory_config_defaults_for_none_disable_sqlite_hygiene() {
         let config = memory_config_defaults_for_backend("none");
         assert_eq!(config.backend, "none");
-        assert!(!config.auto_save);
         assert!(!config.hygiene_enabled);
         assert_eq!(config.archive_after_days, 0);
         assert_eq!(config.purge_after_days, 0);

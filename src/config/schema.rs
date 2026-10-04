@@ -1858,8 +1858,6 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
 pub struct MemoryConfig {
     /// "sqlite" | "none" (`none` = explicit no-op memory)
     pub backend: String,
-    /// Auto-save user-stated conversation input to memory (assistant output is excluded)
-    pub auto_save: bool,
     /// Run memory/session hygiene (archiving + retention cleanup)
     #[serde(default = "default_hygiene_enabled")]
     pub hygiene_enabled: bool,
@@ -1959,7 +1957,6 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             backend: "sqlite".into(),
-            auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
@@ -6216,7 +6213,6 @@ default_temperature = 0.7
     async fn memory_config_default_hygiene_settings() {
         let m = MemoryConfig::default();
         assert_eq!(m.backend, "sqlite");
-        assert!(m.auto_save);
         assert!(m.hygiene_enabled);
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);

@@ -67,7 +67,6 @@ pub struct Agent {
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
-    auto_save: bool,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -107,7 +106,6 @@ pub struct AgentBuilder {
     identity_config: Option<crate::config::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
-    auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     conversation_id: Option<String>,
@@ -134,7 +132,6 @@ impl AgentBuilder {
             identity_config: None,
             skills: None,
             skills_prompt_mode: None,
-            auto_save: None,
             classification_config: None,
             available_hints: None,
             conversation_id: None,
@@ -245,11 +242,6 @@ impl AgentBuilder {
         self
     }
 
-    pub fn auto_save(mut self, auto_save: bool) -> Self {
-        self.auto_save = Some(auto_save);
-        self
-    }
-
     pub fn classification_config(
         mut self,
         classification_config: crate::config::QueryClassificationConfig,
@@ -304,7 +296,6 @@ impl AgentBuilder {
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
-            auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -603,7 +594,6 @@ impl Agent {
                 config,
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
-            .auto_save(config.memory.auto_save)
             .build()
             .map(|mut agent| {
                 agent.security = Some(security);
@@ -982,23 +972,9 @@ impl Agent {
                 )));
         }
 
-        // Store turn memory under this agent's conversation scope. `None`
-        // (default) writes to the shared tier. What the turn reads is the
-        // door's memory view, read by the loader below.
+        // The conversation id (if any) is still on the agent, so a tool the model calls
+        // can read it; the door's loader uses it as the per-turn read scope.
         let conversation_scope = self.conversation_id.as_deref();
-
-        if self.auto_save {
-            // Per-turn key: `memories.key` is UNIQUE and `store` upserts on
-            // conflict, so a literal key would make each turn overwrite the last
-            // and leave this surface with a single row forever.
-            crate::memory::autosave_screened(
-                self.memory.as_ref(),
-                &crate::memory::autosave_memory_key("user_msg"),
-                user_message,
-                conversation_scope,
-            )
-            .await;
-        }
 
         // The loader reads under the door's memory view; a turn with no view
         // recalls nothing.
@@ -1444,13 +1420,15 @@ mod tests {
         }
     }
 
-    /// Auto-save writes the raw user message into the one store that is read
-    /// back into a later prompt without anyone looking at it again. A
-    /// credential typed into the TUI landed verbatim in `brain.db`, was
+    /// Auto-save used to write the raw user message into the one store that
+    /// is read back into a later prompt without anyone looking at it again.
+    /// A credential typed into the TUI landed verbatim in `brain.db`, was
     /// returned by `memory_recall`, was served by `GET /api/v1/memory`, and
-    /// travelled back to the provider on every later recall.
+    /// travelled back to the provider on every later recall. With auto-save
+    /// gone, the turn must leave the store empty — there is no place left for
+    /// a credential to leak to.
     #[tokio::test]
-    async fn turn_autosave_screens_a_credential_before_it_reaches_memory() {
+    async fn turn_does_not_store_a_credential_at_all() {
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
                 usage: None,
@@ -1468,7 +1446,6 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .auto_save(true)
             .build()
             .expect("agent builder should succeed");
 
@@ -1478,16 +1455,10 @@ mod tests {
             .unwrap();
 
         let stored = mem.stored.lock();
-        assert_eq!(stored.len(), 1, "the turn is still auto-saved");
         assert!(
-            !stored[0].contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
-            "the credential must not reach memory: {}",
-            stored[0]
-        );
-        assert!(
-            stored[0].contains("REDACTED"),
-            "the redaction marker should be visible: {}",
-            stored[0]
+            stored.is_empty(),
+            "the turn must not auto-save at all; got {} row(s): {stored:?}",
+            stored.len()
         );
     }
 

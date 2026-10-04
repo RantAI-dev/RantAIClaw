@@ -500,7 +500,7 @@ async fn guest_channel_turn_uses_guest_prompt_scoped_memory_and_probe_view() {
         guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -623,7 +623,7 @@ async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_and_the_all_view
         guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -751,7 +751,7 @@ async fn guest_channel_turn_uses_guest_persona_without_owner_name_or_timezone() 
         guest_system_prompt: Arc::new(prompt_fixture.to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -4234,11 +4234,13 @@ async fn a_save_never_replaces_a_different_note_by_accident() {
     }
 }
 
-/// Auto-save writes each message to the conversation it arrived in, never to the
-/// shared place `MEMORY.md` reads: a guest's, an owner's in a group and an owner's
-/// in a direct chat.
+/// A row enters the `memories` table only because someone asked: the
+/// `memory_store` tool, the CLI, the console or the TUI. This is the
+/// invariant on the channel dispatch door. The dispatch default config has
+/// auto-save on, so a regression that re-adds the writer fires this assertion
+/// immediately for every channel — guest, group owner, direct owner.
 #[tokio::test]
-async fn auto_save_writes_each_message_to_its_own_conversation() {
+async fn channel_dispatch_does_not_write_a_conversation_row() {
     let deployment = Deployment::start(Options::guest_tools(&[])).await;
 
     for (sender, chat, is_direct, text) in [
@@ -4264,20 +4266,15 @@ async fn auto_save_writes_each_message_to_its_own_conversation() {
         deployment
             .turn_in(sender, chat, is_direct, text, Vec::new())
             .await;
-        let saved: Vec<_> = deployment
+        let saved = deployment
             .ctx
             .memory
             .list(Some(&MemoryCategory::Conversation), None)
             .await
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.content.contains(text))
-            .collect();
-        assert_eq!(saved.len(), 1, "{text}: {saved:?}");
-        assert_eq!(
-            saved[0].session_id.as_deref(),
-            Some(scope_of(sender, chat, is_direct).as_str()),
-            "{text}"
+            .unwrap();
+        assert!(
+            saved.is_empty(),
+            "{text}: channel dispatch must not write a Conversation row; got {saved:?}"
         );
     }
 }

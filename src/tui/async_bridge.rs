@@ -647,7 +647,6 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .auto_save(true)
             .build()
             .expect("agent builder should succeed");
 

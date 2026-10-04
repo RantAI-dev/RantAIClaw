@@ -322,24 +322,6 @@ fn build_agent_with(
         .unwrap()
 }
 
-fn build_agent_with_memory(
-    provider: Box<dyn Provider>,
-    tools: Vec<Box<dyn Tool>>,
-    mem: Arc<dyn Memory>,
-    auto_save: bool,
-) -> Agent {
-    Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(mem)
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
-        .auto_save(auto_save)
-        .build()
-        .unwrap()
-}
-
 fn build_agent_with_config(
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -717,102 +699,95 @@ async fn history_trims_after_max_messages() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 9. Memory auto-save round-trip
+// 9. The agent door never writes a Conversation row on its own
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// A row enters the `memories` table only because someone asked: the
+/// `memory_store` tool, the CLI, the console or the TUI. This is the
+/// invariant on the agent door. The agent builder opts into the auto-save
+/// path that used to write here; with it on, the writer was reached on every
+/// turn. The test runs one such turn, then asserts no Conversation row was
+/// written. The auto-save setting is left on deliberately so a regression
+/// that re-adds the writer fires this assertion immediately.
 #[tokio::test]
-async fn auto_save_stores_only_user_messages_in_memory() {
+async fn agent_turn_does_not_write_a_conversation_row() {
     let (mem, _tmp) = make_sqlite_memory();
     let provider = Box::new(ScriptedProvider::new(vec![text_response(
         "I remember everything",
     )]));
 
-    let mut agent = build_agent_with_memory(
-        provider,
-        vec![],
-        mem.clone(),
-        true, // auto_save enabled
-    );
+    let mut agent = Agent::builder()
+        .provider(provider)
+        .tools(vec![])
+        .memory(mem.clone())
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .build()
+        .unwrap();
 
-    let _ = agent.turn("Remember this fact").await.unwrap();
+    crate::memory::MEMORY_VIEW
+        .scope(crate::memory::MemoryView::All, async {
+            let response = agent.turn("Remember this fact").await.unwrap();
+            assert_eq!(response, "I remember everything");
+        })
+        .await;
 
-    // Auto-save only persists user-stated input, never assistant-generated summaries.
-    let count = mem.count().await.unwrap();
-    assert_eq!(
-        count, 1,
-        "Expected exactly 1 user memory entry, got {count}"
-    );
-
-    // The key carries a per-turn suffix, so match the prefix rather than a
-    // literal — a literal here is what let each turn overwrite the last.
     let all = mem.list(None, None).await.unwrap();
-    let stored = all
+    let conversation_rows: Vec<_> = all
         .iter()
-        .find(|e| e.key.starts_with("user_msg_"))
-        .expect("Expected a user_msg_* entry to be present");
-    assert_eq!(
-        stored.content, "Remember this fact",
-        "Stored memory should match the original user message"
+        .filter(|e| e.category == crate::memory::MemoryCategory::Conversation)
+        .collect();
+    assert!(
+        conversation_rows.is_empty(),
+        "the agent turn must not write a Conversation row; got {conversation_rows:?}"
     );
 
-    let assistant = mem.get("assistant_resp").await.unwrap();
+    // The agent's own history still holds the turn — only memory writes were
+    // removed, not the in-process chat.
     assert!(
-        assistant.is_none(),
-        "assistant_resp should not be auto-saved anymore"
+        agent.history().len() >= 2,
+        "the system prompt and the user/assistant pair still sit in agent history"
     );
 }
 
-/// `memories.key` is UNIQUE and `store` upserts on conflict, so a fixed
-/// auto-save key made every turn overwrite the previous one — the TUI and the
-/// gateway kept exactly one user message, forever.
+/// Two turns in a row: each must leave the Conversation count unchanged.
+/// Without this, a per-turn key could write (zero rows would be a defect here
+/// only because no prior rows exist) and still claim the invariant.
 #[tokio::test]
-async fn auto_save_preserves_every_turn() {
+async fn agent_repeated_turns_do_not_grow_conversation_rows() {
     let (mem, _tmp) = make_sqlite_memory();
     let provider = Box::new(ScriptedProvider::new(vec![
         text_response("first reply"),
         text_response("second reply"),
     ]));
 
-    let mut agent = build_agent_with_memory(provider, vec![], mem.clone(), true);
+    let mut agent = Agent::builder()
+        .provider(provider)
+        .tools(vec![])
+        .memory(mem.clone())
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .build()
+        .unwrap();
 
-    let _ = agent.turn("my name is rantaiclaw_user").await.unwrap();
-    let _ = agent.turn("I work in the Jakarta office").await.unwrap();
+    crate::memory::MEMORY_VIEW
+        .scope(crate::memory::MemoryView::All, async {
+            let _ = agent.turn("my name is rantaiclaw_user").await.unwrap();
+            let _ = agent.turn("I work in the Jakarta office").await.unwrap();
+        })
+        .await;
 
-    let entries = mem.list(None, None).await.unwrap();
-    let saved: Vec<_> = entries
+    let all = mem.list(None, None).await.unwrap();
+    let conversation_rows: Vec<_> = all
         .iter()
-        .filter(|e| e.key.starts_with("user_msg_"))
+        .filter(|e| e.category == crate::memory::MemoryCategory::Conversation)
         .collect();
-
-    assert_eq!(
-        saved.len(),
-        2,
-        "both turns must survive; a fixed key collapses them to one: {saved:?}"
-    );
-    let bodies: Vec<&str> = saved.iter().map(|e| e.content.as_str()).collect();
-    assert!(bodies.contains(&"my name is rantaiclaw_user"), "{bodies:?}");
     assert!(
-        bodies.contains(&"I work in the Jakarta office"),
-        "{bodies:?}"
+        conversation_rows.is_empty(),
+        "two turns must not write any Conversation row; got {conversation_rows:?}"
     );
-}
-
-#[tokio::test]
-async fn auto_save_disabled_does_not_store() {
-    let (mem, _tmp) = make_sqlite_memory();
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("hello")]));
-
-    let mut agent = build_agent_with_memory(
-        provider,
-        vec![],
-        mem.clone(),
-        false, // auto_save disabled
-    );
-
-    let _ = agent.turn("test message").await.unwrap();
-
-    let count = mem.count().await.unwrap();
-    assert_eq!(count, 0, "Expected 0 memory entries with auto_save off");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1185,11 +1160,12 @@ impl Memory for RecordingMemory {
     }
 }
 
-/// End-to-end: an agent built with a `conversation_id` writes its turn memory
-/// under that scope (write side of layered memory). With no conversation_id it
-/// would store globally (`None`) — the prior behavior.
+/// End-to-end: an agent built with a `conversation_id` no longer writes turn
+/// memory under any scope. With no conversation_id it would not have stored
+/// globally either — auto-save is gone. The `conversation_id` itself stays on
+/// the agent so any future tool the model calls can still use it.
 #[tokio::test]
-async fn turn_stores_memory_under_conversation_scope() {
+async fn turn_does_not_store_memory_under_conversation_scope_or_anyone() {
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let memory = Arc::new(RecordingMemory {
         stored: recorded.clone(),
@@ -1202,7 +1178,6 @@ async fn turn_stores_memory_under_conversation_scope() {
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
-        .auto_save(true)
         .conversation_id(Some("telegram:123".to_string()))
         .build()
         .unwrap();
@@ -1211,10 +1186,8 @@ async fn turn_stores_memory_under_conversation_scope() {
 
     let recs = recorded.lock().unwrap();
     assert!(
-        recs.iter().any(|(k, sid)| {
-            k.starts_with("user_msg_") && sid.as_deref() == Some("telegram:123")
-        }),
-        "user_msg should be stored under the conversation scope, got {recs:?}"
+        recs.is_empty(),
+        "the agent turn must not write any row, scoped or not; got {recs:?}"
     );
 }
 
@@ -1593,7 +1566,6 @@ fn agent_with_security(provider: Box<dyn Provider>, mem: Arc<dyn Memory>) -> Age
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
         .security(Arc::new(crate::security::SecurityPolicy::default()))
-        .auto_save(false)
         .build()
         .unwrap()
 }

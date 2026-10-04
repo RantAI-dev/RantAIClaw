@@ -126,10 +126,6 @@ use tokio_util::sync::CancellationToken;
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
-/// Minimum user-message length (in chars) for auto-save to memory.
-/// Messages shorter than this (e.g. "ok", "thanks") are not stored,
-/// reducing noise in memory recall.
-const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
@@ -361,7 +357,6 @@ pub(crate) struct ChannelRuntimeDefaults {
     /// live here purely to close the "reload said applied, nothing changed" gap.
     pub(crate) message_timeout_secs: u64,
     pub(crate) max_tool_iterations: usize,
-    pub(crate) auto_save_memory: bool,
     pub(crate) min_relevance_score: f64,
     /// `[channels_config] autonomous_tools`. Reloaded so an operator can re-arm
     /// the in-chat approval gate without a restart. This is the security-relevant
@@ -491,7 +486,6 @@ pub(crate) struct ChannelRuntimeContext {
     pub(crate) guest_system_prompt: Arc<String>,
     pub(crate) model: Arc<String>,
     pub(crate) temperature: f64,
-    pub(crate) auto_save_memory: bool,
     pub(crate) max_tool_iterations: usize,
     pub(crate) min_relevance_score: f64,
     pub(crate) conversation_histories: ConversationHistoryMap,
@@ -1550,10 +1544,9 @@ pub(crate) async fn build_channel_runtime(
 
     let effective_backend = memory::effective_memory_backend_name(&config.memory.backend);
     tracing::info!(
-        "RantaiClaw Channel Server: model={} memory={} (auto-save={}) channels={}",
+        "RantaiClaw Channel Server: model={} memory={} channels={}",
         model,
         effective_backend,
-        if config.memory.auto_save { "on" } else { "off" },
         channels
             .iter()
             .map(|c| c.name())
@@ -1713,7 +1706,6 @@ pub(crate) async fn build_channel_runtime(
         guest_system_prompt: Arc::new(guest_system_prompt),
         model: Arc::new(model.clone()),
         temperature,
-        auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(seeded_histories)),
