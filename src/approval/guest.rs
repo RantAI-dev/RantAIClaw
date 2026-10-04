@@ -112,6 +112,14 @@ impl GuestGate {
         // already tells operators not to grant it; the gate adds the hard
         // deny so an operator who listed it in `guest_allowed_tools` loses it.
         "browser",
+        // Read-only transcript lookup. The tool itself is already scoped to
+        // the current memory view (no-view refuses), but a guest never has a
+        // view in the first place — so the gate blocks it before the view
+        // check. Letting a guest reach the transcripts of an owner's DMs is
+        // the leak we are closing; the gate is the only thing that stops an
+        // operator who listed it in `guest_allowed_tools` from giving them
+        // that access.
+        "session_search",
     ];
 
     /// Whether a guest may invoke `tool` at all. Owner-only tools are always
@@ -443,6 +451,7 @@ mod tests {
                 "ssh".to_string(),
                 "pty".to_string(),
                 "proxy_config".to_string(),
+                "session_search".to_string(),
             ],
             &[],
         );
@@ -453,6 +462,7 @@ mod tests {
             "ssh",
             "pty",
             "proxy_config",
+            "session_search",
         ] {
             assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
             let reason = g.deny_reason(tool, &json!({})).unwrap();

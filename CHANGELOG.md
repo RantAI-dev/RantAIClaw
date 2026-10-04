@@ -39,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `?source=channel` to opt in. `docs/reference/channels.md` documents the
   storage location, retention, and deletion paths; the guest layer records
   like an owner but cannot read any session.
+- A `session_search` chat tool reads recorded conversation transcripts through a
+  single owner-only tool call. The tool is registered unconditionally but is
+  hard-denied for non-owners via `OWNER_ONLY_TOOLS`, so an operator who lists
+  it in `guest_allowed_tools` still cannot give a guest the spec. The result
+  is scoped to the turn's memory view (`All` searches every session,
+  `Only(key)` searches that conversation's sessions only, no view refuses with
+  the same refusal shape the memory tools use). The query tries every word
+  first, then falls back to any word. Each hit shows the message before and
+  after it, secret-shaped values are redacted again on the way out (sessions
+  written by the TUI before the recent change are stored raw), and the result
+  opens with the data-not-instructions line the memory block uses. The tool
+  description names when to use it (when the person asks about an earlier
+  conversation); nothing injects them on its own.
 
 ### Fixed
 

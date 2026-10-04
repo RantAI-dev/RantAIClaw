@@ -951,6 +951,70 @@ impl SessionStore {
         Ok(results)
     }
 
+    /// Full-text search optionally restricted to a single `conversation_key`.
+    ///
+    /// `Some(key)` adds `AND s.conversation_key = ?key` to the FTS query so a
+    /// scoped caller never sees rows outside its view. The covering
+    /// `(conversation_key, started_at DESC)` index makes the filter cheap.
+    /// `None` matches the unscoped [`Self::search`] shape row for row.
+    pub fn search_with_conversation(
+        &self,
+        query: &str,
+        limit: usize,
+        conversation_key: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let match_query = fts_literal_query(query);
+        if match_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match conversation_key {
+            Some(_) => (
+                "SELECT m.session_id, s.title, m.id, m.role, m.content, m.timestamp, \
+                 bm25(messages_fts) as rank \
+                 FROM messages_fts \
+                 JOIN messages m ON messages_fts.rowid = m.id \
+                 JOIN sessions s ON m.session_id = s.id \
+                 WHERE messages_fts MATCH ?1 AND s.conversation_key = ?2 \
+                 ORDER BY rank \
+                 LIMIT ?3",
+                vec![
+                    Box::new(match_query),
+                    Box::new(conversation_key.unwrap_or("").to_string()),
+                    Box::new(limit as i64),
+                ],
+            ),
+            None => (
+                "SELECT m.session_id, s.title, m.id, m.role, m.content, m.timestamp, \
+                 bm25(messages_fts) as rank \
+                 FROM messages_fts \
+                 JOIN messages m ON messages_fts.rowid = m.id \
+                 JOIN sessions s ON m.session_id = s.id \
+                 WHERE messages_fts MATCH ?1 \
+                 ORDER BY rank \
+                 LIMIT ?2",
+                vec![Box::new(match_query), Box::new(limit as i64)],
+            ),
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let results = stmt
+            .query_map(params_iter.as_slice(), |row| {
+                Ok(SearchResult {
+                    session_id: row.get(0)?,
+                    session_title: row.get(1)?,
+                    message_id: row.get(2)?,
+                    role: row.get(3)?,
+                    content: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    rank: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
     /// End the current session and create a new linked session with a summary
     /// system message.
     ///
@@ -2036,5 +2100,54 @@ mod tests {
             .unwrap();
         assert_eq!(only_channel.len(), 2);
         assert!(only_channel.iter().all(|s| s.source == "channel"));
+    }
+
+    /// `search_with_conversation(Some(key))` returns only matches whose session
+    /// `conversation_key` equals `key`. A session with a different key is
+    /// invisible to the call even when its message text contains the query,
+    /// because the conversation scope is the only thing being narrowed.
+    #[test]
+    fn search_with_conversation_some_returns_only_rows_of_given_key() {
+        let mut s = store();
+
+        let other = s
+            .record_channel_turn("m", "telegram:chat-1", "matching word", "r", None)
+            .unwrap();
+        let mine = s
+            .record_channel_turn("m", "telegram:chat-2", "matching word", "r", None)
+            .unwrap();
+
+        let scoped = s
+            .search_with_conversation("matching", 10, Some("telegram:chat-2"))
+            .unwrap();
+        let session_ids: Vec<&str> = scoped.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(
+            session_ids,
+            vec![mine.as_str()],
+            "only the matching conversation key surfaces, the other is filtered: got {session_ids:?}"
+        );
+        assert!(
+            !session_ids.contains(&other.as_str()),
+            "the other conversation key is invisible: got {session_ids:?}"
+        );
+    }
+
+    /// `search_with_conversation(None)` keeps the pre-existing FTS behaviour:
+    /// every matching row, irrespective of conversation key.
+    #[test]
+    fn search_with_conversation_none_searches_all_keys() {
+        let mut s = store();
+
+        s.record_channel_turn("m", "telegram:chat-1", "matching word", "r", None)
+            .unwrap();
+        s.record_channel_turn("m", "telegram:chat-2", "matching word", "r", None)
+            .unwrap();
+
+        let hits = s.search_with_conversation("matching", 10, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "an unscoped search must see both conversations"
+        );
     }
 }

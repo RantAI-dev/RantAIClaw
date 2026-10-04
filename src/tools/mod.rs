@@ -196,6 +196,7 @@ pub mod pty;
 pub mod pushover;
 pub mod schema;
 pub mod screenshot;
+pub mod session_search_tool;
 pub mod shell;
 pub mod skill_tool;
 pub mod skills_install;
@@ -241,6 +242,7 @@ pub use pushover::PushoverTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use session_search_tool::SessionSearchTool;
 pub use shell::ShellTool;
 pub use skill_tool::skill_tools_from_skills;
 #[cfg(feature = "remote-install")]
@@ -438,6 +440,19 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    // Owner-only: read-only transcript lookup. Hard-denied for non-owners via
+    // `GuestGate::OWNER_ONLY_TOOLS`; this entry is registered unconditionally
+    // so an unopenable store surfaces as a `ToolResult` error when the tool is
+    // called instead of the tool silently disappearing. The path is resolved
+    // once at registration: the active profile's `sessions.db`, with the
+    // workspace as a fallback for paths that don't have a profile yet.
+    let session_search_path = crate::profile::ProfileManager::active()
+        .map(|p| p.sessions_db_path())
+        .unwrap_or_else(|_| workspace_dir.join("sessions").join("sessions.db"));
+    tool_arcs.push(Arc::new(SessionSearchTool::new(Arc::new(
+        crate::sessions::ProfileSessionSearch::new(session_search_path),
+    ))));
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -882,6 +897,13 @@ mod tests {
         assert!(names.contains(&"cron_add"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+        // Owner-only transcript lookup. Hard-denied for non-owners via
+        // `GuestGate::OWNER_ONLY_TOOLS`; registration is unconditional so a
+        // missing store surfaces as a tool error rather than a silent gap.
+        assert!(
+            names.contains(&"session_search"),
+            "session_search must be registered unconditionally: {names:?}"
+        );
     }
 
     #[test]
