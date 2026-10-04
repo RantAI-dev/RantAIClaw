@@ -1645,7 +1645,7 @@ fn durable_history_writes_through_and_reloads() {
         guest_system_prompt: Arc::new("system".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(histories)),
@@ -1743,7 +1743,7 @@ fn compact_sender_history_keeps_recent_truncated_messages() {
         guest_system_prompt: Arc::new("system".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(histories)),
@@ -2128,7 +2128,7 @@ async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -2199,7 +2199,7 @@ async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_repl
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -2270,7 +2270,7 @@ async fn process_channel_message_executes_tool_calls_with_alias_tags() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -2349,7 +2349,7 @@ async fn process_channel_message_handles_models_command_without_llm_call() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -2450,7 +2450,7 @@ async fn process_channel_message_uses_route_override_provider_and_model() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -2532,7 +2532,7 @@ async fn process_channel_message_prefers_cached_default_provider_instance() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -2612,7 +2612,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
                 allowlists: Arc::new(HashMap::new()),
                 message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
                 max_tool_iterations: 5,
-                auto_save_memory: false,
+
                 min_relevance_score: 0.0,
                 autonomous_tools: false,
                 mention_only: Arc::new(HashMap::new()),
@@ -2636,7 +2636,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("startup-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -2733,7 +2733,7 @@ async fn maybe_apply_runtime_config_update_hot_reloads_owners_guest_gate_and_all
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("startup-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -2830,7 +2830,7 @@ fn allowlist_test_ctx(
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("startup-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -3447,7 +3447,7 @@ async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("startup-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -3575,7 +3575,7 @@ async fn maybe_apply_runtime_config_update_clears_pinned_sender_on_provider_swit
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("model-a".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -3676,7 +3676,7 @@ async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("model-a".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -3759,7 +3759,7 @@ async fn process_channel_message_respects_configured_max_tool_iterations_above_d
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 12,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -3840,7 +3840,7 @@ async fn process_channel_message_reports_configured_max_tool_iterations_limit() 
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 3,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -4052,7 +4052,7 @@ async fn channel_error_replies_are_sanitized_before_delivery() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -6439,7 +6439,7 @@ async fn threading_off_clears_both_the_thread_and_the_quote() {
                 allowlists: Arc::new(HashMap::new()),
                 message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
                 max_tool_iterations: 5,
-                auto_save_memory: false,
+
                 min_relevance_score: 0.0,
                 autonomous_tools: false,
                 mention_only: Arc::new(HashMap::new()),
@@ -7129,7 +7129,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -7230,7 +7230,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -7344,7 +7344,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -7432,7 +7432,7 @@ async fn process_channel_message_cancels_scoped_typing_task() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -7926,110 +7926,6 @@ fn owner_prompt_keeps_host_workspace_and_tools_file() {
     assert!(owner.contains("### AGENTS.md"), "{owner}");
 }
 
-#[test]
-fn conversation_memory_key_uses_message_id() {
-    let msg = traits::ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "msg_abc123".into(),
-        sender: "U123".into(),
-        reply_target: "C456".into(),
-        content: "hello".into(),
-        channel: "slack".into(),
-        timestamp: 1,
-        thread_ts: None,
-        reply_anchor: None,
-        is_direct: false,
-    };
-
-    assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
-}
-
-#[test]
-fn conversation_memory_key_is_unique_per_message() {
-    let msg1 = traits::ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "msg_1".into(),
-        sender: "U123".into(),
-        reply_target: "C456".into(),
-        content: "first".into(),
-        channel: "slack".into(),
-        timestamp: 1,
-        thread_ts: None,
-        reply_anchor: None,
-        is_direct: false,
-    };
-    let msg2 = traits::ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "msg_2".into(),
-        sender: "U123".into(),
-        reply_target: "C456".into(),
-        content: "second".into(),
-        channel: "slack".into(),
-        timestamp: 2,
-        thread_ts: None,
-        reply_anchor: None,
-        is_direct: false,
-    };
-
-    assert_ne!(
-        conversation_memory_key(&msg1),
-        conversation_memory_key(&msg2)
-    );
-}
-
-#[tokio::test]
-async fn autosave_keys_preserve_multiple_conversation_facts() {
-    let tmp = TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
-
-    let msg1 = traits::ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "msg_1".into(),
-        sender: "U123".into(),
-        reply_target: "C456".into(),
-        content: "I'm Paul".into(),
-        channel: "slack".into(),
-        timestamp: 1,
-        thread_ts: None,
-        reply_anchor: None,
-        is_direct: false,
-    };
-    let msg2 = traits::ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "msg_2".into(),
-        sender: "U123".into(),
-        reply_target: "C456".into(),
-        content: "I'm 45".into(),
-        channel: "slack".into(),
-        timestamp: 2,
-        thread_ts: None,
-        reply_anchor: None,
-        is_direct: false,
-    };
-
-    mem.store(
-        &conversation_memory_key(&msg1),
-        &msg1.content,
-        MemoryCategory::Conversation,
-        None,
-    )
-    .await
-    .unwrap();
-    mem.store(
-        &conversation_memory_key(&msg2),
-        &msg2.content,
-        MemoryCategory::Conversation,
-        None,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(mem.count().await.unwrap(), 2);
-
-    let recalled = mem.recall("45", 5, None).await.unwrap();
-    assert!(recalled.iter().any(|entry| entry.content.contains("45")));
-}
-
 #[tokio::test]
 async fn build_memory_context_includes_recalled_entries() {
     let tmp = TempDir::new().unwrap();
@@ -8086,7 +7982,7 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -8185,7 +8081,7 @@ async fn process_channel_message_enriches_current_turn_without_persisting_contex
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -8282,7 +8178,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(histories)),
@@ -8358,10 +8254,10 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
 /// reaches the model.
 #[tokio::test]
 async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
-    // Long enough to clear AUTOSAVE_MIN_MESSAGE_CHARS, or nothing is saved
-    // and there is no echo to reproduce.
+    // Long enough that the test exercises the same code path real chats hit
+    // — short messages do not exercise the recall surface the same way, and
+    // there is no echo to reproduce from a curated fact.
     let question = "when is the deployment window for this service";
-    assert!(question.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS);
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
@@ -8394,7 +8290,6 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
         temperature: 0.0,
         // Both of these matter: auto-save writes the echo, and the real
         // default threshold is what the echo's ranking pushed facts under.
-        auto_save_memory: true,
         max_tool_iterations: 5,
         min_relevance_score: crate::config::MemoryConfig::default().min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -8540,7 +8435,7 @@ async fn lark_chat_id_in_approval_owners_does_not_make_a_member_an_owner() {
         guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -8608,7 +8503,7 @@ async fn owner_group_channel_turn_keeps_owner_and_direct_flags_in_their_own_slot
         guest_system_prompt: Arc::new("GUEST_SYSTEM_PROMPT".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -8874,7 +8769,7 @@ async fn forged_label_without_tool_call_appends_runtime_net_line() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -8982,7 +8877,7 @@ async fn real_tool_call_keeps_structured_history_and_skips_net_line() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -9145,7 +9040,7 @@ async fn a_persisted_history_with_old_labels_strips_them_on_load() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(loaded)),
@@ -9214,7 +9109,7 @@ async fn two_consecutive_save_requests_keep_structured_form_and_append_net_line(
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 10,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -10231,7 +10126,7 @@ async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() 
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 1,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),

@@ -319,7 +319,7 @@ pub(super) fn dispatch_ctx(
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),
         temperature: 0.0,
-        auto_save_memory: false,
+
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
@@ -506,7 +506,7 @@ pub(super) fn seeded_defaults_slot(
                 allowlists: Arc::new(HashMap::new()),
                 message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
                 max_tool_iterations: 5,
-                auto_save_memory: false,
+
                 min_relevance_score: 0.0,
                 autonomous_tools: false,
                 mention_only: Arc::new(HashMap::new()),

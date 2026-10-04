@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 37;
+pub const CURRENT_VERSION: u32 = 38;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -486,7 +486,17 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v37(raw);
     }
 
-    // Future migrations (v38, …) inserted here in order.
+    // v37 → v38: drop `[memory].auto_save`. The key was the gate every door
+    // consulted to decide whether to write a Conversation row on inbound
+    // input. The door writers are gone, so leaving the key in a config would
+    // advertise a behaviour that no longer exists. Stripping it on migration
+    // removes the dead surface without breaking the rest of the `[memory]`
+    // table.
+    if from < 38 {
+        migrate_v38(raw);
+    }
+
+    // Future migrations (v39, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -930,6 +940,22 @@ fn migrate_v37(raw: &mut Value) {
     };
     if matches!(score, Value::Float(f) if *f == 0.4) {
         *score = Value::Float(0.6);
+    }
+}
+
+/// v37 → v38: drop `[memory].auto_save`. The key was the gate every door
+/// consulted to decide whether to write a Conversation row on inbound input.
+/// The door writers are gone, so leaving the key in a config would advertise
+/// a behaviour that does not exist.
+///
+/// A pure `toml::Value` transform with no I/O, like every other `migrate_vN`.
+fn migrate_v38(raw: &mut Value) {
+    if let Some(memory) = raw
+        .as_table_mut()
+        .and_then(|root| root.get_mut("memory"))
+        .and_then(Value::as_table_mut)
+    {
+        memory.remove("auto_save");
     }
 }
 
@@ -1530,6 +1556,89 @@ allowed_users = ["*"]
         assert!(
             v.get("reliability").is_none(),
             "no [reliability] table invented"
+        );
+    }
+
+    /// `[memory].auto_save` was the gate every door consulted to decide
+    /// whether to write a Conversation row on inbound input. The door writers
+    /// are gone, and no reader remains — leaving the key in a config would
+    /// keep advertising a behaviour that no longer exists. Stripping it on
+    /// migration removes the dead surface without breaking the rest of the
+    /// `[memory]` table.
+    #[test]
+    fn v38_strips_the_auto_save_key_with_no_reader() {
+        let mut v = parse(
+            "schema_version = 37\n\
+             [memory]\nbackend = \"sqlite\"\nauto_save = true\nmin_relevance_score = 0.6\n",
+        );
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+
+        let memory = v
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory survives");
+        assert!(
+            memory.get("auto_save").is_none(),
+            "auto_save dropped; got {memory:?}"
+        );
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite"),
+            "kept memory keys survive"
+        );
+        assert_eq!(
+            memory.get("min_relevance_score").and_then(Value::as_float),
+            Some(0.6),
+            "kept memory keys survive"
+        );
+    }
+
+    /// A config that had explicitly turned auto-save off must also come
+    /// through clean: the operator's `false` is just as dead as a default
+    /// `true`, because nothing reads the field any more.
+    #[test]
+    fn v38_strips_auto_save_even_when_explicitly_false() {
+        let mut v = parse(
+            "schema_version = 37\n\
+             [memory]\nbackend = \"sqlite\"\nauto_save = false\n",
+        );
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+
+        let memory = v
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory survives");
+        assert!(
+            memory.get("auto_save").is_none(),
+            "auto_save dropped even when set to false; got {memory:?}"
+        );
+    }
+
+    /// A config that never carried `[memory].auto_save` must come through
+    /// unchanged — the migration strips one named key, not the whole section.
+    #[test]
+    fn v38_leaves_a_config_without_auto_save_alone() {
+        let mut v = parse(
+            "schema_version = 37\n\
+             [memory]\nbackend = \"sqlite\"\n",
+        );
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+
+        let memory = v
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory survives");
+        assert!(
+            memory.get("auto_save").is_none(),
+            "no auto_save key invented"
+        );
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite"),
+            "kept memory keys survive"
         );
     }
 
@@ -2336,7 +2445,7 @@ allowed_users = ["*"]
              min_relevance_score = 0.4\n",
         );
         assert!(migrate(&mut v).expect("migration runs"));
-        assert_eq!(version_of(&v), Some(37));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         assert_eq!(
             min_relevance_score_of(&v).and_then(Value::as_float),
             Some(0.6)

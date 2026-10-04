@@ -102,6 +102,12 @@ fn v31_with_whatsapp(keys: &str) -> toml::Value {
     toml::from_str(&toml_src).expect("fixture parses")
 }
 
+/// Build a v37 config whose `[memory]` holds `keys`.
+fn v37_with_memory(keys: &str) -> toml::Value {
+    let toml_src = format!("schema_version = 37\n\n[memory]\n{keys}\n", keys = keys);
+    toml::from_str(&toml_src).expect("fixture parses")
+}
+
 fn table<'a>(v: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
     let mut cur = v;
     for seg in path {
@@ -238,15 +244,46 @@ fn v32_leaves_a_cloud_only_config_alone() {
 /// The version the migration chain claims to reach. If this drifts from
 /// `CURRENT_VERSION` the three cases above are testing a migration nobody runs.
 #[test]
-fn v37_is_the_current_version() {
-    assert_eq!(CURRENT_VERSION, 37);
+fn v38_is_the_current_version() {
+    assert_eq!(CURRENT_VERSION, 38);
     let mut v = v31_with_whatsapp("session_path = \"/tmp/wa.db\"");
     migrate(&mut v).expect("migrate runs");
     assert_eq!(
         v.get(SCHEMA_VERSION_KEY).and_then(toml::Value::as_integer),
-        Some(37),
+        Some(38),
         "the migrated config must be stamped with the version it reached"
     );
+}
+
+/// A v37 config that carried `memory.auto_save` must come out without it and
+/// still deserialise. The key was the gate every door consulted to decide
+/// whether to write a Conversation row on inbound input; the door writers are
+/// gone, so leaving the key in the config would advertise a behaviour that
+/// does not exist. The schema no longer accepts `auto_save`, so a
+/// post-migration config that still carried it would fail to load.
+#[test]
+fn v38_strips_auto_save_and_the_result_loads() {
+    let mut v = v37_with_memory("auto_save = true\nbackend = \"sqlite\"\n");
+    migrate(&mut v).expect("migrate runs");
+    assert_eq!(
+        v.get(SCHEMA_VERSION_KEY).and_then(toml::Value::as_integer),
+        Some(38),
+        "the migrated config must reach v38"
+    );
+
+    let memory = v
+        .get("memory")
+        .and_then(toml::Value::as_table)
+        .expect("[memory] survives");
+    assert!(
+        memory.get("auto_save").is_none(),
+        "the dead auto_save key is gone; got {memory:?}"
+    );
+
+    let cfg: Config = v
+        .try_into()
+        .expect("migrated config without auto_save must load");
+    assert_eq!(cfg.memory.backend, "sqlite");
 }
 
 /// A v31 Web config that never listed an allowlist must land fail-closed.

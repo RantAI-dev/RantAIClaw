@@ -90,7 +90,6 @@ impl TuiProvisioner for MemoryProvisioner {
 
         let memory_cfg = MemoryConfig {
             backend: backend.clone(),
-            auto_save: true,
             hygiene_enabled: true,
             archive_after_days: 30,
             purge_after_days: 90,

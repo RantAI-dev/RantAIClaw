@@ -199,7 +199,6 @@ pub(crate) fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDef
             config.channels_config.message_timeout_secs,
         ),
         max_tool_iterations: config.agent.max_tool_iterations,
-        auto_save_memory: config.memory.auto_save,
         min_relevance_score: config.memory.min_relevance_score,
         autonomous_tools: config.channels_config.autonomous_tools,
         mention_only: Arc::new(channel_mention_only(&config.channels_config)),
@@ -260,7 +259,6 @@ pub(crate) fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelR
         // authority, so mirroring them cannot widen anything.
         message_timeout_secs: ctx.message_timeout_secs,
         max_tool_iterations: ctx.max_tool_iterations,
-        auto_save_memory: ctx.auto_save_memory,
         min_relevance_score: ctx.min_relevance_score,
         // The fallback must not be the permissive answer: `false` keeps the gate
         // armed. A path with no config to read may not decide that tools run

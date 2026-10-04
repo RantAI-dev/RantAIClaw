@@ -9,10 +9,10 @@ use super::traits;
 use super::{
     approval_relay, channel_message_timeout_budget_secs, commands, conversation, history, media,
     prompt, routing, sanitize, supervisor, ChannelRuntimeContext, OwnerFiles,
-    AUTOSAVE_MIN_MESSAGE_CHARS, CHANNEL_DRAIN_DEADLINE, CHANNEL_NOTICE_SEND_TIMEOUT,
-    FAILED_TURN_MARKER, INTERRUPTED_TURN_MARKER, IN_FLIGHT_COMPLETION_WAIT_TIMEOUT,
-    MEMORY_CONTEXT_ENTRY_MAX_CHARS, MEMORY_CONTEXT_MAX_CHARS, MEMORY_CONTEXT_MAX_ENTRIES,
-    RESTART_NOTICE, TIMED_OUT_TURN_MARKER, UNDELIVERED_ATTACHMENT_NOTE, UNDELIVERED_TURN_MARKER,
+    CHANNEL_DRAIN_DEADLINE, CHANNEL_NOTICE_SEND_TIMEOUT, FAILED_TURN_MARKER,
+    INTERRUPTED_TURN_MARKER, IN_FLIGHT_COMPLETION_WAIT_TIMEOUT, MEMORY_CONTEXT_ENTRY_MAX_CHARS,
+    MEMORY_CONTEXT_MAX_CHARS, MEMORY_CONTEXT_MAX_ENTRIES, RESTART_NOTICE, TIMED_OUT_TURN_MARKER,
+    UNDELIVERED_ATTACHMENT_NOTE, UNDELIVERED_TURN_MARKER,
 };
 use crate::agent::loop_::run_tool_call_loop;
 use crate::memory::{Memory, MemoryView, MEMORY_VIEW};
@@ -23,10 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-
-pub(crate) fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
-}
 
 /// The conversation this message belongs to, for history and `/model` routing.
 ///
@@ -927,23 +923,6 @@ pub(crate) async fn process_channel_message(
     // a group. Plan 118 fixed exactly this for conversation history and recorded
     // that memory still had it.
     let conversation_scope = conversation_memory_scope(&msg);
-
-    if runtime_defaults.auto_save_memory
-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-    {
-        let autosave_key = conversation_memory_key(&msg);
-        // Raw inbound text, stored unread and re-injected into later prompts as
-        // established context. Screen it the same way an agent-initiated write
-        // is screened — this is the path where untrusted content actually
-        // arrives, and nobody reviews it in between.
-        crate::memory::autosave_screened(
-            ctx.memory.as_ref(),
-            &autosave_key,
-            &msg.content,
-            Some(conversation_scope.as_str()),
-        )
-        .await;
-    }
 
     tracing::info!("processing channel message");
     let started_at = Instant::now();

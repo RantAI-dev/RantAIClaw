@@ -10,7 +10,6 @@ pub enum MemoryBackendKind {
 pub struct MemoryBackendProfile {
     pub key: &'static str,
     pub label: &'static str,
-    pub auto_save_default: bool,
     pub uses_sqlite_hygiene: bool,
     pub sqlite_based: bool,
     pub optional_dependency: bool,
@@ -19,7 +18,6 @@ pub struct MemoryBackendProfile {
 const SQLITE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "sqlite",
     label: "SQLite with Vector Search (recommended) — fast, hybrid search, embeddings",
-    auto_save_default: true,
     uses_sqlite_hygiene: true,
     sqlite_based: true,
     optional_dependency: false,
@@ -28,7 +26,6 @@ const SQLITE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
-    auto_save_default: false,
     uses_sqlite_hygiene: false,
     sqlite_based: false,
     optional_dependency: false,
@@ -37,7 +34,6 @@ const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "custom",
     label: "Custom backend — extension point",
-    auto_save_default: true,
     uses_sqlite_hygiene: false,
     sqlite_based: false,
     optional_dependency: false,
@@ -107,7 +103,6 @@ mod tests {
     fn unknown_profile_preserves_extensibility_defaults() {
         let profile = memory_backend_profile("custom-memory");
         assert_eq!(profile.key, "custom");
-        assert!(profile.auto_save_default);
         assert!(!profile.uses_sqlite_hygiene);
     }
 }
