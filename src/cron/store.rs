@@ -46,7 +46,7 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
         tz: None,
     };
     add_shell_job(
-        config, None, schedule, command, None, false, None, None, None,
+        config, None, schedule, command, None, false, None, None, None, None,
     )
 }
 
@@ -61,6 +61,7 @@ pub fn add_shell_job(
     created_by: Option<&str>,
     origin_channel: Option<&str>,
     origin_chat: Option<&str>,
+    origin_thread: Option<&str>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -76,9 +77,9 @@ pub fn add_shell_job(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, created_by,
-                origin_channel, origin_chat
+                origin_channel, origin_chat, origin_thread
              ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10,
-                       ?11, ?12)",
+                       ?11, ?12, ?13)",
             params![
                 id,
                 expression,
@@ -92,6 +93,7 @@ pub fn add_shell_job(
                 created_by,
                 origin_channel,
                 origin_chat,
+                origin_thread,
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -114,6 +116,7 @@ pub fn add_agent_job(
     created_by: Option<&str>,
     origin_channel: Option<&str>,
     origin_chat: Option<&str>,
+    origin_thread: Option<&str>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -129,9 +132,9 @@ pub fn add_agent_job(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, created_by,
-                origin_channel, origin_chat
+                origin_channel, origin_chat, origin_thread
              ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12,
-                       ?13, ?14)",
+                       ?13, ?14, ?15)",
             params![
                 id,
                 expression,
@@ -147,6 +150,7 @@ pub fn add_agent_job(
                 created_by,
                 origin_channel,
                 origin_chat,
+                origin_thread,
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -160,7 +164,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat, origin_thread
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -175,21 +179,32 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 }
 
 /// List jobs visible from a given chat. The TUI, CLI, and web console pass
-/// `None` and see every job; a chat passes `Some((channel, chat))` and sees
-/// only the jobs it created. Origin-less jobs (CLI / TUI / web console / a
-/// path that did not set them) are managed only from those surfaces — a chat
-/// neither lists nor changes them.
-pub fn list_jobs_for_origin(config: &Config, origin: Option<(&str, &str)>) -> Result<Vec<CronJob>> {
+/// `None` and see every job; a chat passes `Some((channel, chat, thread))`
+/// and sees only the jobs it created. The `thread` is the caller's current
+/// thread id — `None` for a top-level chat. A job is visible when its
+/// `origin_channel`, `origin_chat`, and `origin_thread` all match the
+/// caller's. A chat that targets a thread does NOT see jobs created in a
+/// different thread of the same chat, because the per-job view scopes memory
+/// by thread and the user expects "my thread" to mean "this thread".
+///
+/// Origin-less jobs (CLI / TUI / web console / a path that did not set them)
+/// are managed only from those surfaces — a chat neither lists nor changes
+/// them. Legacy rows written before the `origin_thread` column existed have
+/// `origin_thread = NULL` and so match the top-level `thread = None` query,
+/// not a `Some(thread)` query; that is exactly the pre-fix behaviour.
+pub fn list_jobs_for_origin(
+    config: &Config,
+    origin: Option<(&str, &str, Option<&str>)>,
+) -> Result<Vec<CronJob>> {
     let all = list_jobs(config)?;
     Ok(match origin {
         None => all,
-        Some((channel, chat)) => all
+        Some((channel, chat, thread)) => all
             .into_iter()
             .filter(|job| {
-                matches!(
-                    (job.origin_channel.as_deref(), job.origin_chat.as_deref()),
-                    (Some(c), Some(h)) if c == channel && h == chat
-                )
+                job.origin_channel.as_deref() == Some(channel)
+                    && job.origin_chat.as_deref() == Some(chat)
+                    && job.origin_thread.as_deref() == thread
             })
             .collect(),
     })
@@ -199,12 +214,19 @@ pub fn list_jobs_for_origin(config: &Config, origin: Option<(&str, &str)>) -> Re
 /// sentence a missing job produces, so a chat cannot distinguish "not mine"
 /// from "nowhere" — the refusal carries no trace that the job exists.
 /// Un-scoped callers (TUI / CLI / console) always pass — they own every job.
-pub fn ensure_visible_to_origin(job: &CronJob, origin: Option<(&str, &str)>) -> Result<(), String> {
-    let Some((channel, chat)) = origin else {
+pub fn ensure_visible_to_origin(
+    job: &CronJob,
+    origin: Option<(&str, &str, Option<&str>)>,
+) -> Result<(), String> {
+    let Some((channel, chat, thread)) = origin else {
         return Ok(());
     };
-    match (job.origin_channel.as_deref(), job.origin_chat.as_deref()) {
-        (Some(c), Some(h)) if c == channel && h == chat => Ok(()),
+    match (
+        job.origin_channel.as_deref(),
+        job.origin_chat.as_deref(),
+        job.origin_thread.as_deref(),
+    ) {
+        (Some(c), Some(h), t) if c == channel && h == chat && t == thread => Ok(()),
         _ => Err(format!("Cron job '{}' not found", job.id)),
     }
 }
@@ -213,7 +235,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat, origin_thread
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -245,7 +267,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat, origin_thread
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -327,7 +349,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         let mut job = {
             let mut stmt = tx.prepare(
                 "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                        enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat
+                        enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat, origin_thread
                  FROM cron_jobs WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![job_id])?;
@@ -702,6 +724,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         created_by: row.get(17)?,
         origin_channel: row.get(18)?,
         origin_chat: row.get(19)?,
+        origin_thread: row.get(20)?,
     })
 }
 
@@ -827,7 +850,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             last_output      TEXT,
             created_by       TEXT,
             origin_channel   TEXT,
-            origin_chat      TEXT
+            origin_chat      TEXT,
+            origin_thread    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
 
@@ -898,6 +922,14 @@ fn migrate_cron_columns_once(conn: &Connection, db_path: &std::path::Path) -> Re
     add_column_if_missing(conn, "cron_jobs", "created_by", "TEXT")?;
     add_column_if_missing(conn, "cron_jobs", "origin_channel", "TEXT")?;
     add_column_if_missing(conn, "cron_jobs", "origin_chat", "TEXT")?;
+    // `origin_thread` stores the thread id (Slack ts, Telegram forum-topic id
+    // encoded into reply_target, …) separately from `origin_chat`. The
+    // scheduler rebuilds the per-job view as `ConversationKey::new(channel,
+    // chat).in_thread(thread).resolve()` — without the thread column the
+    // rebuilt view drops the thread and the job reads a place nothing wrote
+    // to. Legacy rows have `NULL`, which means "no thread", exactly matching
+    // the pre-fix behaviour.
+    add_column_if_missing(conn, "cron_jobs", "origin_thread", "TEXT")?;
     // Backfill the origin from the delivery target when an agent created the
     // job from a chat before this column existed — the spec scopes by the
     // delivery's channel+target, whatever the mode. Other rows (cli / tui /
@@ -998,6 +1030,7 @@ mod tests {
             Some("cli"),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(job.created_by.as_deref(), Some("cli"));
@@ -1018,6 +1051,7 @@ mod tests {
             "echo anon",
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -1046,11 +1080,13 @@ mod tests {
             Some("agent-tool"),
             Some("telegram"),
             Some("chat-a"),
+            None,
         )
         .unwrap();
         let loaded = get_job(&config, &scoped.id).unwrap();
         assert_eq!(loaded.origin_channel.as_deref(), Some("telegram"));
         assert_eq!(loaded.origin_chat.as_deref(), Some("chat-a"));
+        assert_eq!(loaded.origin_thread, None);
 
         let unscoped = add_shell_job(
             &config,
@@ -1065,11 +1101,69 @@ mod tests {
             Some("cli"),
             None,
             None,
+            None,
         )
         .unwrap();
         let loaded = get_job(&config, &unscoped.id).unwrap();
         assert_eq!(loaded.origin_channel, None);
         assert_eq!(loaded.origin_chat, None);
+        assert_eq!(loaded.origin_thread, None);
+    }
+
+    /// `origin_thread` carries the thread id from a Slack thread / Telegram
+    /// forum topic across the INSERT / SELECT round trip, so the per-job view
+    /// rebuilt from those three columns exactly equals the dispatcher's view.
+    /// Legacy rows pre-dating the column load with `origin_thread = NULL`,
+    /// which the scheduler treats as "no thread" — the same behaviour the
+    /// store had before the column existed.
+    #[test]
+    fn origin_thread_round_trips_and_defaults_none() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let threaded = add_agent_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "remind in thread",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some("agent-tool"),
+            Some("slack"),
+            Some("C0CHAN"),
+            Some("1700000000.000500"),
+        )
+        .unwrap();
+        let loaded = get_job(&config, &threaded.id).unwrap();
+        assert_eq!(loaded.origin_thread.as_deref(), Some("1700000000.000500"));
+
+        // A job with no thread keeps origin_thread = None even when the
+        // other two origin columns are set.
+        let plain = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo plain",
+            None,
+            false,
+            Some("agent-tool"),
+            Some("telegram"),
+            Some("chat-a"),
+            None,
+        )
+        .unwrap();
+        let loaded = get_job(&config, &plain.id).unwrap();
+        assert_eq!(loaded.origin_channel.as_deref(), Some("telegram"));
+        assert_eq!(loaded.origin_chat.as_deref(), Some("chat-a"));
+        assert_eq!(loaded.origin_thread, None);
     }
 
     /// A legacy agent-tool job whose announce delivery names a chat gets its
@@ -1103,6 +1197,7 @@ mod tests {
             Some("agent-tool"),
             None,
             None,
+            None,
         )
         .unwrap();
         let from_tui = add_shell_job(
@@ -1118,13 +1213,14 @@ mod tests {
             Some("tui"),
             None,
             None,
+            None,
         )
         .unwrap();
 
         // Simulate the legacy DB: no origin columns filled.
         with_connection(&config, |conn| {
             conn.execute(
-                "UPDATE cron_jobs SET origin_channel = NULL, origin_chat = NULL",
+                "UPDATE cron_jobs SET origin_channel = NULL, origin_chat = NULL, origin_thread = NULL",
                 [],
             )
             .unwrap();
@@ -1177,6 +1273,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         // A shell "run this and message me" job must persist its delivery
@@ -1212,6 +1309,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect_err("a locked delivery channel must be refused at creation");
         assert!(
@@ -1238,6 +1336,7 @@ mod tests {
             "echo hi",
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -1306,6 +1405,7 @@ mod tests {
             "echo once",
             None,
             false,
+            None,
             None,
             None,
             None,

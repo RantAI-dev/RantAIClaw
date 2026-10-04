@@ -362,6 +362,13 @@ conversation's notes in that conversation. To see and remove them, run on the ho
   prefix match, so list first.
 - `rantaiclaw memory clear --category <core|daily|conversation>` removes a whole category.
 
+A delete on stored notes (the CLI, the `memory_forget` tool, the gateway `memory_delete`, the TUI
+`/memory remove`) is not a delete on the conversation that already read the note. The conversation
+still holds a copy of it in its history; that copy is cleared only by `/new` (or its equivalent for
+the channel). Every delete path surfaces this with the same one-line note:
+
+> A conversation that mentioned the note still holds it until `/new` in that chat.
+
 Editing `brain.db` by hand does not reach a running daemon, which loads conversation history into
 memory when it starts. Use `/new`, or restart the daemon after a manual edit.
 

@@ -268,6 +268,7 @@ fn add_scheduled(
             Some("cli"),
             None,
             None,
+            None,
         )
     } else {
         add_shell_job(
@@ -278,6 +279,7 @@ fn add_scheduled(
             None,
             delete_after_run,
             Some("cli"),
+            None,
             None,
             None,
         )
@@ -362,6 +364,7 @@ pub fn add_once_at(
         None,
         false,
         Some("cli"),
+        None,
         None,
         None,
     )
@@ -458,6 +461,7 @@ mod tests {
             cmd,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -588,6 +592,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -710,6 +715,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let out = run_job_report(&config, &job.id).await.unwrap();
@@ -738,6 +744,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let out = run_job_report(&config, &job.id).await.unwrap();
@@ -759,6 +766,7 @@ mod tests {
             "echo x",
             None,
             false,
+            None,
             None,
             None,
             None,

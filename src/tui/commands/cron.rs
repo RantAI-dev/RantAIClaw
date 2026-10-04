@@ -148,6 +148,7 @@ fn add_text(config: &Config, args: &[&str]) -> String {
             Some("tui"),
             None,
             None,
+            None,
         )
     } else {
         cron::add_shell_job(
@@ -158,6 +159,7 @@ fn add_text(config: &Config, args: &[&str]) -> String {
             None,
             false,
             Some("tui"),
+            None,
             None,
             None,
         )

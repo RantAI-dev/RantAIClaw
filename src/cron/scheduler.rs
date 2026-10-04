@@ -471,12 +471,23 @@ pub(crate) async fn refresh_working_config(
 ///
 /// A job with half an origin names no chat, so it reads nothing. That is the
 /// fail-closed answer for a row the tools do not write.
+/// Rebuild the per-job view from the three origin columns. The columns were
+/// written by `cron_origin_for_view` from the dispatcher's
+/// `ConversationKey::resolve()` string, so the rebuild uses the same shape
+/// (surface / sender / thread) — with the thread passed through, the rebuilt
+/// place is byte-equal to the one that created the job. A job created in a
+/// Slack thread keeps its thread; a job created in a Telegram forum topic
+/// keeps its topic id. Legacy rows pre-dating the `origin_thread` column
+/// carry `None` here, which is exactly the pre-fix behaviour (no thread).
 fn memory_view_for(job: &CronJob) -> Option<MemoryView> {
     let channel = job.origin_channel.as_deref().filter(|c| !c.is_empty());
-    let chat = job.origin_chat.as_deref().filter(|c| !c.is_empty());
-    match (channel, chat) {
-        (Some(channel), Some(chat)) => Some(MemoryView::Only(
-            ConversationKey::new(channel, chat).resolve(),
+    let sender = job.origin_chat.as_deref().filter(|c| !c.is_empty());
+    let thread = job.origin_thread.as_deref().filter(|t| !t.is_empty());
+    match (channel, sender) {
+        (Some(channel), Some(sender)) => Some(MemoryView::Only(
+            ConversationKey::new(channel, sender)
+                .in_thread(thread)
+                .resolve(),
         )),
         (None, None) => Some(MemoryView::All),
         (Some(_), None) | (None, Some(_)) => None,
@@ -1125,6 +1136,7 @@ mod tests {
     use crate::cron::{self, DeliveryConfig, SessionTarget};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
+    use serde_json::json;
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Config {
@@ -1164,6 +1176,7 @@ mod tests {
             created_by: None,
             origin_channel: None,
             origin_chat: None,
+            origin_thread: None,
         }
     }
 
@@ -1213,39 +1226,124 @@ mod tests {
 
     /// The view a job reads and the scope channel dispatch writes a chat's rows
     /// under must be one string, or the job reads a place nothing writes to.
-    /// Dispatch builds it from the message's channel, reply target and thread;
-    /// the job's `origin_chat` is the same reply target. A target with a colon
-    /// (a Telegram forum topic) is the case a plain join gets wrong.
+    /// Dispatch builds it from the message's channel, reply target and thread
+    /// via `ConversationKey::new(channel, reply_target).in_thread(thread).resolve()`.
+    /// The job stores the three origin columns `cron_origin_for_view` parsed
+    /// from the same place, so rebuilding it via the same `ConversationKey`
+    /// path must give the same string — for every shape the dispatcher
+    /// actually produces: a plain chat, a Slack thread, a Telegram forum
+    /// topic, a Matrix sender, and a sender containing `%`.
+    ///
+    /// Pinned here (not just in `cron_schema`'s `cron_origin_for_view` tests)
+    /// because a regression in EITHER side of the round trip — the
+    /// `cron_origin_for_view` parse, the `memory_view_for` rebuild, or the
+    /// `ConversationKey` encoder — fails this single assertion. The slack
+    /// thread is the one the prior test missed: reply_target + thread_ts =
+    /// a 2-part place, which the old `split_once(':')` rounded-trip lost.
     #[test]
-    fn a_jobs_origin_view_equals_the_scope_dispatch_writes_for_that_chat() {
-        for (channel, reply_target) in [
-            ("telegram", "-100123456"),
-            ("telegram", "-100123456:77"),
-            ("discord", "C0123"),
-            ("matrix", "@rantaiclaw_user:example.org"),
-        ] {
+    fn a_jobs_origin_view_round_trips_through_origin_columns() {
+        /// One tuple of the round-trip table: the dispatcher scope built from
+        /// `(channel, reply_target, thread_ts)` and the three columns
+        /// `cron_origin_for_view` would write into the job. The five pieces
+        /// describe the same conversation; the test asserts both
+        /// directions and the chat pipeline that ties them together.
+        type RoundTripCase = (
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            &'static str,
+            Option<&'static str>,
+        );
+        let cases: &[RoundTripCase] = &[
+            // Plain chat, no thread — top of a Telegram supergroup.
+            ("telegram", "-100123456", None, "-100123456", None),
+            // Telegram forum topic packed into reply_target — no thread ts,
+            // because the channel writes `chat_id:thread_id` itself.
+            ("telegram", "-100123456:77", None, "-100123456:77", None),
+            // Plain Discord channel.
+            ("discord", "C0123", None, "C0123", None),
+            // Matrix sender — `:` lives inside the sender and gets encoded.
+            (
+                "matrix",
+                "@rantaiclaw_user:example.org",
+                None,
+                "@rantaiclaw_user:example.org",
+                None,
+            ),
+            // Slack thread — thread_ts is the actual thread; reply_target is
+            // the channel. This is the case the prior test missed.
+            (
+                "slack",
+                "C0CHAN",
+                Some("1700000000.000500"),
+                "C0CHAN",
+                Some("1700000000.000500"),
+            ),
+            // Slack reply in a thread where the channel id itself has no `:`
+            // but the thread_ts does — both must survive the round trip.
+            (
+                "slack",
+                "C-99",
+                Some("1710:000123"),
+                "C-99",
+                Some("1710:000123"),
+            ),
+            // Sender containing `%` — the encoder writes `%25`, the decoder
+            // must undo it without breaking the surface separator.
+            ("telegram", "user%name", None, "user%name", None),
+        ];
+        for (channel, reply_target, thread_ts, origin_chat, origin_thread) in cases {
             let msg = crate::channels::traits::ChannelMessage {
                 sender_aliases: Vec::new(),
                 id: "m1".into(),
                 sender: "rantaiclaw_user".into(),
-                reply_target: reply_target.into(),
+                reply_target: (*reply_target).into(),
                 content: "hello".into(),
-                channel: channel.into(),
+                channel: (*channel).into(),
                 timestamp: 1,
-                thread_ts: None,
+                thread_ts: thread_ts.map(|t| t.to_string()),
                 reply_anchor: None,
                 is_direct: false,
             };
             let dispatch_scope = crate::channels::dispatch::conversation_memory_scope(&msg);
 
             let mut job = test_job("echo hi");
-            job.origin_channel = Some(channel.into());
-            job.origin_chat = Some(reply_target.into());
+            job.origin_channel = Some((*channel).into());
+            job.origin_chat = Some((*origin_chat).into());
+            job.origin_thread = origin_thread.map(|t| t.to_string());
 
             assert_eq!(
                 memory_view_for(&job),
-                Some(MemoryView::Only(dispatch_scope)),
-                "{channel} / {reply_target}"
+                Some(MemoryView::Only(dispatch_scope.clone())),
+                "{channel} / {reply_target} / thread={thread_ts:?}"
+            );
+
+            // The pipeline the chat tool actually runs: it sees the dispatch
+            // scope as a `MemoryView::Only`, calls `cron_origin_for_view`, and
+            // gets back the three origin columns the scheduler stores on the
+            // job. The rebuilt view from those columns must equal the
+            // dispatcher's view. A regression in `parse_place`,
+            // `cron_origin_for_view`, or `memory_view_for` fails here —
+            // including the regression a manual origin set would have
+            // silently absorbed (the bug fix that triggered this test).
+            let view = MemoryView::Only(dispatch_scope);
+            let parsed = crate::tools::cron_schema::cron_origin_for_view(Some(&view), &json!({}))
+                .expect("the dispatch scope must parse");
+            let (parsed_channel, parsed_chat, parsed_thread) = parsed.as_ref().expect("Only view");
+            assert_eq!(
+                parsed_channel.as_str(),
+                *channel,
+                "the parse must return the surface"
+            );
+            assert_eq!(
+                parsed_chat.as_str(),
+                *origin_chat,
+                "the parse must return the sender"
+            );
+            assert_eq!(
+                parsed_thread.as_deref(),
+                *origin_thread,
+                "the parse must return the thread when there is one"
             );
         }
     }
@@ -2109,6 +2207,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -2142,6 +2241,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             None,
             None,
             None,
@@ -2243,6 +2343,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -2295,6 +2396,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -2339,6 +2441,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -2472,6 +2575,7 @@ mod tests {
             "echo ok",
             None,
             false,
+            None,
             None,
             None,
             None,

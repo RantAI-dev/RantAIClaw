@@ -120,9 +120,9 @@ ask which configured channel to deliver to — do not imply a message will arriv
                 });
             }
         };
-        let (origin_channel, origin_chat) = match origin_owned.as_ref() {
-            Some((c, h)) => (Some(c.as_str()), Some(h.as_str())),
-            None => (None, None),
+        let (origin_channel, origin_chat, origin_thread) = match origin_owned.as_ref() {
+            Some((c, h, t)) => (Some(c.as_str()), Some(h.as_str()), t.as_deref()),
+            None => (None, None, None),
         };
 
         let schedule = match args.get("schedule") {
@@ -230,6 +230,7 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     Some("agent-tool"),
                     origin_channel,
                     origin_chat,
+                    origin_thread,
                 )
             }
             JobType::Agent => {
@@ -316,6 +317,7 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     Some("agent-tool"),
                     origin_channel,
                     origin_chat,
+                    origin_thread,
                 )
             }
         };

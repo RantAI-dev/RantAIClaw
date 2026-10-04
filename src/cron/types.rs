@@ -138,13 +138,22 @@ pub struct CronJob {
     /// existed. Used to scope a scheduled agent job's capability ceiling.
     pub created_by: Option<String>,
     /// The chat (channel + reply target) a job was created from, when it was
-    /// created from one. Together with `origin_channel` this scopes every
-    /// cron_* tool call to the chat that owns the job: a Telegram chat can
-    /// only see, change, run, or remove its own jobs. `None` for jobs
-    /// created from CLI / TUI / web console / a path that does not set
-    /// them — those jobs are not scoped and remain visible to every chat.
+    /// created from one. Together with `origin_channel` and `origin_thread`
+    /// this scopes every cron_* tool call to the chat that owns the job: a
+    /// Telegram chat can only see, change, run, or remove its own jobs.
+    /// `None` for jobs created from CLI / TUI / web console / a path that
+    /// does not set them — those jobs are not scoped and remain visible to
+    /// every chat.
     pub origin_channel: Option<String>,
     pub origin_chat: Option<String>,
+    /// The thread id within the origin chat, when the job was created from a
+    /// thread (a Slack thread ts, a Telegram forum topic id encoded into
+    /// reply_target, …). Stored alongside `origin_chat` so the per-job view
+    /// rebuilt from these three columns exactly equals the dispatcher's view
+    /// — without this column, the rebuilt view lost the thread and the job
+    /// read a place nothing wrote to. `None` for non-threaded chats and for
+    /// legacy rows written before the migration.
+    pub origin_thread: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
