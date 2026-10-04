@@ -1721,6 +1721,68 @@ async fn owner_turn_keeps_every_tool_spec() {
     );
 }
 
+/// `session_search` is owner-only. An owner who lists it in
+/// `guest_allowed_tools` by mistake does not give a guest the spec: the gate
+/// strips owner-only tools before the native tool list reaches the provider,
+/// and a guest turn that names the tool directly is denied by the gate's
+/// owner-only check (see `OWNER_ONLY_TOOLS` in `src/approval/guest.rs`).
+#[tokio::test]
+async fn session_search_is_owner_only_for_guest_turns() {
+    // Control: a guest whose allowlist mistakenly includes `session_search`
+    // never sees it. The operator can list it, but the gate strips it from the
+    // native specs the provider receives.
+    let guest_seen = native_specs_seen_by(
+        GUEST_SENDER,
+        &["file_read", "memory_recall", "session_search"],
+        &["file_read", "memory_recall", "session_search"],
+    )
+    .await;
+    assert_eq!(
+        guest_seen,
+        vec![Some(vec![
+            "file_read".to_string(),
+            "memory_recall".to_string()
+        ])],
+        "session_search must not reach a guest even when listed: {guest_seen:?}"
+    );
+
+    // Control: an owner on the same registry keeps every spec, including
+    // `session_search`. The gate does not apply to owners.
+    let owner_seen = native_specs_seen_by(
+        OWNER_SENDER,
+        &["file_read", "memory_recall", "session_search"],
+        &["file_read", "memory_recall", "session_search"],
+    )
+    .await;
+    assert_eq!(
+        owner_seen,
+        vec![Some(vec![
+            "file_read".to_string(),
+            "memory_recall".to_string(),
+            "session_search".to_string(),
+        ])],
+        "owner must see every spec the registry holds: {owner_seen:?}"
+    );
+}
+
+/// A guest's call to `session_search` is denied with the standard owner-only
+/// refusal message, not silently dropped.
+#[tokio::test]
+async fn session_search_call_by_a_guest_is_denied_by_the_gate() {
+    let g = crate::approval::GuestGate::new(&["session_search".to_string()], &[]);
+    let reason = g
+        .deny_reason("session_search", &serde_json::json!({}))
+        .expect("session_search must be refused for guests even when listed");
+    assert!(
+        reason.contains("owner-only"),
+        "guest refusal must say owner-only: {reason}"
+    );
+    assert!(
+        reason.contains("channels pair") && reason.contains("/claim"),
+        "guest refusal must point at the owner-claim flow: {reason}"
+    );
+}
+
 /// The guest gate still answers every call, including one for a tool that was
 /// left out of the guest's list: the refusal names the ceiling, not an
 /// unknown tool.

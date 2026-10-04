@@ -173,6 +173,23 @@ operator path, which guests do not have. See
 [Channel Session Recording](../reference/channels.md#channel-session-recording)
 for storage location, retention, and the deletion paths.
 
+## Transcript search (`session_search`)
+
+The `session_search` tool reads recorded conversation transcripts through a
+single owner-only tool call. The tool is registered unconditionally, and the
+hard owner-only denylist on the guest gate strips it from the native tool
+specs a guest turn receives, so an operator who lists it in
+`guest_allowed_tools` still does not give a guest the spec. The runtime also
+denies the call outright if a guest turn names the tool. The tool itself
+self-scopes: the result is restricted to what the turn's memory view allows
+(`All` searches every session, `Only(key)` searches that conversation's
+sessions only, no view refuses with the same refusal shape the memory tools
+use). Secret-shaped values are redacted again on the way out — sessions
+written by the TUI before the recent change are stored raw — and the result
+opens with the data-not-instructions line the memory block uses. Nothing
+injects transcripts on its own; the tool description names when to use it
+(when the person asks about an earlier conversation).
+
 ## What stays open
 
 These paths are known and not closed by the rules above.
