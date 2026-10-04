@@ -161,11 +161,11 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct ResolvedEmbeddingConfig {
-    provider: String,
-    model: String,
-    dimensions: usize,
-    api_key: Option<String>,
+pub(crate) struct ResolvedEmbeddingConfig {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) dimensions: usize,
+    pub(crate) api_key: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedEmbeddingConfig {
@@ -179,7 +179,7 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
-fn resolve_embedding_config(
+pub(crate) fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
     api_key: Option<&str>,
@@ -239,6 +239,22 @@ fn resolve_embedding_config(
         dimensions,
         api_key: routed_api_key.or(fallback_api_key),
     }
+}
+
+/// Render the search mode for the surfaces that report on memory: the
+/// `memory stats` CLI, the `memory recall` CLI header, and the
+/// `GET /api/v1/memory/stats` `mode` field.
+///
+/// Kept as one fn so the three surfaces cannot drift. The factory
+/// (`create_embedding_provider`) and `SqliteMemory::recall` share the same
+/// effective mode: a `none` provider runs FTS-only (keyword) and any other
+/// known provider runs hybrid (keyword + semantic).
+pub fn search_mode_label(provider: &str) -> String {
+    let trimmed = provider.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return "keyword".to_string();
+    }
+    format!("keyword + semantic ({trimmed})")
 }
 
 /// Factory: create the right memory backend from config
@@ -695,6 +711,33 @@ mod tests {
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
             }
+        );
+    }
+
+    /// `keyword` is the only label the no-op backend can produce — it is the
+    /// state `search_mode_label` reports when the factory short-circuits to
+    /// `NoopEmbedding`. The CLI stats line, the recall header and the gateway
+    /// `mode` field all read this fn; the absence of any provider name keeps
+    /// them from claiming semantic search is on when it is not.
+    #[test]
+    fn search_mode_label_is_keyword_for_none_and_empty() {
+        assert_eq!(search_mode_label("none"), "keyword");
+        assert_eq!(search_mode_label(""), "keyword");
+        assert_eq!(search_mode_label("  "), "keyword");
+        assert_eq!(search_mode_label("NONE"), "keyword");
+    }
+
+    /// Any non-none name — known or unknown — is reported with the hybrid
+    /// label and the provider name. The check does not validate the name;
+    /// that is the doctor check's job. The surfaces that show the mode must
+    /// not silently down-grade an unknown to `keyword`, because the daemon
+    /// was started with the value and an operator may be reading it.
+    #[test]
+    fn search_mode_label_names_a_known_provider() {
+        assert_eq!(search_mode_label("openai"), "keyword + semantic (openai)");
+        assert_eq!(
+            search_mode_label("custom:https://api.example.com"),
+            "keyword + semantic (custom:https://api.example.com)"
         );
     }
 }

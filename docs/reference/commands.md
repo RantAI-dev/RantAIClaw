@@ -342,7 +342,11 @@ carrying the `[Memory context]` header is refused.
 
 `recall` shows relevance as an absolute quality score, not as a percentage of
 the best hit in that result set. Notes you saved rank before the raw
-conversation rows.
+conversation rows. The header line names the search mode in use
+(`keyword` or `keyword + semantic (<provider>)`) so the operator can see
+whether vector scoring contributed to the result.
+
+`stats` reports the same search mode as `recall` on the `Mode:` line.
 
 `reindex` re-embeds memories the current embedding model cannot use — rows stored
 while the embedding provider was unavailable, and rows embedded by a previous

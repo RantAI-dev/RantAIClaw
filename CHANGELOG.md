@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The search mode memory is using is now reported on every surface that talks
+  about memory: `rantaiclaw memory stats` gains a `Mode:` line, the
+  `rantaiclaw memory recall` header carries `(mode: …)`, and `GET /api/v1/memory/stats`
+  gains a `mode` field. The same fn names the value everywhere, so the label
+  cannot drift across the CLI and the gateway.
+- `rantaiclaw doctor` now runs a `memory.embedding` check. It names the live
+  search mode, fails on an unknown embedding provider (with a hint listing
+  `none`, `openai`, `openrouter`, `minimax`, `custom:<base-url>`), and warns
+  when rows in `brain.db` were embedded by a different model — pointing at
+  `rantaiclaw memory reindex`. A fresh install (no `brain.db` yet) still
+  passes.
+
+### Fixed
+
+- An unknown `embedding_provider` no longer silently disables semantic
+  search. The factory logs a `WARN` naming the bad value at start, and
+  `rantaiclaw doctor` reports it as `✗` so the typo surfaces. The daemon
+  still starts in keyword mode, matching the previous fallback contract.
+
 - `ChannelMessage.is_direct` is now surfaced to the model: `build_channel_system_prompt`
   appends one of four fixed lines naming whether the conversation is a DM or a
   group, and whether the sender is an owner or a guest. The line is rebuilt every

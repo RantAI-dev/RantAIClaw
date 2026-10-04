@@ -140,6 +140,7 @@ fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
         model: "test-model".into(),
         temperature: 0.0,
         mem: Arc::new(MockMemory),
+        memory_search_mode: Arc::new("keyword".to_string()),
 
         tools_factory: Arc::new(|_: &Config| Vec::new()),
         webhook_secret_hash: None,

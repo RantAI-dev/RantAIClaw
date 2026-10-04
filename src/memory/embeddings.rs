@@ -326,7 +326,14 @@ pub fn create_embedding_provider(
             let key = api_key.unwrap_or("");
             Box::new(OpenAiEmbedding::new(base_url, key, model, dims))
         }
-        _ => Box::new(NoopEmbedding),
+        "none" | "" => Box::new(NoopEmbedding),
+        name => {
+            tracing::warn!(
+                "memory embedding provider '{name}' is not known to this build, \
+                 semantic search is off, running keyword only"
+            );
+            Box::new(NoopEmbedding)
+        }
     }
 }
 
@@ -414,6 +421,83 @@ mod tests {
     fn factory_unknown_provider_returns_noop() {
         let p = create_embedding_provider("cohere", None, "model", 1536);
         assert_eq!(p.name(), "none");
+    }
+
+    /// Capture every tracing event while `f` runs.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogBuffer {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_tracing<R>(f: impl FnOnce() -> R) -> (R, String) {
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = f();
+        let captured =
+            String::from_utf8(buffer.0.lock().expect("buffer lock").clone()).expect("utf-8 log");
+        (result, captured)
+    }
+
+    /// A typo'd provider name used to fall back to `NoopEmbedding` silently,
+    /// so a wrong name turned semantic search off with no sign. The factory now
+    /// logs a WARN that names the bad value and the keyword fallback it is
+    /// running, while still returning a usable provider so the daemon starts.
+    #[test]
+    fn factory_unknown_provider_warns_and_returns_noop() {
+        let (p, log) = capture_tracing(|| create_embedding_provider("cohere", None, "model", 1536));
+        assert_eq!(p.name(), "none");
+        assert!(
+            log.contains("cohere"),
+            "the warn must name the bad provider: {log}"
+        );
+        assert!(
+            log.contains("WARN"),
+            "the warn must be at WARN level: {log}"
+        );
+        assert!(
+            log.contains("keyword"),
+            "the warn must name the fallback mode: {log}"
+        );
+    }
+
+    /// `"none"` and `""` are the configured-absent default; a warning there
+    /// would fire on every daemon start with no operator action possible.
+    #[test]
+    fn factory_none_does_not_warn() {
+        let (_p, log) = capture_tracing(|| create_embedding_provider("none", None, "model", 1536));
+        assert!(
+            !log.contains("not known to this build"),
+            "the default `none` must not warn: {log}"
+        );
+    }
+
+    #[test]
+    fn factory_empty_string_does_not_warn() {
+        let (_p, log) = capture_tracing(|| create_embedding_provider("", None, "model", 1536));
+        assert!(
+            !log.contains("not known to this build"),
+            "an empty provider name must not warn: {log}"
+        );
     }
 
     #[test]

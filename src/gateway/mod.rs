@@ -478,6 +478,11 @@ pub struct AppState {
     pub model: String,
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
+    /// Resolved search-mode label for `memory` surfaces (`stats`, the gateway
+    /// `mode` field). Computed once at boot from the same resolution the
+    /// daemon uses for embeddings so the label never disagrees with the live
+    /// mode.
+    pub memory_search_mode: Arc<String>,
     /// Builds the tool registry for one webhook / channel-relay turn. See
     /// [`ToolsFactory`].
     ///
@@ -661,6 +666,14 @@ pub fn build_gateway_router(
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    let memory_search_mode = Arc::new(memory::search_mode_label(
+        &memory::resolve_embedding_config(
+            &config.memory,
+            &config.embedding_routes,
+            config.api_key.as_deref(),
+        )
+        .provider,
+    ));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let tools_factory = build_tools_factory(runtime, Arc::clone(&mem));
@@ -799,6 +812,7 @@ pub fn build_gateway_router(
         model,
         temperature,
         mem,
+        memory_search_mode,
         tools_factory,
         webhook_secret_hash,
         pairing,
@@ -3123,6 +3137,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -3176,6 +3191,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -3546,6 +3562,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(true, &[])),
@@ -3938,6 +3955,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4234,6 +4252,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4302,6 +4321,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4391,6 +4411,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -4458,6 +4479,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4510,6 +4532,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4567,6 +4590,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4655,6 +4679,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5431,6 +5456,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5490,6 +5516,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5552,6 +5579,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5625,6 +5653,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -6437,6 +6466,7 @@ mod tests {
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
+            memory_search_mode: Arc::new("keyword".to_string()),
 
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
