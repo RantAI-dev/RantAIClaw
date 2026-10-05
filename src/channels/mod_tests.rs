@@ -1714,13 +1714,13 @@ fn durable_history_writes_through_and_reloads() {
 }
 
 #[test]
-fn compact_sender_history_drops_overlong_rows_instead_of_truncating() {
+fn compact_sender_history_truncates_overlong_plain_rows_with_ellipsis() {
     let mut histories = HashMap::new();
     let sender = "telegram_u1".to_string();
-    // 20 rows of 700 chars each — every row is overlong. New compaction
-    // behaviour drops them rather than ellipsis-truncating the bodies, since
-    // a truncated body would let the model read a partial value it cannot
-    // reason about safely.
+    // 20 plain rows of 700 chars each — every row is overlong. New compaction
+    // behaviour ellipsis-truncates plain user/assistant prose so the cache
+    // stays well-formed; rows attached to a tool-call carrier still leave in
+    // pairs (none here, since no row is a carrier).
     histories.insert(
         sender.clone(),
         (0..20)
@@ -1771,19 +1771,29 @@ fn compact_sender_history_drops_overlong_rows_instead_of_truncating() {
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
     };
 
-    // Compaction returns false because every row was dropped — there is
-    // nothing to persist after compaction.
-    assert!(!history::compact_sender_history(&ctx, &sender));
+    // Compaction persists the truncated rows.
+    assert!(history::compact_sender_history(&ctx, &sender));
 
     let histories = ctx
         .conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let kept = histories.get(&sender).cloned().unwrap_or_default();
-    assert!(
-        kept.is_empty(),
-        "no row survives when every input row was overlong, got: {kept:?}"
+    assert_eq!(
+        kept.len(),
+        12,
+        "compaction keeps the trailing slice as ellipsis-truncated copies: {kept:?}"
     );
+    for turn in &kept {
+        assert!(
+            turn.content.ends_with('…'),
+            "every kept row carries the ellipsis truncation marker: {turn:?}"
+        );
+        assert!(
+            turn.content.chars().count() <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
+            "every kept row is at or under the cap: {turn:?}"
+        );
+    }
 }
 
 struct DummyProvider;
@@ -2021,8 +2031,8 @@ impl Provider for IterativeToolProvider {
         });
         if force_summary_requested {
             return Ok("Summary: I kept calling mock_price for BTC and got the \
-                           same result, so I stopped. Next step: try a different \
-                           symbol or narrow the question."
+                       same result, so I stopped. Next step: try a different \
+                       symbol or narrow the question."
                 .to_string());
         }
 
@@ -2034,6 +2044,47 @@ impl Provider for IterativeToolProvider {
         } else {
             Ok(tool_call_payload())
         }
+    }
+}
+
+/// Like `IterativeToolProvider`, but each call varies the tool-call nonce so
+/// the loop detector in `agent/loop_.rs` (which hashes tool+args+result) does
+/// not fire before the iteration soft cap. Used to drive the soft-cap
+/// `force_final_summary` path end to end.
+struct VaryingIterativeToolProvider;
+
+#[async_trait::async_trait]
+impl Provider for VaryingIterativeToolProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(varying_tool_call_payload(0))
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let force_summary_requested = messages.iter().any(|msg| {
+            msg.role == "user"
+                && (msg.content.contains("stuck in a loop")
+                    || msg.content.contains("reached the maximum of"))
+        });
+        if force_summary_requested {
+            return Ok(
+                "Summary: I kept calling varying_mock_price and got varying results, \
+                 so I stopped. Next step: try a different angle or narrow the question."
+                    .to_string(),
+            );
+        }
+        let nonce = IterativeToolProvider::completed_tool_iterations(messages);
+        Ok(varying_tool_call_payload(nonce))
     }
 }
 
@@ -2075,6 +2126,12 @@ impl Provider for DelayedHistoryCaptureProvider {
 }
 
 struct MockPriceTool;
+
+/// A mock tool whose result changes between calls so the loop detector in
+/// `agent/loop_.rs` cannot key on a single tool+args+result hash. Used by the
+/// soft-cap test to reach the iteration cap without the loop detector firing
+/// first.
+struct VaryingMockPriceTool;
 
 #[derive(Default)]
 struct ModelCaptureProvider {
@@ -2145,6 +2202,47 @@ impl Tool for MockPriceTool {
             error: None,
         })
     }
+}
+
+#[async_trait::async_trait]
+impl Tool for VaryingMockPriceTool {
+    fn name(&self) -> &str {
+        "varying_mock_price"
+    }
+
+    fn description(&self) -> &str {
+        "Return a mocked BTC price that varies between calls"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "nonce": { "type": "string" }
+            },
+            "required": ["nonce"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let nonce = args
+            .get("nonce")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0");
+        Ok(ToolResult {
+            success: true,
+            output: format!(r#"{{"nonce":"{nonce}","price_usd":65000}}"#),
+            error: None,
+        })
+    }
+}
+
+fn varying_tool_call_payload(nonce: usize) -> String {
+    format!(
+        r#"<tool_call>
+{{"name":"varying_mock_price","arguments":{{"nonce":"n{nonce}"}}}}
+</tool_call>"#
+    )
 }
 
 #[tokio::test]
@@ -7117,11 +7215,414 @@ fn approval_prompts_and_runtime_commands_share_one_prefix_rule() {
     );
 }
 
+/// A native dispatcher turn that ran three tool calls in one response stores
+/// them as one carrier assistant row plus three `tool` rows
+/// (`NativeToolDispatcher::to_provider_messages`, `src/agent/dispatcher.rs`).
+/// The normalizer must keep every `tool` row whose carrier is present — a run
+/// of `tool` rows after a carrier stays together, not just the first one.
+#[test]
+fn normalize_keeps_three_results_after_native_carrier() {
+    let carrier_payload = serde_json::json!({
+        "content": "",
+        "tool_calls": [
+            {"id": "c-1", "name": "a", "arguments": {}},
+            {"id": "c-2", "name": "b", "arguments": {}},
+            {"id": "c-3", "name": "c", "arguments": {}},
+        ]
+    })
+    .to_string();
+    let turns = vec![
+        ChatMessage::user("q1"),
+        ChatMessage::assistant(carrier_payload),
+        ChatMessage::tool(r#"{"tool_call_id":"c-1","content":"r1"}"#),
+        ChatMessage::tool(r#"{"tool_call_id":"c-2","content":"r2"}"#),
+        ChatMessage::tool(r#"{"tool_call_id":"c-3","content":"r3"}"#),
+        ChatMessage::assistant("reply"),
+    ];
+
+    let normalized = normalize_cached_channel_turns(turns);
+
+    assert_eq!(
+        normalized.len(),
+        6,
+        "every tool row stays attached: {normalized:?}"
+    );
+    let tool_rows: Vec<_> = normalized
+        .iter()
+        .filter(|t| t.role == "tool")
+        .map(|t| t.content.as_str())
+        .collect();
+    assert_eq!(
+        tool_rows,
+        vec![
+            r#"{"tool_call_id":"c-1","content":"r1"}"#,
+            r#"{"tool_call_id":"c-2","content":"r2"}"#,
+            r#"{"tool_call_id":"c-3","content":"r3"}"#,
+        ],
+        "all three results survive, none orphaned: {normalized:?}"
+    );
+}
+
+/// Compaction through `drop_overlong_rows` shares the same attachment rule:
+/// a `tool` row whose body exceeds the per-message char cap is dropped
+/// together with its preceding carrier row and every other `tool` row in the
+/// same run, since the model would see the carrier with a missing result in
+/// its next prompt.
+#[tokio::test]
+async fn compact_drops_carrier_and_all_three_results_when_one_oversize() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let ctx = minimal_channel_context();
+    let sender_key = "compact-test:chat-oversize-three";
+
+    let carrier_payload = serde_json::json!({
+        "content": "",
+        "tool_calls": [
+            {"id": "c-1", "name": "a", "arguments": {}},
+            {"id": "c-2", "name": "b", "arguments": {}},
+            {"id": "c-3", "name": "c", "arguments": {}},
+        ]
+    })
+    .to_string();
+    let long_result = serde_json::json!({
+        "tool_call_id": "c-2",
+        "content": "x".repeat(5000),
+    })
+    .to_string();
+
+    let mut turns = Vec::new();
+    for i in 0..14 {
+        turns.push(ChatMessage::user(format!("fill-q-{i}")));
+        turns.push(ChatMessage::assistant(format!("fill-a-{i}")));
+    }
+    turns.push(ChatMessage::user("late-q"));
+    turns.push(ChatMessage::assistant(carrier_payload));
+    turns.push(ChatMessage::tool(
+        r#"{"tool_call_id":"c-1","content":"r1"}"#,
+    ));
+    turns.push(ChatMessage::tool(long_result));
+    turns.push(ChatMessage::tool(
+        r#"{"tool_call_id":"c-3","content":"r3"}"#,
+    ));
+    turns.push(ChatMessage::assistant("after"));
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), turns);
+
+    let _ = super::history::compact_sender_history(&ctx, sender_key);
+
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !stored.iter().any(|t| t.role == "tool"),
+        "every tool row leaves with its carrier when one result is oversize: {stored:?}"
+    );
+    assert!(
+        !stored
+            .iter()
+            .any(|t| t.role == "assistant" && t.content.contains("\"tool_calls\"")),
+        "the carrier is dropped together with its results: {stored:?}"
+    );
+    assert!(
+        stored
+            .iter()
+            .any(|t| t.role == "user" && t.content == "late-q"),
+        "the surrounding turns survive: {stored:?}"
+    );
+    assert!(
+        stored
+            .iter()
+            .any(|t| t.role == "assistant" && t.content == "after"),
+        "the trailing assistant survives: {stored:?}"
+    );
+}
+
+/// A carrier whose tool-call tag uses one of the parser's accepted aliases
+/// (`<toolcall>`, `<tool-call>`, `<invoke>` — see `parse_tool_calls_for_provider`
+/// and `TOOL_CALL_OPEN_TAGS`) still looks like a carrier to the normalizer:
+/// a `tool`-role row that follows an alias carrier stays attached, not dropped
+/// as an orphan.
+#[test]
+fn normalize_keeps_tool_row_after_alias_carrier() {
+    for alias in &["<toolcall>", "<tool-call>", "<invoke>"] {
+        let carrier = format!("{alias}\n{{\"name\":\"x\",\"arguments\":{{}}}}\n</toolcall>");
+        let turns = vec![
+            ChatMessage::user("q1"),
+            ChatMessage::assistant(carrier),
+            ChatMessage::tool(r#"{"tool_call_id":"c-1","content":"r1"}"#),
+            ChatMessage::assistant("a1"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+
+        assert_eq!(
+            normalized.len(),
+            4,
+            "alias `{alias}` is recognised as a carrier so the tool row attaches: {normalized:?}"
+        );
+        assert!(
+            normalized[1].content.contains(alias),
+            "the carrier keeps its alias tag: {:?}",
+            normalized[1]
+        );
+        assert_eq!(
+            normalized[2].role, "tool",
+            "the tool row survives: {normalized:?}"
+        );
+    }
+}
+
+/// Compaction follows the same attachment rule for alias carriers: the pair
+/// either survives whole or leaves together, never an orphan result row.
+#[tokio::test]
+async fn compact_drops_alias_carrier_and_results_together_when_oversize() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let ctx = minimal_channel_context();
+    let sender_key = "compact-test:chat-alias-oversize";
+
+    let alias = "<toolcall>";
+    let carrier = format!("{alias}\n{{\"name\":\"x\",\"arguments\":{{}}}}\n</toolcall>");
+    let long_results: String = "[Tool results]\n".to_string() + &"x".repeat(5000);
+
+    let mut turns = Vec::new();
+    for i in 0..14 {
+        turns.push(ChatMessage::user(format!("fill-q-{i}")));
+        turns.push(ChatMessage::assistant(format!("fill-a-{i}")));
+    }
+    turns.push(ChatMessage::user("late-q"));
+    turns.push(ChatMessage::assistant(carrier));
+    turns.push(ChatMessage::user(long_results));
+    turns.push(ChatMessage::assistant("after"));
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), turns);
+
+    let _ = super::history::compact_sender_history(&ctx, sender_key);
+
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !stored
+            .iter()
+            .any(|t| t.role == "user" && t.content.starts_with("[Tool results]")),
+        "the XML tool-results user row is dropped with its alias carrier: {stored:?}"
+    );
+    assert!(
+        !stored.iter().any(|t| t.content.contains("<toolcall>")),
+        "no carrier row that paired the dropped result survives: {stored:?}"
+    );
+}
+
+/// A carrier written in GLM's line grammar (`name/param>value`, the format
+/// `parse_glm_style_tool_calls` accepts in `agent/loop_.rs`) is a real carrier
+/// for the normalizer: a `tool` row that follows it must stay attached, not
+/// be dropped as orphan, the same way it does after an XML or native carrier.
+#[test]
+fn normalize_keeps_tool_row_after_glm_grammar_carrier() {
+    let carrier = "shell/command>ls -la\nhttp_request/url>https://example.com";
+    let turns = vec![
+        ChatMessage::user("q1"),
+        ChatMessage::assistant(carrier.to_string()),
+        ChatMessage::tool(r#"{"tool_call_id":"c-1","content":"r1"}"#),
+        ChatMessage::assistant("a1"),
+    ];
+
+    let normalized = normalize_cached_channel_turns(turns);
+
+    assert_eq!(
+        normalized.len(),
+        4,
+        "GLM line grammar is a carrier so the tool row attaches: {normalized:?}"
+    );
+    assert_eq!(normalized[1].role, "assistant");
+    assert!(
+        normalized[1].content.contains("shell/command>ls -la"),
+        "the carrier row keeps its GLM shape: {:?}",
+        normalized[1]
+    );
+    assert_eq!(normalized[2].role, "tool");
+}
+
+/// Compaction follows the same attachment rule for GLM grammar carriers: an
+/// oversize `[Tool results]` user row that pairs one must leave with the
+/// carrier, never an orphan result row.
+#[tokio::test]
+async fn compact_drops_glm_grammar_carrier_and_results_together_when_oversize() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let ctx = minimal_channel_context();
+    let sender_key = "compact-test:chat-glm-oversize";
+
+    let carrier = "shell/command>ls -la";
+    let long_results: String = "[Tool results]\n".to_string() + &"x".repeat(5000);
+
+    let mut turns = Vec::new();
+    for i in 0..14 {
+        turns.push(ChatMessage::user(format!("fill-q-{i}")));
+        turns.push(ChatMessage::assistant(format!("fill-a-{i}")));
+    }
+    turns.push(ChatMessage::user("late-q"));
+    turns.push(ChatMessage::assistant(carrier.to_string()));
+    turns.push(ChatMessage::user(long_results));
+    turns.push(ChatMessage::assistant("after"));
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), turns);
+
+    let _ = super::history::compact_sender_history(&ctx, sender_key);
+
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !stored
+            .iter()
+            .any(|t| t.role == "user" && t.content.starts_with("[Tool results]")),
+        "the GLM tool-results user row is dropped with its carrier: {stored:?}"
+    );
+    assert!(
+        !stored
+            .iter()
+            .any(|t| t.role == "assistant" && t.content.contains("shell/command>ls -la")),
+        "no carrier row that paired the dropped result survives: {stored:?}"
+    );
+}
+
+/// The other GLM line-grammar shape `parse_glm_style_tool_calls` in
+/// `agent/loop_.rs` accepts is `name/{json}` — a line whose first
+/// `/`-prefixed token is a tool name and whose rest is a JSON object that
+/// parses. A carrier whose call lines all use this form (no `>` anywhere,
+/// no tags, no fences, no `"tool_calls"`) must still be a carrier: the
+/// dispatcher stores the raw response text, so this is the shape a GLM
+/// assistant row lands in. Otherwise `drop_overlong_rows` would keep the
+/// carrier while dropping every attached `[Tool results]` row, orphaning
+/// the carrier.
+#[test]
+fn normalize_keeps_tool_row_after_glm_json_form_carrier() {
+    let carrier = r#"shell/{"command":"ls -la"}
+http_request/{"url":"https://example.com"}"#;
+    let turns = vec![
+        ChatMessage::user("q1"),
+        ChatMessage::assistant(carrier.to_string()),
+        ChatMessage::tool(r#"{"tool_call_id":"c-1","content":"r1"}"#),
+        ChatMessage::assistant("a1"),
+    ];
+
+    let normalized = normalize_cached_channel_turns(turns);
+
+    assert_eq!(
+        normalized.len(),
+        4,
+        "GLM `name/{{json}}` line grammar is a carrier so the tool row attaches: {normalized:?}"
+    );
+    assert_eq!(normalized[1].role, "assistant");
+    assert!(
+        normalized[1]
+            .content
+            .contains(r#"shell/{"command":"ls -la"}"#),
+        "the carrier row keeps its GLM JSON shape: {:?}",
+        normalized[1]
+    );
+    assert_eq!(normalized[2].role, "tool");
+}
+
+/// Compaction follows the same attachment rule for `name/{json}` GLM
+/// carriers: an oversize `[Tool results]` user row that pairs one must
+/// leave with the carrier, never an orphan result row.
+#[tokio::test]
+async fn compact_drops_glm_json_form_carrier_and_results_together_when_oversize() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let ctx = minimal_channel_context();
+    let sender_key = "compact-test:chat-glm-json-oversize";
+
+    let carrier = r#"shell/{"command":"ls -la"}"#;
+    let long_results: String = "[Tool results]\n".to_string() + &"x".repeat(5000);
+
+    let mut turns = Vec::new();
+    for i in 0..14 {
+        turns.push(ChatMessage::user(format!("fill-q-{i}")));
+        turns.push(ChatMessage::assistant(format!("fill-a-{i}")));
+    }
+    turns.push(ChatMessage::user("late-q"));
+    turns.push(ChatMessage::assistant(carrier.to_string()));
+    turns.push(ChatMessage::user(long_results));
+    turns.push(ChatMessage::assistant("after"));
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), turns);
+
+    let _ = super::history::compact_sender_history(&ctx, sender_key);
+
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !stored
+            .iter()
+            .any(|t| t.role == "user" && t.content.starts_with("[Tool results]")),
+        "the GLM `name/{{json}}` tool-results user row is dropped with its carrier: {stored:?}"
+    );
+    assert!(
+        !stored.iter().any(|t| {
+            t.role == "assistant" && t.content.contains(r#"shell/{"command":"ls -la"}"#)
+        }),
+        "no `name/{{json}}` carrier row that paired the dropped result survives: {stored:?}"
+    );
+}
+
+/// A plain assistant row that merely contains `>` (with or without `/`) is not
+/// a carrier — the recogniser must not false-positive on prose that happens
+/// to look tool-call-shaped, or it would glue an unrelated `tool` row to the
+/// plain assistant row above it. The two `/`-shaped samples each pin one
+/// requirement: `src/main.rs` passes the alphanumeric gate but has neither a
+/// `>` after the slash nor a `{`-opening rest, so only the `>`/`{json}`
+/// requirement rejects it — without that clause the recogniser would
+/// false-positive on any `alphanumeric/rest` line; `check foo/bar baz quux`
+/// is rejected only by the alphanumeric gate, because the space in its tool
+/// part ends recognition before the `>`/`{json}` requirement is reached.
+#[test]
+fn is_tool_call_carrier_rejects_plain_prose_with_gt() {
+    for prose in [
+        "the answer is > 5 and we stop here.",
+        "ratio > threshold, so done.",
+        "if a > b and b > c, the chain holds.",
+        "no tool call here, just punctuation > end.",
+        "src/main.rs",
+        "check foo/bar baz quux",
+    ] {
+        assert!(
+            !is_tool_call_carrier(prose),
+            "plain prose with `>` is not a carrier: {prose}"
+        );
+    }
+}
+
 /// A native tool result lands in the cached channel turns as a `tool`-role
 /// message (`NativeToolDispatcher::to_provider_messages` flattens each
 /// `ToolResults` entry to a `ChatMessage::tool`). The normalizer must pass
 /// these through untouched so the next turn's provider still sees the result;
-/// pairing is the provider's concern, not the cache's.
+/// the cache keeps each `tool` row attached to its preceding assistant
+/// carrier so the next prompt is well-formed.
 #[test]
 fn tool_role_is_preserved_through_normalize() {
     let turns = vec![
@@ -7154,7 +7655,7 @@ fn tool_role_is_preserved_through_normalize() {
 #[test]
 fn normalize_sixty_turns_keeps_user_first_and_tools_attached() {
     let mut turns = Vec::new();
-    for i in 0..15 {
+    for i in 0..60 {
         turns.push(ChatMessage::user(format!("q{i}")));
         turns.push(ChatMessage::assistant(format!(
             "<tool_call>{{\"name\":\"memory_store\",\"arguments\":{{\"i\":{i}}}}}"
@@ -7165,9 +7666,10 @@ fn normalize_sixty_turns_keeps_user_first_and_tools_attached() {
 
     let normalized = normalize_cached_channel_turns(turns);
 
-    assert!(
-        !normalized.is_empty(),
-        "the normalization returns the turns"
+    assert_eq!(
+        normalized.len(),
+        240,
+        "60 turns each emit 4 rows (user, carrier, tool, assistant): {normalized:?}"
     );
     assert_eq!(normalized[0].role, "user", "the cache starts at a user row");
     for (idx, turn) in normalized.iter().enumerate() {
@@ -7437,15 +7939,18 @@ async fn compact_drops_user_row_whose_body_exceeds_limit() {
         .cloned()
         .unwrap_or_default();
 
+    let cap = CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + '…'.len_utf8();
     for turn in &stored {
         assert!(
-            !turn.content.contains("..."),
-            "no row may carry an ellipsis truncation marker: {turn:?}"
+            turn.content.chars().count() <= cap,
+            "a kept row must be at or below the cap (truncated with ellipsis): {turn:?}"
         );
-        assert!(
-            turn.content.chars().count() <= 5000,
-            "a kept row must be whole (within the long-input length): {turn:?}"
-        );
+        if turn.content.starts_with('u') {
+            assert!(
+                turn.content.ends_with('…'),
+                "an overlong plain user row is truncated, not dropped: {turn:?}"
+            );
+        }
     }
 }
 
@@ -7486,6 +7991,21 @@ async fn append_trims_in_whole_turns() {
         .cloned()
         .unwrap_or_default();
     assert!(stored.len() <= max, "the cap is respected: {stored:?}");
+    assert_eq!(
+        stored[0].role, "user",
+        "the first row is always a user row, never an orphan tool row: {stored:?}"
+    );
+    for (idx, turn) in stored.iter().enumerate() {
+        if turn.role == "tool" {
+            let preceding = &stored[idx - 1];
+            assert!(
+                preceding.role == "assistant"
+                    && crate::channels::dispatch::is_tool_call_carrier(&preceding.content),
+                "a tool row must immediately follow its carrier, got: {preceding:?} at idx {}",
+                idx - 1
+            );
+        }
+    }
     // The trim cut at the new turn boundary; the carrier+result pair at the
     // end is intact.
     let last_three: Vec<_> = stored.iter().rev().take(3).collect();
@@ -9417,6 +9937,12 @@ fn sanitize_strips_no_tool_run_notice() {
 /// stored history. The nudge is a line the runtime writes for the model to
 /// answer; storing it where the next turn's cache will read it lets the model
 /// parrot it back as its own line.
+///
+/// To reach the soft cap (`max_tool_iterations: 3`) without the loop detector
+/// firing first, the test runs against a provider whose call payload and a
+/// tool whose result vary between iterations — so the loop detector's
+/// tool+args+result hash differs every iteration and the iteration cap is the
+/// first stop.
 #[tokio::test]
 async fn all_chat_history_drops_soft_cap_nudge_from_storage() {
     let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
@@ -9429,12 +9955,10 @@ async fn all_chat_history_drops_soft_cap_nudge_from_storage() {
     let ctx = Arc::new(ChannelRuntimeContext {
         runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
         channels_by_name: Arc::new(channels_by_name),
-        provider: Arc::new(IterativeToolProvider {
-            required_tool_iterations: 20,
-        }),
+        provider: Arc::new(VaryingIterativeToolProvider),
         default_provider: Arc::new("test-provider".to_string()),
         memory: Arc::new(NoopMemory),
-        tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+        tools_registry: Arc::new(vec![Box::new(VaryingMockPriceTool)]),
         observer: Arc::new(NoopObserver),
         owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -9501,6 +10025,18 @@ async fn all_chat_history_drops_soft_cap_nudge_from_storage() {
         .get(&history_key)
         .cloned()
         .unwrap_or_default();
+    assert!(
+        !stored.is_empty(),
+        "control: the turn stored at least the user query and a final assistant row, got: {stored:?}"
+    );
+    let tool_results = stored
+        .iter()
+        .filter(|t| t.role == "user" && t.content.contains("[Tool results]"))
+        .count();
+    assert!(
+        tool_results >= 3,
+        "control: the soft-cap path ran the tool at least three times, got: {tool_results} in {stored:?}"
+    );
     for turn in &stored {
         assert!(
             !turn.content.contains("reached the maximum of"),
@@ -9599,10 +10135,36 @@ async fn all_chat_history_drops_loop_detector_nudge_from_storage() {
         .get(&history_key)
         .cloned()
         .unwrap_or_default();
+    assert!(
+        !stored.is_empty(),
+        "control: the turn stored at least the user query and a final assistant row, got: {stored:?}"
+    );
+    // The loop detector fires after the third identical tool+args+result
+    // hash, but `force_final_summary` then drops the third carrier+result
+    // before pushing the nudge and the summary. So the persisted slice has
+    // two `[Tool results]` rows plus the nudge, summary, and original query.
+    let tool_results = stored
+        .iter()
+        .filter(|t| t.role == "user" && t.content.contains("[Tool results]"))
+        .count();
+    assert!(
+        tool_results >= 2,
+        "control: the loop-detector path ran the tool at least twice before the detector fired, got: {tool_results} in {stored:?}"
+    );
+    assert!(
+        stored.iter().any(
+            |t| t.role == "assistant" && t.content.contains("same result three times in a row")
+        ),
+        "control: the loop-detector summary is what the model returned, got: {stored:?}"
+    );
     for turn in &stored {
         assert!(
             !turn.content.contains("stuck in a loop"),
             "the loop-detector nudge must not be persisted: {turn:?}"
+        );
+        assert!(
+            !turn.content.contains("reached the maximum of"),
+            "the soft-cap nudge must not be persisted in the loop-detector path either: {turn:?}"
         );
     }
 }

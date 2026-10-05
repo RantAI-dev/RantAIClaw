@@ -2177,15 +2177,12 @@ pub(crate) async fn run_tool_call_loop(
     Ok(text)
 }
 
-/// Append a tools-disabled nudge to history and make one final provider
-/// call. Used by the iteration soft-cap and the loop detector — both
-/// want to produce a real user-visible summary instead of bailing with
-/// Two runtime lines written for the model to read as instructions on its
-/// next turn: the soft-cap nudge (the budget is gone) and the loop-detector
-/// nudge (the same tool returned the same result three times in a row).
-/// Exposed so the channel's store site can strip them from `to_store` for
-/// `MemoryView::All` chats; if either text reaches the next turn the model
-/// can parrot it back as its own line.
+/// Two runtime lines written for the model to read as instructions on the
+/// last call of the same turn: the soft-cap nudge (the budget is gone) and
+/// the loop-detector nudge (the same tool returned the same result three
+/// times in a row). Exposed so the channel's store site can strip them from
+/// `to_store` for `MemoryView::All` chats; if either text reaches the next
+/// turn the model can parrot it back as its own line.
 #[derive(Debug, Clone)]
 pub(crate) enum NudgeKind {
     /// Soft-cap reached: `max_iterations` tool calls in this turn.
@@ -2230,6 +2227,9 @@ pub(crate) fn is_nudge_text(content: &str) -> bool {
             && content.contains(" times in a row.")
 }
 
+/// Append a tools-disabled nudge to history and make one final provider
+/// call. Used by the iteration soft-cap and the loop detector — both
+/// want to produce a real user-visible summary instead of bailing with
 /// an empty response.
 #[allow(clippy::too_many_arguments)]
 async fn force_final_summary(

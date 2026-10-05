@@ -24,35 +24,30 @@ pub(crate) fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str
 }
 
 /// Trim a compaction slice so no row is left whose body exceeds the per-message
-/// char cap. Tool rows and XML `[Tool results]` user rows are erased in pairs
-/// (result + preceding carrier call row) since a truncated body would let the
-/// model read a partial value it cannot reason about safely; non-attached rows
-/// (plain user/assistant prose) are dropped whole — there is no way to shorten
-/// one without introducing ellipsis the cache contract forbids.
+/// char cap. Tool rows and XML `[Tool results]` user rows are erased in
+/// carrier-plus-results units (the carrier and every attached result leave
+/// together) since a truncated body would let the model read a partial value
+/// it cannot reason about safely. Plain `user`/`assistant` rows are truncated
+/// with an ellipsis when they exceed the cap, so the cache keeps the row
+/// rather than dropping the whole turn.
 fn drop_overlong_rows(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(turns.len());
     for turn in turns {
         let overlong = turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS;
         match turn.role.as_str() {
-            // A `tool` row is attached only when the row immediately before it
-            // is an assistant tool-call carrier. If that carrier was already
-            // dropped by an earlier pass (because we erased the previous pair),
-            // the tool row is orphan and must follow the same fate.
+            // A `tool` row is attached when its row, or a run of attached
+            // tool rows, ends at an assistant tool-call carrier. If that
+            // carrier was already dropped by an earlier pass (because we
+            // erased the previous unit), the tool row is orphan and must
+            // follow the same fate.
             "tool" => {
-                let attached_to_call = out
-                    .last()
-                    .map(|t| {
-                        t.role == "assistant"
-                            && crate::channels::dispatch::is_tool_call_carrier(&t.content)
-                    })
-                    .unwrap_or(false);
-                if !attached_to_call {
+                if !crate::channels::dispatch::tool_row_attached_to_carrier(&out) {
                     continue;
                 }
                 if overlong {
-                    // Drop the carrier call row we just pushed and skip this
-                    // result row. The pair leaves no orphan behind.
-                    out.pop();
+                    // Drop the whole carrier-plus-results unit so no result
+                    // row is left without its call.
+                    drop_attached_run(&mut out);
                     continue;
                 }
                 out.push(turn);
@@ -61,31 +56,31 @@ fn drop_overlong_rows(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 if turn.content.starts_with("[Tool results]")
                     || turn.content.starts_with("[Tool Results]")
                 {
-                    let attached_to_call = out
-                        .last()
-                        .map(|t| {
-                            t.role == "assistant"
-                                && crate::channels::dispatch::is_tool_call_carrier(&t.content)
-                        })
-                        .unwrap_or(false);
-                    if !attached_to_call {
+                    if !crate::channels::dispatch::tool_row_attached_to_carrier(&out) {
                         continue;
                     }
                     if overlong {
-                        out.pop();
+                        // Drop the carrier that paired this result row.
+                        drop_attached_run(&mut out);
                         continue;
                     }
                     out.push(turn);
                     continue;
                 }
                 if overlong {
-                    // Plain user prose — drop whole, no mid-row ellipsis.
+                    // Plain user prose — truncate with an ellipsis so the
+                    // surrounding conversation stays well-formed.
+                    out.push(ChatMessage::user(truncate_with_ellipsis(&turn.content)));
                     continue;
                 }
                 out.push(turn);
             }
             "assistant" => {
                 if overlong {
+                    // Plain assistant prose — truncate with an ellipsis.
+                    out.push(ChatMessage::assistant(truncate_with_ellipsis(
+                        &turn.content,
+                    )));
                     continue;
                 }
                 out.push(turn);
@@ -96,6 +91,49 @@ fn drop_overlong_rows(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 }
             }
         }
+    }
+    out
+}
+
+/// Pop the most-recent carrier row and any attached result rows that follow
+/// it. Stops at the first row that is not part of the run, so an earlier
+/// conversation state is left untouched.
+fn drop_attached_run(out: &mut Vec<ChatMessage>) {
+    while let Some(prev) = out.last() {
+        match prev.role.as_str() {
+            "tool" => {
+                out.pop();
+            }
+            "assistant" if crate::channels::dispatch::is_tool_call_carrier(&prev.content) => {
+                out.pop();
+                return;
+            }
+            "user"
+                if prev.content.starts_with("[Tool results]")
+                    || prev.content.starts_with("[Tool Results]") =>
+            {
+                out.pop();
+                return;
+            }
+            _ => return,
+        }
+    }
+}
+
+/// Shorten `content` to at most `CHANNEL_HISTORY_COMPACT_CONTENT_CHARS`
+/// characters, ending with an ellipsis so the truncated row is visibly
+/// incomplete rather than cut mid-token.
+fn truncate_with_ellipsis(content: &str) -> String {
+    const ELLIPSIS: &str = "…";
+    let cap = CHANNEL_HISTORY_COMPACT_CONTENT_CHARS;
+    let prefix_cap = cap.saturating_sub(ELLIPSIS.chars().count());
+    let mut out = String::with_capacity(cap);
+    for (idx, ch) in content.chars().enumerate() {
+        if idx >= prefix_cap {
+            out.push_str(ELLIPSIS);
+            return out;
+        }
+        out.push(ch);
     }
     out
 }

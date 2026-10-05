@@ -15,6 +15,8 @@
 use crate::providers::ChatMessage;
 use anyhow::Context;
 use parking_lot::Mutex;
+#[cfg(test)]
+use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
@@ -131,26 +133,27 @@ impl ChannelHistoryStore {
     /// rather than aborting the whole load, so one corrupt row can't wipe the
     /// rest of the live state.
     ///
-    /// Each loaded turn is walked for shapes the runtime used to leave in
-    /// persisted history but no longer does:
+    /// Each loaded turn is walked for shapes that must not survive a daemon
+    /// restart:
     ///
     /// - the runtime's own `[Used tools: …]` label on an assistant turn — a
     ///   pattern the next turn's provider would read straight back as a way
     ///   to fake tool work;
     /// - native `role = "tool"` rows, assistant tool-call carrier rows
     ///   (XML `<tool_call>` or native JSON with `"tool_calls":`), and XML
-    ///   `[Tool results]` user rows — rows that, in a shared chat, belong to
-    ///   another sender's turn and would leak one sender's tool output into
-    ///   the next sender's prompt.
+    ///   `[Tool results]` user rows — the structured tool rows the live
+    ///   runtime writes for an owner's direct chat so the model can carry
+    ///   its tool work across turns.
     ///
-    /// Stripping happens at load so a daemon upgrade doesn't ship stale
-    /// forgery patterns or cross-sender leaks into the live cache. The strip is
-    /// keyed on the row shape, not the chat kind, so it fires for an owner's
-    /// direct chat too: a persisted key is a chat, and nothing in it records
-    /// whether that chat was shared or direct. That is accepted because only
-    /// unreleased builds ever wrote these rows — an owner's DM loses its own
-    /// pre-fix structured tool rows on restart, the documented cost of not
-    /// being able to tell a shared chat from a DM in a persisted row.
+    /// The strip is keyed on the row shape, not the chat kind, because the
+    /// persisted row carries no record of whether the chat was shared or
+    /// direct. The safety-net effect is that on a daemon restart, an owner's
+    /// direct chat loses its structured tool rows: only the user turn and
+    /// the recorded final reply round-trip through `load_all`. A shared
+    /// chat never wrote these rows in the first place (the `MemoryView::Only`
+    /// write path omits them), so the strip's effect is the same there. The
+    /// legacy-build cross-sender leak the strip originally prevented is also
+    /// gone, since legacy unreleased builds never shipped a release tag.
     pub fn load_all(&self) -> anyhow::Result<HashMap<String, Vec<ChatMessage>>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT history_key, turns_json FROM channel_history")?;
@@ -263,6 +266,22 @@ impl ChannelHistoryStore {
         )?;
         Ok(())
     }
+
+    /// Read the raw `turns_json` blob for a history key, bypassing the
+    /// `load_all` strip. Test-only seam: a privacy assertion needs to know
+    /// whether a row was on disk at all, not what the redacted view shows.
+    #[cfg(test)]
+    pub fn raw_turns_json(&self, history_key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+        let result = conn
+            .query_row(
+                "SELECT turns_json FROM channel_history WHERE history_key = ?1",
+                params![history_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
 }
 
 /// Strip a leading `[Used tools: …]` label the runtime used to write into
@@ -373,6 +392,44 @@ mod tests {
         assert_eq!(turns[0].content, "hi");
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "hello");
+    }
+
+    /// A structured owner-DM turn (user query, native carrier, two tool
+    /// results, recorded final assistant) round-trips through `save` and
+    /// `load_all` to the user row and the recorded final assistant only;
+    /// the carrier and tool rows are stripped, the documented cost of not
+    /// being able to tell a shared chat from a DM in a persisted row.
+    #[test]
+    fn load_all_strips_tool_rows_from_owner_dm_persisted_history() {
+        let tmp = TempDir::new().unwrap();
+        let turns = vec![
+            ChatMessage::user("q1"),
+            ChatMessage::assistant(
+                "{\"content\":\"\",\"tool_calls\":[{\"id\":\"c-1\",\"name\":\"a\",\"arguments\":{}}]}",
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"c-1","content":"r1"}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"c-1","content":"r2"}"#),
+            ChatMessage::assistant("final reply"),
+        ];
+        {
+            let store = ChannelHistoryStore::open(tmp.path()).unwrap();
+            store.save("telegram:owner-dm", &turns).unwrap();
+        }
+
+        let store2 = ChannelHistoryStore::open(tmp.path()).unwrap();
+        let loaded = store2.load_all().unwrap();
+        let turns = loaded
+            .get("telegram:owner-dm")
+            .expect("key present after reopen");
+        assert_eq!(
+            turns.len(),
+            2,
+            "the user row and the recorded final assistant are the rows that survive the strip"
+        );
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "q1");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "final reply");
     }
 
     #[test]
