@@ -105,16 +105,36 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
 /// first". A key with no open session opens a new one; the lookup needs to
 /// answer that in one round trip.
 fn migrate_v2(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        ALTER TABLE sessions ADD COLUMN conversation_key TEXT;
+    // A previous build that crashed between the `ALTER TABLE` and the
+    // version write would leave the table already carrying the column, so a
+    // second migration would error with "duplicate column name". Skip the
+    // ALTER when `pragma_table_info` already lists it. The version write is
+    // inside the same transaction so a crash anywhere in this function
+    // leaves the schema at v1 and the next open retries the migration.
+    let tx = conn.unchecked_transaction()?;
 
-        CREATE INDEX IF NOT EXISTS idx_sessions_conversation_key
-            ON sessions(conversation_key, started_at DESC);
-        "#,
+    let has_column: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('sessions') \
+         WHERE name = 'conversation_key'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_column == 0 {
+        tx.execute_batch("ALTER TABLE sessions ADD COLUMN conversation_key TEXT;")?;
+    }
+
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_conversation_key \
+         ON sessions(conversation_key, started_at DESC);",
     )?;
 
-    set_schema_version(conn, 2)?;
+    tx.execute("DELETE FROM schema_version", [])?;
+    tx.execute(
+        "INSERT INTO schema_version (version) VALUES (?1)",
+        [CURRENT_VERSION],
+    )?;
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -351,5 +371,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1, "idx_sessions_conversation_key exists");
+    }
+
+    /// A `sessions.db` that already has the `conversation_key` column added
+    /// by hand (e.g. a v2 migration that crashed between the `ALTER TABLE`
+    /// and the version write) must open cleanly through `run_migrations`
+    /// and land at v2 — the migration has to be tolerant of its own
+    /// partially-applied state, not just of running twice.
+    #[test]
+    fn migration_v2_is_runnable_when_conversation_key_column_already_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        migrate_v1(&conn).unwrap();
+        // A row exists, and the v2 column has been added by hand — the
+        // situation a crash between `ALTER TABLE` and the version write
+        // leaves the file in. `pragma_table_info` already lists the column.
+        conn.execute("ALTER TABLE sessions ADD COLUMN conversation_key TEXT", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, model, started_at, source) \
+             VALUES ('row-1', 'm', 100, 'tui')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) \
+             VALUES ('row-1', 'user', 'hello', 100)",
+            [],
+        )
+        .unwrap();
+
+        // Re-running the v2 migration must not raise "duplicate column",
+        // and the existing row must keep its data.
+        migrate_v2(&conn).expect("v2 must be re-runnable on a partially-migrated db");
+
+        let version = get_schema_version(&conn).unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        let (title, key): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT title, conversation_key FROM sessions WHERE id = 'row-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            key.is_none(),
+            "the hand-inserted row keeps key NULL: {key:?}"
+        );
+        assert!(title.is_none(), "no title set on the hand-inserted row");
+
+        let msg_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'row-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 1, "messages table is untouched");
     }
 }

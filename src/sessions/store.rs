@@ -125,6 +125,18 @@ fn fts_literal_query(input: &str) -> String {
         .join(" ")
 }
 
+/// Like [`fts_literal_query`], but joins the quoted tokens with `OR` so the
+/// FTS5 parser matches any single word. Used by the any-word fallback the
+/// `session_search` tool runs when its first pass returns nothing; see
+/// [`SessionStore::search_any_word_with_conversation`].
+fn fts_any_word_query(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 /// Cumulative session/message statistics, computed in SQL by [`SessionStore::stats`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStats {
@@ -673,22 +685,26 @@ impl SessionStore {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // Delete child messages first — `messages.session_id` has no
-        // `ON DELETE CASCADE`, so removing the session row first would fail
-        // the foreign-key check under `PRAGMA foreign_keys=ON`. The subquery
-        // matches the prune criteria exactly so non-channel sessions are
-        // untouched.
+        // Retention is 30 days after the *last turn*, so prune by message
+        // timestamp, not by `started_at`. A session whose only old messages
+        // sit before the cutoff is left in place while its stale rows are
+        // dropped; a session whose every message is old is empty afterwards
+        // and is deleted in the same transaction.
         tx.execute(
             "DELETE FROM messages \
-             WHERE session_id IN ( \
-                 SELECT id FROM sessions \
-                 WHERE source = 'channel' AND started_at < ?1 \
+             WHERE timestamp < ?1 \
+               AND session_id IN ( \
+                 SELECT id FROM sessions WHERE source = 'channel' \
              )",
             params![cutoff],
         )?;
         let removed = tx.execute(
             "DELETE FROM sessions \
              WHERE source = 'channel' \
+               AND id NOT IN ( \
+                 SELECT DISTINCT session_id FROM messages \
+                 WHERE session_id IS NOT NULL \
+               ) \
                AND started_at < ?1",
             params![cutoff],
         )?;
@@ -964,6 +980,72 @@ impl SessionStore {
         conversation_key: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         let match_query = fts_literal_query(query);
+        if match_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match conversation_key {
+            Some(_) => (
+                "SELECT m.session_id, s.title, m.id, m.role, m.content, m.timestamp, \
+                 bm25(messages_fts) as rank \
+                 FROM messages_fts \
+                 JOIN messages m ON messages_fts.rowid = m.id \
+                 JOIN sessions s ON m.session_id = s.id \
+                 WHERE messages_fts MATCH ?1 AND s.conversation_key = ?2 \
+                 ORDER BY rank \
+                 LIMIT ?3",
+                vec![
+                    Box::new(match_query),
+                    Box::new(conversation_key.unwrap_or("").to_string()),
+                    Box::new(limit as i64),
+                ],
+            ),
+            None => (
+                "SELECT m.session_id, s.title, m.id, m.role, m.content, m.timestamp, \
+                 bm25(messages_fts) as rank \
+                 FROM messages_fts \
+                 JOIN messages m ON messages_fts.rowid = m.id \
+                 JOIN sessions s ON m.session_id = s.id \
+                 WHERE messages_fts MATCH ?1 \
+                 ORDER BY rank \
+                 LIMIT ?2",
+                vec![Box::new(match_query), Box::new(limit as i64)],
+            ),
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let results = stmt
+            .query_map(params_iter.as_slice(), |row| {
+                Ok(SearchResult {
+                    session_id: row.get(0)?,
+                    session_title: row.get(1)?,
+                    message_id: row.get(2)?,
+                    role: row.get(3)?,
+                    content: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    rank: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    /// Full-text search where any single whitespace token in `query` matches,
+    /// optionally restricted to a single `conversation_key`. The fallback
+    /// path the tool uses when the all-words pass returns nothing: a row that
+    /// carries one of the words is surfaced. Tokens are quoted individually
+    /// so an FTS operator in user input never reaches the parser as syntax;
+    /// the previous build hand-joined `"a" OR "b"` and passed it through
+    /// `fts_literal_query`, which re-quoted the whole expression and made
+    /// `OR` a literal word to match.
+    pub fn search_any_word_with_conversation(
+        &self,
+        query: &str,
+        limit: usize,
+        conversation_key: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let match_query = fts_any_word_query(query);
         if match_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -1956,6 +2038,92 @@ mod tests {
         );
     }
 
+    /// A non-ASCII quoted secret (CJK characters in the value) does not panic
+    /// the recorder. The value-pass scrub takes a fixed-byte prefix of the
+    /// captured secret; a prefix that crosses a UTF-8 char boundary panics
+    /// inside `replace_all`'s closure and poisons the held store mutex, so the
+    /// next turn's record would fail too. A second turn must still record.
+    #[test]
+    fn record_channel_turn_survives_a_non_ascii_quoted_secret() {
+        let mut s = store();
+
+        let secret = r#"password: "密码密码密码密码""#;
+        let id = s
+            .record_channel_turn("m", "telegram:chat-1", secret, "ok", None)
+            .expect("a non-ASCII quoted secret must not panic the recorder");
+        let msgs = s.get_messages(&id).unwrap();
+        assert!(
+            !msgs[0].content.contains("密码密码密码密码"),
+            "the full secret content must not be in storage: {msgs:?}"
+        );
+        assert!(
+            msgs[0].content.contains("REDACTED"),
+            "the redaction marker must be present: {msgs:?}"
+        );
+
+        // The poison case: a panic in the first call leaves the store mutex
+        // unusable, so the second call would surface a poison error. A clean
+        // recorder answers normally.
+        let id2 = s
+            .record_channel_turn("m", "telegram:chat-1", "second", "second-reply", None)
+            .expect("the second turn must still record after a non-ASCII secret");
+        let msgs2 = s.get_messages(&id2).unwrap();
+        assert!(
+            msgs2.iter().any(|m| m.content == "second"),
+            "second turn must be visible: {msgs2:?}"
+        );
+    }
+
+    /// An inbound message that carries `[IMAGE:data:image/png;base64,<payload>]`
+    /// is recorded with the payload replaced by a short placeholder. The base64
+    /// bytes themselves are stored for thirty days and indexed for FTS unless the
+    /// recording scrubber catches them; the row only keeps the kind and the fact
+    /// that an image was attached.
+    #[test]
+    fn record_channel_turn_redacts_a_base64_image_payload_in_the_message() {
+        let mut s = store();
+        let payload = "A".repeat(2048);
+        let user_msg = format!("here is a picture [IMAGE:data:image/png;base64,{payload}]");
+        let reply = format!("got it [IMAGE:data:image/png;base64,{payload}]");
+
+        let id = s
+            .record_channel_turn("m", "telegram:chat-1", &user_msg, &reply, None)
+            .unwrap();
+        let msgs = s.get_messages(&id).unwrap();
+
+        for (label, row) in [("user", &msgs[0]), ("assistant", &msgs[1])] {
+            assert!(
+                !row.content.contains(&payload),
+                "{label} row must not contain the base64 payload: {row:?}"
+            );
+            assert!(
+                row.content.contains("[IMAGE:"),
+                "{label} row must keep the [IMAGE:] kind marker: {row:?}"
+            );
+            assert!(
+                !row.content.contains("base64"),
+                "{label} row must drop the base64 hint: {row:?}"
+            );
+        }
+    }
+
+    /// An attachment marker that names a path (not a data URI) is kept
+    /// verbatim — paths are not payloads and there is nothing to withhold.
+    #[test]
+    fn record_channel_turn_keeps_path_only_attachment_markers() {
+        let mut s = store();
+        let user_msg = "see this [IMAGE:/w/foo.png] and [DOCUMENT:/w/notes.txt]";
+
+        let id = s
+            .record_channel_turn("m", "telegram:chat-1", user_msg, "ok", None)
+            .unwrap();
+        let msgs = s.get_messages(&id).unwrap();
+        assert_eq!(
+            msgs[0].content, user_msg,
+            "path-only markers must survive: {msgs:?}"
+        );
+    }
+
     /// A title carried on the first turn becomes the session title. The
     /// second turn does not overwrite it. Channels carry the title directly
     /// when the parser already has it (e.g. Telegram `chat.title`); without
@@ -1984,13 +2152,22 @@ mod tests {
     fn prune_channel_sessions_removes_only_source_channel_past_retention() {
         let mut s = store();
 
-        // A channel session aged past retention.
+        // A channel session aged past retention — both its session row and
+        // every message it carries, since retention is "30 days after the
+        // last turn" and a chat whose last turn was that long ago has nothing
+        // left to keep.
         let old_id = s
             .record_channel_turn("m", "telegram:chat-old", "u", "r", None)
             .unwrap();
         s.conn
             .execute(
                 "UPDATE sessions SET started_at = 1 WHERE id = ?1",
+                params![old_id],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET timestamp = 1 WHERE session_id = ?1",
                 params![old_id],
             )
             .unwrap();
@@ -2004,6 +2181,12 @@ mod tests {
         s.conn
             .execute(
                 "UPDATE sessions SET started_at = 1 WHERE id = ?1",
+                params![&tui_id.id],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET timestamp = 1 WHERE session_id = ?1",
                 params![&tui_id.id],
             )
             .unwrap();
@@ -2034,6 +2217,108 @@ mod tests {
         let removed = s.prune_channel_sessions(31_i64 * 24 * 60 * 60).unwrap();
         assert_eq!(removed, 0);
         assert!(s.get_session(&tui_id.id).unwrap().is_some());
+    }
+
+    /// Retention counts from the last message, not from `started_at`. A chat
+    /// that has been silent for thirty days keeps its fresh turn; only the
+    /// messages older than the cutoff go, and the session survives with what
+    /// it still has.
+    #[test]
+    fn prune_channel_sessions_keeps_a_session_that_had_a_recent_message() {
+        let mut s = store();
+
+        // Open the channel session, then backdate its `started_at` past the
+        // retention cutoff — the chat is, on paper, old.
+        let id = s
+            .record_channel_turn("m", "telegram:chat-1", "old user", "old reply", None)
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE sessions SET started_at = 1 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        // Mark the first turn's rows as old so they are past the cutoff,
+        // then record a fresh turn so the messages table holds both an old
+        // and a fresh row, the latter with `timestamp` = now.
+        s.conn
+            .execute(
+                "UPDATE messages SET timestamp = 1 \
+                 WHERE session_id = ?1 AND content IN ('old user','old reply')",
+                params![id],
+            )
+            .unwrap();
+        s.record_channel_turn("m", "telegram:chat-1", "fresh user", "fresh reply", None)
+            .unwrap();
+
+        let cutoff = 31_i64 * 24 * 60 * 60;
+        let removed = s
+            .prune_channel_sessions(cutoff)
+            .expect("prune must succeed");
+        assert_eq!(
+            removed, 0,
+            "a session with a fresh message must not be removed, only its old messages pruned"
+        );
+
+        let sess = s.get_session(&id).unwrap().unwrap();
+        assert!(
+            sess.ended_at.is_none(),
+            "the open channel session must still be open"
+        );
+
+        let msgs = s.get_messages(&id).unwrap();
+        let user_contents: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            user_contents.contains(&"fresh user"),
+            "the fresh user message must survive: {msgs:?}"
+        );
+        assert!(
+            !user_contents.contains(&"old user"),
+            "the old user message must be pruned: {msgs:?}"
+        );
+    }
+
+    /// A channel session whose messages are ALL older than the cutoff is
+    /// removed along with its messages — a session with no content is not
+    /// worth keeping.
+    #[test]
+    fn prune_channel_sessions_removes_a_session_whose_messages_are_all_old() {
+        let mut s = store();
+
+        let id = s
+            .record_channel_turn("m", "telegram:chat-1", "old user", "old reply", None)
+            .unwrap();
+        // Force both the session and its messages past the cutoff.
+        s.conn
+            .execute(
+                "UPDATE sessions SET started_at = 1 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET timestamp = 1 WHERE session_id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let cutoff = 31_i64 * 24 * 60 * 60;
+        let removed = s.prune_channel_sessions(cutoff).unwrap();
+        assert_eq!(removed, 1, "the emptied session goes away");
+        assert!(s.get_session(&id).unwrap().is_none());
+        let msgs_left: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(msgs_left, 0, "no orphan messages left behind");
     }
 
     /// `close_channel_session` returns the number of sessions it closed. A
@@ -2148,6 +2433,46 @@ mod tests {
             hits.len(),
             2,
             "an unscoped search must see both conversations"
+        );
+    }
+
+    /// `search_any_word_with_conversation` returns rows whose message matches
+    /// at least one of the query tokens. A row whose text holds none of the
+    /// words is invisible; a row that holds one is surfaced even when the
+    /// all-words pass would return nothing.
+    #[test]
+    fn search_any_word_finds_rows_with_one_matching_token() {
+        let mut s = store();
+
+        s.record_channel_turn(
+            "m",
+            "telegram:chat-1",
+            "the quick brown fox jumps",
+            "yes",
+            None,
+        )
+        .unwrap();
+        s.record_channel_turn(
+            "m",
+            "telegram:chat-2",
+            "an unrelated message here",
+            "no",
+            None,
+        )
+        .unwrap();
+
+        // Only chat-1 carries any of `fox`, `strawberry`, `apple`.
+        let hits = s
+            .search_any_word_with_conversation("strawberry fox apple", 10, None)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the chat with one matching word is found: {hits:?}"
+        );
+        assert!(
+            hits[0].content.contains("fox"),
+            "the matching word is the hit: {hits:?}"
         );
     }
 }

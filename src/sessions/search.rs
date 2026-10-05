@@ -20,10 +20,20 @@ use super::types::{Message, SearchResult};
 /// `search_messages` is the FTS lookup. `conversation_key = Some(k)` filters
 /// by `sessions.conversation_key` so a scoped caller never reads another
 /// conversation's rows; `None` is the unscoped read used under the `All` view.
-/// `get_messages` returns every message for `session_id` in replay order, so
-/// the tool can include the message before and after each hit.
+/// `search_messages_any_word` runs the same FTS lookup but joins whitespace
+/// tokens with `OR` instead of the implicit `AND` — the fallback path the
+/// tool uses when the all-words pass returns nothing. `get_messages`
+/// returns every message for `session_id` in replay order, so the tool can
+/// include the message before and after each hit.
 pub trait SessionSearch: Send + Sync {
     fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        conversation_key: Option<&str>,
+    ) -> Result<Vec<SearchResult>>;
+
+    fn search_messages_any_word(
         &self,
         query: &str,
         limit: usize,
@@ -61,6 +71,16 @@ impl SessionSearch for MutexSessionStore {
         guard.search_with_conversation(query, limit, conversation_key)
     }
 
+    fn search_messages_any_word(
+        &self,
+        query: &str,
+        limit: usize,
+        conversation_key: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let guard = self.inner.lock().expect("session store poisoned");
+        guard.search_any_word_with_conversation(query, limit, conversation_key)
+    }
+
     fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let guard = self.inner.lock().expect("session store poisoned");
         SessionStore::get_messages(&guard, session_id)
@@ -95,6 +115,16 @@ impl SessionSearch for ProfileSessionSearch {
     ) -> Result<Vec<SearchResult>> {
         let store = SessionStore::open(&self.path)?;
         store.search_with_conversation(query, limit, conversation_key)
+    }
+
+    fn search_messages_any_word(
+        &self,
+        query: &str,
+        limit: usize,
+        conversation_key: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let store = SessionStore::open(&self.path)?;
+        store.search_any_word_with_conversation(query, limit, conversation_key)
     }
 
     fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
