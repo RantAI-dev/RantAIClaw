@@ -115,7 +115,6 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;

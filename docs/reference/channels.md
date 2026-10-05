@@ -546,7 +546,8 @@ file, in the same thread as the reply. The text of a reply is sent before its
 attachments on every channel, so that line says the attachment did not arrive
 rather than that the answer was lost, and a reply that was only markers gets the
 same line instead of silence. History then keeps the text the person read plus
-`(the attachment was not delivered)`, and all five internal history notes are
+`(the attachment was not delivered)`, and all the runtime's internal history
+notes — the delivery markers above and `(No tool ran this turn.)` — are
 stripped from outgoing replies, so a model that parrots its own history cannot
 deliver the runtime's bookkeeping to a reader.
 
@@ -555,11 +556,32 @@ reply it sits. That label is the runtime's own vocabulary: it is built from the
 tools that actually ran and added to the **history** entry, never to the
 delivered reply, so one that appears in a reply is a label the model typed. On
 2026-09-12 two Telegram replies carried one with no tool call in the turn at all,
-and the second sat above an invented config file, which is what made a
+and the second sat above an invented config file, which was what made a
 fabrication read like a tool's output. The runtime cannot make the model honest,
 so it stops repeating the claim and logs a WARN carrying a count and no text, so
 an operator can see how often it happens. A reply that was nothing but a label
-still gets the ordinary empty-reply answer rather than an empty bubble.
+still gets the ordinary empty-reply answer plus the runtime net line rather
+than an empty bubble — and that net line is what the model never sees stored.
+
+History itself is split per chat (the key is the chat, not the sender), and a turn
+that can come from more than one sender stores only the user row and the final
+assistant row. A named owner in a platform-direct chat — the
+`MemoryView::All` case — stores the structured form (tool call, tool result,
+final assistant) so the model can carry its own tool work across turns.
+Everywhere else, the structured rows are dropped at the store site so a later
+sender in the same chat cannot read another sender's tool output. The view is
+selected once, at dispatch time (`memory_view` in `dispatch.rs`); the store
+site reuses the same decision rather than re-deriving it.
+
+The runtime also writes two more lines for the model to read on its next turn
+— the soft-cap nudge (`You've reached the maximum of N tool calls…`) and the
+loop-detector nudge (`…same tool call…returned the same result N times in a
+row…`). Both push into the in-memory transcript so the next `force_final_summary`
+call knows to break early, but both are filtered out of the **stored** history
+for owner-DM chats so a future turn cannot parrot them back as its own line.
+Older builds persisted these along with `[Used tools: …]` labels and the
+structured tool rows; loading through the runtime's store strips every one of
+those shapes on the way into the live cache, so an upgrade starts clean.
 
 A local path goes through `media::resolve_attachment_path_in_workspace`, the same
 way on every channel: a leading `~/` expands against `$HOME`, a relative path is
