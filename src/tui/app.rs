@@ -4937,10 +4937,10 @@ const RECALL_KEYS_SHOWN: usize = 3;
 
 /// One line naming the memories that shaped this turn.
 ///
-/// Auto-saved turn entries are counted, not named: their keys are
-/// `user_msg_<uuid>`, and a uuid identifies nothing to the person reading it.
-/// Naming them was the first version of this line, and it filled the width with
-/// hex while saying less than "3 from this conversation" does.
+/// Turn entries from the retired auto-save are counted, not named: their keys
+/// are `user_msg_<uuid>`, and a uuid identifies nothing to the person reading
+/// it. Naming them was the first version of this line, and it filled the width
+/// with hex while saying less than "3 from this conversation" does.
 fn render_recalled_memories(keys: &[String]) -> String {
     let noun = if keys.len() == 1 {
         "memory"
@@ -10206,8 +10206,8 @@ mod recalled_memory_tests {
         assert_eq!(line, "↺ recalled 5 memories: a, b, c, +2 more");
     }
 
-    /// A uuid names nothing to the reader. Counting the auto-saved turns says
-    /// more in less width than three lines of hex.
+    /// A uuid names nothing to the reader. Counting the turn entries the retired
+    /// auto-save wrote says more in less width than three lines of hex.
     #[test]
     fn autosaved_turns_are_counted_not_named() {
         let line = render_recalled_memories(&keys(&[

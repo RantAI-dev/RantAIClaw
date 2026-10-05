@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   search. The factory logs a `WARN` naming the bad value at start, and
   `rantaiclaw doctor` reports it as `✗` so the typo surfaces. The daemon
   still starts in keyword mode, matching the previous fallback contract.
+  The mode label that `memory stats`, the `memory recall` header and
+  `GET /api/v1/memory/stats` print now says `keyword (unknown embedding
+  provider '<name>')` for such a value instead of claiming
+  `keyword + semantic` while the factory runs keyword only.
 
 - `ChannelMessage.is_direct` is now surfaced to the model: `build_channel_system_prompt`
   appends one of four fixed lines naming whether the conversation is a DM or a

@@ -751,14 +751,9 @@ async fn run_quick_setup_with_home(
         style("Supervised (workspace-scoped)").green()
     );
     println!(
-        "  {} Memory:     {} (auto-save: {})",
+        "  {} Memory:     {}",
         style("✓").green().bold(),
-        style(&memory_backend_name).green(),
-        if memory_backend_name == "none" {
-            "off"
-        } else {
-            "on"
-        }
+        style(&memory_backend_name).green()
     );
     println!(
         "  {} Secrets:    {}",

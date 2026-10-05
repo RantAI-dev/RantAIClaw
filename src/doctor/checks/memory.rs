@@ -67,10 +67,11 @@ impl DoctorCheck for MemorySearchModeCheck {
 /// Mirrors the match in [`crate::memory::embeddings::create_embedding_provider`]:
 /// `openai` / `openrouter` / `minimax` and the `custom:<base-url>` prefix are
 /// known, anything else is a typo that the factory silently downgrades to
-/// `NoopEmbedding`. Centralised here so the doctor and the factory cannot
-/// disagree on what "known" means.
+/// `NoopEmbedding`. Re-exported here as `is_known_embedding_provider` so the
+/// doctor and the factory cannot disagree on what "known" means; the original
+/// lives in `crate::memory::embeddings`.
 fn is_known_embedding_provider(provider: &str) -> bool {
-    matches!(provider, "openai" | "openrouter" | "minimax") || provider.starts_with("custom:")
+    crate::memory::embeddings::is_known_embedding_provider(provider)
 }
 
 /// Open the workspace's `brain.db` read-only and count rows whose stored

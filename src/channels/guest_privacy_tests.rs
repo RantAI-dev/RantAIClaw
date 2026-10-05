@@ -4252,9 +4252,9 @@ async fn a_save_never_replaces_a_different_note_by_accident() {
 
 /// A row enters the `memories` table only because someone asked: the
 /// `memory_store` tool, the CLI, the console or the TUI. This is the
-/// invariant on the channel dispatch door. The dispatch default config has
-/// auto-save on, so a regression that re-adds the writer fires this assertion
-/// immediately for every channel — guest, group owner, direct owner.
+/// invariant on the channel dispatch door. No door writes on its own, so a
+/// regression that re-adds a writer fires this assertion immediately for every
+/// channel — guest, group owner, direct owner.
 #[tokio::test]
 async fn channel_dispatch_does_not_write_a_conversation_row() {
     let deployment = Deployment::start(Options::guest_tools(&[])).await;

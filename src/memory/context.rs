@@ -59,8 +59,8 @@ impl Default for MemoryContextLimits {
 
 /// Extra rows to ask recall for, covering the self-echoes about to be dropped.
 ///
-/// Auto-save writes one copy of the message per surface that handled it, so a
-/// turn can echo more than once.
+/// A stored row can repeat the question more than once, so a turn can echo
+/// more than once.
 ///
 /// This is deliberately small. Asking the same question verbatim N times leaves
 /// N stored echoes, and past this margin the usable page shrinks by one per
@@ -78,14 +78,14 @@ fn squash(text: &str) -> String {
 
 /// True when a recalled entry is just the message being answered.
 ///
-/// Auto-save writes each user message to memory, so by the time recall runs the
-/// store holds a verbatim copy of the question. It is worthless as context —
-/// the text sits in the prompt directly below this block — and it is actively
-/// harmful: being an exact lexical match it takes the top rank, and scores are
-/// normalised *relative to the best hit*, so a single self-echo pushes every
-/// real fact under `min_relevance_score`. Measured on a live store: with
-/// auto-save on, one turn recalled only its own question; with auto-save off,
-/// the same query surfaced five curated facts.
+/// A stored row can hold a verbatim copy of the question, so by the time recall
+/// runs the store may echo it back. It is worthless as context — the text sits
+/// in the prompt directly below this block — and it is actively harmful: being
+/// an exact lexical match it takes the top rank, and scores are normalised
+/// *relative to the best hit*, so a single self-echo pushes every real fact
+/// under `min_relevance_score`. Measured on a live store: a turn that left a
+/// copy of its own question recalled only that question; without the copy, the
+/// same query surfaced five curated facts.
 fn is_echo_of_query(content: &str, user_message: &str) -> bool {
     let query = squash(user_message);
     !query.is_empty() && squash(content) == query
@@ -93,12 +93,12 @@ fn is_echo_of_query(content: &str, user_message: &str) -> bool {
 
 /// Entries that must never reach the prompt, whatever they scored.
 fn should_skip(entry: &MemoryEntry, limits: &MemoryContextLimits) -> bool {
-    // Raw conversation turns. Every auto-save path stores under this category
-    // (channel dispatch and the interactive agent alike), whatever key scheme
-    // it uses — the key-shape checks below cannot keep up with new schemes,
-    // and a stale request injected as context has been observed answered (and
-    // its tools executed) in place of the live message. The rows stay stored:
-    // `memory_recall` reaches them explicitly, and retention prunes them.
+    // Raw conversation turns. Older builds wrote them under this category from
+    // every surface, whatever key scheme they used — the key-shape checks below
+    // cannot keep up with new schemes, and a stale request injected as context
+    // has been observed answered (and its tools executed) in place of the live
+    // message. The rows stay stored: `memory_recall` reaches them explicitly,
+    // and retention prunes them.
     if entry.category == MemoryCategory::Conversation {
         return true;
     }
@@ -483,8 +483,8 @@ mod tests {
         assert!(!out.contains("transcript"));
     }
 
-    /// The live defect, pinned: auto-saved conversation turns carry innocuous
-    /// keys (`telegram_<sender>_<msg_id>`, `user_msg_<uuid>`) that no
+    /// The live defect, pinned: conversation turns an older build auto-saved carry
+    /// innocuous keys (`telegram_<sender>_<msg_id>`, `user_msg_<uuid>`) that no
     /// key-shape rule catches, and a perfect score cannot save them — the
     /// category alone must keep them out of the prompt.
     #[tokio::test]
@@ -627,7 +627,7 @@ mod tests {
         );
     }
 
-    /// The defect, reproduced: auto-save stores the question, the stored copy
+    /// The defect, reproduced: auto-save stored the question, the stored copy
     /// is a perfect lexical match and takes the top rank; dropping it must
     /// leave the genuinely relevant facts injectable. Scores are absolute, so
     /// the facts stand on their own — nothing is re-ranked after the drop.

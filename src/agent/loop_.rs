@@ -4097,77 +4097,13 @@ mod tests {
         );
     }
 
-    /// The headless `agent -m` door used to write the user's input message
-    /// into the `memories` table as a Conversation row, before any reply
-    /// existed. A row enters that table only when someone asks — through the
-    /// `memory_store` tool, the CLI, the console or the TUI. This guard pins
-    /// the writer's absence at the source so a regression that re-adds the
-    /// call fires this assertion immediately.
-    ///
-    /// Why source-pinned rather than a runtime test:
-    ///   * `run_with_scope` constructs a real provider before reaching the
-    ///     writer. A test that reaches the writer end-to-end needs a live
-    ///     provider, network, and timer.
-    ///   * The cron scheduler, the daemon heartbeat, the CLI single-shot and
-    ///     the gateway chat all flow through this same code path. Pinning
-    ///     the writer's presence covers every caller at once.
-    ///   * Runtime coverage for the same invariant lives at the agent door:
-    ///     `agent::tests::agent_turn_does_not_write_a_conversation_row` and
-    ///     its siblings prove a real turn leaves the `memories` table
-    ///     untouched when nobody asked.
-    #[test]
-    fn headless_agent_message_writer_is_removed() {
-        let src = include_str!("loop_.rs");
-        let test_module = format!("\n#[cfg({})]\nmod tests {{", "test");
-        let (runtime, _) = src
-            .split_once(test_module.as_str())
-            .expect("the test module marker is still in loop_.rs; update this guard");
-        // The headless writer token: `autosave_screened(` reached from
-        // `config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS`.
-        // The helper itself is being retired, so its presence anywhere in
-        // the production code of `loop_.rs` means a regression.
-        let call = "autosave_screened(";
-        let sites: Vec<usize> = runtime.match_indices(call).map(|(i, _)| i).collect();
-        assert!(
-            sites.is_empty(),
-            "the headless `agent -m` door must not call `autosave_screened`; \
-             the writer was retired. Found {} site(s) in loop_.rs at byte offsets \
-             {:?}. The agent door only writes to memory when the operator (or the \
-             model they trust) asks — never on inbound input.",
-            sites.len(),
-            sites
-        );
-    }
-
-    /// The interactive REPL door used to write the user's input message into
-    /// the `memories` table as a Conversation row at the top of every loop
-    /// iteration. The same rule applies as the headless door: a row enters
-    /// only when someone asks. This guard pins the writer's absence.
-    ///
-    /// Same source-pinning rationale as `headless_agent_message_writer_is_removed`:
-    /// the REPL drives the same future as the CLI's headless path, and a
-    /// regression that re-adds the writer fires this assertion.
-    #[test]
-    fn repl_writer_is_removed() {
-        let src = include_str!("loop_.rs");
-        let test_module = format!("\n#[cfg({})]\nmod tests {{", "test");
-        let (runtime, _) = src
-            .split_once(test_module.as_str())
-            .expect("the test module marker is still in loop_.rs; update this guard");
-        // The REPL writer token: same helper as the headless door. The
-        // production code must not contain it.
-        let call = "autosave_screened(";
-        let sites: Vec<usize> = runtime.match_indices(call).map(|(i, _)| i).collect();
-        assert!(
-            sites.is_empty(),
-            "the REPL door must not call `autosave_screened`; \
-             the writer was retired. Found {} site(s) in loop_.rs at byte offsets \
-             {:?}. The REPL turn only writes to memory when the operator (or the \
-             model they trust) asks — never on inbound input.",
-            sites.len(),
-            sites
-        );
-    }
+    /// Behaviour coverage for the no-write invariant lives at the agent door
+    /// in `agent::tests::headless_door_does_not_write_a_memory_row` and
+    /// `agent::tests::repl_door_does_not_write_a_memory_row`. The runtime
+    /// tests drive a real turn through `run_with_scope` / `Agent::turn` and
+    /// assert the row count is the same — a re-added `mem.store(...)` call in
+    /// the loop fires the test, which the older source-pinning guard missed
+    /// because the helper it grepped for had been retired.
 
     #[tokio::test]
     async fn injected_backend_overrides_non_cli_auto_deny() {

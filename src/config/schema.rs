@@ -5712,8 +5712,8 @@ fn import_markdown_backup_into_sqlite(workspace_dir: &Path, backup_dir: &Path) -
         if entry.content.trim().is_empty() {
             continue;
         }
-        // An autosave key (`<prefix>_<uuid>`) is runtime-generated, not a
-        // name the operator chose; keeping it a `daily`/`core` row would let
+        // An autosave key (`<prefix>_<uuid>`) from an older build is runtime-generated,
+        // not a name the operator chose; keeping it a `daily`/`core` row would let
         // it re-enter another chat's memory through the shared backfill that
         // only screens `conversation`.
         let category = if crate::memory::is_autosave_key(&entry.key) {

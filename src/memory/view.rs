@@ -230,7 +230,7 @@ mod tests {
     /// `Only(this)` must keep only entries whose `session_id` equals `this`,
     /// even when the backend returns them through the unscoped backfill.
     /// This is the test the rest of the plan lives on: a guest's
-    /// `memory_recall` and injection must not see someone else's auto-save
+    /// `memory_recall` and injection must not see another conversation's
     /// row or the owner's `MEMORY.md` projection.
     #[tokio::test]
     async fn recall_in_view_only_keeps_entries_with_the_exact_session_id() {
