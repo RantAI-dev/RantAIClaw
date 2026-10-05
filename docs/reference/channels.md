@@ -560,8 +560,10 @@ deliver the runtime's bookkeeping to a reader.
 
 A `[Used tools: …]` label inside a reply is stripped as well, wherever in the
 reply it sits. That label is the runtime's own vocabulary: it is built from the
-tools that actually ran and added to the **history** entry, never to the
-delivered reply, so one that appears in a reply is a label the model typed. On
+tools that actually ran and added to the **history** entry in older builds,
+never to the delivered reply. The current runtime does not write it into
+history at all (legacy persisted rows that still carry it are filtered out at
+load time), so one that appears in a reply is a label the model typed. On
 2026-09-12 two Telegram replies carried one with no tool call in the turn at all,
 and the second sat above an invented config file, which was what made a
 fabrication read like a tool's output. The runtime cannot make the model honest,
@@ -580,12 +582,20 @@ sender in the same chat cannot read another sender's tool output. The view is
 selected once, at dispatch time (`memory_view` in `dispatch.rs`); the store
 site reuses the same decision rather than re-deriving it.
 
-The runtime also writes two more lines for the model to read on its next turn
-— the soft-cap nudge (`You've reached the maximum of N tool calls…`) and the
-loop-detector nudge (`…same tool call…returned the same result N times in a
-row…`). Both push into the in-memory transcript so the next `force_final_summary`
-call knows to break early, but both are filtered out of the **stored** history
-for owner-DM chats so a future turn cannot parrot them back as its own line.
+> **Restart caveat.** A persisted row carries no record of whether the chat
+> was shared or direct, so `load_all` strips structured tool rows from every
+> chat it returns. An owner's direct chat therefore loses its tool call and
+> tool result rows on a daemon restart — only the user query and the recorded
+> final assistant reply round-trip through `load_all`. A shared chat is
+> unaffected, since it never wrote those rows in the first place.
+
+The runtime also writes two more lines for the model to read on the **last
+call of the same turn** — the soft-cap nudge (`You've reached the maximum of
+N tool calls…`) and the loop-detector nudge (`…same tool call…returned the
+same result N times in a row…`). Both push into the in-memory transcript so
+the `force_final_summary` call that immediately follows them sees the warning
+and breaks early, but both are filtered out of the **stored** history for
+owner-DM chats so a future turn cannot parrot them back as its own line.
 Older builds persisted these along with `[Used tools: …]` labels and the
 structured tool rows; loading through the runtime's store strips every one of
 those shapes on the way into the live cache, so an upgrade starts clean.

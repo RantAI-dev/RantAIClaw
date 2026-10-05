@@ -75,23 +75,103 @@ pub(crate) fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
 }
 
 /// True when the assistant row carries a tool-call request that any following
-/// `tool` row or `[Tool results]` user row is allowed to attach to. Two shapes
-/// are written today:
+/// `tool` row or `[Tool results]` user row is allowed to attach to. The
+/// carrier is the assistant row whose content the dispatcher wrote, which is
+/// either of these today:
 ///
-/// - XML (`XmlToolDispatcher::to_provider_messages`): the assistant row is the
-///   raw response text, with one or more `<tool_call>...</tool_call>` blocks
-///   embedded inline.
+/// - XML (`XmlToolDispatcher::to_provider_messages`): the raw response text,
+///   with one or more `<tool_call>...</tool_call>` blocks embedded inline,
+///   or any of the aliases the parser accepts (`<toolcall>`, `<tool-call>`,
+///   `<invoke>` — see `TOOL_CALL_OPEN_TAGS` in `agent/loop_.rs`), or a
+///   markdown-fenced call (``` ```tool_call ```, ``` ```toolcall ```,
+///   ``` ```tool-call ```, ``` ```invoke ``` — see the `MD_TOOL_CALL_RE`
+///   regex in the same file).
 /// - Native (`NativeToolDispatcher::to_provider_messages`): the assistant row
 ///   is `{"content": ..., "tool_calls": [...]}` as a string. The `tool_calls`
 ///   key is the marker we look for.
+/// - GLM line grammar (`parse_glm_style_tool_calls` in `agent/loop_.rs`, used
+///   as a last-resort fallback by `parse_tool_calls_for_provider`): one or
+///   more `name/param>value` lines, e.g. `shell/command>ls -la`. The XML
+///   dispatcher renders the response text as-is, so a GLM carrier is just the
+///   raw text the parser recognised.
 ///
 /// Plain assistant prose (the recorded reply after tool execution) carries
-/// neither marker, and a `tool` row that follows it has no matching call.
+/// none of these markers, and a `tool` row that follows it has no matching
+/// call.
 pub(crate) fn is_tool_call_carrier(content: &str) -> bool {
     if content.contains("<tool_call>") {
         return true;
     }
-    content.contains("\"tool_calls\"")
+    if content.contains("<toolcall>") {
+        return true;
+    }
+    if content.contains("<tool-call>") {
+        return true;
+    }
+    if content.contains("<invoke>") {
+        return true;
+    }
+    if content.contains("```tool_call")
+        || content.contains("```toolcall")
+        || content.contains("```tool-call")
+        || content.contains("```invoke")
+    {
+        return true;
+    }
+    if content.contains("\"tool_calls\"") {
+        return true;
+    }
+    is_glm_grammar_carrier(content)
+}
+
+/// True when `content` carries a GLM line-grammar tool call
+/// (`name/param>value` or `name/{json}`, the two shapes
+/// `parse_glm_style_tool_calls` in `agent/loop_.rs` accepts).
+/// Mirrors the parser's accept conditions per line: a non-empty trimmed
+/// line whose first `/`-prefixed token is all alphanumeric or underscore,
+/// with either `>` somewhere after the slash (the `name/param>value`
+/// shape) or text after the slash that starts with `{` and parses as
+/// JSON (the `name/{json}` shape — the parser requires a JSON parse, so
+/// prose that merely opens a brace but does not parse is not a carrier).
+/// Any matching line in a multi-line response makes the whole row a
+/// carrier — the parser accepts the same way.
+fn is_glm_grammar_carrier(content: &str) -> bool {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(pos) = line.find('/') else {
+            continue;
+        };
+        let tool_part = &line[..pos];
+        if !tool_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let rest = &line[pos + 1..];
+        if rest.contains('>') {
+            return true;
+        }
+        if rest.starts_with('{') && serde_json::from_str::<serde_json::Value>(rest).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a `tool`-role row or a `[Tool results]` user row that follows
+/// `normalized` is part of the same attached run as the most-recent
+/// assistant carrier in `normalized`. Walks back over `tool` rows so a run
+/// of three native results after one carrier all attach, not just the first.
+pub(crate) fn tool_row_attached_to_carrier(normalized: &[ChatMessage]) -> bool {
+    for prev in normalized.iter().rev() {
+        match prev.role.as_str() {
+            "tool" => {}
+            "assistant" => return is_tool_call_carrier(&prev.content),
+            _ => return false,
+        }
+    }
+    false
 }
 
 pub(crate) fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -125,11 +205,7 @@ pub(crate) fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<Cha
             // reading a stray value out of context. Drop it here, the same way
             // we drop an unexpected role above, so the cache stays well-formed.
             "tool" => {
-                let attached_to_call = normalized
-                    .last()
-                    .map(|t| t.role == "assistant" && is_tool_call_carrier(&t.content))
-                    .unwrap_or(false);
-                if !attached_to_call {
+                if !tool_row_attached_to_carrier(&normalized) {
                     tracing::debug!(
                         "dropping orphan tool turn with no preceding tool-call carrier"
                     );

@@ -4201,7 +4201,15 @@ async fn a_save_never_replaces_a_different_note_by_accident() {
                 vec![store(key, "the code is bravo"), "Saved.".to_string()],
             )
             .await;
-        let results = second.last_turn_tool_results();
+        // GUEST_CHAT (shared) has its tool rows stripped on load, so the
+        // provider never sees prior tool results in this chat — read the
+        // whole request. Owner-DM keeps its structured tool rows in the
+        // cache, so the most recent turn's results alone are enough.
+        let results = if chat == GUEST_CHAT {
+            second.tool_results()
+        } else {
+            second.last_turn_tool_results()
+        };
         assert!(results.contains("different key"), "{key}: {results}");
         assert!(!results.contains("Stored memory"), "{key}: {results}");
         let row = deployment.ctx.memory.get(key).await.unwrap().unwrap();
@@ -6714,86 +6722,111 @@ const OWNER_ONLY_TOOL_MARKER: &str = "owner-tool-marker-quartz-9d2f";
 /// owner, which becomes a `<tool_result>` row in the request — exactly the
 /// shape the leaked history was carried in. The test exercises the read path
 /// through the real dispatch and the persisted path through the real
-/// `ChannelHistoryStore`.
+/// `ChannelHistoryStore`, both through the safe `load_all` strip and through
+/// the raw `turns_json` blob on disk (which the strip can't reach).
 #[tokio::test]
 async fn a_guests_next_turn_in_a_shared_chat_never_reads_the_owners_tool_output() {
-    let deployment =
-        Deployment::start(Options::guest_tools(&["memory_store", "memory_recall"])).await;
+    for scripted in [
+        // The XML dispatcher's `<tool_result>` shape, the one the prior
+        // version of this test exercised.
+        vec![
+            call(
+                "memory_store",
+                serde_json::json!({
+                    "key": "owner_only_marker",
+                    "content": format!("an owner-only fact: {OWNER_ONLY_TOOL_MARKER}"),
+                }),
+            ),
+            "Saved.".to_string(),
+        ],
+        // The native dispatcher's `{"tool_call_id":...,"content":...}` shape
+        // — what the runtime now stores for owner-DM. The shared-chat write
+        // path must drop it before the row ever hits disk, so a fresh read
+        // back through `load_all` or through the raw `turns_json` cannot
+        // reach the marker.
+        vec![
+            "{\"content\":\"\",\"tool_calls\":[{\"id\":\"c-1\",\"name\":\"memory_store\",\"arguments\":{\"key\":\"owner_only_marker\",\"content\":\"an owner-only fact: OWNER_ONLY_TOOL_MARKER\"}}]}".to_string(),
+            r#"{"tool_call_id":"c-1","content":"Stored memory: owner_only_marker"}"#.to_string(),
+            "Saved.".to_string(),
+        ],
+    ] {
+        let deployment =
+            Deployment::start(Options::guest_tools(&["memory_store", "memory_recall"])).await;
 
-    // Owner's turn in the group chat stores a note whose body carries the
-    // marker. The structured `<tool_result>` row for the call is what the
-    // history leak rides on.
-    let owner = deployment
-        .turn_in(
-            OWNER_SENDER,
-            GUEST_CHAT,
-            false,
-            "remember",
-            vec![
-                call(
-                    "memory_store",
-                    serde_json::json!({
-                        "key": "owner_only_marker",
-                        "content": format!("an owner-only fact: {OWNER_ONLY_TOOL_MARKER}"),
-                    }),
-                ),
-                "Saved.".to_string(),
-            ],
-        )
-        .await;
-    assert!(
-        owner
-            .last_turn_tool_results()
-            .contains("Stored memory: owner_only_marker"),
-        "control: the owner's tool ran and reported the storage:\n{}",
-        owner.last_turn_tool_results()
-    );
-
-    // Guest's turn next in the same chat. Whatever the runtime stored for the
-    // owner's tool result must not reach this request, in any message and in
-    // any persisted row.
-    let guest = deployment
-        .turn_in(
-            GUEST_SENDER,
-            GUEST_CHAT,
-            false,
-            "what was stored?",
-            vec!["Nothing on my side.".to_string()],
-        )
-        .await;
-
-    let guest_request = guest.requests.last().expect("at least one request");
-    assert!(
-        !guest_request.messages.is_empty(),
-        "the guest's turn produced at least one request"
-    );
-    for (role, content) in &guest_request.messages {
+        // Owner's turn in the group chat stores a note whose body carries the
+        // marker. The structured `<tool_result>` row for the call is what the
+        // history leak rides on.
+        let owner = deployment
+            .turn_in(OWNER_SENDER, GUEST_CHAT, false, "remember", scripted)
+            .await;
         assert!(
-            !content.contains(OWNER_ONLY_TOOL_MARKER),
-            "owner tool marker reached the guest's request ({role}): {content}"
+            owner
+                .last_turn_tool_results()
+                .contains("Stored memory: owner_only_marker")
+                || owner
+                    .last_turn_tool_results()
+                    .contains(OWNER_ONLY_TOOL_MARKER),
+            "control: the owner's tool ran and reported the storage:\n{}",
+            owner.last_turn_tool_results()
         );
-    }
 
-    // Persisted rows for this chat, read back through the real store the
-    // runtime uses. A non-`All` memory view owns the chat, so no tool row
-    // should ever have been stored for it.
-    let store = deployment
-        .ctx
-        .history_store
-        .as_ref()
-        .expect("the deployment's runtime built a history store")
-        .clone();
-    let history_key = format!("test-channel:{GUEST_CHAT}");
-    let persisted = store.load_all().expect("load persisted rows");
-    let rows = persisted.get(&history_key).cloned().unwrap_or_default();
-    assert!(
-        !rows.is_empty(),
-        "control: the chat's persisted rows survived the turns"
-    );
-    for row in &rows {
+        // Guest's turn next in the same chat. Whatever the runtime stored for the
+        // owner's tool result must not reach this request, in any message and in
+        // any persisted row.
+        let guest = deployment
+            .turn_in(
+                GUEST_SENDER,
+                GUEST_CHAT,
+                false,
+                "what was stored?",
+                vec!["Nothing on my side.".to_string()],
+            )
+            .await;
+
+        let guest_request = guest.requests.last().expect("at least one request");
         assert!(
-            !row.content.contains(OWNER_ONLY_TOOL_MARKER),
-            "owner tool marker reached a persisted row of the shared chat: {row:?}"
+            !guest_request.messages.is_empty(),
+            "the guest's turn produced at least one request"
+        );
+        for (role, content) in &guest_request.messages {
+            assert!(
+                !content.contains(OWNER_ONLY_TOOL_MARKER),
+                "owner tool marker reached the guest's request ({role}): {content}"
+            );
+        }
+
+        // Persisted rows for this chat, read back through the safe strip and
+        // through the raw `turns_json` blob on disk. The runtime's
+        // `MemoryView::Only` write path must omit tool rows for shared chats
+        // entirely, so neither view can see the marker.
+        let store = deployment
+            .ctx
+            .history_store
+            .as_ref()
+            .expect("the deployment's runtime built a history store")
+            .clone();
+        let history_key = format!("test-channel:{GUEST_CHAT}");
+        let persisted = store.load_all().expect("load persisted rows");
+        let rows = persisted.get(&history_key).cloned().unwrap_or_default();
+        assert!(
+            !rows.is_empty(),
+            "control: the chat's persisted rows survived the turns"
+        );
+        for row in &rows {
+            assert!(
+                !row.content.contains(OWNER_ONLY_TOOL_MARKER),
+                "owner tool marker reached a persisted row of the shared chat: {row:?}"
+            );
+        }
+        // Raw `turns_json` cannot reach the marker either, because the
+        // runtime dropped the tool rows before persisting.
+        let raw_turns_json = store
+            .raw_turns_json(&history_key)
+            .expect("raw turns_json query succeeds")
+            .expect("raw turns_json is on disk for the shared chat");
+        assert!(
+            !raw_turns_json.contains(OWNER_ONLY_TOOL_MARKER),
+            "owner tool marker reached the raw turns_json of the shared chat: {raw_turns_json}"
         );
     }
 }
