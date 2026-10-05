@@ -1495,6 +1495,20 @@ pub(crate) async fn process_channel_message(
                 failure.history_entry(&reply_for_history)
             };
 
+            // The session recorder stores the text the reader actually saw:
+            // `reply_for_user` (delivered, post-filter, with the runtime net
+            // line and the `Noted:` suffix when one was added) on the delivered
+            // path, and the same `recorded` form the prompt cache gets on the
+            // failure path so a turn that never reached the chat keeps its
+            // failure note. The prompt cache itself keeps the pre-filter
+            // model's text — the `Noted:` line is for the person reading, not
+            // for the next turn's model to imitate.
+            let session_recorded = if delivered {
+                reply_for_user.clone()
+            } else {
+                recorded.clone()
+            };
+
             // Session recording: land this turn as one user row + one assistant row in
             // the channel session for `history_key`. Only the model's final
             // text is recorded — tool calls, tool results, and the in-progress
@@ -1506,7 +1520,7 @@ pub(crate) async fn process_channel_message(
                 &history_key,
                 route.model.as_str(),
                 &msg,
-                &recorded,
+                &session_recorded,
             );
 
             // History stores the structured form the dispatcher produced: each

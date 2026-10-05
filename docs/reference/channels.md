@@ -349,10 +349,17 @@ How it lands in the store:
   the same session, until the sender runs `/new` or `/clear` (Telegram,
   Discord, WhatsApp Web).
 - What's recorded: the sender's message text and the assistant's final reply.
-  Draft streaming chunks and tool calls/results are not stored. Secret-shaped
-  patterns (`sk-...`, `ghp_...`, bearer tokens, and the broader regex list at
-  `src/providers/mod.rs`) are scrubbed before the row is written. A secret
-  written as a plain sentence is not recognised.
+  Draft streaming chunks and tool calls/results are not stored. Two scrubbers
+  run before the row is written. `scrub_secret_patterns` replaces tokens that
+  start with `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`, `ghu_` or `github_pat_`
+  with `[REDACTED]`. `scrub_credentials` redacts `key=value` lines whose key
+  is one of `token`, `api_key`, `api-key`, `password`, `secret`, `user_key`,
+  `bearer`, `credential` and whose value is eight or more characters long. A
+  secret written as a plain sentence ("here is my token: mysecretvalue123")
+  is not recognised by either scrubber. Inbound attachments whose marker
+  body is a base64 data URI (`[IMAGE:data:image/png;base64,…]`) are recorded
+  as `[IMAGE:payload withheld]`, so the image does not sit on disk for
+  thirty days.
 - Retention: channel sessions are pruned 30 days after the last turn. The
   daily prune runs alongside the channel runtime and one extra time at
   startup so a long-down daemon catches up immediately on restart.

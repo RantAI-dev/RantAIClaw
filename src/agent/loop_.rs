@@ -61,8 +61,14 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("");
 
-            // Preserve first 4 chars for context, then redact
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+            // Preserve first 4 chars for context, then redact. Slice by
+            // characters, not bytes — a byte slice panics on a UTF-8
+            // boundary (e.g. a quoted value in a non-Latin script).
+            let prefix = if val.chars().count() > 4 {
+                val.chars().take(4).collect::<String>()
+            } else {
+                String::new()
+            };
 
             if full_match.contains(':') {
                 if full_match.contains('"') {

@@ -112,10 +112,12 @@ impl Tool for SessionSearchTool {
 }
 
 impl SessionSearchTool {
-    /// All-words first; if nothing matches, any single word. The store runs
-    /// the FTS query as-is — see [`fts_literal_query`](crate::sessions::store::fts_literal_query)
-    /// for how user text becomes an AND of quoted phrases. The fallback uses
-    /// the same FTS parser with explicit `OR` between quoted tokens.
+    /// All-words first; if nothing matches, any single word. The store owns
+    /// how each query becomes FTS5 syntax — the tool never hands the store a
+    /// pre-built OR string. See
+    /// [`fts_literal_query`](crate::sessions::store::fts_literal_query) for
+    /// the all-words pass and
+    /// [`SessionStore::search_any_word_with_conversation`] for the fallback.
     fn search_with_fallback(
         &self,
         query: &str,
@@ -127,30 +129,27 @@ impl SessionSearchTool {
         if !all_words.is_empty() {
             return Ok(all_words);
         }
-        let or_query = any_word_query(query);
-        if or_query.is_empty() {
-            return Ok(all_words);
-        }
+        // Whitespace-only input has nothing to fall back to; the store
+        // returns an empty Vec for it, so the tool does not need to skip the
+        // call, but the empty result keeps the response deterministic.
         self.store
-            .search_messages(&or_query, MAX_HITS, conversation_key)
+            .search_messages_any_word(query, MAX_HITS, conversation_key)
     }
-}
-
-/// Turn free text into an FTS5 query that matches any single word. Inner `"` is
-/// doubled so a stray quote in user input never reaches the parser as syntax.
-/// Returns an empty string for whitespace-only input.
-fn any_word_query(input: &str) -> String {
-    input
-        .split_whitespace()
-        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" OR ")
 }
 
 fn render_hit_block(hit: &SearchResult, neighbours: &[Message]) -> String {
     let idx = neighbours.iter().position(|m| m.id == hit.message_id);
     let mut out = String::new();
-    let title = hit.session_title.as_deref().unwrap_or("(untitled)");
+    // The title comes from `derive_session_title(&first_user_message)` — the
+    // first user message is recorded verbatim by the TUI, so a secret-shaped
+    // value there lands in `sessions.title` un-scrubbed. Scrub here, on the
+    // way out, so a title with `password: "..."` in it does not leave the
+    // store.
+    let title = hit
+        .session_title
+        .as_deref()
+        .map(scrub_and_truncate)
+        .unwrap_or_else(|| "(untitled)".to_string());
     let _ = writeln!(out, "\nSession {} — hit:", title);
     if let Some(i) = idx {
         if i > 0 {
@@ -277,6 +276,20 @@ mod tests {
             }
         }
 
+        fn search_messages_any_word(
+            &self,
+            query: &str,
+            _limit: usize,
+            conversation_key: Option<&str>,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            // Record the call so the probe can still assert both stages ran,
+            // then return `any_words` exactly as the second pass used to.
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            calls.push((query.to_string(), conversation_key.map(str::to_string)));
+            drop(calls);
+            Ok(self.any_words.clone())
+        }
+
         fn get_messages(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
             Ok(self.messages.get(session_id).cloned().unwrap_or_default())
         }
@@ -400,9 +413,9 @@ mod tests {
         assert!(!calls.is_empty(), "Only view must have queried the store");
     }
 
-    /// All-words first; if that finds nothing, any single word. Both stages
-    /// run, so a row that only carries one of the words is found on the
-    /// second pass and the probe has two calls.
+    /// All-words first; if that finds nothing, any single word. The probe
+    /// records the two calls so the assertion holds whatever the store's
+    /// any-word implementation looks like.
     #[tokio::test]
     async fn all_words_first_then_any_word_fallback() {
         let hit = search_result("s1", Some("group-a"), 1, "user", "just apple here");
@@ -435,6 +448,46 @@ mod tests {
             calls
         );
         assert!(result.output.contains("apple"));
+    }
+
+    /// Any-word fallback uses the real FTS5 store: three words where only one
+    /// appears in any message. The all-words pass returns nothing; the
+    /// any-word pass must match that one word and surface the hit. A
+    /// previous build hand-built `"a" OR "b"` and passed it through
+    /// `fts_literal_query`, which re-quoted the whole expression and treated
+    /// `OR` as a literal word to match — the fallback returned nothing.
+    #[tokio::test]
+    async fn any_word_fallback_finds_one_word_against_a_real_store() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = SessionStore::open(&tmp.path().join("sessions.db")).unwrap();
+        store
+            .record_channel_turn(
+                "m",
+                "telegram:chat-1",
+                "the quick brown fox jumps over the lazy dog",
+                "yes",
+                None,
+            )
+            .unwrap();
+        let handle = Arc::new(MutexSessionStore::new(store));
+        let tool = SessionSearchTool::new(handle.clone());
+
+        // Only `fox` from the query appears in the seeded text. The
+        // all-words pass returns nothing; the any-word pass must match on
+        // `fox` and surface the row.
+        let result = MEMORY_VIEW
+            .scope(MemoryView::All, async {
+                tool.execute(json!({"query": "strawberry banana fox"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(result.success, "{:?}", result);
+        assert!(
+            result.output.contains("brown fox"),
+            "any-word fallback must find the row by the matching word: {}",
+            result.output
+        );
     }
 
     /// Empty results open with the data-not-instructions preamble, so a model
@@ -498,6 +551,47 @@ mod tests {
         assert!(
             result.output.contains("REDACTED"),
             "scrubbed marker must be present: {}",
+            result.output
+        );
+    }
+
+    /// A session title is the first user message, derived before the channel
+    /// recorder was installed, and a secret-shaped value there sits in
+    /// `sessions.title` un-scrubbed. The hit block must scrub the title on
+    /// the way out so it does not reach the model.
+    #[tokio::test]
+    async fn a_secret_shaped_title_is_scrubbed_on_output() {
+        let hit = search_result(
+            "s1",
+            Some(r#"saved with api_key: "supersecretvalue1234""#),
+            1,
+            "user",
+            "the actual hit",
+        );
+        let probe = Arc::new(ProbeStore::new(
+            Some(vec![hit.clone()]),
+            vec![hit.clone()],
+            std::iter::once((
+                hit.session_id.clone(),
+                vec![row(&hit.session_id, "user", &hit.content, hit.message_id)],
+            ))
+            .collect(),
+        ));
+        let tool = SessionSearchTool::new(probe.clone());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::All, async {
+                tool.execute(json!({"query": "actual"})).await.unwrap()
+            })
+            .await;
+        assert!(result.success);
+        assert!(
+            !result.output.contains("supersecretvalue1234"),
+            "the title must be scrubbed before it leaves the store: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("REDACTED"),
+            "the scrubbed marker must be present in the title line: {}",
             result.output
         );
     }
