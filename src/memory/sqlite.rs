@@ -925,7 +925,7 @@ impl Memory for SqliteMemory {
         // A provider failure degrades rather than failing the write. Memory is an
         // auxiliary capability: refusing to store a message because a third-party
         // embedding endpoint is rate-limiting loses the message outright, and the
-        // callers make that invisible — auto-save discards the error. The row is
+        // callers make that invisible — the store discards the error. The row is
         // still keyword-searchable, and its provenance columns stay NULL, which is
         // exactly what a later re-embedding pass looks for. Documented departure
         // from fail-fast, announced in the log rather than silent.
@@ -2271,8 +2271,8 @@ mod tests {
         assert_eq!(SqliteMemory::build_fts_query("   "), "");
     }
 
-    /// An embedding outage used to fail the write outright, and auto-save
-    /// discards the error — so the message was lost without a trace.
+    /// An embedding outage used to fail the write outright, and a caller that
+    /// discards the error loses the message without a trace.
     #[tokio::test]
     async fn store_survives_embedding_provider_failure() {
         let tmp = TempDir::new().unwrap();

@@ -6,7 +6,8 @@
 //! here is re-presented to the model as established fact for as long as it
 //! stays stored.
 //!
-//! Auto-save writes raw user messages, so this is not a hypothetical path.
+//! A memory write carries what a person or the agent typed, so this is not a
+//! hypothetical path.
 //!
 //! Three rules, each for a different reason. Deliberately not a general content
 //! filter — this rejects what can *forge structure* or *leak credentials*, not

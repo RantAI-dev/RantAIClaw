@@ -4347,8 +4347,8 @@ mod tests {
 
         // The body still reaches the model — the test asserts the body is
         // served, not that the writer is the only path. A regression that
-        // re-adds the writer with `auto_save: true` and a view in scope
-        // would push a key here and fail the assertion below.
+        // re-adds a writer with a view in scope would push a key here and
+        // fail the assertion below.
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
         }));
@@ -4397,7 +4397,7 @@ mod tests {
     /// memory — a webhook would otherwise be able to leave a note visible to
     /// every chat.
     #[tokio::test]
-    async fn webhook_with_no_view_does_not_autosave() {
+    async fn webhook_with_no_view_does_not_write_memory() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
 
@@ -4447,7 +4447,7 @@ mod tests {
         let keys = tracking_impl.keys.lock().clone();
         assert!(
             keys.is_empty(),
-            "no-view webhook must NOT autosave; got {keys:?}"
+            "no-view webhook must NOT write memory; got {keys:?}"
         );
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }

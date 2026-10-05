@@ -109,7 +109,7 @@ mod tests {
                 id: "1".into(),
                 key: "k".into(),
                 content: "v".into(),
-                // Curated category: `conversation` entries are auto-save
+                // Curated category: `conversation` entries are
                 // transcript rows and are excluded from context injection.
                 category: MemoryCategory::Core,
                 timestamp: "now".into(),

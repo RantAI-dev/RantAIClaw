@@ -133,21 +133,21 @@ fn warn_retired_backend_once() {
     }
 }
 
-/// Build a per-turn auto-save key.
+/// True for the `<prefix>_<uuid>` keys the retired auto-save wrote.
 ///
-/// `memories.key` is UNIQUE and `store` upserts on conflict, so a fixed key makes
-/// each turn overwrite the last. Every auto-save write site must go through this
-/// True for a key this runtime generated rather than a person naming a fact.
+/// The runtime no longer writes these keys, but rows an older build left under
+/// this shape still sit in `memories`, so the import and display paths that
+/// group them read the shape rather than a category the runtime still writes.
 ///
-/// Auto-save writes one entry per turn under `<prefix>_<uuid>`. The uuid is an
-/// address, not a name: showing it to an operator identifies nothing, so
-/// surfaces that list recalled memories summarise these instead of naming them.
+/// The uuid is an address, not a name: showing it to an operator identifies
+/// nothing, so surfaces that list recalled memories summarise these instead of
+/// naming them.
 pub fn is_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     let Some((_, suffix)) = normalized.rsplit_once('_') else {
         return false;
     };
-    // A v4 uuid tail is what auto-save appends; anything else is a chosen name.
+    // A v4 uuid tail is the shape auto-save wrote; anything else is a chosen name.
     suffix.len() == 36
         && suffix.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
         && suffix.matches('-').count() == 4
@@ -247,14 +247,22 @@ pub(crate) fn resolve_embedding_config(
 ///
 /// Kept as one fn so the three surfaces cannot drift. The factory
 /// (`create_embedding_provider`) and `SqliteMemory::recall` share the same
-/// effective mode: a `none` provider runs FTS-only (keyword) and any other
-/// known provider runs hybrid (keyword + semantic).
+/// effective mode: a `none` provider runs FTS-only (keyword), a known
+/// provider runs hybrid (keyword + semantic), and an unknown provider name
+/// falls back to keyword only at the factory — the label reports that as
+/// `keyword (unknown embedding provider '<name>')` so the operator sees
+/// the factory's silent downgrade instead of a `semantic` claim that is
+/// not running.
 pub fn search_mode_label(provider: &str) -> String {
     let trimmed = provider.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
         return "keyword".to_string();
     }
-    format!("keyword + semantic ({trimmed})")
+    if embeddings::is_known_embedding_provider(trimmed) {
+        format!("keyword + semantic ({trimmed})")
+    } else {
+        format!("keyword (unknown embedding provider '{trimmed}')")
+    }
 }
 
 /// Factory: create the right memory backend from config
@@ -725,19 +733,46 @@ mod tests {
         assert_eq!(search_mode_label(""), "keyword");
         assert_eq!(search_mode_label("  "), "keyword");
         assert_eq!(search_mode_label("NONE"), "keyword");
+        // An unknown name (e.g. a typo) gets the keyword label and an explicit
+        // "unknown embedding provider" tag, instead of a misleading hybrid label.
+        assert_eq!(
+            search_mode_label("bogus"),
+            "keyword (unknown embedding provider 'bogus')"
+        );
     }
 
-    /// Any non-none name — known or unknown — is reported with the hybrid
-    /// label and the provider name. The check does not validate the name;
-    /// that is the doctor check's job. The surfaces that show the mode must
-    /// not silently down-grade an unknown to `keyword`, because the daemon
-    /// was started with the value and an operator may be reading it.
+    /// Any non-none known name is reported with the hybrid label and the
+    /// provider name. The check does not validate the name; that is the
+    /// doctor check's job. Unknown names take the honest unknown-provider
+    /// path instead — see `search_mode_label_reports_unknown_provider_honestly`.
     #[test]
     fn search_mode_label_names_a_known_provider() {
         assert_eq!(search_mode_label("openai"), "keyword + semantic (openai)");
         assert_eq!(
             search_mode_label("custom:https://api.example.com"),
             "keyword + semantic (custom:https://api.example.com)"
+        );
+    }
+
+    /// The factory silently downgrades an unknown name to `NoopEmbedding`
+    /// (keyword only). The label must not lie about that: it must NOT claim
+    /// `semantic` is running, and it must surface the unknown name so the
+    /// operator reading `memory stats` / `memory recall` / `GET
+    /// /api/v1/memory/stats` sees the silent downgrade.
+    #[test]
+    fn search_mode_label_reports_unknown_provider_honestly() {
+        let label = search_mode_label("cohere");
+        assert!(
+            label.contains("unknown embedding provider"),
+            "an unknown provider name must surface as unknown: {label}"
+        );
+        assert!(
+            label.contains("'cohere'"),
+            "the unknown name must appear quoted in the label: {label}"
+        );
+        assert!(
+            !label.contains("semantic"),
+            "the label must not claim semantic search is running: {label}"
         );
     }
 }

@@ -337,6 +337,19 @@ pub fn create_embedding_provider(
     }
 }
 
+/// Whether `create_embedding_provider` recognises the name: `openai`,
+/// `openrouter`, `minimax` and any `custom:<base-url>`. Anything else falls
+/// through the catch arm and the factory silently returns [`NoopEmbedding`],
+/// turning search into keyword only.
+///
+/// One source of truth for the factory and the surfaces that name the live
+/// search mode (the `search_mode_label` docstring in `mod.rs` and the
+/// `MemorySearchModeCheck` in `crate::doctor::checks::memory`). Adding a new
+/// provider here means the factory, the label and the doctor stay in step.
+pub fn is_known_embedding_provider(provider: &str) -> bool {
+    matches!(provider, "openai" | "openrouter" | "minimax") || provider.starts_with("custom:")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

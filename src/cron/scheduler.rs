@@ -1493,6 +1493,43 @@ mod tests {
         );
     }
 
+    /// A cron job runs the same future as the headless `agent -m` door, but
+    /// with `memory_view` driven by the job's origin (`Main` no-`with` reads
+    /// everything; an isolated job without an origin reads everything too).
+    /// A row enters the `memories` table only because someone asked — never
+    /// because a scheduled job ran. A re-added `mem.store(...)` in the
+    /// scheduler's `run_agent_job` or inside `run_with_scope` shows up as a
+    /// `count_after > count_before` here.
+    #[tokio::test]
+    async fn cron_door_does_not_write_a_memory_row() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        let mem: std::sync::Arc<dyn crate::memory::Memory> =
+            std::sync::Arc::from(crate::memory::SqliteMemory::new(&fixture.workspace).unwrap());
+        let count_before = mem.count().await.unwrap();
+
+        let mut job = test_job("");
+        job.id = "no-write-job".into();
+        job.job_type = JobType::Agent;
+        job.prompt = Some("a reminder about the lantern".into());
+        // No origin ⇒ MemoryView::All, the widest read the scheduler hands an
+        // agent job; if this door auto-writes anywhere, it writes here.
+        job.session_target = SessionTarget::Main;
+        let security =
+            SecurityPolicy::from_config(&fixture.config.autonomy, &fixture.config.workspace_dir);
+        let (ok, output) = run_agent_job(&fixture.config, &security, &job, None, None).await;
+        assert!(
+            ok,
+            "the cron agent job ran against the local server: {output}"
+        );
+
+        let count_after = mem.count().await.unwrap();
+        assert_eq!(
+            count_before, count_after,
+            "the cron scheduler must not change the memories table \
+             (before={count_before}, after={count_after})"
+        );
+    }
+
     fn unique_component(prefix: &str) -> String {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
     }

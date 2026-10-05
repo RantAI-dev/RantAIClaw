@@ -790,6 +790,94 @@ async fn agent_repeated_turns_do_not_grow_conversation_rows() {
     );
 }
 
+/// The headless `agent -m` door (`src/main.rs:1804`) drives
+/// [`crate::agent::run`], which builds a provider from
+/// `config.default_provider` and turns the agent. A row enters the
+/// `memories` table only because someone asked — through the
+/// `memory_store` tool, the CLI, the console or the TUI. A re-added
+/// `mem.store(...)` inside `run_with_scope` (or any helper it calls)
+/// shows up as a `count_after > count_before` here.
+///
+/// Replaces `agent::loop_::tests::headless_agent_message_writer_is_removed`,
+/// a source-pinning guard that grepped `loop_.rs` for `autosave_screened(`,
+/// a function that no longer exists; a re-added `mem.store(...)` would have
+/// passed the old guard.
+#[tokio::test]
+async fn headless_door_does_not_write_a_memory_row() {
+    let fixture = super::door_test_support::DoorFixture::start().await;
+    let mem = crate::memory::SqliteMemory::new(&fixture.workspace).unwrap();
+    let count_before = mem.count().await.unwrap();
+
+    crate::memory::MEMORY_VIEW
+        .scope(crate::memory::MemoryView::All, async {
+            // `agent::run` is a large future; box it once to keep this test
+            // future off the poll-loop stack (clippy::large_futures), mirroring
+            // the cron scheduler and the existing door tests.
+            let reply = Box::pin(crate::agent::run(
+                fixture.config.clone(),
+                Some("hi from headless".to_string()),
+                None,
+                None,
+                0.0,
+                "cli",
+                // The CLI single-shot path: stdout is the operator's
+                // terminal and the wrapper `println!`s the reply.
+                false,
+            ))
+            .await
+            .expect("the headless turn runs against the local server");
+            assert_eq!(reply, "Done.");
+        })
+        .await;
+
+    let count_after = mem.count().await.unwrap();
+    assert_eq!(
+        count_before, count_after,
+        "the headless `agent -m` door must not change the memories table \
+             (before={count_before}, after={count_after})"
+    );
+}
+
+/// The interactive REPL door drives the same future as the headless one,
+/// but through `Agent::turn` rather than the full `agent::run` wrapper
+/// (no session store, no observer bootstrap, no stdout print). The
+/// invariant is the same: a row enters the table only when someone
+/// asked. The two tests together cover the two surfaces the operator
+/// can reach directly from a terminal.
+///
+/// Replaces `agent::loop_::tests::repl_writer_is_removed`, which had the
+/// same source-pinning flaw as its headless sibling.
+#[tokio::test]
+async fn repl_door_does_not_write_a_memory_row() {
+    let (mem, _tmp) = make_sqlite_memory();
+    let count_before = mem.count().await.unwrap();
+    let provider = Box::new(ScriptedProvider::new(vec![text_response("done")]));
+
+    let mut agent = Agent::builder()
+        .provider(provider)
+        .tools(vec![])
+        .memory(mem.clone())
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .build()
+        .unwrap();
+
+    crate::memory::MEMORY_VIEW
+        .scope(crate::memory::MemoryView::All, async {
+            let reply = agent.turn("hi from repl").await.unwrap();
+            assert_eq!(reply, "done");
+        })
+        .await;
+
+    let count_after = mem.count().await.unwrap();
+    assert_eq!(
+        count_before, count_after,
+        "the REPL turn must not change the memories table \
+             (before={count_before}, after={count_after})"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 10. Native vs XML dispatcher integration
 // ═══════════════════════════════════════════════════════════════════════════

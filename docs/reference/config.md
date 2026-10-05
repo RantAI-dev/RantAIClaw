@@ -545,8 +545,8 @@ Notes:
 Durable facts live in `core` (and `daily`) categories, written via the
 `memory_store` tool. The agent writes one only when the person asks to have
 something remembered. No prompt on any surface tells the model to save on its
-own, and compaction (`/compress`) stores nothing. Auto-saved `conversation` rows
-are not part of this tier and are never injected into prompts.
+own, and compaction (`/compress`) stores nothing. `conversation` rows are not
+part of this tier and are never injected into prompts.
 
 The `memory_store` description is one text that every surface shows the model.
 It asks for a fact about the person or the work ("The owner prefers short
@@ -961,6 +961,23 @@ is refused rather than half-understood.
 
 Migrations only move forward. There is no automatic downgrade, so reverting to a
 binary older than your config's `schema_version` needs a manual edit.
+
+### v38: the `[memory].auto_save` key retired
+
+`[memory].auto_save` is removed. It was the gate every runtime door consulted
+to decide whether to write a `conversation` row from inbound input; the door
+writers are gone, so the key configured nothing. A row now enters that category
+only when an operator invokes the `memory_store` tool, the `rantaiclaw memory`
+CLI, the console, or the TUI.
+
+Existing configs drop the key on load (config schema **37 → 38**). The migrator
+is unconditional, so a v37 file that set `auto_save = true` or `false` loses the
+entry. Rows an older build already wrote under the `conversation` category stay
+on disk and can be cleared with
+`rantaiclaw memory clear --category conversation --yes`.
+
+A config written by this schema is refused by a binary that knows only schema
+37.
 
 ### v37: the relevance floor moves from 0.4 to 0.6
 

@@ -1007,8 +1007,8 @@ pub(crate) async fn process_channel_message(
     // the request carries one block however long the conversation is.
     //
     // The read goes through the turn's memory view, so a view limited to one
-    // conversation never lets the shared tier or another chat's auto-save rows
-    // reach the prompt. The view key is the conversation scope, not the bare
+    // conversation never lets the shared tier or another chat's rows reach the
+    // prompt. The view key is the conversation scope, not the bare
     // sender, so two senders in the same chat cannot see each other's words.
     let memory_context = build_memory_context(
         ctx.memory.as_ref(),

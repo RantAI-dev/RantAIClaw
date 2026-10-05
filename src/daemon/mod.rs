@@ -689,6 +689,42 @@ mod tests {
         fixture.assert_every_note_was_sent();
     }
 
+    /// The heartbeat tick runs `agent::run` once per task. A row enters the
+    /// `memories` table only because someone asked — never because a
+    /// periodic check fired. A re-added `mem.store(...)` inside the worker's
+    /// turn shows up as a `count_after > count_before` here. Sibling to
+    /// `agent::tests::headless_door_does_not_write_a_memory_row` (same
+    /// `agent::run` path, different caller).
+    #[tokio::test]
+    async fn the_heartbeat_door_does_not_write_a_memory_row() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        std::fs::write(
+            fixture.workspace.join("HEARTBEAT.md"),
+            "# Periodic Tasks\n\n- check the lantern\n",
+        )
+        .unwrap();
+
+        let mem: std::sync::Arc<dyn crate::memory::Memory> =
+            std::sync::Arc::from(crate::memory::SqliteMemory::new(&fixture.workspace).unwrap());
+        let count_before = mem.count().await.unwrap();
+
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
+        let worker = tokio::spawn(run_heartbeat_worker(fixture.config.clone(), observer));
+        // One request means one heartbeat tick reached the model; if a
+        // regression that auto-wrote a row fired on the inbound task, the
+        // count would have grown by then.
+        fixture.llm.wait_for_requests(1).await;
+        worker.abort();
+
+        let count_after = mem.count().await.unwrap();
+        assert_eq!(
+            count_before, count_after,
+            "the heartbeat door must not change the memories table \
+             (before={count_before}, after={count_after})"
+        );
+    }
+
     /// Plan 353: the gateway and channels share one drain deadline instead of
     /// eight seconds each in turn. The gateway normally exits at once, and its
     /// unused eight seconds were lost, so channels were aborted eight seconds

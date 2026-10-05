@@ -184,7 +184,7 @@ scripts, so their code-executing subcommands are classified Medium.
 - **Credential scrubbing where text leaves the process.** `token`/`api_key`/`password`/
   `secret`/`bearer`/`credential` patterns are redacted (keeping a 4-char prefix for
   context) before cron run history is stored and before a cron result is announced to a
-  chat; auto-saved conversation turns are screened the same way before they reach memory,
+  chat; memory writes are screened the same way before they reach the store,
   which is the one store re-injected into later prompts. Provider and bot tokens are
   scrubbed from error logs too. **Tool output is not scrubbed on its way to the model** —
   an agent asked to read a credentials file is expected to be able to read it.

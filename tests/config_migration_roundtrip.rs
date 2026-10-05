@@ -259,8 +259,7 @@ fn v38_is_the_current_version() {
 /// still deserialise. The key was the gate every door consulted to decide
 /// whether to write a Conversation row on inbound input; the door writers are
 /// gone, so leaving the key in the config would advertise a behaviour that
-/// does not exist. The schema no longer accepts `auto_save`, so a
-/// post-migration config that still carried it would fail to load.
+/// does not exist. The migrator strips it and the result loads.
 #[test]
 fn v38_strips_auto_save_and_the_result_loads() {
     let mut v = v37_with_memory("auto_save = true\nbackend = \"sqlite\"\n");

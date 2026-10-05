@@ -8379,8 +8379,8 @@ async fn build_memory_context_surfaces_conversation_scoped_entry() {
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
     // Stored under a specific conversation scope, it must be recalled when
-    // that conversation's view asks. Curated category: `conversation` entries are
-    // auto-save transcript rows and are excluded from injection outright.
+    // that conversation's view asks. Curated category: `conversation` entries
+    // are transcript rows and are excluded from injection outright.
     mem.store(
         "scoped_fact",
         "Project ships Friday",
@@ -8679,14 +8679,13 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
 }
 
 /// The channel dispatcher shares `build_memory_context` with the agent and
-/// the CLI loop, and it has the same shape that broke them: it auto-saves
-/// the inbound message *before* recalling, so the store holds a verbatim
-/// copy of the question by the time the context block is built.
+/// the CLI loop. The self-echo drop is shared too: a stored copy of the
+/// question, left by an older build or written as a curated note that repeats
+/// it, would otherwise take the top rank and push the facts under the floor.
 ///
 /// This drives the real dispatcher against a real SQLite store — no stub
-/// memory — and reads the prompt off the provider. Without the self-echo
-/// drop the block is the question quoted back, and the curated fact never
-/// reaches the model.
+/// memory — and reads the prompt off the provider. The curated fact must reach
+/// the model, and the question must not be injected back as its own context.
 #[tokio::test]
 async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
     // Long enough that the test exercises the same code path real chats hit
@@ -8723,8 +8722,8 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
-        // Both of these matter: auto-save writes the echo, and the real
-        // default threshold is what the echo's ranking pushed facts under.
+        // Both matter: `max_tool_iterations` lets the turn finish, and the
+        // real default threshold is the floor a fact must clear.
         max_tool_iterations: 5,
         min_relevance_score: crate::config::MemoryConfig::default().min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),

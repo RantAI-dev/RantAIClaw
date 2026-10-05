@@ -107,8 +107,11 @@ pub fn parse_place(place: &str) -> Result<(String, String, Option<String>), Stri
     })?;
     // A literal `:` in `rest` is the sender/thread separator. `%3A` inside an
     // encoded component is not a separator, so `split_once` only catches it.
+    // The sender is decoded in both branches so a percent-encoded value
+    // round-trips symmetrically — no channel produces a thread with `:` or
+    // `%` in its id today, but the asymmetry would have leaked silently.
     let (sender, thread) = match rest.split_once(':') {
-        Some((s, t)) => (s.to_string(), Some(decode_component(t))),
+        Some((s, t)) => (decode_component(s), Some(decode_component(t))),
         None => (decode_component(rest), None),
     };
     Ok((surface.to_string(), sender, thread))
@@ -298,6 +301,7 @@ mod tests {
             ("discord", "chan99", Some("100%")),
             ("slack", "C", Some("a:b")),
             ("telegram", "-100123456:77", None), // Telegram forum topic
+            ("matrix", "!room:example.org", Some("t1")), // threaded sender with `:` — sender must still decode
         ];
         for (surface, sender, thread) in cases {
             let place = ConversationKey::new(surface, sender)
