@@ -1714,9 +1714,13 @@ fn durable_history_writes_through_and_reloads() {
 }
 
 #[test]
-fn compact_sender_history_keeps_recent_truncated_messages() {
+fn compact_sender_history_drops_overlong_rows_instead_of_truncating() {
     let mut histories = HashMap::new();
     let sender = "telegram_u1".to_string();
+    // 20 rows of 700 chars each — every row is overlong. New compaction
+    // behaviour drops them rather than ellipsis-truncating the bodies, since
+    // a truncated body would let the model read a partial value it cannot
+    // reason about safely.
     histories.insert(
         sender.clone(),
         (0..20)
@@ -1767,21 +1771,19 @@ fn compact_sender_history_keeps_recent_truncated_messages() {
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
     };
 
-    assert!(history::compact_sender_history(&ctx, &sender));
+    // Compaction returns false because every row was dropped — there is
+    // nothing to persist after compaction.
+    assert!(!history::compact_sender_history(&ctx, &sender));
 
     let histories = ctx
         .conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let kept = histories
-        .get(&sender)
-        .expect("sender history should remain");
-    assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    assert!(kept.iter().all(|turn| {
-        let len = turn.content.chars().count();
-        len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
-            || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3 && turn.content.ends_with("..."))
-    }));
+    let kept = histories.get(&sender).cloned().unwrap_or_default();
+    assert!(
+        kept.is_empty(),
+        "no row survives when every input row was overlong, got: {kept:?}"
+    );
 }
 
 struct DummyProvider;
@@ -1949,6 +1951,44 @@ impl IterativeToolProvider {
             .iter()
             .filter(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
             .count()
+    }
+}
+
+/// A provider that always asks for `mock_price` so the loop detector in
+/// `agent/loop_.rs` trips after three identical result hashes. Used to drive
+/// the loop-detector `force_final_summary` path end to end.
+struct LoopDetectorProvider;
+
+#[async_trait::async_trait]
+impl Provider for LoopDetectorProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(tool_call_payload())
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let force_summary_requested = messages.iter().any(|msg| {
+            msg.role == "user"
+                && (msg.content.contains("stuck in a loop")
+                    || msg.content.contains("reached the maximum of"))
+        });
+        if force_summary_requested {
+            return Ok("Summary: I kept calling the same tool and got the same \
+                       result three times in a row, so I stopped. Next step: \
+                       try a different approach."
+                .to_string());
+        }
+        Ok(tool_call_payload())
     }
 }
 
@@ -7107,6 +7147,401 @@ fn tool_role_is_preserved_through_normalize() {
     assert_eq!(normalized[3].content, "a1");
 }
 
+/// Sixty user/tool/assistant turns, normalized in one pass, must keep the
+/// cache well-formed: every row at index >=1 immediately follows a call row,
+/// the normalized slice starts at a `user` row, and no `tool` row appears
+/// before any user row exists in the conversation.
+#[test]
+fn normalize_sixty_turns_keeps_user_first_and_tools_attached() {
+    let mut turns = Vec::new();
+    for i in 0..15 {
+        turns.push(ChatMessage::user(format!("q{i}")));
+        turns.push(ChatMessage::assistant(format!(
+            "<tool_call>{{\"name\":\"memory_store\",\"arguments\":{{\"i\":{i}}}}}"
+        )));
+        turns.push(ChatMessage::tool(format!("tool output {i}")));
+        turns.push(ChatMessage::assistant(format!("a{i}")));
+    }
+
+    let normalized = normalize_cached_channel_turns(turns);
+
+    assert!(
+        !normalized.is_empty(),
+        "the normalization returns the turns"
+    );
+    assert_eq!(normalized[0].role, "user", "the cache starts at a user row");
+    for (idx, turn) in normalized.iter().enumerate() {
+        if turn.role == "tool" {
+            assert!(idx >= 1, "a tool row cannot be the first row");
+            let preceding = &normalized[idx - 1];
+            assert_eq!(
+                preceding.role, "assistant",
+                "a tool row must immediately follow an assistant call row, got: {preceding:?}"
+            );
+            assert!(
+                preceding.content.contains("<tool_call>"),
+                "the preceding assistant row must be a carrier, got: {preceding:?}"
+            );
+        }
+    }
+    for turn in &normalized {
+        assert!(
+            !turn.content.contains("<tool_call>\n…"),
+            "tool bodies must never be ellipsis-truncated by the normalizer"
+        );
+    }
+}
+
+/// An XML-shape cache: the dispatcher flattens `ToolResults` into a single
+/// `user` row whose content starts with `[Tool results]`. The normalizer must
+/// keep that user row attached to the preceding XML carrier assistant row
+/// (the only one whose text contains `<tool_call>` blocks) and must not
+/// truncate the row mid-block.
+#[test]
+fn normalize_xml_tool_results_user_row_stays_attached_to_call_row() {
+    let turns = vec![
+        ChatMessage::user("q1"),
+        ChatMessage::assistant("<tool_call>{...}</tool_call>some text after"),
+        ChatMessage::user("[Tool results]\n<tool_result name=\"x\">\nhello\n</tool_result>"),
+        ChatMessage::assistant("a1"),
+    ];
+
+    let normalized = normalize_cached_channel_turns(turns);
+
+    assert_eq!(
+        normalized.len(),
+        4,
+        "the XML [Tool results] user row must stay attached, not merge or drop"
+    );
+    assert_eq!(normalized[0].role, "user");
+    assert_eq!(normalized[0].content, "q1");
+    assert_eq!(normalized[1].role, "assistant");
+    assert!(
+        normalized[1].content.contains("<tool_call>"),
+        "the assistant row is the XML carrier: {:?}",
+        normalized[1]
+    );
+    assert_eq!(normalized[2].role, "user");
+    assert!(
+        normalized[2].content.starts_with("[Tool results]"),
+        "the tool-results user row survives untouched"
+    );
+    assert!(
+        !normalized[2].content.contains("…"),
+        "the tool body must not be ellipsis-truncated"
+    );
+    assert_eq!(normalized[3].role, "assistant");
+    assert_eq!(normalized[3].content, "a1");
+}
+
+/// An orphan `tool` row at the start of the cache (no preceding assistant
+/// call row in the kept slice, e.g. after a load-time strip removed the
+/// call row but the result row remained) must be dropped by the normalizer.
+#[test]
+fn normalize_drops_orphan_tool_rows() {
+    let turns = vec![
+        ChatMessage::tool("leftover from a dropped pair"),
+        ChatMessage::user("q1"),
+        ChatMessage::assistant("<tool_call>{...}</tool_call>"),
+        ChatMessage::tool("attached"),
+    ];
+
+    let normalized = normalize_cached_channel_turns(turns);
+
+    assert!(
+        normalized
+            .iter()
+            .filter(|t| t.role == "tool" && t.content == "leftover from a dropped pair")
+            .count()
+            == 0,
+        "an orphan tool row at the head is dropped: {normalized:?}"
+    );
+    assert!(
+        normalized
+            .iter()
+            .any(|t| t.role == "tool" && t.content == "attached"),
+        "the attached tool row survives: {normalized:?}"
+    );
+}
+
+/// A `tool` row whose preceding assistant row is a plain text response (no
+/// tool-call marker) is an orphan — the call row was dropped earlier or never
+/// landed. The normalizer must drop it instead of handing the next turn's
+/// provider a result with no matching call.
+#[test]
+fn normalize_drops_tool_row_after_plain_assistant() {
+    let turns = vec![
+        ChatMessage::user("q1"),
+        ChatMessage::assistant("just a plain text reply"),
+        ChatMessage::tool("a result with no matching call"),
+        ChatMessage::assistant("<tool_call>{...}</tool_call>"),
+        ChatMessage::tool("an attached result"),
+    ];
+
+    let normalized = normalize_cached_channel_turns(turns);
+
+    assert!(
+        !normalized
+            .iter()
+            .any(|t| t.role == "tool" && t.content == "a result with no matching call"),
+        "an orphan tool row is dropped: {normalized:?}"
+    );
+    assert!(
+        normalized
+            .iter()
+            .any(|t| t.role == "tool" && t.content == "an attached result"),
+        "the attached tool row survives: {normalized:?}"
+    );
+}
+
+/// Compaction must never truncate a tool body mid-block. A 5,000-character
+/// `tool` row whose char-count exceeds `CHANNEL_HISTORY_COMPACT_CONTENT_CHARS`
+/// (600) must either be kept whole or be dropped together with the preceding
+/// call row; the model cannot safely consume a partially-truncated body.
+#[tokio::test]
+async fn compact_does_not_truncate_long_tool_body_mid_block() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let ctx = minimal_channel_context();
+    let sender_key = "compact-test:chat-1";
+
+    let long_tool_body: String = "x".repeat(5000);
+    let tool_payload = serde_json::json!({
+        "tool_call_id": "call-x",
+        "content": long_tool_body,
+    })
+    .to_string();
+    let call_row = ChatMessage::assistant(
+        "<tool_call>{\"name\":\"x\",\"arguments\":{},\"id\":\"call-x\"}".to_string(),
+    );
+
+    // 15 user/assistant turns before the long-tool pair, so the pair lands in
+    // the last 12 (positions 31 and 32).
+    let mut turns = Vec::new();
+    for i in 0..15 {
+        turns.push(ChatMessage::user(format!("fill-q-{i}")));
+        turns.push(ChatMessage::assistant(format!("fill-a-{i}")));
+    }
+    turns.push(ChatMessage::user("late-q"));
+    turns.push(call_row.clone());
+    turns.push(ChatMessage::tool(tool_payload.clone()));
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), turns);
+
+    let compacted = super::history::compact_sender_history(&ctx, sender_key);
+    assert!(compacted, "compaction reports a change happened");
+
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default();
+
+    let tool_rows: Vec<_> = stored.iter().filter(|t| t.role == "tool").collect();
+    assert_eq!(
+        tool_rows.len(),
+        0,
+        "a tool row whose body exceeds the per-message char limit must be dropped together with its call row, found: {tool_rows:?}"
+    );
+    let still_has_call = stored
+        .iter()
+        .any(|t| t.role == "assistant" && t.content.contains("call-x"));
+    assert!(
+        !still_has_call,
+        "the call row is dropped together with the dropped tool body: {stored:?}"
+    );
+}
+
+/// A tool row whose body fits within the per-message char limit (600) but is
+/// in the kept slice must survive compaction unchanged — whole call rows
+/// survive compaction as a unit, never half-truncated.
+#[tokio::test]
+async fn compact_keeps_short_tool_row_whole() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let ctx = minimal_channel_context();
+    let sender_key = "compact-test:chat-3";
+
+    let call_row = ChatMessage::assistant(
+        "<tool_call>{\"name\":\"x\",\"arguments\":{},\"id\":\"call-x\"}".to_string(),
+    );
+    let tool_row = ChatMessage::tool("short body that does not exceed the cap");
+
+    let mut turns = Vec::new();
+    for i in 0..15 {
+        turns.push(ChatMessage::user(format!("fill-q-{i}")));
+        turns.push(ChatMessage::assistant(format!("fill-a-{i}")));
+    }
+    turns.push(ChatMessage::user("late-q"));
+    turns.push(call_row);
+    turns.push(tool_row);
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), turns);
+
+    let _ = super::history::compact_sender_history(&ctx, sender_key);
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default();
+
+    assert!(
+        stored
+            .iter()
+            .any(|t| t.role == "tool" && t.content == "short body that does not exceed the cap"),
+        "the kept tool row survives whole: {stored:?}"
+    );
+}
+
+/// A user/assistant row whose body exceeds the per-message char limit must be
+/// dropped whole (no mid-row truncation), so the cache is always well-formed.
+/// The test plants a 5,000-char user row at index 16 (within the kept slice of
+/// 12 messages), so current behaviour would ellipsis-truncate it.
+#[tokio::test]
+async fn compact_drops_user_row_whose_body_exceeds_limit() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let ctx = minimal_channel_context();
+    let sender_key = "compact-test:chat-2";
+
+    let long_user_body: String = "u".repeat(5000);
+    let mut turns = Vec::new();
+    // First 8 user/assistant pairs (indices 0..16).
+    for i in 0..8 {
+        turns.push(ChatMessage::user(format!("q-{i}")));
+        turns.push(ChatMessage::assistant(format!("a-{i}")));
+    }
+    // The long user row lands at index 16 — inside the kept slice (last 12).
+    turns.push(ChatMessage::user(long_user_body.clone()));
+    // A few short ones to ensure the long row is followed by something kept.
+    turns.push(ChatMessage::assistant("after-long"));
+    turns.push(ChatMessage::user("late-q"));
+    turns.push(ChatMessage::assistant("late-a"));
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string(), turns);
+
+    let _ = super::history::compact_sender_history(&ctx, sender_key);
+
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default();
+
+    for turn in &stored {
+        assert!(
+            !turn.content.contains("..."),
+            "no row may carry an ellipsis truncation marker: {turn:?}"
+        );
+        assert!(
+            turn.content.chars().count() <= 5000,
+            "a kept row must be whole (within the long-input length): {turn:?}"
+        );
+    }
+}
+
+/// `append_sender_turn` must trim in whole turns, never leave the cache with a
+/// `tool` row whose preceding call row was sliced off.
+#[tokio::test]
+async fn append_trims_in_whole_turns() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let ctx = minimal_channel_context();
+    let sender_key = "append-trim:chat-1";
+
+    // Pre-fill the cache with MAX_CHANNEL_HISTORY user rows that don't use
+    // tools (one turn each), then push a tool-using turn and assert the trim
+    // drops the oldest user/assistant pair (whole) and the new tool-using
+    // turn lands intact at the end.
+    let max = super::MAX_CHANNEL_HISTORY;
+    for i in 0..max {
+        super::history::append_sender_turn(&ctx, sender_key, ChatMessage::user(format!("q-{i}")));
+        super::history::append_sender_turn(
+            &ctx,
+            sender_key,
+            ChatMessage::assistant(format!("a-{i}")),
+        );
+    }
+    super::history::append_sender_turn(&ctx, sender_key, ChatMessage::user("late-q"));
+    super::history::append_sender_turn(
+        &ctx,
+        sender_key,
+        ChatMessage::assistant("<tool_call>{\"name\":\"x\"}</tool_call>"),
+    );
+    super::history::append_sender_turn(&ctx, sender_key, ChatMessage::tool("short result"));
+
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default();
+    assert!(stored.len() <= max, "the cap is respected: {stored:?}");
+    // The trim cut at the new turn boundary; the carrier+result pair at the
+    // end is intact.
+    let last_three: Vec<_> = stored.iter().rev().take(3).collect();
+    assert_eq!(last_three[2].role, "user", "late-q survives: {stored:?}");
+    assert_eq!(last_three[1].role, "assistant", "the carrier survives");
+    assert!(
+        last_three[1].content.contains("<tool_call>"),
+        "the carrier has its tool-call marker: {last_three:?}"
+    );
+    assert_eq!(last_three[0].role, "tool", "the result survives");
+}
+
+/// Build a `ChannelRuntimeContext` with only the fields `compact_sender_history`
+/// reads (history map + optional history store). Used by the INV 2 tests.
+fn minimal_channel_context() -> ChannelRuntimeContext {
+    let mut channels_by_name: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+    channels_by_name.insert(
+        "telegram".to_string(),
+        Arc::new(RecordingChannel::default()) as Arc<dyn Channel>,
+    );
+    ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: Arc::new(ToolCallingProvider),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        session_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(Vec::new()),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    }
+}
+
 #[tokio::test]
 async fn message_dispatch_processes_messages_in_parallel() {
     let channel_impl = Arc::new(RecordingChannel::default());
@@ -8853,9 +9288,330 @@ async fn forged_label_without_tool_call_appends_runtime_net_line() {
     }
 }
 
-/// A turn that actually calls a tool stores the tool call and result as
+/// `NO_TOOL_RUN_NOTICE` is a line the runtime writes for the user to read. It
+/// must never reach stored history — a future turn would otherwise see it in
+/// the cache and parrot it back as its own line. (The delivered reply still
+/// carries it; sanitize strips any model forgery of the same shape from that
+/// reply path.)
+#[tokio::test]
+async fn no_tool_run_notice_is_never_stored_where_model_can_copy_it() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let provider: Arc<dyn Provider> = Arc::new(FixedTextProvider {
+        reply: "[Used tools: memory_store]\nSaved your note.".to_string(),
+    });
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider,
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        session_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["alice".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        ctx.clone(),
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "msg-no-tool-notice-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-no-tool-notice".to_string(),
+            content: "save my note".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let sent_messages = channel_impl.sent_messages.lock().await;
+    assert_eq!(sent_messages.len(), 1);
+    let delivered = &sent_messages[0];
+    assert!(
+        delivered.contains(NO_TOOL_RUN_NOTICE),
+        "the delivered reply still carries the runtime net line for the reader: {delivered}"
+    );
+
+    let history_key = conversation_history_key(&traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "msg-no-tool-notice-1".to_string(),
+        sender: "alice".to_string(),
+        reply_target: "chat-no-tool-notice".to_string(),
+        content: "save my note".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: true,
+    });
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !stored.is_empty(),
+        "an All-chat owner-DM still stores this turn's final assistant row"
+    );
+    for turn in &stored {
+        assert!(
+            !turn.content.contains(NO_TOOL_RUN_NOTICE),
+            "stored history must never carry the runtime net line, found in: {turn:?}"
+        );
+    }
+}
+
+/// Sanitize strips `NO_TOOL_RUN_NOTICE` from any reply the model wrote it
+/// into. The runtime writes the notice itself when a forged `[Used tools: …]`
+/// label appears with no tool call, so a model that forges the notice on its
+/// own must not see it reach a reader either.
+#[test]
+fn sanitize_strips_no_tool_run_notice() {
+    let reply = format!("A note.\n{NO_TOOL_RUN_NOTICE}\nMore text.");
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let sanitized = crate::channels::sanitize::sanitize_channel_response(&reply, &tools);
+    assert!(
+        !sanitized.contains(NO_TOOL_RUN_NOTICE),
+        "sanitize must drop the runtime net line from the reply path: {sanitized}"
+    );
+}
+
+/// A turn that hits the soft-cap (`agent/loop_.rs` `force_final_summary`) in
+/// an owner-DM (`MemoryView::All`) must not persist the soft-cap nudge into
+/// stored history. The nudge is a line the runtime writes for the model to
+/// answer; storing it where the next turn's cache will read it lets the model
+/// parrot it back as its own line.
+#[tokio::test]
+async fn all_chat_history_drops_soft_cap_nudge_from_storage() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: Arc::new(IterativeToolProvider {
+            required_tool_iterations: 20,
+        }),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+
+        max_tool_iterations: 3,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        session_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["alice".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        ctx.clone(),
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "msg-soft-cap-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-soft-cap".to_string(),
+            content: "Loop forever".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let history_key = conversation_history_key(&traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "msg-soft-cap-1".to_string(),
+        sender: "alice".to_string(),
+        reply_target: "chat-soft-cap".to_string(),
+        content: "Loop forever".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: true,
+    });
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .cloned()
+        .unwrap_or_default();
+    for turn in &stored {
+        assert!(
+            !turn.content.contains("reached the maximum of"),
+            "the soft-cap nudge must not be persisted: {turn:?}"
+        );
+        assert!(
+            !turn.content.contains("stuck in a loop"),
+            "the loop-detector nudge must not be persisted: {turn:?}"
+        );
+    }
+}
+
+/// A turn that hits the loop detector (`agent/loop_.rs` `force_final_summary`)
+/// in an owner-DM (`MemoryView::All`) must not persist the loop-detector
+/// nudge into stored history. The nudge is a line the runtime writes for the
+/// model to answer; storing it lets the next turn parrot it.
+#[tokio::test]
+async fn all_chat_history_drops_loop_detector_nudge_from_storage() {
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot::default())),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: Arc::new(LoopDetectorProvider),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        session_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(vec!["alice".to_string()]),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+    });
+
+    process_channel_message(
+        ctx.clone(),
+        traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "msg-loop-detect-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-loop-detect".to_string(),
+            content: "loop me".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: true,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    let history_key = conversation_history_key(&traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "msg-loop-detect-1".to_string(),
+        sender: "alice".to_string(),
+        reply_target: "chat-loop-detect".to_string(),
+        content: "loop me".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        is_direct: true,
+    });
+    let stored = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .cloned()
+        .unwrap_or_default();
+    for turn in &stored {
+        assert!(
+            !turn.content.contains("stuck in a loop"),
+            "the loop-detector nudge must not be persisted: {turn:?}"
+        );
+    }
+}
 /// their own messages (the dispatcher's own shape), not a prose label, and
-/// the delivered reply carries no runtime net line — the tool ran.
+/// the delivered reply carries no runtime net line — the tool ran. Only a
+/// named owner in a platform-direct chat (the `MemoryView::All` case) stores
+/// the structured form; a shared chat stores the user row and the final
+/// assistant row only.
 #[tokio::test]
 async fn real_tool_call_keeps_structured_history_and_skips_net_line() {
     let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
@@ -8896,7 +9652,7 @@ async fn real_tool_call_keeps_structured_history_and_skips_net_line() {
         multimodal: crate::config::MultimodalConfig::default(),
         security: Arc::new(crate::security::SecurityPolicy::default()),
         channel_approval: None,
-        approval_owners: Arc::new(Vec::new()),
+        approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
     });
@@ -8913,7 +9669,7 @@ async fn real_tool_call_keeps_structured_history_and_skips_net_line() {
             timestamp: 1,
             thread_ts: None,
             reply_anchor: None,
-            is_direct: false,
+            is_direct: true,
         },
         CancellationToken::new(),
     )

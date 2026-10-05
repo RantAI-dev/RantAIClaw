@@ -2002,13 +2002,10 @@ pub(crate) async fn run_structured_loop(
                     repeats,
                     "loop detected — same tool+args+result repeated; breaking early"
                 );
-                let nudge = format!(
-                    "The same tool call (`{}`) returned the same result {} times in a row. \
-                     You're stuck in a loop. Without using any more tools, briefly explain \
-                     what's blocking you and suggest one concrete next step the user can \
-                     take. Do not retry the same call.",
-                    key.0, repeats
-                );
+                let nudge = nudge_text(&NudgeKind::LoopDetected {
+                    tool_name: key.0.clone(),
+                    repeats,
+                });
                 let summary = force_final_summary(
                     provider,
                     history,
@@ -2049,13 +2046,7 @@ pub(crate) async fn run_structured_loop(
     // tools-disabled provider call so the user gets a real summary of
     // what was attempted. Mentions `/continue` so the user knows how
     // to extend the budget if more work is needed.
-    let nudge = format!(
-        "You've reached the maximum of {max_iterations} tool calls for this turn. \
-         Without using any more tools, briefly summarize what you found, what's still \
-         unresolved, and suggest a clear next step. If the user wants you to keep \
-         going from here, they can type `/continue` to extend this turn with a fresh \
-         tool-call budget."
-    );
+    let nudge = nudge_text(&NudgeKind::SoftCap { max_iterations });
     let summary = force_final_summary(
         provider,
         history,
@@ -2183,6 +2174,56 @@ pub(crate) async fn run_tool_call_loop(
 /// Append a tools-disabled nudge to history and make one final provider
 /// call. Used by the iteration soft-cap and the loop detector — both
 /// want to produce a real user-visible summary instead of bailing with
+/// Two runtime lines written for the model to read as instructions on its
+/// next turn: the soft-cap nudge (the budget is gone) and the loop-detector
+/// nudge (the same tool returned the same result three times in a row).
+/// Exposed so the channel's store site can strip them from `to_store` for
+/// `MemoryView::All` chats; if either text reaches the next turn the model
+/// can parrot it back as its own line.
+#[derive(Debug, Clone)]
+pub(crate) enum NudgeKind {
+    /// Soft-cap reached: `max_iterations` tool calls in this turn.
+    SoftCap { max_iterations: usize },
+    /// Loop detector: same tool, args, and result three times in a row.
+    LoopDetected { tool_name: String, repeats: usize },
+}
+
+/// Build the runtime-written nudge text the `force_final_summary` path pushes
+/// into history. The text is exactly what is later filtered out at the channel
+/// store site for `MemoryView::All` chats — keep these two callers in
+/// lock-step by routing both through this helper.
+pub(crate) fn nudge_text(kind: &NudgeKind) -> String {
+    match kind {
+        NudgeKind::SoftCap { max_iterations } => format!(
+            "You've reached the maximum of {max_iterations} tool calls for this turn. \
+             Without using any more tools, briefly summarize what you found, what's still \
+             unresolved, and suggest a clear next step. If the user wants you to keep \
+             going from here, they can type `/continue` to extend this turn with a fresh \
+             tool-call budget."
+        ),
+        NudgeKind::LoopDetected { tool_name, repeats } => format!(
+            "The same tool call (`{tool_name}`) returned the same result {repeats} times in a row. \
+             You're stuck in a loop. Without using any more tools, briefly explain \
+             what's blocking you and suggest one concrete next step the user can \
+             take. Do not retry the same call."
+        ),
+    }
+}
+
+/// True when a stored user row was added by `force_final_summary`'s nudge push
+/// (soft-cap or loop detector). Used by the channel store site to drop that
+/// row from `to_store` for `MemoryView::All` chats, so a future turn's prompt
+/// never sees a runtime line it can parrot back. The check is structural
+/// rather than a literal-equality with `nudge_text` because `max_iterations`,
+/// `tool_name`, and `repeats` vary per turn.
+pub(crate) fn is_nudge_text(content: &str) -> bool {
+    content.starts_with("You've reached the maximum of ")
+        && content.contains("tool calls for this turn.")
+        || content.starts_with("The same tool call (`")
+            && content.contains(") returned the same result ")
+            && content.contains(" times in a row.")
+}
+
 /// an empty response.
 #[allow(clippy::too_many_arguments)]
 async fn force_final_summary(

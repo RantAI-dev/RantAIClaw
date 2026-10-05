@@ -74,6 +74,26 @@ pub(crate) fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
 
+/// True when the assistant row carries a tool-call request that any following
+/// `tool` row or `[Tool results]` user row is allowed to attach to. Two shapes
+/// are written today:
+///
+/// - XML (`XmlToolDispatcher::to_provider_messages`): the assistant row is the
+///   raw response text, with one or more `<tool_call>...</tool_call>` blocks
+///   embedded inline.
+/// - Native (`NativeToolDispatcher::to_provider_messages`): the assistant row
+///   is `{"content": ..., "tool_calls": [...]}` as a string. The `tool_calls`
+///   key is the marker we look for.
+///
+/// Plain assistant prose (the recorded reply after tool execution) carries
+/// neither marker, and a `tool` row that follows it has no matching call.
+pub(crate) fn is_tool_call_carrier(content: &str) -> bool {
+    if content.contains("<tool_call>") {
+        return true;
+    }
+    content.contains("\"tool_calls\"")
+}
+
 pub(crate) fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized: Vec<ChatMessage> = Vec::with_capacity(turns.len());
     let mut has_any_user = false;
@@ -95,9 +115,26 @@ pub(crate) fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<Cha
             // entry in the structured history flattens to a `ChatMessage::tool`
             // by `NativeToolDispatcher::to_provider_messages`, and the channel
             // door stores that as its own turn so the next turn's provider sees
-            // the result. Pass it through untouched; pairing is the provider's
-            // concern, not the cache's.
+            // the result. The provider, however, only knows what to do with a
+            // `tool` row when its immediately-preceding row is an assistant
+            // tool-call carrier row (the row whose content contains
+            // `<tool_call>` for XML, or `{"content":...,"tool_calls":...}`
+            // for native). Anything else means the call row was dropped or
+            // never landed, and the result row is an orphan — hand the next
+            // turn's provider a result with no matching call and the model is
+            // reading a stray value out of context. Drop it here, the same way
+            // we drop an unexpected role above, so the cache stays well-formed.
             "tool" => {
+                let attached_to_call = normalized
+                    .last()
+                    .map(|t| t.role == "assistant" && is_tool_call_carrier(&t.content))
+                    .unwrap_or(false);
+                if !attached_to_call {
+                    tracing::debug!(
+                        "dropping orphan tool turn with no preceding tool-call carrier"
+                    );
+                    continue;
+                }
                 normalized.push(turn);
             }
             "assistant" => {
@@ -722,10 +759,12 @@ impl DeliveryFailure {
     /// What history records, given the reply this turn would have recorded.
     ///
     /// The model's next turn has to work from what the person actually read, so a
-    /// half-delivered reply keeps that text — the `[Used tools: …]` summary
-    /// included, since it is the model's own bookkeeping — with the markers
-    /// removed and a note added. The blanket marker stays for a reply that never
-    /// left.
+    /// half-delivered reply keeps that text (already cleaned of `[Used tools: …]`
+    /// labels and any runtime net lines by the time it reaches here — `recorded`
+    /// is `reply_for_history`, captured before any runtime net line was appended).
+    /// The blanket marker stays for a reply that never left; for one that landed
+    /// its text but lost an attachment, the text is kept and the delivery note is
+    /// appended so the next turn knows what the user did and did not see.
     pub(crate) fn history_entry(&self, recorded: &str) -> String {
         match self {
             Self::NothingSent { .. } => UNDELIVERED_TURN_MARKER.to_string(),
@@ -1357,6 +1396,14 @@ pub(crate) async fn process_channel_message(
                 sanitized_response
             };
 
+            // The reply the model will see stored against its turn must be the
+            // model's actual answer. `NO_TOOL_RUN_NOTICE` is a line the runtime
+            // writes for the reader, not for the cache — append it to the
+            // delivered string AFTER `reply_for_history` is captured, so a
+            // future turn's prompt never finds it and parrots it back as its
+            // own line.
+            let reply_for_history = clean_delivered_reply(&delivered_response);
+
             // The runtime no longer writes `[Used tools: …]` labels of its own
             // into replies. Anything the model wrote in that shape is by
             // definition a forgery, and a forged label on a turn where the
@@ -1373,16 +1420,12 @@ pub(crate) async fn process_channel_message(
                 delivered_response.push_str(NO_TOOL_RUN_NOTICE);
             }
 
-            // Deliver the model's answer only: history stores the dispatcher's
-            // structured form (tool call / tool result / final assistant), not
-            // a prose summary, so the model never sees a pattern it can copy.
-            // `clean_delivered_reply` is the defensive strip in case sanitize
-            // missed something.
-            let reply_for_history = clean_delivered_reply(&delivered_response);
-            // Say what the turn stored. The line is added only to the reply
-            // the user reads; history keeps `reply_for_history` so the model
-            // never sees a `Noted:` line to imitate.
-            let reply_for_user = with_noted_line(reply_for_history.clone(), &saved_notes);
+            // `reply_for_user` is built from `delivered_response` (which now
+            // carries the runtime net line, when one was needed), not from
+            // `reply_for_history`. The reader still sees the net line; the
+            // cache does not.
+            let reply_for_user =
+                with_noted_line(clean_delivered_reply(&delivered_response), &saved_notes);
             // An attachment marker is uploaded with no tool call, so the guest
             // gate never sees it. A guest's reply is filtered here, before either
             // send path below.
@@ -1472,12 +1515,43 @@ pub(crate) async fn process_channel_message(
             // delivery did not land). The runtime no longer prepends a prose
             // `[Used tools: …]` summary, so the model can no longer copy that
             // pattern to fake tool work.
-            let new_turns = history[history_len_before_tools..].to_vec();
-            let mut to_store = new_turns;
-            if let Some(last) = to_store.last_mut() {
-                *last = ChatMessage::assistant(recorded);
+            //
+            // A chat whose turns can come from more than one sender — anything
+            // that is not a named owner in a platform-direct chat — stores
+            // only the final assistant row. The user row was already stored at
+            // the start of the turn, and tool call/result rows would let one
+            // sender's tool output reach the next sender's prompt in the same
+            // chat (the history key is the chat, not the sender). An owner in a
+            // direct chat keeps the structured form so the model can carry its
+            // own tool work across turns. The view that picks this rule is the
+            // same `memory_view` set earlier in this function; do not re-derive
+            // it here.
+            if matches!(memory_view, MemoryView::All) {
+                let new_turns = history[history_len_before_tools..].to_vec();
+                let mut to_store = new_turns;
+                // Drop any user row whose content is a runtime nudge. The
+                // push site (`agent::loop_::force_final_summary`) is the same
+                // shape we filter here via `loop_::nudge_text`, so the two
+                // stay in lock-step: if the runtime writes the line, the
+                // store site drops it before it can reach the next turn's
+                // prompt.
+                to_store.retain(|turn| {
+                    if turn.role != "user" {
+                        return true;
+                    }
+                    !crate::agent::loop_::is_nudge_text(&turn.content)
+                });
+                if let Some(last) = to_store.last_mut() {
+                    *last = ChatMessage::assistant(recorded);
+                }
+                history::append_sender_turns(ctx.as_ref(), &history_key, &to_store);
+            } else {
+                history::append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(recorded),
+                );
             }
-            history::append_sender_turns(ctx.as_ref(), &history_key, &to_store);
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()

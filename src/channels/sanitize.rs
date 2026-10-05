@@ -7,6 +7,7 @@
 //! The tool-call half moved out of `mod.rs` verbatim in plan 121, row 2, and is
 //! still that same text.
 
+use crate::channels::dispatch::NO_TOOL_RUN_NOTICE;
 use crate::tools::Tool;
 use std::collections::HashSet;
 
@@ -30,9 +31,12 @@ pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>])
 
 /// Remove every `[Used tools: …]` label the model typed, and count them.
 ///
-/// `[Used tools: …]` is the runtime's own vocabulary. It is built from the tools
-/// that actually ran and added to the **history** entry, never to the delivered
-/// reply, so a label inside a reply is by definition one the model wrote itself.
+/// `[Used tools: …]` was the runtime's vocabulary for labelling which tools
+/// ran on a turn; the runtime no longer writes this shape into either the
+/// delivered reply or stored history (see `history_store::load_all` for the
+/// load-time strip on rows persisted by older builds). A label that still
+/// appears inside a reply is therefore one the model typed itself, and we
+/// strip it for the same reason we strip the runtime's bookkeeping notes.
 ///
 /// F-24, 2026-09-12: two Telegram replies carried one with no tool call in the
 /// turn at all, at 06:38:11 and 12:20:14. The second sat above an invented
@@ -93,6 +97,7 @@ fn strip_internal_history_notes(message: &str) -> String {
         super::INTERRUPTED_TURN_MARKER,
         super::TIMED_OUT_TURN_MARKER,
         super::FAILED_TURN_MARKER,
+        NO_TOOL_RUN_NOTICE,
     ] {
         cleaned = cleaned.replace(note, "");
     }

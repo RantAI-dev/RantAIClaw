@@ -131,12 +131,26 @@ impl ChannelHistoryStore {
     /// rather than aborting the whole load, so one corrupt row can't wipe the
     /// rest of the live state.
     ///
-    /// Each loaded assistant turn is walked for `[Used tools: …]` labels the
-    /// runtime used to write there. The runtime no longer writes them, but a
-    /// row persisted by an older build carries them — and the next turn's
-    /// provider would read them straight back as a pattern to copy. Strip them
-    /// on load so a daemon upgrade doesn't ship stale forgery patterns into the
-    /// model.
+    /// Each loaded turn is walked for shapes the runtime used to leave in
+    /// persisted history but no longer does:
+    ///
+    /// - the runtime's own `[Used tools: …]` label on an assistant turn — a
+    ///   pattern the next turn's provider would read straight back as a way
+    ///   to fake tool work;
+    /// - native `role = "tool"` rows, assistant tool-call carrier rows
+    ///   (XML `<tool_call>` or native JSON with `"tool_calls":`), and XML
+    ///   `[Tool results]` user rows — rows that, in a shared chat, belong to
+    ///   another sender's turn and would leak one sender's tool output into
+    ///   the next sender's prompt.
+    ///
+    /// Stripping happens at load so a daemon upgrade doesn't ship stale
+    /// forgery patterns or cross-sender leaks into the live cache. The strip is
+    /// keyed on the row shape, not the chat kind, so it fires for an owner's
+    /// direct chat too: a persisted key is a chat, and nothing in it records
+    /// whether that chat was shared or direct. That is accepted because only
+    /// unreleased builds ever wrote these rows — an owner's DM loses its own
+    /// pre-fix structured tool rows on restart, the documented cost of not
+    /// being able to tell a shared chat from a DM in a persisted row.
     pub fn load_all(&self) -> anyhow::Result<HashMap<String, Vec<ChatMessage>>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT history_key, turns_json FROM channel_history")?;
@@ -153,11 +167,41 @@ impl ChannelHistoryStore {
                 Ok(turns) => {
                     let cleaned: Vec<ChatMessage> = turns
                         .into_iter()
-                        .map(|mut turn| {
+                        .filter_map(|mut turn| {
+                            if turn.role == "tool" {
+                                // Native tool result from an older build that
+                                // stored structured rows. The provider expects
+                                // its preceding call row to be present too;
+                                // without that pairing, the row is unsafe to
+                                // ship forward.
+                                return None;
+                            }
+                            if turn.role == "assistant"
+                                && crate::channels::dispatch::is_tool_call_carrier(&turn.content)
+                            {
+                                // XML `<tool_call>…</tool_call>` carrier or
+                                // native `{"content":...,"tool_calls":...}`
+                                // carrier. The runtime only stores one of
+                                // these in an `All`-chat owner-DM; on every
+                                // other path a carrier that survived a restart
+                                // is a row from a previous shape.
+                                return None;
+                            }
+                            if turn.role == "user"
+                                && (turn.content.starts_with("[Tool results]")
+                                    || turn.content.starts_with("[Tool Results]"))
+                            {
+                                // XML `[Tool results]` carrier — the dispatcher
+                                // flattens `ToolResults` into a single `user`
+                                // row in the XML path. Surviving a restart, it
+                                // needs its call row to make sense, and that
+                                // row was already filtered above.
+                                return None;
+                            }
                             if turn.role == "assistant" {
                                 turn.content = strip_legacy_tool_label(&turn.content);
                             }
-                            turn
+                            Some(turn)
                         })
                         .collect();
                     out.insert(key, cleaned);
@@ -415,6 +459,89 @@ mod tests {
         assert!(
             turns[1].content.contains("Saved your note."),
             "the reply text survives the strip: {turns:?}"
+        );
+    }
+
+    /// Rows persisted by older builds hold the structured tool-call and tool-
+    /// result shapes the dispatcher used to write: a native `role = "tool"`
+    /// row, an XML `[Tool results]` user row, and assistant tool-call carrier
+    /// rows in either XML or native JSON form. Loading them through the
+    /// runtime's store and then driving a fresh turn would hand the next
+    /// turn's provider a transcript whose tool output a different sender
+    /// could read in a shared chat. Drop them on load so an upgrade starts
+    /// clean.
+    #[test]
+    fn load_all_strips_legacy_tool_rows_and_carriers() {
+        let tmp = TempDir::new().unwrap();
+        let store = ChannelHistoryStore::open(tmp.path()).unwrap();
+        let native_tool_row = serde_json::json!({
+            "tool_call_id": "call-x",
+            "content": "owner-only body",
+        })
+        .to_string();
+        store
+            .save(
+                "telegram:chat-shared",
+                &[
+                    ChatMessage::user("q1"),
+                    ChatMessage::assistant("<tool_call>{\"name\":\"x\"}</tool_call>"),
+                    ChatMessage::tool(native_tool_row),
+                    ChatMessage::assistant("reply"),
+                    ChatMessage::user(
+                        "[Tool results]\n<tool_result name=\"x\">\nfoo\n</tool_result>",
+                    ),
+                ],
+            )
+            .unwrap();
+        store
+            .save(
+                "telegram:chat-dm",
+                &[
+                    ChatMessage::user("q2"),
+                    ChatMessage::assistant(
+                        "{\"content\":\"\",\"tool_calls\":[{\"name\":\"y\"}]}".to_string(),
+                    ),
+                    ChatMessage::tool(
+                        "{\"tool_call_id\":\"call-y\",\"content\":\"ok\"}".to_string(),
+                    ),
+                    ChatMessage::assistant("reply2"),
+                ],
+            )
+            .unwrap();
+
+        let loaded = store.load_all().unwrap();
+        let shared = loaded
+            .get("telegram:chat-shared")
+            .expect("shared chat history");
+        assert_eq!(
+            shared.len(),
+            2,
+            "user q1 and plain assistant reply survive; carrier + tool + XML results row are stripped: {shared:?}"
+        );
+        assert_eq!(shared[0].role, "user");
+        assert_eq!(shared[0].content, "q1");
+        assert_eq!(shared[1].role, "assistant");
+        assert_eq!(shared[1].content, "reply");
+        assert!(
+            !shared.iter().any(|t| t.content.contains("owner-only body")),
+            "the tool body must not survive a load: {shared:?}"
+        );
+        assert!(
+            !shared
+                .iter()
+                .any(|t| t.content.contains("<tool_call>") || t.content.contains("[Tool results]")),
+            "no carrier or results row survives a load: {shared:?}"
+        );
+        let dm = loaded.get("telegram:chat-dm").expect("dm chat history");
+        assert!(
+            dm.iter()
+                .all(|t| !t.content.contains("tool_calls") && !t.content.contains("call-y")),
+            "no native carrier or tool row survives: {dm:?}"
+        );
+        assert!(
+            dm.iter()
+                .any(|t| t.role == "assistant" && t.content == "reply2"),
+            "the plain prose assistant turn survives a load"
         );
     }
 }
