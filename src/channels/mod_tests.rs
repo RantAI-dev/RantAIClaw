@@ -7387,7 +7387,7 @@ async fn compact_drops_alias_carrier_and_results_together_when_oversize() {
 
     let alias = "<toolcall>";
     let carrier = format!("{alias}\n{{\"name\":\"x\",\"arguments\":{{}}}}\n</toolcall>");
-    let long_results: String = "[Tool results]\n".to_string() + &"x".repeat(5000);
+    let long_results: String = format!("[Tool results]\n{}", "x".repeat(5000));
 
     let mut turns = Vec::new();
     for i in 0..14 {
@@ -7464,7 +7464,7 @@ async fn compact_drops_glm_grammar_carrier_and_results_together_when_oversize() 
     let sender_key = "compact-test:chat-glm-oversize";
 
     let carrier = "shell/command>ls -la";
-    let long_results: String = "[Tool results]\n".to_string() + &"x".repeat(5000);
+    let long_results: String = format!("[Tool results]\n{}", "x".repeat(5000));
 
     let mut turns = Vec::new();
     for i in 0..14 {
@@ -7551,7 +7551,7 @@ async fn compact_drops_glm_json_form_carrier_and_results_together_when_oversize(
     let sender_key = "compact-test:chat-glm-json-oversize";
 
     let carrier = r#"shell/{"command":"ls -la"}"#;
-    let long_results: String = "[Tool results]\n".to_string() + &"x".repeat(5000);
+    let long_results: String = format!("[Tool results]\n{}", "x".repeat(5000));
 
     let mut turns = Vec::new();
     for i in 0..14 {
