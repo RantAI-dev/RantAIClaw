@@ -1801,17 +1801,25 @@ async fn main() -> Result<()> {
             provider,
             model,
             temperature,
-        }) => Box::pin(agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature,
-            "cli",
-            false,
-        ))
-        .await
-        .map(|_| ()),
+        }) => {
+            // The REPL else-branch reads from this; the single-shot branch
+            // never touches it. `tokio::io::stdin()` wrapped in a `BufReader`
+            // is `AsyncBufRead + Unpin + Send`, so the future carrying it can
+            // run on the multi-threaded runtime.
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            Box::pin(agent::run(
+                config,
+                message,
+                provider,
+                model,
+                temperature,
+                "cli",
+                false,
+                &mut stdin,
+            ))
+            .await
+            .map(|_| ())
+        }
 
         Some(Commands::Gateway { port, host }) => {
             let port = port.unwrap_or(config.gateway.port);
@@ -2207,6 +2215,10 @@ async fn main() -> Result<()> {
                     } else {
                         Some(tui_config.model.clone())
                     };
+                    // TUI one-shot path: `Some(msg)` reaches the single-shot
+                    // branch, so the REPL reader is unused. Any
+                    // `AsyncBufRead + Unpin + Send` works.
+                    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
                     let response = Box::pin(agent::loop_::run(
                         config.clone(),
                         Some(msg),
@@ -2217,6 +2229,7 @@ async fn main() -> Result<()> {
                         // The caller owns the print for this surface, so the
                         // loop must not print the reply too.
                         true,
+                        &mut stdin,
                     ))
                     .await?;
                     if !response.is_empty() {

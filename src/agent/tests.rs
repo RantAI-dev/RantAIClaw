@@ -812,7 +812,11 @@ async fn headless_door_does_not_write_a_memory_row() {
         .scope(crate::memory::MemoryView::All, async {
             // `agent::run` is a large future; box it once to keep this test
             // future off the poll-loop stack (clippy::large_futures), mirroring
-            // the cron scheduler and the existing door tests.
+            // the cron scheduler and the existing door tests. The headless
+            // path always passes `Some(message)`, so the REPL branch never
+            // reads from the reader; `tokio::io::BufReader::new(tokio::io::stdin())`
+            // is the safe default since this is a `Send` future.
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
             let reply = Box::pin(crate::agent::run(
                 fixture.config.clone(),
                 Some("hi from headless".to_string()),
@@ -823,6 +827,7 @@ async fn headless_door_does_not_write_a_memory_row() {
                 // The CLI single-shot path: stdout is the operator's
                 // terminal and the wrapper `println!`s the reply.
                 false,
+                &mut stdin,
             ))
             .await
             .expect("the headless turn runs against the local server");
@@ -838,9 +843,11 @@ async fn headless_door_does_not_write_a_memory_row() {
     );
 }
 
-/// The interactive REPL door drives the same future as the headless one,
-/// but through `Agent::turn` rather than the full `agent::run` wrapper
-/// (no session store, no observer bootstrap, no stdout print). The
+/// The console/TUI door drives a turn through `Agent::turn`, which the
+/// console route (`src/gateway/api_v1.rs:717`) reaches when an operator
+/// sends a message from the web UI. The headless door in the sibling test
+/// covers the `agent -m` path that builds a full `agent::run` wrapper;
+/// this test covers the in-process turn the API and the TUI send. The
 /// invariant is the same: a row enters the table only when someone
 /// asked. The two tests together cover the two surfaces the operator
 /// can reach directly from a terminal.
@@ -848,7 +855,7 @@ async fn headless_door_does_not_write_a_memory_row() {
 /// Replaces `agent::loop_::tests::repl_writer_is_removed`, which had the
 /// same source-pinning flaw as its headless sibling.
 #[tokio::test]
-async fn repl_door_does_not_write_a_memory_row() {
+async fn agent_turn_door_does_not_write_a_memory_row() {
     let (mem, _tmp) = make_sqlite_memory();
     let count_before = mem.count().await.unwrap();
     let provider = Box::new(ScriptedProvider::new(vec![text_response("done")]));
@@ -865,8 +872,63 @@ async fn repl_door_does_not_write_a_memory_row() {
 
     crate::memory::MEMORY_VIEW
         .scope(crate::memory::MemoryView::All, async {
-            let reply = agent.turn("hi from repl").await.unwrap();
+            let reply = agent.turn("hi from console").await.unwrap();
             assert_eq!(reply, "done");
+        })
+        .await;
+
+    let count_after = mem.count().await.unwrap();
+    assert_eq!(
+        count_before, count_after,
+        "the console/TUI turn must not change the memories table \
+             (before={count_before}, after={count_after})"
+    );
+}
+
+/// The stdin REPL door is the REPL else-branch of `run_with_scope`: when
+/// no message is passed on the command line, the loop reads from the
+/// injected reader, runs each line through
+/// `run_tool_call_loop`, prints the reply, and breaks on `/quit`. Driving
+/// it under test needs an injected `AsyncBufRead` so a single scripted
+/// buffer can run one turn then break — the production caller passes
+/// `tokio::io::stdin()` wrapped in a `BufReader`, which would block
+/// forever on an empty stdin in a test. The invariant is the same as the
+/// headless and agent-turn doors: a row enters the table only when
+/// someone asked.
+#[tokio::test]
+async fn repl_door_does_not_write_a_memory_row() {
+    let fixture = super::door_test_support::DoorFixture::start().await;
+    let mem = crate::memory::SqliteMemory::new(&fixture.workspace).unwrap();
+    let count_before = mem.count().await.unwrap();
+
+    // Scripted input: one turn then `/quit` so the loop exits cleanly.
+    let mut reader =
+        tokio::io::BufReader::new(std::io::Cursor::new(b"hi from repl\n/quit\n".to_vec()));
+
+    crate::memory::MEMORY_VIEW
+        .scope(crate::memory::MemoryView::All, async {
+            // `message = None` reaches the REPL else-branch. The reader is
+            // the only thing that lets the loop make progress; the future
+            // is boxed because `agent::run` is large.
+            let reply = Box::pin(crate::agent::run(
+                fixture.config.clone(),
+                None,
+                None,
+                None,
+                0.0,
+                "cli",
+                // REPL path prints the reply to the operator's terminal on
+                // every turn. The stdout noise is fine here; the assertion
+                // is on memory.
+                false,
+                &mut reader,
+            ))
+            .await
+            .expect("the REPL turn runs against the local server");
+            assert_eq!(
+                reply, "Done.",
+                "the last reply the REPL saw is the one returned: {reply}"
+            );
         })
         .await;
 

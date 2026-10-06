@@ -11,11 +11,12 @@
 //! three are idempotent so a double-run produces the same string.
 //!
 //! **Known limit.** Neither secret scrubber catches a secret written as a
-//! plain sentence ("here is my token: mysecretvalue123"). Both rely on shape
-//! — a prefix list and a `key=value` pattern — and `mysecretvalue123` carries
-//! neither. This is the limit the operator-facing copy states plainly; a
-//! general natural-language scrubber would be a different and far larger
-//! change.
+//! plain sentence ("the token string is abcdefghijklmno"). Both rely on
+//! shape — a prefix list and a `key=value` pattern — and the prose form
+//! carries neither. `Authorization: Bearer …` headers, bot tokens whose
+//! prefix is not on `scrub_secret_patterns`'s list, and JWTs are not caught.
+//! This is the limit the operator-facing copy states plainly; a general
+//! natural-language scrubber would be a different and far larger change.
 
 use crate::agent::loop_::scrub_credentials;
 use crate::providers::scrub_secret_patterns;
@@ -23,15 +24,17 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Match any of the five marker kinds followed by a body that opens with
-/// `data:` (a base64 data URI). The non-greedy `.+?` plus the explicit `]`
-/// stop at the first closing bracket on the same marker, so a nested bracket
-/// in the body would only confuse the parser in pathological cases (none of
-/// the live marker kinds accept one in practice).
+/// `data:` (a base64 data URI). The `[^\]\n]+` body class stops at the
+/// first closing bracket *or* the first newline — a marker that opens with
+/// `data:` and never closes on its line is left alone, because the only way a
+/// channel parser could give us back a path that lives on the next line is
+/// through a marker it could not close, and that path is what the model
+/// already saw.
 ///
 /// Captures the kind tag (`IMAGE`, `DOCUMENT`, `VIDEO`, `AUDIO`, `VOICE`)
 /// without the trailing colon, so the replacement can rebuild the marker.
 static PAYLOAD_MARKER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?P<open>\[(?:IMAGE|DOCUMENT|VIDEO|AUDIO|VOICE):)data:[^\]]+\]").unwrap()
+    Regex::new(r"(?P<open>\[(?:IMAGE|DOCUMENT|VIDEO|AUDIO|VOICE):)data:[^\]\n]+\]").unwrap()
 });
 
 /// Run both secret scrubbers on `input` and replace any attachment marker
@@ -52,10 +55,10 @@ pub fn scrub_channel_message(input: &str) -> String {
 /// they can look at the channel history for the file.
 ///
 /// Path-only markers (`[IMAGE:/w/foo.png]`, `[DOCUMENT:notes/menu.txt]`) are
-/// kept verbatim: a path is not a payload. The body of a marker that has no
-/// closing `]` on the same line is also left alone — the channel parser is
-/// the only thing that recovers those, and the recovered text is a path the
-/// model already saw.
+/// kept verbatim: a path is not a payload. The body of a marker that opens
+/// with `data:` but has no closing `]` before the next line is also left
+/// alone — the channel parser is the only thing that recovers those, and
+/// the recovered text is a path the model already saw.
 fn redact_media_payloads(input: &str) -> String {
     PAYLOAD_MARKER_REGEX
         .replace_all(input, |caps: &regex::Captures<'_>| {
@@ -153,5 +156,48 @@ mod tests {
                 "{kind} placeholder must name the kind: {out}"
             );
         }
+    }
+
+    /// Pin test for the docs (`docs/reference/channels.md` and the module
+    /// doc above): a plain sentence that mentions a key like `token` but
+    /// uses prose instead of a `key: value` shape is left untouched. The
+    /// regex requires the separator `[:=]` between key and value, so a
+    /// value attached by prose (`is`, `was`, `equals`) does not match. The
+    /// prose example must stay unredacted: it is the docs' illustration of
+    /// a sentence the scrubber is not meant to catch.
+    #[test]
+    fn scrub_channel_message_leaves_a_prose_token_unchanged() {
+        // No `:` or `=` between the key and the value, so the regex skips it.
+        let msg = "the token string is abcdefghijklmno";
+        let out = scrub_channel_message(msg);
+        assert_eq!(
+            out, msg,
+            "a prose sentence with no key:value separator must not be redacted: {out}"
+        );
+        assert!(
+            !out.contains("REDACTED"),
+            "the doc example must remain unredacted: {out}"
+        );
+    }
+
+    /// An unclosed attachment marker on one line, followed by another marker
+    /// shape later in the same input, must not be matched across the newline:
+    /// the regex stops at the first line break. Without that, an
+    /// `[IMAGE:data:abc\ntext [note] more` would consume the second marker as
+    /// part of the payload and rewrite the model-visible text. The recorded
+    /// path keeps the unclosed fragment; the channel parser is the only
+    /// thing that recovers the original path.
+    #[test]
+    fn scrub_channel_message_leaves_an_unclosed_marker_on_one_line_alone() {
+        let msg = "[IMAGE:data:abc\ntext [note] more";
+        let out = scrub_channel_message(msg);
+        assert_eq!(
+            out, msg,
+            "an unclosed marker followed by a newline must not cross lines: {out}"
+        );
+        assert!(
+            !out.contains("payload withheld"),
+            "the unclosed marker must not be rewritten: {out}"
+        );
     }
 }

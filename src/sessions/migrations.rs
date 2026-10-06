@@ -129,10 +129,11 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
     )?;
 
     tx.execute("DELETE FROM schema_version", [])?;
-    tx.execute(
-        "INSERT INTO schema_version (version) VALUES (?1)",
-        [CURRENT_VERSION],
-    )?;
+    // Stamp the literal 2 so a later v3 cannot accidentally push the row to
+    // its own value before the v3 changes have run. `CURRENT_VERSION` is the
+    // current head; the per-migration stamp must always be the version that
+    // migration introduces.
+    tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [2])?;
 
     tx.commit()?;
     Ok(())

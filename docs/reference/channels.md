@@ -353,13 +353,19 @@ How it lands in the store:
   run before the row is written. `scrub_secret_patterns` replaces tokens that
   start with `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`, `ghu_` or `github_pat_`
   with `[REDACTED]`. `scrub_credentials` redacts `key=value` lines whose key
-  is one of `token`, `api_key`, `api-key`, `password`, `secret`, `user_key`,
-  `bearer`, `credential` and whose value is eight or more characters long. A
-  secret written as a plain sentence ("here is my token: mysecretvalue123")
-  is not recognised by either scrubber. Inbound attachments whose marker
-  body is a base64 data URI (`[IMAGE:data:image/png;base64,…]`) are recorded
-  as `[IMAGE:payload withheld]`, so the image does not sit on disk for
-  thirty days.
+  matches one of `token`, `api_key`, `api-key`, `password`, `secret`,
+  `user_key`, `user-key`, `bearer`, `credential` (matched as a substring, so
+  `mytoken` and `apikey` are also keys) and whose separator is `:` or `=`,
+  with a value eight or more characters long; the first four characters of
+  the value stay in the stored row. A secret written as a plain sentence
+  that does not use `:` or `=` as the separator ("the token string is
+  abcdefghijklmno") is not recognised by either scrubber.
+  `Authorization: Bearer …` headers, bot tokens whose prefix is not on the
+  scrubber's list, and JWTs are not caught by either scrubber. Inbound
+  attachments whose marker body is a base64 data URI
+  (`[IMAGE:data:image/png;base64,…]`) are recorded as
+  `[IMAGE:payload withheld]`, so the image does not sit on disk for thirty
+  days.
 - Retention: channel sessions are pruned 30 days after the last turn. The
   daily prune runs alongside the channel runtime and one extra time at
   startup so a long-down daemon catches up immediately on restart.

@@ -10,6 +10,10 @@ use super::door_test_support::DoorFixture;
 async fn the_cli_door_reads_all_of_memory() {
     let fixture = DoorFixture::start().await;
 
+    // The CLI single-shot path always passes `Some(message)`, so the REPL
+    // branch never reads from this; any `AsyncBufRead + Unpin + Send`
+    // satisfies the parameter.
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let reply = Box::pin(crate::agent::run(
         fixture.config.clone(),
         Some("what about the lantern".to_string()),
@@ -18,6 +22,7 @@ async fn the_cli_door_reads_all_of_memory() {
         0.0,
         "cli",
         true,
+        &mut stdin,
     ))
     .await
     .expect("the CLI turn runs against the local server");
