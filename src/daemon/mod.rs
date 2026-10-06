@@ -635,6 +635,11 @@ async fn run_heartbeat_worker(
             // Box the agent future: `crate::agent::run` is a large future and
             // boxing it keeps the enclosing heartbeat loop off the poll-loop
             // stack (clippy::large_futures), mirroring the cron scheduler.
+            // Heartbeat always passes `Some(prompt)`, so the REPL branch is
+            // never reached; the reader is unused. `tokio::io::BufReader::new
+            // (tokio::io::stdin())` is `AsyncBufRead + Unpin + Send`, so the
+            // future carrying it can run on the multi-threaded runtime.
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
             if let Err(e) = Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
@@ -646,6 +651,7 @@ async fn run_heartbeat_worker(
                 // journal; the reply (if any) is logged through the
                 // observer, not printed.
                 true,
+                &mut stdin,
             ))
             .await
             {

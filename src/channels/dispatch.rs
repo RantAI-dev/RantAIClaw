@@ -2164,7 +2164,7 @@ fn record_channel_turn(
         Err(poisoned) => {
             tracing::warn!(
                 conversation_key = %conversation_key,
-                "channel session store lock poisoned; turn not recorded"
+                "channel session store lock poisoned; recovering by recording into the inner state"
             );
             // Recover by recording into the inner state — the lock guard's
             // `IntoInner` is the safe way.

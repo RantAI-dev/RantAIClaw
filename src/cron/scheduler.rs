@@ -533,6 +533,12 @@ async fn run_agent_job(
     // (execute_job_with_retry → execute_job_now/run_job_manual/
     // execute_and_persist_job). Boxing it once here keeps every enclosing future
     // off the poll-loop stack (clippy::large_futures).
+    // `tokio::io::BufReader::new(tokio::io::stdin())` is
+    // `AsyncBufRead + Unpin + Send`, so the future carrying it can run on
+    // the multi-threaded runtime. The scheduler always passes
+    // `Some(prefixed_prompt)`, so the REPL branch is never reached and the
+    // reader is unused.
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let run_result = Box::pin(crate::agent::run_with_scope(
         config.clone(),
         Some(prefixed_prompt),
@@ -547,6 +553,11 @@ async fn run_agent_job(
         // the reply reaches the operator through the delivery path and the run
         // record, never through `println!`.
         true,
+        // The scheduler always passes `Some(prefixed_prompt)`, so the REPL
+        // branch is never reached and the reader is unused. `stdin` is the
+        // safe default — any `AsyncBufRead + Unpin + Send` would satisfy
+        // the type.
+        &mut stdin,
     ))
     .await;
 

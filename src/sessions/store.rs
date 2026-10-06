@@ -380,8 +380,12 @@ impl SessionStore {
     ///
     /// Both statements run in one transaction. Separately, a failure on the
     /// `UPDATE` left the message stored with `message_count` never incremented
-    /// — and since the counter is only ever adjusted by `+1` here, the drift is
-    /// permanent: nothing recomputes it from the messages table.
+    /// — and since the counter is only ever adjusted by `+1` here, the drift
+    /// would be permanent: the per-row `+1` could not fix a session whose
+    /// count was already wrong. `prune_channel_sessions` re-counts the
+    /// surviving rows for the sessions it touches, which covers the case
+    /// where a row went away through pruning; no other path adjusts the
+    /// counter, so the per-row `+1` is the only way the append state changes.
     pub fn append_message(&self, msg: &Message) -> Result<i64> {
         // `unchecked_transaction` takes `&self`, so atomicity here does not
         // force `&mut` on every caller holding the store behind a shared ref.
@@ -674,9 +678,10 @@ impl SessionStore {
         }
     }
 
-    /// Remove every `source='channel'` session whose `started_at` is older
-    /// than `now - retention_secs`. Non-channel sessions are untouched. The
-    /// caller decides how often to run it (startup + once a day).
+    /// Drop the messages of `source='channel'` sessions whose `timestamp` is
+    /// older than `now - retention_secs`, and delete any session left empty
+    /// after the drop. Non-channel sessions are untouched. The caller decides
+    /// how often to run it (startup + once a day).
     ///
     /// Returns the number of sessions removed.
     pub fn prune_channel_sessions(&mut self, retention_secs: i64) -> Result<usize> {
@@ -689,7 +694,11 @@ impl SessionStore {
         // timestamp, not by `started_at`. A session whose only old messages
         // sit before the cutoff is left in place while its stale rows are
         // dropped; a session whose every message is old is empty afterwards
-        // and is deleted in the same transaction.
+        // and is deleted in the same transaction. The recount below keeps
+        // `sessions.message_count` consistent with the messages table in the
+        // same transaction — a kept session that lost half its history would
+        // otherwise keep the pre-prune count, and `SUM(message_count)` in
+        // `stats` would overstate the store.
         tx.execute(
             "DELETE FROM messages \
              WHERE timestamp < ?1 \
@@ -697,6 +706,17 @@ impl SessionStore {
                  SELECT id FROM sessions WHERE source = 'channel' \
              )",
             params![cutoff],
+        )?;
+        // Recount every kept channel session in one statement. The set is
+        // bounded by the number of channel sessions with surviving messages,
+        // not the number of messages, so the per-row subquery stays cheap.
+        tx.execute(
+            "UPDATE sessions \
+             SET message_count = ( \
+               SELECT COUNT(*) FROM messages m WHERE m.session_id = sessions.id \
+             ) \
+             WHERE source = 'channel'",
+            [],
         )?;
         let removed = tx.execute(
             "DELETE FROM sessions \
@@ -2041,8 +2061,11 @@ mod tests {
     /// A non-ASCII quoted secret (CJK characters in the value) does not panic
     /// the recorder. The value-pass scrub takes a fixed-byte prefix of the
     /// captured secret; a prefix that crosses a UTF-8 char boundary panics
-    /// inside `replace_all`'s closure and poisons the held store mutex, so the
-    /// next turn's record would fail too. A second turn must still record.
+    /// inside `replace_all`'s closure. The closure runs on the message text
+    /// inside the same transaction, before the `INSERT`, so a panic there
+    /// fails the `INSERT` and leaves the in-progress turn with no recorded
+    /// row, and a second turn must still record — a clean recorder answers
+    /// the next call normally.
     #[test]
     fn record_channel_turn_survives_a_non_ascii_quoted_secret() {
         let mut s = store();
@@ -2061,9 +2084,11 @@ mod tests {
             "the redaction marker must be present: {msgs:?}"
         );
 
-        // The poison case: a panic in the first call leaves the store mutex
-        // unusable, so the second call would surface a poison error. A clean
-        // recorder answers normally.
+        // The regression case: a panic in the first call's scrub closure would
+        // fail the `INSERT` for that turn. A clean recorder answers the next
+        // call normally — the store is not shared behind a `Mutex` here, so
+        // there is no poison state to recover from; the assertion just
+        // confirms the second call also runs end to end.
         let id2 = s
             .record_channel_turn("m", "telegram:chat-1", "second", "second-reply", None)
             .expect("the second turn must still record after a non-ASCII secret");
@@ -2219,6 +2244,51 @@ mod tests {
         assert!(s.get_session(&tui_id.id).unwrap().is_some());
     }
 
+    /// The source filter on the message `DELETE` matters: a TUI session
+    /// whose messages predate the cutoff must survive. The existing
+    /// `prune_channel_sessions_removes_only_source_channel_past_retention`
+    /// test backdates a TUI session with no messages, so dropping
+    /// `source = 'channel'` from the `DELETE FROM messages` clause failed no
+    /// assertion. This test seeds the TUI session with old rows and asserts
+    /// they are still there after the prune — a regression that drops the
+    /// source filter on the message `DELETE` would delete every TUI and API
+    /// message older than the cutoff, which is a real-world data-loss bug.
+    #[test]
+    fn prune_channel_sessions_keeps_old_messages_of_a_tui_session() {
+        let mut s = store();
+        let tui_id = s.new_session("m", "tui").unwrap();
+        // Seed two messages on the TUI session, backdated past the cutoff.
+        s.conn
+            .execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) \
+                 VALUES (?1, 'user', 'old tui user', ?2)",
+                params![&tui_id.id, 1_i64],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) \
+                 VALUES (?1, 'assistant', 'old tui reply', ?2)",
+                params![&tui_id.id, 1_i64],
+            )
+            .unwrap();
+
+        let removed = s.prune_channel_sessions(31_i64 * 24 * 60 * 60).unwrap();
+        assert_eq!(removed, 0, "no channel session was removed");
+
+        let msgs = s.get_messages(&tui_id.id).unwrap();
+        let contents: Vec<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            contents.contains(&"old tui user"),
+            "the TUI session's old user message must remain: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"old tui reply"),
+            "the TUI session's old reply message must remain: {contents:?}"
+        );
+        assert_eq!(msgs.len(), 2, "no TUI messages pruned");
+    }
+
     /// Retention counts from the last message, not from `started_at`. A chat
     /// that has been silent for thirty days keeps its fresh turn; only the
     /// messages older than the cutoff go, and the session survives with what
@@ -2279,6 +2349,57 @@ mod tests {
         assert!(
             !user_contents.contains(&"old user"),
             "the old user message must be pruned: {msgs:?}"
+        );
+    }
+
+    /// `prune_channel_sessions` keeps `sessions.message_count` consistent with
+    /// the rows actually left behind: a session that survives with only the
+    /// fresh half of its history must carry the fresh count, so the operator
+    /// list (`message_count` is what `list_sessions_*` renders) and
+    /// `SUM(message_count)` in `stats` agree with the messages table. Without
+    /// the in-transaction recount, the list and the stats keep the old count
+    /// and overstate the session; a test that only checked `get_messages`
+    /// would miss the drift.
+    #[test]
+    fn prune_channel_sessions_updates_message_count_for_kept_rows() {
+        let mut s = store();
+
+        let id = s
+            .record_channel_turn("m", "telegram:chat-1", "first user", "first reply", None)
+            .unwrap();
+        s.record_channel_turn("m", "telegram:chat-1", "second user", "second reply", None)
+            .unwrap();
+        // Two messages with `timestamp = 1` (old), two more at `now()` (fresh).
+        s.conn
+            .execute(
+                "UPDATE messages SET timestamp = 1 \
+                 WHERE session_id = ?1 AND content IN ('first user','first reply')",
+                params![id],
+            )
+            .unwrap();
+
+        let cutoff = 31_i64 * 24 * 60 * 60;
+        let removed = s.prune_channel_sessions(cutoff).unwrap();
+        assert_eq!(removed, 0, "the session keeps its fresh messages");
+
+        let sess = s.get_session(&id).unwrap().unwrap();
+        assert_eq!(
+            sess.message_count, 2,
+            "the kept session must report 2 messages (the fresh user + fresh reply); got {}",
+            sess.message_count
+        );
+
+        let stat_msgs: i64 = s
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(message_count), 0) FROM sessions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stat_msgs, 2,
+            "stats SUM(message_count) must reflect the pruned count, not the pre-prune 4"
         );
     }
 
@@ -2473,6 +2594,43 @@ mod tests {
         assert!(
             hits[0].content.contains("fox"),
             "the matching word is the hit: {hits:?}"
+        );
+    }
+
+    /// `search_any_word_with_conversation(Some(key))` is the any-word fallback
+    /// the tool uses under a scoped view: a row from another conversation
+    /// must be invisible even when it carries one of the query tokens, because
+    /// the FTS query and the conversation filter are both applied together.
+    /// The all-words twin (`search_with_conversation`) has the same test
+    /// (`search_with_conversation_some_returns_only_rows_of_given_key`); this
+    /// test pins the same invariant on the OR-joined any-word statement, so a
+    /// regression that drops `AND s.conversation_key = ?2` from that branch
+    /// fires here.
+    #[test]
+    fn search_any_word_with_conversation_some_returns_only_rows_of_given_key() {
+        let mut s = store();
+
+        let other = s
+            .record_channel_turn("m", "telegram:chat-1", "matching word", "r", None)
+            .unwrap();
+        let mine = s
+            .record_channel_turn("m", "telegram:chat-2", "matching word", "r", None)
+            .unwrap();
+
+        // A query that includes "matching" only. The scoped search must
+        // surface the row whose conversation_key is chat-2 and nothing else.
+        let scoped = s
+            .search_any_word_with_conversation("matching", 10, Some("telegram:chat-2"))
+            .unwrap();
+        let session_ids: Vec<&str> = scoped.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(
+            session_ids,
+            vec![mine.as_str()],
+            "only the matching conversation key surfaces, the other is filtered: got {session_ids:?}"
+        );
+        assert!(
+            !session_ids.contains(&other.as_str()),
+            "the other conversation key is invisible: got {session_ids:?}"
         );
     }
 }

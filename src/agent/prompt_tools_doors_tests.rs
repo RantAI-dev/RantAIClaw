@@ -12,6 +12,10 @@ use super::door_test_support::{assert_prompt_lists, held_by, registry_for, DoorF
 async fn the_cli_door_lists_the_registry_tools_with_their_own_descriptions() {
     let fixture = DoorFixture::start().await;
 
+    // The CLI single-shot path always passes `Some(message)`, so the REPL
+    // branch never reads from this; any `AsyncBufRead + Unpin + Send`
+    // satisfies the parameter.
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     Box::pin(crate::agent::run(
         fixture.config.clone(),
         Some("hello".to_string()),
@@ -20,6 +24,7 @@ async fn the_cli_door_lists_the_registry_tools_with_their_own_descriptions() {
         0.0,
         "cli",
         true,
+        &mut stdin,
     ))
     .await
     .expect("the CLI turn runs against the local server");

@@ -18,6 +18,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+use tokio::io::AsyncBufReadExt as _;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -2433,6 +2434,17 @@ pub async fn run_with_scope(
     // heartbeat reply is private to the operator; it must travel through the
     // delivery path and the run record, never through `println!`.
     silent: bool,
+    // The interactive REPL (`message = None` else-branch) reads lines from
+    // this async reader. Production passes `tokio::io::stdin()` wrapped in
+    // `tokio::io::BufReader` (which is `AsyncBufRead`) so the loop reads
+    // from the operator's terminal; the no-write REPL test passes a
+    // `tokio::io::BufReader<Cursor<Vec<u8>>>` so a single scripted buffer
+    // drives one turn then a `/quit`. The parameter is only read on the REPL
+    // path, so single-shot and unattended callers can pass a dummy reader
+    // without effect. Async so a TTY read never blocks a runtime worker
+    // thread; the `+ Send` bound is separate — the boxed cron and daemon
+    // futures require it.
+    reader: &mut (dyn tokio::io::AsyncBufRead + Unpin + Send),
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let observer: Arc<dyn Observer> = observer
@@ -2706,7 +2718,7 @@ pub async fn run_with_scope(
             let _ = std::io::stdout().flush();
 
             let mut input = String::new();
-            match std::io::stdin().read_line(&mut input) {
+            match reader.read_line(&mut input).await {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(e) => {
@@ -2737,7 +2749,7 @@ pub async fn run_with_scope(
                     let _ = std::io::stdout().flush();
 
                     let mut confirm = String::new();
-                    if std::io::stdin().read_line(&mut confirm).is_err() {
+                    if reader.read_line(&mut confirm).await.is_err() {
                         continue;
                     }
                     if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
@@ -2861,6 +2873,12 @@ pub async fn run(
     // model text. Pass `false` from a CLI single-shot (pipeable); pass `true`
     // from any unattended caller whose stdout is the systemd journal.
     silent: bool,
+    // The interactive REPL reads from this. Production passes
+    // `&mut tokio::io::stdin()`; tests pass a scripted
+    // `tokio::io::BufReader<Cursor<Vec<u8>>>` so the no-write invariant at
+    // the REPL door can be exercised without a TTY. Unused on every other
+    // path; any `AsyncBufRead + Unpin + Send` will do.
+    reader: &mut (dyn tokio::io::AsyncBufRead + Unpin + Send),
 ) -> Result<String> {
     run_with_scope(
         config,
@@ -2875,6 +2893,7 @@ pub async fn run(
         // drops them with the registry.
         None,
         silent,
+        reader,
     )
     .await
 }
@@ -4097,13 +4116,19 @@ mod tests {
         );
     }
 
-    /// Behaviour coverage for the no-write invariant lives at the agent door
-    /// in `agent::tests::headless_door_does_not_write_a_memory_row` and
-    /// `agent::tests::repl_door_does_not_write_a_memory_row`. The runtime
-    /// tests drive a real turn through `run_with_scope` / `Agent::turn` and
-    /// assert the row count is the same — a re-added `mem.store(...)` call in
-    /// the loop fires the test, which the older source-pinning guard missed
-    /// because the helper it grepped for had been retired.
+    /// Behaviour coverage for the no-write invariant lives at three doors.
+    /// `agent::tests::headless_door_does_not_write_a_memory_row` drives the
+    /// full `run_with_scope` wrapper that `agent -m` reaches;
+    /// `agent::tests::agent_turn_door_does_not_write_a_memory_row` drives
+    /// `Agent::turn` itself, which the console and TUI reach
+    /// (`src/gateway/api_v1.rs:717`); and
+    /// `agent::tests::repl_door_does_not_write_a_memory_row` drives the
+    /// REPL else-branch of `run_with_scope` through the injected `reader`
+    /// parameter, so a scripted buffer runs one turn then a `/quit`. Each
+    /// test asserts the row count is unchanged, so a re-added
+    /// `mem.store(...)` in any door fires its test — which the older
+    /// source-pinning guard missed because the helper it grepped for had
+    /// been retired.
 
     #[tokio::test]
     async fn injected_backend_overrides_non_cli_auto_deny() {
