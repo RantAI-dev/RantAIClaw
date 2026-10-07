@@ -39,7 +39,7 @@ use rantaiclaw::kb::axi::api;
 use rantaiclaw::kb::store::sqlite::SqliteStore;
 use rantaiclaw::kb::store::KbStore;
 use rantaiclaw::kb::{Document, DocumentId};
-use rantaiclaw::memory::{Memory, MemoryCategory, MemoryEntry};
+use rantaiclaw::memory::{Memory, MemoryCategory, MemoryEntry, SessionScope};
 use rantaiclaw::observability::NoopObserver;
 use rantaiclaw::providers::Provider;
 use rantaiclaw::security::pairing::PairingGuard;
@@ -85,7 +85,7 @@ impl Memory for MockMemory {
         &self,
         _query: &str,
         _limit: usize,
-        _session_id: Option<&str>,
+        _scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
@@ -95,14 +95,14 @@ impl Memory for MockMemory {
     async fn list(
         &self,
         _category: Option<&MemoryCategory>,
-        _session_id: Option<&str>,
+        _scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
     async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
-    async fn count(&self) -> anyhow::Result<usize> {
+    async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
         Ok(0)
     }
     async fn health_check(&self) -> bool {

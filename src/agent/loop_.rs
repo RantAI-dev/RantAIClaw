@@ -299,7 +299,10 @@ async fn clear_conversation_memory(mem: &dyn Memory, view: Option<&memory::Memor
     in_memory_view(view, async {
         let mut cleared = 0;
         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-            let entries = mem.list(Some(&category), None).await.unwrap_or_default();
+            let entries = mem
+                .list(Some(&category), memory::SessionScope::Any)
+                .await
+                .unwrap_or_default();
             for entry in entries {
                 if memory::forget_in_view(mem, &entry.key)
                     .await
@@ -3096,7 +3099,7 @@ mod tests {
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
     }
-    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use crate::memory::{Memory, MemoryCategory, SessionScope, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
     use crate::providers::ChatResponse;
@@ -5015,12 +5018,17 @@ Done."#;
             &self,
             _q: &str,
             _l: usize,
-            session_id: Option<&str>,
+            scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
-            self.calls
-                .lock()
-                .expect("probe mutex")
-                .push(session_id.map(str::to_string));
+            // Mirror the encoding used by `tools::memory_recall::RecallScopeProbe`:
+            // `Any` → None, `Private` → Some("__private__"), `Conversation(k)`
+            // → Some(k). The probe only asserts `Any` and `Conversation`.
+            let recorded = match scope {
+                SessionScope::Any => None,
+                SessionScope::Private => Some("__private__".to_string()),
+                SessionScope::Conversation(k) => Some(k.to_string()),
+            };
+            self.calls.lock().expect("probe mutex").push(recorded);
             Ok(vec![])
         }
         async fn get(&self, _k: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
@@ -5029,14 +5037,14 @@ Done."#;
         async fn list(
             &self,
             _c: Option<&MemoryCategory>,
-            _s: Option<&str>,
+            _s: SessionScope<'_>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(vec![])
         }
         async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(0)
         }
         async fn health_check(&self) -> bool {
@@ -6212,7 +6220,7 @@ Let me check the result."#;
         let all = clear_conversation_memory(&mem, Some(&memory::MemoryView::All)).await;
         assert_eq!(all, 3);
         let left: Vec<String> = mem
-            .list(None, None)
+            .list(None, memory::SessionScope::Any)
             .await
             .unwrap()
             .into_iter()
@@ -6233,6 +6241,6 @@ Let me check the result."#;
 
         let (_tmp, mem) = seed().await;
         assert_eq!(clear_conversation_memory(&mem, None).await, 0);
-        assert_eq!(mem.count().await.unwrap(), 4);
+        assert_eq!(mem.count(memory::SessionScope::Any).await.unwrap(), 4);
     }
 }

@@ -8,7 +8,7 @@
 
 use super::dispatch::*;
 use super::*;
-use crate::memory::Memory;
+use crate::memory::{Memory, SessionScope};
 use crate::observability::NoopObserver;
 use crate::providers::{ChatMessage, Provider};
 use crate::tools::{Tool, ToolResult};
@@ -263,7 +263,7 @@ impl Memory for NoopMemory {
         &self,
         _query: &str,
         _limit: usize,
-        _session_id: Option<&str>,
+        _scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
         Ok(Vec::new())
     }
@@ -275,7 +275,7 @@ impl Memory for NoopMemory {
     async fn list(
         &self,
         _category: Option<&crate::memory::MemoryCategory>,
-        _session_id: Option<&str>,
+        _scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
         Ok(Vec::new())
     }
@@ -284,7 +284,7 @@ impl Memory for NoopMemory {
         Ok(false)
     }
 
-    async fn count(&self) -> anyhow::Result<usize> {
+    async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
         Ok(0)
     }
 

@@ -2328,13 +2328,34 @@ async fn memory_stats(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let mem: Arc<dyn crate::memory::Memory> = Arc::clone(&state.mem);
-    let total = mem.count().await.map_err(err_500)?;
+    let total = mem
+        .count(crate::memory::SessionScope::Any)
+        .await
+        .map_err(err_500)?;
+    // `SessionScope::Conversation(_)` is keyed, not "any conversation", so a
+    // `conversation_entries` count has to be derived as the rows with a
+    // non-NULL `session_id`. The store's invariant is `private + conversation
+    // == total`, so the second leg is one subtraction against a count the
+    // backend already produced.
+    let private_entries = mem
+        .count(crate::memory::SessionScope::Private)
+        .await
+        .map_err(err_500)?;
+    let conversation_entries = total - private_entries;
     let healthy = mem.health_check().await;
+    // The figure comes from the same function the tool's capacity notice
+    // reads, so `memory_md_chars` and "X chars over the budget" cannot
+    // disagree.
+    let usage = crate::memory::snapshot::core_block_usage(mem.as_ref()).await;
     Ok(Json(serde_json::json!({
         "backend": mem.name(),
         "total_entries": total,
         "healthy": healthy,
         "mode": state.memory_search_mode.as_str(),
+        "private_entries": private_entries,
+        "conversation_entries": conversation_entries,
+        "memory_md_chars": usage.used_chars,
+        "memory_md_max_chars": usage.max_chars,
     })))
 }
 
@@ -2357,6 +2378,11 @@ struct MemoryListQuery {
     /// instead of `Memory::list`, so results come back ranked.
     #[serde(default)]
     q: Option<String>,
+    /// Where a note lives: `private` selects rows with no `session_id`,
+    /// anything else is treated as a conversation key and selects that
+    /// conversation's rows. Absent keeps the unfiltered read.
+    #[serde(default)]
+    place: Option<String>,
 }
 
 /// Map a category name onto [`MemoryCategory`], or `None` when absent/blank.
@@ -2370,6 +2396,20 @@ fn parse_memory_category(raw: Option<&str>) -> Option<crate::memory::MemoryCateg
         "daily" => Some(crate::memory::MemoryCategory::Daily),
         "conversation" => Some(crate::memory::MemoryCategory::Conversation),
         other => Some(crate::memory::MemoryCategory::Custom(other.to_string())),
+    }
+}
+
+/// Render `place=…` onto a [`SessionScope`]. The string is treated verbatim
+/// once it is not the literal `private` — a TUI session id, an older key, or
+/// any other shape becomes a [`SessionScope::Conversation`] that matches only
+/// that exact value. Anything that failed to trim down to a non-empty
+/// string is treated as "no filter" so a stray `?place=` does not return an
+/// empty page by surprise.
+fn parse_place_scope(raw: Option<&str>) -> crate::memory::SessionScope<'_> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => crate::memory::SessionScope::Any,
+        Some("private") => crate::memory::SessionScope::Private,
+        Some(s) => crate::memory::SessionScope::Conversation(s),
     }
 }
 
@@ -2390,6 +2430,11 @@ async fn memory_list(
     // category got the whole store back under a 200 — a silent wrong answer.
     let category = parse_memory_category(q.category.as_deref());
     let query = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    // The place filter is applied through the store for both the list and
+    // the recall path so `total` reflects the narrowed set. Borrow from
+    // `q.place` for the duration of the request so the `SessionScope<'_>`
+    // outlives every `mem.*` call in this handler.
+    let scope = parse_place_scope(q.place.as_deref());
 
     // A search is a ranked read, so it goes through `recall`; `recall` returns
     // its own ranked page, which `offset`/`limit` then window like any other.
@@ -2399,7 +2444,7 @@ async fn memory_list(
             // recall to the requested page would make the reported total grow
             // as the caller pages through it.
             let mut hits = mem
-                .recall(text, SEARCH_CEILING, None)
+                .recall(text, SEARCH_CEILING, scope)
                 .await
                 .map_err(err_500)?;
             if let Some(cat) = category.as_ref() {
@@ -2407,7 +2452,7 @@ async fn memory_list(
             }
             hits
         }
-        None => mem.list(category.as_ref(), None).await.map_err(err_500)?,
+        None => mem.list(category.as_ref(), scope).await.map_err(err_500)?,
     };
     // `offset` used to be accepted and ignored here, so a console could never
     // reach past its first page however it asked.
@@ -2415,24 +2460,42 @@ async fn memory_list(
     // is the total, and reporting the page size as one made a large store look
     // permanently stuck at the cap.
     let listed = entries.len();
-    // `count()` counts the whole store, so it is only the right total when
-    // nothing narrowed the read.
-    let total = if category.is_some() || query.is_some() {
+    // `count()` previously counted the whole store, so it was only the right
+    // total when nothing narrowed the read. With `place` the read is narrowed,
+    // and `count(scope)` matches the rows that would come out of `list(scope)`
+    // — so the page header is the actual filtered count, not the capped page.
+    // `count(scope)` does not know about `q` or `category`, so for those
+    // filters the recall/list page itself is the only honest total we have
+    // and `listed` is the best we can report.
+    let total = if query.is_some() || category.is_some() {
         listed
     } else {
-        mem.count().await.unwrap_or(listed)
+        mem.count(scope).await.unwrap_or(listed)
     };
     let json: Vec<_> = entries
         .iter()
         .skip(offset)
         .take(limit)
         .map(|e| {
+            // The label is the session_id decoded back into the three parts the
+            // channel emits when it builds a key. A private note and an
+            // unparseable key (older rows, a TUI session id) both surface as
+            // nulls — the raw `session_id` is always preserved so a console
+            // can still show the row.
+            let (surface, place, thread) = crate::channels::conversation::parse_place(
+                &e.session_id.clone().unwrap_or_default(),
+            )
+            .map(|(surface, place, thread)| (Some(surface), Some(place), thread))
+            .unwrap_or((None, None, None));
             serde_json::json!({
                 "key": e.key,
                 "category": e.category.to_string(),
                 "content": e.content,
                 "timestamp": e.timestamp,
                 "session_id": e.session_id,
+                "surface": surface,
+                "place": place,
+                "thread": thread,
                 // Only a search ranks, so this is absent on a plain list.
                 "score": e.score,
             })
@@ -2734,8 +2797,9 @@ async fn provider_models_refresh(
 mod tests {
     use super::*;
     use crate::gateway::{GatewayRateLimiter, IdempotencyStore};
-    use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+    use crate::memory::{Memory, MemoryCategory, MemoryEntry, SessionScope};
     use crate::providers::Provider;
+    use crate::tools::traits::Tool;
     use async_trait::async_trait;
     use axum::body::Body;
     use http_body_util::BodyExt;
@@ -2782,7 +2846,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -2794,7 +2858,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -2803,7 +2867,7 @@ mod tests {
             Ok(false)
         }
 
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(0)
         }
 
@@ -4687,6 +4751,7 @@ mod tests {
                 offset: Some(0),
                 category: None,
                 q: None,
+                place: None,
             }),
         )
         .await
@@ -4699,6 +4764,7 @@ mod tests {
                 offset: Some(2),
                 category: None,
                 q: None,
+                place: None,
             }),
         )
         .await
@@ -4710,6 +4776,371 @@ mod tests {
             first.0["entries"][0]["key"], second.0["entries"][0]["key"],
             "a second page must not repeat the first"
         );
+    }
+
+    // ── the place filter ────────────────────────────────────────────
+
+    /// Three notes: a private core row (no `session_id`), a conversation row
+    /// keyed `chat:one`, and a second conversation row keyed `chat:two`. The
+    /// fixture every `?place=` test below relies on.
+    async fn app_with_three_places() -> (tempfile::TempDir, axum::Router) {
+        let (tmp, state) = state_with_real_memory();
+        let mem = state.mem.clone();
+        mem.store(
+            "private_note",
+            "operator-only note",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "chat_one_note",
+            "note from chat one",
+            MemoryCategory::Core,
+            Some("chat:one"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "chat_two_note",
+            "note from chat two",
+            MemoryCategory::Core,
+            Some("chat:two"),
+        )
+        .await
+        .unwrap();
+        (tmp, router().with_state(state))
+    }
+
+    /// `?place=private` reaches only the rows whose `session_id` is NULL.
+    /// `total` follows the narrowed read so a console can show "of N" for a
+    /// filtered page instead of the whole store.
+    #[tokio::test]
+    async fn memory_list_with_place_private_returns_only_null_session_rows() {
+        let (_tmp, app) = app_with_three_places().await;
+        let body = memory_list_json(&app, "place=private").await;
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "private place must reach only the row with no session_id"
+        );
+        assert_eq!(entries[0]["key"], "private_note");
+        assert!(
+            entries[0]["session_id"].is_null(),
+            "the private row has no session_id; the label decoding must say so"
+        );
+        assert_eq!(body["total"], 1, "total reflects the place filter");
+    }
+
+    /// `?place=chat:one` reaches only the rows whose `session_id` equals the
+    /// key exactly. A console caller's `place` is one conversation at a time.
+    #[tokio::test]
+    async fn memory_list_with_place_key_returns_only_that_conversation() {
+        let (_tmp, app) = app_with_three_places().await;
+        let body = memory_list_json(&app, "place=chat%3Aone").await;
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["key"], "chat_one_note");
+        assert_eq!(body["total"], 1);
+    }
+
+    /// `?place=` (empty) keeps the unfiltered read so a stray form field does
+    /// not silently narrow the response to nothing.
+    #[tokio::test]
+    async fn memory_list_with_empty_place_keeps_the_unfiltered_read() {
+        let (_tmp, app) = app_with_three_places().await;
+        let body = memory_list_json(&app, "place=").await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 3);
+        assert_eq!(body["total"], 3);
+    }
+
+    /// The `?q=` recall path narrows by `place` too: the ranked page must only
+    /// contain hits whose `session_id` matches the place, and the totals have
+    /// to follow the filter.
+    #[tokio::test]
+    async fn memory_list_with_place_and_q_ranks_only_that_place() {
+        let (_tmp, app) = app_with_three_places().await;
+        let body = memory_list_json(&app, "q=note&place=chat%3Aone").await;
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["key"], "chat_one_note");
+        // The recall path does not re-count; `total` reports the page size and
+        // a `0` would have been a wrong answer for "of how many" — the count
+        // is one of the original three, all mine.
+        assert_eq!(body["total"], 1);
+    }
+
+    /// `total` under a `place` filter on the list path equals the count of
+    /// that place, not the page size and not the whole store. A console
+    /// showing "5 of 12" was the bug; "12 of 12" with a 5-row page is the
+    /// other bug.
+    #[tokio::test]
+    async fn memory_list_total_with_place_reflects_the_filtered_count() {
+        let (_tmp, app) = app_with_three_places().await;
+        // `limit=2` would only show the first two rows; `total` has to be 3
+        // for the unfiltered read, and 1 / 1 / 1 for the per-place reads.
+        let all = memory_list_json(&app, "limit=2").await;
+        assert_eq!(all["count"], 2);
+        assert_eq!(all["total"], 3, "total is the whole store when no place");
+
+        let private = memory_list_json(&app, "limit=2&place=private").await;
+        assert_eq!(private["count"], 1);
+        assert_eq!(private["total"], 1, "total narrows with place=private");
+
+        let chat_one = memory_list_json(&app, "limit=2&place=chat%3Aone").await;
+        assert_eq!(chat_one["count"], 1);
+        assert_eq!(chat_one["total"], 1);
+    }
+
+    /// A fixture where the private place holds 1005 rows and the per-place
+    /// counts are 5 / 5. The list path caps the SQL response at 1000 rows,
+    /// so without `count(scope)` the page header would freeze at the cap
+    /// (`listed = 1000`) instead of reporting the real filtered count. That
+    /// is the case the `total = listed` mutation turns into a wrong answer.
+    async fn app_with_more_than_a_page() -> (tempfile::TempDir, axum::Router) {
+        let (tmp, state) = state_with_real_memory();
+        let mem = state.mem.clone();
+        // 1005 private rows: just above the SqliteMemory list cap so the
+        // SQL `LIMIT 1000` actually binds.
+        for i in 0..1005 {
+            mem.store(
+                &format!("private_{i:05}"),
+                "filler for a private note",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..5 {
+            mem.store(
+                &format!("chat_one_{i}"),
+                "filler for chat one",
+                MemoryCategory::Core,
+                Some("chat:one"),
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..5 {
+            mem.store(
+                &format!("chat_two_{i}"),
+                "filler for chat two",
+                MemoryCategory::Core,
+                Some("chat:two"),
+            )
+            .await
+            .unwrap();
+        }
+        (tmp, router().with_state(state))
+    }
+
+    /// With the list-cap binding on a filtered set, `total` must still equal
+    /// the filtered count, not the page size. A `total = listed` mutation
+    /// would freeze the header at 1000 for the `place=private` case and
+    /// report 1000 instead of 1015 for the unfiltered read — both wrong.
+    #[tokio::test]
+    async fn memory_list_total_keeps_growing_past_the_list_cap() {
+        let (_tmp, app) = app_with_more_than_a_page().await;
+
+        // 1005 private + 5 chat:one + 5 chat:two = 1015 total.
+        let all = memory_list_json(&app, "limit=2").await;
+        assert_eq!(all["count"], 2);
+        assert_eq!(
+            all["total"], 1015,
+            "total is the whole store (1015 notes), not the page size"
+        );
+
+        // `place=private` narrows to the 1005 private rows. The page carries
+        // at most `limit=2` entries; the header must still report 1005.
+        let private = memory_list_json(&app, "limit=2&place=private").await;
+        assert_eq!(private["count"], 2);
+        assert_eq!(
+            private["total"], 1005,
+            "total narrows to the place count, not the page and not the cap"
+        );
+
+        // `place=chat%3Aone` narrows to the 5 chat:one rows. The cap doesn't
+        // bind here, but it would still be wrong to report the page size.
+        let chat_one = memory_list_json(&app, "limit=2&place=chat%3Aone").await;
+        assert_eq!(chat_one["count"], 2);
+        assert_eq!(
+            chat_one["total"], 5,
+            "total narrows to the chat:one place count"
+        );
+    }
+
+    // ── decoded place labels ────────────────────────────────────────
+
+    /// Each entry includes the surface (channel id), place (the part after the
+    /// first `:`), and thread (the part after the second `:`), parsed back from
+    /// the `session_id` the channel wrote. A `chat:one` key decodes to
+    /// `chat` / `one` / `null`; a `chat:two:thread-7` key decodes to `chat` /
+    /// `two` / `thread-7`.
+    #[tokio::test]
+    async fn memory_list_decodes_surface_place_and_thread_per_entry() {
+        let (_tmp, app) = app_with_three_places().await;
+        let body = memory_list_json(&app, "").await;
+        let entries = body["entries"].as_array().unwrap();
+        let chat_one = entries
+            .iter()
+            .find(|e| e["key"] == "chat_one_note")
+            .expect("chat:one row is present");
+        assert_eq!(chat_one["surface"], "chat");
+        assert_eq!(chat_one["place"], "one");
+        assert!(
+            chat_one["thread"].is_null(),
+            "a `chat:one` key has no thread; the label says so"
+        );
+    }
+
+    /// An unparseable `session_id` (one without a `:` separator) still returns
+    /// the row under a 200 — the raw `session_id` is preserved so a console
+    /// can show it — but every label is null. A console that surfaced
+    /// "channel: <unknown>" or crashed on the missing colon would be wrong.
+    #[tokio::test]
+    async fn memory_list_survives_unparseable_session_ids() {
+        let (_tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "unparseable_note",
+                "an older row with a UUID-shaped session_id",
+                MemoryCategory::Core,
+                Some("550e8400-e29b-41d4-a716-446655440000"),
+            )
+            .await
+            .unwrap();
+        let app = router().with_state(state);
+        let body = memory_list_json(&app, "").await;
+        let entries = body["entries"].as_array().unwrap();
+        let row = entries
+            .iter()
+            .find(|e| e["key"] == "unparseable_note")
+            .expect("unparseable row is present");
+        assert_eq!(
+            row["session_id"], "550e8400-e29b-41d4-a716-446655440000",
+            "the raw session_id is preserved even when the labels cannot decode"
+        );
+        assert!(
+            row["surface"].is_null(),
+            "no `:` separator means no surface label"
+        );
+        assert!(
+            row["place"].is_null(),
+            "no `:` separator means no place label"
+        );
+        assert!(
+            row["thread"].is_null(),
+            "no `:` separator means no thread label"
+        );
+    }
+
+    // ── the round-trip private-by-default ───────────────────────────
+
+    /// A note posted with no `session_id` is private, and `?place=private`
+    /// finds it. With the old unfiltered Option<&str> shape the row at `None`
+    /// was reachable through every `?place=<key>` query — a guest on a
+    /// different conversation could ask for `place=anything` and read a
+    /// private note's content. The fix is the `Private` scope: `?place=`
+    /// (other than `private`) only matches that exact key, so a private
+    /// row never surfaces.
+    #[tokio::test]
+    async fn memory_list_place_round_trip_private_does_not_leak_through_other_places() {
+        let (_tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "private_round_trip",
+                "the operator's note",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        // A different conversation asked for, that has no row of its own.
+        state
+            .mem
+            .store(
+                "other_conv_note",
+                "a note in chat:two",
+                MemoryCategory::Core,
+                Some("chat:two"),
+            )
+            .await
+            .unwrap();
+        let app = router().with_state(state);
+
+        let private = memory_list_json(&app, "place=private").await;
+        let private_keys: Vec<&str> = private["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["key"].as_str().unwrap())
+            .collect();
+        assert!(
+            private_keys.contains(&"private_round_trip"),
+            "place=private must reach the operator's row: {private_keys:?}"
+        );
+        assert!(
+            !private_keys.contains(&"other_conv_note"),
+            "place=private must not reach a conversation row: {private_keys:?}"
+        );
+
+        // The conversation's `place` reaches only its row. The private row
+        // is invisible from there — the round-trip test.
+        let other = memory_list_json(&app, "place=chat%3Atwo").await;
+        let other_keys: Vec<&str> = other["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(other_keys, vec!["other_conv_note"]);
+        assert!(
+            !other_keys.contains(&"private_round_trip"),
+            "a conversation's place must not reach a private row"
+        );
+    }
+
+    /// A note posted with a conversation id is reachable from that exact
+    /// `place=<key>` and from no other. The control for the round-trip test
+    /// above: the conversation path also stays private by default.
+    #[tokio::test]
+    async fn memory_list_place_round_trip_conversation_is_scoped_to_its_key() {
+        let (_tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "this_conv_note",
+                "kept in chat:one",
+                MemoryCategory::Core,
+                Some("chat:one"),
+            )
+            .await
+            .unwrap();
+        state
+            .mem
+            .store(
+                "other_conv_note",
+                "kept in chat:two",
+                MemoryCategory::Core,
+                Some("chat:two"),
+            )
+            .await
+            .unwrap();
+        let app = router().with_state(state);
+
+        let this_conv = memory_list_json(&app, "place=chat%3Aone").await;
+        let keys: Vec<&str> = this_conv["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["this_conv_note"]);
     }
 
     /// `GET /api/v1/memory/stats` carries the resolved search mode the same way
@@ -4748,6 +5179,237 @@ mod tests {
         let hybrid = stats_with_mode("keyword + semantic (openai)").await;
         assert_eq!(hybrid["mode"], "keyword + semantic (openai)");
     }
+
+    /// Drive `GET /api/v1/memory/stats` end-to-end through the router. Used
+    /// by every count / usage test below — same shape as `memory_list_json`
+    /// one block up, kept local because the stats route is its own handler.
+    async fn memory_stats_json(app: &axum::Router) -> serde_json::Value {
+        use axum::body::Body;
+        use tower::ServiceExt as _;
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/memory/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "GET /api/v1/memory/stats");
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The three-note fixture: one private note and one row each in
+    /// `chat:one` and `chat:two`. Pinned so a regression that swaps the two
+    /// legs of the count would still have the right totals to disagree with.
+    #[tokio::test]
+    async fn memory_stats_reports_private_and_conversation_counts_with_sum_invariant() {
+        let (_tmp, app) = app_with_three_places().await;
+        let body = memory_stats_json(&app).await;
+
+        let total = body["total_entries"].as_u64().unwrap();
+        let private_entries = body["private_entries"].as_u64().unwrap();
+        let conversation_entries = body["conversation_entries"].as_u64().unwrap();
+
+        assert_eq!(
+            private_entries, 1,
+            "private_entries counts rows with NULL session_id"
+        );
+        assert_eq!(
+            conversation_entries, 2,
+            "conversation_entries counts rows with a non-NULL session_id"
+        );
+        assert_eq!(
+            total, 3,
+            "total_entries is the whole store, regardless of place"
+        );
+        // The store's invariant: every row is private or in a conversation,
+        // never both and never neither. A regression that double-counts or
+        // drops a leg is the first thing this catches.
+        assert_eq!(
+            private_entries + conversation_entries,
+            total,
+            "private + conversation must equal total"
+        );
+    }
+
+    /// Swap the two legs and the invariant still holds, but the per-leg
+    /// counts flip. This is the assertion a mutation that just renames the
+    /// fields would break.
+    #[tokio::test]
+    async fn memory_stats_counts_put_the_private_note_in_the_private_leg() {
+        let (_tmp, app) = app_with_three_places().await;
+        let body = memory_stats_json(&app).await;
+        let private_entries = body["private_entries"].as_u64().unwrap();
+
+        // app_with_three_places writes the private note under no session_id;
+        // the other two are written with `chat:one` and `chat:two`. A swap
+        // would report `private_entries == 2` here.
+        assert!(
+            private_entries == 1,
+            "private_entries should be 1, got {private_entries}"
+        );
+    }
+
+    /// A fresh database reports zeros for everything: counts, totals, the
+    /// `memory_md_chars` figure, and the ceiling. A console that showed
+    /// `total_entries: 0` next to `memory_md_chars: 1234` would be a wrong
+    /// answer for a fresh install.
+    #[tokio::test]
+    async fn memory_stats_reports_zero_on_an_empty_store() {
+        let (_tmp, state) = state_with_real_memory();
+        let app = router().with_state(state);
+        let body = memory_stats_json(&app).await;
+
+        assert_eq!(body["total_entries"], 0);
+        assert_eq!(body["private_entries"], 0);
+        assert_eq!(body["conversation_entries"], 0);
+        assert_eq!(body["memory_md_chars"], 0);
+        assert_eq!(
+            body["memory_md_max_chars"], 4_000,
+            "the ceiling is the constant `PROJECTION_MAX_CHARS`"
+        );
+    }
+
+    /// `memory_md_chars == 0` is the empty-store figure. Pinning it here
+    /// separately from the all-zeros test, because a regression that
+    /// computed the count before the empty-store zero check would still
+    /// pass the all-zeros test.
+    #[tokio::test]
+    async fn memory_stats_reports_memory_md_usage_zero_on_an_empty_store() {
+        let (_tmp, state) = state_with_real_memory();
+        let app = router().with_state(state);
+        let body = memory_stats_json(&app).await;
+        assert_eq!(body["memory_md_chars"], 0);
+        assert_eq!(body["memory_md_max_chars"], 4_000);
+    }
+
+    /// Six private core entries of 900 chars each overflow the 4 000-char
+    /// ceiling. The console sees `memory_md_chars > memory_md_max_chars`,
+    /// the same shape the capacity notice reports as "X chars over the
+    /// budget". The exact value matches what `render_projection` would
+    /// produce per line: 6 × 911 = 5 466 chars.
+    #[tokio::test]
+    async fn memory_stats_reports_memory_md_usage_over_cap() {
+        let (_tmp, state) = state_with_real_memory();
+        let mem = state.mem.clone();
+        let filler = "y".repeat(900);
+        for i in 0..6 {
+            mem.store(&format!("bulk_{i}"), &filler, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        let app = router().with_state(state);
+        let body = memory_stats_json(&app).await;
+
+        let used = body["memory_md_chars"].as_u64().unwrap();
+        let max = body["memory_md_max_chars"].as_u64().unwrap();
+        assert_eq!(max, 4_000);
+        assert!(used > max, "the block is over budget: {used} > {max}");
+        // Exact-value pin: a stats handler that reported a different
+        // arithmetic (capped at 4 000, or summed raw bytes without escape)
+        // would land somewhere else.
+        assert_eq!(used, 5_466, "the figure matches render_projection per line");
+    }
+
+    /// The stats handler and the capacity notice read the same function.
+    /// Drive both paths against one store, then assert the number on the
+    /// console matches the "X chars over the budget" in the notice — so
+    /// `memory_md_chars` and "X + budget" cannot diverge.
+    #[tokio::test]
+    async fn memory_stats_and_tool_capacity_notice_agree_on_the_used_size() {
+        use crate::tools::memory_store::MemoryStoreTool;
+
+        let (tmp, state) = state_with_real_memory();
+        let mem = state.mem.clone();
+        let filler = "y".repeat(900);
+        for i in 0..6 {
+            mem.store(&format!("bulk_{i}"), &filler, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        // Sample the shared function and the gateway against the same
+        // pre-tool state (6 entries). If the gateway stops calling the
+        // shared function and uses its own line-sum, this is the assertion
+        // that fails. The comparison stays in `u64` because that is the
+        // JSON number type the handler returns; a `usize` cast on a 32-bit
+        // target would be a silent truncation.
+        let shared_pre = crate::memory::snapshot::core_block_usage(mem.as_ref()).await;
+        let app = router().with_state(state);
+        let stats = memory_stats_json(&app).await;
+        let stats_used = stats["memory_md_chars"].as_u64().unwrap();
+        let stats_max = stats["memory_md_max_chars"].as_u64().unwrap();
+        assert_eq!(
+            stats_used, shared_pre.used_chars as u64,
+            "the gateway must call the shared function; a divergence means the \
+             handler has its own copy of the arithmetic"
+        );
+        assert_eq!(stats_max, shared_pre.max_chars as u64);
+
+        // Drive the tool with a 7th write so the notice fires, then read the
+        // shared function again against the post-write state. The notice's
+        // "X chars over the budget" and `over_by + budget == used` is the
+        // round-trip the model reads; assert the shared function and the
+        // parsed notice agree.
+        let tool = MemoryStoreTool::new(
+            mem.clone(),
+            Arc::new(crate::security::SecurityPolicy::default()),
+            tmp.path().to_path_buf(),
+        );
+        let result = crate::memory::MEMORY_VIEW
+            .scope(
+                crate::memory::MemoryView::All,
+                tool.execute(serde_json::json!({
+                    "key": "one_more",
+                    "content": "a durable fact",
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "control: {}",
+            result.error.unwrap_or_default()
+        );
+
+        let (over_by, budget) = parse_capacity_notice(&result.output)
+            .expect("the notice must state the over-by and the budget");
+        let shared_post = crate::memory::snapshot::core_block_usage(mem.as_ref()).await;
+        assert_eq!(
+            over_by + budget,
+            shared_post.used_chars,
+            "the tool's notice must come from the shared function; a divergence \
+             means the tool has its own copy of the arithmetic"
+        );
+        assert_eq!(budget, shared_post.max_chars);
+    }
+
+    /// Parse the "X characters over the Y-character block" sentence out of
+    /// the capacity notice. The format string lives in
+    /// `MemoryStoreTool::core_capacity_notice`; parsing the rendered output
+    /// is the only way to assert against the same value the model reads,
+    /// without reaching across the gateway → tools boundary the production
+    /// code respects.
+    fn parse_capacity_notice(output: &str) -> Option<(usize, usize)> {
+        let marker = " characters over the ";
+        let start = output.find(marker)?;
+        let head = &output[..start];
+        let tail = &output[start + marker.len()..];
+        let is_idx = head.rfind("is ")? + 3;
+        let over_by: usize = head[is_idx..].trim().parse().ok()?;
+        let block_idx = tail.find("-character block")?;
+        let budget: usize = tail[..block_idx].trim().parse().ok()?;
+        Some((over_by, budget))
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // skills management API (plan 039)
+    // ────────────────────────────────────────────────────────────────────
 
     // ────────────────────────────────────────────────────────────────────
     // skills management API (plan 039)

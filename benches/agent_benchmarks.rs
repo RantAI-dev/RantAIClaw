@@ -256,15 +256,25 @@ fn bench_memory_operations(c: &mut Criterion) {
     c.bench_function("memory_recall_top10", |b| {
         b.iter(|| {
             rt.block_on(async {
-                mem.recall(black_box("rantaiclaw agent"), 10, None)
-                    .await
-                    .unwrap()
+                mem.recall(
+                    black_box("rantaiclaw agent"),
+                    10,
+                    rantaiclaw::memory::SessionScope::Any,
+                )
+                .await
+                .unwrap()
             })
         });
     });
 
     c.bench_function("memory_count", |b| {
-        b.iter(|| rt.block_on(async { mem.count().await.unwrap() }));
+        b.iter(|| {
+            rt.block_on(async {
+                mem.count(rantaiclaw::memory::SessionScope::Any)
+                    .await
+                    .unwrap()
+            })
+        });
     });
 }
 

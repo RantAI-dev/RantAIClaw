@@ -4296,7 +4296,10 @@ async fn channel_dispatch_does_not_write_a_conversation_row() {
         let saved = deployment
             .ctx
             .memory
-            .list(Some(&MemoryCategory::Conversation), None)
+            .list(
+                Some(&MemoryCategory::Conversation),
+                crate::memory::SessionScope::Any,
+            )
             .await
             .unwrap();
         assert!(

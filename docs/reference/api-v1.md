@@ -769,6 +769,11 @@ should check the encoded size and say so plainly rather than surfacing a bare
     the backend's ranked recall instead of a plain list, so entries carry a
     `score`. Saved notes come first, then conversation rows. Composes with
     `category`.
+  - `place` — optional filter by location. The word `private` selects notes
+    with no `session_id`; any other value is treated as a conversation key
+    and selects that conversation's notes; absent keeps the unfiltered read.
+    Applies to both list and `q` recall. The `total` count reflects the
+    filtered set.
 - **Response** `200`:
   ```json
   {
@@ -779,6 +784,9 @@ should check the encoded size and say so plainly rather than surfacing a bare
         "content": "...",
         "timestamp": "...",
         "session_id": "may be null",
+        "surface": "may be null",
+        "place": "may be null",
+        "thread": "may be null",
         "score": 0.87
       }
     ],
@@ -795,6 +803,12 @@ should check the encoded size and say so plainly rather than surfacing a bare
   current inconsistency across resource groups worth knowing about if you're
   writing a client that parses both.
 
+  `surface`, `place`, and `thread` are decoded from `session_id` for a
+  channel conversation, so they name the platform, the chat identifier, and
+  the thread id (if any). All three are `null` for a private note (no
+  `session_id`) or when the `session_id` is an older row or a TUI session
+  id that does not parse.
+
   `score` is relevance in `0.0..=1.0`, an **absolute** measure: the share of
   the query's words the entry holds as whole words, blended with vector
   similarity when an embedding provider is set. It does not depend on the other
@@ -806,10 +820,10 @@ should check the encoded size and say so plainly rather than surfacing a bare
   `count` is how many entries this response carries, `listed` is how many the
   backend returned before `offset`/`limit` windowed them, and `total` is the
   size of the set you are paging. For an unfiltered read `total` is the whole
-  store; when `category` or `q` narrows the read, `total` is the size of the
-  narrowed set — otherwise a filtered page would advertise a total it could
-  never reach. A `q` search ranks up to 500 hits before paging, so `total`
-  stays put as you page through it.
+  store; when `category`, `q`, or `place` narrows the read, `total` is the
+  size of the narrowed set — otherwise a filtered page would advertise a total
+  it could never reach. A `q` search ranks up to 500 hits before paging, so
+  `total` stays put as you page through it.
 
   The handler fetches the entry list from the backend and windows it in the
   response — `limit` bounds the response size, not the underlying query.
@@ -833,9 +847,11 @@ should check the encoded size and say so plainly rather than surfacing a bare
   - `key` — optional. A `memory_<uuid>` key is generated when it is absent or blank.
   - `category` — optional, default `core`. `core`, `daily` and `conversation` are
     the built-in categories; any other name is stored as a custom category.
-  - `session_id` — optional conversation scope. Absent or blank means the shared
-    place. Only shared `core` notes reach the owner's `MEMORY.md` and system
-    prompt; a `core` note stored with a `session_id` stays in the database.
+  - `session_id` — optional conversation scope. Absent or blank creates a private
+    note (with no `session_id`). When present, the note is scoped to that
+    conversation key. Only shared `core` notes (with no `session_id`) reach the
+    owner's `MEMORY.md` and system prompt; a `core` note stored with a
+    `session_id` stays in the database.
 - **Response** `201`: `{ "key": "office", "stored": true, "notes": [] }`. `notes`
   lists what the screen changed in `content`, and is empty when nothing changed.
 - **Response** `409` — the key already belongs to another memory place. A key keeps
@@ -873,12 +889,31 @@ should check the encoded size and say so plainly rather than surfacing a bare
 - **Request**: none.
 - **Response** `200`:
   ```json
-  { "backend": "...", "total_entries": 100, "healthy": true, "mode": "keyword" }
+  {
+    "backend": "...",
+    "total_entries": 100,
+    "healthy": true,
+    "mode": "keyword",
+    "private_entries": 45,
+    "conversation_entries": 55,
+    "memory_md_chars": 1250,
+    "memory_md_max_chars": 4000
+  }
   ```
   `mode` names the search mode the runtime is using: `keyword` when the
   embedding provider is `none` (or empty), `keyword + semantic (<provider>)`
   otherwise — e.g. `keyword + semantic (openai)`. The same value appears on
   `rantaiclaw memory stats` and the header of `rantaiclaw memory recall`.
+
+  `private_entries` counts notes with no `session_id`; `conversation_entries`
+  counts notes that belong to a conversation. The two sum to `total_entries`.
+
+  `memory_md_chars` is the character count of the runtime-owned block in the
+  `MEMORY.md` file, calculated from shared (private) `core` notes that fit
+  under the ceiling. `memory_md_max_chars` is the cap on that block —
+  currently 4000 characters. When `memory_md_chars` exceeds the cap, older
+  core notes are omitted from the system prompt, and this field serves the
+  same purpose as the memory tool's capacity notice.
 - **Status codes**: `200`, `401`.
 
 ---

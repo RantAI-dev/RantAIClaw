@@ -60,6 +60,45 @@ pub struct KeyInUse {
     pub key: String,
 }
 
+/// Which rows a [`Memory`] read reaches, in terms of the `session_id` column.
+///
+/// `session_id = NULL` was unreachable on the old `Option<&str>` shape: there was
+/// no slot that asked for the rows the shared tier holds. The `?place=private`
+/// parameter the gateway exposes needs that slot, and the `?place=<key>` form
+/// shares it. Naming the three cases makes a list/recall/count call describe
+/// exactly the set the caller wants — no `Option<Option<&str>>` ambiguity to
+/// read past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionScope<'a> {
+    /// No session filter: every row the other filters let through.
+    Any,
+    /// Rows whose `session_id` IS NULL — a private note, visible to the
+    /// operator regardless of the conversation that wrote it.
+    Private,
+    /// Rows whose `session_id` equals `key` exactly: one conversation.
+    Conversation(&'a str),
+}
+
+impl<'a> SessionScope<'a> {
+    /// Map the old `Option<&str>` shape onto [`SessionScope`]. `None` was the
+    /// "no filter" slot and stays the same; `Some(key)` was the conversation
+    /// slot and keeps that name.
+    pub fn from_session_id(session_id: Option<&'a str>) -> Self {
+        match session_id {
+            None => SessionScope::Any,
+            Some(key) => SessionScope::Conversation(key),
+        }
+    }
+
+    /// True when the scope actually narrows the read — `Private` and
+    /// `Conversation` are both narrower than the unfiltered `Any`. Callers
+    /// that show "of N" totals use this to decide whether `count(scope)` is
+    /// the right total or the page size has to stand in.
+    pub fn is_narrowed(&self) -> bool {
+        !matches!(self, SessionScope::Any)
+    }
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -79,7 +118,7 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// Recall memories matching a query (keyword search), optionally scoped to a session.
+    /// Recall memories matching a query (keyword search), scoped by `scope`.
     ///
     /// Implementations must satisfy the scoring contract on
     /// [`MemoryEntry::score`]: whatever raw signal the backend ranks by, each
@@ -91,24 +130,26 @@ pub trait Memory: Send + Sync {
         &self,
         query: &str,
         limit: usize,
-        session_id: Option<&str>,
+        scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
     /// Get a specific memory by key
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>>;
 
-    /// List all memory keys, optionally filtered by category and/or session
+    /// List all memory keys, filtered by category and `scope`.
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
-        session_id: Option<&str>,
+        scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
 
-    /// Count total memories
-    async fn count(&self) -> anyhow::Result<usize>;
+    /// Count memories matching `scope`. `Any` is the whole store; a narrower
+    /// scope counts what a `list` of the same scope would return, so a
+    /// paginated caller can show "of N" for a filtered read.
+    async fn count(&self, scope: SessionScope<'_>) -> anyhow::Result<usize>;
 
     /// Health check
     async fn health_check(&self) -> bool;

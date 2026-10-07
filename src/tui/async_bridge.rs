@@ -277,7 +277,7 @@ mod tests {
     use crate::agent::agent::Agent;
     use crate::agent::dispatcher::XmlToolDispatcher;
     use crate::agent::events::AgentEvent;
-    use crate::memory::Memory;
+    use crate::memory::{Memory, SessionScope};
     use crate::observability::Observer;
     use crate::providers::{ChatRequest, ChatResponse, Provider};
     use async_trait::async_trait;
@@ -606,7 +606,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(vec![])
         }
@@ -616,14 +616,14 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&crate::memory::MemoryCategory>,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(vec![])
         }
         async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(0)
         }
         async fn health_check(&self) -> bool {

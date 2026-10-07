@@ -29,7 +29,7 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::config::{AgentConfig, MemoryConfig};
-use crate::memory::{self, Memory};
+use crate::memory::{self, Memory, SessionScope};
 use crate::observability::{NoopObserver, Observer};
 use crate::providers::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
@@ -733,7 +733,7 @@ async fn agent_turn_does_not_write_a_conversation_row() {
         })
         .await;
 
-    let all = mem.list(None, None).await.unwrap();
+    let all = mem.list(None, memory::SessionScope::Any).await.unwrap();
     let conversation_rows: Vec<_> = all
         .iter()
         .filter(|e| e.category == crate::memory::MemoryCategory::Conversation)
@@ -779,7 +779,7 @@ async fn agent_repeated_turns_do_not_grow_conversation_rows() {
         })
         .await;
 
-    let all = mem.list(None, None).await.unwrap();
+    let all = mem.list(None, memory::SessionScope::Any).await.unwrap();
     let conversation_rows: Vec<_> = all
         .iter()
         .filter(|e| e.category == crate::memory::MemoryCategory::Conversation)
@@ -806,7 +806,7 @@ async fn agent_repeated_turns_do_not_grow_conversation_rows() {
 async fn headless_door_does_not_write_a_memory_row() {
     let fixture = super::door_test_support::DoorFixture::start().await;
     let mem = crate::memory::SqliteMemory::new(&fixture.workspace).unwrap();
-    let count_before = mem.count().await.unwrap();
+    let count_before = mem.count(memory::SessionScope::Any).await.unwrap();
 
     crate::memory::MEMORY_VIEW
         .scope(crate::memory::MemoryView::All, async {
@@ -835,7 +835,7 @@ async fn headless_door_does_not_write_a_memory_row() {
         })
         .await;
 
-    let count_after = mem.count().await.unwrap();
+    let count_after = mem.count(memory::SessionScope::Any).await.unwrap();
     assert_eq!(
         count_before, count_after,
         "the headless `agent -m` door must not change the memories table \
@@ -857,7 +857,7 @@ async fn headless_door_does_not_write_a_memory_row() {
 #[tokio::test]
 async fn agent_turn_door_does_not_write_a_memory_row() {
     let (mem, _tmp) = make_sqlite_memory();
-    let count_before = mem.count().await.unwrap();
+    let count_before = mem.count(memory::SessionScope::Any).await.unwrap();
     let provider = Box::new(ScriptedProvider::new(vec![text_response("done")]));
 
     let mut agent = Agent::builder()
@@ -877,7 +877,7 @@ async fn agent_turn_door_does_not_write_a_memory_row() {
         })
         .await;
 
-    let count_after = mem.count().await.unwrap();
+    let count_after = mem.count(memory::SessionScope::Any).await.unwrap();
     assert_eq!(
         count_before, count_after,
         "the console/TUI turn must not change the memories table \
@@ -899,7 +899,7 @@ async fn agent_turn_door_does_not_write_a_memory_row() {
 async fn repl_door_does_not_write_a_memory_row() {
     let fixture = super::door_test_support::DoorFixture::start().await;
     let mem = crate::memory::SqliteMemory::new(&fixture.workspace).unwrap();
-    let count_before = mem.count().await.unwrap();
+    let count_before = mem.count(memory::SessionScope::Any).await.unwrap();
 
     // Scripted input: one turn then `/quit` so the loop exits cleanly.
     let mut reader =
@@ -932,7 +932,7 @@ async fn repl_door_does_not_write_a_memory_row() {
         })
         .await;
 
-    let count_after = mem.count().await.unwrap();
+    let count_after = mem.count(memory::SessionScope::Any).await.unwrap();
     assert_eq!(
         count_before, count_after,
         "the REPL turn must not change the memories table \
@@ -1285,7 +1285,7 @@ impl Memory for RecordingMemory {
         &self,
         _q: &str,
         _l: usize,
-        _s: Option<&str>,
+        _s: SessionScope<'_>,
     ) -> Result<Vec<crate::memory::MemoryEntry>> {
         Ok(vec![])
     }
@@ -1295,14 +1295,14 @@ impl Memory for RecordingMemory {
     async fn list(
         &self,
         _c: Option<&crate::memory::MemoryCategory>,
-        _s: Option<&str>,
+        _s: SessionScope<'_>,
     ) -> Result<Vec<crate::memory::MemoryEntry>> {
         Ok(vec![])
     }
     async fn forget(&self, _k: &str) -> Result<bool> {
         Ok(false)
     }
-    async fn count(&self) -> Result<usize> {
+    async fn count(&self, _scope: SessionScope<'_>) -> Result<usize> {
         Ok(0)
     }
     async fn health_check(&self) -> bool {
@@ -1755,7 +1755,10 @@ async fn compaction_asks_for_a_summary_and_stores_nothing() {
         "compaction made a request besides the summary"
     );
     assert!(
-        mem.list(None, None).await.unwrap().is_empty(),
+        mem.list(None, memory::SessionScope::Any)
+            .await
+            .unwrap()
+            .is_empty(),
         "compaction stored a note nobody asked for"
     );
 }

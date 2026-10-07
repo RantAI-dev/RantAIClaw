@@ -28,7 +28,10 @@ async fn sqlite_memory_store_same_key_deduplicates() {
         .unwrap();
 
     // Should have exactly 1 entry, not 2
-    let count = mem.count().await.unwrap();
+    let count = mem
+        .count(rantaiclaw::memory::SessionScope::Any)
+        .await
+        .unwrap();
     assert_eq!(
         count, 1,
         "storing same key twice should not create duplicates"
@@ -55,7 +58,10 @@ async fn sqlite_memory_store_different_keys_creates_separate_entries() {
         .await
         .unwrap();
 
-    let count = mem.count().await.unwrap();
+    let count = mem
+        .count(rantaiclaw::memory::SessionScope::Any)
+        .await
+        .unwrap();
     assert_eq!(count, 2, "different keys should create separate entries");
 }
 
@@ -117,7 +123,10 @@ async fn sqlite_memory_restart_does_not_duplicate_on_rewrite() {
             .await
             .unwrap();
 
-        let count = mem.count().await.unwrap();
+        let count = mem
+            .count(rantaiclaw::memory::SessionScope::Any)
+            .await
+            .unwrap();
         assert_eq!(
             count, 2,
             "re-storing same keys after restart should not create duplicates"
@@ -154,7 +163,10 @@ async fn sqlite_memory_session_scoped_store_and_recall() {
 
     // List scoped to session_a
     let session_a_entries = mem
-        .list(Some(&MemoryCategory::Conversation), Some("session_a"))
+        .list(
+            Some(&MemoryCategory::Conversation),
+            rantaiclaw::memory::SessionScope::Conversation("session_a"),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -183,7 +195,10 @@ async fn sqlite_memory_global_recall_includes_all_sessions() {
         .unwrap();
 
     // Global count should include all
-    let count = mem.count().await.unwrap();
+    let count = mem
+        .count(rantaiclaw::memory::SessionScope::Any)
+        .await
+        .unwrap();
     assert_eq!(
         count, 2,
         "global count should include entries from all sessions"
@@ -216,7 +231,14 @@ async fn sqlite_memory_recall_returns_relevant_results() {
     .await
     .unwrap();
 
-    let results = mem.recall("Rust programming", 10, None).await.unwrap();
+    let results = mem
+        .recall(
+            "Rust programming",
+            10,
+            rantaiclaw::memory::SessionScope::Any,
+        )
+        .await
+        .unwrap();
     assert!(!results.is_empty(), "recall should find matching entries");
     // The Rust-related entry should be in results
     assert!(
@@ -241,7 +263,10 @@ async fn sqlite_memory_recall_respects_limit() {
         .unwrap();
     }
 
-    let results = mem.recall("test content", 3, None).await.unwrap();
+    let results = mem
+        .recall("test content", 3, rantaiclaw::memory::SessionScope::Any)
+        .await
+        .unwrap();
     assert!(
         results.len() <= 3,
         "recall should respect limit of 3, got {}",
@@ -258,7 +283,10 @@ async fn sqlite_memory_recall_empty_query_returns_empty() {
         .await
         .unwrap();
 
-    let results = mem.recall("", 10, None).await.unwrap();
+    let results = mem
+        .recall("", 10, rantaiclaw::memory::SessionScope::Any)
+        .await
+        .unwrap();
     assert!(results.is_empty(), "empty query should return no results");
 }
 
@@ -274,11 +302,21 @@ async fn sqlite_memory_forget_removes_entry() {
     mem.store("to_forget", "temporary info", MemoryCategory::Core, None)
         .await
         .unwrap();
-    assert_eq!(mem.count().await.unwrap(), 1);
+    assert_eq!(
+        mem.count(rantaiclaw::memory::SessionScope::Any)
+            .await
+            .unwrap(),
+        1
+    );
 
     let removed = mem.forget("to_forget").await.unwrap();
     assert!(removed, "forget should return true for existing key");
-    assert_eq!(mem.count().await.unwrap(), 0);
+    assert_eq!(
+        mem.count(rantaiclaw::memory::SessionScope::Any)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -327,7 +365,10 @@ async fn sqlite_memory_concurrent_stores_no_data_loss() {
         handle.await.unwrap();
     }
 
-    let count = mem.count().await.unwrap();
+    let count = mem
+        .count(rantaiclaw::memory::SessionScope::Any)
+        .await
+        .unwrap();
     assert_eq!(
         count, 5,
         "all concurrent stores should succeed, got {count}"
@@ -358,10 +399,22 @@ async fn sqlite_memory_list_by_category() {
     .await
     .unwrap();
 
-    let core_entries = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+    let core_entries = mem
+        .list(
+            Some(&MemoryCategory::Core),
+            rantaiclaw::memory::SessionScope::Any,
+        )
+        .await
+        .unwrap();
     assert_eq!(core_entries.len(), 1, "should have 1 Core entry");
     assert_eq!(core_entries[0].key, "core_fact");
 
-    let daily_entries = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
+    let daily_entries = mem
+        .list(
+            Some(&MemoryCategory::Daily),
+            rantaiclaw::memory::SessionScope::Any,
+        )
+        .await
+        .unwrap();
     assert_eq!(daily_entries.len(), 1, "should have 1 Daily entry");
 }
