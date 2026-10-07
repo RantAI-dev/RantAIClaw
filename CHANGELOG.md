@@ -16,11 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recall, and `total` reflects the filtered set. Entry objects now carry
   `surface`, `place`, and `thread` fields, decoded from `session_id` for
   channel conversations — all three are `null` for private notes or when
-  `session_id` does not parse.
-- `GET /api/v1/memory/stats` gains four new fields: `private_entries` (count of
-  notes with no `session_id`), `conversation_entries` (count of conversation-scoped
-  notes), `memory_md_chars` (characters used by the runtime-owned block in
-  `MEMORY.md`), and `memory_md_max_chars` (the 4000-character cap on that block).
+  `session_id` does not parse. `GET /api/v1/memory/stats` gains four new
+  fields: `private_entries` (count of notes with no `session_id`),
+  `conversation_entries` (count of conversation-scoped notes), `memory_md_chars`
+  (total characters used by private core notes in `MEMORY.md`, uncapped),
+  and `memory_md_max_chars` (the 4000-character ceiling). `rantaiclaw memory
+  list --session X` now reports the total for that session only, instead of
+  the whole store.
 - Deleting a `source=channel` session through `DELETE /api/v1/sessions/{id}`
   now removes the whole conversation: every session with that
   `conversation_key`, their messages, the persisted `channel_history` row in

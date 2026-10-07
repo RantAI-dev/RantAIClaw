@@ -365,7 +365,9 @@ impl MemoryStoreTool {
     /// block reads as `used > budget` here and as `memory_md_chars >
     /// memory_md_max_chars` on the console.
     async fn core_capacity_notice(&self) -> Option<String> {
-        let usage = crate::memory::snapshot::core_block_usage(self.memory.as_ref()).await;
+        let usage = crate::memory::snapshot::core_block_usage(self.memory.as_ref())
+            .await
+            .ok()?;
         let budget = usage.max_chars;
         if usage.used_chars <= budget {
             return None;

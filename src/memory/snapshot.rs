@@ -261,17 +261,6 @@ pub struct CoreBlockUsage {
     pub total: usize,
 }
 
-impl CoreBlockUsage {
-    fn empty() -> Self {
-        Self {
-            used_chars: 0,
-            max_chars: PROJECTION_MAX_CHARS,
-            projected: 0,
-            total: 0,
-        }
-    }
-}
-
 /// Measure the runtime-owned core block through the same backend the prompt
 /// sees.
 ///
@@ -281,18 +270,18 @@ impl CoreBlockUsage {
 /// the input both callers need: the gateway reads `used_chars` /
 /// `max_chars`, the tool reads `used_chars` to size the over-budget notice
 /// and `total`/`projected` to name the omitted entries.
-pub async fn core_block_usage(memory: &dyn Memory) -> CoreBlockUsage {
-    let Ok(entries) = memory
-        .list(Some(&super::MemoryCategory::Core), super::SessionScope::Any)
-        .await
-    else {
-        return CoreBlockUsage::empty();
-    };
+pub async fn core_block_usage(memory: &dyn Memory) -> Result<CoreBlockUsage> {
+    let entries = memory
+        .list(
+            Some(&super::MemoryCategory::Core),
+            super::SessionScope::Private,
+        )
+        .await?;
 
     let mut total = 0_usize;
     let mut used_chars = 0_usize;
     let mut projected = 0_usize;
-    for entry in entries.into_iter().filter(|e| e.session_id.is_none()) {
+    for entry in entries {
         total += 1;
         // `- {key}: {content}\n` — five fixed chars around the variable parts,
         // the same per-line size `render_projection` produces.
@@ -305,12 +294,12 @@ pub async fn core_block_usage(memory: &dyn Memory) -> CoreBlockUsage {
         }
     }
 
-    CoreBlockUsage {
+    Ok(CoreBlockUsage {
         used_chars,
         max_chars: PROJECTION_MAX_CHARS,
         projected,
         total,
-    }
+    })
 }
 
 /// Flatten text to one line and remove both projection markers. A carriage
@@ -1269,7 +1258,7 @@ Rule 3: Protect the user.
     async fn core_block_usage_is_zero_on_an_empty_store() {
         let tmp = TempDir::new().unwrap();
         let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
-        let usage = core_block_usage(&mem).await;
+        let usage = core_block_usage(&mem).await.unwrap();
         assert_eq!(usage.used_chars, 0);
         assert_eq!(usage.max_chars, PROJECTION_MAX_CHARS);
         assert_eq!(usage.projected, 0);
@@ -1286,7 +1275,7 @@ Rule 3: Protect the user.
             .await
             .unwrap();
         let boxed: Box<dyn crate::memory::Memory> = Box::new(mem);
-        let usage = core_block_usage(boxed.as_ref()).await;
+        let usage = core_block_usage(boxed.as_ref()).await.unwrap();
         assert_eq!(usage.total, 1);
         assert_eq!(usage.projected, 1);
         // `- k: v\n` is 7 chars; "k".len() + "v".len() + 5 = 7.
@@ -1294,8 +1283,8 @@ Rule 3: Protect the user.
     }
 
     /// A note stored in a conversation does not count against the block: the
-    /// block holds shared core notes only, and the shared function filters
-    /// on `session_id IS NULL` after the list returns.
+    /// block holds shared core notes only, and the shared function lists the
+    /// `Private` scope.
     #[tokio::test]
     async fn core_block_usage_skips_notes_stored_in_a_conversation() {
         let tmp = workspace_with_core(&[("shared_pref", "short")]).await;
@@ -1309,7 +1298,7 @@ Rule 3: Protect the user.
         .await
         .unwrap();
 
-        let usage = core_block_usage(&mem).await;
+        let usage = core_block_usage(&mem).await.unwrap();
         assert_eq!(usage.total, 1, "guest rows are excluded");
         assert_eq!(usage.projected, 1);
         assert_eq!(
@@ -1336,7 +1325,7 @@ Rule 3: Protect the user.
         let tmp = workspace_with_core(&borrowed).await;
 
         let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
-        let usage = core_block_usage(&mem).await;
+        let usage = core_block_usage(&mem).await.unwrap();
 
         // 6 × 911 = 5466 chars: `- bulk_X: ` (10) + 900 `y`s + `\n` (1) each.
         assert_eq!(usage.used_chars, 5_466);
@@ -1346,5 +1335,91 @@ Rule 3: Protect the user.
         // 4 × 911 = 3644 fits; 5 × 911 = 4555 does not — so 4 project, 2 are
         // omitted. The notice and the console agree on this split.
         assert_eq!(usage.projected, 4);
+    }
+
+    /// A store that cannot be read is an error, not an empty block: a console
+    /// reading zero characters would look like a healthy empty file.
+    #[tokio::test]
+    async fn core_block_usage_reports_a_store_that_cannot_be_listed() {
+        struct UnlistableMemory;
+
+        #[async_trait::async_trait]
+        impl crate::memory::Memory for UnlistableMemory {
+            fn name(&self) -> &str {
+                "unlistable"
+            }
+            async fn store(
+                &self,
+                _key: &str,
+                _content: &str,
+                _category: crate::memory::MemoryCategory,
+                _session_id: Option<&str>,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _query: &str,
+                _limit: usize,
+                _scope: SessionScope<'_>,
+            ) -> Result<Vec<crate::memory::MemoryEntry>> {
+                Ok(Vec::new())
+            }
+            async fn get(&self, _key: &str) -> Result<Option<crate::memory::MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _category: Option<&crate::memory::MemoryCategory>,
+                _scope: SessionScope<'_>,
+            ) -> Result<Vec<crate::memory::MemoryEntry>> {
+                anyhow::bail!("list failed")
+            }
+            async fn forget(&self, _key: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn count(&self, _scope: SessionScope<'_>) -> Result<usize> {
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        assert!(core_block_usage(&UnlistableMemory).await.is_err());
+    }
+
+    /// `list` returns at most 1000 rows, newest first. The figure has to come
+    /// from the private rows alone, like the file `project_core_memories`
+    /// writes, or conversation notes crowd the owner's notes out of it.
+    #[tokio::test]
+    async fn core_block_usage_counts_private_notes_behind_many_conversation_notes() {
+        let tmp = TempDir::new().unwrap();
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        for i in 0..3 {
+            mem.store(
+                &format!("owner_{i}"),
+                "v",
+                crate::memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..1_005 {
+            mem.store(
+                &format!("chat_{i}"),
+                "v",
+                crate::memory::MemoryCategory::Core,
+                Some("chat:busy"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let usage = core_block_usage(&mem).await.unwrap();
+        assert_eq!(usage.total, 3);
+        // `- owner_0: v\n` is 13 chars; three of them.
+        assert_eq!(usage.used_chars, 3 * 13);
     }
 }

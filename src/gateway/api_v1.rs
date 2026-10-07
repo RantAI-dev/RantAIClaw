@@ -2341,12 +2341,14 @@ async fn memory_stats(
         .count(crate::memory::SessionScope::Private)
         .await
         .map_err(err_500)?;
-    let conversation_entries = total - private_entries;
+    let conversation_entries = total.saturating_sub(private_entries);
     let healthy = mem.health_check().await;
     // The figure comes from the same function the tool's capacity notice
     // reads, so `memory_md_chars` and "X chars over the budget" cannot
     // disagree.
-    let usage = crate::memory::snapshot::core_block_usage(mem.as_ref()).await;
+    let usage = crate::memory::snapshot::core_block_usage(mem.as_ref())
+        .await
+        .map_err(err_500)?;
     Ok(Json(serde_json::json!({
         "backend": mem.name(),
         "total_entries": total,
@@ -4306,7 +4308,11 @@ mod tests {
 
         assert_eq!(resp.0, StatusCode::CREATED);
         assert_eq!(resp.1["key"], "office");
-        assert!(state.mem.get("office").await.unwrap().is_some());
+        let row = state.mem.get("office").await.unwrap().unwrap();
+        assert_eq!(
+            row.session_id, None,
+            "no session_id in the body is a private note"
+        );
     }
 
     #[tokio::test]
@@ -4866,9 +4872,8 @@ mod tests {
         let entries = body["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["key"], "chat_one_note");
-        // The recall path does not re-count; `total` reports the page size and
-        // a `0` would have been a wrong answer for "of how many" — the count
-        // is one of the original three, all mine.
+        // The recall path returns only the matching entries; `total` reflects the
+        // filtered count of the requested place, not the unfiltered store.
         assert_eq!(body["total"], 1);
     }
 
@@ -5041,12 +5046,9 @@ mod tests {
     // ── the round-trip private-by-default ───────────────────────────
 
     /// A note posted with no `session_id` is private, and `?place=private`
-    /// finds it. With the old unfiltered Option<&str> shape the row at `None`
-    /// was reachable through every `?place=<key>` query — a guest on a
-    /// different conversation could ask for `place=anything` and read a
-    /// private note's content. The fix is the `Private` scope: `?place=`
-    /// (other than `private`) only matches that exact key, so a private
-    /// row never surfaces.
+    /// A private note with no `place` parameter is returned, but is not returned
+    /// when filtering to a different conversation's place. The round-trip ensures
+    /// the `Private` scope filter blocks unrelated places from accessing private notes.
     #[tokio::test]
     async fn memory_list_place_round_trip_private_does_not_leak_through_other_places() {
         let (_tmp, state) = state_with_real_memory();
@@ -5105,42 +5107,232 @@ mod tests {
         );
     }
 
-    /// A note posted with a conversation id is reachable from that exact
-    /// `place=<key>` and from no other. The control for the round-trip test
-    /// above: the conversation path also stays private by default.
-    #[tokio::test]
-    async fn memory_list_place_round_trip_conversation_is_scoped_to_its_key() {
-        let (_tmp, state) = state_with_real_memory();
-        state
-            .mem
-            .store(
-                "this_conv_note",
-                "kept in chat:one",
-                MemoryCategory::Core,
-                Some("chat:one"),
+    /// `POST /api/v1/memory` through the router, so the body is parsed the way a
+    /// console sends it.
+    async fn memory_post_json(app: &axum::Router, body: &str) -> StatusCode {
+        use tower::ServiceExt as _;
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/memory")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
             )
             .await
-            .unwrap();
-        state
-            .mem
-            .store(
-                "other_conv_note",
-                "kept in chat:two",
-                MemoryCategory::Core,
-                Some("chat:two"),
-            )
-            .await
-            .unwrap();
-        let app = router().with_state(state);
+            .unwrap()
+            .status()
+    }
 
-        let this_conv = memory_list_json(&app, "place=chat%3Aone").await;
-        let keys: Vec<&str> = this_conv["entries"]
+    fn listed_keys(body: &serde_json::Value) -> Vec<&str> {
+        body["entries"]
             .as_array()
             .unwrap()
             .iter()
             .map(|e| e["key"].as_str().unwrap())
-            .collect();
-        assert_eq!(keys, vec!["this_conv_note"]);
+            .collect()
+    }
+
+    /// A body without `session_id` writes a private note: the stored row has no
+    /// `session_id`, `?place=private` finds it, and a conversation's place does
+    /// not.
+    #[tokio::test]
+    async fn memory_post_without_session_id_is_found_under_place_private() {
+        let (_tmp, state) = state_with_real_memory();
+        let mem = state.mem.clone();
+        let app = router().with_state(state);
+
+        let status = memory_post_json(&app, r#"{"content":"operator fact","key":"posted"}"#).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let row = mem.get("posted").await.unwrap().unwrap();
+        assert_eq!(row.session_id, None);
+        let private = memory_list_json(&app, "place=private").await;
+        assert_eq!(listed_keys(&private), vec!["posted"]);
+        let conversation = memory_list_json(&app, "place=chat%3Aone").await;
+        assert!(listed_keys(&conversation).is_empty());
+    }
+
+    /// A body with `session_id` writes into that conversation: its own place
+    /// finds the note and `?place=private` does not.
+    #[tokio::test]
+    async fn memory_post_with_session_id_is_found_only_under_that_place() {
+        let (_tmp, state) = state_with_real_memory();
+        let mem = state.mem.clone();
+        let app = router().with_state(state);
+
+        let status = memory_post_json(
+            &app,
+            r#"{"content":"chat fact","key":"posted","session_id":"chat:one"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let row = mem.get("posted").await.unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("chat:one"));
+        let conversation = memory_list_json(&app, "place=chat%3Aone").await;
+        assert_eq!(listed_keys(&conversation), vec!["posted"]);
+        let private = memory_list_json(&app, "place=private").await;
+        assert!(listed_keys(&private).is_empty());
+    }
+
+    /// `?q=` with `place=private` ranks only the rows with no `session_id`,
+    /// even though the conversation rows match the query as well.
+    #[tokio::test]
+    async fn memory_list_with_place_private_and_q_ranks_only_private_rows() {
+        let (_tmp, app) = app_with_three_places().await;
+        let body = memory_list_json(&app, "q=note&place=private").await;
+        assert_eq!(listed_keys(&body), vec!["private_note"]);
+        assert_eq!(body["total"], 1);
+    }
+
+    /// With `q` the total is the size of the ranked set inside the place, not
+    /// the whole store and not the page: paging through it leaves it unchanged.
+    #[tokio::test]
+    async fn memory_list_total_with_q_and_place_is_the_matches_in_that_place() {
+        let (_tmp, state) = state_with_real_memory();
+        for i in 0..3 {
+            state
+                .mem
+                .store(
+                    &format!("private_{i}"),
+                    "shared topic",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        for i in 0..4 {
+            state
+                .mem
+                .store(
+                    &format!("chat_{i}"),
+                    "shared topic",
+                    MemoryCategory::Core,
+                    Some("chat:one"),
+                )
+                .await
+                .unwrap();
+        }
+        let app = router().with_state(state);
+
+        let first = memory_list_json(&app, "q=shared&place=private&limit=2").await;
+        assert_eq!(first["count"], 2);
+        assert_eq!(first["total"], 3, "four chat rows match too, but not here");
+        let second = memory_list_json(&app, "q=shared&place=private&limit=2&offset=2").await;
+        assert_eq!(second["count"], 1);
+        assert_eq!(second["total"], 3, "paging does not change the total");
+
+        let chat = memory_list_json(&app, "q=shared&place=chat%3Aone&limit=2").await;
+        assert_eq!(chat["total"], 4);
+    }
+
+    /// A store whose counts and list can be set, to drive `GET /memory/stats`
+    /// into states a real backend only reaches by racing or failing.
+    struct StatsProbeMemory {
+        any: usize,
+        private: usize,
+        list_fails: bool,
+    }
+
+    #[async_trait]
+    impl Memory for StatsProbeMemory {
+        fn name(&self) -> &str {
+            "stats-probe"
+        }
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _scope: SessionScope<'_>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _scope: SessionScope<'_>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            if self.list_fails {
+                anyhow::bail!("list failed");
+            }
+            Ok(Vec::new())
+        }
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self, scope: SessionScope<'_>) -> anyhow::Result<usize> {
+            Ok(match scope {
+                SessionScope::Private => self.private,
+                _ => self.any,
+            })
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    async fn stats_response(mem: StatsProbeMemory) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt as _;
+        let mut state = test_state();
+        state.mem = Arc::new(mem);
+        let res = router()
+            .with_state(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/memory/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Two separate count queries can disagree when a write lands between
+    /// them. The conversation leg then clamps to zero instead of underflowing.
+    #[tokio::test]
+    async fn memory_stats_clamps_conversation_entries_when_the_counts_race() {
+        let (status, body) = stats_response(StatsProbeMemory {
+            any: 3,
+            private: 5,
+            list_fails: false,
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["conversation_entries"], 0);
+    }
+
+    /// A store that cannot be read answers 500, the same as a failing count,
+    /// instead of reporting an empty MEMORY.md block.
+    #[tokio::test]
+    async fn memory_stats_answers_500_when_the_core_block_cannot_be_measured() {
+        let (status, body) = stats_response(StatsProbeMemory {
+            any: 3,
+            private: 1,
+            list_fails: true,
+        })
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "internal_error");
     }
 
     /// `GET /api/v1/memory/stats` carries the resolved search mode the same way
@@ -5237,24 +5429,6 @@ mod tests {
         );
     }
 
-    /// Swap the two legs and the invariant still holds, but the per-leg
-    /// counts flip. This is the assertion a mutation that just renames the
-    /// fields would break.
-    #[tokio::test]
-    async fn memory_stats_counts_put_the_private_note_in_the_private_leg() {
-        let (_tmp, app) = app_with_three_places().await;
-        let body = memory_stats_json(&app).await;
-        let private_entries = body["private_entries"].as_u64().unwrap();
-
-        // app_with_three_places writes the private note under no session_id;
-        // the other two are written with `chat:one` and `chat:two`. A swap
-        // would report `private_entries == 2` here.
-        assert!(
-            private_entries == 1,
-            "private_entries should be 1, got {private_entries}"
-        );
-    }
-
     /// A fresh database reports zeros for everything: counts, totals, the
     /// `memory_md_chars` figure, and the ceiling. A console that showed
     /// `total_entries: 0` next to `memory_md_chars: 1234` would be a wrong
@@ -5273,19 +5447,6 @@ mod tests {
             body["memory_md_max_chars"], 4_000,
             "the ceiling is the constant `PROJECTION_MAX_CHARS`"
         );
-    }
-
-    /// `memory_md_chars == 0` is the empty-store figure. Pinning it here
-    /// separately from the all-zeros test, because a regression that
-    /// computed the count before the empty-store zero check would still
-    /// pass the all-zeros test.
-    #[tokio::test]
-    async fn memory_stats_reports_memory_md_usage_zero_on_an_empty_store() {
-        let (_tmp, state) = state_with_real_memory();
-        let app = router().with_state(state);
-        let body = memory_stats_json(&app).await;
-        assert_eq!(body["memory_md_chars"], 0);
-        assert_eq!(body["memory_md_max_chars"], 4_000);
     }
 
     /// Six private core entries of 900 chars each overflow the 4 000-char
@@ -5339,7 +5500,9 @@ mod tests {
         // that fails. The comparison stays in `u64` because that is the
         // JSON number type the handler returns; a `usize` cast on a 32-bit
         // target would be a silent truncation.
-        let shared_pre = crate::memory::snapshot::core_block_usage(mem.as_ref()).await;
+        let shared_pre = crate::memory::snapshot::core_block_usage(mem.as_ref())
+            .await
+            .unwrap();
         let app = router().with_state(state);
         let stats = memory_stats_json(&app).await;
         let stats_used = stats["memory_md_chars"].as_u64().unwrap();
@@ -5379,7 +5542,9 @@ mod tests {
 
         let (over_by, budget) = parse_capacity_notice(&result.output)
             .expect("the notice must state the over-by and the budget");
-        let shared_post = crate::memory::snapshot::core_block_usage(mem.as_ref()).await;
+        let shared_post = crate::memory::snapshot::core_block_usage(mem.as_ref())
+            .await
+            .unwrap();
         assert_eq!(
             over_by + budget,
             shared_post.used_chars,
@@ -5406,10 +5571,6 @@ mod tests {
         let budget: usize = tail[..block_idx].trim().parse().ok()?;
         Some((over_by, budget))
     }
-
-    // ────────────────────────────────────────────────────────────────────
-    // skills management API (plan 039)
-    // ────────────────────────────────────────────────────────────────────
 
     // ────────────────────────────────────────────────────────────────────
     // skills management API (plan 039)

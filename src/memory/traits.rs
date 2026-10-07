@@ -89,14 +89,6 @@ impl<'a> SessionScope<'a> {
             Some(key) => SessionScope::Conversation(key),
         }
     }
-
-    /// True when the scope actually narrows the read — `Private` and
-    /// `Conversation` are both narrower than the unfiltered `Any`. Callers
-    /// that show "of N" totals use this to decide whether `count(scope)` is
-    /// the right total or the page size has to stand in.
-    pub fn is_narrowed(&self) -> bool {
-        !matches!(self, SessionScope::Any)
-    }
 }
 
 /// Core memory trait — implement for any persistence backend

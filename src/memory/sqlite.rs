@@ -2366,6 +2366,103 @@ mod tests {
         assert_eq!(hits[0].key, "a");
     }
 
+    /// `Private` selects the rows with no `session_id`, in SQL: the conversation
+    /// rows outnumber the private one and match the query better, so a filter
+    /// applied after the limit would lose it. Asks `fts5_search` directly
+    /// because `recall` re-checks the scope and falls back to a substring scan,
+    /// which would hide the missing clause.
+    #[tokio::test]
+    async fn fts5_search_private_scope_filters_in_sql() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..40 {
+            mem.store(
+                &format!("noise_{i}"),
+                "shared topic shared topic shared topic",
+                MemoryCategory::Core,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store("operator_note", "shared topic", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let conn = mem.conn.lock();
+        let hits = SqliteMemory::fts5_search(
+            &conn,
+            "shared topic",
+            10,
+            SessionScope::Private,
+            CategoryScope::Notes,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "only the private row matches the scope");
+    }
+
+    /// The substring fallback runs when the keyword index finds nothing, and it
+    /// carries its own copy of the scope clause. The private row is the oldest,
+    /// so a fallback that filtered after its limit would spend the limit on
+    /// the newer conversation rows and lose it.
+    #[tokio::test]
+    async fn private_recall_substring_fallback_filters_in_sql() {
+        let (_tmp, mem) = temp_sqlite();
+        // `foobar` sits inside a longer token, so the keyword index cannot
+        // match it and only the substring scan can.
+        mem.store("operator_note", "qqfoobarqq", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        for i in 0..40 {
+            mem.store(
+                &format!("noise_{i}"),
+                "xyzfoobarxyz",
+                MemoryCategory::Core,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let hits = mem
+            .recall("foobar", 5, SessionScope::Private)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = hits.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["operator_note"]);
+    }
+
+    /// The vector scan filters in SQL as well, so a scoped scan does not read
+    /// every conversation's embeddings.
+    #[tokio::test]
+    async fn vector_search_private_scope_skips_conversation_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = stub_memory(tmp.path(), "stub", 8);
+        mem.store(
+            "chat_row",
+            "shared topic",
+            MemoryCategory::Core,
+            Some("session-a"),
+        )
+        .await
+        .unwrap();
+        mem.store("operator_note", "shared topic", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let embedding = vec![1.0_f32; 8];
+        let conn = mem.conn.lock();
+        let hits = SqliteMemory::vector_search(
+            &conn,
+            &embedding,
+            10,
+            None,
+            SessionScope::Private,
+            CategoryScope::Notes,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "only the private row is scanned");
+    }
+
     /// A `"` inside a term closed the FTS5 string literal early, so the whole
     /// expression failed to parse and the query silently dropped to the
     /// substring fallback.
