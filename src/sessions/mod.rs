@@ -14,4 +14,6 @@ pub use search::{MutexSessionStore, ProfileSessionSearch, SessionSearch};
 pub use store::{
     derive_session_title, normalize_set_title, SessionRef, SessionStats, SessionStore,
 };
-pub use types::{messages_to_turns, Message, SearchResult, Session, SessionMeta};
+pub use types::{
+    messages_to_turns, ConversationSessionRow, Message, SearchResult, Session, SessionMeta,
+};

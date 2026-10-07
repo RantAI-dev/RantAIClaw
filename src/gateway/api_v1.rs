@@ -324,6 +324,19 @@ fn open_session_store() -> anyhow::Result<crate::sessions::SessionStore> {
     crate::sessions::SessionStore::open(&path)
 }
 
+/// Workspace directory the runtime publishes under. Reads from
+/// `state.config` so the fallback `ChannelHistoryStore` (the no-runtime path
+/// in `DELETE /api/v1/sessions/{id}`) opens the same workspace the runtime
+/// built with (`config.workspace_dir`, set by `Config::load_or_init` /
+/// `resolve_runtime_config_dirs`). Going through `ProfileManager::active()`
+/// instead would derive `<rantaiclaw_root>/profiles/<active>/workspace` —
+/// which differs from `config.workspace_dir` whenever an env var
+/// (`RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE`, or an
+/// `active_workspace.toml` override) selects a non-profile workspace.
+fn workspace_dir(state: &AppState) -> anyhow::Result<std::path::PathBuf> {
+    Ok(state.config.lock().workspace_dir.clone())
+}
+
 /// Resolve a `{id}` path segment — a full session id or a unique prefix — into
 /// a concrete id, mapping the outcome onto the API's error shapes.
 ///
@@ -1242,6 +1255,44 @@ async fn sessions_list(
     // than the newest 500 used to be unreachable from the API entirely.
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
+    // `?source=channel` is the console's per-conversation bucket — it carries
+    // the conversation key plus surface/place/thread so the row reads as a
+    // chat, not a generic session. Anything else uses the generic row shape.
+    if q.source.as_deref() == Some("channel") {
+        let sessions = store
+            .list_conversation_sessions(limit, offset)
+            .map_err(err_500)?;
+        let total = store.count_conversation_sessions().map_err(err_500)?;
+        let json: Vec<_> = sessions
+            .iter()
+            .map(|s| {
+                let (surface, place, thread) =
+                    crate::channels::conversation::parse_place(&s.conversation_key)
+                        .map(|(surface, place, thread)| (Some(surface), Some(place), thread))
+                        .unwrap_or((None, None, None));
+                serde_json::json!({
+                    "id": s.id,
+                    "title": s.title,
+                    "model": s.model,
+                    "started_at": s.started_at,
+                    "ended_at": s.ended_at,
+                    "message_count": s.message_count,
+                    "source": s.source,
+                    "conversation_key": s.conversation_key,
+                    "surface": surface,
+                    "place": place,
+                    "thread": thread,
+                    "last_activity_at": s.last_activity_at,
+                })
+            })
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "sessions": json,
+            "count": json.len(),
+            "offset": offset,
+            "total": total,
+        })));
+    }
     let (sessions, total) = match q.source.as_deref() {
         Some(src) => {
             let sessions = store
@@ -1279,7 +1330,6 @@ async fn sessions_list(
         "count": json.len(),
         "offset": offset,
         "total": total,
-        "source_filter": q.source,
     })))
 }
 
@@ -1309,11 +1359,16 @@ async fn sessions_get(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SearchBody {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+    /// Same shape as `ListQuery.source`: defaults to every row except
+    /// `channel` so the operator's free-text search stays in their own
+    /// bucket. Pass `channel` to scope the search to channel recordings.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 async fn sessions_search(
@@ -1327,7 +1382,14 @@ async fn sessions_search(
     }
     let store = open_session_store().map_err(err_500)?;
     let limit = body.limit.unwrap_or(20).min(200);
-    let results = store.search(&body.query, limit).map_err(err_500)?;
+    // Default (None) and any non-channel source value keep the search
+    // scoped away from channel rows; `Some("channel")` narrows it to
+    // channel recordings. The source predicate is applied in SQL so the
+    // `limit` slots are filled with on-bucket matches instead of being
+    // eaten by off-bucket rows that a Rust-side filter would then drop.
+    let results = store
+        .search_scoped(&body.query, limit, body.source.as_deref())
+        .map_err(err_500)?;
     let json: Vec<_> = results
         .iter()
         .map(|r| {
@@ -1341,9 +1403,10 @@ async fn sessions_search(
             })
         })
         .collect();
-    Ok(Json(
-        serde_json::json!({ "results": json, "count": json.len() }),
-    ))
+    Ok(Json(serde_json::json!({
+        "results": json,
+        "count": json.len(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1420,13 +1483,113 @@ async fn sessions_delete(
     check_auth(&state, &headers)?;
     let mut store = open_session_store().map_err(err_500)?;
     let session_id = resolve_session_id(&store, &id)?;
-    let deleted = store.delete_session(&session_id).map_err(err_500)?;
-    // A deleted session's "Always" grants must not outlive it (a reused id would
-    // otherwise inherit stale approvals).
-    crate::approval::session_grants::clear_session_grants(&session_id);
-    Ok(Json(
-        serde_json::json!({ "deleted": deleted, "id": session_id }),
-    ))
+    // Look up the session row directly so the source determines whether to
+    // fan the delete out across the conversation. `resolve_session_id` only
+    // returned the canonical id; the source lives on the row.
+    let session = match store.get_session(&session_id).map_err(err_500)? {
+        Some(s) => s,
+        None => return Err(err_404(format!("no session matches `{id}`"))),
+    };
+    if session.source != "channel" {
+        let deleted = store.delete_session(&session_id).map_err(err_500)?;
+        // A deleted session's "Always" grants must not outlive it (a reused id would
+        // otherwise inherit stale approvals).
+        crate::approval::session_grants::clear_session_grants(&session_id);
+        return Ok(Json(
+            serde_json::json!({ "deleted": deleted, "id": session_id }),
+        ));
+    }
+
+    // Channel source: delete the whole conversation. Three places hold it:
+    //   1. sessions.db rows for this conversation_key (messages + the sessions),
+    //   2. brain.db `channel_history` row for this conversation_key,
+    //   3. the runtime's in-RAM `conversation_histories` entry.
+    // Notes with `memories.session_id = <key>` and scheduled jobs are not
+    // touched; the response does not claim they are removed.
+    let conversation_key = session
+        .conversation_key
+        .clone()
+        .ok_or_else(|| err_500(anyhow::anyhow!("channel session has no conversation_key")))?;
+
+    // Ask the channel runtime to drop the in-RAM entry + `channel_history`
+    // row. The runtime's request handler holds its in-flight counter across
+    // the busy check and the clear so a new turn cannot register for this
+    // key between them.
+    //
+    // Three outcomes:
+    //   - `Done`: runtime handled both copies. The gateway still owns the
+    //     `sessions.db` rows.
+    //   - `Busy`: a turn for this conversation is in flight; refuse with 409
+    //     so the operator retries once it ends.
+    //   - `Closed` (bus closed): no runtime is alive in this process. The
+    //     standalone `gateway` command, and a daemon with no channel
+    //     configured, hit this. The gateway opens its own
+    //     `ChannelHistoryStore` for the durable copy; the in-RAM entry is
+    //     the previous runtime's and is gone with it.
+    //   - `RuntimeError`: the handler accepted the request but the
+    //     in-RAM/durable clear failed mid-flight. The two copies may be
+    //     inconsistent; refuse with `500` rather than fall back and clear
+    //     just one.
+    match state
+        .channel_bus
+        .try_request_drop(conversation_key.clone())
+        .await
+    {
+        Ok(crate::channels::ChannelBusReply::Done) => {}
+        Ok(crate::channels::ChannelBusReply::Busy) => {
+            return Err(err_409("conversation has an in-flight turn"));
+        }
+        Err(crate::channels::BusRequestRejection::Full) => {
+            return Err(err_500(anyhow::anyhow!(
+                "channel runtime request queue is full"
+            )));
+        }
+        Err(crate::channels::BusRequestRejection::RuntimeError(message)) => {
+            return Err(err_500(anyhow::anyhow!(
+                "channel runtime could not clear the conversation: {message}"
+            )));
+        }
+        Err(crate::channels::BusRequestRejection::Closed) => {
+            // No runtime to ask; the gateway clears the durable copy itself.
+            let workspace = workspace_dir(&state).map_err(err_500)?;
+            // `ChannelHistoryStore::open` is open-or-create, so a real I/O
+            // failure (no parent dir, bad perms, locked file) is the only way
+            // it returns Err — and a row may already exist on disk. A copy
+            // that cannot be deleted is an error: the handler must NOT answer
+            // `deleted: true` while leaving the durable row behind, because
+            // the invariant says every copy of the conversation is gone.
+            let store = crate::channels::history_store::ChannelHistoryStore::open(&workspace)
+                .map_err(|e| {
+                    err_500(anyhow::anyhow!(
+                        "channel_history store could not be opened for delete: {e}"
+                    ))
+                })?;
+            if let Err(e) = store.delete(&conversation_key) {
+                return Err(err_500(anyhow::anyhow!(
+                    "channel_history delete failed: {e}"
+                )));
+            }
+        }
+    }
+
+    // Collect every session id BEFORE the delete so we can clear session
+    // grants per removed session. `delete_conversation` removes the rows.
+    let session_ids = store
+        .session_ids_for_conversation(&conversation_key)
+        .map_err(err_500)?;
+    let removed = store
+        .delete_conversation(&conversation_key)
+        .map_err(err_500)?;
+    for id in &session_ids {
+        crate::approval::session_grants::clear_session_grants(id);
+    }
+
+    Ok(Json(serde_json::json!({
+        "deleted": removed > 0,
+        "id": session_id,
+        "conversation_key": conversation_key,
+        "sessions_removed": removed,
+    })))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2807,8 +2970,11 @@ mod tests {
     async fn sessions_list_default_excludes_channel_sessions() {
         // The default `GET /api/v1/sessions` page omits `source='channel'`
         // rows so the operator's bulk scan does not surface transcripts that
-        // already live in their own bucket. Pass `?source=channel` (or any
-        // other source) to opt in.
+        // already live in their own bucket. Pass `?source=channel` to opt in.
+        // Three sources are seeded so a regression that drops either
+        // predicate shows up next to a passing neighbour: a `tui` row, an `api`
+        // row, and a `channel` row. Default lists the `tui` + `api` rows;
+        // `?source=channel` lists the `channel` row and nothing else.
         use axum::extract::Query;
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp home");
@@ -2816,16 +2982,17 @@ mod tests {
         let profile = crate::profile::ProfileManager::active().expect("active profile");
         let db = profile.sessions_db_path();
         assert!(db.starts_with(tmp.path()), "test must own its sessions.db");
-        let session_id = {
+        let (tui_id, api_id, channel_id) = {
             let mut store = crate::sessions::SessionStore::open(&db).expect("open store");
+            let tui_id = store.new_session("m", "tui").unwrap().id;
             let api_id = store.new_session("m", "api").unwrap().id;
-            store
+            let channel_id = store
                 .record_channel_turn("m", "telegram:chat-1", "u", "r", None)
                 .unwrap();
-            api_id
+            (tui_id, api_id, channel_id)
         };
 
-        // Default view: only the api session comes through.
+        // Default view: only the tui + api sessions come through.
         let state = test_state();
         let resp = sessions_list(
             State(state.clone()),
@@ -2840,9 +3007,19 @@ mod tests {
         .expect("default list ok")
         .0;
         let count = resp["count"].as_u64().expect("count");
-        assert_eq!(count, 1, "only the api session in the default view");
-        let id_str = resp["sessions"][0]["id"].as_str().expect("id");
-        assert_eq!(id_str, session_id);
+        assert_eq!(count, 2, "default view lists tui + api only");
+        let ids: std::collections::HashSet<String> = resp["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&tui_id), "tui row in default list");
+        assert!(ids.contains(&api_id), "api row in default list");
+        assert!(
+            !ids.contains(&channel_id),
+            "channel row MUST NOT appear in default list"
+        );
 
         // Explicit `?source=channel` returns the channel session and nothing
         // else.
@@ -2859,8 +3036,10 @@ mod tests {
         .expect("channel list ok")
         .0;
         let count = resp["count"].as_u64().expect("count");
-        assert_eq!(count, 1, "only the channel session");
+        assert_eq!(count, 1, "channel list returns exactly one row");
+        let id_str = resp["sessions"][0]["id"].as_str().expect("id");
         let source_str = resp["sessions"][0]["source"].as_str().expect("source");
+        assert_eq!(id_str, channel_id);
         assert_eq!(source_str, "channel");
     }
 
@@ -2888,11 +3067,108 @@ mod tests {
             Json(SearchBody {
                 query: "\"".into(),
                 limit: Some(5),
+                source: None,
             }),
         )
         .await
         .expect("bare quote must not 500");
         assert_eq!(resp.0["count"], 0);
+    }
+
+    /// Handler-level search filter. The store-level `search_scoped` covers the
+    /// SQL predicate; this test pins the same four cases the operator-facing
+    /// API serves, on a store that holds one `tui`, one `api`, and one
+    /// `channel` session, all carrying the same free-text token. The token
+    /// matches every session so the source predicate is the only thing
+    /// keeping the rows in their bucket. Drop either predicate on either
+    /// branch and the matching case fails next to its passing neighbour.
+    #[tokio::test]
+    async fn sessions_search_source_filter_segregates_channel_rows() {
+        const TOKEN: &str = "rantaiclawsearchmarker";
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let db = profile.sessions_db_path();
+        assert!(db.starts_with(tmp.path()), "test must own its sessions.db");
+        let (tui_id, api_id, channel_id) = {
+            let mut store = crate::sessions::SessionStore::open(&db).expect("open store");
+            let tui_id = store.new_session("m", "tui").unwrap().id;
+            // Re-use the tui session id so the messages land under
+            // `source = 'tui'` (record_api_turn keeps the existing source
+            // when the session already exists, only stamping `api` on a
+            // fresh INSERT).
+            store
+                .record_api_turn("m", Some(&tui_id), TOKEN, "tui assistant")
+                .unwrap();
+            let api_id = store
+                .record_api_turn("m", None, TOKEN, "api assistant")
+                .unwrap();
+            let channel_id = store
+                .record_channel_turn("m", "telegram:chat-1", TOKEN, "channel assistant", None)
+                .unwrap();
+            (tui_id, api_id, channel_id)
+        };
+
+        let state = test_state();
+
+        // Default search matches every row by FTS, but the predicate excludes
+        // channel rows. Returns tui + api only.
+        let resp_default = sessions_search(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SearchBody {
+                query: TOKEN.to_string(),
+                limit: Some(20),
+                source: None,
+            }),
+        )
+        .await
+        .expect("default search ok")
+        .0;
+        let mut default_ids: Vec<String> = resp_default["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap().to_string())
+            .collect();
+        default_ids.sort();
+        let mut expected = vec![tui_id.clone(), api_id.clone()];
+        expected.sort();
+        assert_eq!(
+            default_ids, expected,
+            "default search must include tui + api and exclude channel"
+        );
+        assert!(
+            !default_ids.contains(&channel_id),
+            "default search MUST NOT include the channel row"
+        );
+
+        // `source: "channel"` returns only the channel row.
+        let resp_channel = sessions_search(
+            State(state),
+            HeaderMap::new(),
+            Json(SearchBody {
+                query: TOKEN.to_string(),
+                limit: Some(20),
+                source: Some("channel".to_string()),
+            }),
+        )
+        .await
+        .expect("channel search ok")
+        .0;
+        let channel_ids: Vec<String> = resp_channel["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            channel_ids,
+            vec![channel_id.clone()],
+            "source=channel search must return exactly the channel row"
+        );
     }
 
     #[test]
@@ -5181,5 +5457,1245 @@ mod tests {
             !skills_root.join("weather").exists(),
             "skill directory must be removed"
         );
+    }
+
+    // ── Deleting a channel conversation removes every copy ─────────────
+
+    /// A channel conversation lives in three places under one
+    /// `conversation_key` — the running daemon's `conversation_histories`
+    /// map, the durable `channel_history` row in `brain.db`, and one or
+    /// more `sessions` rows in `sessions.db` (one per `/new` cycle). The
+    /// whole-conversation DELETE removes all three copies atomically and
+    /// the next turn in that chat starts from an empty history under a
+    /// new session id.
+    #[tokio::test]
+    async fn sessions_delete_channel_conversation_clears_every_copy_with_running_runtime() {
+        use crate::channels::dispatch::run_message_dispatch_loop;
+        use crate::channels::history_store::ChannelHistoryStore;
+        use crate::channels::test_support::HistoryCaptureProvider;
+        use crate::channels::{
+            run_channel_bus_requests, ChannelBus, ChannelBusRequest, ChannelRuntimeContext,
+        };
+        use crate::sessions::SessionStore as SessionsStore;
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+
+        // Pre-create the stores so the runtime and the handler share them.
+        let history_store = ChannelHistoryStore::open(&workspace_dir).expect("open history store");
+        let session_store = SessionsStore::open(&session_db).expect("open sessions store");
+
+        // Build a channel runtime context with every store the dispatch
+        // worker writes to, plus the in-flight counter the bus-request
+        // handler reads.
+        let channel_impl = Arc::new(crate::channels::test_support::RecordingChannel::default())
+            as Arc<dyn crate::channels::traits::Channel>;
+        let mut channels_by_name = std::collections::HashMap::new();
+        channels_by_name.insert(channel_impl.name().to_string(), channel_impl.clone());
+
+        let provider = Arc::new(HistoryCaptureProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(std::sync::Mutex::new(
+                crate::channels::routing::RuntimeConfigSlot::default(),
+            )),
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(crate::channels::test_support::NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
+            owner_prompt: crate::channels::prompt::fixed_owner_prompt(
+                "test-system-prompt".to_string(),
+            ),
+            guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            history_store: Some(Arc::new(history_store)),
+            session_store: Some(Arc::new(std::sync::Mutex::new(session_store))),
+            ledger: None,
+            provider_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            route_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: crate::providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace_dir.clone()),
+            message_timeout_secs: crate::channels::CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+            in_flight_counter: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        });
+
+        let bus = Arc::new(ChannelBus::default());
+        let (msg_tx, msg_rx) =
+            tokio::sync::mpsc::channel::<crate::channels::traits::ChannelMessage>(8);
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel::<ChannelBusRequest>(8);
+
+        bus.publish(msg_tx.clone()).await;
+        bus.publish_request_sender(req_tx).await;
+
+        // Mirror what `run_channel_runtime` does — the bus-request handler
+        // and the dispatch loop share the same runtime context, so the
+        // counter they read is one map. Each loop carries its own shutdown
+        // token so we can drain one loop, run the delete, then start a
+        // second loop for the third message.
+        let req_handle = tokio::spawn({
+            let ctx = Arc::clone(&runtime_ctx);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            async move { run_channel_bus_requests(req_rx, ctx, shutdown).await }
+        });
+        let shutdown_first = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn({
+            let ctx = Arc::clone(&runtime_ctx);
+            let shutdown = shutdown_first.clone();
+            async move { run_message_dispatch_loop(msg_rx, ctx, 1, shutdown).await }
+        });
+
+        // Two turns on the same conversation key. The channel is a recording
+        // stub, the provider captures every request, both stores persist.
+        // `conversation_history_key` is what the dispatch counter, the
+        // session writer, and the bus-request handler all share, so the
+        // `key` we assert on has to be the value the dispatch code derives
+        // from the message — not a string we picked by hand.
+        let m1 = test_channel_message("m1", "first user", "telegram:chat-1");
+        let m2 = test_channel_message("m2", "second user", "telegram:chat-1");
+        let key = crate::channels::dispatch::conversation_history_key(&m1);
+        msg_tx.send(m1).await.expect("send m1");
+        msg_tx.send(m2).await.expect("send m2");
+
+        // Wait for both turns to land. The dispatch worker decrements
+        // `in_flight_counter` only after `process_channel_message` has
+        // returned, and `process_channel_message` finishes with the
+        // `record_channel_turn` write to `sessions.db` and the in-RAM +
+        // `channel_history` appends. We first wait for the provider to have
+        // been called twice (so both workers have entered the turn body),
+        // then for the counter to drop back to zero (so both have finished
+        // the recording step).
+        let wait_for_workers = async {
+            for _ in 0..200 {
+                let calls = provider
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len();
+                if calls >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            for _ in 0..200 {
+                let n = {
+                    let counts = runtime_ctx
+                        .in_flight_counter
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    counts.get(&key).copied().unwrap_or(0)
+                };
+                if n == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait_for_workers)
+            .await
+            .expect("dispatch workers did not finish within 10s");
+        // Forbid new senders so `rx` no longer holds the bus's sender alive.
+        drop(msg_tx);
+        bus.clear().await;
+        shutdown_first.cancel();
+        let () = tokio::time::timeout(std::time::Duration::from_secs(10), loop_handle)
+            .await
+            .expect("dispatch loop timed out")
+            .expect("dispatch loop panicked");
+
+        // All three copies populated before the delete.
+        let sessions_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+        let rows_before = sessions_store
+            .session_ids_for_conversation(&key)
+            .expect("list before");
+        assert!(
+            !rows_before.is_empty(),
+            "sessions.db copy: at least one row before delete"
+        );
+
+        let hist_store = ChannelHistoryStore::open(&workspace_dir).expect("reopen history");
+        let raw_before = hist_store
+            .raw_turns_json(&key)
+            .expect("raw turn read")
+            .expect("raw turn present");
+        assert!(
+            raw_before.contains("first user"),
+            "channel_history copy: persisted row carries the first user turn"
+        );
+
+        let live_before = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+            .expect("in-RAM map: key present");
+        assert!(
+            live_before.iter().any(|t| t.content.contains("first user")),
+            "in-RAM map: at least one earlier turn"
+        );
+
+        // Build an AppState that points the gateway at the same workspace
+        // the runtime uses. The handler's fallback (bus closed) opens the
+        // channel_history store from `config.workspace_dir`.
+        let mut state = test_state();
+        *state.config.lock() = {
+            let mut cfg = crate::config::Config::default();
+            cfg.workspace_dir = workspace_dir.clone();
+            cfg
+        };
+        state.channel_bus = Arc::clone(&bus);
+        let session_id = rows_before[0].clone();
+
+        // Delete the conversation through the handler.
+        let resp = sessions_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.clone()),
+        )
+        .await
+        .expect("delete ok")
+        .0;
+        assert_eq!(resp["deleted"], true);
+        assert_eq!(resp["id"], session_id);
+        assert_eq!(resp["conversation_key"], key);
+        assert!(
+            resp["sessions_removed"].as_u64().unwrap_or(0) >= 1,
+            "sessions_removed must count at least the one row we deleted"
+        );
+
+        // All three copies empty after the delete.
+        let sessions_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+        let rows_after = sessions_store
+            .session_ids_for_conversation(&key)
+            .expect("list after");
+        assert!(
+            rows_after.is_empty(),
+            "sessions.db copy: every row for this key is gone"
+        );
+        // FTS rows for those messages must be gone too — the AFTER DELETE
+        // trigger on `messages` clears them. Confirm by searching for the
+        // unique token we recorded; default search (no source) excludes
+        // channel anyway, so pass `Some("channel")` and expect zero hits.
+        let fts_hits = sessions_store
+            .search_scoped("first user", 10, Some("channel"))
+            .expect("search");
+        assert!(
+            fts_hits.is_empty(),
+            "FTS rows: search returns no hits for the deleted conversation"
+        );
+
+        let hist_store = ChannelHistoryStore::open(&workspace_dir).expect("reopen history");
+        let raw_after = hist_store.raw_turns_json(&key).expect("raw turn read");
+        assert!(
+            raw_after.is_none(),
+            "channel_history copy: the persisted row is gone"
+        );
+
+        let live_after = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        assert!(live_after.is_none(), "in-RAM map: the key entry is gone");
+
+        // Run one more turn. The next request the provider sees must NOT
+        // carry the earlier text, and a brand-new session id exists for
+        // the same key.
+        let (msg_tx2, msg_rx2) = tokio::sync::mpsc::channel(8);
+        bus.publish(msg_tx2.clone()).await;
+        msg_tx2
+            .send(test_channel_message("m3", "third user", "telegram:chat-1"))
+            .await
+            .expect("send m3");
+
+        let ctx2 = Arc::clone(&runtime_ctx);
+        let shutdown2 = tokio_util::sync::CancellationToken::new();
+        let loop_handle2 = tokio::spawn({
+            let shutdown = shutdown2.clone();
+            async move { run_message_dispatch_loop(msg_rx2, ctx2, 1, shutdown).await }
+        });
+        // Wait for the third turn's worker to fully finish — past the
+        // `record_channel_turn` write — before cancelling.
+        let prev_calls = provider
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let wait_for_worker3 = async {
+            for _ in 0..200 {
+                let calls = provider
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len();
+                if calls > prev_calls {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            for _ in 0..200 {
+                let n = {
+                    let counts = runtime_ctx
+                        .in_flight_counter
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    counts.get(&key).copied().unwrap_or(0)
+                };
+                if n == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait_for_worker3)
+            .await
+            .expect("third turn's worker did not finish within 10s");
+        drop(msg_tx2);
+        bus.clear().await;
+        shutdown2.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), loop_handle2)
+            .await
+            .expect("dispatch loop 2 timed out")
+            .expect("dispatch loop 2 panicked");
+
+        let provider_calls = provider
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let last_call = provider_calls.last().expect("provider was called");
+        let saw_earlier_text = last_call
+            .iter()
+            .any(|(_, content)| content.contains("first user") || content.contains("second user"));
+        assert!(
+            !saw_earlier_text,
+            "the next provider request must not carry earlier turns: {last_call:?}"
+        );
+
+        let sessions_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+        let rows_new = sessions_store
+            .session_ids_for_conversation(&key)
+            .expect("list new");
+        assert!(
+            !rows_new.is_empty(),
+            "the next turn opened a fresh session for the same key"
+        );
+        let new_id = &rows_new[0];
+        assert_ne!(*new_id, session_id, "fresh session id, not the deleted one");
+
+        // The request handler was spawned with its own shutdown token and
+        // holds `req_rx`; the only signal that lets it exit is the bus
+        // dropping the request sender. Clearing it here lets `req_handle`
+        // drain instead of blocking on `request_rx.recv()` for the rest of
+        // the test process.
+        bus.clear_request_sender().await;
+        let _ = req_handle.await;
+    }
+
+    /// Busy rule through the real dispatch path: the operator's `DELETE`
+    /// arrives while a worker is still mid-turn for the same conversation
+    /// key. The runtime holds the in-flight count from the worker's
+    /// registration through `clear_sender_history`, so the request handler
+    /// returns `Busy` and the handler refuses with `409`. When the worker
+    /// finishes, the same delete succeeds — and every copy is empty, the
+    /// same shape the unheld-path test asserts on. The provider test-double
+    /// holds the *second* call on a `Notify` gate so the first call still
+    /// completes (writing the session row the delete needs) and the second
+    /// one stays parked inside `chat_with_history` for the duration of the
+    /// busy window.
+    #[tokio::test]
+    async fn sessions_delete_busy_rule_409s_while_a_handler_dispatch_is_in_flight() {
+        use crate::channels::dispatch::run_message_dispatch_loop;
+        use crate::channels::history_store::ChannelHistoryStore;
+        use crate::channels::{run_channel_bus_requests, ChannelBus, ChannelRuntimeContext};
+        use crate::sessions::SessionStore as SessionsStore;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+        use std::sync::{Arc, Mutex};
+
+        /// Provider that lets the first call through (so worker 1 writes the
+        /// session row the delete will address) and parks the second call on
+        /// a `Notify` gate. Subsequent calls also wait on the same gate so
+        /// the test stays deterministic.
+        struct FirstThenHeldProvider {
+            gate: tokio::sync::Notify,
+            calls: Mutex<Vec<Vec<(String, String)>>>,
+            call_count: AtomicUsize,
+        }
+        impl FirstThenHeldProvider {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    gate: tokio::sync::Notify::new(),
+                    calls: Mutex::new(Vec::new()),
+                    call_count: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::providers::Provider for FirstThenHeldProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<String> {
+                Ok("fallback".to_string())
+            }
+            async fn chat_with_history(
+                &self,
+                messages: &[crate::providers::ChatMessage],
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<String> {
+                let snapshot = messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect::<Vec<_>>();
+                self.calls.lock().unwrap().push(snapshot);
+                let n = self.call_count.fetch_add(1, AtomicOrd::SeqCst);
+                if n >= 1 {
+                    self.gate.notified().await;
+                }
+                Ok(format!("held-{n}"))
+            }
+        }
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+
+        let history_store = ChannelHistoryStore::open(&workspace_dir).expect("history");
+        let session_store = SessionsStore::open(&session_db).expect("open");
+
+        let channel_impl = Arc::new(crate::channels::test_support::RecordingChannel::default())
+            as Arc<dyn crate::channels::traits::Channel>;
+        let mut channels_by_name = std::collections::HashMap::new();
+        channels_by_name.insert(channel_impl.name().to_string(), channel_impl.clone());
+
+        let provider = FirstThenHeldProvider::new();
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(std::sync::Mutex::new(
+                crate::channels::routing::RuntimeConfigSlot::default(),
+            )),
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(crate::channels::test_support::NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
+            owner_prompt: crate::channels::prompt::fixed_owner_prompt(
+                "test-system-prompt".to_string(),
+            ),
+            guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            history_store: Some(Arc::new(history_store)),
+            session_store: Some(Arc::new(std::sync::Mutex::new(session_store))),
+            ledger: None,
+            provider_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            route_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: crate::providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace_dir.clone()),
+            message_timeout_secs: crate::channels::CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+            in_flight_counter: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        });
+
+        let bus = Arc::new(ChannelBus::default());
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(8);
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(8);
+        bus.publish(msg_tx.clone()).await;
+        bus.publish_request_sender(req_tx).await;
+
+        let req_handle = tokio::spawn({
+            let ctx = Arc::clone(&runtime_ctx);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            async move { run_channel_bus_requests(req_rx, ctx, shutdown).await }
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn({
+            let ctx = Arc::clone(&runtime_ctx);
+            let shutdown = shutdown.clone();
+            async move { run_message_dispatch_loop(msg_rx, ctx, 2, shutdown).await }
+        });
+
+        let m1 = test_channel_message("m1", "first user", "telegram:chat-1");
+        let m2 = test_channel_message("m2", "second user", "telegram:chat-1");
+        let key = crate::channels::dispatch::conversation_history_key(&m1);
+        msg_tx.send(m1).await.expect("send m1");
+        msg_tx.send(m2).await.expect("send m2");
+
+        // Worker 1 finishes immediately (writes the session row); worker 2
+        // is held on the gate.
+        for _ in 0..200 {
+            if provider.call_count.load(AtomicOrd::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            provider.call_count.load(AtomicOrd::SeqCst) >= 2,
+            "worker 2 must have entered the held call"
+        );
+
+        // Wait for worker 1's session row to land. Worker 2 is still in
+        // its call, so the in-flight count for this key is 1.
+        let session_id = {
+            let mut found = None;
+            for _ in 0..200 {
+                let s = SessionsStore::open(&session_db).expect("open");
+                if let Some(id) = s
+                    .session_ids_for_conversation(&key)
+                    .expect("list")
+                    .into_iter()
+                    .next()
+                {
+                    found = Some(id);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            found.expect("worker 1 must have recorded a session id")
+        };
+        let n_in_flight = {
+            let counts = runtime_ctx
+                .in_flight_counter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            counts.get(&key).copied().unwrap_or(0)
+        };
+        assert!(
+            n_in_flight >= 1,
+            "worker 2's held call must keep the counter non-zero, got {}",
+            n_in_flight
+        );
+
+        let mut state = test_state();
+        *state.config.lock() = {
+            let mut cfg = crate::config::Config::default();
+            cfg.workspace_dir = workspace_dir.clone();
+            cfg
+        };
+        state.channel_bus = Arc::clone(&bus);
+
+        // Delete must answer 409 — worker 2 is still in the call.
+        let busy_resp = sessions_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.clone()),
+        )
+        .await;
+        match busy_resp {
+            Err((status, _)) => assert_eq!(
+                status,
+                axum::http::StatusCode::CONFLICT,
+                "in-flight turn must yield 409"
+            ),
+            Ok(other) => panic!("in-flight turn must not yield 200: {other:?}"),
+        }
+
+        // Release worker 2; it finishes, the counter drops to 0, the same
+        // delete goes through.
+        provider.gate.notify_one();
+        for _ in 0..200 {
+            let n = {
+                let counts = runtime_ctx
+                    .in_flight_counter
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                counts.get(&key).copied().unwrap_or(0)
+            };
+            if n == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let ok_resp = sessions_delete(State(state), HeaderMap::new(), Path(session_id.clone()))
+            .await
+            .expect("delete ok after the worker finished")
+            .0;
+        assert_eq!(ok_resp["deleted"], true);
+        assert_eq!(ok_resp["id"], session_id);
+        assert_eq!(ok_resp["conversation_key"], key);
+
+        // Stop the loops.
+        drop(msg_tx);
+        bus.clear().await;
+        shutdown.cancel();
+        let () = tokio::time::timeout(std::time::Duration::from_secs(5), loop_handle)
+            .await
+            .expect("dispatch loop timed out")
+            .expect("dispatch loop panicked");
+        bus.clear_request_sender().await;
+        let _ = req_handle.await;
+    }
+
+    /// Two overlapping turns on one key: the first worker starts and is held,
+    /// the second worker starts and is held too. Releasing the first worker
+    /// makes it finish (writing the session row); the second worker is still
+    /// in-flight. The in-flight count for the key is `1`, the request handler
+    /// still sees `Busy`. When the second worker is also released the count
+    /// drops to 0 and the delete goes through. Both calls go through the same
+    /// `Notify` gate because the test only needs two workers on the same key.
+    #[tokio::test]
+    async fn sessions_delete_two_overlapping_turns_keep_the_key_busy_until_both_end() {
+        use crate::channels::dispatch::run_message_dispatch_loop;
+        use crate::channels::history_store::ChannelHistoryStore;
+        use crate::channels::{run_channel_bus_requests, ChannelBus, ChannelRuntimeContext};
+        use crate::sessions::SessionStore as SessionsStore;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::Notify;
+
+        /// Provider that holds every call on a single `Notify` gate. The test
+        /// runs two workers on one key, both parked inside `chat_with_history`.
+        /// `notify_one()` releases exactly one worker per call so the test
+        /// can drive each worker's exit in order.
+        struct HeldProvider {
+            gate: Notify,
+            calls: Mutex<Vec<Vec<(String, String)>>>,
+            call_count: AtomicUsize,
+        }
+        impl HeldProvider {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    gate: Notify::new(),
+                    calls: Mutex::new(Vec::new()),
+                    call_count: AtomicUsize::new(0),
+                })
+            }
+            /// Release exactly one parked worker. Each `notify_one()` unblocks
+            /// exactly one waiter; `Notify` queues them.
+            fn release_one(&self) {
+                self.gate.notify_one();
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::providers::Provider for HeldProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<String> {
+                Ok("fallback".to_string())
+            }
+            async fn chat_with_history(
+                &self,
+                messages: &[crate::providers::ChatMessage],
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<String> {
+                let snapshot = messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect::<Vec<_>>();
+                self.calls.lock().unwrap().push(snapshot);
+                self.call_count.fetch_add(1, AtomicOrd::SeqCst);
+                self.gate.notified().await;
+                Ok("held".to_string())
+            }
+        }
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+
+        let history_store = ChannelHistoryStore::open(&workspace_dir).expect("history");
+        let session_store = SessionsStore::open(&session_db).expect("open");
+
+        let channel_impl = Arc::new(crate::channels::test_support::RecordingChannel::default())
+            as Arc<dyn crate::channels::traits::Channel>;
+        let mut channels_by_name = std::collections::HashMap::new();
+        channels_by_name.insert(channel_impl.name().to_string(), channel_impl.clone());
+
+        let provider = HeldProvider::new();
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(std::sync::Mutex::new(
+                crate::channels::routing::RuntimeConfigSlot::default(),
+            )),
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(crate::channels::test_support::NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
+            owner_prompt: crate::channels::prompt::fixed_owner_prompt(
+                "test-system-prompt".to_string(),
+            ),
+            guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            history_store: Some(Arc::new(history_store)),
+            session_store: Some(Arc::new(std::sync::Mutex::new(session_store))),
+            ledger: None,
+            provider_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            route_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: crate::providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace_dir.clone()),
+            message_timeout_secs: crate::channels::CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+            in_flight_counter: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        });
+
+        let bus = Arc::new(ChannelBus::default());
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(8);
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(8);
+        bus.publish(msg_tx.clone()).await;
+        bus.publish_request_sender(req_tx).await;
+
+        let req_handle = tokio::spawn({
+            let ctx = Arc::clone(&runtime_ctx);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            async move { run_channel_bus_requests(req_rx, ctx, shutdown).await }
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn({
+            let ctx = Arc::clone(&runtime_ctx);
+            let shutdown = shutdown.clone();
+            async move { run_message_dispatch_loop(msg_rx, ctx, 2, shutdown).await }
+        });
+
+        let m1 = test_channel_message("m1", "first user", "telegram:chat-1");
+        let m2 = test_channel_message("m2", "second user", "telegram:chat-1");
+        let key = crate::channels::dispatch::conversation_history_key(&m1);
+        msg_tx.send(m1).await.expect("send m1");
+        msg_tx.send(m2).await.expect("send m2");
+
+        // Both workers enter the call and park on the gate.
+        for _ in 0..200 {
+            if provider.call_count.load(AtomicOrd::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            provider.call_count.load(AtomicOrd::SeqCst) >= 2,
+            "both workers must have entered the held call"
+        );
+        let n_in_flight = {
+            let counts = runtime_ctx
+                .in_flight_counter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            counts.get(&key).copied().unwrap_or(0)
+        };
+        assert_eq!(
+            n_in_flight, 2,
+            "two overlapping workers must register the in-flight count as 2"
+        );
+
+        let mut state = test_state();
+        *state.config.lock() = {
+            let mut cfg = crate::config::Config::default();
+            cfg.workspace_dir = workspace_dir.clone();
+            cfg
+        };
+        state.channel_bus = Arc::clone(&bus);
+
+        // No session row yet (both workers are still inside chat_with_history).
+        // Release worker 1; it writes the row, decrements, and the test can
+        // proceed with the second 409 check.
+        provider.release_one();
+        let session_id = {
+            let mut found = None;
+            for _ in 0..200 {
+                let s = SessionsStore::open(&session_db).expect("open");
+                if let Some(id) = s
+                    .session_ids_for_conversation(&key)
+                    .expect("list")
+                    .into_iter()
+                    .next()
+                {
+                    found = Some(id);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            found.expect("worker 1 must have written a session row after release")
+        };
+        // Wait for worker 1's counter decrement to settle. Worker 2 is still
+        // held, so the count drops from 2 to 1.
+        for _ in 0..200 {
+            let n = {
+                let counts = runtime_ctx
+                    .in_flight_counter
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                counts.get(&key).copied().unwrap_or(0)
+            };
+            if n == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Delete must still answer 409 — worker 2 is still in-flight.
+        let busy_resp = sessions_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.clone()),
+        )
+        .await;
+        match busy_resp {
+            Err((status, _)) => assert_eq!(
+                status,
+                axum::http::StatusCode::CONFLICT,
+                "the second held turn must keep the key busy"
+            ),
+            Ok(other) => panic!("the second held turn must not yield 200: {other:?}"),
+        }
+
+        // Release worker 2; both finish, the counter drops to 0, the delete
+        // goes through.
+        provider.release_one();
+        for _ in 0..200 {
+            let n = {
+                let counts = runtime_ctx
+                    .in_flight_counter
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                counts.get(&key).copied().unwrap_or(0)
+            };
+            if n == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let ok_resp = sessions_delete(State(state), HeaderMap::new(), Path(session_id.clone()))
+            .await
+            .expect("delete ok after both workers finished")
+            .0;
+        assert_eq!(ok_resp["deleted"], true);
+        assert_eq!(ok_resp["sessions_removed"].as_u64().unwrap_or(0), 1);
+
+        // Stop the loops.
+        drop(msg_tx);
+        bus.clear().await;
+        shutdown.cancel();
+        let () = tokio::time::timeout(std::time::Duration::from_secs(5), loop_handle)
+            .await
+            .expect("dispatch loop timed out")
+            .expect("dispatch loop panicked");
+        bus.clear_request_sender().await;
+        let _ = req_handle.await;
+    }
+
+    /// Bus closed: the gateway has no runtime to ask, so it falls back to
+    /// its own `ChannelHistoryStore` and clears the durable copy directly.
+    /// Sessions.db copy is still removed by `delete_conversation`; the
+    /// in-RAM entry is the previous runtime's and is gone with it.
+    #[tokio::test]
+    async fn sessions_delete_channel_conversation_with_no_runtime_clears_through_fallback() {
+        use crate::channels::history_store::ChannelHistoryStore;
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+
+        // Pre-seed both copies through the public writers so the handler
+        // sees them on read.
+        {
+            let history_store = ChannelHistoryStore::open(&workspace_dir).expect("history");
+            history_store
+                .save(
+                    "telegram:chat-1",
+                    &[crate::providers::ChatMessage::user("kept message")],
+                )
+                .expect("save history");
+            let mut session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+            let id = session_store
+                .record_channel_turn("m", "telegram:chat-1", "user", "reply", None)
+                .expect("record");
+
+            let state = test_state();
+            *state.config.lock() = {
+                let mut cfg = crate::config::Config::default();
+                cfg.workspace_dir = workspace_dir.clone();
+                cfg
+            };
+            // Channel bus is the default — no request sender published, so
+            // the gateway sees a closed bus and falls back to its own store.
+            let resp = sessions_delete(State(state), HeaderMap::new(), Path(id.clone()))
+                .await
+                .expect("delete ok")
+                .0;
+            assert_eq!(resp["deleted"], true);
+            assert_eq!(resp["id"], id);
+            assert_eq!(resp["conversation_key"], "telegram:chat-1");
+            assert_eq!(resp["sessions_removed"], 1);
+        }
+
+        // Channel_history row gone.
+        let history_store = ChannelHistoryStore::open(&workspace_dir).expect("reopen");
+        assert!(
+            history_store
+                .raw_turns_json("telegram:chat-1")
+                .expect("raw turn read")
+                .is_none(),
+            "channel_history copy: fallback cleared the durable row"
+        );
+
+        // Sessions.db rows for this conversation_key are gone.
+        let session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+        assert!(
+            session_store
+                .session_ids_for_conversation("telegram:chat-1")
+                .expect("list")
+                .is_empty(),
+            "sessions.db copy: every row for this key is gone"
+        );
+    }
+
+    /// `ChannelHistoryStore::open` is open-or-create, so a real I/O failure
+    /// (no parent dir, locked file, bad perms) is the only way it returns
+    /// `Err`. The previous fallback swallowed that error and answered
+    /// `deleted: true`, which leaves a `channel_history` row on disk that the
+    /// plan's invariant forbids. The handler must now answer `500`. The
+    /// failure is induced by planting a regular file at `<workspace>/memory`,
+    /// so `create_dir_all` cannot create the parent and `open` returns Err.
+    /// `ChannelHistoryStore::open` is pub, so the test reaches it directly to
+    /// confirm the failure mode it relies on is real and stable.
+    #[tokio::test]
+    async fn sessions_delete_channel_conversation_with_no_runtime_refuses_on_history_store_open_failure(
+    ) {
+        use crate::channels::history_store::ChannelHistoryStore;
+        use std::fs;
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+
+        // Plant a regular file at `<workspace>/memory` so `create_dir_all`
+        // refuses and `ChannelHistoryStore::open` returns Err. `permissions`
+        // does not help here because `create_dir_all` follows symlinks.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(workspace_dir.join("memory"))
+            .expect("plant file at workspace/memory");
+        let open_err = ChannelHistoryStore::open(&workspace_dir)
+            .err()
+            .expect("open must fail when workspace/memory is a file");
+        let _ = open_err; // the message is unstable; what matters is the Err arm.
+
+        // Seed a session row the handler will look up.
+        let id = {
+            let mut session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+            session_store
+                .record_channel_turn("m", "telegram:chat-1", "user", "reply", None)
+                .expect("record")
+        };
+
+        let state = test_state();
+        *state.config.lock() = {
+            let mut cfg = crate::config::Config::default();
+            cfg.workspace_dir = workspace_dir.clone();
+            cfg
+        };
+        // Bus is `default()` — no runtime published, so the gateway takes the
+        // `Closed` fallback and tries to open the history store.
+        let result = sessions_delete(State(state), HeaderMap::new(), Path(id.clone())).await;
+        match result {
+            Err((status, _body)) => assert_eq!(
+                status,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "open failure must surface as 500, not 200 + deleted"
+            ),
+            Ok(other) => panic!("open failure must not yield 200: {other:?}"),
+        }
+
+        // The sessions row survives: the handler returns 500 *before* reaching the
+        // sessions.db delete, so the partial-success answer the previous shape
+        // would have produced (deleted: true + every copy still on disk) is
+        // impossible. The plan invariant requires every copy gone on a 200;
+        // on a 500 the rows are untouched so the operator can retry.
+        let session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+        assert!(
+            session_store.get_session(&id).expect("get").is_some(),
+            "sessions.db row stays put on open failure so the operator can retry"
+        );
+    }
+
+    /// A non-channel session delete behaves as on `main`: one row removed,
+    /// the response keeps the old `{deleted, id}` shape, no `conversation_key`.
+    #[tokio::test]
+    async fn sessions_delete_non_channel_session_still_removes_only_one_session() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+
+        // Seed: a `tui` session, an `api` session, and a `channel` session
+        // for the same conversation_key. The tui delete must not touch the
+        // channel rows.
+        let tui_id;
+        let api_id;
+        let channel_id;
+        {
+            let mut session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+            tui_id = session_store
+                .new_session("m", "tui")
+                .expect("tui session")
+                .id;
+            api_id = session_store
+                .record_api_turn("m", None, "second", "reply")
+                .expect("api turn");
+            channel_id = session_store
+                .record_channel_turn("m", "telegram:chat-1", "third", "reply", None)
+                .expect("channel turn");
+        }
+
+        let state = test_state();
+        *state.config.lock() = {
+            let mut cfg = crate::config::Config::default();
+            cfg.workspace_dir = workspace_dir.clone();
+            cfg
+        };
+
+        let resp = sessions_delete(State(state), HeaderMap::new(), Path(tui_id.clone()))
+            .await
+            .expect("delete ok")
+            .0;
+        assert_eq!(resp["deleted"], true);
+        assert_eq!(resp["id"], tui_id);
+        assert!(
+            resp.get("conversation_key").is_none(),
+            "a non-channel delete must NOT carry conversation_key: {resp:?}"
+        );
+        assert!(
+            resp.get("sessions_removed").is_none(),
+            "a non-channel delete must NOT carry sessions_removed: {resp:?}"
+        );
+
+        let session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+        assert!(session_store.get_session(&tui_id).expect("get").is_none());
+        // Other rows still there.
+        assert!(session_store.get_session(&api_id).expect("get").is_some());
+        let channel_rows = session_store
+            .session_ids_for_conversation("telegram:chat-1")
+            .expect("list");
+        assert_eq!(channel_rows, vec![channel_id]);
+    }
+
+    /// A `/new`-ended session for the same `conversation_key` is removed
+    /// by the whole-conversation delete. `close_channel_session` writes the
+    /// `ended_at` and parks the row alongside the open one; both go.
+    #[tokio::test]
+    async fn sessions_delete_channel_conversation_clears_a_slash_new_ended_session_too() {
+        use crate::channels::history_store::ChannelHistoryStore;
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+        let key = "telegram:chat-1";
+
+        // Two channel sessions under the same key: one ended (the `/new`
+        // before), one open (the current one).
+        let ended_id;
+        let open_id;
+        {
+            let mut session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+            let first = session_store
+                .record_channel_turn("m", key, "first", "reply", None)
+                .expect("first turn");
+            // `/new` closes the open session.
+            session_store.close_channel_session(key).expect("close");
+            let second = session_store
+                .record_channel_turn("m", key, "second", "reply", None)
+                .expect("second turn");
+            ended_id = first;
+            open_id = second;
+            assert_ne!(ended_id, open_id);
+        }
+
+        // Seed channel_history.
+        let history_store = ChannelHistoryStore::open(&workspace_dir).expect("history");
+        history_store
+            .save(key, &[crate::providers::ChatMessage::user("first")])
+            .ok();
+
+        let state = test_state();
+        *state.config.lock() = {
+            let mut cfg = crate::config::Config::default();
+            cfg.workspace_dir = workspace_dir.clone();
+            cfg
+        };
+
+        let resp = sessions_delete(State(state), HeaderMap::new(), Path(open_id.clone()))
+            .await
+            .expect("delete ok")
+            .0;
+        assert_eq!(resp["deleted"], true);
+        assert_eq!(
+            resp["sessions_removed"], 2,
+            "both rows under the key, the open one and the /new-ended one"
+        );
+
+        let session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+        let rows_after = session_store
+            .session_ids_for_conversation(key)
+            .expect("list");
+        assert!(
+            rows_after.is_empty(),
+            "every session for this key — including the /new-ended one — is gone"
+        );
+        assert!(session_store.get_session(&ended_id).expect("get").is_none());
+    }
+
+    /// The list `?source=channel` row shape: every field documented in the
+    /// plan is present, no chat title, `ended_at` and `last_activity_at`
+    /// reflect the recorded state.
+    #[tokio::test]
+    async fn sessions_list_with_source_channel_returns_conversation_metadata() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+
+        let channel_id = {
+            let mut session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+            session_store
+                .record_channel_turn("m", "telegram:chat-9", "u", "r", None)
+                .expect("channel turn")
+        };
+
+        let state = test_state();
+        *state.config.lock() = {
+            let mut cfg = crate::config::Config::default();
+            cfg.workspace_dir = workspace_dir.clone();
+            cfg
+        };
+
+        let resp = sessions_list(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Query(ListQuery {
+                limit: None,
+                offset: None,
+                source: Some("channel".to_string()),
+            }),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        let row = &resp["sessions"][0];
+        assert_eq!(row["id"], channel_id);
+        assert_eq!(row["source"], "channel");
+        assert_eq!(row["conversation_key"], "telegram:chat-9");
+        assert_eq!(row["surface"], "telegram");
+        assert_eq!(row["place"], "chat-9");
+        assert_eq!(row["thread"], serde_json::Value::Null);
+        // No chat title — channel sessions don't carry one.
+        assert_eq!(row["title"], serde_json::Value::Null);
+        assert!(row["started_at"].as_i64().unwrap_or(0) > 0);
+        assert!(row["last_activity_at"].as_i64().unwrap_or(0) > 0);
+        // `record_channel_turn` does NOT stamp `ended_at` (only
+        // `close_channel_session` does, on `/new` or `/clear`). An open
+        // session therefore serialises `ended_at: null` — pin that contract
+        // so a future schema change that backfills the column from a
+        // finished-row join surfaces here.
+        assert_eq!(row["ended_at"], serde_json::Value::Null);
+    }
+
+    fn test_channel_message(
+        id: &str,
+        content: &str,
+        chat: &str,
+    ) -> crate::channels::traits::ChannelMessage {
+        crate::channels::traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: id.to_string(),
+            sender: "rantaiclaw_user".to_string(),
+            reply_target: chat.to_string(),
+            content: content.to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            reply_anchor: None,
+            is_direct: false,
+        }
     }
 }

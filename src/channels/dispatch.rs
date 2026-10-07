@@ -20,9 +20,38 @@ use crate::providers::{self, ChatMessage, ProviderCapabilityError};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Decrements the worker's in-flight refcount on drop, including on unwind.
+///
+/// The decrement used to be the last statement of the worker closure, so a
+/// panic anywhere in `process_channel_message` — provider, tool loop, a
+/// channel's `send`, the renderer — skipped it. The refcount stayed at 1
+/// forever, the runtime's bus-request handler kept answering `Busy` for that
+/// conversation key, and every subsequent `DELETE /api/v1/sessions/{id}` for
+/// it returned `409`. Same shape as `supervisor::CompletionGuard`, which
+/// carries the same "release on every exit path" rule.
+pub(super) struct InFlightCountGuard {
+    counter: Arc<Mutex<HashMap<String, usize>>>,
+    key: String,
+}
+
+impl Drop for InFlightCountGuard {
+    fn drop(&mut self) {
+        // The same mutex the runtime's request handler takes; the take is short
+        // and the race is benign — if `clear_sender_history` beat us the entry
+        // is already gone and this is a no-op.
+        let mut counts = self.counter.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
 
 /// The conversation this message belongs to, for history and `/model` routing.
 ///
@@ -2007,11 +2036,15 @@ pub(crate) async fn run_message_dispatch_loop(
         let task_sequence = Arc::clone(&task_sequence);
         let stop_running_turns = stop_running_turns.clone();
         let notified = Arc::clone(&notified);
+        // Computed outside the move so the in-flight counter and the
+        // interruption map register against the same `ChannelMessage` without
+        // taking a reference after the closure starts.
+        let conversation_key = conversation_history_key(&msg);
+        let sender_scope_key = interruption_scope_key(&msg);
         workers.spawn(async move {
             let _permit = permit;
             let interrupt_enabled =
                 worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
-            let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(supervisor::InFlightTaskCompletion::new());
             let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
@@ -2019,6 +2052,28 @@ pub(crate) async fn run_message_dispatch_loop(
             // Releases waiters on EVERY exit path, including a panic. Held for
             // the rest of the closure; see `supervisor::CompletionGuard`.
             let _completion_guard = supervisor::CompletionGuard(Arc::clone(&completion));
+
+            // Increment the in-flight refcount on `worker_ctx.in_flight_counter`
+            // for this turn's conversation key. The runtime's bus-request
+            // handler reads the same counter under one mutex hold across the
+            // check + `clear_sender_history` step, so holding this registration
+            // for the duration of the turn keeps a `DELETE` from racing past
+            // us. The decrement lives on `InFlightCountGuard` so it runs on
+            // every exit path, including one where `process_channel_message`
+            // panics — the previous "decrement at the end of the closure"
+            // shape leaked a refcount on unwind and pinned the conversation
+            // to `Busy` for the rest of the daemon's life.
+            let _in_flight_guard = {
+                let mut counts = worker_ctx
+                    .in_flight_counter
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *counts.entry(conversation_key.clone()).or_insert(0) += 1;
+                InFlightCountGuard {
+                    counter: Arc::clone(&worker_ctx.in_flight_counter),
+                    key: conversation_key.clone(),
+                }
+            };
 
             if interrupt_enabled {
                 let previous = {
@@ -2098,6 +2153,11 @@ pub(crate) async fn run_message_dispatch_loop(
                     active.remove(&sender_scope_key);
                 }
             }
+
+            // The decrement lives on `InFlightCountGuard`; holding the binding
+            // until here scopes its drop to the same lifetime the explicit
+            // decrement used to cover, so the counter still drops exactly once
+            // on the normal path.
         });
 
         while let Some(result) = workers.try_join_next() {

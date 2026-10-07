@@ -532,6 +532,14 @@ pub struct AppState {
     /// histories for one conversation, and no session persistence on this path
     /// at all. It now only enqueues; the turn, the reply and the session write
     /// belong to dispatch (plan 313).
+    ///
+    /// The same bus carries the request-with-answer side the gateway uses to
+    /// ask the channel runtime to drop a conversation's in-RAM history entry
+    /// and its persisted `channel_history` row. The runtime owns everything
+    /// about that conversation: the gateway has no history map and no
+    /// in-flight registry. A closed bus means no runtime is alive in this
+    /// process and the gateway falls back to its own `ChannelHistoryStore`
+    /// for the durable copy.
     pub channel_bus: Arc<crate::channels::ChannelBus>,
     /// In-browser modal tool-approval registry for the console SSE chat. The
     /// `WebModalApprovalBackend` registers + awaits here; `POST /api/v1/approvals/{id}`
@@ -4935,6 +4943,7 @@ mod tests {
             approval_owners: Arc::new(approval_owners),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
             guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+            in_flight_counter: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);

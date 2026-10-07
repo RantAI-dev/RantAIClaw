@@ -381,9 +381,21 @@ Visibility on the operator surfaces:
 Deleting a channel session:
 
 - API: `GET /api/v1/sessions?source=channel` to discover the id, then
-  `DELETE /api/v1/sessions/{id}`.
+  `DELETE /api/v1/sessions/{id}`. The delete is whole-conversation:
+  every session with the same `conversation_key`, their messages, the
+  `channel_history` row in `brain.db`, and the in-RAM
+  `conversation_histories` entry the runtime holds are removed together.
+  The response body is `{"deleted", "id", "conversation_key",
+  "sessions_removed"}`. If a dispatcher is mid-turn for that
+  conversation the request is refused with `409` — retry once the turn
+  completes. Notes that belong to the conversation
+  (`memories.session_id = <key>`) and scheduled jobs made in the chat are
+  not touched; the response does not claim otherwise.
 - `/new` and `/clear` (Telegram, Discord, WhatsApp Web) close the open
-  session so the next message starts a fresh one.
+  session so the next message starts a fresh one. They do not delete
+  saved notes or scheduled jobs either — only `DELETE /api/v1/sessions/{id}`
+  on a channel session does that, and only for the in-RAM entry, the
+  `channel_history` row, and the session rows.
 
 Guests and the recording layer:
 

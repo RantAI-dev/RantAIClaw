@@ -335,6 +335,90 @@ impl SessionStore {
         Ok(removed > 0)
     }
 
+    /// Every session id for one conversation_key, ordered newest first.
+    /// Caller still has to fetch each session's metadata if it needs it; this
+    /// helper only returns ids so the DELETE handler can fan out grant
+    /// clearing across the rows the delete is about to remove.
+    pub fn session_ids_for_conversation(&self, conversation_key: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM sessions WHERE conversation_key = ?1 \
+             ORDER BY started_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![conversation_key], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One transaction: every session for `conversation_key` and every
+    /// message under those sessions. Returns the number of session rows
+    /// removed. Caller `clear_session_grants` runs outside this transaction
+    /// for each id (grants are in-memory) so a busy database lock never
+    /// blocks prompt granting.
+    pub fn delete_conversation(&mut self, conversation_key: &str) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id IN \
+             (SELECT id FROM sessions WHERE conversation_key = ?1)",
+            params![conversation_key],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM sessions WHERE conversation_key = ?1",
+            params![conversation_key],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Page of channel sessions with conversation metadata for the console's
+    /// `source=channel` listing. Ordered newest first.
+    pub fn list_conversation_sessions(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::sessions::ConversationSessionRow>> {
+        let limit_v = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset_v = i64::try_from(offset).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.title, s.model, s.started_at, s.ended_at, \
+                    s.message_count, s.source, s.conversation_key, \
+                    COALESCE( \
+                        (SELECT MAX(m.timestamp) FROM messages m \
+                         WHERE m.session_id = s.id), s.started_at) \
+             FROM sessions s \
+             WHERE s.source = 'channel' AND s.conversation_key IS NOT NULL \
+             ORDER BY s.started_at DESC, s.id DESC \
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![limit_v, offset_v], |row| {
+                Ok(crate::sessions::ConversationSessionRow {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    model: row.get(2)?,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    message_count: row.get(5)?,
+                    source: row.get(6)?,
+                    conversation_key: row.get(7)?,
+                    last_activity_at: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Count of channel rows for the console's `source=channel` count.
+    pub fn count_conversation_sessions(&self) -> Result<usize> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'channel' \
+             AND conversation_key IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(total).unwrap_or(0))
+    }
+
     /// One-shot backfill: for every session whose title is NULL or empty,
     /// derive a title from the earliest user message (first 50 chars of
     /// the first non-empty line, whitespace collapsed). Sessions with no
@@ -987,6 +1071,67 @@ impl SessionStore {
         Ok(results)
     }
 
+    /// Full-text search like [`Self::search`], restricted at the SQL level to
+    /// one `sessions.source` bucket.
+    ///
+    /// Predicate folding keeps the query plan the same in both shapes — a
+    /// single bound parameter on `s.source` and a folded `=` / `!=`
+    /// comparison, never a `LIKE` over a generic argument. `Some(src)` adds
+    /// `s.source = ?2` so only rows with that source can match; `None` adds
+    /// `s.source != ?2` bound to the literal `"channel"` so the operator's
+    /// free-text search never bleeds into channel recordings.
+    ///
+    /// `search` returned channel rows together with every other source before this
+    /// method existed; there was no post-fetch filter. Filtering in SQL is what
+    /// keeps `limit` slots honest for the bucket the caller asked for: a
+    /// query that used to fill `limit` with channel rows now fills it with the
+    /// rows the source predicate lets through.
+    pub fn search_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        source: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let match_query = fts_literal_query(query);
+        if match_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Fold the predicate and pick one bound parameter. The source value
+        // we bind depends on whether the caller wants to include or exclude
+        // the bucket. `None` excludes `channel`; `Some(src)` matches exactly
+        // that source.
+        let (source_predicate, source_value): (&str, &str) = match source {
+            Some(src) => ("s.source = ?2", src),
+            None => ("s.source != ?2", "channel"),
+        };
+        let sql = format!(
+            "SELECT m.session_id, s.title, m.id, m.role, m.content, m.timestamp, \
+             bm25(messages_fts) as rank \
+             FROM messages_fts \
+             JOIN messages m ON messages_fts.rowid = m.id \
+             JOIN sessions s ON m.session_id = s.id \
+             WHERE messages_fts MATCH ?1 \
+             AND {source_predicate} \
+             ORDER BY rank \
+             LIMIT ?3"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt
+            .query_map(params![match_query, source_value, limit as i64], |row| {
+                Ok(SearchResult {
+                    session_id: row.get(0)?,
+                    session_title: row.get(1)?,
+                    message_id: row.get(2)?,
+                    role: row.get(3)?,
+                    content: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    rank: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
     /// Full-text search optionally restricted to a single `conversation_key`.
     ///
     /// `Some(key)` adds `AND s.conversation_key = ?key` to the FTS query so a
@@ -1344,6 +1489,59 @@ mod tests {
         let results = s.search("quick", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("quick"));
+    }
+
+    /// `search_scoped` must fold the source predicate to a single bound
+    /// parameter and exclude channel rows from the operator's free-text
+    /// search by default. Both shapes share one query plan: a missing source
+    /// means "anything except `channel`", and an explicit source means
+    /// "exactly that source". Pin both at once so a regression that drops
+    /// the predicate on either path shows up next to it.
+    #[test]
+    fn search_scoped_segregates_channel_rows() {
+        let mut s = store();
+        // API row, written via the public writer.
+        let api_id = s
+            .record_api_turn("m", None, "who carries sundial", "owner said it")
+            .unwrap();
+        // Channel row, written via the channel writer — its body matches the
+        // same free-text token so the predicate is the only thing that can
+        // keep them apart.
+        let channel_id = s
+            .record_channel_turn(
+                "m",
+                "telegram:chat-1",
+                "channel sundial",
+                "channel reply",
+                None,
+            )
+            .unwrap();
+
+        // Default search excludes the channel row.
+        let default_hits = s.search_scoped("sundial", 10, None).unwrap();
+        let default_ids: Vec<&str> = default_hits.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(
+            default_ids.contains(&api_id.as_str()),
+            "default search must include the api row"
+        );
+        assert!(
+            !default_ids.contains(&channel_id.as_str()),
+            "default search must NOT include the channel row"
+        );
+
+        // Source-pinned search returns only the channel row.
+        let channel_hits = s.search_scoped("sundial", 10, Some("channel")).unwrap();
+        let channel_ids: Vec<&str> = channel_hits.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(channel_hits.len(), 1);
+        assert_eq!(channel_ids[0], channel_id);
+
+        // A different source excludes both: the folded predicate is `=`, so
+        // a request for `source=api` cannot accidentally return a channel
+        // row.
+        let api_hits = s.search_scoped("sundial", 10, Some("api")).unwrap();
+        let api_ids: Vec<&str> = api_hits.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(api_hits.len(), 1);
+        assert_eq!(api_ids[0], api_id);
     }
 
     /// Force a known id onto a session so prefix collisions can be constructed.
