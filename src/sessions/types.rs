@@ -36,6 +36,28 @@ pub struct SessionMeta {
     pub source: String,
 }
 
+/// Session row with the conversation-channel metadata needed by the
+/// console's `source=channel` listing.
+///
+/// Carries everything `SessionMeta` does plus the conversation key, the
+/// surface/place/thread tuple, and the last-activity time. SessionMeta
+/// stays small: the TUI/CLI listings do not want these fields and the row
+/// sits next to a non-channel row in the same `serde_json::Value` response.
+#[derive(Debug, Clone)]
+pub struct ConversationSessionRow {
+    pub id: String,
+    pub title: Option<String>,
+    pub model: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub message_count: i64,
+    pub source: String,
+    pub conversation_key: String,
+    /// Epoch seconds of the most recent message in this session, or
+    /// `started_at` when the session is brand new.
+    pub last_activity_at: i64,
+}
+
 /// A message within a session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {

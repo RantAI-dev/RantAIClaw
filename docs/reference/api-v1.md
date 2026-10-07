@@ -294,6 +294,15 @@ resolves normally, `2+` matches return `400` ("ambiguous").
   - `offset` — optional, default `0`. Rows to skip, newest first. Without it the
     API could only ever return the newest 500 sessions and anything older was
     unreachable. Page with `offset += limit` until `offset + count >= total`.
+  - `source` — optional. A value matches that source exactly: `channel`
+    returns one row per channel session with `conversation_key`, decoded
+    `surface`/`place`/`thread`, `last_activity_at`, and `ended_at` (null
+    while the session is open); `tui`, `api`, and any other value return
+    the rows whose `source` equals that value. Omitting it (the default)
+    excludes channel rows from the list. With `source=channel`, the list
+    returns one row per channel session — a conversation has the open
+    session and one more ended session for every `/new` it ran, and every
+    one of those rows shows up here.
 - **Response** `200`:
   ```json
   {
@@ -322,11 +331,16 @@ resolves normally, `2+` matches return `400` ("ambiguous").
 - **Auth**: bearer-gated.
 - **Request body**:
   ```json
-  { "query": "required, non-empty", "limit": 20 }
+  { "query": "required, non-empty", "limit": 20, "source": "optional" }
   ```
-  `limit` optional, default `20`, capped at `200`. The query is matched
-  literally — each whitespace token is treated as a quoted phrase, so FTS5
-  operator characters (`"`, `*`, `(`, `NEAR`, `OR`) are searched as text rather
+  `limit` optional, default `20`, capped at `200`. `source` optional: a
+  value matches that source exactly — `source: "channel"` searches for
+  matches inside channel sessions, `source: "tui"` searches tui sessions,
+  and any other value matches that source. Omitting it (the default)
+  narrows it to non-channel rows so the operator's free-text search never
+  bleeds into channel recordings. The query is matched literally — each
+  whitespace token is treated as a quoted phrase, so FTS5 operator
+  characters (`"`, `*`, `(`, `NEAR`, `OR`) are searched as text rather
   than parsed as query syntax (which previously produced a `500`).
 - **Response** `200`:
   ```json
@@ -371,11 +385,28 @@ resolves normally, `2+` matches return `400` ("ambiguous").
 
 - **Auth**: bearer-gated.
 - **Path param**: `id` (prefix match, see note above).
-- **Response** `200`:
+- **Response** `200` (non-channel session):
   ```json
   { "deleted": true, "id": "..." }
   ```
-- **Status codes**: `200`, `404`, `400` (ambiguous), `401`.
+- **Response** `200` (channel session, removes the whole conversation):
+  ```json
+  { "deleted": true, "id": "...", "conversation_key": "telegram:chat-1", "sessions_removed": 3 }
+  ```
+- **Behaviour**: For `source=channel` sessions the endpoint removes every
+  session with the same `conversation_key`, their messages, the persisted
+  `channel_history` row in `brain.db`, and the in-RAM `conversation_histories`
+  entry the runtime holds. The conversation has the open session and one
+  more ended session for every `/new` it ran; `sessions_removed` is the
+  count of rows that the delete took out (including the one addressed by
+  the path). Notes that belong to the conversation
+  (`memories.session_id = <key>`) and scheduled jobs made in the chat are
+  not touched; the response does not claim they are removed.
+  If a dispatcher is mid-turn for that conversation the request is
+  refused; retry once the turn completes. A copy that cannot be deleted
+  is reported as an error rather than as `deleted: true`, so the
+  operator sees a half-cleared conversation instead of a clean reply.
+- **Status codes**: `200`, `404`, `400` (ambiguous), `401`, `409` (in-flight turn), `500` (a copy could not be deleted).
 
 ### PUT /api/v1/sessions/{id}/title
 

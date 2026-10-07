@@ -525,6 +525,7 @@ async fn guest_channel_turn_uses_guest_prompt_scoped_memory_and_probe_view() {
             &["memory_view_probe".to_string()],
             &[],
         )),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
@@ -648,6 +649,7 @@ async fn owner_channel_turn_uses_owner_prompt_and_shared_memory_and_the_all_view
             &["memory_view_probe".to_string()],
             &[],
         )),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -773,6 +775,7 @@ async fn guest_channel_turn_uses_guest_persona_without_owner_name_or_timezone() 
         approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(

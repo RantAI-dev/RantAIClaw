@@ -486,7 +486,11 @@ pub(crate) async fn handle_runtime_command_if_needed(
                             if provider_name != current.provider {
                                 current.provider = provider_name.clone();
                                 routing::set_route_selection(ctx, &sender_key, current.clone());
-                                history::clear_sender_history(ctx, &sender_key);
+                                if let Err(e) = history::clear_sender_history(ctx, &sender_key) {
+                                    tracing::warn!(
+                                        "channel_history delete failed on provider change: {e}"
+                                    );
+                                }
                             }
 
                             provider_switched_message(&provider_name, &current.model, prefix)
@@ -514,7 +518,9 @@ pub(crate) async fn handle_runtime_command_if_needed(
             } else {
                 current.model = model.clone();
                 routing::set_route_selection(ctx, &sender_key, current.clone());
-                history::clear_sender_history(ctx, &sender_key);
+                if let Err(e) = history::clear_sender_history(ctx, &sender_key) {
+                    tracing::warn!("channel_history delete failed on model change: {e}");
+                }
 
                 model_switched_message(&model, &current.provider)
             }
@@ -523,7 +529,9 @@ pub(crate) async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::Reset => {
             // This conversation's key only: another chat, topic or thread
             // keeps its history.
-            history::clear_sender_history(ctx, &sender_key);
+            if let Err(e) = history::clear_sender_history(ctx, &sender_key) {
+                tracing::warn!("channel_history delete failed on /new|clear: {e}");
+            }
             // Close the open channel session for this conversation so the
             // next recorded turn lands in a fresh one. Done on the runtime
             // command path, not on `/model` — the plan explicitly keeps the

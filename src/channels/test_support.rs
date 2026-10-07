@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[derive(Default)]
-pub(super) struct RecordingChannel {
+pub(crate) struct RecordingChannel {
     pub(super) sent_messages: tokio::sync::Mutex<Vec<String>>,
     /// The marker of every file a real channel would have uploaded for the
     /// messages `send` received, in order. `finalize_draft` uploads nothing, as
@@ -209,8 +209,8 @@ impl Channel for RecordingChannel {
 }
 
 #[derive(Default)]
-pub(super) struct HistoryCaptureProvider {
-    pub(super) calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+pub(crate) struct HistoryCaptureProvider {
+    pub(crate) calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
 }
 
 #[async_trait::async_trait]
@@ -241,7 +241,7 @@ impl Provider for HistoryCaptureProvider {
     }
 }
 
-pub(super) struct NoopMemory;
+pub(crate) struct NoopMemory;
 
 #[async_trait::async_trait]
 impl Memory for NoopMemory {
@@ -341,6 +341,7 @@ pub(super) fn dispatch_ctx(
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 

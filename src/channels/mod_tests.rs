@@ -1667,12 +1667,14 @@ fn durable_history_writes_through_and_reloads() {
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let ctx = ChannelRuntimeContext {
         history_store: Some(Arc::new(store)),
         session_store: None,
         ledger: None,
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
         ..ctx
     };
 
@@ -1769,6 +1771,7 @@ fn compact_sender_history_truncates_overlong_plain_rows_with_ellipsis() {
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Compaction persists the truncated rows.
@@ -2288,6 +2291,7 @@ async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -2359,6 +2363,7 @@ async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_repl
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -2430,6 +2435,7 @@ async fn process_channel_message_executes_tool_calls_with_alias_tags() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -2509,6 +2515,7 @@ async fn process_channel_message_handles_models_command_without_llm_call() {
         approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -2610,6 +2617,7 @@ async fn process_channel_message_uses_route_override_provider_and_model() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -2692,6 +2700,7 @@ async fn process_channel_message_prefers_cached_default_provider_instance() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -2799,6 +2808,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -2896,6 +2906,7 @@ async fn maybe_apply_runtime_config_update_hot_reloads_owners_guest_gate_and_all
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // First apply: seeds the store from the initial config.
@@ -2993,6 +3004,7 @@ fn allowlist_test_ctx(
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 
@@ -3610,6 +3622,7 @@ async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     };
 
     routing::maybe_apply_runtime_config_update(&ctx)
@@ -3738,6 +3751,7 @@ async fn maybe_apply_runtime_config_update_clears_pinned_sender_on_provider_swit
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Seed the store from the initial config.
@@ -3839,6 +3853,7 @@ async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     };
 
     routing::maybe_apply_runtime_config_update(&ctx)
@@ -3919,6 +3934,7 @@ async fn process_channel_message_respects_configured_max_tool_iterations_above_d
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -4000,6 +4016,7 @@ async fn process_channel_message_reports_configured_max_tool_iterations_limit() 
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -4212,6 +4229,7 @@ async fn channel_error_replies_are_sanitized_before_delivery() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
@@ -5898,6 +5916,410 @@ async fn the_runtime_closes_channels_only_after_dispatch_has_finished() {
         ["send", "close"],
         "the restart notice must go out before the channel is closed"
     );
+}
+
+/// Provider that holds every call on a `Notify` gate. Lets a test pin a worker
+/// inside `chat_with_history` for as long as the busy check needs.
+struct GateHeldProvider {
+    gate: tokio::sync::Notify,
+    call_count: AtomicUsize,
+}
+impl GateHeldProvider {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gate: tokio::sync::Notify::new(),
+            call_count: AtomicUsize::new(0),
+        })
+    }
+    fn release_one(&self) {
+        self.gate.notify_one();
+    }
+}
+#[async_trait::async_trait]
+impl Provider for GateHeldProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("fallback".to_string())
+    }
+    async fn chat_with_history(
+        &self,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.gate.notified().await;
+        Ok("held".to_string())
+    }
+}
+
+/// The daemon path. `start_channels_with_cancellation` reaches the dispatch
+/// worker and the bus-request handler through `run_channel_runtime`, which
+/// spawns `run_message_dispatch_loop` and `run_channel_bus_requests` with the
+/// SAME `Arc<ChannelRuntimeContext>`. The webhook dispatch path
+/// (`spawn_webhook_dispatch`) spawns `run_message_dispatch_loop` directly —
+/// it has no listeners to supervise — but it shares
+/// `build_bus_request_wiring` for the request side, so the bus-request
+/// handler still reads from the same `Arc` the worker writes to. That shared
+/// `Arc` is what makes the worker's in-flight counter the same map the
+/// bus-request handler reads — and is what the previous busy test could not
+/// prove (it built the wiring by hand around `run_message_dispatch_loop`).
+///
+/// Drive the production function with a held turn: the bus-request handler
+/// must see `Busy` while the worker is in flight, and `Done` once the worker
+/// has released the counter. If someone rebuilds `run_channel_runtime`
+/// without the counter — or hands the dispatch loop and the request handler
+/// different `Arc`s — the request handler sees `Done` immediately and the
+/// `Busy` assertion fails.
+#[tokio::test]
+async fn run_channel_runtime_wires_dispatch_and_bus_request_to_one_in_flight_counter() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let provider = GateHeldProvider::new();
+    let ctx = dispatch_ctx(
+        vec![],
+        provider.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let runtime = ChannelRuntime {
+        ctx: Arc::clone(&ctx),
+        channels: vec![],
+        tx: tx.clone(),
+        rx,
+        max_in_flight_messages: 1,
+        initial_backoff_secs: 1,
+        max_backoff_secs: 1,
+    };
+    let bus = Arc::new(ChannelBus::default());
+    let shutdown = CancellationToken::new();
+    let runtime_handle = tokio::spawn({
+        let bus = Arc::clone(&bus);
+        async move { run_channel_runtime(runtime, shutdown, Some(bus)).await }
+    });
+
+    // Build a message that resolves to a stable `conversation_history_key`.
+    let msg = drain_message("chat-wire");
+    let key = conversation_history_key(&msg);
+    tx.send(msg).await.expect("send");
+
+    // Worker has incremented the counter. The bus-request handler reads the
+    // same map, so the same request that increments the counter would see
+    // `Busy` here.
+    for _ in 0..200 {
+        if provider.call_count.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        provider.call_count.load(Ordering::SeqCst) >= 1,
+        "worker must have entered the held call"
+    );
+    for _ in 0..200 {
+        let n = ctx
+            .in_flight_counter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if n >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let n = ctx
+        .in_flight_counter
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        n, 1,
+        "the dispatch loop registered the counter for this conversation key"
+    );
+
+    // The bus-request handler is the daemon's own worker: a DROP request for
+    // the same key sees `Busy` because the counter is non-zero on the SAME
+    // `Arc` the dispatch loop is writing to.
+    let busy = bus
+        .try_request_drop(key.clone())
+        .await
+        .expect("request reaches the runtime");
+    assert!(
+        matches!(busy, crate::channels::ChannelBusReply::Busy),
+        "DROP must be Busy while the dispatch worker holds the counter"
+    );
+
+    // Release the worker, the counter drops, the next DROP returns `Done`.
+    provider.release_one();
+    for _ in 0..200 {
+        let n = ctx
+            .in_flight_counter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let done = bus
+        .try_request_drop(key.clone())
+        .await
+        .expect("request reaches the runtime");
+    assert!(
+        matches!(done, crate::channels::ChannelBusReply::Done),
+        "DROP must be Done after the worker finishes"
+    );
+
+    // Tear down: drop the bus's senders and our clone, the dispatch loop and
+    // the bus-request handler both exit.
+    drop(tx);
+    bus.clear().await;
+    bus.clear_request_sender().await;
+    tokio::time::timeout(Duration::from_secs(10), runtime_handle)
+        .await
+        .expect("run_channel_runtime did not finish in time")
+        .expect("run_channel_runtime panicked")
+        .expect("run_channel_runtime errored");
+}
+
+/// The webhook dispatch path. `spawn_webhook_dispatch` is the path `rantaiclaw
+/// gateway` standalone takes; before this fix it published only the message
+/// sender, so the bus's `request_tx` stayed `None` and every `DELETE` against
+/// a channel conversation took the `Closed` fallback. This test drives the
+/// production wiring helper `install_webhook_dispatch_wiring` (the body of
+/// `spawn_webhook_dispatch` after `build_channel_runtime`) with a hand-built
+/// `ChannelRuntime`, so the request-with-answer side is installed exactly the
+/// way the production call site installs it: publishing `request_tx` into the
+/// bus, the handler reading from the same `Arc`, and `clear_request_sender`
+/// resetting the slot when the runtime stops. The counter is empty so the
+/// request handler answers `Done` (no worker registered), which is what the
+/// Closed fallback would otherwise mask.
+///
+/// Mutation: skip the `publish_request_sender` call inside the wiring helper
+/// and the live `try_request_drop` assertion fails with `Closed`, because no
+/// sender means no handler reachable through it.
+#[tokio::test]
+async fn webhook_dispatch_wiring_publishes_request_sender_for_gateway_to_use() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let provider = Arc::new(CallCountingProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let ctx = dispatch_ctx(
+        vec![],
+        provider.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let runtime = ChannelRuntime {
+        ctx: Arc::clone(&ctx),
+        channels: vec![],
+        tx: tx.clone(),
+        rx,
+        max_in_flight_messages: 1,
+        initial_backoff_secs: 1,
+        max_backoff_secs: 1,
+    };
+    let bus = Arc::new(ChannelBus::default());
+    let shutdown = CancellationToken::new();
+    // Drives the production wiring helper, exactly the way `spawn_webhook_dispatch`
+    // does once `build_channel_runtime` returns `Some`. A dropped
+    // `publish_request_sender` line inside that helper would leave `request_tx`
+    // uninstalled, so the live `try_request_drop` below would return `Closed`.
+    let dispatch_handle =
+        install_webhook_dispatch_wiring(runtime, shutdown.clone(), Arc::clone(&bus)).await;
+
+    // The request side is published: a DROP request against this bus reaches
+    // the handler rather than returning `Closed`. Without the publish the bus
+    // would refuse with `Closed` even though the handler task is alive.
+    let reply = bus
+        .try_request_drop("webhook:test:chat".to_string())
+        .await
+        .expect("request reaches the wiring helper, not the Closed fallback");
+    assert!(
+        matches!(reply, ChannelBusReply::Done),
+        "DROP must be Done while the dispatch is live"
+    );
+
+    // No worker ever registered for this key, so the counter is empty. The
+    // guard is scoped to this block so it is dropped before the awaits below.
+    {
+        let counts = ctx
+            .in_flight_counter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            counts.is_empty(),
+            "no worker registered: counter stays empty"
+        );
+    }
+
+    // Tear down: cancel the token so the dispatch loop returns. The wiring
+    // helper then clears the bus's message and request senders before it joins
+    // the request handler. After that, a late request must be refused with
+    // `Closed` rather than blocking on a sender that has gone.
+    shutdown.cancel();
+    drop(tx);
+    let join_result = tokio::time::timeout(Duration::from_secs(10), dispatch_handle)
+        .await
+        .expect("webhook dispatch did not exit after shutdown");
+    join_result.expect("webhook dispatch panicked");
+
+    let after = bus
+        .try_request_drop("webhook:test:chat".to_string())
+        .await
+        .err()
+        .expect("post-teardown request must be refused");
+    assert!(
+        matches!(after, BusRequestRejection::Closed),
+        "post-teardown request must take the Closed arm, not a stale reply"
+    );
+}
+
+/// A worker that panics inside `process_channel_message` used to leak its
+/// in-flight refcount: the explicit decrement at the end of the closure was
+/// the last statement, so unwind skipped it and the key stayed pinned to
+/// `Busy` for the rest of the daemon's life. The `InFlightCountGuard` carries
+/// the decrement on `Drop`, so it runs on unwind too. This test drives a
+/// dispatch loop with a provider that panics, then asks the bus-request handler
+/// to drop the same key — the request handler must see an empty counter and
+/// answer `Done`, not `Busy`. Mutation: skip the guard's `Drop` impl and the
+/// request handler stays on `Busy` forever (the assertion fails on the first
+/// `try_request_drop`).
+#[tokio::test]
+async fn panic_in_worker_still_decrements_in_flight_counter() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    struct PanicProvider;
+    #[async_trait::async_trait]
+    impl Provider for PanicProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            panic!("deliberate panic from the test provider")
+        }
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            panic!("deliberate panic from the test provider")
+        }
+    }
+
+    let provider = Arc::new(PanicProvider);
+    let ctx = dispatch_ctx(
+        vec![],
+        provider.clone(),
+        routing::RuntimeConfigSlot::default(),
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let runtime = ChannelRuntime {
+        ctx: Arc::clone(&ctx),
+        channels: vec![],
+        tx: tx.clone(),
+        rx,
+        max_in_flight_messages: 1,
+        initial_backoff_secs: 1,
+        max_backoff_secs: 1,
+    };
+    let bus = Arc::new(ChannelBus::default());
+    let shutdown = CancellationToken::new();
+    let runtime_handle = tokio::spawn({
+        let bus = Arc::clone(&bus);
+        async move { run_channel_runtime(runtime, shutdown, Some(bus)).await }
+    });
+
+    let msg = drain_message("chat-panic");
+    let key = conversation_history_key(&msg);
+    tx.send(msg).await.expect("send");
+
+    // Wait for the worker to register the counter. The provider panics
+    // immediately, so the increment is observable as soon as the worker enters
+    // `process_channel_message`.
+    for _ in 0..200 {
+        let n = ctx
+            .in_flight_counter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if n >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Give the dispatch loop time to finish the worker and unwind the panic.
+    // The supervisor's join handler absorbs the panic; the counter must come
+    // back to zero even though the body never reached its last statement.
+    for _ in 0..200 {
+        let n = ctx
+            .in_flight_counter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let n = ctx
+        .in_flight_counter
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "the in-flight refcount must drop to zero even on a worker panic"
+    );
+
+    // The bus-request handler reads the same map and answers `Done`.
+    let reply = bus
+        .try_request_drop(key.clone())
+        .await
+        .expect("request reaches the wiring helper, not the Closed fallback");
+    assert!(
+        matches!(reply, ChannelBusReply::Done),
+        "DROP must be Done after the panic-path decrement"
+    );
+
+    // Tear down.
+    drop(tx);
+    bus.clear().await;
+    bus.clear_request_sender().await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), runtime_handle).await;
 }
 
 /// A slow provider that counts the turns that reached it.
@@ -8059,6 +8481,7 @@ fn minimal_channel_context() -> ChannelRuntimeContext {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 
@@ -8106,6 +8529,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -8207,6 +8631,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8321,6 +8746,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8409,6 +8835,7 @@ async fn process_channel_message_cancels_scoped_typing_task() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -8959,6 +9386,7 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -9058,6 +9486,7 @@ async fn process_channel_message_enriches_current_turn_without_persisting_contex
         approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -9156,6 +9585,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
         approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -9265,6 +9695,7 @@ async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
         approval_owners: Arc::new(vec!["rantaiclaw_user".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -9414,6 +9845,7 @@ async fn lark_chat_id_in_approval_owners_does_not_make_a_member_an_owner() {
         approval_owners: Arc::new(vec!["oc_chat123".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
@@ -9479,6 +9911,7 @@ async fn owner_group_channel_turn_keeps_owner_and_direct_flags_in_their_own_slot
         approval_owners: Arc::new(vec!["rantaiclaw_owner".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -9745,6 +10178,7 @@ async fn forged_label_without_tool_call_appends_runtime_net_line() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -9858,6 +10292,7 @@ async fn no_tool_run_notice_is_never_stored_where_model_can_copy_it() {
         approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -9986,6 +10421,7 @@ async fn all_chat_history_drops_soft_cap_nudge_from_storage() {
         approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -10096,6 +10532,7 @@ async fn all_chat_history_drops_loop_detector_nudge_from_storage() {
         approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -10216,6 +10653,7 @@ async fn real_tool_call_keeps_structured_history_and_skips_net_line() {
         approval_owners: Arc::new(vec!["alice".to_string()]),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -10379,6 +10817,7 @@ async fn a_persisted_history_with_old_labels_strips_them_on_load() {
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(ctx, msg, CancellationToken::new()).await;
@@ -10448,6 +10887,7 @@ async fn two_consecutive_save_requests_keep_structured_form_and_append_net_line(
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     process_channel_message(
@@ -11465,6 +11905,7 @@ async fn the_dispatch_loop_stops_on_the_shutdown_token_while_a_sender_is_open() 
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let shutdown = CancellationToken::new();

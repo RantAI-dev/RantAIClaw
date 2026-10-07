@@ -134,7 +134,7 @@ const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
 const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 /// Default timeout for processing a single channel message (LLM + tools).
 /// Used as fallback when not configured in channels_config.message_timeout_secs.
-const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
+pub(crate) const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
@@ -541,6 +541,16 @@ pub(crate) struct ChannelRuntimeContext {
     /// config; a turn uses it only when the sender isn't an owner. Owners get
     /// the full toolset.
     pub(crate) guest_gate: Arc<crate::approval::GuestGate>,
+    /// Process-wide refcount of in-flight channel turns keyed by conversation
+    /// key. The dispatcher increments a key before it reads history and
+    /// decrements on the worker's every exit path; the runtime's bus-request
+    /// handler reads the same counter under one mutex hold across the
+    /// `check + clear_sender_history` step so no turn can start between them.
+    /// Lives on the runtime context because exactly one context is alive per
+    /// process — same invariant the rest of the runtime already relies on,
+    /// and the one that makes `start_channels_with_cancellation` and the
+    /// webhook dispatch share this counter without extra wiring.
+    pub(crate) in_flight_counter: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 /// Every channel type this build knows about: `(key, display, maturity)` in a
@@ -1181,9 +1191,19 @@ pub(crate) fn configured_channel_count(config: &Config) -> usize {
 /// invariant that matters — **one `ChannelRuntimeContext` alive per process** —
 /// while letting the runtime be rebuilt underneath it. Same shape as
 /// `McpPoolHandle` (plan 287).
+///
+/// Two senders ride on the bus: the inbound `ChannelMessage` queue (the
+/// webhook + listener path) and a request-with-answer side the gateway uses
+/// to ask the runtime to drop a conversation's `channel_history` row plus its
+/// in-RAM entry. The request side is closed when the runtime is down for any
+/// reason; the gateway then takes the `Closed` arm of
+/// [`ChannelBus::try_request_drop`] and falls back to opening its own
+/// `ChannelHistoryStore` for the durable copy. A single attempt: the handler
+/// never retries.
 #[derive(Default)]
 pub struct ChannelBus {
     tx: tokio::sync::RwLock<Option<tokio::sync::mpsc::Sender<traits::ChannelMessage>>>,
+    request_tx: tokio::sync::RwLock<Option<tokio::sync::mpsc::Sender<ChannelBusRequest>>>,
 }
 
 /// Why an enqueue was refused, so the caller can answer the platform correctly.
@@ -1195,14 +1215,56 @@ pub enum BusRejection {
     Full,
 }
 
+/// A request the gateway puts on the bus for the channel runtime to handle.
+///
+/// One variant today: `DropConversation`, the "clear this conversation's
+/// in-RAM + persisted `channel_history`" command the gateway fires from
+/// `DELETE /api/v1/sessions/{id}` on a `source='channel'` session. The reply
+/// is a oneshot so the gateway can `await` a single answer; an `Err` reply
+/// propagates the runtime's failure (typically a failed `channel_history`
+/// write) so the gateway can refuse rather than lie about deletion.
+pub struct ChannelBusRequest {
+    pub conversation_key: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<ChannelBusReply, anyhow::Error>>,
+}
+
+/// Outcome the runtime reports for a `ChannelBusRequest`.
+pub enum ChannelBusReply {
+    /// The runtime cleared both the in-RAM `conversation_histories` entry
+    /// and the persisted `channel_history` row for the requested key.
+    Done,
+    /// A channel turn is in flight for this conversation key; the gateway
+    /// should answer `409 Conflict` so the operator retries once it ends.
+    Busy,
+}
+
+/// Why a bus-side request was not answered, so the gateway can decide between
+/// retrying and falling back.
+#[derive(Debug)]
+pub enum BusRequestRejection {
+    /// No runtime is alive for this bus; the gateway should fall back to its
+    /// own `ChannelHistoryStore` for the `channel_history` row.
+    Closed,
+    /// The runtime's request queue is full; the gateway answers `500` and
+    /// lets the operator retry.
+    Full,
+    /// The runtime accepted the request but its handler returned an error
+    /// before the in-RAM and `channel_history` copies could be cleared. The
+    /// gateway surfaces this as a `500` rather than silently falling back to
+    /// its own store, because falling back would clear the durable copy but
+    /// leave the runtime's in-RAM entry behind — leaving the conversation
+    /// half-deleted, which is exactly the invariant the plan is fixing.
+    RuntimeError(String),
+}
+
 impl ChannelBus {
-    /// Publish the sender of a freshly built runtime.
+    /// Publish the message sender of a freshly built runtime.
     pub async fn publish(&self, tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) {
         *self.tx.write().await = Some(tx);
     }
 
-    /// Forget the sender when its runtime stops, so an enqueue is refused
-    /// rather than accepted into a bus nothing is draining.
+    /// Forget the message sender when its runtime stops, so an enqueue is
+    /// refused rather than accepted into a bus nothing is draining.
     pub async fn clear(&self) {
         *self.tx.write().await = None;
     }
@@ -1223,6 +1285,63 @@ impl ChannelBus {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(BusRejection::Full),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(BusRejection::Closed),
+        }
+    }
+
+    /// Publish the request side of a freshly built runtime.
+    pub async fn publish_request_sender(&self, tx: tokio::sync::mpsc::Sender<ChannelBusRequest>) {
+        *self.request_tx.write().await = Some(tx);
+    }
+
+    /// Forget the request sender when its runtime stops, so a request is
+    /// answered with `Closed` rather than waiting on a handler that has gone.
+    pub async fn clear_request_sender(&self) {
+        *self.request_tx.write().await = None;
+    }
+
+    /// Ask the runtime to drop a conversation's in-RAM entry + persisted
+    /// `channel_history` row, or report why it can't.
+    ///
+    /// `try_send`, never `send`: the runtime's request queue is small and
+    /// bounded, and the gateway holds an HTTP handler behind it. A `Closed`
+    /// reply means the runtime is down — the gateway falls back to opening
+    /// its own `ChannelHistoryStore`. A `Full` reply is the queue-full case;
+    /// the gateway answers `500` and lets the operator retry. A
+    /// `RuntimeError` means the handler accepted the request but failed
+    /// mid-flight: the in-RAM map and the `channel_history` row may be in
+    /// inconsistent states, so the gateway answers `500` rather than silently
+    /// cover one copy by clearing the other itself.
+    pub async fn try_request_drop(
+        &self,
+        conversation_key: String,
+    ) -> std::result::Result<ChannelBusReply, BusRequestRejection> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let request = ChannelBusRequest {
+            conversation_key,
+            reply: reply_tx,
+        };
+        let guard = self.request_tx.read().await;
+        let Some(tx) = guard.as_ref() else {
+            return Err(BusRequestRejection::Closed);
+        };
+        if let Err(send_err) = tx.try_send(request) {
+            // The oneshot drops with the message, so the gateway does not wait
+            // for an answer the runtime will never produce.
+            drop(send_err);
+            return Err(BusRequestRejection::Full);
+        }
+        drop(guard);
+        match reply_rx.await {
+            Ok(Ok(reply)) => Ok(reply),
+            // Handler ran, but its `clear_sender_history` returned an error
+            // before the in-RAM and durable copies were cleared together.
+            // Treat as an internal failure: the operator must see that the
+            // conversation is half-deleted, not silently get a partial clear.
+            Ok(Err(e)) => Err(BusRequestRejection::RuntimeError(format!("{e}"))),
+            // The handler dropped the oneshot (runtime task ended mid-call):
+            // the runtime is no longer reliably reachable, same outcome as
+            // a closed bus.
+            Err(_) => Err(BusRequestRejection::Closed),
         }
     }
 }
@@ -1753,6 +1872,13 @@ pub(crate) async fn build_channel_runtime(
         // (role-based, not per-user) by `guest_gate_from_config` so production
         // and tests share one entry point.
         guest_gate,
+        // In-flight refcount: the dispatcher increments one entry per turn
+        // before it reads history and decrements on every exit path; the
+        // runtime's bus-request handler reads the same map under one mutex
+        // hold across the check + `clear_sender_history` so no turn can
+        // start between them. Lives on the runtime context because exactly
+        // one context is alive per process.
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     });
 
     Ok(Some(ChannelRuntime {
@@ -1832,6 +1958,25 @@ pub(crate) async fn spawn_webhook_dispatch(
     let Some(runtime) = build_channel_runtime(config, None).await? else {
         return Ok(None);
     };
+    Ok(Some(
+        install_webhook_dispatch_wiring(runtime, shutdown, bus).await,
+    ))
+}
+
+/// Wire a webhook dispatch onto a pre-built runtime: publish the message and
+/// request-with-answer senders on the bus, then spawn the dispatch loop and
+/// the request handler together so the bus clears both sides when the loop
+/// returns. The webhook path does not call `run_channel_runtime` (it has no
+/// listeners to supervise), but it shares the request wiring so the gateway
+/// always has a real handler to answer `try_request_drop` while the dispatch
+/// loop is alive. Without the `publish_request_sender` here, `rantaiclaw
+/// gateway` standalone sees `Closed` on every `DELETE` for a channel
+/// conversation.
+pub(super) async fn install_webhook_dispatch_wiring(
+    runtime: ChannelRuntime,
+    shutdown: CancellationToken,
+    bus: Arc<ChannelBus>,
+) -> tokio::task::JoinHandle<()> {
     let ChannelRuntime {
         ctx,
         tx,
@@ -1839,11 +1984,49 @@ pub(crate) async fn spawn_webhook_dispatch(
         max_in_flight_messages,
         ..
     } = runtime;
+    let (request_join, request_tx) = build_bus_request_wiring(Arc::clone(&ctx), shutdown.clone());
     bus.publish(tx).await;
-    Ok(Some(tokio::spawn(async move {
-        dispatch::run_message_dispatch_loop(rx, ctx, max_in_flight_messages, shutdown).await;
+    bus.publish_request_sender(request_tx).await;
+    tokio::spawn(async move {
+        dispatch::run_message_dispatch_loop(rx, ctx, max_in_flight_messages, shutdown.clone())
+            .await;
         bus.clear().await;
-    })))
+        bus.clear_request_sender().await;
+        // The request handler drains the request mpsc until the sender we
+        // published above is dropped by `clear_request_sender`; awaiting here
+        // joins it cleanly rather than leaving it parked on `recv()`.
+        let _ = request_join.await;
+    })
+}
+
+/// Build the bus's request-with-answer mpsc and spawn the
+/// [`run_channel_bus_requests`] task that drains it.
+///
+/// Used by every dispatch path the daemon runs: [`run_channel_runtime`] (the
+/// daemon's supervised path) and [`spawn_webhook_dispatch`] (`rantaiclaw
+/// gateway` standalone). Both call this so the gateway always has a real
+/// request handler to answer `try_request_drop` while the dispatch loop is
+/// alive. The caller publishes the returned sender via
+/// [`ChannelBus::publish_request_sender`]; the handler runs as long as that
+/// sender stays installed, and exits when the bus drops it. Returns the
+/// `JoinHandle` of the request task so the caller can await its exit after
+/// the bus is cleared.
+pub(super) fn build_bus_request_wiring(
+    ctx: Arc<ChannelRuntimeContext>,
+    shutdown: CancellationToken,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<ChannelBusRequest>,
+) {
+    let (request_tx, request_rx) = tokio::sync::mpsc::channel::<ChannelBusRequest>(16);
+    let handle = {
+        let ctx = Arc::clone(&ctx);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            run_channel_bus_requests(request_rx, ctx, shutdown).await;
+        })
+    };
+    (handle, request_tx)
 }
 
 /// Watch this runtime's `config.toml` and apply a change as soon as it lands,
@@ -1960,7 +2143,19 @@ pub(crate) async fn run_channel_runtime(
     // an inbound webhook during a restart is refused rather than accepted into a
     // bus nothing is draining.
     if let Some(ref bus) = bus {
+        // The request-with-answer side lives on its own mpsc, drained by a
+        // sibling task spawned via [`build_bus_request_wiring`] (the same
+        // wiring the webhook dispatch path uses). We publish the sender here
+        // so a `DROP` command from the gateway reaches the runtime while the
+        // bus is up, and clear it on exit so a late request answers `Closed`
+        // rather than blocking on a handler that has gone away.
+        let (request_handle, request_tx) =
+            build_bus_request_wiring(Arc::clone(&ctx), shutdown.clone());
         bus.publish(tx.clone()).await;
+        bus.publish_request_sender(request_tx).await;
+        // Hold the request handler join handle so we can await its exit after
+        // the bus is cleared below.
+        handles.push(request_handle);
     }
     // Drop our copy so `rx` closes when all listeners stop. Any sender the
     // gateway holds keeps the loop alive past that, which is why the loop also
@@ -1971,6 +2166,7 @@ pub(crate) async fn run_channel_runtime(
 
     if let Some(ref bus) = bus {
         bus.clear().await;
+        bus.clear_request_sender().await;
     }
 
     if let Some(h) = config_watch_handle {
@@ -1994,12 +2190,66 @@ pub(crate) async fn run_channel_runtime(
     Ok(())
 }
 
+/// Drain [`ChannelBusRequest`]s while the runtime is alive: for every
+/// `DropConversation` request, hold the in-flight counter mutex across both
+/// the busy check and `clear_sender_history` so no turn can register for that
+/// key between them.
+///
+/// The mutex hold is short: the busy check is a single map lookup; the
+/// history clear is one take of `ctx.conversation_histories` and one
+/// `ctx.history_store.delete`. Workers only take the same counter mutex to
+/// add or remove one refcount, so they cannot starve behind a held request.
+///
+/// Replies carry the outcome back through the oneshot the gateway put on the
+/// request. An `Err` reply propagates a `clear_sender_history` failure so the
+/// gateway can refuse the operator-facing session deletion. Shutdown cancels
+/// the receiver cleanly: pending requests just see `ChannelBusRequest::reply`
+/// close its sender and the gateway falls back to its own store handle.
+pub(crate) async fn run_channel_bus_requests(
+    mut request_rx: tokio::sync::mpsc::Receiver<ChannelBusRequest>,
+    ctx: Arc<ChannelRuntimeContext>,
+    shutdown: CancellationToken,
+) {
+    while let Some(req) = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        r = request_rx.recv() => r,
+    } {
+        let outcome = {
+            // Hold the counter across the check AND the clear: a worker that
+            // hasn't entered `process_channel_message` yet takes the same mutex
+            // to increment, so blocking here serializes new turns behind the
+            // delete rather than letting one start after the check and read
+            // history we just cleared.
+            let counts = ctx
+                .in_flight_counter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if counts.contains_key(&req.conversation_key) {
+                Ok(ChannelBusReply::Busy)
+            } else {
+                history::clear_sender_history(&ctx, &req.conversation_key)
+                    .map(|()| ChannelBusReply::Done)
+            }
+        };
+        // The receiver may have been dropped if the runtime tore down first;
+        // a `send` failure is benign and worth one trace so the operator can
+        // see a request that answered itself.
+        if req.reply.send(outcome).is_err() {
+            tracing::warn!(
+                conversation_key = %req.conversation_key,
+                "channel bus drop request reply went nowhere; the caller is gone"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 pub(crate) mod tests;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(test)]
 pub(crate) mod owner_dm;

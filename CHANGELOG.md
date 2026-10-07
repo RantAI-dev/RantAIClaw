@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Deleting a `source=channel` session through `DELETE /api/v1/sessions/{id}`
+  now removes the whole conversation: every session with that
+  `conversation_key`, their messages, the persisted `channel_history` row in
+  `brain.db`, and the in-RAM `conversation_histories` entry the runtime
+  holds. While a dispatcher is mid-turn the handler returns `409` rather
+  than racing it. The response shape is `{"deleted", "id", "conversation_key",
+  "sessions_removed"}`. Non-channel sessions keep the old `{"deleted", "id"}`
+  body and remove only the one session, matching the previous contract.
+  `GET /api/v1/sessions` with `?source=channel` now also returns conversation
+  metadata (`conversation_key`, decoded `surface`/`place`/`thread`,
+  `last_activity_at`) so the console can label and group channel rows
+  without a second round-trip. `POST /api/v1/sessions/search` gains the
+  same `source` field; without it the search scopes itself to non-channel
+  rows, and with `source=channel` it narrows to channel recordings.
 - The search mode memory is using is now reported on every surface that talks
   about memory: `rantaiclaw memory stats` gains a `Mode:` line, the
   `rantaiclaw memory recall` header carries `(mode: …)`, and `GET /api/v1/memory/stats`
@@ -20,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when rows in `brain.db` were embedded by a different model — pointing at
   `rantaiclaw memory reindex`. A fresh install (no `brain.db` yet) still
   passes.
+
+### Changed
+
+- `POST /api/v1/sessions/search` now scopes to the one `source` the body
+  names and excludes channel rows by default. `source: "channel"` searches
+  channel sessions; `source: "<other>"` matches that source exactly;
+  omitting the field narrows the search to non-channel rows. The filter is
+  applied in SQL so the `limit` slots are filled with on-bucket matches
+  instead of being shared with every other source. The previous behaviour
+  was that the search returned channel rows together with every other
+  source and the caller had no way to scope away from them.
 
 ### Fixed
 

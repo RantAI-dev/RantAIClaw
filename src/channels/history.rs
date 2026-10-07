@@ -9,18 +9,23 @@ use super::{
 };
 use crate::providers::ChatMessage;
 
-pub(crate) fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
+pub(crate) fn clear_sender_history(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+) -> anyhow::Result<()> {
     ctx.conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
 
-    // Persistence must never break message handling: log and ignore errors.
     if let Some(store) = ctx.history_store.as_ref() {
-        if let Err(e) = store.delete(sender_key) {
-            tracing::warn!("failed to delete persisted channel history for {sender_key}: {e}");
-        }
+        // The whole-conversation `DELETE` path treats a failed `channel_history`
+        // delete as an error: the gateway must not answer `deleted: true`
+        // while one of the three copies is still on disk. Live message
+        // handling keeps the log-and-ignore path on its own caller.
+        store.delete(sender_key)?;
     }
+    Ok(())
 }
 
 /// Trim a compaction slice so no row is left whose body exceeds the per-message
