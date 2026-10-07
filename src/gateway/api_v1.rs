@@ -4986,7 +4986,25 @@ mod tests {
     /// `two` / `thread-7`.
     #[tokio::test]
     async fn memory_list_decodes_surface_place_and_thread_per_entry() {
-        let (_tmp, app) = app_with_three_places().await;
+        let (_tmp, state) = state_with_real_memory();
+        let mem = state.mem.clone();
+        mem.store(
+            "chat_one_note",
+            "note from chat one",
+            MemoryCategory::Core,
+            Some("chat:one"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "chat_two_threaded_note",
+            "note from a thread in chat two",
+            MemoryCategory::Core,
+            Some("chat:two:thread-7"),
+        )
+        .await
+        .unwrap();
+        let app = router().with_state(state);
         let body = memory_list_json(&app, "").await;
         let entries = body["entries"].as_array().unwrap();
         let chat_one = entries
@@ -4998,6 +5016,16 @@ mod tests {
         assert!(
             chat_one["thread"].is_null(),
             "a `chat:one` key has no thread; the label says so"
+        );
+        let threaded = entries
+            .iter()
+            .find(|e| e["key"] == "chat_two_threaded_note")
+            .expect("chat:two:thread-7 row is present");
+        assert_eq!(threaded["surface"], "chat");
+        assert_eq!(threaded["place"], "two");
+        assert_eq!(
+            threaded["thread"], "thread-7",
+            "the part after the second `:` is the thread label"
         );
     }
 
@@ -5045,7 +5073,6 @@ mod tests {
 
     // ── the round-trip private-by-default ───────────────────────────
 
-    /// A note posted with no `session_id` is private, and `?place=private`
     /// A private note with no `place` parameter is returned, but is not returned
     /// when filtering to a different conversation's place. The round-trip ensures
     /// the `Private` scope filter blocks unrelated places from accessing private notes.

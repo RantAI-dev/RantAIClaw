@@ -908,10 +908,10 @@ should check the encoded size and say so plainly rather than surfacing a bare
   `private_entries` counts notes with no `session_id`; `conversation_entries`
   counts notes that belong to a conversation. The two sum to `total_entries`.
 
-  `memory_md_chars` is the total character count of all private `core` notes
-  as rendered in the `MEMORY.md` block, without any cap applied. It can exceed
-  `memory_md_max_chars` (the 4000-character ceiling). `memory_md_max_chars` is
-  the limit used when deciding which notes fit in the system prompt; this field
+  `memory_md_chars` is the total character count of up to the newest 1000 private
+  `core` notes as rendered in the `MEMORY.md` block, without any cap applied.
+  It can exceed `memory_md_max_chars` (the 4000-character ceiling). `memory_md_max_chars`
+  is the limit used when deciding which notes fit in the system prompt; this field
   serves the same purpose as the memory tool's capacity notice.
 - **Status codes**: `200`, `401`.
 
