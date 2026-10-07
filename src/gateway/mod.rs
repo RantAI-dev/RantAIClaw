@@ -3064,7 +3064,7 @@ mod tests {
 
     use super::*;
     use crate::channels::traits::ChannelMessage;
-    use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+    use crate::memory::{Memory, MemoryCategory, MemoryEntry, SessionScope};
     use crate::providers::Provider;
     use async_trait::async_trait;
     use axum::http::HeaderValue;
@@ -3681,7 +3681,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -3693,7 +3693,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -3702,7 +3702,7 @@ mod tests {
             Ok(false)
         }
 
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(0)
         }
 
@@ -3756,7 +3756,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -3768,7 +3768,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -3777,7 +3777,7 @@ mod tests {
             Ok(false)
         }
 
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             let size = self.keys.lock().len();
             Ok(size)
         }
@@ -4163,7 +4163,7 @@ mod tests {
                 let run = webhook_door_run(trigger, false, &store_call(key, content)).await;
 
                 assert_eq!(
-                    run.memory.count().await.unwrap(),
+                    run.memory.count(memory::SessionScope::Any).await.unwrap(),
                     1,
                     "{what} (trigger {trigger}): a row was written"
                 );

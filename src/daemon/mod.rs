@@ -712,7 +712,7 @@ mod tests {
 
         let mem: std::sync::Arc<dyn crate::memory::Memory> =
             std::sync::Arc::from(crate::memory::SqliteMemory::new(&fixture.workspace).unwrap());
-        let count_before = mem.count().await.unwrap();
+        let count_before = mem.count(crate::memory::SessionScope::Any).await.unwrap();
 
         let observer: std::sync::Arc<dyn crate::observability::Observer> =
             std::sync::Arc::new(crate::observability::NoopObserver);
@@ -723,7 +723,7 @@ mod tests {
         fixture.llm.wait_for_requests(1).await;
         worker.abort();
 
-        let count_after = mem.count().await.unwrap();
+        let count_after = mem.count(crate::memory::SessionScope::Any).await.unwrap();
         assert_eq!(
             count_before, count_after,
             "the heartbeat door must not change the memories table \

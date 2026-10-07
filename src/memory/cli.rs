@@ -68,7 +68,11 @@ async fn handle_list(
 ) -> Result<()> {
     let mem = create_cli_memory(config)?;
     let cat = category.as_deref().map(parse_category);
-    let entries = mem.list(cat.as_ref(), session.as_deref()).await?;
+    // The CLI's `--session` argument was the previous conversation filter; it
+    // maps onto `SessionScope::Conversation(key)` for one conversation and
+    // onto `Any` when absent. There is no `private` keyword on this surface.
+    let scope = crate::memory::SessionScope::from_session_id(session.as_deref());
+    let entries = mem.list(cat.as_ref(), scope).await?;
 
     if entries.is_empty() {
         println!("No memory entries found.");
@@ -79,7 +83,7 @@ async fn handle_list(
     // total. Asking `count()` is what stops a database of 5,000 entries
     // reporting "1000 total" forever.
     let listed = entries.len();
-    let total = mem.count().await.unwrap_or(listed);
+    let total = mem.count(scope).await.unwrap_or(listed);
     let page: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
 
     if page.is_empty() {
@@ -124,7 +128,7 @@ async fn handle_get(config: &Config, key: &str) -> Result<()> {
     }
 
     // Fall back to prefix match so users can copy partial keys from `list`.
-    let all = mem.list(None, None).await?;
+    let all = mem.list(None, crate::memory::SessionScope::Any).await?;
     let matches: Vec<_> = all.iter().filter(|e| e.key.starts_with(key)).collect();
 
     match matches.len() {
@@ -211,7 +215,9 @@ async fn handle_add(config: &Config, key: &str, content: &str, category: &str) -
 async fn handle_recall(config: &Config, query: &str, limit: usize) -> Result<()> {
     let mem = create_cli_memory(config)?;
     let mode = super::search_mode_label(&resolved_embedding_provider(config));
-    let hits = mem.recall(query, limit.max(1), None).await?;
+    let hits = mem
+        .recall(query, limit.max(1), crate::memory::SessionScope::Any)
+        .await?;
 
     if hits.is_empty() {
         println!("No memory entries matched '{query}' (mode: {mode}).");
@@ -278,7 +284,7 @@ async fn handle_stats(config: &Config) -> Result<()> {
     // `Total: 0` next to `Health: healthy` and read as an empty store. `stats` is
     // the command an operator runs *because* memory is misbehaving; report what
     // can be read and name what cannot.
-    let counted = mem.count().await;
+    let counted = mem.count(crate::memory::SessionScope::Any).await;
 
     println!("Memory Statistics:\n");
     println!("  Backend:  {}", style(mem.name()).white().bold());
@@ -296,7 +302,10 @@ async fn handle_stats(config: &Config) -> Result<()> {
     );
     println!("  Total:    {}", render_total(counted.as_ref()));
 
-    let all = mem.list(None, None).await.unwrap_or_default();
+    let all = mem
+        .list(None, crate::memory::SessionScope::Any)
+        .await
+        .unwrap_or_default();
     print!(
         "{}",
         render_category_breakdown(&all, counted.as_ref().ok().copied())
@@ -384,7 +393,9 @@ async fn handle_clear(
 
     // Batch deletion by category (or all).
     let cat = category.as_deref().map(parse_category);
-    let entries = mem.list(cat.as_ref(), None).await?;
+    let entries = mem
+        .list(cat.as_ref(), crate::memory::SessionScope::Any)
+        .await?;
 
     if entries.is_empty() {
         println!("No entries to clear.");
@@ -436,7 +447,7 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
     let target = if mem.get(key).await?.is_some() {
         key.to_string()
     } else {
-        let all = mem.list(None, None).await?;
+        let all = mem.list(None, crate::memory::SessionScope::Any).await?;
         let matches: Vec<_> = all.iter().filter(|e| e.key.starts_with(key)).collect();
         match matches.len() {
             0 => {

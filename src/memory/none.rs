@@ -1,4 +1,4 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, SessionScope};
 use async_trait::async_trait;
 
 /// Explicit no-op memory backend.
@@ -34,7 +34,7 @@ impl Memory for NoneMemory {
         &self,
         _query: &str,
         _limit: usize,
-        _session_id: Option<&str>,
+        _scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
@@ -46,7 +46,7 @@ impl Memory for NoneMemory {
     async fn list(
         &self,
         _category: Option<&MemoryCategory>,
-        _session_id: Option<&str>,
+        _scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
@@ -55,7 +55,7 @@ impl Memory for NoneMemory {
         Ok(false)
     }
 
-    async fn count(&self) -> anyhow::Result<usize> {
+    async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
         Ok(0)
     }
 
@@ -78,10 +78,18 @@ mod tests {
             .unwrap();
 
         assert!(memory.get("k").await.unwrap().is_none());
-        assert!(memory.recall("k", 10, None).await.unwrap().is_empty());
-        assert!(memory.list(None, None).await.unwrap().is_empty());
+        assert!(memory
+            .recall("k", 10, SessionScope::Any)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(memory
+            .list(None, SessionScope::Any)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(!memory.forget("k").await.unwrap());
-        assert_eq!(memory.count().await.unwrap(), 0);
+        assert_eq!(memory.count(SessionScope::Any).await.unwrap(), 0);
         assert!(memory.health_check().await);
     }
 }

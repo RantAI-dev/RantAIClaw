@@ -1080,6 +1080,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SessionScope;
     use async_trait::async_trait;
     use parking_lot::Mutex;
 
@@ -1395,7 +1396,7 @@ mod tests {
             &self,
             _q: &str,
             _l: usize,
-            _s: Option<&str>,
+            _s: SessionScope<'_>,
         ) -> Result<Vec<crate::memory::MemoryEntry>> {
             Ok(vec![])
         }
@@ -1405,14 +1406,14 @@ mod tests {
         async fn list(
             &self,
             _c: Option<&MemoryCategory>,
-            _s: Option<&str>,
+            _s: SessionScope<'_>,
         ) -> Result<Vec<crate::memory::MemoryEntry>> {
             Ok(vec![])
         }
         async fn forget(&self, _k: &str) -> Result<bool> {
             Ok(false)
         }
-        async fn count(&self) -> Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> Result<usize> {
             Ok(0)
         }
         async fn health_check(&self) -> bool {

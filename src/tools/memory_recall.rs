@@ -103,7 +103,7 @@ impl Tool for MemoryRecallTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemoryCategory, SqliteMemory};
+    use crate::memory::{MemoryCategory, SessionScope, SqliteMemory};
     use tempfile::TempDir;
 
     fn seeded_mem() -> (TempDir, Arc<dyn Memory>) {
@@ -252,12 +252,19 @@ mod tests {
             &self,
             _q: &str,
             _l: usize,
-            session_id: Option<&str>,
+            scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
-            self.calls
-                .lock()
-                .expect("probe mutex")
-                .push(session_id.map(str::to_string));
+            // Encode the session scope in the same `Option<String>` shape the
+            // old probe recorded: `Any` → None, `Private` → Some("__private__"),
+            // `Conversation(k)` → Some(k). The two assertions below only
+            // exercise `Any` and `Conversation`, but keeping `Private`
+            // observable lets future probes distinguish it from `Any`.
+            let recorded = match scope {
+                SessionScope::Any => None,
+                SessionScope::Private => Some("__private__".to_string()),
+                SessionScope::Conversation(k) => Some(k.to_string()),
+            };
+            self.calls.lock().expect("probe mutex").push(recorded);
             Ok(vec![])
         }
         async fn get(&self, _k: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
@@ -266,14 +273,14 @@ mod tests {
         async fn list(
             &self,
             _c: Option<&MemoryCategory>,
-            _s: Option<&str>,
+            _s: SessionScope<'_>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(vec![])
         }
         async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(0)
         }
         async fn health_check(&self) -> bool {

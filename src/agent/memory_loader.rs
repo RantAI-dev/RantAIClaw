@@ -67,7 +67,7 @@ impl MemoryLoader for DefaultMemoryLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+    use crate::memory::{Memory, MemoryCategory, MemoryEntry, SessionScope};
     use std::sync::Arc;
 
     /// A loader built without a config scores at the same floor a config does.
@@ -100,7 +100,7 @@ mod tests {
             &self,
             _query: &str,
             limit: usize,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             if limit == 0 {
                 return Ok(vec![]);
@@ -125,7 +125,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(vec![])
         }
@@ -134,7 +134,7 @@ mod tests {
             Ok(true)
         }
 
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(0)
         }
 
@@ -163,7 +163,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(self.entries.as_ref().clone())
         }
@@ -175,7 +175,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(vec![])
         }
@@ -184,7 +184,7 @@ mod tests {
             Ok(true)
         }
 
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(self.entries.len())
         }
 

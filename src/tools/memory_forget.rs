@@ -184,7 +184,7 @@ impl Tool for MemoryForgetTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemoryCategory, SqliteMemory};
+    use crate::memory::{MemoryCategory, SessionScope, SqliteMemory};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -371,7 +371,7 @@ mod tests {
                 &self,
                 _query: &str,
                 _limit: usize,
-                _session_id: Option<&str>,
+                _scope: SessionScope<'_>,
             ) -> anyhow::Result<Vec<MemoryEntry>> {
                 Ok(Vec::new())
             }
@@ -381,14 +381,14 @@ mod tests {
             async fn list(
                 &self,
                 _category: Option<&MemoryCategory>,
-                _session_id: Option<&str>,
+                _scope: SessionScope<'_>,
             ) -> anyhow::Result<Vec<MemoryEntry>> {
                 Ok(Vec::new())
             }
             async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
                 Ok(false)
             }
-            async fn count(&self) -> anyhow::Result<usize> {
+            async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
                 Ok(0)
             }
             async fn health_check(&self) -> bool {
@@ -527,7 +527,7 @@ mod tests {
                 &self,
                 _query: &str,
                 _limit: usize,
-                _session_id: Option<&str>,
+                _scope: SessionScope<'_>,
             ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Vec::new())
@@ -539,7 +539,7 @@ mod tests {
             async fn list(
                 &self,
                 _category: Option<&MemoryCategory>,
-                _session_id: Option<&str>,
+                _scope: SessionScope<'_>,
             ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Vec::new())
@@ -548,7 +548,7 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(false)
             }
-            async fn count(&self) -> anyhow::Result<usize> {
+            async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(0)
             }
@@ -973,7 +973,7 @@ mod tests {
                 &self,
                 _query: &str,
                 _limit: usize,
-                _session_id: Option<&str>,
+                _scope: SessionScope<'_>,
             ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
                 self.reads.fetch_add(1, Ordering::SeqCst);
                 Ok(Vec::new())
@@ -985,7 +985,7 @@ mod tests {
             async fn list(
                 &self,
                 _category: Option<&MemoryCategory>,
-                _session_id: Option<&str>,
+                _scope: SessionScope<'_>,
             ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
                 self.reads.fetch_add(1, Ordering::SeqCst);
                 Ok(Vec::new())
@@ -993,7 +993,7 @@ mod tests {
             async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
                 Ok(false)
             }
-            async fn count(&self) -> anyhow::Result<usize> {
+            async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
                 Ok(0)
             }
             async fn health_check(&self) -> bool {

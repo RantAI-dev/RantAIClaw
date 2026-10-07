@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::memory::{Memory, MemoryCategory};
+use crate::memory::{Memory, MemoryCategory, SessionScope};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -32,8 +32,12 @@ pub(super) async fn resolve_unique_entry(
     // ambiguity error below would name keys the guest has no business seeing. A
     // turn with no view has nothing to read, so it finds no candidate at all.
     let entries = match crate::memory::current_memory_view() {
-        Some(crate::memory::MemoryView::All) => memory.list(None, None).await,
-        Some(crate::memory::MemoryView::Only(key)) => memory.list(None, Some(key.as_str())).await,
+        Some(crate::memory::MemoryView::All) => memory.list(None, SessionScope::Any).await,
+        Some(crate::memory::MemoryView::Only(key)) => {
+            memory
+                .list(None, SessionScope::Conversation(key.as_str()))
+                .await
+        }
         None => Ok(Vec::new()),
     }
     .map_err(|e| format!("Failed to read memory: {e}"))?;
@@ -352,41 +356,31 @@ impl MemoryStoreTool {
     /// that was missing — the file already says `… N more not shown`, but the
     /// agent never saw it. The text states the fact and says to tell the person,
     /// since a tool result is read by the model and must not urge a write.
+    ///
+    /// The figure comes from [`crate::memory::snapshot::core_block_usage`] —
+    /// the same function the gateway's `GET /api/v1/memory/stats` reads — so
+    /// the operator sees the same number the model is told about. The
+    /// `used_chars` figure is the *uncapped* per-entry sum, which is the
+    /// "would render if there were no ceiling" number, so an over-budget
+    /// block reads as `used > budget` here and as `memory_md_chars >
+    /// memory_md_max_chars` on the console.
     async fn core_capacity_notice(&self) -> Option<String> {
-        // The block holds shared notes only, so notes kept in a conversation do
-        // not count against it.
-        let entries: Vec<_> = self
-            .memory
-            .list(Some(&MemoryCategory::Core), None)
+        let usage = crate::memory::snapshot::core_block_usage(self.memory.as_ref())
             .await
-            .ok()?
-            .into_iter()
-            .filter(|entry| entry.session_id.is_none())
-            .collect();
-
-        let mut used = 0_usize;
-        let mut injected = 0_usize;
-        for entry in &entries {
-            let line_chars = entry.key.chars().count() + entry.content.chars().count() + 4;
-            used += line_chars;
-            if used <= crate::memory::snapshot::PROJECTION_MAX_CHARS {
-                injected += 1;
-            }
-        }
-
-        let budget = crate::memory::snapshot::PROJECTION_MAX_CHARS;
-        if used <= budget {
+            .ok()?;
+        let budget = usage.max_chars;
+        if usage.used_chars <= budget {
             return None;
         }
 
-        let omitted = entries.len().saturating_sub(injected);
+        let omitted = usage.total.saturating_sub(usage.projected);
         Some(format!(
             "Note: core memory is {} characters over the {budget}-character block that is \
              injected into the prompt, so {omitted} of {} core memories are no longer \
              carried there. They are still found by memory_recall. Tell the person; do not \
              store or forget notes on your own.",
-            used - budget,
-            entries.len()
+            usage.used_chars - budget,
+            usage.total
         ))
     }
 }
@@ -1279,7 +1273,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             self.bump();
             Ok(Vec::new())
@@ -1291,7 +1285,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             self.bump();
             Ok(Vec::new())
@@ -1300,7 +1294,7 @@ mod tests {
             self.bump();
             Ok(false)
         }
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             self.bump();
             Ok(0)
         }
@@ -1364,7 +1358,11 @@ mod tests {
             assert_eq!(result.error.as_deref(), Some(NO_VIEW_REFUSAL), "{what}");
         }
 
-        assert_eq!(mem.count().await.unwrap(), 1, "a row was written");
+        assert_eq!(
+            mem.count(SessionScope::Any).await.unwrap(),
+            1,
+            "a row was written"
+        );
         assert_eq!(
             mem.get("held_key").await.unwrap().unwrap().content,
             "The operator prefers Python",

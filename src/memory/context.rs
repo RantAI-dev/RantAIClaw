@@ -262,7 +262,7 @@ pub async fn build_memory_context_in_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemoryCategory, MemoryEntry};
+    use crate::memory::{MemoryCategory, MemoryEntry, SessionScope};
     use async_trait::async_trait;
 
     struct FixedMemory {
@@ -287,7 +287,7 @@ mod tests {
             &self,
             _q: &str,
             limit: usize,
-            _s: Option<&str>,
+            _s: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             let mut out = self.entries.clone();
             out.truncate(limit);
@@ -299,14 +299,14 @@ mod tests {
         async fn list(
             &self,
             _c: Option<&MemoryCategory>,
-            _s: Option<&str>,
+            _s: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(vec![])
         }
         async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(self.entries.len())
         }
         async fn health_check(&self) -> bool {
@@ -780,7 +780,7 @@ mod tests {
             &self,
             q: &str,
             limit: usize,
-            s: Option<&str>,
+            s: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             self.calls
                 .lock()
@@ -794,15 +794,15 @@ mod tests {
         async fn list(
             &self,
             c: Option<&MemoryCategory>,
-            s: Option<&str>,
+            s: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             self.inner.list(c, s).await
         }
         async fn forget(&self, k: &str) -> anyhow::Result<bool> {
             self.inner.forget(k).await
         }
-        async fn count(&self) -> anyhow::Result<usize> {
-            self.inner.count().await
+        async fn count(&self, scope: SessionScope<'_>) -> anyhow::Result<usize> {
+            self.inner.count(scope).await
         }
         async fn health_check(&self) -> bool {
             true

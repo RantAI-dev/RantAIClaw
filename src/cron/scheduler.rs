@@ -1516,7 +1516,7 @@ mod tests {
         let fixture = crate::agent::door_test_support::DoorFixture::start().await;
         let mem: std::sync::Arc<dyn crate::memory::Memory> =
             std::sync::Arc::from(crate::memory::SqliteMemory::new(&fixture.workspace).unwrap());
-        let count_before = mem.count().await.unwrap();
+        let count_before = mem.count(crate::memory::SessionScope::Any).await.unwrap();
 
         let mut job = test_job("");
         job.id = "no-write-job".into();
@@ -1533,7 +1533,7 @@ mod tests {
             "the cron agent job ran against the local server: {output}"
         );
 
-        let count_after = mem.count().await.unwrap();
+        let count_after = mem.count(crate::memory::SessionScope::Any).await.unwrap();
         assert_eq!(
             count_before, count_after,
             "the cron scheduler must not change the memories table \

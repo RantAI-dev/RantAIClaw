@@ -17,6 +17,7 @@
 //! feeds stored memory into a prompt or a tool result. `current_memory_view()`
 //! returns `None` where no door set a view.
 
+use crate::memory::SessionScope;
 use anyhow::Result;
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
@@ -88,9 +89,11 @@ pub async fn recall_in_view(
     view: &MemoryView,
 ) -> Result<Vec<MemoryEntry>> {
     match view {
-        MemoryView::All => memory.recall(query, limit, None).await,
+        MemoryView::All => memory.recall(query, limit, SessionScope::Any).await,
         MemoryView::Only(key) => {
-            let results = memory.recall(query, limit, Some(key.as_str())).await?;
+            let results = memory
+                .recall(query, limit, SessionScope::Conversation(key.as_str()))
+                .await?;
             Ok(results
                 .into_iter()
                 .filter(|e| e.session_id.as_deref() == Some(key.as_str()))
@@ -152,13 +155,32 @@ mod tests {
     /// Records every `recall` call so a test can prove which scope the read
     /// asked for. Returns ALL entries regardless of the slot it was asked for
     /// — i.e. mimics a backend that ignores `session_id` (markdown, lucid
-    /// remote), the case this view's filter must save us from. The `None`
-    /// case keeps the "no filter = all" contract the production backends
-    /// share.
+    /// remote), the case this view's filter must save us from. The unscoped
+    /// case keeps the "no filter = all" contract the production backends share.
     #[derive(Default)]
     struct ScopeRecordingMemory {
-        calls: Mutex<Vec<Option<String>>>,
+        calls: Mutex<Vec<ScopeCall>>,
         entries: Vec<MemoryEntry>,
+    }
+
+    /// Recorded shape of a [`SessionScope`] call so the surrounding assertions
+    /// can match by value. `Any` covers the unscoped read; `Private` the rows
+    /// with `session_id IS NULL`; `Conversation(k)` one named conversation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ScopeCall {
+        Any,
+        Private,
+        Conversation(String),
+    }
+
+    impl ScopeCall {
+        fn from_scope(scope: SessionScope<'_>) -> Self {
+            match scope {
+                SessionScope::Any => Self::Any,
+                SessionScope::Private => Self::Private,
+                SessionScope::Conversation(k) => Self::Conversation(k.to_string()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -179,17 +201,17 @@ mod tests {
             &self,
             _query: &str,
             limit: usize,
-            session_id: Option<&str>,
+            scope: SessionScope<'_>,
         ) -> Result<Vec<MemoryEntry>> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(session_id.map(str::to_string));
+                .push(ScopeCall::from_scope(scope));
             let mut out: Vec<MemoryEntry> = self.entries.clone();
-            // Cap the unsocped case at `limit`; keep the scoped case
-            // un-capped so a `Some(key)` recall never quietly loses entries
-            // before the view's filter runs.
-            if session_id.is_none() {
+            // Cap the unscoped case at `limit`; keep every narrower scope
+            // un-capped so a `Conversation(k)` recall never quietly loses
+            // entries before the view's filter runs.
+            if matches!(scope, SessionScope::Any) {
                 out.truncate(limit);
             }
             Ok(out)
@@ -200,14 +222,14 @@ mod tests {
         async fn list(
             &self,
             _c: Option<&MemoryCategory>,
-            _s: Option<&str>,
+            _s: SessionScope<'_>,
         ) -> Result<Vec<MemoryEntry>> {
             Ok(vec![])
         }
         async fn forget(&self, _k: &str) -> Result<bool> {
             Ok(false)
         }
-        async fn count(&self) -> Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> Result<usize> {
             Ok(self.entries.len())
         }
         async fn health_check(&self) -> bool {
@@ -260,7 +282,7 @@ mod tests {
         // And it had to ask the backend with the right session slot, or the
         // filter would silently work on whatever the backend chose to return.
         let calls = mem.calls.lock().unwrap().clone();
-        assert_eq!(calls, vec![Some("conv1".to_string())]);
+        assert_eq!(calls, vec![ScopeCall::Conversation("conv1".into())]);
     }
 
     /// A view whose key has no matching entries — including the case where
@@ -307,8 +329,8 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(
             mem.calls.lock().unwrap().clone(),
-            vec![None],
-            "All must call recall(.., None) — the global slot"
+            vec![ScopeCall::Any],
+            "All must call recall(.., Any) — the global slot"
         );
     }
 

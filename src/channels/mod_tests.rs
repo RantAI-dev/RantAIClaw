@@ -1239,7 +1239,7 @@ use super::*;
 // reaching it, now by name.
 use super::dispatch::*;
 use super::test_support::*;
-use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+use crate::memory::{Memory, MemoryCategory, SessionScope, SqliteMemory};
 use crate::observability::NoopObserver;
 use crate::providers::{ChatMessage, Provider};
 use crate::tools::{Tool, ToolResult};
@@ -4068,7 +4068,7 @@ impl Memory for RecallMemory {
         &self,
         _query: &str,
         _limit: usize,
-        _session_id: Option<&str>,
+        _scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
         Ok(vec![crate::memory::MemoryEntry {
             id: "entry-1".to_string(),
@@ -4088,7 +4088,7 @@ impl Memory for RecallMemory {
     async fn list(
         &self,
         _category: Option<&crate::memory::MemoryCategory>,
-        _session_id: Option<&str>,
+        _scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
         Ok(Vec::new())
     }
@@ -4097,7 +4097,7 @@ impl Memory for RecallMemory {
         Ok(false)
     }
 
-    async fn count(&self) -> anyhow::Result<usize> {
+    async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
         Ok(1)
     }
 

@@ -1,6 +1,6 @@
 use super::embeddings::EmbeddingProvider;
 use super::terms;
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, SessionScope};
 use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -60,10 +60,56 @@ impl CategoryScope {
 /// What one `recall` asks, shared by both of its passes.
 struct RecallQuery<'a> {
     text: &'a str,
-    session: Option<&'a str>,
+    scope: SessionScope<'a>,
     embedding: Option<&'a [f32]>,
     vector_weight: f32,
     keyword_weight: f32,
+}
+
+/// Owned companion of [`SessionScope`]. Used when a scope has to outlive the
+/// caller's borrow, e.g. when [`SqliteMemory::recall`] moves it into a
+/// `spawn_blocking` closure. The conversion is `From<&SessionScope<'_>>`, the
+/// back-reference is [`OwnedSessionScope::as_scope`].
+#[derive(Debug, Clone)]
+enum OwnedSessionScope {
+    Any,
+    Private,
+    Conversation(String),
+}
+
+impl OwnedSessionScope {
+    fn as_scope(&self) -> SessionScope<'_> {
+        match self {
+            Self::Any => SessionScope::Any,
+            Self::Private => SessionScope::Private,
+            Self::Conversation(key) => SessionScope::Conversation(key.as_str()),
+        }
+    }
+}
+
+impl<'a> From<&SessionScope<'a>> for OwnedSessionScope {
+    fn from(scope: &SessionScope<'a>) -> Self {
+        match scope {
+            SessionScope::Any => Self::Any,
+            SessionScope::Private => Self::Private,
+            SessionScope::Conversation(key) => Self::Conversation((*key).to_string()),
+        }
+    }
+}
+
+/// True when `session_id` is in the rows `scope` admits.
+///
+/// The match is symmetrical so a row with `session_id = "X"` passes a
+/// `Conversation("X")` scope and only a `Conversation("X")` scope; the
+/// private case is the rows whose `session_id` is NULL, and `Any` admits
+/// everything. Used to post-filter results a hybrid search merged outside the
+/// chosen scope.
+fn scope_matches(session_id: Option<&str>, scope: SessionScope<'_>) -> bool {
+    match scope {
+        SessionScope::Any => true,
+        SessionScope::Private => session_id.is_none(),
+        SessionScope::Conversation(key) => session_id == Some(key),
+    }
 }
 
 /// SQLite-backed persistent memory — the brain
@@ -429,7 +475,7 @@ impl SqliteMemory {
         conn: &Connection,
         query: &str,
         limit: usize,
-        session_id: Option<&str>,
+        session: SessionScope<'_>,
         scope: CategoryScope,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let fts_query = Self::build_fts_query(query);
@@ -443,10 +489,14 @@ impl SqliteMemory {
         // busy database a scoped recall came back empty while matching rows sat
         // in the table.
         let category_clause = scope.clause("m.category");
-        let session_clause = if session_id.is_some() {
-            " AND m.session_id = ?3"
-        } else {
-            ""
+        // The conversation case adds a parameter at position 3; the other two
+        // cases leave the placeholder list at two entries. The branch is split
+        // rather than parameterised so each `query_map` call sees a uniform
+        // shape and rusqlite does not have to type-erase `None`.
+        let (session_clause, with_session_param) = match session {
+            SessionScope::Any => ("", false),
+            SessionScope::Private => (" AND m.session_id IS NULL", false),
+            SessionScope::Conversation(_) => (" AND m.session_id = ?3", true),
         };
         let sql = format!(
             "SELECT m.id, m.key, m.content
@@ -476,14 +526,14 @@ impl SqliteMemory {
         };
 
         let mut results = Vec::new();
-        match session_id {
-            Some(sid) => {
+        match (session, with_session_param) {
+            (SessionScope::Conversation(sid), true) => {
                 let rows = stmt.query_map(params![fts_query, limit_i64, sid], map_row)?;
                 for row in rows {
                     results.push(row?);
                 }
             }
-            None => {
+            _ => {
                 let rows = stmt.query_map(params![fts_query, limit_i64], map_row)?;
                 for row in rows {
                     results.push(row?);
@@ -547,14 +597,14 @@ impl SqliteMemory {
 
     /// Vector similarity search: scan embeddings and compute cosine similarity.
     ///
-    /// Optional `category` and `session_id` filters reduce full-table scans
-    /// when the caller already knows the scope of relevant memories.
+    /// Optional `category` filter and the [`SessionScope`] reduce full-table
+    /// scans when the caller already knows the scope of relevant memories.
     fn vector_search(
         conn: &Connection,
         query_embedding: &[f32],
         limit: usize,
         category: Option<&str>,
-        session_id: Option<&str>,
+        session: SessionScope<'_>,
         scope: CategoryScope,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let mut sql =
@@ -569,9 +619,15 @@ impl SqliteMemory {
             param_values.push(Box::new(cat.to_string()));
             idx += 1;
         }
-        if let Some(sid) = session_id {
-            let _ = write!(sql, " AND session_id = ?{idx}");
-            param_values.push(Box::new(sid.to_string()));
+        match session {
+            SessionScope::Any => {}
+            SessionScope::Private => {
+                let _ = write!(sql, " AND session_id IS NULL");
+            }
+            SessionScope::Conversation(sid) => {
+                let _ = write!(sql, " AND session_id = ?{idx}");
+                param_values.push(Box::new(sid.to_string()));
+            }
         }
 
         let mut stmt = conn.prepare(&sql)?;
@@ -710,7 +766,7 @@ impl SqliteMemory {
         // unparseable MATCH expression, a damaged index — and used to be
         // indistinguishable from "nothing matched", which quietly demoted the
         // query to the substring fallback. Say so, then degrade as before.
-        let keyword_results = match Self::fts5_search(conn, q.text, limit * 2, q.session, scope) {
+        let keyword_results = match Self::fts5_search(conn, q.text, limit * 2, q.scope, scope) {
             Ok(hits) => hits,
             Err(e) => {
                 tracing::warn!(
@@ -723,7 +779,7 @@ impl SqliteMemory {
 
         // Vector similarity search (if embeddings available)
         let vector_results = if let Some(qe) = q.embedding {
-            match Self::vector_search(conn, qe, limit * 2, None, q.session, scope) {
+            match Self::vector_search(conn, qe, limit * 2, None, q.scope, scope) {
                 Ok(hits) => hits,
                 Err(e) => {
                     tracing::warn!(
@@ -807,10 +863,15 @@ impl SqliteMemory {
                         session_id: sid,
                         score: Some(f64::from(scored.final_score)),
                     };
-                    if let Some(filter_sid) = q.session {
-                        if entry.session_id.as_deref() != Some(filter_sid) {
-                            continue;
-                        }
+                    // The merged set comes from both `fts5_search` and
+                    // `vector_search`, each of which applied the SQL filter.
+                    // A hybrid merge, however, ranks across the two — its
+                    // top-N is the union, and the union can carry entries the
+                    // other side would have skipped. Re-check here so a
+                    // session-scoped recall cannot leak a row through the
+                    // vector path.
+                    if !scope_matches(entry.session_id.as_deref(), q.scope) {
+                        continue;
                     }
                     results.push(entry);
                 }
@@ -839,13 +900,13 @@ impl SqliteMemory {
                 // the whole limit with other sessions' rows before the filter
                 // ever runs.
                 let limit_idx = keywords.len() * 2 + 1;
-                let (scope_clause, session_idx) = if q.session.is_some() {
-                    (
+                let (scope_clause, session_sid) = match q.scope {
+                    SessionScope::Any => (String::new(), None),
+                    SessionScope::Private => (" AND session_id IS NULL".to_string(), None),
+                    SessionScope::Conversation(sid) => (
                         format!(" AND session_id = ?{}", limit_idx + 1),
-                        Some(limit_idx + 1),
-                    )
-                } else {
-                    (String::new(), None)
+                        Some(sid.to_string()),
+                    ),
                 };
                 let category_clause = scope.clause("category");
                 let sql = format!(
@@ -862,10 +923,8 @@ impl SqliteMemory {
                 }
                 #[allow(clippy::cast_possible_wrap)]
                 param_values.push(Box::new(limit as i64));
-                if session_idx.is_some() {
-                    if let Some(sid) = q.session {
-                        param_values.push(Box::new(sid.to_string()));
-                    }
+                if let Some(sid) = session_sid {
+                    param_values.push(Box::new(sid));
                 }
                 let params_ref: Vec<&dyn rusqlite::types::ToSql> =
                     param_values.iter().map(AsRef::as_ref).collect();
@@ -888,10 +947,8 @@ impl SqliteMemory {
                 })?;
                 for row in rows {
                     let entry = row?;
-                    if let Some(sid) = q.session {
-                        if entry.session_id.as_deref() != Some(sid) {
-                            continue;
-                        }
+                    if !scope_matches(entry.session_id.as_deref(), q.scope) {
+                        continue;
                     }
                     results.push(entry);
                 }
@@ -1005,7 +1062,7 @@ impl Memory for SqliteMemory {
         &self,
         query: &str,
         limit: usize,
-        session_id: Option<&str>,
+        scope: super::SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
@@ -1028,7 +1085,11 @@ impl Memory for SqliteMemory {
 
         let conn = self.conn.clone();
         let query = query.to_string();
-        let sid = session_id.map(String::from);
+        // `RecallQuery` takes a borrowed `SessionScope`; the closure outlives
+        // the caller's borrow, so move the scope into an owned copy here. The
+        // owned form is the same enum with the conversation key on the heap
+        // when it is present.
+        let owned_scope: OwnedSessionScope = (&scope).into();
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
 
@@ -1036,7 +1097,7 @@ impl Memory for SqliteMemory {
             let conn = conn.lock();
             let q = RecallQuery {
                 text: &query,
-                session: sid.as_deref(),
+                scope: owned_scope.as_scope(),
                 embedding: query_embedding.as_deref(),
                 vector_weight,
                 keyword_weight,
@@ -1093,7 +1154,7 @@ impl Memory for SqliteMemory {
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
-        session_id: Option<&str>,
+        scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         // Callers render `list().len()` as a total. It is not one past this
         // cap — `count()` is — so anything reporting a total has to ask for it
@@ -1102,11 +1163,10 @@ impl Memory for SqliteMemory {
 
         let conn = self.conn.clone();
         let category = category.cloned();
-        let sid = session_id.map(String::from);
+        let owned_scope = OwnedSessionScope::from(&scope);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
-            let session_ref = sid.as_deref();
             let mut results = Vec::new();
 
             let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
@@ -1121,36 +1181,59 @@ impl Memory for SqliteMemory {
                 })
             };
 
-            if let Some(ref cat) = category {
-                let cat_str = Self::category_to_str(cat);
-                let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id FROM memories
-                     WHERE category = ?1 ORDER BY updated_at DESC LIMIT ?2",
-                )?;
-                let rows = stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?;
-                for row in rows {
-                    let entry = row?;
-                    if let Some(sid) = session_ref {
-                        if entry.session_id.as_deref() != Some(sid) {
-                            continue;
+            // Build the WHERE clause around the scope once. The category
+            // branch already pinned `?1` to the category literal and `?2` to
+            // the limit; the unscoped branch has only the limit (`?1`).
+            // Either way the scope's `?` parameter sits at index 2 in the
+            // category branch and is absent from the other, so the SQL shape
+            // is split rather than concatenated with a stray `?`.
+            match (&category, owned_scope.as_scope()) {
+                (Some(cat), scope_now) => {
+                    let cat_str = Self::category_to_str(cat);
+                    let (scope_clause, scope_param) = match scope_now {
+                        SessionScope::Any => (String::new(), None),
+                        SessionScope::Private => (" AND session_id IS NULL".to_string(), None),
+                        SessionScope::Conversation(sid) => {
+                            (" AND session_id = ?3".to_string(), Some(sid.to_string()))
                         }
+                    };
+                    let sql = format!(
+                        "SELECT id, key, content, category, created_at, session_id FROM memories
+                         WHERE category = ?1{scope_clause}
+                         ORDER BY updated_at DESC LIMIT ?2"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = if let Some(sid) = scope_param {
+                        stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT, sid], row_mapper)?
+                    } else {
+                        stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?
+                    };
+                    for row in rows {
+                        results.push(row?);
                     }
-                    results.push(entry);
                 }
-            } else {
-                let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id FROM memories
-                     ORDER BY updated_at DESC LIMIT ?1",
-                )?;
-                let rows = stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?;
-                for row in rows {
-                    let entry = row?;
-                    if let Some(sid) = session_ref {
-                        if entry.session_id.as_deref() != Some(sid) {
-                            continue;
+                (None, scope_now) => {
+                    let (scope_clause, scope_param) = match scope_now {
+                        SessionScope::Any => (String::new(), None),
+                        SessionScope::Private => (" AND session_id IS NULL".to_string(), None),
+                        SessionScope::Conversation(sid) => {
+                            (" AND session_id = ?2".to_string(), Some(sid.to_string()))
                         }
+                    };
+                    let sql = format!(
+                        "SELECT id, key, content, category, created_at, session_id FROM memories
+                         WHERE 1 = 1{scope_clause}
+                         ORDER BY updated_at DESC LIMIT ?1"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = if let Some(sid) = scope_param {
+                        stmt.query_map(params![DEFAULT_LIST_LIMIT, sid], row_mapper)?
+                    } else {
+                        stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?
+                    };
+                    for row in rows {
+                        results.push(row?);
                     }
-                    results.push(entry);
                 }
             }
 
@@ -1171,13 +1254,29 @@ impl Memory for SqliteMemory {
         .await?
     }
 
-    async fn count(&self) -> anyhow::Result<usize> {
+    async fn count(&self, scope: SessionScope<'_>) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
+        let owned_scope = OwnedSessionScope::from(&scope);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = conn.lock();
-            let count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+            // Push the scope predicate into SQL rather than fetching every
+            // row to count, so a `?place=private` total on a busy store stays
+            // O(1) in rows held.
+            let (scope_clause, scope_param) = match owned_scope.as_scope() {
+                SessionScope::Any => (String::new(), None),
+                SessionScope::Private => (" WHERE session_id IS NULL".to_string(), None),
+                SessionScope::Conversation(sid) => {
+                    (" WHERE session_id = ?1".to_string(), Some(sid.to_string()))
+                }
+            };
+            let sql = format!("SELECT COUNT(*) FROM memories{scope_clause}");
+            let mut stmt = conn.prepare(&sql)?;
+            let count: i64 = if let Some(sid) = scope_param {
+                stmt.query_row(params![sid.as_str()], |row| row.get(0))?
+            } else {
+                stmt.query_row([], |row| row.get(0))?
+            };
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(count as usize)
         })
@@ -1242,7 +1341,7 @@ mod tests {
 
         let entry = mem.get("pref").await.unwrap().unwrap();
         assert_eq!(entry.content, "loves Rust");
-        assert_eq!(mem.count().await.unwrap(), 1);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -1263,7 +1362,7 @@ mod tests {
         .await
         .unwrap();
 
-        let results = mem.recall("Rust", 10, None).await.unwrap();
+        let results = mem.recall("Rust", 10, SessionScope::Any).await.unwrap();
         assert_eq!(results.len(), 2);
         assert!(results
             .iter()
@@ -1280,7 +1379,10 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("fast safe", 10, None).await.unwrap();
+        let results = mem
+            .recall("fast safe", 10, SessionScope::Any)
+            .await
+            .unwrap();
         assert!(!results.is_empty());
         // Entry with both keywords should score higher
         assert!(results[0].content.contains("safe") && results[0].content.contains("fast"));
@@ -1292,7 +1394,10 @@ mod tests {
         mem.store("a", "Rust rocks", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("javascript", 10, None).await.unwrap();
+        let results = mem
+            .recall("javascript", 10, SessionScope::Any)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1302,11 +1407,11 @@ mod tests {
         mem.store("temp", "temporary data", MemoryCategory::Conversation, None)
             .await
             .unwrap();
-        assert_eq!(mem.count().await.unwrap(), 1);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 1);
 
         let removed = mem.forget("temp").await.unwrap();
         assert!(removed);
-        assert_eq!(mem.count().await.unwrap(), 0);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1329,7 +1434,7 @@ mod tests {
             .await
             .unwrap();
 
-        let all = mem.list(None, None).await.unwrap();
+        let all = mem.list(None, SessionScope::Any).await.unwrap();
         assert_eq!(all.len(), 3);
     }
 
@@ -1346,17 +1451,23 @@ mod tests {
             .await
             .unwrap();
 
-        let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        let core = mem
+            .list(Some(&MemoryCategory::Core), SessionScope::Any)
+            .await
+            .unwrap();
         assert_eq!(core.len(), 2);
 
-        let daily = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
+        let daily = mem
+            .list(Some(&MemoryCategory::Daily), SessionScope::Any)
+            .await
+            .unwrap();
         assert_eq!(daily.len(), 1);
     }
 
     #[tokio::test]
     async fn sqlite_count_empty() {
         let (_tmp, mem) = temp_sqlite();
-        assert_eq!(mem.count().await.unwrap(), 0);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1435,7 +1546,7 @@ mod tests {
         .await
         .unwrap();
 
-        let results = mem.recall("Rust", 10, None).await.unwrap();
+        let results = mem.recall("Rust", 10, SessionScope::Any).await.unwrap();
         assert!(results.len() >= 2);
         // All results should contain "Rust"
         for r in &results {
@@ -1460,7 +1571,10 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("quick dog", 10, None).await.unwrap();
+        let results = mem
+            .recall("quick dog", 10, SessionScope::Any)
+            .await
+            .unwrap();
         assert!(!results.is_empty());
         // "The quick dog runs fast" matches both terms
         assert!(results[0].content.contains("quick"));
@@ -1472,7 +1586,7 @@ mod tests {
         mem.store("a", "data", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("", 10, None).await.unwrap();
+        let results = mem.recall("", 10, SessionScope::Any).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -1482,7 +1596,7 @@ mod tests {
         mem.store("a", "data", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("   ", 10, None).await.unwrap();
+        let results = mem.recall("   ", 10, SessionScope::Any).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -1694,7 +1808,7 @@ mod tests {
         assert_eq!(count, 0);
 
         // FTS should still work after rebuild
-        let results = mem.recall("reindex", 10, None).await.unwrap();
+        let results = mem.recall("reindex", 10, SessionScope::Any).await.unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -1714,7 +1828,10 @@ mod tests {
             .unwrap();
         }
 
-        let results = mem.recall("common keyword", 5, None).await.unwrap();
+        let results = mem
+            .recall("common keyword", 5, SessionScope::Any)
+            .await
+            .unwrap();
         assert!(results.len() <= 5);
     }
 
@@ -1727,7 +1844,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("scored", 10, None).await.unwrap();
+        let results = mem.recall("scored", 10, SessionScope::Any).await.unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(r.score.is_some(), "Expected score on result: {:?}", r.key);
@@ -1743,7 +1860,10 @@ mod tests {
             .await
             .unwrap();
         // Quotes in query should not crash FTS5
-        let results = mem.recall("\"hello\"", 10, None).await.unwrap();
+        let results = mem
+            .recall("\"hello\"", 10, SessionScope::Any)
+            .await
+            .unwrap();
         // May or may not match depending on FTS5 escaping, but must not error
         assert!(results.len() <= 10);
     }
@@ -1754,7 +1874,7 @@ mod tests {
         mem.store("a1", "wildcard test content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("wild*", 10, None).await.unwrap();
+        let results = mem.recall("wild*", 10, SessionScope::Any).await.unwrap();
         assert!(results.len() <= 10);
     }
 
@@ -1764,7 +1884,10 @@ mod tests {
         mem.store("p1", "function call test", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("function()", 10, None).await.unwrap();
+        let results = mem
+            .recall("function()", 10, SessionScope::Any)
+            .await
+            .unwrap();
         assert!(results.len() <= 10);
     }
 
@@ -1776,12 +1899,12 @@ mod tests {
             .unwrap();
         // Should not crash or leak data
         let results = mem
-            .recall("'; DROP TABLE memories; --", 10, None)
+            .recall("'; DROP TABLE memories; --", 10, SessionScope::Any)
             .await
             .unwrap();
         assert!(results.len() <= 10);
         // Table should still exist
-        assert_eq!(mem.count().await.unwrap(), 1);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 1);
     }
 
     // ── Edge cases: store ────────────────────────────────────────
@@ -1852,7 +1975,7 @@ mod tests {
             .await
             .unwrap();
         // Single char may not match FTS5 but LIKE fallback should work
-        let results = mem.recall("x", 10, None).await.unwrap();
+        let results = mem.recall("x", 10, SessionScope::Any).await.unwrap();
         // Should not crash; may or may not find results
         assert!(results.len() <= 10);
     }
@@ -1863,7 +1986,7 @@ mod tests {
         mem.store("a", "some content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("some", 0, None).await.unwrap();
+        let results = mem.recall("some", 0, SessionScope::Any).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -1876,7 +1999,10 @@ mod tests {
         mem.store("b", "matching content beta", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("matching content", 1, None).await.unwrap();
+        let results = mem
+            .recall("matching content", 1, SessionScope::Any)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1892,7 +2018,7 @@ mod tests {
         .await
         .unwrap();
         // "rust" appears in key but not content — LIKE fallback checks key too
-        let results = mem.recall("rust", 10, None).await.unwrap();
+        let results = mem.recall("rust", 10, SessionScope::Any).await.unwrap();
         assert!(!results.is_empty(), "Should match by key");
     }
 
@@ -1902,7 +2028,7 @@ mod tests {
         mem.store("jp", "日本語のテスト", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("日本語", 10, None).await.unwrap();
+        let results = mem.recall("日本語", 10, SessionScope::Any).await.unwrap();
         assert!(!results.is_empty());
     }
 
@@ -1926,7 +2052,7 @@ mod tests {
         mem2.store("k2", "v2", MemoryCategory::Daily, None)
             .await
             .unwrap();
-        assert_eq!(mem2.count().await.unwrap(), 2);
+        assert_eq!(mem2.count(SessionScope::Any).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -1952,7 +2078,10 @@ mod tests {
         .await
         .unwrap();
         mem.forget("ghost").await.unwrap();
-        let results = mem.recall("phantom memory", 10, None).await.unwrap();
+        let results = mem
+            .recall("phantom memory", 10, SessionScope::Any)
+            .await
+            .unwrap();
         assert!(
             results.is_empty(),
             "Deleted memory should not appear in recall"
@@ -1971,7 +2100,7 @@ mod tests {
             .unwrap();
         let entry = mem.get("cycle").await.unwrap().unwrap();
         assert_eq!(entry.content, "version 2");
-        assert_eq!(mem.count().await.unwrap(), 1);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 1);
     }
 
     // ── Edge cases: reindex ──────────────────────────────────────
@@ -1993,7 +2122,7 @@ mod tests {
         let count = mem.reindex().await.unwrap();
         assert_eq!(count, 0); // Noop embedder → nothing to re-embed
                               // Data should still be intact
-        let results = mem.recall("reindex", 10, None).await.unwrap();
+        let results = mem.recall("reindex", 10, SessionScope::Any).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -2153,7 +2282,7 @@ mod tests {
         .unwrap();
 
         let hits = mem
-            .recall("shared topic", 5, Some("session-b"))
+            .recall("shared topic", 5, SessionScope::Conversation("session-b"))
             .await
             .unwrap();
 
@@ -2197,7 +2326,7 @@ mod tests {
             &conn,
             "shared topic",
             10,
-            Some("session-b"),
+            SessionScope::Conversation("session-b"),
             CategoryScope::Conversation,
         )
         .unwrap();
@@ -2229,9 +2358,109 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = mem.recall("shared", 10, Some("session-a")).await.unwrap();
+        let hits = mem
+            .recall("shared", 10, SessionScope::Conversation("session-a"))
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1, "scope filter must not become a no-op");
         assert_eq!(hits[0].key, "a");
+    }
+
+    /// `Private` selects the rows with no `session_id`, in SQL: the conversation
+    /// rows outnumber the private one and match the query better, so a filter
+    /// applied after the limit would lose it. Asks `fts5_search` directly
+    /// because `recall` re-checks the scope and falls back to a substring scan,
+    /// which would hide the missing clause.
+    #[tokio::test]
+    async fn fts5_search_private_scope_filters_in_sql() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..40 {
+            mem.store(
+                &format!("noise_{i}"),
+                "shared topic shared topic shared topic",
+                MemoryCategory::Core,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store("operator_note", "shared topic", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let conn = mem.conn.lock();
+        let hits = SqliteMemory::fts5_search(
+            &conn,
+            "shared topic",
+            10,
+            SessionScope::Private,
+            CategoryScope::Notes,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "only the private row matches the scope");
+    }
+
+    /// The substring fallback runs when the keyword index finds nothing, and it
+    /// carries its own copy of the scope clause. The private row is the oldest,
+    /// so a fallback that filtered after its limit would spend the limit on
+    /// the newer conversation rows and lose it.
+    #[tokio::test]
+    async fn private_recall_substring_fallback_filters_in_sql() {
+        let (_tmp, mem) = temp_sqlite();
+        // `foobar` sits inside a longer token, so the keyword index cannot
+        // match it and only the substring scan can.
+        mem.store("operator_note", "qqfoobarqq", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        for i in 0..40 {
+            mem.store(
+                &format!("noise_{i}"),
+                "xyzfoobarxyz",
+                MemoryCategory::Core,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let hits = mem
+            .recall("foobar", 5, SessionScope::Private)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = hits.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["operator_note"]);
+    }
+
+    /// The vector scan filters in SQL as well, so a scoped scan does not read
+    /// every conversation's embeddings.
+    #[tokio::test]
+    async fn vector_search_private_scope_skips_conversation_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = stub_memory(tmp.path(), "stub", 8);
+        mem.store(
+            "chat_row",
+            "shared topic",
+            MemoryCategory::Core,
+            Some("session-a"),
+        )
+        .await
+        .unwrap();
+        mem.store("operator_note", "shared topic", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let embedding = vec![1.0_f32; 8];
+        let conn = mem.conn.lock();
+        let hits = SqliteMemory::vector_search(
+            &conn,
+            &embedding,
+            10,
+            None,
+            SessionScope::Private,
+            CategoryScope::Notes,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "only the private row is scanned");
     }
 
     /// A `"` inside a term closed the FTS5 string literal early, so the whole
@@ -2247,7 +2476,10 @@ mod tests {
         // `runbook"` is a whole token to FTS5 once the quote is escaped, but is
         // not a substring of the stored content — so a hit here cannot have come
         // from the LIKE fallback.
-        let hits = mem.recall("runbook\"", 10, None).await.unwrap();
+        let hits = mem
+            .recall("runbook\"", 10, SessionScope::Any)
+            .await
+            .unwrap();
 
         assert_eq!(
             hits.len(),
@@ -2312,7 +2544,7 @@ mod tests {
             .unwrap();
 
         let hits = mem
-            .recall("ownership", 10, None)
+            .recall("ownership", 10, SessionScope::Any)
             .await
             .expect("recall must not fail when the embedding provider does");
         assert_eq!(hits.len(), 1, "keyword results must still come back");
@@ -2336,7 +2568,7 @@ mod tests {
             mem.store(k, c, MemoryCategory::Core, None).await.unwrap();
         }
 
-        let hits = mem.recall("rust", 10, None).await.unwrap();
+        let hits = mem.recall("rust", 10, SessionScope::Any).await.unwrap();
         assert!(!hits.is_empty(), "expected keyword hits");
         let best = hits.iter().filter_map(|e| e.score).fold(0.0_f64, f64::max);
         assert!(
@@ -2349,7 +2581,10 @@ mod tests {
         }
 
         // Partial coverage stays partial — the best hit is NOT rescaled up.
-        let partial = mem.recall("rust gardening", 10, None).await.unwrap();
+        let partial = mem
+            .recall("rust gardening", 10, SessionScope::Any)
+            .await
+            .unwrap();
         let best = partial
             .iter()
             .filter_map(|e| e.score)
@@ -2375,7 +2610,10 @@ mod tests {
             .unwrap();
 
         // Partial words: FTS5 matches whole tokens, so this reaches the fallback.
-        let hits = mem.recall("eleme ubsyst", 10, None).await.unwrap();
+        let hits = mem
+            .recall("eleme ubsyst", 10, SessionScope::Any)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 2, "both rows contain at least one fragment");
 
         let score_of = |key: &str| {
@@ -2424,7 +2662,10 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = mem.recall("deployment window", 3, None).await.unwrap();
+        let hits = mem
+            .recall("deployment window", 3, SessionScope::Any)
+            .await
+            .unwrap();
 
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].key, "deploy_window", "the saved note comes first");
@@ -2450,7 +2691,10 @@ mod tests {
             .unwrap();
         }
 
-        let hits = mem.recall("deployment window", 10, None).await.unwrap();
+        let hits = mem
+            .recall("deployment window", 10, SessionScope::Any)
+            .await
+            .unwrap();
 
         assert_eq!(hits.len(), 4);
         assert_eq!(hits[0].key, "note");
@@ -2476,7 +2720,10 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = mem.recall("deployment window", 5, Some("a")).await.unwrap();
+        let hits = mem
+            .recall("deployment window", 5, SessionScope::Conversation("a"))
+            .await
+            .unwrap();
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].key, "mine");
@@ -2490,7 +2737,10 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = mem.recall("release? schedule!", 5, None).await.unwrap();
+        let hits = mem
+            .recall("release? schedule!", 5, SessionScope::Any)
+            .await
+            .unwrap();
 
         assert_eq!(hits.len(), 1);
         assert!((hits[0].score.unwrap() - 1.0).abs() < 1e-6);
@@ -2504,7 +2754,10 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = mem.recall("log rotation", 5, None).await.unwrap();
+        let hits = mem
+            .recall("log rotation", 5, SessionScope::Any)
+            .await
+            .unwrap();
 
         assert_eq!(hits.len(), 1);
         assert!(
@@ -2524,7 +2777,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = mem.recall("log", 5, None).await.unwrap();
+        let hits = mem.recall("log", 5, SessionScope::Any).await.unwrap();
 
         assert_eq!(hits.len(), 1, "the row holds the letters of the search");
         let score = hits[0].score.unwrap();
@@ -2543,7 +2796,7 @@ mod tests {
             .unwrap();
 
         let hits = mem
-            .recall("what is the release schedule", 5, None)
+            .recall("what is the release schedule", 5, SessionScope::Any)
             .await
             .unwrap();
 
@@ -2559,7 +2812,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = mem.recall("who", 5, None).await.unwrap();
+        let hits = mem.recall("who", 5, SessionScope::Any).await.unwrap();
 
         assert_eq!(hits.len(), 1);
     }
@@ -2752,8 +3005,15 @@ mod tests {
             .expect("stub embedder should produce a vector");
 
         let conn = large.conn.lock();
-        let hits = SqliteMemory::vector_search(&conn, &query, 10, None, None, CategoryScope::Notes)
-            .unwrap();
+        let hits = SqliteMemory::vector_search(
+            &conn,
+            &query,
+            10,
+            None,
+            SessionScope::Any,
+            CategoryScope::Notes,
+        )
+        .unwrap();
 
         let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
@@ -2809,7 +3069,10 @@ mod tests {
             .unwrap();
 
         let project = mem
-            .list(Some(&MemoryCategory::Custom("project".into())), None)
+            .list(
+                Some(&MemoryCategory::Custom("project".into())),
+                SessionScope::Any,
+            )
             .await
             .unwrap();
         assert_eq!(project.len(), 2);
@@ -2818,7 +3081,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty_db() {
         let (_tmp, mem) = temp_sqlite();
-        let all = mem.list(None, None).await.unwrap();
+        let all = mem.list(None, SessionScope::Any).await.unwrap();
         assert!(all.is_empty());
     }
 
@@ -2838,7 +3101,10 @@ mod tests {
             .unwrap();
 
         // Recall with session-a filter returns only session-a entry
-        let results = mem.recall("fact", 10, Some("sess-a")).await.unwrap();
+        let results = mem
+            .recall("fact", 10, SessionScope::Conversation("sess-a"))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "k1");
         assert_eq!(results[0].session_id.as_deref(), Some("sess-a"));
@@ -2909,7 +3175,7 @@ mod tests {
         let shared = mem.get("s").await.unwrap().unwrap();
         assert_eq!(shared.content, "second");
         assert_eq!(shared.session_id, None);
-        assert_eq!(mem.count().await.unwrap(), 2);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -2926,7 +3192,7 @@ mod tests {
             .unwrap();
 
         // Recall without session filter returns all matching entries
-        let results = mem.recall("fact", 10, None).await.unwrap();
+        let results = mem.recall("fact", 10, SessionScope::Any).await.unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -2943,11 +3209,17 @@ mod tests {
         .unwrap();
 
         // Session B cannot see session A data
-        let results = mem.recall("secret", 10, Some("sess-b")).await.unwrap();
+        let results = mem
+            .recall("secret", 10, SessionScope::Conversation("sess-b"))
+            .await
+            .unwrap();
         assert!(results.is_empty());
 
         // Session A can see its own data
-        let results = mem.recall("secret", 10, Some("sess-a")).await.unwrap();
+        let results = mem
+            .recall("secret", 10, SessionScope::Conversation("sess-a"))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -2968,7 +3240,10 @@ mod tests {
             .unwrap();
 
         // List with session-a filter
-        let results = mem.list(None, Some("sess-a")).await.unwrap();
+        let results = mem
+            .list(None, SessionScope::Conversation("sess-a"))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results
             .iter()
@@ -2976,7 +3251,10 @@ mod tests {
 
         // List with session-a + category filter
         let results = mem
-            .list(Some(&MemoryCategory::Core), Some("sess-a"))
+            .list(
+                Some(&MemoryCategory::Core),
+                SessionScope::Conversation("sess-a"),
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -2998,7 +3276,10 @@ mod tests {
         // Second open: migration runs again but is idempotent
         {
             let mem = SqliteMemory::new(tmp.path()).unwrap();
-            let results = mem.recall("reopen", 10, Some("sess-x")).await.unwrap();
+            let results = mem
+                .recall("reopen", 10, SessionScope::Conversation("sess-x"))
+                .await
+                .unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].key, "k1");
             assert_eq!(results[0].session_id.as_deref(), Some("sess-x"));
@@ -3031,7 +3312,7 @@ mod tests {
             handle.await.unwrap();
         }
 
-        let count = mem.count().await.unwrap();
+        let count = mem.count(SessionScope::Any).await.unwrap();
         assert_eq!(
             count, 10,
             "all 10 concurrent writes must succeed without data loss"
@@ -3078,7 +3359,7 @@ mod tests {
         }
 
         // Should have 6 total entries (1 pre-existing + 5 new)
-        assert_eq!(mem.count().await.unwrap(), 6);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 6);
     }
 
     // ── §4.2 Reindex / corruption recovery tests ────────────
@@ -3095,7 +3376,7 @@ mod tests {
 
         mem.reindex().await.unwrap();
 
-        let count = mem.count().await.unwrap();
+        let count = mem.count(SessionScope::Any).await.unwrap();
         assert_eq!(count, 2, "reindex must preserve all entries");
 
         let entry = mem.get("a").await.unwrap();
@@ -3115,6 +3396,6 @@ mod tests {
         mem.reindex().await.unwrap();
         mem.reindex().await.unwrap();
 
-        assert_eq!(mem.count().await.unwrap(), 1);
+        assert_eq!(mem.count(SessionScope::Any).await.unwrap(), 1);
     }
 }

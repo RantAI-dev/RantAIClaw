@@ -135,7 +135,11 @@ fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         return Ok(no_backend_message());
     };
     let category = parse_category(rest);
-    let entries = run_blocking(async { memory.list(category.as_ref(), None).await })?;
+    let entries = run_blocking(async {
+        memory
+            .list(category.as_ref(), crate::memory::SessionScope::Any)
+            .await
+    })?;
     if entries.is_empty() {
         return Ok(CommandResult::Message(format!(
             "(no entries{} found)",
@@ -153,7 +157,8 @@ fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     let (total, scope) = match &category {
         Some(cat) => (listed, format!(" in '{cat}'")),
         None => (
-            run_blocking(async { memory.count().await }).unwrap_or(listed),
+            run_blocking(async { memory.count(crate::memory::SessionScope::Any).await })
+                .unwrap_or(listed),
             String::new(),
         ),
     };
@@ -316,7 +321,11 @@ fn recall_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         return Ok(no_backend_message());
     };
     let query_owned = query.to_string();
-    let entries = run_blocking(async move { memory.recall(&query_owned, limit, None).await })?;
+    let entries = run_blocking(async move {
+        memory
+            .recall(&query_owned, limit, crate::memory::SessionScope::Any)
+            .await
+    })?;
     if entries.is_empty() {
         return Ok(CommandResult::Message(format!(
             "No memory entries matched '{query}'."
@@ -349,7 +358,7 @@ fn stats_memory(ctx: &TuiContext) -> Result<CommandResult> {
         return Ok(no_backend_message());
     };
     let (count, healthy) = run_blocking(async {
-        let count = memory.count().await?;
+        let count = memory.count(crate::memory::SessionScope::Any).await?;
         Ok((count, memory.health_check().await))
     })?;
 
@@ -479,7 +488,7 @@ impl CommandHandler for CompressCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::traits::Memory;
+    use crate::memory::traits::{Memory, SessionScope};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -528,7 +537,7 @@ mod tests {
             &self,
             query: &str,
             limit: usize,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             let q = query.to_lowercase();
             let entries = self.entries.lock().unwrap();
@@ -553,7 +562,7 @@ mod tests {
         async fn list(
             &self,
             category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
+            _scope: SessionScope<'_>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             let entries = self.entries.lock().unwrap();
             Ok(entries
@@ -568,7 +577,7 @@ mod tests {
             entries.retain(|e| e.key != key);
             Ok(entries.len() != before)
         }
-        async fn count(&self) -> anyhow::Result<usize> {
+        async fn count(&self, _scope: SessionScope<'_>) -> anyhow::Result<usize> {
             Ok(self.entries.lock().unwrap().len())
         }
         async fn health_check(&self) -> bool {

@@ -27,7 +27,7 @@ pub use none::NoneMemory;
 pub use sanitize::sanitize_memory_content;
 pub use saved::{record_saved_note, SavedNotes, SAVED_NOTES};
 pub use sqlite::SqliteMemory;
-pub use traits::{KeyInUse, Memory};
+pub use traits::{KeyInUse, Memory, SessionScope};
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 pub use view::{
