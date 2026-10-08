@@ -2028,6 +2028,126 @@ const OWNER_FILE_SECRETS: [&str; 6] = [
     DAILY_NOTE_SECRET,
 ];
 
+/// A reasoning model's tool step answers with empty `content`, its reasoning
+/// and a tool call. The reasoning must not be stored as the assistant's own
+/// message in the owner's direct chat, or sent back to the model as such.
+/// Driven through a real provider against a mock endpoint, because the scripted
+/// provider returns text only and would pass with or without the fix.
+#[tokio::test]
+async fn an_owners_direct_chat_never_stores_a_tool_steps_reasoning_as_the_assistants_message() {
+    use crate::providers::compatible::reasoning_endpoint::{ReasoningEndpoint, REASONING_MARKER};
+
+    let mut deployment = Deployment::start(Options::guest_tools(&["memory_store"])).await;
+    let endpoint = ReasoningEndpoint::start(
+        "memory_store",
+        serde_json::json!({ "key": "a_note", "content": "a plain note" }),
+        "Noted.",
+    )
+    .await;
+    deployment.answer_with(Arc::new(endpoint.provider())).await;
+
+    let turn = deployment
+        .turn_in(
+            OWNER_SENDER,
+            OWNER_CHAT,
+            true,
+            "remember a note",
+            Vec::new(),
+        )
+        .await;
+
+    assert!(
+        turn.sent.iter().any(|text| text.contains("Noted.")),
+        "control: the second answer reached the chat: {:?}",
+        turn.sent
+    );
+    for text in &turn.sent {
+        assert!(
+            !text.contains(REASONING_MARKER),
+            "reasoning was delivered: {text}"
+        );
+    }
+    let requests = endpoint.requests().await;
+    assert_eq!(requests.len(), 2, "one tool step and one answer");
+    assert!(
+        !requests[1].to_string().contains(REASONING_MARKER),
+        "reasoning was sent back to the model: {}",
+        requests[1]
+    );
+
+    let store = deployment
+        .ctx
+        .history_store
+        .as_ref()
+        .expect("the deployment's runtime built a history store")
+        .clone();
+    let raw_turns_json = store
+        .raw_turns_json(&format!("test-channel:{OWNER_CHAT}"))
+        .expect("raw turns_json query succeeds")
+        .expect("raw turns_json is on disk for the owner's chat");
+    assert!(
+        raw_turns_json.contains("memory_store"),
+        "control: the tool-call carrier row is stored: {raw_turns_json}"
+    );
+    assert!(
+        !raw_turns_json.contains(REASONING_MARKER),
+        "reasoning was stored as the assistant's message: {raw_turns_json}"
+    );
+}
+
+/// Same step in a group chat the owner talks in: the model's second request of
+/// the turn holds no reasoning in any assistant message.
+#[tokio::test]
+async fn an_owners_shared_chat_turn_never_sends_a_tool_steps_reasoning_back_to_the_model() {
+    use crate::providers::compatible::reasoning_endpoint::{ReasoningEndpoint, REASONING_MARKER};
+
+    let mut deployment = Deployment::start(Options::guest_tools(&["memory_store"])).await;
+    let endpoint = ReasoningEndpoint::start(
+        "memory_store",
+        serde_json::json!({ "key": "a_note", "content": "a plain note" }),
+        "Noted.",
+    )
+    .await;
+    deployment.answer_with(Arc::new(endpoint.provider())).await;
+
+    let turn = deployment
+        .turn_in(
+            OWNER_SENDER,
+            GUEST_CHAT,
+            false,
+            "remember a note",
+            Vec::new(),
+        )
+        .await;
+
+    assert!(
+        turn.sent.iter().any(|text| text.contains("Noted.")),
+        "control: the second answer reached the chat: {:?}",
+        turn.sent
+    );
+    let requests = endpoint.requests().await;
+    assert_eq!(requests.len(), 2, "one tool step and one answer");
+    let assistant_messages: Vec<&serde_json::Value> = requests[1]["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert!(
+        assistant_messages
+            .iter()
+            .any(|m| m.get("tool_calls").is_some()),
+        "control: the tool-call carrier is in the second request: {}",
+        requests[1]
+    );
+    for message in assistant_messages {
+        assert!(
+            !message.to_string().contains(REASONING_MARKER),
+            "reasoning was sent back as an assistant message: {message}"
+        );
+    }
+}
+
 /// Fails when `text`, which reached `sink`, carries any of the owner's file
 /// content, or one of the `extra` owner strings.
 fn assert_owner_data_absent(sink: &str, text: &str, extra: &[&str]) {
@@ -2642,7 +2762,7 @@ impl Deployment {
             options.extras.contains(&Extra::Telegram),
             std::sync::atomic::Ordering::SeqCst,
         );
-        let ctx = Self::build_context(&config, &provider, &channel).await;
+        let ctx = Self::build_context(&config, provider.clone(), &channel).await;
         Self {
             ctx,
             provider,
@@ -2662,7 +2782,7 @@ impl Deployment {
 
     async fn build_context(
         config: &Config,
-        provider: &Arc<ScriptedProvider>,
+        provider: Arc<dyn Provider>,
         channel: &Arc<RecordingChannel>,
     ) -> Arc<ChannelRuntimeContext> {
         let mut runtime = build_channel_runtime(config, None)
@@ -2677,12 +2797,11 @@ impl Deployment {
                 std::time::Duration::from_millis(200),
             )));
         }
-        let scripted: Arc<dyn Provider> = provider.clone();
-        ctx.provider = Arc::clone(&scripted);
+        ctx.provider = Arc::clone(&provider);
         ctx.provider_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(routing::resolved_default_provider(config), scripted);
+            .insert(routing::resolved_default_provider(config), provider);
         let recording: Arc<dyn Channel> = channel.clone();
         ctx.channels_by_name = Arc::new(HashMap::from([(recording.name().to_string(), recording)]));
         Arc::clone(&runtime.ctx)
@@ -2691,7 +2810,16 @@ impl Deployment {
     /// Stops the runtime and starts it again over the same workspace, the way a
     /// daemon restart rebuilds the prompts from the files on disk.
     async fn restart(&mut self) {
-        self.ctx = Self::build_context(&self.config, &self.provider, &self.channel).await;
+        self.ctx = Self::build_context(&self.config, self.provider.clone(), &self.channel).await;
+    }
+
+    /// Rebuilds the runtime over the same workspace with `provider` answering
+    /// instead of the script, for a case that needs the wire behaviour of a
+    /// real provider. The turn's requests are then read from the provider's
+    /// own endpoint, not from [`Turn::requests`]. [`Deployment::restart`]
+    /// returns the deployment to its `ScriptedProvider` afterwards.
+    async fn answer_with(&mut self, provider: Arc<dyn Provider>) {
+        self.ctx = Self::build_context(&self.config, provider, &self.channel).await;
     }
 
     /// Runs one message from `sender` in `chat` through dispatch, with the

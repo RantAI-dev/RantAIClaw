@@ -70,6 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On a turn that used a tool, a reasoning model's reasoning was kept as its own
+  earlier message and sent back to it on the next step, and replies could then
+  begin with that reasoning. A provider now drops the reasoning of a response
+  that has a tool call or an answer. It is the reply only when the response has
+  neither. Seen with a reasoning model behind a custom endpoint, and also fixed
+  for streamed replies and for the Anthropic, OpenAI and Gemini providers.
 - The token-prefix scrubber no longer redacts ordinary words that contain a
   prefix, such as the `sk-` inside `task-force` or `risk-free`. A prefix now
   counts only at the start of the text or after a character that is not an
