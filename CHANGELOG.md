@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **claw-ui pinned to v0.3.30.** Carries the console half of this release: the Memory page gets a Notes tab and a
+  Chat recordings tab. Both need this runtime. The Notes tab's Place filter, place labels, note counts and MEMORY.md
+  usage read the fields this release adds to `GET /api/v1/memory` and `GET /api/v1/memory/stats`. The Chat recordings
+  tab lists the channel sessions this release records, and its delete calls the conversation delete on
+  `DELETE /api/v1/sessions/{id}`. Against an older gateway the console hides the Place filter, keeps the earlier note
+  wording and shows an empty recordings list. The console also moves to Next.js 16.4.0, which closes a critical
+  advisory in `next`. `ui install` and `ui update` fetch that tag by default; `--ref` still overrides per invocation.
 - `POST /api/v1/sessions/search` now scopes to the one `source` the body
   names and excludes channel rows by default. `source: "channel"` searches
   channel sessions; `source: "<other>"` matches that source exactly;
