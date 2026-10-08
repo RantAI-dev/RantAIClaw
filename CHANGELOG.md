@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `docs/security/privacy.md` states what RantaiClaw stores about conversations
+  and notes, who reads it back, how long it stays, where it lives and with what
+  file modes, how to delete it, and what leaves the machine. It names the
+  differences between channels instead of describing one behaviour for all of
+  them. `docs/reference/config.md` links to it and states in the `approval_owners`
+  entry that one RantaiClaw serves one person.
 - `GET /api/v1/memory` gains an optional `place` query parameter to filter by
   location: `place=private` selects notes with no `session_id`, any other value
   treats it as a conversation key and selects that conversation's notes, and
@@ -64,6 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The channels reference no longer says channel recordings are pruned 30 days
+  after the last turn. A recorded message is deleted 30 days after it was
+  written, and a session is deleted when it has no message left. The same
+  section now lists the three passes that run before a row is written, the five
+  attachment kinds the payload redaction covers, and the fact that the token
+  prefixes match anywhere in the text.
 - An unknown `embedding_provider` no longer silently disables semantic
   search. The factory logs a `WARN` naming the bad value at start, and
   `rantaiclaw doctor` reports it as `✗` so the typo surfaces. The daemon
