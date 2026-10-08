@@ -521,6 +521,8 @@ Notes:
 
 ## `[memory]`
 
+For what the memory and channel stores hold, who reads them, how long they keep it and how to delete it, see [Privacy](../security/privacy.md).
+
 | Key | Default | Purpose |
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `none`. An unrecognised value is a startup error, not a fallback |
@@ -562,6 +564,8 @@ sets. A view is either all of memory or one conversation's notes. There is no
 backfill: a conversation view never adds the shared (unscoped) tier. The view
 decides what `memory_recall`, the `[Memory context]` block in front of the
 user's message, and the lookups of `memory_store` and `memory_forget` may read.
+
+One RantaiClaw serves one person. Every named identity in `approval_owners` is treated as that person, and reads the whole memory only in a direct chat on a channel that marks direct chats. An owner through `"*"` never does.
 
 - A named owner in a direct chat, the TUI, `agent -m`, `chat -m`, the web
   console chat, the daemon heartbeat and a cron job with no origin chat, whatever
@@ -814,7 +818,7 @@ Top-level channel options are configured under `channels_config`.
 | Key | Default | Purpose |
 |---|---|---|
 | `message_timeout_secs` | `600` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
-| `approval_owners` | `[]` | Senders who may approve privileged tool calls. Empty = **nobody** can approve, so approval-required tools auto-deny. `"*"` lets any allowed sender approve (insecure, opt-in). A sender who is an owner only through `"*"` never reads the owner's notes: its turns read the conversation they are in, not the whole store. Private notes need an identity named in the list. The list also decides who may switch the provider or model from chat (`/models <provider>`, `/model <model-id>`) and who may clear a group's history (`/new`, `/clear`); see [In-Chat Runtime Model Switching](channels.md#in-chat-runtime-model-switching). |
+| `approval_owners` | `[]` | Senders who may approve privileged tool calls. Empty = **nobody** can approve, so approval-required tools auto-deny. `"*"` lets any allowed sender approve (insecure, opt-in). One RantaiClaw serves one person. Every named identity in `approval_owners` is treated as that person, and reads the whole memory only in a direct chat on a channel that marks direct chats. An owner through `"*"` never does. Its turns read the conversation they are in, not the whole store. Private notes need an identity named in the list. The list also decides who may switch the provider or model from chat (`/models <provider>`, `/model <model-id>`) and who may clear a group's history (`/new`, `/clear`); see [In-Chat Runtime Model Switching](channels.md#in-chat-runtime-model-switching). |
 | `guest_allowed_tools` | `[]` | Capability ceiling for allowed senders who are not owners. Empty = the agent calls no tool on a guest's behalf; list names like `"shell"` or `"web_search_tool"` to widen. The owner's `autonomy.auto_approve` list is intentionally **not** unioned in — an operator who wants a guest to be able to read files or recall memory must list those tools here |
 | `guest_allowed_commands` | `[]` | Shell globs a guest may run (needs `"shell"` in `guest_allowed_tools`). Hard ceiling — a non-matching command is denied, never escalated |
 | `autonomous_tools` | `false` | `true` skips the approval gate entirely for this channel, for every sender |

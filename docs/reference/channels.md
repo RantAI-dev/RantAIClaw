@@ -310,7 +310,7 @@ Notes:
 - WhatsApp Cloud registers under the same channel name as WhatsApp Web, so it answers the slash form as well.
 - Other channels do not answer these commands; the text reaches the model as ordinary chat.
 
-Telegram, Discord and WhatsApp Web answer three more kinds of slash command:
+Telegram, Discord, Lark, WhatsApp Cloud API and WhatsApp Web answer three more kinds of slash command:
 
 - `/new` or `/clear` clears this conversation's history. Long-term memory stays; see
   [Clearing a Conversation](#clearing-a-conversation).
@@ -332,7 +332,7 @@ conversation.
 
 ## Channel Session Recording
 
-Every addressed message on a connected channel is recorded as an open session in
+Every addressed message on a connected channel that ends in a reply is recorded as an open session in
 `sessions.db`, alongside the TUI and API sessions. The point is the same as
 for those surfaces: the operator can review what was said and ask follow-up questions
 later.
@@ -347,28 +347,38 @@ How it lands in the store:
 - Conversation key: `<channel>:<chat-id>` (e.g. `telegram:chat-42`). One
   conversation is one session; consecutive turns in the same chat append to
   the same session, until the sender runs `/new` or `/clear` (Telegram,
-  Discord, WhatsApp Web).
+  Discord, Lark, WhatsApp Cloud API, WhatsApp Web).
 - What's recorded: the sender's message text and the assistant's final reply.
-  Draft streaming chunks and tool calls/results are not stored. Two scrubbers
-  run before the row is written. `scrub_secret_patterns` replaces tokens that
-  start with `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`, `ghu_` or `github_pat_`
-  with `[REDACTED]`. `scrub_credentials` redacts `key=value` lines whose key
+  Draft streaming chunks and tool calls/results are not stored. Three passes
+  run before the row is written, in this order. `scrub_secret_patterns`
+  replaces any run of characters that starts with `sk-`, `xoxb-`, `xoxp-`,
+  `ghp_`, `gho_`, `ghu_` or `github_pat_` and continues through ASCII letters,
+  ASCII digits, `-`, `_`, `.` and `:` with `[REDACTED]`. It matches the prefix anywhere in the
+  text, with no word boundary, so the `sk-` inside `task-force` is replaced too.
+  `scrub_credentials` redacts `key=value` lines whose key
   matches one of `token`, `api_key`, `api-key`, `password`, `secret`,
   `user_key`, `user-key`, `bearer`, `credential` (matched as a substring, so
   `mytoken` and `apikey` are also keys) and whose separator is `:` or `=`,
   with a value eight or more characters long; the first four characters of
-  the value stay in the stored row. A secret written as a plain sentence
+  the value stay in the stored row. An unquoted value is redacted up to the
+  first character outside ASCII letters, ASCII digits, `_`, `-` and `.`, and anything after
+  that character stays in the row. A secret written as a plain sentence
   that does not use `:` or `=` as the separator ("the token string is
   abcdefghijklmno") is not recognised by either scrubber.
   `Authorization: Bearer …` headers, bot tokens whose prefix is not on the
-  scrubber's list, and JWTs are not caught by either scrubber. Inbound
-  attachments whose marker body is a base64 data URI
-  (`[IMAGE:data:image/png;base64,…]`) are recorded as
-  `[IMAGE:payload withheld]`, so the image does not sit on disk for thirty
-  days.
-- Retention: channel sessions are pruned 30 days after the last turn. The
-  daily prune runs alongside the channel runtime and one extra time at
-  startup so a long-down daemon catches up immediately on restart.
+  scrubber's list, and JWTs are not caught by either scrubber. The third pass
+  replaces the body of an `[IMAGE:`, `[DOCUMENT:`, `[VIDEO:`, `[AUDIO:` or
+  `[VOICE:` marker with `payload withheld` when the body starts with `data:`
+  and the marker closes with `]` on the same line, so
+  `[IMAGE:data:image/png;base64,…]` is recorded as `[IMAGE:payload withheld]`
+  and the image does not sit on disk for thirty days. The pass does not check
+  that the body is base64. A marker with no closing `]` before the end of the
+  line, and a marker whose body is a path, stay as they are.
+- Retention: each recorded message is deleted 30 days after it was written,
+  and a session is deleted when it has no message left. A session that keeps
+  receiving turns therefore loses its older messages first. The prune runs
+  once at startup and every 24 hours while the channel runtime runs, so a
+  long-down daemon catches up immediately on restart.
 
 Visibility on the operator surfaces:
 
@@ -391,7 +401,7 @@ Deleting a channel session:
   completes. Notes that belong to the conversation
   (`memories.session_id = <key>`) and scheduled jobs made in the chat are
   not touched; the response does not claim otherwise.
-- `/new` and `/clear` (Telegram, Discord, WhatsApp Web) close the open
+- `/new` and `/clear` (Telegram, Discord, Lark, WhatsApp Cloud API, WhatsApp Web) close the open
   session so the next message starts a fresh one. They do not delete
   saved notes or scheduled jobs either — only `DELETE /api/v1/sessions/{id}`
   on a channel session does that, and only for the in-RAM entry, the
@@ -413,7 +423,7 @@ earlier. To start fresh:
 
 | Channel | How |
 |---|---|
-| Telegram, Discord, WhatsApp Web | send `/new` or `/clear` |
+| Telegram, Discord, Lark, WhatsApp Cloud API, WhatsApp Web | send `/new` or `/clear` |
 | Slack | start a new top-level message instead of replying inside the thread. With threading on, the default, each top-level message is already its own conversation. With `thread_replies = false` a Slack channel is one conversation, and no chat command resets it |
 
 A `/model` or `/models <provider>` switch also clears that conversation's history, as the section

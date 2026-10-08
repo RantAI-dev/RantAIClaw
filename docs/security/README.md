@@ -11,6 +11,7 @@ For current runtime behavior, start here:
 - Troubleshooting: [../start/troubleshooting.md](../start/troubleshooting.md)
 - SSRF threat model (http_request tool): [http-request-ssrf-threat-model.md](http-request-ssrf-threat-model.md)
 - Shell execution security note: [shell-execution-security-note.md](shell-execution-security-note.md)
+- Privacy (what is stored, who reads it, how long it stays, how to delete it): [privacy.md](privacy.md)
 
 ## Proposal / Roadmap Docs
 

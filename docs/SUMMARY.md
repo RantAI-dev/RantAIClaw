@@ -61,6 +61,7 @@
 - [security/http-request-ssrf-threat-model.md](security/http-request-ssrf-threat-model.md)
 - [security/inbound-media-policy.md](security/inbound-media-policy.md) — size, MIME sniffing, where bytes land, and why a rejection is never silent
 - [security/shell-execution-security-note.md](security/shell-execution-security-note.md)
+- [security/privacy.md](security/privacy.md)
 - Roadmap: tracked in the ClickUp v0.6.0 release task · pointer in [pillar 3](pillars/3-tools-approvals.md)
 
 ## 6) Contributing & CI

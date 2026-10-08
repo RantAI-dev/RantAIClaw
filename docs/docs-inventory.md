@@ -55,6 +55,7 @@ Last reviewed: **February 18, 2026**.
 | `docs/start/troubleshooting.md` | Current Guide | users/operators |
 | `docs/operations/network-deployment.md` | Current Guide | operators |
 | `docs/reference/mattermost-setup.md` | Current Guide | operators |
+| `docs/security/privacy.md` | Current Reference | operators |
 
 ## Policy / Process Docs
 
