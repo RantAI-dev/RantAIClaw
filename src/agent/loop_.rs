@@ -6170,6 +6170,78 @@ Let me check the result."#;
         );
     }
 
+    /// A reasoning model answers a tool step with empty `content`, its
+    /// reasoning and a tool call. The reasoning must not become the step's text:
+    /// the loop would store it in the history and send it back on the next
+    /// request as the assistant's own message.
+    #[tokio::test]
+    async fn run_tool_call_loop_does_not_replay_reasoning_as_the_assistants_message() {
+        use crate::providers::compatible::reasoning_endpoint::{
+            ReasoningEndpoint, REASONING_MARKER,
+        };
+
+        let endpoint = ReasoningEndpoint::start(
+            "echo",
+            serde_json::json!({ "text": "hi" }),
+            "The answer is 42.",
+        )
+        .await;
+        let provider = endpoint.provider();
+        let mut history = vec![ChatMessage::user("call echo")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let observer = NoopObserver;
+
+        let reply = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-reasoner",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None, // test: no origin chat
+            None,
+            None,
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+        )
+        .await
+        .expect("loop succeeds");
+
+        assert_eq!(reply, "The answer is 42.");
+        let requests = endpoint.requests().await;
+        assert_eq!(requests.len(), 2, "one tool step and one answer");
+        let carrier = requests[1]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .unwrap_or_else(|| panic!("no assistant tool-call message in {}", requests[1]));
+        assert!(
+            !carrier.to_string().contains(REASONING_MARKER),
+            "the tool step's reasoning was sent back as the assistant's message: {carrier}"
+        );
+        assert!(
+            !requests[1].to_string().contains(REASONING_MARKER),
+            "reasoning reached the second request: {}",
+            requests[1]
+        );
+        assert!(
+            history
+                .iter()
+                .all(|m| !m.content.contains(REASONING_MARKER)),
+            "reasoning was left in the history: {history:?}"
+        );
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_cancellation_mid_tool_emits_paired_start_end() {
         // A tool that sleeps 200ms — long enough for cancel to fire.

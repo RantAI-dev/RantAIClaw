@@ -367,27 +367,27 @@ fn build_rig_request(
 
 /// Collapse rig's `AssistantContent` enum into our `ChatResponse`
 /// shape. Text → ChatResponse.text (concatenated), ToolCall →
-/// pushed to tool_calls. Reasoning + Image content currently
-/// flatten into the text — we don't expose reasoning blocks
-/// through the agent loop yet.
+/// pushed to tool_calls. Reasoning blocks are the reply only when the
+/// response has neither text nor a tool call (see [`reply_text`]); Image
+/// content is ignored. We don't expose reasoning blocks through the agent
+/// loop yet.
 fn flatten_assistant(choice: OneOrMany<AssistantContent>) -> (Option<String>, Vec<ToolCall>) {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     for part in choice {
         match part {
             AssistantContent::Text(t) => text.push_str(&t.text),
             AssistantContent::ToolCall(tc) => tool_calls.push(rig_tool_to_ours(tc.id, tc.function)),
             AssistantContent::Reasoning(r) => {
-                // Preserve as text for now — could surface
-                // separately once the agent loop has a reasoning
-                // event channel. `r.content` is a `Vec<ReasoningContent>`;
-                // we extract the text variant of each block.
+                // `r.content` is a `Vec<ReasoningContent>`; we extract the
+                // text variant of each block.
                 for block in r.content {
                     if let rig_core::completion::message::ReasoningContent::Text {
                         text: t, ..
                     } = block
                     {
-                        text.push_str(&t);
+                        reasoning.push_str(&t);
                     }
                 }
             }
@@ -396,8 +396,22 @@ fn flatten_assistant(choice: OneOrMany<AssistantContent>) -> (Option<String>, Ve
             }
         }
     }
-    let text_opt = if text.is_empty() { None } else { Some(text) };
-    (text_opt, tool_calls)
+    let text = reply_text(text, reasoning, !tool_calls.is_empty());
+    (text, tool_calls)
+}
+
+/// The text of a response. Reasoning is the reply only when the response has
+/// no text and no tool call. Otherwise it would be stored as the assistant's
+/// own message and sent back to the model on the next request, which then
+/// writes its reasoning into its answers.
+fn reply_text(text: String, reasoning: String, has_tool_calls: bool) -> Option<String> {
+    if !text.is_empty() {
+        Some(text)
+    } else if has_tool_calls || reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning)
+    }
 }
 
 fn rig_tool_to_ours(id: String, f: ToolFunction) -> ToolCall {
@@ -631,6 +645,8 @@ where
         .with_context(|| format!("rig {canonical} stream open failed"))?;
 
     let mut full_text = String::new();
+    // Reasoning is kept apart from the text; see `reply_text`.
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     // Pre-allocate so accumulating tool call argument fragments doesn't
     // reallocate per chunk. Most calls have <2KB of args.
@@ -688,19 +704,19 @@ where
                 }
             }
             StreamedAssistantContent::Reasoning(r) => {
-                // Streaming reasoning blocks — flatten into text for
-                // now. Same compat note as the non-streaming path.
                 for block in r.content {
                     if let rig_core::completion::message::ReasoningContent::Text {
                         text: t, ..
                     } = block
                     {
-                        full_text.push_str(&t);
+                        reasoning.push_str(&t);
                     }
                 }
             }
-            StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                full_text.push_str(&reasoning);
+            StreamedAssistantContent::ReasoningDelta {
+                reasoning: delta, ..
+            } => {
+                reasoning.push_str(&delta);
             }
             other @ StreamedAssistantContent::Final(_) => {
                 tracing::debug!(
@@ -728,18 +744,14 @@ where
         }
     }
 
-    let text_opt = if full_text.is_empty() {
-        None
-    } else {
-        Some(full_text)
-    };
+    let tool_calls = dedupe_tool_calls_by_id(tool_calls);
     Ok(ChatResponse {
         usage: None,
-        text: text_opt,
+        text: reply_text(full_text, reasoning, !tool_calls.is_empty()),
         // rig may surface a tool call via both the immediate-complete event and
         // the delta path; collapse same-id duplicates before they reach the
         // next request (OpenAI 400s on duplicate tool_call ids).
-        tool_calls: dedupe_tool_calls_by_id(tool_calls),
+        tool_calls,
     })
 }
 
@@ -1055,6 +1067,174 @@ mod tests {
             "final response text"
         );
         assert!(resp.tool_calls.is_empty(), "resp was {resp:?}");
+    }
+
+    // ── Reasoning blocks are never the text of a tool-call or answered step ──
+
+    fn reasoning_block(text: &str) -> AssistantContent {
+        AssistantContent::Reasoning(rig_core::completion::message::Reasoning::new(text))
+    }
+
+    #[test]
+    fn flatten_assistant_drops_reasoning_when_the_response_has_a_tool_call() {
+        let choice = OneOrMany::many(vec![
+            reasoning_block("The user wants the weather. I should call the tool."),
+            AssistantContent::tool_call(
+                "call_1",
+                "get_weather",
+                serde_json::json!({ "city": "Jakarta" }),
+            ),
+        ])
+        .expect("two blocks");
+
+        let (text, tool_calls) = flatten_assistant(choice);
+
+        assert_eq!(text, None);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn flatten_assistant_drops_reasoning_when_the_response_has_text() {
+        let choice = OneOrMany::many(vec![
+            reasoning_block("Thinking about how to answer."),
+            AssistantContent::text("It is sunny."),
+        ])
+        .expect("two blocks");
+
+        let (text, tool_calls) = flatten_assistant(choice);
+
+        assert_eq!(text.as_deref(), Some("It is sunny."));
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn flatten_assistant_keeps_text_written_next_to_a_tool_call() {
+        let choice = OneOrMany::many(vec![
+            reasoning_block("Thinking."),
+            AssistantContent::text("Checking that."),
+            AssistantContent::tool_call("call_1", "get_weather", serde_json::json!({})),
+        ])
+        .expect("three blocks");
+
+        let (text, tool_calls) = flatten_assistant(choice);
+
+        assert_eq!(text.as_deref(), Some("Checking that."));
+        assert_eq!(tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn flatten_assistant_still_answers_with_reasoning_when_there_is_nothing_else() {
+        let choice = OneOrMany::one(reasoning_block("Only thinking."));
+
+        let (text, tool_calls) = flatten_assistant(choice);
+
+        assert_eq!(text.as_deref(), Some("Only thinking."));
+        assert!(tool_calls.is_empty());
+    }
+
+    async fn anthropic_stream_of(sse: &str) -> ChatResponse {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse.as_bytes(), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            RigProvider::for_provider_with_url("anthropic", Some("k"), Some(&server.uri()))
+                .expect("construct");
+        let messages = vec![ChatMessage::user("weather in Jakarta?")];
+        let tools = vec![probe_tool()];
+        let (tx, _rx) = mpsc::channel::<String>(16);
+
+        provider
+            .chat_stream(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "claude-3-haiku-20240307",
+                0.2,
+                tx,
+            )
+            .await
+            .expect("stream against the mock")
+    }
+
+    /// The streaming twin of `flatten_assistant`: a thinking block followed by
+    /// a tool call must come back as the tool call alone.
+    #[tokio::test]
+    async fn anthropic_stream_drops_thinking_when_the_response_has_a_tool_call() {
+        let resp = anthropic_stream_of(concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_t","type":"message","role":"assistant","model":"claude-3-haiku-20240307","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user wants the weather. I should call the tool."}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Jakarta\"}"}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":7}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        ))
+        .await;
+
+        assert_eq!(resp.tool_calls.len(), 1, "resp was {resp:?}");
+        assert_eq!(resp.tool_calls[0].name, "get_weather");
+        assert_eq!(resp.text, None, "thinking became text: {resp:?}");
+    }
+
+    /// A stream with only a thinking block and no tool call still answers with
+    /// the thinking, as it did before reasoning was kept out of the text.
+    #[tokio::test]
+    async fn anthropic_stream_still_answers_with_thinking_when_there_is_nothing_else() {
+        let resp = anthropic_stream_of(concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_t","type":"message","role":"assistant","model":"claude-3-haiku-20240307","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Only thinking."}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        ))
+        .await;
+
+        assert!(resp.tool_calls.is_empty(), "resp was {resp:?}");
+        let text = resp.text.as_deref().unwrap_or_default();
+        assert!(text.contains("Only thinking."), "resp was {resp:?}");
     }
 
     #[test]

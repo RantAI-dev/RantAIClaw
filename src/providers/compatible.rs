@@ -317,7 +317,10 @@ struct ResponseMessage {
     content: Option<String>,
     /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
-    #[serde(default)]
+    ///
+    /// Never serialized: the history paths hand a message that carries tool
+    /// calls back as JSON text, and reasoning must not travel in that text.
+    #[serde(default, skip_serializing)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
@@ -325,31 +328,33 @@ struct ResponseMessage {
 
 impl ResponseMessage {
     /// Extract text content, falling back to `reasoning_content` when `content`
-    /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
-    /// often return their output solely in `reasoning_content`.
+    /// is missing or empty and the message has no tool call. Reasoning/thinking
+    /// models (Qwen3, GLM-4, etc.) often return their output solely in
+    /// `reasoning_content`.
     /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
     /// inline in `content` instead of using a separate field.
     fn effective_content(&self) -> String {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return stripped;
-            }
-        }
-
-        self.reasoning_content
-            .as_ref()
-            .map(|c| strip_think_tags(c))
-            .filter(|c| !c.is_empty())
-            .unwrap_or_default()
+        self.effective_content_optional().unwrap_or_default()
     }
 
+    /// Reasoning is only the reply when the message has neither content nor a
+    /// tool call. On a tool-call step it would otherwise become the step's text,
+    /// be stored as the assistant's own message and be sent back to the model
+    /// on the next request as if it had said it.
     fn effective_content_optional(&self) -> Option<String> {
         if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
             let stripped = strip_think_tags(content);
             if !stripped.is_empty() {
                 return Some(stripped);
             }
+        }
+
+        if self
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            return None;
         }
 
         self.reasoning_content
@@ -694,14 +699,16 @@ fn parse_sse_line_full(line: &str) -> StreamResult<Option<ParsedSseLine>> {
             // An empty `content` ALSO falls back to reasoning_content —
             // some providers emit `{"content":"","reasoning_content":"…"}`
             // during thinking phases.
-            let text = match (&choice.delta.content, &choice.delta.reasoning_content) {
-                (Some(c), _) if !c.is_empty() => Some(c.clone()),
-                (_, Some(r)) => Some(r.clone()),
-                _ => None,
-            };
+            let (text, from_reasoning) =
+                match (&choice.delta.content, &choice.delta.reasoning_content) {
+                    (Some(c), _) if !c.is_empty() => (Some(c.clone()), false),
+                    (_, Some(r)) => (Some(r.clone()), true),
+                    _ => (None, false),
+                };
 
             return Ok(Some(ParsedSseLine {
                 text,
+                from_reasoning,
                 tool_calls: choice.delta.tool_calls.clone(),
                 finish_reason: choice.finish_reason.clone(),
             }));
@@ -716,6 +723,8 @@ fn parse_sse_line_full(line: &str) -> StreamResult<Option<ParsedSseLine>> {
 /// finish_reason, any combination, or none.
 struct ParsedSseLine {
     text: Option<String>,
+    /// `text` came from `reasoning_content`, not from `content`.
+    from_reasoning: bool,
     tool_calls: Option<Vec<StreamToolCallDelta>>,
     #[allow(dead_code)] // Reserved for future use (e.g., emit "[tool_use stop]" cues to TUI).
     finish_reason: Option<String>,
@@ -749,6 +758,20 @@ fn drain_tool_accumulator(
             })
         })
         .collect()
+}
+
+/// The text of a streamed response. Reasoning deltas are collected apart from
+/// the content and are the reply only when the stream ended with no content
+/// and no tool call; otherwise they would be stored as the assistant's own
+/// words and replayed to the model, or glued in front of its answer.
+fn streamed_reply(content: String, reasoning: String, has_tool_calls: bool) -> Option<String> {
+    if !content.is_empty() {
+        Some(content)
+    } else if has_tool_calls || reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning)
+    }
 }
 
 /// Append `chunk` to the carry-over `pending` buffer and decode the
@@ -1785,6 +1808,8 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let mut full_text = String::new();
+        // Text that arrived as `reasoning_content`; see `streamed_reply`.
+        let mut reasoning_text = String::new();
         // BTreeMap keyed by `index` so the final tool_calls Vec is in
         // the order the model emitted them, regardless of fragment
         // interleaving across SSE chunks.
@@ -1847,19 +1872,20 @@ impl Provider for OpenAiCompatibleProvider {
                 if visible.is_empty() {
                     continue;
                 }
-                full_text.push_str(&visible);
+                if parsed.from_reasoning {
+                    reasoning_text.push_str(&visible);
+                } else {
+                    full_text.push_str(&visible);
+                }
                 // Pace out big chunks so TUI shows progressive streaming
                 // even when the server batches.
                 for piece in split_for_streaming(&visible) {
                     if text_tx.send(piece).await.is_err() {
+                        let tool_calls = drain_tool_accumulator(tool_acc);
                         return Ok(ProviderChatResponse {
                             usage: None,
-                            text: if full_text.is_empty() {
-                                None
-                            } else {
-                                Some(full_text)
-                            },
-                            tool_calls: drain_tool_accumulator(tool_acc),
+                            text: streamed_reply(full_text, reasoning_text, !tool_calls.is_empty()),
+                            tool_calls,
                         });
                     }
                     if visible.len() > 16 {
@@ -1888,14 +1914,11 @@ impl Provider for OpenAiCompatibleProvider {
             let _ = text_tx.send(leftover).await;
         }
 
+        let tool_calls = drain_tool_accumulator(tool_acc);
         Ok(ProviderChatResponse {
             usage: None,
-            text: if full_text.is_empty() {
-                None
-            } else {
-                Some(full_text)
-            },
-            tool_calls: drain_tool_accumulator(tool_acc),
+            text: streamed_reply(full_text, reasoning_text, !tool_calls.is_empty()),
+            tool_calls,
         })
     }
 
@@ -3320,5 +3343,427 @@ mod tests {
         // Simulate the end-of-stream flush from `chat_stream`.
         out.push_str(&String::from_utf8_lossy(&pending));
         assert_eq!(out, "hi \u{FFFD}");
+    }
+
+    // ----------------------------------------------------------
+    // Reasoning is never the text of a response that also has a
+    // tool call or real content. Driven through the real provider
+    // against a mock endpoint, so the wire body is what a
+    // reasoning model sends.
+    // ----------------------------------------------------------
+
+    const REASONING: &str = "The user asked me to read the file. Let me call the tool.";
+
+    fn lookup_tool_spec() -> crate::tools::ToolSpec {
+        crate::tools::ToolSpec {
+            name: "lookup".to_string(),
+            description: "Looks something up".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } }
+            }),
+        }
+    }
+
+    fn chat_completion_body(message: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }]
+        })
+    }
+
+    fn lookup_tool_call() -> serde_json::Value {
+        serde_json::json!({
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "lookup", "arguments": "{\"q\":\"x\"}" }
+        })
+    }
+
+    async fn endpoint_answering(
+        body: serde_json::Value,
+    ) -> (wiremock::MockServer, OpenAiCompatibleProvider) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "mock-reasoner",
+            &server.uri(),
+            Some("test-key"),
+            AuthStyle::Bearer,
+        );
+        (server, provider)
+    }
+
+    async fn chat_once(provider: &OpenAiCompatibleProvider) -> ProviderChatResponse {
+        let messages = [ChatMessage::user("read it")];
+        let tools = [lookup_tool_spec()];
+        provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "mock-model",
+                0.0,
+            )
+            .await
+            .expect("the mock answers")
+    }
+
+    #[tokio::test]
+    async fn chat_drops_reasoning_when_the_response_has_a_tool_call() {
+        let (_server, provider) = endpoint_answering(chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": REASONING,
+            "tool_calls": [lookup_tool_call()],
+        })))
+        .await;
+
+        let response = chat_once(&provider).await;
+
+        assert_eq!(response.tool_calls.len(), 1, "response was {response:?}");
+        assert_eq!(response.tool_calls[0].name, "lookup");
+        assert_eq!(response.text, None, "reasoning became text: {response:?}");
+    }
+
+    #[tokio::test]
+    async fn chat_keeps_the_content_written_next_to_a_tool_call_and_drops_reasoning() {
+        let (_server, provider) = endpoint_answering(chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "Checking that now.",
+            "reasoning_content": REASONING,
+            "tool_calls": [lookup_tool_call()],
+        })))
+        .await;
+
+        let response = chat_once(&provider).await;
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.text.as_deref(), Some("Checking that now."));
+    }
+
+    #[tokio::test]
+    async fn chat_still_answers_with_reasoning_when_there_is_nothing_else() {
+        let (_server, provider) = endpoint_answering(chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": REASONING,
+        })))
+        .await;
+
+        let response = chat_once(&provider).await;
+
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.text.as_deref(), Some(REASONING));
+    }
+
+    #[tokio::test]
+    async fn chat_prefers_content_over_reasoning() {
+        let (_server, provider) = endpoint_answering(chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "1 line.",
+            "reasoning_content": REASONING,
+        })))
+        .await;
+
+        let response = chat_once(&provider).await;
+
+        assert_eq!(response.text.as_deref(), Some("1 line."));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_drops_reasoning_when_the_response_has_a_tool_call() {
+        let (_server, provider) = endpoint_answering(chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": REASONING,
+            "tool_calls": [lookup_tool_call()],
+        })))
+        .await;
+
+        let response = provider
+            .chat_with_tools(
+                &[ChatMessage::user("read it")],
+                &[serde_json::json!({
+                    "type": "function",
+                    "function": { "name": "lookup", "description": "d", "parameters": {} }
+                })],
+                "mock-model",
+                0.0,
+            )
+            .await
+            .expect("the mock answers");
+
+        assert_eq!(response.tool_calls.len(), 1, "response was {response:?}");
+        assert_eq!(response.text, None, "reasoning became text: {response:?}");
+    }
+
+    /// With a tool call in the message, the history paths hand the whole
+    /// message back as JSON for the loop's parser. The reasoning field must
+    /// not ride along in that string.
+    #[tokio::test]
+    async fn chat_with_history_does_not_hand_back_reasoning_next_to_tool_calls() {
+        let (_server, provider) = endpoint_answering(chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": REASONING,
+            "tool_calls": [lookup_tool_call()],
+        })))
+        .await;
+
+        let raw = provider
+            .chat_with_history(&[ChatMessage::user("read it")], "mock-model", 0.0)
+            .await
+            .expect("the mock answers");
+
+        assert!(raw.contains("lookup"), "the tool call is kept: {raw}");
+        assert!(!raw.contains(REASONING), "reasoning was returned: {raw}");
+    }
+
+    fn sse_body(events: &[serde_json::Value]) -> String {
+        let mut body = String::new();
+        for event in events {
+            body.push_str("data: ");
+            body.push_str(&event.to_string());
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn delta(delta: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "choices": [{ "index": 0, "delta": delta }] })
+    }
+
+    async fn stream_once(events: &[serde_json::Value]) -> ProviderChatResponse {
+        stream_once_with(events, false).await
+    }
+
+    /// `hang_up` drops the receiving end before the stream starts, as a
+    /// consumer that went away does.
+    async fn stream_once_with(events: &[serde_json::Value], hang_up: bool) -> ProviderChatResponse {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse_body(events).into_bytes(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "mock-reasoner",
+            &server.uri(),
+            Some("test-key"),
+            AuthStyle::Bearer,
+        );
+        let messages = [ChatMessage::user("read it")];
+        let tools = [lookup_tool_spec()];
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut rx = (!hang_up).then_some(rx);
+        let response = provider
+            .chat_stream(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "mock-model",
+                0.0,
+                tx,
+            )
+            .await
+            .expect("the mock streams");
+        if let Some(rx) = rx.as_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+        response
+    }
+
+    fn streamed_tool_call() -> serde_json::Value {
+        delta(serde_json::json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "lookup", "arguments": "{\"q\":\"x\"}" }
+            }]
+        }))
+    }
+
+    #[tokio::test]
+    async fn stream_drops_reasoning_deltas_when_the_stream_ends_in_a_tool_call() {
+        let response = stream_once(&[
+            delta(serde_json::json!({ "content": "", "reasoning_content": "The user asked " })),
+            delta(serde_json::json!({ "content": "", "reasoning_content": "me to read." })),
+            streamed_tool_call(),
+        ])
+        .await;
+
+        assert_eq!(response.tool_calls.len(), 1, "response was {response:?}");
+        assert_eq!(response.text, None, "reasoning became text: {response:?}");
+    }
+
+    /// The consumer going away ends the read at the first piece of text, so a
+    /// tool call that arrived in the same event is the only one there is. The
+    /// reasoning in that event must still not become the reply.
+    #[tokio::test]
+    async fn stream_drops_reasoning_when_the_consumer_hangs_up_next_to_a_tool_call() {
+        let response = stream_once_with(
+            &[delta(serde_json::json!({
+                "content": "",
+                "reasoning_content": "The user asked me to read.",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "lookup", "arguments": "{\"q\":\"x\"}" }
+                }]
+            }))],
+            true,
+        )
+        .await;
+
+        assert_eq!(response.tool_calls.len(), 1, "response was {response:?}");
+        assert_eq!(response.text, None, "reasoning became text: {response:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_keeps_content_written_next_to_a_tool_call_and_drops_reasoning() {
+        let response = stream_once(&[
+            delta(serde_json::json!({ "reasoning_content": "Thinking. " })),
+            delta(serde_json::json!({ "content": "Checking that." })),
+            streamed_tool_call(),
+        ])
+        .await;
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.text.as_deref(), Some("Checking that."));
+    }
+
+    #[tokio::test]
+    async fn stream_reply_has_no_reasoning_in_front_of_the_answer() {
+        let response = stream_once(&[
+            delta(serde_json::json!({ "content": "", "reasoning_content": "Thinking it over." })),
+            delta(serde_json::json!({ "content": "1 " })),
+            delta(serde_json::json!({ "content": "line." })),
+        ])
+        .await;
+
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.text.as_deref(), Some("1 line."));
+    }
+
+    #[tokio::test]
+    async fn stream_still_answers_with_reasoning_when_there_is_nothing_else() {
+        let response = stream_once(&[
+            delta(serde_json::json!({ "content": "", "reasoning_content": "Only " })),
+            delta(serde_json::json!({ "content": "", "reasoning_content": "thinking." })),
+        ])
+        .await;
+
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.text.as_deref(), Some("Only thinking."));
+    }
+}
+
+/// A mock OpenAI-compatible endpoint that behaves like a reasoning model, for
+/// tests of the layers above the provider (the tool loop, the channel
+/// dispatcher). The first request is answered with a tool call whose
+/// `content` is empty and whose `reasoning_content` carries
+/// [`REASONING_MARKER`]; every later request is answered with a plain
+/// `final_answer` (and more reasoning). A test then reads the requests the mock
+/// received and asserts the marker never came back to the model.
+#[cfg(test)]
+pub(crate) mod reasoning_endpoint {
+    use super::{AuthStyle, OpenAiCompatibleProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) const REASONING_MARKER: &str = "REASONING-MARKER-never-the-assistants-words";
+
+    struct Script {
+        requests_seen: AtomicUsize,
+        tool_name: String,
+        tool_arguments: serde_json::Value,
+        final_answer: String,
+    }
+
+    impl wiremock::Respond for Script {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let message = if self.requests_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": format!("{REASONING_MARKER}: I should call the tool."),
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": self.tool_name,
+                            "arguments": self.tool_arguments.to_string(),
+                        }
+                    }],
+                })
+            } else {
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": self.final_answer,
+                    "reasoning_content": format!("{REASONING_MARKER}: now I can answer."),
+                })
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }]
+            }))
+        }
+    }
+
+    pub(crate) struct ReasoningEndpoint {
+        server: wiremock::MockServer,
+    }
+
+    impl ReasoningEndpoint {
+        pub(crate) async fn start(
+            tool_name: &str,
+            tool_arguments: serde_json::Value,
+            final_answer: &str,
+        ) -> Self {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/chat/completions"))
+                .respond_with(Script {
+                    requests_seen: AtomicUsize::new(0),
+                    tool_name: tool_name.to_string(),
+                    tool_arguments,
+                    final_answer: final_answer.to_string(),
+                })
+                .mount(&server)
+                .await;
+            Self { server }
+        }
+
+        pub(crate) fn provider(&self) -> OpenAiCompatibleProvider {
+            OpenAiCompatibleProvider::new_no_responses_fallback(
+                "mock-reasoner",
+                &self.server.uri(),
+                Some("test-key"),
+                AuthStyle::Bearer,
+            )
+        }
+
+        /// The JSON body of every request the endpoint received, oldest first.
+        pub(crate) async fn requests(&self) -> Vec<serde_json::Value> {
+            self.server
+                .received_requests()
+                .await
+                .expect("wiremock records requests")
+                .iter()
+                .map(|request| {
+                    serde_json::from_slice(&request.body).expect("the request body is JSON")
+                })
+                .collect()
+        }
     }
 }

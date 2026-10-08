@@ -140,9 +140,19 @@ struct NativeResponseMessage {
 }
 
 impl NativeResponseMessage {
+    /// Reasoning is only the reply when the message has neither content nor a
+    /// tool call; on a tool-call step it would be stored and sent back to the
+    /// model as the assistant's own message.
     fn effective_content(&self) -> Option<String> {
         match &self.content {
             Some(c) if !c.is_empty() => Some(c.clone()),
+            _ if self
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty()) =>
+            {
+                None
+            }
             _ => self.reasoning_content.clone(),
         }
     }
@@ -603,6 +613,14 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(msg.effective_content(), Some("Real answer".to_string()));
+    }
+
+    #[test]
+    fn native_response_reasoning_content_dropped_when_a_tool_call_is_present() {
+        let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Native thinking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), None);
     }
 
     #[tokio::test]
