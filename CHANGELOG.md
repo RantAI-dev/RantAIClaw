@@ -70,12 +70,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The token-prefix scrubber no longer redacts ordinary words that contain a
+  prefix, such as the `sk-` inside `task-force` or `risk-free`. A prefix now
+  counts only at the start of the text or after a character that is not an
+  ASCII letter, an ASCII digit, `_` or `-`, and at least five token characters
+  must follow it. A key glued to a word character, `_` or `-` in front of its
+  prefix (`key_sk-…`) is no longer redacted by this scrubber. This applies to
+  provider error text, memory notes and recorded channel messages.
+- The `key=value` credential scrubber now takes the whole unquoted value, up to
+  the next whitespace, quote, backtick, `,`, `;`, `&`, `)`, `[`, `]`, `}` or `>`
+  (a `[REDACTED]` marker already in the text does not end the value). Before, a
+  base64 or URL-safe value such as `password=abcdEFGH/ijklMNOP+qrst==`
+  was cut at the first `/`, `+` or `=` and the rest stayed in the stored row.
+  This applies to recorded channel messages and to stored cron run output.
 - The channels reference no longer says channel recordings are pruned 30 days
   after the last turn. A recorded message is deleted 30 days after it was
   written, and a session is deleted when it has no message left. The same
   section now lists the three passes that run before a row is written, the five
-  attachment kinds the payload redaction covers, and the fact that the token
-  prefixes match anywhere in the text.
+  attachment kinds the payload redaction covers, and the rule that decides where
+  a token prefix counts.
 - An unknown `embedding_provider` no longer silently disables semantic
   search. The factory logs a `WARN` naming the bad value at start, and
   `rantaiclaw doctor` reports it as `✗` so the typo surfaces. The daemon

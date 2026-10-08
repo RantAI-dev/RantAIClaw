@@ -42,8 +42,18 @@ static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     .unwrap()
 });
 
+// The unquoted value class is a negation, so it takes `/`, `+`, `=` and any
+// other character up to whitespace, a quote, a backtick or a terminator. A
+// `[REDACTED]` marker already in the text never ends a value: it counts as one
+// unit of the value, and the value is then redacted like any other. The
+// token-prefix scrubber runs first on recorded messages and leaves that marker
+// right after the key, so ending the value at the marker's `]` would store
+// `[RED*[REDACTED]]`. A lone `[` is a terminator too. Alternation order alone
+// does not keep the marker in the value: if `[` were also in the class,
+// `[REDACTED` would match as nine plain characters. The four kept characters
+// can fall inside the marker (`[RED*[REDACTED]`), which is cosmetic.
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|((?:\[REDACTED\]|[^\s"'`,;&)\[\]}>]){8,}))"#).unwrap()
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
@@ -61,6 +71,24 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .or(caps.get(4))
                 .map(|m| m.as_str())
                 .unwrap_or("");
+
+            // A quoted value this function already wrote (`"supe*[REDACTED]"`)
+            // matches again, because a quoted value may hold any character.
+            // Scrubbing runs more than once on the same text (store write,
+            // then read), and a second pass would add a quote, so a value
+            // that is already a redaction is left as it is. The unquoted
+            // branch never matches the exact shape this function writes (at
+            // most four kept characters, `*`, then the marker is at most six
+            // units, under the eight-unit minimum), so only quoted values
+            // reach this. Only the exact shape this function writes counts (at
+            // most four kept characters, then the marker), so a real secret
+            // that happens to contain the marker text is still redacted.
+            let already_redacted = val
+                .strip_suffix("*[REDACTED]")
+                .is_some_and(|kept| kept.chars().count() <= 4);
+            if already_redacted {
+                return full_match.to_string();
+            }
 
             // Preserve first 4 chars for context, then redact. Slice by
             // characters, not bytes — a byte slice panics on a UTF-8
@@ -3098,6 +3126,133 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
+    }
+
+    #[test]
+    fn scrub_credentials_takes_a_whole_unquoted_base64_value() {
+        let scrubbed = scrub_credentials("password=abcdEFGH/ijklMNOP+qrst==");
+        assert_eq!(scrubbed, "password=abcd*[REDACTED]");
+    }
+
+    #[test]
+    fn scrub_credentials_takes_a_value_with_slashes_and_plus_signs() {
+        let scrubbed = scrub_credentials("token: abc/def+ghi/jkl+mno");
+        assert_eq!(scrubbed, "token: abc/*[REDACTED]");
+        for tail in ["ghi", "jkl", "mno"] {
+            assert!(!scrubbed.contains(tail), "tail {tail} survived: {scrubbed}");
+        }
+    }
+
+    #[test]
+    fn scrub_credentials_takes_a_dotted_unquoted_jwt_value() {
+        let scrubbed = scrub_credentials("api_key=eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl");
+        assert_eq!(scrubbed, "api_key=eyJh*[REDACTED]");
+    }
+
+    #[test]
+    fn scrub_credentials_stops_an_unquoted_value_at_a_terminator() {
+        assert_eq!(
+            scrub_credentials("token=abcdefgh12345678&page=2"),
+            "token=abcd*[REDACTED]&page=2"
+        );
+        assert_eq!(
+            scrub_credentials("token=abcdefgh12345678, next"),
+            "token=abcd*[REDACTED], next"
+        );
+        assert_eq!(
+            scrub_credentials("(password: abcdefgh12345678) next"),
+            "(password: abcd*[REDACTED]) next"
+        );
+        assert_eq!(
+            scrub_credentials("[secret=abcdefgh12345678] next"),
+            "[secret=abcd*[REDACTED]] next"
+        );
+        assert_eq!(
+            scrub_credentials("{secret=abcdefgh12345678} next"),
+            "{secret=abcd*[REDACTED]} next"
+        );
+        assert_eq!(
+            scrub_credentials("<secret=abcdefgh12345678> next"),
+            "<secret=abcd*[REDACTED]> next"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_keeps_the_tail_of_a_sentence_after_a_short_value() {
+        let msg = "the secret: none of this is one, really";
+        assert_eq!(scrub_credentials(msg), msg);
+    }
+
+    #[test]
+    fn scrub_credentials_leaves_an_unquoted_value_under_eight_characters_alone() {
+        let msg = "token=abc/def";
+        assert_eq!(scrub_credentials(msg), msg);
+    }
+
+    #[test]
+    fn scrub_credentials_redacts_a_real_value_that_ends_with_the_redaction_marker() {
+        // Quoted: the only form that reaches the already-redacted guard, which
+        // must not accept a long kept part.
+        let quoted = scrub_credentials(r#"password="abcdefgh1234*[REDACTED]""#);
+        assert_eq!(quoted, r#"password="abcd*[REDACTED]""#);
+        assert!(!quoted.contains("efgh1234"), "got: {quoted}");
+
+        // Unquoted: the marker counts as one unit, so the value is 14 units.
+        let unquoted = scrub_credentials("password=abcdefgh1234*[REDACTED]");
+        assert_eq!(unquoted, "password=abcd*[REDACTED]");
+        assert!(!unquoted.contains("efgh1234"), "got: {unquoted}");
+    }
+
+    #[test]
+    fn scrub_credentials_does_not_split_a_redaction_marker_inside_a_value() {
+        // Output of the token-prefix pass, which runs before this scrubber.
+        assert_eq!(
+            scrub_credentials("OPENAI_API_KEY=[REDACTED]"),
+            "OPENAI_API_KEY=[REDACTED]"
+        );
+        assert_eq!(scrub_credentials("token: [REDACTED]"), "token: [REDACTED]");
+        let scrubbed = scrub_credentials("password=abcd[REDACTED]secretsecretsecret");
+        assert!(
+            !scrubbed.contains("secretsecretsecret"),
+            "tail survived: {scrubbed}"
+        );
+        assert_eq!(scrubbed, "password=abcd*[REDACTED]");
+    }
+
+    #[test]
+    fn scrub_credentials_takes_punctuation_and_non_ascii_letters_after_the_key() {
+        assert_eq!(
+            scrub_credentials("token: expired!"),
+            "token: expi*[REDACTED]"
+        );
+        assert_eq!(
+            scrub_credentials("password=p\u{e4}ssw\u{f6}rd123 ok"),
+            "password=p\u{e4}ss*[REDACTED] ok"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_stops_an_unquoted_value_at_an_opening_bracket() {
+        assert_eq!(
+            scrub_credentials("password=abcdefgh[x]"),
+            "password=abcd*[REDACTED][x]"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_twice_equals_scrub_credentials_once() {
+        for input in [
+            "password=abcdEFGH/ijklMNOP+qrst==",
+            "token: abc/def+ghi/jkl+mno",
+            r#"api_key: "supersecretvalue1234""#,
+            "api_key=eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl",
+            "token=abcdefgh12345678&page=2",
+            "password=abcd[REDACTED]secretsecretsecret",
+            "OPENAI_API_KEY=[REDACTED]",
+        ] {
+            let once = scrub_credentials(input);
+            assert_eq!(scrub_credentials(&once), once, "not stable for {input}");
+        }
     }
     use crate::memory::{Memory, MemoryCategory, SessionScope, SqliteMemory};
     use crate::observability::NoopObserver;

@@ -632,9 +632,10 @@ impl SessionStore {
 
     // ── Channel recording ────────────────────────────────────────────────────
 
-    /// How long a channel session is kept after the last turn before the daily
-    /// retention sweep removes it. Matches the `channel_history` retention in
-    /// `src/channels/history_store.rs`.
+    /// How long a channel message is kept after it was written. The daily
+    /// retention sweep deletes a message once it is older than this, and
+    /// removes a session when it has no message left. Same length as the
+    /// `channel_history` retention in `src/channels/history_store.rs`.
     pub const CHANNEL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
     /// Record a user + assistant turn for a channel conversation, reusing the
@@ -774,8 +775,8 @@ impl SessionStore {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // Retention is 30 days after the *last turn*, so prune by message
-        // timestamp, not by `started_at`. A session whose only old messages
+        // Retention is thirty days after a message was written, so prune by
+        // message timestamp, not by `started_at`. A session whose only old messages
         // sit before the cutoff is left in place while its stale rows are
         // dropped; a session whose every message is old is empty afterwards
         // and is deleted in the same transaction. The recount below keeps
@@ -2376,9 +2377,9 @@ mod tests {
         let mut s = store();
 
         // A channel session aged past retention — both its session row and
-        // every message it carries, since retention is "30 days after the
-        // last turn" and a chat whose last turn was that long ago has nothing
-        // left to keep.
+        // every message it carries. Retention is per message, thirty days
+        // after the message was written, and every message of this session is
+        // older than that, so nothing is left to keep.
         let old_id = s
             .record_channel_turn("m", "telegram:chat-old", "u", "r", None)
             .unwrap();
