@@ -1762,6 +1762,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepare_cron_output_takes_the_whole_base64_secret() {
+        let stored = prepare_cron_output("password=abcdEFGH/ijklMNOP+qrst== done");
+        assert_eq!(stored, "password=abcd*[REDACTED] done");
+    }
+
     #[cfg(unix)]
     #[test]
     fn jobs_db_is_restricted_to_owner_only() {

@@ -353,16 +353,36 @@ How it lands in the store:
   run before the row is written, in this order. `scrub_secret_patterns`
   replaces any run of characters that starts with `sk-`, `xoxb-`, `xoxp-`,
   `ghp_`, `gho_`, `ghu_` or `github_pat_` and continues through ASCII letters,
-  ASCII digits, `-`, `_`, `.` and `:` with `[REDACTED]`. It matches the prefix anywhere in the
-  text, with no word boundary, so the `sk-` inside `task-force` is replaced too.
+  ASCII digits, `-`, `_`, `.` and `:` with `[REDACTED]`. A prefix counts only
+  at the start of the text or after a character that is not an ASCII letter,
+  an ASCII digit, `_` or `-`, so the `sk-` inside `task-force` stays and the
+  word is stored as written. At least five of those characters must follow the
+  prefix, so `sk-1` in prose stays too. The same boundary means a key glued to
+  a word character, `_` or `-` directly in front of its prefix, such as
+  `key_sk-…`, is not redacted by this pass.
   `scrub_credentials` redacts `key=value` lines whose key
   matches one of `token`, `api_key`, `api-key`, `password`, `secret`,
   `user_key`, `user-key`, `bearer`, `credential` (matched as a substring, so
   `mytoken` and `apikey` are also keys) and whose separator is `:` or `=`,
   with a value eight or more characters long; the first four characters of
-  the value stay in the stored row. An unquoted value is redacted up to the
-  first character outside ASCII letters, ASCII digits, `_`, `-` and `.`, and anything after
-  that character stays in the row. A secret written as a plain sentence
+  the value stay in the stored row. An unquoted value is any run of
+  characters up to the first whitespace, quote (`"` or `'`), backtick, `,`,
+  `;`, `&`, `[`, `)`, `]`, `}` or `>`, and anything after that character stays
+  in the row. A base64 value with `/`, `+` and `=`, a URL-safe or dotted
+  value, symbols and non-ASCII letters are all taken. Because the rule names
+  what ends a value and not what a secret looks like, punctuation and
+  non-ASCII letters directly after the key are taken too, so a short prose
+  value of eight or more characters such as `token: expired!` is also
+  redacted. The eight-character minimum counts characters, except that a
+  `[REDACTED]` marker already in the text counts as one character and never
+  ends a value. A value that is only the marker is too short to match, so
+  `OPENAI_API_KEY=[REDACTED]`, left by the first pass, stays as it is. A
+  longer value that holds a marker is redacted like any other, and the four
+  kept characters can fall inside the marker: `OPENAI_API_KEY=sk-…/more+stuff`
+  is stored as `OPENAI_API_KEY=[RED*[REDACTED]`. A tail shorter than seven
+  characters after a prefixed key does not reach eight with the marker, so the
+  marker and the tail stay as they are: `password=ghp_<key>/abc12` is stored as
+  `password=[REDACTED]/abc12`. A secret written as a plain sentence
   that does not use `:` or `=` as the separator ("the token string is
   abcdefghijklmno") is not recognised by either scrubber.
   `Authorization: Bearer …` headers, bot tokens whose prefix is not on the

@@ -92,6 +92,89 @@ mod tests {
         assert!(out.contains("REDACTED"));
     }
 
+    /// Ordinary words that contain a token prefix (`task-`, `risk-`) are
+    /// stored as written.
+    #[test]
+    fn scrub_channel_message_keeps_words_that_contain_a_token_prefix() {
+        let msg = "the risk-assessment task-force plan";
+        assert_eq!(scrub_channel_message(msg), msg);
+    }
+
+    /// An unquoted base64 value is taken whole, `/`, `+` and `=` included, and
+    /// a second pass leaves the stored text as it is.
+    #[test]
+    fn scrub_channel_message_takes_a_whole_unquoted_base64_value() {
+        let once = scrub_channel_message("password=abcdEFGH/ijklMNOP+qrst== ok");
+        assert_eq!(once, "password=abcd*[REDACTED] ok");
+        assert_eq!(scrub_channel_message(&once), once);
+    }
+
+    /// The token-prefix pass runs first and leaves `[REDACTED]` as the value;
+    /// the `key=value` pass must not split that marker into a second redaction.
+    #[test]
+    fn scrub_channel_message_redacts_a_prefixed_key_once() {
+        let once = scrub_channel_message("OPENAI_API_KEY=sk-abcdef1234567890XYZ");
+        assert_eq!(once, "OPENAI_API_KEY=[REDACTED]");
+        assert_eq!(scrub_channel_message(&once), once);
+
+        let once = scrub_channel_message("token: ghp_abcdefghij0123456789XYZ");
+        assert_eq!(once, "token: [REDACTED]");
+        assert_eq!(scrub_channel_message(&once), once);
+    }
+
+    /// A marker left by the first pass at the start of a longer unquoted value
+    /// is part of that value: the whole value goes, and the four kept
+    /// characters can fall inside the marker.
+    #[test]
+    fn scrub_channel_message_takes_the_whole_value_that_starts_with_a_marker() {
+        let once = scrub_channel_message("OPENAI_API_KEY=sk-abcdef1234567890XYZ/more+stuff");
+        assert_eq!(once, "OPENAI_API_KEY=[RED*[REDACTED]");
+        assert!(
+            !once.contains("more") && !once.contains("stuff"),
+            "got: {once}"
+        );
+        assert_eq!(scrub_channel_message(&once), once);
+    }
+
+    /// Known limit: a tail of fewer than seven characters after a prefixed key
+    /// leaves the value under eight units (the marker counts as one), so the
+    /// marker and the tail are stored as they are.
+    #[test]
+    fn scrub_channel_message_keeps_a_short_tail_after_a_prefixed_key() {
+        let once = scrub_channel_message("password=ghp_abcdefghij0123456789XYZ/abc12");
+        assert_eq!(once, "password=[REDACTED]/abc12");
+        assert_eq!(scrub_channel_message(&once), once);
+    }
+
+    /// A marker in the middle of an unquoted value does not end the value.
+    #[test]
+    fn scrub_channel_message_takes_the_whole_value_with_a_marker_in_the_middle() {
+        let once = scrub_channel_message("password=ab[REDACTED]cdefgh");
+        assert_eq!(once, "password=ab[R*[REDACTED]");
+        assert!(!once.contains("cdefgh"), "got: {once}");
+        assert_eq!(scrub_channel_message(&once), once);
+    }
+
+    /// A quoted key goes through both passes: the first leaves a marker inside
+    /// the quotes, the second keeps four characters of it. The result is
+    /// stable and holds no part of the key.
+    #[test]
+    fn scrub_channel_message_stores_a_quoted_prefixed_key_stably() {
+        let once = scrub_channel_message(r#"api_key: "sk-abcdefghij0123456789XYZ""#);
+        assert_eq!(once, r#""api_key": "[RED*[REDACTED]""#);
+        assert!(!once.contains("abcdefghij"), "got: {once}");
+        assert_eq!(scrub_channel_message(&once), once);
+    }
+
+    /// A key behind a slash after `=` is still taken, and the result is stable.
+    #[test]
+    fn scrub_channel_message_redacts_a_key_after_a_slash_in_a_value() {
+        let once = scrub_channel_message("password=/sk-abcdefghij0123456789XYZ");
+        assert!(!once.contains("abcdefghij0123456789XYZ"), "got: {once}");
+        assert_eq!(once, "password=/[REDACTED]");
+        assert_eq!(scrub_channel_message(&once), once);
+    }
+
     /// Idempotent: scrubbing twice produces the same string.
     #[test]
     fn scrub_channel_message_is_idempotent() {

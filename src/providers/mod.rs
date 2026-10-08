@@ -766,10 +766,23 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
+/// Fewest token characters that must follow a prefix before it is redacted.
+///
+/// The existing tests pin 5-character bodies (`xoxb-12345`), so a higher floor
+/// would weaken them. Real keys are 20 characters or longer, so 5 only
+/// excludes prose such as `sk-1` or `sk-a`.
+const MIN_SECRET_BODY_CHARS: usize = 5;
+
 /// Scrub known secret-like token prefixes from provider error strings.
 ///
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
 /// `ghu_`, and `github_pat_`.
+///
+/// A prefix counts only at the start of the text or when the character before
+/// it is not an ASCII alphanumeric, `_` or `-`, so the `sk-` in `task-force`
+/// stays. Accepted trade-off: a key glued to a word character, `_` or `-`
+/// directly in front of its prefix (`key_sk-...`, `GITHUB_TOKEN_ghp_...`) is
+/// not redacted by this function.
 pub fn scrub_secret_patterns(input: &str) -> String {
     const PREFIXES: [&str; 7] = [
         "sk-",
@@ -788,10 +801,23 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         while let Some(rel) = scrubbed[search_from..].find(prefix) {
             let start = search_from + rel;
             let content_start = start + prefix.len();
+
+            // Compare the preceding char, not a byte, so multibyte text is
+            // safe. The prefix is ASCII, so `content_start` is a char boundary.
+            let glued_to_word = scrubbed[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+            if glued_to_word {
+                search_from = content_start;
+                continue;
+            }
+
             let end = token_end(&scrubbed, content_start);
 
-            // Bare prefixes like "sk-" should not stop future scans.
-            if end == content_start {
+            // Bare prefixes like "sk-" and short bodies like "sk-1" should not
+            // stop future scans.
+            if scrubbed[content_start..end].chars().count() < MIN_SECRET_BODY_CHARS {
                 search_from = content_start;
                 continue;
             }
@@ -3094,5 +3120,74 @@ mod tests {
         let input = "failed: github_pat_11AABBC_xyzzy789";
         let result = scrub_secret_patterns(input);
         assert_eq!(result, "failed: [REDACTED]");
+    }
+
+    #[test]
+    fn scrub_leaves_ordinary_words_that_contain_a_prefix_unchanged() {
+        // Collect every changed text so one failure does not hide the others.
+        let changed: Vec<String> = [
+            "task-force",
+            "risk-free analysis",
+            "disk-full",
+            "a mask-like shape",
+            "risk-assessment",
+            "disk-usage report",
+            "mask-wearing rules",
+            "desk-lamp-bright",
+        ]
+        .iter()
+        .filter(|text| scrub_secret_patterns(text) != **text)
+        .map(|text| format!("{text} -> {}", scrub_secret_patterns(text)))
+        .collect();
+        assert!(changed.is_empty(), "must stay whole: {changed:?}");
+    }
+
+    #[test]
+    fn scrub_redacts_a_real_shaped_key_after_every_kind_of_boundary() {
+        let keys = [
+            "sk-abcdefghij0123456789XYZ",
+            "ghp_abcdefghij0123456789XYZ",
+            "xoxb-abcdefghij0123456789XYZ",
+        ];
+        for key in keys {
+            for before in [" ", "\"", "=", ":", "(", "'", "\n"] {
+                let input = format!("failed{before}{key} done");
+                let out = scrub_secret_patterns(&input);
+                assert!(
+                    !out.contains("abcdefghij0123456789XYZ"),
+                    "key after {before:?} must be redacted: {out}"
+                );
+                assert!(out.contains("[REDACTED]"), "got: {out}");
+            }
+            let at_start = scrub_secret_patterns(key);
+            assert_eq!(at_start, "[REDACTED]", "key at the start of the text");
+        }
+    }
+
+    #[test]
+    fn scrub_leaves_a_prefix_with_a_body_shorter_than_five_characters_unchanged() {
+        for text in [
+            "see sk-1 here",
+            "see sk-ab here",
+            "a ghp_xyz1 b",
+            "xoxb-1234 x",
+        ] {
+            assert_eq!(scrub_secret_patterns(text), text, "too short: {text}");
+        }
+    }
+
+    #[test]
+    fn scrub_redacts_a_real_key_that_follows_a_mid_word_prefix_hit() {
+        let out = scrub_secret_patterns("a task-force then sk-abcdefghij0123456789XYZ");
+        assert_eq!(out, "a task-force then [REDACTED]");
+    }
+
+    #[test]
+    fn scrub_treats_a_non_ascii_character_before_a_prefix_as_a_boundary() {
+        let out = scrub_secret_patterns(
+            "kunci\u{2192}sk-abcdefghij0123456789XYZ dan \u{00e9}ghp_abcdefghij0123456789XYZ",
+        );
+        assert!(!out.contains("abcdefghij0123456789XYZ"), "got: {out}");
+        assert!(out.starts_with("kunci\u{2192}[REDACTED]"), "got: {out}");
     }
 }
