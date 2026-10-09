@@ -7,8 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The shell, `pty`, `ssh exec`, skill tools and cron jobs refuse a command that names a credential
+  directory (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.kube`, `~/.netrc`,
+  `~/.azure`, `~/.config/gcloud`, or a profile `secrets` directory), at every autonomy
+  level, with no approval prompt that can lift it. The check is best effort: a command
+  reaches a credential directory without naming it through `cd`, a variable other than
+  `HOME`, a glob, command substitution or an interpreter. Operating-system containment is
+  `[runtime].kind`.
+
+### Changed
+
+- Approval presets write two policy files (`autonomy.toml` and `command_allowlist.toml`),
+  not three. An existing `forbidden_paths.toml` is ignored and left where it is. The
+  profile clone no longer copies it. `~/.azure`, `~/.config/gcloud` and the profile
+  `secrets` directories joined the built-in file-tool floor.
+
 ### Fixed
 
+- The `forbidden_paths` default in the config reference now lists the eighteen entries
+  that `AutonomyConfig::default` ships, instead of `[]`.
 - A channel listener task no longer ends when a rejected sender id has a non-ASCII
   character near its start. The WARN line that names the rejected sender now cuts
   the id at four characters, not four bytes, so it no longer panics on a character

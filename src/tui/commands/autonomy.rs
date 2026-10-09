@@ -1,7 +1,7 @@
 //! Slash command for inspecting and switching the approval-policy preset
 //! without leaving the TUI. This path forces the write (regenerates the
-//! policy files wholesale, overwriting hand-edited `command_allowlist.toml`
-//! and `forbidden_paths.toml`); Shift+Tab is the path that preserves hand
+//! policy files wholesale, overwriting hand-edited `command_allowlist.toml`);
+//! Shift+Tab is the path that preserves hand
 //! edits — see `app.rs::cycle_autonomy_preset` for the contrast.
 //!
 //! - `/autonomy` — print the active preset plus the four options.

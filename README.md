@@ -215,11 +215,16 @@ A stale document asserting an active security control is worse than silence, so:
   section is still an unknown top-level key and the trail runs on defaults
   (enabled, 100 MB rotation). Writing it produces an `unknown config key
   \`security\`` warning at load.
-- **`forbidden_paths` covers the file tools only** (`file_read`, `file_write`,
-  `pdf_read`, `image_info`). It does **not** confine the shell: an allowlisted `cat` or
-  `grep` can still read any path. Its always-denied floor cannot be removed and matching
-  is case-folded, but that is the scope. For shell confinement, lower the autonomy level
-  or set `[runtime].kind`.
+- **Credential directories are refused by every tool, at every level.** `~/.ssh`,
+  `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.kube`, `~/.netrc`, `~/.azure`,
+  `~/.config/gcloud` and each profile's `secrets` directory cannot be reached by the file
+  tools, the shell, `pty`, `ssh exec`, skill tools or cron jobs. No approval lifts this refusal, and
+  it is not configurable. `[autonomy].forbidden_paths` and the built-in floor are the only
+  source of path denials; there is no `forbidden_paths.toml`. The shell check is best
+  effort. A command reaches a credential directory without naming it through `cd`, a
+  variable other than `HOME`, a glob, command substitution or an interpreter.
+  Operating-system containment is `[runtime].kind`. The system directories `/etc`,
+  `/proc` and `/tmp` stay open to the shell.
 - **`command_allowlist.toml` globs are advisory.** They are shown to the model, not
   enforced. The runtime gate matches `autonomy.allowed_commands` by **basename**, so
   `git status` there enforces as "any `git`". Editing the file changes what the model is

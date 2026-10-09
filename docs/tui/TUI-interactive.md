@@ -467,7 +467,7 @@ Delete the `CHANNEL_TYPES` const (not used after this).
 1. `Choose` (single-select) — tier. Options: `["L1 — Read only", "L2 — Read + safe writes (default)", "L3 — Full local exec", "L4 — Autonomous (use with care)"]`. Default: cursor on `L2`.
 
 **Config writes:**
-- Write three preset TOML files under `<profile>/policy/`: `autonomy.toml`, `command_allowlist.toml`, `forbidden_paths.toml`.
+- Write two preset TOML files under `<profile>/policy/`: `autonomy.toml`, `command_allowlist.toml`.
 - Source: `crate::approval::policy_writer::write_preset(profile, tier)` — re-use existing helper.
 
 **Validation:** After write, instantiate `crate::approval::ApprovalGate::from_profile(profile)` to verify the files parse cleanly. On parse failure, emit `Failed`.

@@ -78,6 +78,16 @@ An operator can allow the base command via [autonomy].allowed_commands in config
 or remove approval prompts entirely with `rantaiclaw autonomy full` \
 (no prompts — use only in trusted/sandboxed environments).";
 
+/// The error for a blocked command. The lift advice is appended only when the
+/// operator's settings can actually lift the block: a credential-directory
+/// refusal holds at every level, so the advice would be false and is omitted.
+fn blocked_reason_with_remediation(reason: &str) -> String {
+    if reason.starts_with(crate::security::policy::CREDENTIAL_REFUSAL_PREFIX) {
+        return reason.to_string();
+    }
+    format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")
+}
+
 /// Read an async pipe to EOF, appending into `buf` (kept at most `cap` bytes).
 /// Bytes past the cap are still drained (so the child never blocks on a full
 /// pipe) but discarded — a runaway command can't OOM the agent, unlike
@@ -304,6 +314,16 @@ impl Tool for ShellTool {
         // command validates or the user denies. Cap at 6 prompts per
         // call so an adversarial command can't spin forever.
         const MAX_CASCADING_APPROVALS: usize = 6;
+        // A credential-directory refusal is a hard block: no approval is offered
+        // and no lift advice is appended, because nothing in config lifts it.
+        // Checked before the loop so an approver is never asked about it.
+        if let Some(dir) = self.security.command_names_credential_dir(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(crate::security::policy::credential_refusal(&dir)),
+            });
+        }
         let mut iters = 0;
         loop {
             match self
@@ -330,7 +350,7 @@ impl Tool for ShellTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")),
+                            error: Some(blocked_reason_with_remediation(&reason)),
                         });
                     };
                     // The chat this turn came from, when there is one. Empty on
@@ -426,7 +446,7 @@ impl Tool for ShellTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")),
+                            error: Some(blocked_reason_with_remediation(&reason)),
                         });
                     }
                 }
@@ -724,6 +744,12 @@ mod tests {
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
         assert!(error.contains("not allowed") || error.contains("high-risk"));
+        // A non-credential block can be lifted by the operator, so the lift
+        // advice stays.
+        assert!(
+            error.contains("[autonomy].allowed_commands"),
+            "a lifted-by-config block keeps the remediation, got: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1050,6 +1076,126 @@ mod tests {
         assert!(
             !res.success,
             "a block_high_risk command must be hard-blocked, not approvable"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_credential_directory_is_refused_without_a_prompt() {
+        // Supervised, with an allowlist that does not cover `cat`, so the
+        // command would reach the Case 1 basename prompt if the credential
+        // pre-check did not stop it first, and the backend below would
+        // approve it. What the pre-check buys is that no request is raised at
+        // all: without it the run still ends in a refusal, because
+        // `validate_command_execution` carries the same credential check
+        // (`src/security/policy.rs`), so the operator is asked about a command
+        // that no answer can allow. The `watch.try_recv()` assertion below is
+        // what pins that property; the other assertions hold either way.
+        // Pins: the refusal is a hard block (not approvable), it names the
+        // directory, it carries no lift advice, and no request is ever raised.
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_allowed_commands(vec!["echo".into()])
+                .with_workspace_dir(std::env::temp_dir()),
+        );
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let resolver = approvals.clone();
+        let mut rx = approvals.subscribe();
+        let mut watch = approvals.subscribe();
+        tokio::spawn(async move {
+            if let Ok(req) = rx.recv().await {
+                resolver.resolve(req.id, crate::security::Decision::Once);
+            }
+        });
+        let tool = ShellTool::new(security.clone(), test_runtime());
+        let res = tool
+            .execute(json!({"command": "cat ~/.ssh/id_rantaiclaw_fixture"}))
+            .await
+            .expect("command should return a result");
+        assert!(
+            !res.success,
+            "a credential-directory command must be refused, not approvable"
+        );
+        let error = res.error.unwrap_or_default();
+        assert!(
+            error.contains("~/.ssh") || error.contains(".ssh"),
+            "refusal must name the directory, got: {error}"
+        );
+        assert!(
+            error.contains("every level") && error.contains("not configurable"),
+            "refusal must say the rule holds at every level and is not configurable, got: {error}"
+        );
+        // The lift advice is false for a credential refusal: no config setting
+        // or `autonomy full` lifts it, so the advice must not be attached.
+        assert!(
+            !error.contains("[autonomy].allowed_commands") && !error.contains("autonomy full"),
+            "a credential refusal must not carry the lift advice, got: {error}"
+        );
+        assert!(
+            watch.try_recv().is_err(),
+            "a credential-directory refusal must not raise an approval request"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_credential_directory_is_refused_under_full_autonomy() {
+        // Pins only that the refusal holds at Full autonomy, where no allowlist
+        // or risk gate applies. It does NOT pin the no-prompt property: at Full
+        // the approval gate returns early, so the Supervised test above is the
+        // one that proves no request is raised.
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(std::env::temp_dir()),
+        );
+        let tool = ShellTool::new(security.clone(), test_runtime());
+        let res = tool
+            .execute(json!({"command": "cat ~/.ssh/id_rantaiclaw_fixture"}))
+            .await
+            .expect("command should return a result");
+        assert!(
+            !res.success,
+            "a credential-directory command must be refused under Full"
+        );
+        let error = res.error.unwrap_or_default();
+        assert!(
+            error.contains("every level") && error.contains("not configurable"),
+            "refusal must say the rule holds at every level, got: {error}"
+        );
+    }
+
+    #[test]
+    fn blocked_reason_with_remediation_omits_lift_advice_for_credential_refusal() {
+        // Pins the prefix branch of the helper directly. The pre-check in
+        // `execute` returns a credential refusal before the helper sees it, so
+        // only this call exercises the branch.
+        let reason = crate::security::policy::credential_refusal("~/.ssh");
+        let text = blocked_reason_with_remediation(&reason);
+        assert_eq!(
+            text, reason,
+            "a credential refusal must pass through unchanged"
+        );
+        assert!(
+            !text.contains("[autonomy].allowed_commands") && !text.contains("autonomy full"),
+            "a credential refusal must not carry the lift advice, got: {text}"
+        );
+    }
+
+    #[test]
+    fn blocked_reason_with_remediation_appends_lift_advice_for_ordinary_block() {
+        // The other half: an ordinary block (a command off the allowlist) is
+        // lifted by config, so the advice must be attached.
+        let text = blocked_reason_with_remediation("Command not allowed by security policy: curl");
+        assert!(
+            text.starts_with("Command not allowed by security policy: curl"),
+            "the original reason must lead, got: {text}"
+        );
+        assert!(
+            text.contains("[autonomy].allowed_commands") && text.contains("autonomy full"),
+            "an ordinary block must carry the lift advice, got: {text}"
         );
     }
 

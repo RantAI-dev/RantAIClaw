@@ -5,7 +5,7 @@
 //!   1. Choose preset (Manual / Smart / Strict / Off)
 //!   2. Write policy files via `crate::approval::policy_writer::write_policy_files`
 //!
-//! Config writes: `<profile>/policy/autonomy.toml`, `command_allowlist.toml`, `forbidden_paths.toml`
+//! Config writes: `<profile>/policy/autonomy.toml`, `command_allowlist.toml`
 
 use super::traits::{ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner};
 use crate::approval::policy_writer::{self, PolicyPreset};

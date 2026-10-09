@@ -26,9 +26,11 @@ resets on a rolling 1-hour window. For heavier use, an operator can raise \
 /// rejected and how to allow it, instead of dead-ending (as real sessions did
 /// when a file lived outside the workspace).
 pub(crate) const PATH_POLICY_REMEDIATION: &str = "\nFile tools are confined to \
-the workspace directory; [autonomy].workspace_only and [autonomy].forbidden_paths \
-in config.toml control this. Move the file into the workspace, or have an operator \
-relax those settings.";
+the workspace directory, and system and credential directories are always refused. \
+[autonomy].workspace_only and [autonomy].forbidden_paths in config.toml control the \
+workspace rule and any extra directories; no setting lifts a built-in system or \
+credential directory. Move the file into the workspace, or have an operator relax \
+those settings.";
 
 /// The workspace, canonicalised.
 ///
@@ -1118,5 +1120,13 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
+    }
+
+    #[test]
+    fn path_policy_remediation_says_built_in_directories_cannot_be_lifted() {
+        // A floor entry is not relaxable, so the remediation must not promise
+        // that an operator can relax every refusal.
+        assert!(PATH_POLICY_REMEDIATION.contains("credential directories are always refused"));
+        assert!(PATH_POLICY_REMEDIATION.contains("no setting lifts a built-in"));
     }
 }

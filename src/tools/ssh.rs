@@ -291,8 +291,17 @@ impl Tool for SshTool {
             return Ok(fail("missing `action`"));
         };
         // `exec` runs an arbitrary remote command — require a human decision.
+        // A credential-directory name is a hard block, checked before the
+        // approval gate so a refusal never raises a prompt.
+        //
+        // This is a local-policy fence on a string that runs on the REMOTE host.
+        // It sees the path spellings in the command text, the same as the local
+        // shell: it cannot see what the remote host's home directory holds.
         if action == "exec" {
             if let Some(command) = str_field(&args, "command") {
+                if let Some(dir) = self.security.command_names_credential_dir(command) {
+                    return Ok(fail(crate::security::policy::credential_refusal(&dir)));
+                }
                 if let Some(refusal) = self.require_command_approval("ssh exec", command).await {
                     return Ok(refusal);
                 }
@@ -338,6 +347,35 @@ mod tests {
             .unwrap();
         assert!(!res.success, "ssh exec must not run without an approver");
         assert!(res.error.unwrap_or_default().contains("approver"));
+    }
+
+    #[tokio::test]
+    async fn exec_refuses_a_credential_directory_without_a_prompt() {
+        // Full autonomy skips the human-approval gate, so the credential refusal
+        // is the only thing standing between `ssh exec` and a credential path in
+        // the command. The approver below would approve everything; it must
+        // never be asked.
+        let policy = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::Full));
+        let approvals = Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(5),
+        )));
+        policy.set_pending(approvals.clone());
+        let mut rx = approvals.subscribe();
+        let t = SshTool::new(policy);
+        let res = t
+            .execute(json!({
+                "action": "exec",
+                "session": "nope",
+                "command": "cat ~/.ssh/id_rantaiclaw_fixture"
+            }))
+            .await
+            .unwrap();
+        assert!(!res.success, "ssh exec must refuse a credential directory");
+        assert!(res.error.unwrap_or_default().contains(".ssh"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a credential-directory refusal must not raise an approval request"
+        );
     }
 
     #[tokio::test]

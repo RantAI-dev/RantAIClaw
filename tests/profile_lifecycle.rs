@@ -177,8 +177,9 @@ fn create_clone_does_not_copy_command_allowlist() {
         let dst = ProfileManager::create("dst", Some("src"), CloneOpts::default()).unwrap();
         // command_allowlist intentionally not copied (fresh start safer).
         assert!(!dst.policy_dir().join("command_allowlist.toml").exists());
-        // forbidden_paths copied — same defaults still apply.
-        assert!(dst.policy_dir().join("forbidden_paths.toml").exists());
+        // forbidden_paths is not cloned: the credential floor is in code, so
+        // the clone carries no forbidden-paths file.
+        assert!(!dst.policy_dir().join("forbidden_paths.toml").exists());
     });
 }
 

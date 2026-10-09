@@ -1,19 +1,18 @@
 # RantaiClaw approval policy — preset Manual (paranoid)
 #
-# Source bundle for the three policy files written into
+# Source bundle for the two policy files written into
 # `<profile>/policy/` by `crate::approval::policy_writer::write_policy_files`.
 # The keys here mirror the eventual on-disk layout one-for-one:
 #
 #   [autonomy]          → `<profile>/policy/autonomy.toml`
 #   [command_allowlist] → `<profile>/policy/command_allowlist.toml`
-#   [forbidden_paths]   → `<profile>/policy/forbidden_paths.toml`
 #
 # Manual is the most restrictive preset. Every tool call is gated by an
 # interactive prompt. The allowlist starts empty — an `[a]lways` answer
 # is saved to `runtime_allowlist.toml` (the persisted one, separate from
 # this preset's allowlist), so the list here changes only when a preset
-# is applied. The forbidden-paths list covers system + user-secret
-# directories that no agent should ever touch.
+# is applied. System and credential directories are not listed here: the
+# built-in floor in `SecurityPolicy` refuses them under every preset.
 
 [autonomy]
 preset = "manual"
@@ -27,23 +26,3 @@ timeout_secs = 60
 [command_allowlist]
 # Empty — every command requires an interactive prompt.
 patterns = []
-
-[forbidden_paths]
-# Maximum surface: system internals + user-secret dirs.
-patterns = [
-  "/etc/**",
-  "/sys/**",
-  "/proc/**",
-  "/boot/**",
-  "/root/**",
-  "/var/log/**",
-  "~/.ssh/**",
-  "~/.gnupg/**",
-  "~/.aws/**",
-  "~/.azure/**",
-  "~/.config/gcloud/**",
-  "~/.kube/**",
-  "~/.docker/**",
-  "~/.rantaiclaw/secrets/**",
-  "~/.rantaiclaw/profiles/*/secrets/**",
-]

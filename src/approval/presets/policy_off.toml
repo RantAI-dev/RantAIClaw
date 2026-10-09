@@ -23,12 +23,3 @@ timeout_secs = 0
 [command_allowlist]
 # Empty — `mode = "off"` short-circuits the allowlist match step.
 patterns = []
-
-[forbidden_paths]
-# A minimal floor we keep even under Off: the rantaiclaw secrets dir
-# itself. `mode = "off"` does not bypass forbidden-path checks; that
-# fence is non-negotiable per spec §6.1.
-patterns = [
-  "~/.rantaiclaw/secrets/**",
-  "~/.rantaiclaw/profiles/*/secrets/**",
-]

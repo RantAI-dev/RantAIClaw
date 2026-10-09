@@ -1,13 +1,14 @@
-//! Approval policy bootstrap — materialises the three on-disk policy
-//! files (`autonomy.toml`, `command_allowlist.toml`, `forbidden_paths.toml`)
-//! under `<profile>/policy/` from a chosen `PolicyPreset`.
+//! Approval policy bootstrap — materialises the two on-disk policy files
+//! (`autonomy.toml`, `command_allowlist.toml`) under `<profile>/policy/` from
+//! a chosen `PolicyPreset`. The credential and system directories are not in
+//! these files: they are the built-in floor in `SecurityPolicy`.
 //!
 //! Spec: `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
 //! §6 "Approval runtime" + §"Preset bundles".
 //!
 //! The four preset bundles ship as `include_str!` resources under
 //! `presets/`. Each bundle is a single TOML document containing the
-//! sections that fan out to the three output files; `write_policy_files`
+//! sections that fan out to the two output files; `write_policy_files`
 //! parses the bundle and re-emits each section into its destination.
 //!
 //! Idempotence: by default the writer skips any file that already exists
@@ -327,8 +328,8 @@ pub fn preset_for_autonomy(autonomy: &crate::config::AutonomyConfig) -> PolicyPr
 }
 
 /// Update **only** the active-preset marker in `<policy_dir>/autonomy.toml`,
-/// preserving every other field and leaving `command_allowlist.toml` /
-/// `forbidden_paths.toml` untouched. The gateway calls this after an autonomy
+/// preserving every other field and leaving `command_allowlist.toml`
+/// untouched. The gateway calls this after an autonomy
 /// change so the agent's system prompt (which reads the marker via
 /// [`read_active_preset`]) reflects the enforced policy — without rewriting the
 /// allowlist bundle, which the enforcement gate must never have change under it.
@@ -367,8 +368,6 @@ struct PolicyBundle {
     approvals: toml::Table,
     #[serde(default)]
     command_allowlist: SectionPatterns,
-    #[serde(default)]
-    forbidden_paths: SectionPatterns,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -388,7 +387,7 @@ pub const OFF_WARNING: &str = "⚠️  approval policy preset Off selected — g
 Every tool call will execute without prompts. Use this only in trusted CI \
 environments. To revert: `rantaiclaw setup approvals --force`.";
 
-/// Write the three policy files for `preset` into `profile.policy_dir()`.
+/// Write the two policy files for `preset` into `profile.policy_dir()`.
 ///
 /// Returns `Some(OFF_WARNING)` when the `Off` preset is written so the
 /// caller can route the stern warning to the right surface (stderr for
@@ -402,7 +401,9 @@ environments. To revert: `rantaiclaw setup approvals --force`.";
 /// Files written:
 ///   * `autonomy.toml`          — `[autonomy]` + `[approvals]` from bundle
 ///   * `command_allowlist.toml` — patterns array
-///   * `forbidden_paths.toml`   — patterns array
+///
+/// A `forbidden_paths.toml` left on disk by an older release is not written,
+/// read or removed: the gate ignores it, and the built-in floor governs.
 pub fn write_policy_files(
     profile: &Profile,
     preset: PolicyPreset,
@@ -426,14 +427,6 @@ pub fn write_policy_files(
         ALLOWLIST_HEADER,
         force,
     )?;
-    let wrote_forbidden = write_patterns(
-        &dir.join("forbidden_paths.toml"),
-        "forbidden_paths",
-        &bundle.forbidden_paths.patterns,
-        FORBIDDEN_HEADER,
-        force,
-    )?;
-
     let warning = if matches!(preset, PolicyPreset::Off) {
         Some(OFF_WARNING)
     } else {
@@ -448,31 +441,23 @@ pub fn write_policy_files(
     // Only verify the files this call actually wrote — when `force=false`
     // and a file already exists on disk we leave the user's edits alone,
     // and that file is no longer the writer's responsibility to validate.
-    verify_written_policy(&dir, wrote_autonomy, wrote_allowlist, wrote_forbidden).with_context(
-        || {
-            format!(
-                "approval preset {} wrote policy files but they failed parse-back \
+    verify_written_policy(&dir, wrote_autonomy, wrote_allowlist).with_context(|| {
+        format!(
+            "approval preset {} wrote policy files but they failed parse-back \
              — preset bundles or writer drift",
-                preset.id()
-            )
-        },
-    )?;
+            preset.id()
+        )
+    })?;
 
     Ok(warning)
 }
 
-/// Re-read each of `autonomy.toml`, `command_allowlist.toml`,
-/// `forbidden_paths.toml` and confirm they deserialize into the shapes
-/// the approval gate consumer code expects. Files that this call did
+/// Re-read each of `autonomy.toml` and `command_allowlist.toml` and confirm
+/// they deserialize into the shapes the approval gate consumer code expects. Files that this call did
 /// NOT freshly write (the `force=false` no-op path with pre-existing
 /// content) are skipped — the user's edits are not the writer's
 /// concern.
-fn verify_written_policy(
-    dir: &Path,
-    check_autonomy: bool,
-    check_allowlist: bool,
-    check_forbidden: bool,
-) -> Result<()> {
+fn verify_written_policy(dir: &Path, check_autonomy: bool, check_allowlist: bool) -> Result<()> {
     if check_autonomy {
         let autonomy = dir.join("autonomy.toml");
         let raw = fs::read_to_string(&autonomy)
@@ -487,14 +472,11 @@ fn verify_written_policy(
         }
     }
 
-    let pattern_files: &[(bool, &str, &str)] = &[
-        (
-            check_allowlist,
-            "command_allowlist.toml",
-            "command_allowlist",
-        ),
-        (check_forbidden, "forbidden_paths.toml", "forbidden_paths"),
-    ];
+    let pattern_files: &[(bool, &str, &str)] = &[(
+        check_allowlist,
+        "command_allowlist.toml",
+        "command_allowlist",
+    )];
     for &(should_check, name, key) in pattern_files {
         if !should_check {
             continue;
@@ -548,12 +530,6 @@ const ALLOWLIST_HEADER: &str = "\
 # when a preset is applied. Applying a preset with `rantaiclaw
 # autonomy`, `/autonomy`, or `setup approvals --force` regenerates this
 # file and drops any comments or entries you added.
-";
-
-const FORBIDDEN_HEADER: &str = "\
-# Forbidden paths — never-allow globs checked first by the approval
-# gate. No allowlist entry, /yolo toggle, or `Off` setting can override
-# these paths (spec §6.1).
 ";
 
 /// Returns `Ok(true)` if the file was freshly written, `Ok(false)` if the
@@ -640,6 +616,57 @@ mod tests {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().contains(".tmp-"));
         assert!(!leaked, "atomic_write leaked a temp file");
+    }
+
+    fn profile_in(root: &Path) -> Profile {
+        Profile {
+            name: "rantaiclaw_profile".into(),
+            root: root.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn write_policy_files_writes_two_files_and_no_forbidden_paths_file() {
+        // The credential floor lives in code now, so a preset writes two policy
+        // files. A third `forbidden_paths.toml` would promise an enforcement the
+        // gate no longer reads.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = profile_in(tmp.path());
+        write_policy_files(&profile, PolicyPreset::Manual, true).expect("writer succeeds");
+        let dir = profile.policy_dir();
+        assert!(dir.join("autonomy.toml").exists());
+        assert!(dir.join("command_allowlist.toml").exists());
+        assert!(
+            !dir.join("forbidden_paths.toml").exists(),
+            "a preset must not write forbidden_paths.toml"
+        );
+    }
+
+    #[test]
+    fn verify_written_policy_ignores_a_stale_forbidden_paths_file() {
+        // A `forbidden_paths.toml` from an older release is not read: the validator
+        // passes with it present and with it absent, and a malformed one is ignored.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("autonomy.toml"),
+            "[autonomy]\npreset = \"smart\"\n[approvals]\nmode = \"manual\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("command_allowlist.toml"),
+            "[command_allowlist]\npatterns = []\n",
+        )
+        .unwrap();
+        verify_written_policy(tmp.path(), true, true)
+            .expect("validator passes without a forbidden_paths.toml");
+
+        std::fs::write(
+            tmp.path().join("forbidden_paths.toml"),
+            "this is { not toml = ",
+        )
+        .unwrap();
+        verify_written_policy(tmp.path(), true, true)
+            .expect("validator ignores a stale forbidden_paths.toml, even a malformed one");
     }
 
     #[test]
@@ -984,16 +1011,7 @@ mod tests {
                 true,
             )
             .expect("write allowlist");
-            write_patterns(
-                &tmp.path().join("forbidden_paths.toml"),
-                "forbidden_paths",
-                &bundle.forbidden_paths.patterns,
-                FORBIDDEN_HEADER,
-                true,
-            )
-            .expect("write forbidden_paths");
-
-            verify_written_policy(tmp.path(), true, true, true)
+            verify_written_policy(tmp.path(), true, true)
                 .unwrap_or_else(|e| panic!("preset {} round-trip self-check failed: {e}", p.id()));
         }
     }
@@ -1043,12 +1061,7 @@ mod tests {
             "[command_allowlist]\npatterns = []\n",
         )
         .unwrap();
-        std::fs::write(
-            tmp.path().join("forbidden_paths.toml"),
-            "[forbidden_paths]\npatterns = []\n",
-        )
-        .unwrap();
-        let err = verify_written_policy(tmp.path(), true, true, true).unwrap_err();
+        let err = verify_written_policy(tmp.path(), true, true).unwrap_err();
         assert!(
             err.to_string().contains("autonomy"),
             "expected autonomy-related error, got {err}"
@@ -1070,12 +1083,7 @@ mod tests {
             "[command_allowlist]\npatterns = [42]\n",
         )
         .unwrap();
-        std::fs::write(
-            tmp.path().join("forbidden_paths.toml"),
-            "[forbidden_paths]\npatterns = []\n",
-        )
-        .unwrap();
-        let err = verify_written_policy(tmp.path(), true, true, true).unwrap_err();
+        let err = verify_written_policy(tmp.path(), true, true).unwrap_err();
         assert!(
             err.to_string().contains("not a string"),
             "expected pattern type error, got {err}"

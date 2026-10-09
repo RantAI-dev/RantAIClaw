@@ -58,7 +58,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 - `rantaiclaw autonomy` — print the active preset, the enforced autonomy level from `config.toml`, and the four options (warns when the preset marker has drifted from the enforced level)
 - `rantaiclaw autonomy <preset>` — switch to `manual`, `smart`, `strict`, `off`, or `full` (alias for `off`)
 
-Profile-level operation. Writes `<profile>/policy/{autonomy,command_allowlist,forbidden_paths}.toml` from the bundled preset AND mirrors `[autonomy].level`, `[autonomy].always_ask`, and `[autonomy].allowed_commands` into `config.toml` so the runtime gate actually consumes the change. `runtime_allowlist.toml` (from `/allow X --persist`) is preserved across preset switches.
+Profile-level operation. Writes `<profile>/policy/{autonomy,command_allowlist}.toml` from the bundled preset AND mirrors `[autonomy].level`, `[autonomy].always_ask`, and `[autonomy].allowed_commands` into `config.toml` so the runtime gate actually consumes the change. `runtime_allowlist.toml` (from `/allow X --persist`) is preserved across preset switches.
 
 The preset is encoded in `config.toml` as a `level` + `always_ask` pair — the same encoding the web console reads and writes — so a preset switched here is visible in the console (and vice versa) without a restart.
 
