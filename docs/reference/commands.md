@@ -62,12 +62,14 @@ Profile-level operation. Writes `<profile>/policy/{autonomy,command_allowlist}.t
 
 The preset is encoded in `config.toml` as a `level` + `always_ask` pair — the same encoding the web console reads and writes — so a preset switched here is visible in the console (and vice versa) without a restart.
 
-| Preset | `[autonomy].level` | `[autonomy].always_ask` | Behaviour |
-|---|---|---|---|
-| `manual` | `supervised` | every built-in tool | Every shell call prompts. Read-only file/memory tools not gated. |
-| `smart` | `supervised` | empty | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/A/N/Esc]` widget. |
-| `strict` | `readonly` | unchanged | `shell` tool removed from the model's registry entirely, and every acting tool is refused by the autonomy gate. Agent describes commands the user can run, doesn't execute. CC plan-mode analog. |
-| `off` / `full` | `full` | unchanged | No gating. Forbidden paths still enforced. CI / trusted-env only. |
+| Preset | `[autonomy].level` | `[autonomy].always_ask` | `[autonomy].auto_approve` | Behaviour |
+|---|---|---|---|---|
+| `manual` | `supervised` | `["*"]` (every tool) | empty | Every shell call prompts. Read-only file/memory tools not gated. |
+| `smart` | `supervised` | empty | the default list (`file_read`, `memory_recall`) when empty, otherwise unchanged | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/A/N/Esc]` widget. |
+| `strict` | `readonly` | unchanged, minus `"*"` | unchanged | `shell` tool removed from the model's registry entirely, and every acting tool is refused by the autonomy gate. Agent describes commands the user can run, doesn't execute. CC plan-mode analog. |
+| `off` / `full` | `full` | unchanged, minus `"*"` | unchanged | No gating. Forbidden paths still enforced. CI / trusted-env only. |
+
+Each preset sets the fields in its row to that preset's values, whatever the previous preset left behind. `manual` then `smart` gives the same config as `smart` on a fresh config. `"*"` is Manual's mark: only `manual` keeps it, and `strict` and `off` drop it. Named entries an operator wrote (for example `ssh`, `pty`) survive `strict` and `off`. An install already left in the old `full` plus `"*"` state is repaired by running `rantaiclaw autonomy off` again.
 
 Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker · `/autonomy <preset>` skips the picker.
 

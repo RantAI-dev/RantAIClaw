@@ -511,7 +511,7 @@ Web console (`rantaiclaw ui start`) settings.
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `false` | hard block for high-risk commands |
 | `auto_approve` | `["file_read", "memory_recall"]` | tool operations always auto-approved |
-| `always_ask` | `["ssh", "pty"]` | tool operations that always require approval, even after an "Always". Also the Manual-vs-Smart discriminator — `rantaiclaw autonomy <preset>` and the web console both rewrite this field (see [commands](commands.md#autonomy)) |
+| `always_ask` | `["ssh", "pty"]` | tool operations that always require approval, even after an "Always". Also the Manual-vs-Smart discriminator — `rantaiclaw autonomy <preset>` and the web console both rewrite this field (see [commands](commands.md#autonomy)). `"*"` is Manual's mark and only Manual keeps it: `strict` and `off` drop it and keep every named entry, and a console write that sets `level` to `readonly` or `full` without sending `always_ask` drops it the same way |
 
 Notes:
 

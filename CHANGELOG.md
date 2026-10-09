@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rantaiclaw autonomy off` after `rantaiclaw autonomy manual` no longer leaves every tool
+  prompting. Manual's `"*"` wildcard stayed in `always_ask` under `full`, so the gate kept asking
+  for each call (a `glob_search` answered `Denied by user.`) while the CLI reported gating as off.
+  Strict and Off now drop `"*"` and keep named entries, and a console write that sets `level` to
+  `readonly` or `full` without sending `always_ask` does the same. An install already in that state
+  is repaired by running `rantaiclaw autonomy off` again. Smart now refills an empty `auto_approve`
+  with the default list, so `autonomy manual` then `autonomy smart` auto-approves `file_read` and
+  `memory_recall` where it previously prompted for them.
 - The `forbidden_paths` default in the config reference now lists the eighteen entries
   that `AutonomyConfig::default` ships, instead of `[]`.
 - A channel listener task no longer ends when a rejected sender id has a non-ASCII

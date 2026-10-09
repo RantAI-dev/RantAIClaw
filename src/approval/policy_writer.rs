@@ -208,14 +208,27 @@ const BUILTIN_TOOLS: [&str; 7] = [
     "browser",
 ];
 
-/// Apply `preset` to the in-memory `Config`. Updates three fields:
+/// Apply `preset` to the in-memory `Config`. After this call the fields the
+/// preset writes hold that preset's values, whatever they held before:
+///
+/// | Preset | `level`    | `always_ask`                      | `auto_approve`                              |
+/// |--------|------------|-----------------------------------|---------------------------------------------|
+/// | Manual | supervised | `["*"]`                           | empty                                       |
+/// | Smart  | supervised | empty                             | the default list when empty, else unchanged |
+/// | Strict | readonly   | unchanged, minus `"*"`            | unchanged                                   |
+/// | Off    | full       | unchanged, minus `"*"`            | unchanged                                   |
+///
+/// `"*"` is Manual's mark and only Manual leaves it. Strict and Off drop it and
+/// keep every named entry the operator wrote (`ssh`, `pty`).
+///
+/// Updates three fields:
 ///
 /// 1. `config.autonomy.level` — drives `SecurityPolicy.autonomy`
 ///    (Manual/Smart → Supervised, Strict → ReadOnly, Off → Full).
-/// 2. `config.autonomy.always_ask` — the Manual/Smart discriminator. Both
-///    presets are `Supervised`, so the level alone cannot tell them apart:
-///    Manual forces every built-in tool to prompt, Smart forces none. This
-///    is the same encoding the web console writes and reads
+/// 2. `config.autonomy.always_ask` and `auto_approve` — the table above. Manual
+///    and Smart are both `Supervised`, so the level alone cannot tell them
+///    apart: Manual forces every built-in tool to prompt, Smart forces none.
+///    This is the same encoding the web console writes and reads
 ///    (`rungToAutonomyPayload` / `levelToRung`), and [`preset_for_autonomy`]
 ///    is its inverse. Before v0.12 the TUI/CLI left this field untouched, so
 ///    a preset switched in the TUI was invisible in the console — the level
@@ -234,22 +247,32 @@ const BUILTIN_TOOLS: [&str; 7] = [
 pub fn apply_preset_to_config(config: &mut crate::config::Config, preset: PolicyPreset) {
     config.autonomy.level = preset.autonomy_level();
     match preset {
-        // Force EVERY tool to prompt with a `*` wildcard, so the strictest
-        // supervised preset can never drift from the registry (the old list of
-        // named built-ins missed ~40 real tools, and named 3 that don't exist).
-        // Also clear `auto_approve` so no stale entry skips the prompt under the
-        // "Safest" preset. `forces_prompt` treats `*` as "any tool prompts", and
-        // `preset_for_autonomy` reads a non-empty `always_ask` back as Manual.
+        // Table row Manual: force EVERY tool to prompt with the `*` wildcard, so
+        // the strictest supervised preset cannot drift from the registry. Clear
+        // `auto_approve` so no stale entry skips the prompt. `forces_prompt`
+        // reads `*` as "any tool prompts"; `preset_for_autonomy` reads a
+        // non-empty `always_ask` back as Manual.
         PolicyPreset::Manual => {
             config.autonomy.always_ask = vec!["*".to_string()];
             config.autonomy.auto_approve.clear();
         }
-        // Smart means "nothing is forced to prompt"; an empty list is also
-        // what marks it as Smart rather than Manual on the way back out.
-        PolicyPreset::Smart => config.autonomy.always_ask.clear(),
-        // Strict and Off are already unambiguous from `level` alone, so their
-        // always-ask entries are left exactly as the operator configured them.
-        PolicyPreset::Strict | PolicyPreset::Off => {}
+        // Table row Smart: nothing is forced to prompt, so `always_ask` is empty.
+        // An empty `always_ask` is also what marks Smart rather than Manual on the
+        // way back out. An empty `auto_approve` gets the default list, so Smart
+        // after Manual matches Smart on a fresh config.
+        PolicyPreset::Smart => {
+            config.autonomy.always_ask.clear();
+            if config.autonomy.auto_approve.is_empty() {
+                config.autonomy.auto_approve =
+                    crate::config::AutonomyConfig::default().auto_approve;
+            }
+        }
+        // Table rows Strict and Off: `"*"` is Manual's mark and only Manual keeps
+        // it, so drop it. Every named entry the operator wrote stays, and
+        // `auto_approve` is left alone.
+        PolicyPreset::Strict | PolicyPreset::Off => {
+            config.autonomy.always_ask.retain(|t| t != "*");
+        }
     }
     if let Ok(bundle) = toml::from_str::<PolicyBundle>(preset.bundle()) {
         let mut basenames: Vec<String> = bundle
@@ -688,6 +711,140 @@ mod tests {
         }
     }
 
+    /// The invariant: the fields a preset writes hold that preset's
+    /// values, whatever the previous preset left behind. Table-driven over every
+    /// ordered pair, so a preset added to `ALL` is covered without a new test.
+    ///
+    /// The expectation for each second preset is the table, applied to the
+    /// default config as the reference:
+    /// - level: always the second preset's level.
+    /// - Manual: `always_ask = ["*"]`, `auto_approve` empty.
+    /// - Smart: `always_ask` empty; `auto_approve` the default list (the
+    ///   reference) because Smart fills an empty list and keeps a non-empty one.
+    /// - Strict and Off: `always_ask` is the reference minus `"*"`, so the
+    ///   default `["ssh","pty"]` survives. `auto_approve` is unchanged from the
+    ///   first preset, so Manual-then-Strict/Off keeps the empty list Manual wrote.
+    #[test]
+    fn applying_two_presets_in_order_matches_the_second_preset() {
+        use crate::config::Config;
+        for first in PolicyPreset::ALL {
+            for second in PolicyPreset::ALL {
+                let mut sequenced = Config::default();
+                apply_preset_to_config(&mut sequenced, first);
+                apply_preset_to_config(&mut sequenced, second);
+
+                let mut reference = Config::default();
+                apply_preset_to_config(&mut reference, second);
+
+                let label = format!("{} then {}", first.id(), second.id());
+                assert_eq!(
+                    sequenced.autonomy.level, reference.autonomy.level,
+                    "{label}: level"
+                );
+                match second {
+                    PolicyPreset::Manual => {
+                        assert_eq!(
+                            sequenced.autonomy.always_ask,
+                            vec!["*".to_string()],
+                            "{label}"
+                        );
+                        assert!(sequenced.autonomy.auto_approve.is_empty(), "{label}");
+                    }
+                    PolicyPreset::Smart => {
+                        assert!(sequenced.autonomy.always_ask.is_empty(), "{label}");
+                        assert_eq!(
+                            sequenced.autonomy.auto_approve, reference.autonomy.auto_approve,
+                            "{label}: Smart fills an empty auto_approve with the default list"
+                        );
+                    }
+                    PolicyPreset::Strict | PolicyPreset::Off => {
+                        // Strict and Off keep what `always_ask` held after the
+                        // first preset, minus the wildcard. Manual replaces the
+                        // defaults with `["*"]` and Smart clears the list, so the
+                        // expectation is the first preset's own list, not the
+                        // default config's.
+                        let mut after_first = Config::default();
+                        apply_preset_to_config(&mut after_first, first);
+                        let expected_always_ask: Vec<String> = after_first
+                            .autonomy
+                            .always_ask
+                            .into_iter()
+                            .filter(|t| t != "*")
+                            .collect();
+                        assert_eq!(
+                            sequenced.autonomy.always_ask, expected_always_ask,
+                            "{label}: always_ask keeps what was there, minus the wildcard"
+                        );
+                        // Manual cleared `auto_approve`, and Strict/Off leave it
+                        // alone, so the first preset decides what survives. The
+                        // default list comes from the struct default, not from
+                        // `apply_preset_to_config`, so an arm that wrongly clears
+                        // the list cannot also clear the expectation.
+                        let expected = if first == PolicyPreset::Manual {
+                            Vec::new()
+                        } else {
+                            crate::config::AutonomyConfig::default().auto_approve
+                        };
+                        assert_eq!(
+                            sequenced.autonomy.auto_approve,
+                            expected,
+                            "{label}: auto_approve is unchanged by {}",
+                            second.id()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Manual's wildcard must not survive a move to Strict or Off, and the
+    /// named `ssh` entry the operator wrote must. Asserts the gate, not just the
+    /// fields: with `ssh` named, `ssh` prompts under Off and `glob_search` does not.
+    #[test]
+    fn manual_then_off_clears_the_wildcard_so_only_named_tools_prompt() {
+        use crate::approval::ApprovalManager;
+        use crate::config::Config;
+        use crate::security::AutonomyLevel;
+        let mut config = Config::default();
+        apply_preset_to_config(&mut config, PolicyPreset::Manual);
+        config.autonomy.always_ask.push("ssh".to_string());
+        apply_preset_to_config(&mut config, PolicyPreset::Off);
+
+        assert_eq!(config.autonomy.level, AutonomyLevel::Full);
+        assert!(
+            !config.autonomy.always_ask.iter().any(|t| t == "*"),
+            "Off must drop Manual's wildcard, got {:?}",
+            config.autonomy.always_ask
+        );
+        let mgr = ApprovalManager::from_config(&config.autonomy);
+        assert!(
+            !mgr.needs_approval("glob_search"),
+            "after Manual then Off, an unlisted tool must run without a prompt"
+        );
+        assert!(
+            mgr.needs_approval("ssh"),
+            "a named always_ask entry must still prompt under Off"
+        );
+    }
+
+    /// Strict and Off drop only `"*"`. Named entries an operator wrote survive,
+    /// as do the other fields the preset does not own.
+    #[test]
+    fn strict_and_off_keep_named_always_ask_entries() {
+        use crate::config::Config;
+        for preset in [PolicyPreset::Strict, PolicyPreset::Off] {
+            let mut config = Config::default();
+            config.autonomy.always_ask = vec!["*".into(), "ssh".into(), "pty".into()];
+            apply_preset_to_config(&mut config, preset);
+            assert_eq!(
+                config.autonomy.always_ask,
+                vec!["ssh".to_string(), "pty".to_string()],
+                "{}: named entries survive and the wildcard goes",
+                preset.id()
+            );
+        }
+    }
+
     #[test]
     fn preset_round_trips_through_config_encoding() {
         // The TUI/CLI switch autonomy by preset name; the web console reads
@@ -874,6 +1031,17 @@ mod tests {
         assert!(!BUILTIN_TOOLS.contains(&"web_search"));
         assert!(!BUILTIN_TOOLS.contains(&"send_message"));
         assert!(!BUILTIN_TOOLS.contains(&"cron_schedule"));
+    }
+
+    /// Smart fills an empty `auto_approve` only. A list the operator already
+    /// wrote is kept as it is, so Smart never overrides a choice made by hand.
+    #[test]
+    fn smart_keeps_a_non_empty_operator_auto_approve() {
+        use crate::config::Config;
+        let mut config = Config::default();
+        config.autonomy.auto_approve = vec!["shell".to_string()];
+        apply_preset_to_config(&mut config, PolicyPreset::Smart);
+        assert_eq!(config.autonomy.auto_approve, vec!["shell".to_string()]);
     }
 
     #[test]
