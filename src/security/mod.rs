@@ -40,13 +40,13 @@ pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
 
-/// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
+/// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.
+/// Values of four characters or fewer are fully masked.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
 pub fn redact(value: &str) -> String {
-    if value.len() <= 4 {
-        "***".to_string()
-    } else {
-        format!("{}***", &value[..4])
+    match value.char_indices().nth(4) {
+        None => "***".to_string(),
+        Some((cut, _)) => format!("{}***", &value[..cut]),
     }
 }
 
@@ -80,5 +80,16 @@ mod tests {
         assert_eq!(redact("ab"), "***");
         assert_eq!(redact(""), "***");
         assert_eq!(redact("12345"), "1234***");
+    }
+
+    #[test]
+    fn redact_keeps_whole_characters_for_multibyte_input() {
+        assert_eq!(redact("abcéxyz"), "abcé***");
+        assert_eq!(redact("ééabc"), "ééab***");
+    }
+
+    #[test]
+    fn redact_masks_four_character_multibyte_value_entirely() {
+        assert_eq!(redact("日本語字"), "***");
     }
 }
