@@ -629,6 +629,16 @@ fn parse_level(s: &str) -> Option<AutonomyLevel> {
     }
 }
 
+/// Whether a request's `level` moves autonomy to `readonly` or `full`. Only
+/// these two levels drop Manual's `"*"` when `always_ask` is not sent. An
+/// unparseable level is rejected by `set_autonomy`, so it never reaches the rule.
+fn sets_readonly_or_full(level: Option<&str>) -> bool {
+    matches!(
+        level.and_then(parse_level),
+        Some(AutonomyLevel::ReadOnly | AutonomyLevel::Full)
+    )
+}
+
 async fn set_autonomy(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -636,6 +646,7 @@ async fn set_autonomy(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let (_guard, mut cfg) = lock_and_load(&state).await?;
+    let level_is_readonly_or_full = sets_readonly_or_full(body.level.as_deref());
     if let Some(l) = body.level {
         cfg.autonomy.level =
             parse_level(&l).ok_or_else(|| err_400(format!("invalid autonomy level: {l}")))?;
@@ -645,6 +656,14 @@ async fn set_autonomy(
     }
     if let Some(v) = body.always_ask {
         cfg.autonomy.always_ask = validate_tool_entries(v)?;
+    } else if level_is_readonly_or_full {
+        // `"*"` is Manual's mark, and only Manual keeps it. A body that moves the
+        // level to readonly or full without sending `always_ask` leaves the list
+        // unsent, so the wildcard Manual wrote would keep prompting under the new
+        // level. Drop it and keep the named entries. Same rule as
+        // `apply_preset_to_config` for Strict and Off; `preset_for_autonomy` still
+        // reads these levels from `level` alone.
+        cfg.autonomy.always_ask.retain(|t| t != "*");
     }
     if let Some(v) = body.allowed_commands {
         // Validate each entry into a single basename (the shell gate matches by
@@ -3567,6 +3586,81 @@ mod tests {
         config.channels_config.lark =
             Some(lark_config("saved-app", "saved-secret-not-real", false));
         config
+    }
+
+    /// Drive `set_autonomy` with a body and return the autonomy the gateway
+    /// stored. The config is isolated in a temp dir, as the other write tests do.
+    async fn put_autonomy(
+        initial: &crate::config::AutonomyConfig,
+        body: serde_json::Value,
+    ) -> crate::config::AutonomyConfig {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        config.autonomy = initial.clone();
+        let state = console_state(config);
+
+        let body: AutonomyBody = serde_json::from_value(body).expect("autonomy body");
+        let response = Box::pin(set_autonomy(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(body),
+        ))
+        .await
+        .expect("autonomy write must succeed");
+        assert!(
+            response.0.is_object(),
+            "the handler returns the stored autonomy"
+        );
+        let stored = state.config.lock().autonomy.clone();
+        stored
+    }
+
+    /// Setting `level` to `full` without sending `always_ask` drops Manual's
+    /// `"*"` wildcard, so the gate stops prompting for every tool. Named entries
+    /// the operator wrote are kept. Without this rule the console's Off left the
+    /// wildcard in place and the gate kept prompting under Full.
+    #[tokio::test]
+    async fn setting_full_without_always_ask_drops_the_wildcard() {
+        let initial = crate::config::AutonomyConfig {
+            always_ask: vec!["*".into(), "ssh".into()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let stored = put_autonomy(&initial, serde_json::json!({ "level": "full" })).await;
+
+        assert_eq!(stored.level, crate::security::AutonomyLevel::Full);
+        assert_eq!(
+            stored.always_ask,
+            vec!["ssh".to_string()],
+            "the wildcard goes and the named entry stays"
+        );
+    }
+
+    /// A body that sends `always_ask` explicitly is stored as sent, even when it
+    /// names `"*"` under `full`. The route rule only applies when the operator
+    /// said nothing about the list.
+    #[tokio::test]
+    async fn setting_full_with_an_explicit_always_ask_stores_it_as_sent() {
+        let initial = crate::config::AutonomyConfig {
+            always_ask: vec!["*".into()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let stored = put_autonomy(
+            &initial,
+            serde_json::json!({ "level": "full", "always_ask": ["*"] }),
+        )
+        .await;
+
+        assert_eq!(stored.level, crate::security::AutonomyLevel::Full);
+        assert_eq!(
+            stored.always_ask,
+            vec!["*".to_string()],
+            "an explicit always_ask is stored as sent, wildcard included"
+        );
     }
 
     /// The only `connect_lark` path this suite can exercise without a live
