@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A channel listener task no longer ends when a rejected sender id has a non-ASCII
+  character near its start. The WARN line that names the rejected sender now cuts
+  the id at four characters, not four bytes, so it no longer panics on a character
+  split.
+
 ## [0.33.0-alpha] — 2026-10-08
 
 The memory release. The agent saves a note only when someone asks, a guest never
