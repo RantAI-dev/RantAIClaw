@@ -2,8 +2,11 @@ use super::traits::{Tool, ToolResult};
 use crate::skills::SkillTool;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+
+use crate::security::SecurityPolicy;
 
 /// Maximum execution time for a skill tool command.
 const SKILL_TOOL_TIMEOUT_SECS: u64 = 120;
@@ -22,10 +25,14 @@ pub struct SkillToolAdapter {
     tool: SkillTool,
     /// Name of the parent skill (for logging/description).
     skill_name: String,
+    /// Policy every shell skill's command is checked against before it runs.
+    /// A skill's stored command runs without a shell, so the credential
+    /// directory check reads its argv directly.
+    security: Arc<SecurityPolicy>,
 }
 
 impl SkillToolAdapter {
-    pub fn new(skill_name: &str, tool: SkillTool) -> Self {
+    pub fn new(skill_name: &str, tool: SkillTool, security: Arc<SecurityPolicy>) -> Self {
         let safe_skill = skill_name
             .chars()
             .map(|c| {
@@ -52,6 +59,7 @@ impl SkillToolAdapter {
             prefixed_name,
             tool,
             skill_name: skill_name.to_string(),
+            security,
         }
     }
 }
@@ -121,6 +129,20 @@ impl Tool for SkillToolAdapter {
 
 impl SkillToolAdapter {
     async fn execute_shell(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Refuse a command that names a credential directory before anything
+        // runs. The stored command is not passed through a shell, so `~` is
+        // not expanded by the OS: the policy check expands it itself.
+        // The model-supplied `args` is appended to the same argv, so it is checked too.
+        let extra_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
+        let named = format!("{} {}", self.tool.command, extra_args);
+        if let Some(dir) = self.security.command_names_credential_dir(&named) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(crate::security::policy::credential_refusal(&dir)),
+            });
+        }
+
         // Split the stored command into program + args to avoid sh -c injection.
         // The command field is typically "bun run /path/to/script.js" or "python3 /path".
         let parts: Vec<&str> = self.tool.command.split_whitespace().collect();
@@ -141,7 +163,6 @@ impl SkillToolAdapter {
         }
 
         // Append LLM-provided extra args as a single argument (not shell-expanded)
-        let extra_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
         if !extra_args.is_empty() {
             cmd.arg(extra_args);
         }
@@ -260,11 +281,18 @@ impl SkillToolAdapter {
 /// Create callable tool adapters from all loaded skills.
 ///
 /// Returns a `Vec<Box<dyn Tool>>` that can be appended to the main tool registry.
-pub fn skill_tools_from_skills(skills: &[crate::skills::Skill]) -> Vec<Box<dyn Tool>> {
+pub fn skill_tools_from_skills(
+    skills: &[crate::skills::Skill],
+    security: &Arc<SecurityPolicy>,
+) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
-            tools.push(Box::new(SkillToolAdapter::new(&skill.name, tool.clone())));
+            tools.push(Box::new(SkillToolAdapter::new(
+                &skill.name,
+                tool.clone(),
+                Arc::clone(security),
+            )));
         }
     }
     tools
@@ -275,6 +303,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
+
     #[test]
     fn skill_tool_name_prefixed() {
         let st = SkillTool {
@@ -284,7 +316,7 @@ mod tests {
             command: "curl wttr.in".to_string(),
             args: HashMap::new(),
         };
-        let adapter = SkillToolAdapter::new("weather-skill", st);
+        let adapter = SkillToolAdapter::new("weather-skill", st, test_security());
         assert_eq!(adapter.name(), "skill_weather_skill_get_weather");
     }
 
@@ -297,7 +329,7 @@ mod tests {
             command: "echo hi".to_string(),
             args: HashMap::new(),
         };
-        let adapter = SkillToolAdapter::new("test", st);
+        let adapter = SkillToolAdapter::new("test", st, test_security());
         let schema = adapter.parameters_schema();
         assert!(schema.get("properties").unwrap().get("args").is_some());
     }
@@ -311,10 +343,37 @@ mod tests {
             command: "echo hello".to_string(),
             args: HashMap::new(),
         };
-        let adapter = SkillToolAdapter::new("test", st);
+        let adapter = SkillToolAdapter::new("test", st, test_security());
         let result = adapter.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn skill_tool_execute_shell_refuses_a_credential_directory() {
+        // A skill's stored command runs without a shell, so `~` is not expanded
+        // by the OS. The policy check must still see the credential directory
+        // in the argv and refuse before `Command::new` runs anything.
+        let st = SkillTool {
+            name: "peek".to_string(),
+            description: "Read a key".to_string(),
+            kind: "shell".to_string(),
+            command: "cat ~/.ssh/id_rantaiclaw_fixture".to_string(),
+            args: HashMap::new(),
+        };
+        let policy =
+            Arc::new(SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::Full));
+        let adapter = SkillToolAdapter::new("test", st, policy);
+        let result = adapter.execute(json!({})).await.unwrap();
+        assert!(
+            !result.success,
+            "a skill naming a credential directory must be refused"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("credential directory"),
+            "the refusal must come from the policy, not from `cat` failing on a missing file: {error}"
+        );
     }
 
     #[test]
@@ -348,7 +407,7 @@ mod tests {
             remote: false,
             origin: None,
         }];
-        let tools = skill_tools_from_skills(&skills);
+        let tools = skill_tools_from_skills(&skills, &test_security());
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name(), "skill_weather_forecast");
         assert_eq!(tools[1].name(), "skill_weather_current");

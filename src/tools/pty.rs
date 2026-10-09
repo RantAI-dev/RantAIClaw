@@ -396,6 +396,11 @@ impl Tool for PtyTool {
         // already-approved session, so it is not gated per keystroke.
         if action == "start" {
             if let Some(command) = str_field(&args, "command") {
+                // A credential directory is a hard block, checked before the
+                // approval gate so a refusal never raises a prompt.
+                if let Some(dir) = self.security.command_names_credential_dir(command) {
+                    return Ok(fail(crate::security::policy::credential_refusal(&dir)));
+                }
                 if let Some(refusal) = self.require_command_approval("pty start", command).await {
                     return Ok(refusal);
                 }
@@ -439,6 +444,31 @@ mod tests {
             .unwrap();
         assert!(!res.success, "pty start must not run without an approver");
         assert!(res.error.unwrap_or_default().contains("approver"));
+    }
+
+    #[tokio::test]
+    async fn start_refuses_a_credential_directory_without_a_prompt() {
+        // Full autonomy skips the human-approval gate, so the credential refusal
+        // is the only thing standing between `pty start` and `~/.ssh`. The
+        // approver below would approve everything; it must never be asked.
+        let policy =
+            Arc::new(SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::Full));
+        let approvals = Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(5),
+        )));
+        policy.set_pending(approvals.clone());
+        let mut rx = approvals.subscribe();
+        let t = PtyTool::new(policy);
+        let res = t
+            .execute(json!({"action": "start", "command": "cat ~/.ssh/id_rantaiclaw_fixture"}))
+            .await
+            .unwrap();
+        assert!(!res.success, "pty start must refuse a credential directory");
+        assert!(res.error.unwrap_or_default().contains(".ssh"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a credential-directory refusal must not raise an approval request"
+        );
     }
 
     #[test]

@@ -506,7 +506,7 @@ Web console (`rantaiclaw ui start`) settings.
 | `level` | `supervised` | `readonly`, `supervised`, or `full` |
 | `workspace_only` | `true` | restrict writes/command paths to workspace scope |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
-| `forbidden_paths` | `[]` | explicit path denylist |
+| `forbidden_paths` | `["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "/tmp", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]` (eighteen entries) | extra path denylist for the file tools, added to the built-in floor. The floor (system directories and credential directories) cannot be removed. The floor and this key are the only source: there is no `forbidden_paths.toml`. |
 | `max_actions_per_hour` | `200` | per-policy action budget |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `false` | hard block for high-risk commands |
@@ -518,6 +518,7 @@ Notes:
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+- The credential-directory refusal is best effort for commands. A command reaches a credential directory without naming it through `cd`, a variable other than `HOME`, a glob, command substitution or an interpreter. Operating-system containment is `[runtime].kind`.
 
 ## `[memory]`
 

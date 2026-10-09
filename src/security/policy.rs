@@ -214,6 +214,117 @@ impl Default for SecurityPolicy {
     }
 }
 
+// ── Credential directories ────────────────────────────────────────────────
+// One list names the directories no tool may reach. The file tools check a
+// path against `path_floor()`; the command gate checks each argv token against
+// the same directories. The system entries (`/etc`, `/proc`, …) are file-tool
+// only: `cat /etc/os-release` stays a normal command.
+
+/// Credential directories, relative to the home directory. Every tool that
+/// takes a path or a command string refuses a call that names one of these, at
+/// every autonomy level. Not configurable: `[autonomy].forbidden_paths` can add
+/// to the file-tool floor, never remove an entry from this list.
+const CREDENTIAL_DIRECTORIES: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".config/gh",
+    ".kube",
+    ".netrc",
+    ".azure",
+    ".config/gcloud",
+];
+
+/// System directories the file tools always refuse. The shell is not
+/// confined to these: `cat /proc/meminfo` and `cat /etc/os-release` keep working.
+const SYSTEM_DIRECTORIES: &[&str] = &["/etc", "/root", "/boot", "/sys", "/proc"];
+
+/// The file-tool floor: system directories plus credential directories written
+/// as `~/` paths, expanded against `$HOME` at check time.
+fn path_floor() -> Vec<String> {
+    SYSTEM_DIRECTORIES
+        .iter()
+        .map(|d| (*d).to_string())
+        .chain(CREDENTIAL_DIRECTORIES.iter().map(|d| format!("~/{d}")))
+        .collect()
+}
+
+/// The refusal for a command that names a credential directory. Shared by the
+/// shell, `pty`, the skill tool and cron so every surface says the same thing.
+/// It states that the rule holds at every level, so no approval is offered.
+pub fn credential_refusal(dir: &str) -> String {
+    format!(
+        "{CREDENTIAL_REFUSAL_PREFIX}{dir}, which is a credential directory or cannot be \
+         checked safely. Credential directories are refused at every level and are not \
+         configurable."
+    )
+}
+
+/// The start of every credential refusal. Callers that append operator advice
+/// test for it, so the advice is never attached to a hard block.
+pub const CREDENTIAL_REFUSAL_PREFIX: &str = "Command blocked: it names ";
+
+/// Resolve `.` and `..` without touching the filesystem. A `..` pops the last
+/// normal component; it cannot climb above the root.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The credential directory `resolved` names or lies under, rendered for an
+/// error message (`~/.ssh`, or the profile secrets path). `None` when it is
+/// outside every credential directory.
+fn credential_dir_for(resolved: &Path, home: Option<&Path>) -> Option<String> {
+    if let Some(home) = home {
+        for dir in CREDENTIAL_DIRECTORIES {
+            let abs = home.join(dir);
+            if resolved.starts_with(&abs) {
+                return Some(format!("~/{dir}"));
+            }
+        }
+    }
+    if is_under_profile_secrets(resolved) {
+        return Some("a profile secrets directory".to_string());
+    }
+    None
+}
+
+/// The user name in a `~user` or `~user/...` word, if the word is one. A bare
+/// `~` (the own home) and `~/...` are not `~user` forms and return `None`.
+fn tilde_user_name(word: &str) -> Option<&str> {
+    let after = word.strip_prefix('~')?;
+    if after.is_empty() || after.starts_with('/') {
+        return None;
+    }
+    let name = after.split('/').next().unwrap_or(after);
+    Some(name)
+}
+
+/// Whether `path` lies under a profile `secrets` directory: `<data root>/secrets`
+/// (the legacy root) or `<data root>/profiles/<any>/secrets`. Matches whole
+/// path components, so `secrets_extra` does not match.
+fn is_under_profile_secrets(path: &Path) -> bool {
+    let root = crate::profile::paths::rantaiclaw_root();
+    let Ok(rel) = path.strip_prefix(&root) else {
+        return false;
+    };
+    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    match parts.as_slice() {
+        [first, ..] if *first == "secrets" => true,
+        [first, _name, third, ..] if *first == "profiles" && *third == "secrets" => true,
+        _ => false,
+    }
+}
+
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
 // These helpers implement a minimal quote-aware shell lexer. They exist
 // because security validation must reason about the *structure* of a
@@ -698,12 +809,21 @@ impl SecurityPolicy {
     // This ordering ensures deny-by-default: unknown commands are rejected
     // before any risk or autonomy logic runs.
 
-    /// Validate full command execution policy (allowlist + risk gate).
+    /// Validate full command execution policy (credential-directory refusal,
+    /// allowlist + risk gate).
+    ///
+    /// The credential-directory refusal runs first and is a hard block: it does
+    /// not depend on the allowlist or the autonomy level, so `full` is covered
+    /// and an approval cannot lift it.
     pub fn validate_command_execution(
         &self,
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
+        if let Some(dir) = self.command_names_credential_dir(command) {
+            return Err(credential_refusal(&dir));
+        }
+
         if !self.is_command_allowed(command) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -733,6 +853,76 @@ impl SecurityPolicy {
         }
 
         Ok(risk)
+    }
+
+    /// The credential directory a command string names, if any.
+    ///
+    /// A token counts when, after taking the part behind `=` in `--flag=value`,
+    /// expanding a leading `~/`, `$HOME/` or `${HOME}/`, and resolving `.` and
+    /// `..` lexically against the workspace, it is a credential directory or
+    /// lies under one (see [`CREDENTIAL_DIRECTORIES`] and the profile secrets
+    /// rule). Quotes are removed first, as `sh -c` would. This is best effort:
+    /// a path reached through `cd`, another variable, a glob, command
+    /// substitution or an interpreter is not seen here.
+    pub fn command_names_credential_dir(&self, command: &str) -> Option<String> {
+        let home = std::env::var("HOME").ok().map(PathBuf::from);
+        self.credential_dir_in(command, home.as_deref())
+    }
+
+    /// `command_names_credential_dir` with the home directory passed in, so
+    /// tests can pin it without touching the process environment.
+    fn credential_dir_in(&self, command: &str, home: Option<&Path>) -> Option<String> {
+        for segment in split_unquoted_segments(command) {
+            for word in shell_argv(&segment) {
+                // `sh` expands a leading `~user` through the passwd database,
+                // which this check cannot resolve, so refuse the word rather than
+                // guess. Only a leading `~` expands: `--opt=~user/x` does not.
+                if let Some(name) = tilde_user_name(&word) {
+                    return Some(format!("~{name}"));
+                }
+                let value = word.split_once('=').map_or(word.as_str(), |(_, rest)| rest);
+                // With HOME unset a leading `~` still expands (through the passwd
+                // database), so the word cannot be placed. Refuse it instead of
+                // skipping it. Only a leading `~` expands: `--opt=~/x` does not.
+                if home.is_none() && word.starts_with('~') {
+                    return Some("~".to_string());
+                }
+                let Some(resolved) = self.resolve_command_token(value, home) else {
+                    continue;
+                };
+                if let Some(dir) = credential_dir_for(&resolved, home) {
+                    return Some(dir);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve one command token to an absolute path, or `None` if it is not
+    /// a path-like token (a bare word, a URL, a flag).
+    fn resolve_command_token(&self, token: &str, home: Option<&Path>) -> Option<PathBuf> {
+        if token.is_empty() || token.contains("://") {
+            return None;
+        }
+        let expanded: PathBuf = if let Some(rest) = token
+            .strip_prefix("~/")
+            .or_else(|| token.strip_prefix("$HOME/"))
+            .or_else(|| token.strip_prefix("${HOME}/"))
+        {
+            // `sh` collapses repeated separators, so `~//.ssh` is `~/.ssh`.
+            // `Path::join` with an absolute `rest` would drop the home prefix,
+            // so strip the leading separators first.
+            home?.join(rest.trim_start_matches('/'))
+        } else if token == "~" || token == "$HOME" || token == "${HOME}" {
+            home?.to_path_buf()
+        } else if Path::new(token).is_absolute() {
+            PathBuf::from(token)
+        } else if token.contains('/') || token.starts_with('.') {
+            self.workspace_dir.join(token)
+        } else {
+            return None;
+        };
+        Some(lexical_normalize(&expanded))
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────
@@ -983,10 +1173,15 @@ impl SecurityPolicy {
     /// Check if a file path is allowed (no path traversal, within workspace).
     ///
     /// SCOPE: this gate is consulted by the FILE tools (file_read/file_write/
-    /// pdf_read/image_info), NOT the shell tool. An allowlisted `cat`/`grep` in
-    /// the shell can still read any path — `forbidden_paths` does not confine
-    /// shell reads. Use a lower autonomy level or `[runtime].kind` for shell
-    /// confinement — that is the only OS-level containment this product has.
+    /// pdf_read/image_info). glob_search, git_operations and screenshot have
+    /// their own path checks and do not call it. The shell, `pty`, the skill
+    /// tool's `execute_shell` and cron shell jobs do not call it for their
+    /// arguments; they run the credential-directory check in
+    /// [`Self::command_names_credential_dir`] instead, which refuses a command
+    /// naming a directory in [`CREDENTIAL_DIRECTORIES`] or a profile secrets
+    /// directory. Shell reads of any other path stay open to the allowlist.
+    /// Use a lower autonomy level or `[runtime].kind` for OS-level containment
+    /// — that is the only containment this product has.
     /// `[security.sandbox]` used to be named here as a roadmap item; the layer
     /// it configured was deleted in plan 305 rather than left as a promise.
     pub fn is_path_allowed(&self, path: &str) -> bool {
@@ -995,19 +1190,7 @@ impl SecurityPolicy {
         // this floor — it can never remove an entry — so an emptied or relaxed
         // `forbidden_paths` (including one set via `PUT /api/v1/config/autonomy`)
         // cannot expose credentials or system files.
-        const FORBIDDEN_PATH_FLOOR: &[&str] = &[
-            "/etc",
-            "/root",
-            "/boot",
-            "/sys",
-            "/proc",
-            "~/.ssh",
-            "~/.aws",
-            "~/.gnupg",
-            "~/.config/gh",
-            "~/.kube",
-            "~/.netrc",
-        ];
+        let floor = path_floor();
 
         // Block null bytes (can truncate paths in C-backed syscalls)
         if path.contains('\0') {
@@ -1067,14 +1250,21 @@ impl SecurityPolicy {
                 expanded_path.starts_with(Path::new(&fe))
             }
         };
-        for forbidden in FORBIDDEN_PATH_FLOOR
+        for forbidden in floor
             .iter()
-            .copied()
+            .map(String::as_str)
             .chain(self.fields().forbidden_paths.iter().map(String::as_str))
         {
             if is_under_forbidden(forbidden) {
                 return false;
             }
+        }
+
+        // Profile secrets directories have no fixed location: each profile has
+        // its own `secrets` under the data root. Match them by path component,
+        // not by prefix, so `secrets_extra` is not a secrets directory.
+        if is_under_profile_secrets(expanded_path) {
+            return false;
         }
 
         true
@@ -2607,6 +2797,199 @@ mod tests {
             !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
             "URL-encoded parent dir traversal must be blocked"
         );
+    }
+
+    // ── Credential directories: one list, every tool ─────────
+
+    #[test]
+    fn credential_floor_file_tools_refuse_azure_gcloud_and_profile_secrets() {
+        let home = std::env::var("HOME").expect("HOME is set in tests");
+        let p = SecurityPolicy::default().with_workspace_only(false);
+        assert!(!p.is_path_allowed(&format!("{home}/.azure/accessTokens.json")));
+        assert!(!p.is_path_allowed(&format!("{home}/.config/gcloud/credentials.db")));
+        let secret = crate::profile::paths::rantaiclaw_root()
+            .join("profiles/rantaiclaw_user/secrets/key.bin");
+        assert!(!p.is_path_allowed(&secret.to_string_lossy()));
+        let legacy = crate::profile::paths::rantaiclaw_root().join("secrets/key.bin");
+        assert!(!p.is_path_allowed(&legacy.to_string_lossy()));
+    }
+
+    #[test]
+    fn credential_floor_file_tools_refuse_every_credential_directory() {
+        // The required list is written out here, not read from CREDENTIAL_DIRECTORIES,
+        // so deleting any entry from the constant fails this test for the file tools.
+        let home = std::env::var("HOME").expect("HOME is set in tests");
+        let p = SecurityPolicy::default()
+            .with_forbidden_paths(vec![])
+            .with_workspace_only(false);
+        for dir in [
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".config/gh",
+            ".kube",
+            ".netrc",
+            ".azure",
+            ".config/gcloud",
+        ] {
+            let path = format!("{home}/{dir}/x");
+            assert!(!p.is_path_allowed(&path), "file tools must refuse {path}");
+        }
+    }
+
+    #[test]
+    fn credential_floor_holds_with_empty_config_forbidden_paths() {
+        let home = std::env::var("HOME").expect("HOME is set in tests");
+        let p = SecurityPolicy::default()
+            .with_forbidden_paths(vec![])
+            .with_workspace_only(false);
+        assert!(
+            !p.is_path_allowed(&format!("{home}/.azure/x")),
+            "floor ~/.azure"
+        );
+        assert!(
+            !p.is_path_allowed(&format!("{home}/.config/gcloud/x")),
+            "floor gcloud"
+        );
+    }
+
+    #[test]
+    fn credential_floor_is_component_matched_not_a_prefix_of_a_sibling() {
+        // `secrets_extra` is a different directory from `secrets`: the profile
+        // rule matches whole components, never a string prefix. The config list
+        // is emptied so only the floor is under test: the default config list
+        // forbids `/home`, which would refuse every path under a home directory.
+        let home = std::env::var("HOME").expect("HOME is set in tests");
+        let p = SecurityPolicy::default()
+            .with_forbidden_paths(vec![])
+            .with_workspace_only(false);
+        let sibling = crate::profile::paths::rantaiclaw_root()
+            .join("profiles/rantaiclaw_user/secrets_extra/x");
+        assert!(p.is_path_allowed(&sibling.to_string_lossy()));
+        // `~/.azure2` is not `~/.azure`.
+        assert!(p.is_path_allowed(&format!("{home}/.azure2/x")));
+    }
+
+    #[test]
+    fn command_under_full_refuses_credential_directories() {
+        let home = std::env::var("HOME").expect("HOME is set in tests");
+        let p = full_policy();
+        for cmd in [
+            "cat ~/.ssh/id_x".to_string(),
+            "cat $HOME/.aws/credentials".to_string(),
+            format!("cat {home}/.gnupg/x"),
+            "kubectl --kubeconfig=~/.kube/config get pods".to_string(),
+            "ls ~/.config/gcloud".to_string(),
+            "echo ok && cat ~/.netrc".to_string(),
+            "cat ~/.azure/accessTokens.json".to_string(),
+            format!(
+                "cat {}/profiles/rantaiclaw_user/secrets/key.bin",
+                crate::profile::paths::rantaiclaw_root().display()
+            ),
+        ] {
+            assert!(
+                p.validate_command_execution(&cmd, false).is_err(),
+                "Full must refuse a credential directory: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_under_full_refuses_repeated_separator_and_trailing_slash_spellings() {
+        // `sh` collapses `//`, so `~//.ssh/id_x` reads `~/.ssh/id_x`. The token
+        // must resolve to the same directory, not to the absolute `/.ssh/id_x`.
+        let p = full_policy();
+        for cmd in [
+            "cat ~//.ssh/id_x",
+            "cat $HOME//.aws/credentials",
+            "cat ${HOME}//.kube/config",
+            "cat ~/.ssh/",
+        ] {
+            assert!(
+                p.validate_command_execution(cmd, false).is_err(),
+                "Full must refuse a credential directory spelled {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_names_refuse_double_slash_spellings_with_a_fixed_home() {
+        // Direct, with a fixed home: no process environment is changed.
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("cat ~//.ssh/id_x", Some(home))
+            .is_some());
+        assert!(p
+            .credential_dir_in("cat $HOME//.aws/credentials", Some(home))
+            .is_some());
+        assert!(p
+            .credential_dir_in("cat ${HOME}//.kube/config", Some(home))
+            .is_some());
+        assert!(p.credential_dir_in("cat ~/.ssh/", Some(home)).is_some());
+    }
+
+    #[test]
+    fn command_names_refuse_tilde_user_home_forms() {
+        // `sh` expands `~user` to that user's home, which this check cannot
+        // resolve. Refuse it rather than resolve it as a workspace-relative path.
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("cat ~rantaiclaw_user/.ssh/id", Some(home))
+            .is_some());
+        assert!(p.credential_dir_in("ls ~root", Some(home)).is_some());
+        // `~` with no name is the own home, not a `~user` reference.
+        assert!(p.credential_dir_in("ls ~", Some(home)).is_none());
+        // A `~` that is not at the start of a word after `=` (e.g. a git format
+        // string) is not a home reference.
+        assert!(p
+            .credential_dir_in("git log --format=~%h", Some(home))
+            .is_none());
+    }
+
+    #[test]
+    fn command_names_refuse_home_forms_when_home_is_unset() {
+        // With HOME unset the shell still expands `~` through the passwd
+        // database, so these forms are refused instead of skipped. `$HOME`
+        // with HOME unset expands to an empty string, not a credential path.
+        let p = SecurityPolicy::default();
+        assert!(p.credential_dir_in("cat ~/notes.md", None).is_some());
+        assert!(p.credential_dir_in("ls ~", None).is_some());
+        assert!(p.credential_dir_in("cat ~/.ssh/id", None).is_some());
+        // A path that names no home reference is still resolved as before.
+        assert!(p.credential_dir_in("cat notes/ssh.md", None).is_none());
+    }
+
+    #[test]
+    fn command_under_full_allows_system_and_home_listing() {
+        let p = full_policy();
+        for cmd in [
+            "cat /etc/os-release",
+            "cat /proc/meminfo",
+            "ls ~",
+            "cat notes/ssh.md",
+            "git push",
+            "ssh-keygen -t ed25519",
+        ] {
+            assert!(
+                p.validate_command_execution(cmd, false).is_ok(),
+                "Full must still allow: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_command_is_refused_even_when_an_approver_says_yes() {
+        let p = SecurityPolicy::default().with_autonomy(AutonomyLevel::Supervised);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        p.set_pending(approvals.clone());
+        // A hard block is never routed to approval, so `approved=true` cannot lift it.
+        assert!(p
+            .validate_command_execution("cat ~/.ssh/id_x", true)
+            .is_err());
     }
 
     // ── runtime allowlist ───────────────────────────────────

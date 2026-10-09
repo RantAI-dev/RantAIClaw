@@ -198,8 +198,8 @@ impl ProfileManager {
         Ok(names)
     }
 
-    /// Create a new profile, optionally cloning persona/skills/forbidden-paths
-    /// from a source profile. See spec §"Profile clone semantics".
+    /// Create a new profile, optionally cloning persona/skills from a source
+    /// profile. See spec §"Profile clone semantics".
     pub fn create(name: &str, clone_from: Option<&str>, opts: CloneOpts) -> Result<Profile> {
         validate_profile_name(name)?;
         let dst_dir = paths::profile_dir(name);
@@ -298,15 +298,8 @@ fn clone_into(src: &Profile, dst: &Profile, opts: CloneOpts) -> Result<()> {
     // Directories cloned by default.
     copy_dir_all(&src.persona_dir(), &dst.persona_dir())?;
 
-    // policy/forbidden_paths.toml — yes; command_allowlist.toml — fresh start (skip).
-    let forbidden_src = src.policy_dir().join("forbidden_paths.toml");
-    if forbidden_src.exists() {
-        let forbidden_dst = dst.policy_dir().join("forbidden_paths.toml");
-        if let Some(parent) = forbidden_dst.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&forbidden_src, &forbidden_dst)?;
-    }
+    // policy/ — not cloned: the clone starts with a fresh policy, and the
+    // credential floor is in code, so there is no forbidden-paths file to carry.
 
     copy_dir_all(&src.skills_dir(), &dst.skills_dir())?;
 

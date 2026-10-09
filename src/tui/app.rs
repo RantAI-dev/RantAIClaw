@@ -599,19 +599,19 @@ impl TuiApp {
     /// Advance the approval-policy preset for the active profile by one
     /// step (`Manual → Smart → Strict → Manual`, **skipping `Off`**) and
     /// persist it to
-    /// `<policy_dir>/{autonomy,command_allowlist,forbidden_paths}.toml`.
+    /// `<policy_dir>/{autonomy,command_allowlist}.toml`.
     ///
     /// Wired to `KeyCode::BackTab` (Shift+Tab). The `/autonomy` slash
     /// command goes through the same writer but with `force = true` (see
     /// `src/tui/commands/autonomy.rs`), so it regenerates the policy
-    /// files and overwrites hand-edited `command_allowlist.toml` /
-    /// `forbidden_paths.toml`; only Shift+Tab preserves user edits.
+    /// files and overwrites hand-edited `command_allowlist.toml`; only
+    /// Shift+Tab preserves user edits.
     ///
     /// Two writes, and both are needed:
     ///
     /// - `write_policy_files(.., force = false)` creates the bundle on a fresh
     ///   profile and otherwise **preserves** hand-edited
-    ///   `command_allowlist.toml` / `forbidden_paths.toml` — a keybinding is one
+    ///   `command_allowlist.toml` — a keybinding is one
     ///   keypress with no confirmation, so it must not clobber them.
     /// - `write_active_preset` then moves the active-preset marker, which lives
     ///   inside `autonomy.toml` and is therefore left untouched by the
@@ -649,8 +649,8 @@ impl TuiApp {
         // step, while `config.toml` drifted away from the marker.
         //
         // `write_active_preset` is the narrow write for exactly this — it
-        // updates the marker and leaves `command_allowlist.toml` /
-        // `forbidden_paths.toml` untouched. The gateway already calls it after
+        // updates the marker and leaves `command_allowlist.toml` untouched.
+        // The gateway already calls it after
         // an autonomy change for the same reason.
         if let Err(e) = policy_writer::write_active_preset(&dir, next) {
             let _ = self

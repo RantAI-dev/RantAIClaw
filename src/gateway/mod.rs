@@ -620,7 +620,7 @@ fn build_tools_factory(
         // Skills define [[tools]] blocks in SKILL.toml that become real
         // callable shell/http tools.
         let skills = skills::load_skills_with_config(&config.workspace_dir, config);
-        tools.extend(tools::skill_tools_from_skills(&skills));
+        tools.extend(tools::skill_tools_from_skills(&skills, &security));
         tools
     })
 }

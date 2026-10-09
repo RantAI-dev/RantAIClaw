@@ -239,6 +239,42 @@ mod tests {
     }
 
     #[test]
+    fn run_gives_the_same_result_with_a_stale_forbidden_paths_file_present_or_absent() {
+        // A `forbidden_paths.toml` from an older release is ignored by the gate and
+        // by doctor: the check must read the same result either way.
+        let check = |with_stale: bool| {
+            let tmp = TempDir::new().unwrap();
+            let mut config = Config::default();
+            config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+            config.autonomy.allowed_commands = vec![];
+            stage_allowlist_file(tmp.path(), &AllowlistDiagnosis::Missing);
+            if with_stale {
+                std::fs::write(
+                    tmp.path().join("policy").join("forbidden_paths.toml"),
+                    "[forbidden_paths]\npatterns = [\"~/.ssh/**\"]\n",
+                )
+                .unwrap();
+            }
+            let ctx = DoctorContext {
+                profile: profile_with(&tmp),
+                config,
+                offline: true,
+            };
+            futures::executor::block_on(AllowlistCheck.run(&ctx))
+        };
+        let without = check(false);
+        let with = check(true);
+        assert_eq!(
+            with.severity, without.severity,
+            "severity must not depend on the stale file"
+        );
+        assert_eq!(
+            with.message, without.message,
+            "message must not depend on the stale file"
+        );
+    }
+
+    #[test]
     fn run_warns_when_allowed_commands_empty_under_supervised() {
         let r = run_check(
             crate::security::AutonomyLevel::Supervised,

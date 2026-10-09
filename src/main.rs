@@ -283,9 +283,8 @@ Examples:
     ///
     /// Without `<preset>`, prints the currently-active preset plus the
     /// four options. With `<preset>`, force-writes
-    /// `<profile>/policy/{autonomy,command_allowlist,forbidden_paths}.toml`
-    /// from the bundled preset. Hand-edits to those three files are
-    /// clobbered; `runtime_allowlist.toml` (from `/allow X --persist`)
+    /// `<profile>/policy/{autonomy,command_allowlist}.toml` from the bundled
+    /// preset. Hand-edits to those two files are clobbered; `runtime_allowlist.toml` (from `/allow X --persist`)
     /// is preserved.
     ///
     /// `full` is accepted as an alias for `off` — same destination, just
@@ -299,7 +298,7 @@ Examples:
 Show or switch the approval-policy preset for the active profile.
 
 Without <preset>, prints the currently-active preset plus the four options.
-With <preset>, force-writes the three policy files from the bundled preset.
+With <preset>, force-writes the two policy files from the bundled preset.
 Hand-edits to those files are clobbered; runtime_allowlist.toml is preserved.
 
 Examples:

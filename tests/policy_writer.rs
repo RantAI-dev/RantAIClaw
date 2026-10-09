@@ -3,11 +3,13 @@
 //! Spec: `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
 //! §6 "Approval runtime" + §"Preset bundles" (Manual / Smart / Strict / Off).
 //!
-//! `write_policy_files(profile, preset, force)` materialises three TOML
+//! `write_policy_files(profile, preset, force)` materialises two TOML
 //! files under `<profile>/policy/`:
 //!   * `autonomy.toml`          — mode + preset metadata
 //!   * `command_allowlist.toml` — glob patterns for pre-approved commands
-//!   * `forbidden_paths.toml`   — glob patterns that can never be allowed
+//!
+//! The credential and system directories are not a file: they are the
+//! built-in floor in `SecurityPolicy`.
 //!
 //! Bundles ship as `include_str!` resources in `src/approval/presets/`.
 //!
@@ -46,13 +48,18 @@ fn with_home<F: FnOnce()>(f: F) {
     }
 }
 
+/// A preset writes no `forbidden_paths.toml`: the credential and system
+/// directories are the built-in floor, not a file an operator can edit.
+fn assert_no_forbidden_paths_file(profile: &rantaiclaw::profile::Profile) {
+    assert!(
+        !profile.policy_dir().join("forbidden_paths.toml").exists(),
+        "a preset must not write forbidden_paths.toml"
+    );
+}
+
 fn assert_policy_files_exist(profile: &rantaiclaw::profile::Profile) {
     let dir = profile.policy_dir();
-    for f in [
-        "autonomy.toml",
-        "command_allowlist.toml",
-        "forbidden_paths.toml",
-    ] {
+    for f in ["autonomy.toml", "command_allowlist.toml"] {
         assert!(
             dir.join(f).exists(),
             "expected {} under {}",
@@ -63,7 +70,7 @@ fn assert_policy_files_exist(profile: &rantaiclaw::profile::Profile) {
 }
 
 #[test]
-fn manual_writes_three_files_with_manual_mode_and_empty_allowlist() {
+fn manual_writes_two_policy_files_with_manual_mode_and_empty_allowlist() {
     with_home(|| {
         let profile = ProfileManager::ensure_default().unwrap();
         policy_writer::write_policy_files(&profile, PolicyPreset::Manual, false)
@@ -84,11 +91,7 @@ fn manual_writes_three_files_with_manual_mode_and_empty_allowlist() {
             allowlist
         );
 
-        let forbidden =
-            std::fs::read_to_string(profile.policy_dir().join("forbidden_paths.toml")).unwrap();
-        assert!(forbidden.contains("~/.ssh/**"));
-        assert!(forbidden.contains("/etc/**"));
-        assert!(forbidden.contains("~/.aws/**"));
+        assert_no_forbidden_paths_file(&profile);
     });
 }
 
@@ -112,10 +115,7 @@ fn smart_seeds_safe_read_only_commands() {
             );
         }
 
-        let forbidden =
-            std::fs::read_to_string(profile.policy_dir().join("forbidden_paths.toml")).unwrap();
-        assert!(forbidden.contains("~/.ssh/**"));
-        assert!(forbidden.contains("~/.aws/**"));
+        assert_no_forbidden_paths_file(&profile);
     });
 }
 
@@ -162,10 +162,8 @@ fn off_disables_gating_and_keeps_secret_floor() {
             "Off must set mode=off, got:\n{autonomy}"
         );
 
-        let forbidden =
-            std::fs::read_to_string(profile.policy_dir().join("forbidden_paths.toml")).unwrap();
-        // Even Off keeps the rantaiclaw-secrets fence — non-negotiable.
-        assert!(forbidden.contains("~/.rantaiclaw/secrets/**"));
+        // The Off preset keeps the credential floor in code, not in a file.
+        assert_no_forbidden_paths_file(&profile);
     });
 }
 

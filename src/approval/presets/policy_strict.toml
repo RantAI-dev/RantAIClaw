@@ -60,24 +60,3 @@ patterns = [
   "cron_*",
   "session_*",
 ]
-
-[forbidden_paths]
-# Strictest set: same as Manual + Smart, with read-only system trees added.
-patterns = [
-  "/etc/**",
-  "/sys/**",
-  "/proc/**",
-  "/boot/**",
-  "/root/**",
-  "/var/log/**",
-  "/var/lib/**",
-  "~/.ssh/**",
-  "~/.gnupg/**",
-  "~/.aws/**",
-  "~/.azure/**",
-  "~/.config/gcloud/**",
-  "~/.kube/**",
-  "~/.docker/**",
-  "~/.rantaiclaw/secrets/**",
-  "~/.rantaiclaw/profiles/*/secrets/**",
-]
