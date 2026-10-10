@@ -31,6 +31,10 @@ impl PdfReadTool {
 
 #[async_trait]
 impl Tool for PdfReadTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "pdf_read"
     }

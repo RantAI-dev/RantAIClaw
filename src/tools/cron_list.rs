@@ -17,6 +17,10 @@ impl CronListTool {
 
 #[async_trait]
 impl Tool for CronListTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_list"
     }

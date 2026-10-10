@@ -19,6 +19,10 @@ impl GlobSearchTool {
 
 #[async_trait]
 impl Tool for GlobSearchTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "glob_search"
     }

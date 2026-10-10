@@ -43,6 +43,10 @@ impl SessionSearchTool {
 
 #[async_trait]
 impl Tool for SessionSearchTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         TOOL_NAME
     }

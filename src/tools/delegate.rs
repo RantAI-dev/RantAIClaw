@@ -428,6 +428,7 @@ impl DelegateTool {
                 self.ledger.as_deref(),
                 // Sub-agent: surface name only, no chat sender and no role.
                 &crate::security::AuditActor::surface(),
+                Some(self.security.as_ref()),
             ),
         )
         .await;
@@ -492,6 +493,10 @@ impl Tool for ToolArcRef {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    fn is_read_only_call(&self, args: &serde_json::Value) -> bool {
+        self.inner.is_read_only_call(args)
     }
 }
 
@@ -1264,5 +1269,37 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("provider boom"));
+    }
+
+    /// `ToolArcRef` is how a sub-agent's tool list reaches `run_tool_call_loop`.
+    /// It has to forward the read-only declaration, or a delegated read tool is
+    /// refused under `ReadOnly` for no reason the operator can see.
+    #[test]
+    fn tool_arc_ref_forwards_the_read_only_declaration() {
+        struct ReadProbe;
+        #[async_trait]
+        impl Tool for ReadProbe {
+            fn name(&self) -> &str {
+                "read_probe"
+            }
+            fn description(&self) -> &str {
+                "test tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                })
+            }
+            fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+                true
+            }
+        }
+        let wrapped = ToolArcRef::new(Arc::new(ReadProbe));
+        assert!(wrapped.is_read_only_call(&serde_json::json!({})));
     }
 }

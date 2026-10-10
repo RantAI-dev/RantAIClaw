@@ -21,6 +21,10 @@ impl MemoryRecallTool {
 
 #[async_trait]
 impl Tool for MemoryRecallTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "memory_recall"
     }

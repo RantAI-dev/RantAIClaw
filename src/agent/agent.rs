@@ -1036,6 +1036,7 @@ impl Agent {
             events.cloned(),
             self.ledger.as_deref(),
             &crate::security::AuditActor::surface(),
+            self.security.as_deref(),
         )
         .await;
 

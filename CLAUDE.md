@@ -281,6 +281,7 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Implement `Tool` in `src/tools/` with strict parameter schema.
 - Validate and sanitize all inputs.
 - Return structured `ToolResult`; avoid panics in runtime path.
+- A new built-in tool is refused under `readonly` until it overrides `is_read_only_call` to return true for its read-only calls.
 
 ### 7.5 Security / Runtime / Gateway Changes
 

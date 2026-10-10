@@ -299,6 +299,10 @@ impl Tool for ArcDelegatingTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
+
+    fn is_read_only_call(&self, args: &serde_json::Value) -> bool {
+        self.inner.is_read_only_call(args)
+    }
 }
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
@@ -1128,5 +1132,129 @@ mod tests {
         // that an operator can relax every refusal.
         assert!(PATH_POLICY_REMEDIATION.contains("credential directories are always refused"));
         assert!(PATH_POLICY_REMEDIATION.contains("no setting lifts a built-in"));
+    }
+
+    /// A read-only probe: declares every call read-only so a forwarder that
+    /// drops the declaration is visible.
+    struct ForwardingReadProbe;
+
+    #[async_trait]
+    impl Tool for ForwardingReadProbe {
+        fn name(&self) -> &str {
+            "forwarding_read_probe"
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+        fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+            true
+        }
+    }
+
+    /// The registry wraps every tool in `ArcDelegatingTool`. If that wrapper did
+    /// not forward `is_read_only_call`, a read tool would silently become a
+    /// refused one under `ReadOnly`, so the declaration has to pass through.
+    #[test]
+    fn arc_delegating_tool_forwards_the_read_only_declaration() {
+        let wrapped = boxed_registry_from_arcs(vec![Arc::new(ForwardingReadProbe)]);
+        assert!(wrapped[0].is_read_only_call(&serde_json::json!({})));
+    }
+
+    /// Built-in tools that declare some call read-only. This is the complete
+    /// list, so declaring a new tool read-only is a visible diff here and the
+    /// review has to see it. `git_operations`, `composio` and `pty` declare
+    /// only some calls; the probe below finds them by trying read and write
+    /// arguments.
+    const READ_ONLY_DECLARING_TOOLS: &[&str] = &[
+        "file_read",
+        "glob_search",
+        "memory_recall",
+        "cron_list",
+        "cron_runs",
+        "web_search_tool",
+        "pdf_read",
+        "image_info",
+        "session_search",
+        "get_task",
+        "list_tasks",
+        "read_comments",
+        "skills_list",
+        "skill_view",
+        "skills_search",
+        "git_operations",
+        "composio",
+        "pty",
+        "proxy_config",
+    ];
+
+    /// The pinned list: a built-in tool counts as read-only-declaring when some
+    /// probe call returns true for it. The probes cover the argument shapes the
+    /// read-only overrides branch on (`operation`, `action`) plus an empty
+    /// object, so a tool that declares nothing is seen as declaring nothing.
+    #[test]
+    fn built_in_tools_declaring_read_only_calls_match_the_pinned_list() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec!["example.com".into()],
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            Some("test-key"),
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+
+        let probes = [
+            serde_json::json!({}),
+            serde_json::json!({"operation": "status"}),
+            serde_json::json!({"operation": "commit"}),
+            serde_json::json!({"action": "list"}),
+            serde_json::json!({"action": "execute"}),
+            serde_json::json!({"action": "screen"}),
+            serde_json::json!({"action": "send"}),
+            serde_json::json!({"action": "get"}),
+            serde_json::json!({"action": "list_services"}),
+        ];
+        let mut declaring: Vec<String> = tools
+            .iter()
+            .filter(|t| probes.iter().any(|a| t.is_read_only_call(a)))
+            .map(|t| t.name().to_string())
+            .collect();
+        declaring.sort();
+        let mut pinned: Vec<&str> = READ_ONLY_DECLARING_TOOLS.to_vec();
+        pinned.sort_unstable();
+        assert_eq!(
+            declaring, pinned,
+            "a built-in tool declares read-only calls: update READ_ONLY_DECLARING_TOOLS on purpose"
+        );
     }
 }

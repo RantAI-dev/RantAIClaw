@@ -320,6 +320,10 @@ fn strip_tags(content: &str) -> String {
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "web_search_tool"
     }

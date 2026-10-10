@@ -32,6 +32,16 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Whether this call only reads state, so it may run under `ReadOnly`.
+    ///
+    /// The default is the refusal: under `ReadOnly` the agent loop does not run
+    /// the call. An override must return true for exactly the calls that are
+    /// read-only, and no others. A tool that cannot tell its read calls apart
+    /// keeps the default.
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        false
+    }
+
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
         ToolSpec {

@@ -558,6 +558,14 @@ impl Tool for ComposioTool {
         "composio"
     }
 
+    /// Only the list actions read; `execute` and `connect` act on the account.
+    fn is_read_only_call(&self, args: &serde_json::Value) -> bool {
+        matches!(
+            args.get("action").and_then(serde_json::Value::as_str),
+            Some("list" | "list_accounts" | "connected_accounts")
+        )
+    }
+
     fn description(&self) -> &str {
         "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). \
          Use action='list' to see available actions, \

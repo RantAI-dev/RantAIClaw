@@ -1424,6 +1424,7 @@ pub(crate) async fn process_channel_message(
                                 None,
                                 ctx.ledger.as_deref(),
                                 &audit_actor,
+                                Some(ctx.security.as_ref()),
                             )
                             .await
                         } else {
@@ -1452,6 +1453,7 @@ pub(crate) async fn process_channel_message(
                                 None,
                                 ctx.ledger.as_deref(),
                                 &audit_actor,
+                                Some(ctx.security.as_ref()),
                             ))
                             .await
                         }

@@ -22,6 +22,10 @@ impl FileReadTool {
 
 #[async_trait]
 impl Tool for FileReadTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "file_read"
     }

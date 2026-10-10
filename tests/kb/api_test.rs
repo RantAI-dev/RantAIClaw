@@ -143,6 +143,7 @@ fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
         memory_search_mode: Arc::new("keyword".to_string()),
 
         tools_factory: Arc::new(|_: &Config| Vec::new()),
+        security: Arc::new(rantaiclaw::security::SecurityPolicy::default()),
         webhook_secret_hash: None,
         pairing: Arc::new(PairingGuard::new(require_pairing, tokens)),
         channel_bus: Arc::new(rantaiclaw::channels::ChannelBus::default()),

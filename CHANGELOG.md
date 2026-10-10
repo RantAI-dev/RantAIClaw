@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches a credential directory without naming it through `cd`, a variable other than
   `HOME`, a glob, command substitution or an interpreter. Operating-system containment is
   `[runtime].kind`.
+- Under `readonly` (the Strict preset), MCP tools and skill tools no longer run. The agent loop
+  refuses every tool call that the tool has not declared read-only, before the tool body starts.
+  The same gate refuses any future tool that does not declare its read calls. Read tools keep
+  running: `file_read`, `glob_search`, `memory_recall`, `cron_list`, `cron_runs`, `web_search_tool`,
+  `pdf_read`, `image_info`, `session_search`, the task reads `get_task`, `list_tasks` and
+  `read_comments`, the skill reads `skills_list`, `skill_view` and `skills_search`,
+  `git_operations` status, diff, log and branch, `proxy_config` `get` and `list_services`, the
+  composio `list`, `list_accounts` and `connected_accounts` actions, and the `pty` `screen`, `wait`
+  and `stop` actions. Under `supervised` and `full` nothing changes.
 
 ### Changed
 
@@ -34,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is repaired by running `rantaiclaw autonomy off` again. Smart now refills an empty `auto_approve`
   with the default list, so `autonomy manual` then `autonomy smart` auto-approves `file_read` and
   `memory_recall` where it previously prompted for them.
+- A tool call refused under `readonly` is written to `audit.log` as refused: `risk_level`
+  `read_only`, `approval` denied, `allowed` false, `success` false. It was written as `executed`
+  with `allowed` true, as if it had run. The `executed` line is now written only after the tool ran.
 - The `forbidden_paths` default in the config reference now lists the eighteen entries
   that `AutonomyConfig::default` ships, instead of `[]`.
 - A channel listener task no longer ends when a rejected sender id has a non-ASCII
