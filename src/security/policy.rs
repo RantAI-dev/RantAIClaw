@@ -309,6 +309,46 @@ fn tilde_user_name(word: &str) -> Option<&str> {
     Some(name)
 }
 
+/// The forms of one command word the credential check runs on: the word as
+/// it is, the residual after each redirect operator run (sh opens every
+/// target in a word, so each one is a form), and the word without leading
+/// grouping characters (`(`, `{`, `!`), which leave a path literal in front
+/// of it. `shell_argv` strips quotes first, so a quoted operator reads the
+/// same as a real one and its target is refused, which is the safe direction.
+fn word_forms(word: &str) -> Vec<&str> {
+    let mut forms = vec![word];
+    forms.extend(redirect_targets(word));
+    let stripped = word.trim_start_matches(['(', '{', '!']);
+    if stripped.len() != word.len() {
+        forms.push(stripped);
+    }
+    forms
+}
+
+/// The residual each redirect operator run in a word leaves behind, in
+/// order. `shell_argv` splits on whitespace only, so `>~/.ssh/x` stays one
+/// word. An operator run is a `<` or `>` and the run of `<>&|` that follows it
+/// (`>>`, `>|`, `<>`, `<<<`, `>&`, `<&`); a leading `&` (`&>`) sits before it.
+/// `>b>~/.ssh/x` yields `b>~/.ssh/x` and `~/.ssh/x`. Quote state is gone by
+/// this point, so `echo ">~/.ssh/x"` is refused like a real redirect.
+fn redirect_targets(word: &str) -> Vec<&str> {
+    let mut targets = Vec::new();
+    let mut rest = word;
+    while let Some(start) = rest.find(['<', '>']) {
+        rest = &rest[start..];
+        let operator_len = rest
+            .find(|c: char| !"<>&|".contains(c))
+            .unwrap_or(rest.len());
+        let target = &rest[operator_len..];
+        if target.is_empty() {
+            break;
+        }
+        targets.push(target);
+        rest = target;
+    }
+    targets
+}
+
 /// Whether `path` lies under a profile `secrets` directory: `<data root>/secrets`
 /// (the legacy root) or `<data root>/profiles/<any>/secrets`. Matches whole
 /// path components, so `secrets_extra` does not match.
@@ -874,28 +914,34 @@ impl SecurityPolicy {
     fn credential_dir_in(&self, command: &str, home: Option<&Path>) -> Option<String> {
         for segment in split_unquoted_segments(command) {
             for word in shell_argv(&segment) {
-                // `sh` expands a leading `~user` through the passwd database,
-                // which this check cannot resolve, so refuse the word rather than
-                // guess. Only a leading `~` expands: `--opt=~user/x` does not.
-                if let Some(name) = tilde_user_name(&word) {
-                    return Some(format!("~{name}"));
-                }
-                let value = word.split_once('=').map_or(word.as_str(), |(_, rest)| rest);
-                // With HOME unset a leading `~` still expands (through the passwd
-                // database), so the word cannot be placed. Refuse it instead of
-                // skipping it. Only a leading `~` expands: `--opt=~/x` does not.
-                if home.is_none() && word.starts_with('~') {
-                    return Some("~".to_string());
-                }
-                let Some(resolved) = self.resolve_command_token(value, home) else {
-                    continue;
-                };
-                if let Some(dir) = credential_dir_for(&resolved, home) {
-                    return Some(dir);
+                for form in word_forms(&word) {
+                    if let Some(dir) = self.word_names_credential_dir(form, home) {
+                        return Some(dir);
+                    }
                 }
             }
         }
         None
+    }
+
+    /// The credential directory one command word names, if any. The per-word
+    /// check behind `credential_dir_in`, which runs it on each form of a word.
+    fn word_names_credential_dir(&self, word: &str, home: Option<&Path>) -> Option<String> {
+        // `sh` expands a leading `~user` through the passwd database,
+        // which this check cannot resolve, so refuse the word rather than
+        // guess. Only a leading `~` expands: `--opt=~user/x` does not.
+        if let Some(name) = tilde_user_name(word) {
+            return Some(format!("~{name}"));
+        }
+        let value = word.split_once('=').map_or(word, |(_, rest)| rest);
+        // With HOME unset a leading `~` still expands (through the passwd
+        // database), so the word cannot be placed. Refuse it instead of
+        // skipping it. Only a leading `~` expands: `--opt=~/x` does not.
+        if home.is_none() && word.starts_with('~') {
+            return Some("~".to_string());
+        }
+        let resolved = self.resolve_command_token(value, home)?;
+        credential_dir_for(&resolved, home)
     }
 
     /// Resolve one command token to an absolute path, or `None` if it is not
@@ -2908,6 +2954,183 @@ mod tests {
             assert!(
                 p.validate_command_execution(cmd, false).is_err(),
                 "Full must refuse a credential directory spelled {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_glued_to_credential_path_is_refused_under_full() {
+        // `shell_argv` keeps `>~/.ssh/x` as one word when no space separates
+        // the operator from its target. Full skips the allowlist, so the
+        // credential check is the only gate that can see these.
+        let p = full_policy();
+        for cmd in [
+            "echo PWNED >~/.ssh/authorized_keys",
+            "echo PWNED 2>~/.ssh/err >>~/.ssh/authorized_keys2",
+            "cat <~/.ssh/id_fake",
+            "cat<~/.ssh/id_fake",
+            "cat 0<~/.ssh/id_fake",
+        ] {
+            assert!(
+                p.validate_command_execution(cmd, false).is_err(),
+                "Full must refuse a redirect into a credential directory: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_clobber_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("echo PWNED >|~/.ssh/authorized_keys", Some(home))
+            .is_some());
+    }
+
+    #[test]
+    fn redirect_read_write_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("cat <>~/.ssh/id_fake", Some(home))
+            .is_some());
+    }
+
+    #[test]
+    fn redirect_both_streams_clobber_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p.credential_dir_in("cmd &>~/.ssh/x", Some(home)).is_some());
+    }
+
+    #[test]
+    fn redirect_both_streams_append_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p.credential_dir_in("cmd &>>~/.ssh/x", Some(home)).is_some());
+    }
+
+    #[test]
+    fn multi_operator_redirect_into_credential_dir_is_refused() {
+        // A word can carry several operators, and sh opens every target. The
+        // credential path after the second or later operator must be seen too.
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        for cmd in [
+            "echo PWNED >b>~/.ssh/authorized_keys",
+            "cmd 2>&1>~/.ssh/x",
+            "echo x >out.txt<~/.ssh/id",
+        ] {
+            assert!(
+                p.credential_dir_in(cmd, Some(home)).is_some(),
+                "a later redirect into a credential directory must be refused: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn here_string_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("cat <<<~/.ssh/id_fake", Some(home))
+            .is_some());
+    }
+
+    #[test]
+    fn fd_numbered_clobber_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("cmd 2>~/.ssh/err", Some(home))
+            .is_some());
+    }
+
+    #[test]
+    fn fd_numbered_append_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("cmd 10>>~/.ssh/x", Some(home))
+            .is_some());
+    }
+
+    #[test]
+    fn fd_numbered_read_write_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("cat 2<>~/.ssh/id_fake", Some(home))
+            .is_some());
+    }
+
+    #[test]
+    fn duplication_redirect_into_credential_dir_is_refused() {
+        // `>&` and `<&` with a path target send a stream to a file in bash.
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p.credential_dir_in("cmd >&~/.ssh/x", Some(home)).is_some());
+        assert!(p.credential_dir_in("cmd <&~/.ssh/x", Some(home)).is_some());
+    }
+
+    #[test]
+    fn mid_word_redirect_into_credential_dir_is_refused() {
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("out.txt<~/.ssh/id", Some(home))
+            .is_some());
+    }
+
+    #[test]
+    fn grouping_prefix_before_credential_path_is_refused() {
+        // A subshell `(`, a brace `{` or a negation `!` glued in front of a path
+        // leaves the path literal in the word.
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("cmd (~/.ssh/id_fake)", Some(home))
+            .is_some());
+        assert!(p
+            .credential_dir_in("cmd {~/.ssh/id_fake", Some(home))
+            .is_some());
+        assert!(p.credential_dir_in("cmd !~/.ssh/x", Some(home)).is_some());
+    }
+
+    #[test]
+    fn semicolon_and_assignment_before_credential_path_are_refused() {
+        // Already covered by the segment split and the `=` split; pinned so a
+        // change to either cannot silently drop them.
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        assert!(p
+            .credential_dir_in("foo;cat ~/.ssh/x", Some(home))
+            .is_some());
+        assert!(p
+            .credential_dir_in("KEY=~/.ssh/id cmd", Some(home))
+            .is_some());
+    }
+
+    #[test]
+    fn redirect_to_non_credential_target_is_not_refused() {
+        // Targets that are not credential paths keep passing, including the
+        // descriptor duplications and bare `>`/`<` with a space.
+        let home = Path::new("/home/test_user");
+        let p = SecurityPolicy::default();
+        for cmd in [
+            "echo ok >out.txt",
+            "cat <notes/input.txt",
+            "cmd 2>&1",
+            "cmd 2>/dev/null",
+            "echo a > b",
+            "cmd >&2",
+            "cmd <&-",
+            "cmd 2>&-",
+            "cmd a>b>c",
+        ] {
+            assert!(
+                p.credential_dir_in(cmd, Some(home)).is_none(),
+                "a non-credential redirect must pass: {cmd}"
             );
         }
     }
