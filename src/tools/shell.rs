@@ -1167,6 +1167,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shell_redirect_into_credential_directory_is_refused_and_writes_nothing() {
+        // A redirect glued to its target stays one word. The refusal must hold
+        // through the shell tool, and the child must not create the file.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir(tmp.path().join(".ssh")).expect("create .ssh");
+        let home_guard = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(tmp.path().to_path_buf()),
+        );
+        let tool = ShellTool::new(security, test_runtime());
+        let res = tool
+            .execute(json!({"command": "echo x >~/.ssh/authorized_keys"}))
+            .await
+            .expect("command should return a result");
+        drop(home_guard);
+        assert!(
+            !res.success,
+            "a redirect into a credential directory must be refused under Full"
+        );
+        let error = res.error.unwrap_or_default();
+        assert!(
+            error.contains("every level") && error.contains("not configurable"),
+            "refusal must say the rule holds at every level, got: {error}"
+        );
+        assert!(
+            !tmp.path().join(".ssh/authorized_keys").exists(),
+            "the refused command must not create the file"
+        );
+    }
+
     #[test]
     fn blocked_reason_with_remediation_omits_lift_advice_for_credential_refusal() {
         // Pins the prefix branch of the helper directly. The pre-check in

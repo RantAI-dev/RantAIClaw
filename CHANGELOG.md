@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   level, with no approval prompt that can lift it. The check is best effort: a command
   reaches a credential directory without naming it through `cd`, a variable other than
   `HOME`, a glob, command substitution or an interpreter. Operating-system containment is
-  `[runtime].kind`.
+  `[runtime].kind`. A redirect glued to its target (`echo x >~/.ssh/authorized_keys`) is
+  refused the same as the bare path.
 - Under `readonly` (the Strict preset), MCP tools and skill tools no longer run. The agent loop
   refuses every tool call that the tool has not declared read-only, before the tool body starts.
   The same gate refuses any future tool that does not declare its read calls. Read tools keep
