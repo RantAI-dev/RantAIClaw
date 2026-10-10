@@ -133,6 +133,18 @@ pub fn apply(config: &mut Config, target: Target, op: Op, value: &str) -> Change
                 }
             }
         }
+    } else if matches!((target, op), (Target::GuestTool, Op::Add)) {
+        match validate_guest_tool(&value) {
+            Ok(note) => (value, note),
+            Err(msg) => {
+                return ChangeOutcome {
+                    changed: false,
+                    message: msg,
+                }
+            }
+        }
+    } else if matches!((target, op), (Target::GuestCommand, Op::Add)) {
+        (value.clone(), guest_command_warning(&value))
     } else {
         (value, None)
     };
@@ -179,6 +191,107 @@ pub fn apply(config: &mut Config, target: Target, op: Op, value: &str) -> Change
             }
         }
     }
+}
+
+/// Check a guest tool name against what the guest gate can match.
+///
+/// Returns `Ok(Some(note))` for a name that cannot be checked yet (`mcp__*`
+/// tools exist only once their server is loaded; `skill_*` tools only once
+/// their skill is), `Ok(None)` for a built-in name, and `Err` for a name the
+/// gate can never match, so storing it would be a silently dead grant.
+fn validate_guest_tool(name: &str) -> Result<Option<String>, String> {
+    if crate::approval::GuestGate::OWNER_ONLY_TOOLS.contains(&name) {
+        return Err(format!(
+            "Refused: `{name}` is owner-only. Guests can never use it, so it cannot be \
+             granted to them."
+        ));
+    }
+    if crate::tools::BUILTIN_TOOL_NAMES.contains(&name) {
+        return Ok(None);
+    }
+    if name.starts_with("mcp__") || name.starts_with("skill_") {
+        // The builders (`mcp::tool::qualified_name`, `SkillToolAdapter::new`)
+        // replace each character outside `[A-Za-z0-9_]` with `_`. A name
+        // holding one is stored but its registered spelling never matches.
+        if let Some(bad) = name
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
+        {
+            let sanitized: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            return Err(format!(
+                "Refused: `{name}` contains `{bad}`. The registered tool name replaces that \
+                 character with `_`, so this grant would never match. Use the sanitized name \
+                 `{sanitized}` instead."
+            ));
+        }
+        return Ok(Some(format!(
+            "\nNote: `{name}` cannot be checked until its MCP server or skill is loaded. \
+             It has no effect before then."
+        )));
+    }
+    Err(format!(
+        "Refused: `{name}` is not a tool the agent has. A grant for it would never match a \
+         tool. Built-in tool names are listed in `BUILTIN_TOOL_NAMES` (src/tools/mod.rs), \
+         and the tool list is in docs/reference/commands.md."
+    ))
+}
+
+/// Describe what a guest command glob grants, when it is wide or high-risk.
+///
+/// The glob is stored either way; this only says what it lets a guest run.
+/// `glob_match` anchors the pattern and treats `*` as any run of characters, so
+/// a wildcard at the end of the command name is fully described by the literal
+/// run before it: `rm*` matches every command whose text starts with `rm`. A
+/// wildcard anywhere earlier is not, because it constrains the tail as well:
+/// `*rm` matches commands ending in `rm`, and `r*m` those ending in `m`. Naming
+/// a prefix for those would misstate the grant, so they get neutral wording.
+fn guest_command_warning(pattern: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    let first_token = pattern.split_whitespace().next().unwrap_or("");
+    if let Some(wildcard) = first_token.find(['*', '?']) {
+        let prefix = &first_token[..wildcard];
+        // `glob_match` has no `?`: a `?` is a literal byte, so only a single
+        // trailing `*` is described as a prefix. `rm?` and `rm*x*` get wording
+        // that does not overstate the grant.
+        let single_trailing_star = !prefix.is_empty()
+            && first_token.ends_with('*')
+            && first_token[wildcard + 1..].is_empty();
+        let has_question_mark = first_token.contains('?');
+        let has_star = first_token.contains('*');
+        if has_question_mark {
+            parts.push(format!(
+                "\n⚠ `{pattern}` holds a `?`, which the gate matches literally, not as one \
+                 character: in the command name, `?` matches only a literal `?`."
+            ));
+        }
+        if single_trailing_star && !has_question_mark {
+            parts.push(format!(
+                "\n⚠ `{pattern}` is a wide glob: its command name holds a wildcard, so it \
+                 matches every command whose text starts with `{prefix}`, whatever comes after."
+            ));
+        } else if has_star || !has_question_mark {
+            parts.push(format!(
+                "\n⚠ `{pattern}` is a wide glob: its command name holds a wildcard, so it \
+                 matches more than one command."
+            ));
+        }
+    }
+    let risk = crate::security::SecurityPolicy::default().command_risk_level(pattern);
+    if matches!(risk, crate::security::policy::CommandRiskLevel::High) {
+        parts.push(format!(
+            "\n⚠ `{pattern}` is rated high risk. Guests granted it can run a dangerous command."
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(""))
 }
 
 /// Validate an `allow-command` value into a single command basename. Returns the
@@ -518,13 +631,13 @@ mod tests {
         let mut c = cfg();
         apply(&mut c, Target::Owner, Op::Add, "alice");
         apply(&mut c, Target::AllowCommand, Op::Add, "kubectl");
-        apply(&mut c, Target::GuestTool, Op::Add, "web_search");
+        apply(&mut c, Target::GuestTool, Op::Add, "web_search_tool");
         apply(&mut c, Target::GuestCommand, Op::Add, "ls *");
         let s = render(&c);
         assert!(s.contains("alice"));
         assert!(s.contains("kubectl"));
         assert!(s.contains("Owner shell commands")); // autonomy allowlist section
-        assert!(s.contains("web_search"));
+        assert!(s.contains("web_search_tool"));
         assert!(s.contains("ls *"));
     }
 
@@ -631,6 +744,206 @@ mod tests {
         let out = apply(&mut c, Target::AllowCommand, Op::Add, "/usr/bin/docker");
         assert!(out.changed);
         assert!(c.autonomy.allowed_commands.iter().any(|e| e == "docker"));
+    }
+
+    #[test]
+    fn guest_tool_refuses_an_unknown_name_and_leaves_config_unchanged() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestTool, Op::Add, "nosuchtool");
+        assert!(!out.changed, "an unknown tool name must be refused");
+        assert!(
+            out.message.contains("nosuchtool") && out.message.contains("Refused"),
+            "the refusal must name the tool and say it was refused: {}",
+            out.message
+        );
+        assert!(
+            c.channels_config.guest_allowed_tools.is_empty(),
+            "a refused name must not reach the config"
+        );
+    }
+
+    #[test]
+    fn guest_tool_accepts_a_builtin_name() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestTool, Op::Add, "shell");
+        assert!(out.changed, "{}", out.message);
+        assert_eq!(
+            c.channels_config.guest_allowed_tools,
+            vec!["shell".to_string()]
+        );
+    }
+
+    #[test]
+    fn guest_tool_accepts_mcp_name_with_a_note() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestTool, Op::Add, "mcp__github__search");
+        assert!(out.changed, "{}", out.message);
+        assert!(
+            out.message.contains("mcp__github__search") && out.message.contains("loaded"),
+            "an mcp__ name must carry the note that it cannot be checked until loaded: {}",
+            out.message
+        );
+        assert_eq!(
+            c.channels_config.guest_allowed_tools,
+            vec!["mcp__github__search".to_string()]
+        );
+    }
+
+    /// The builders map any character outside `[A-Za-z0-9_]` to `_`, so a name
+    /// holding `-` or `.` is stored but its registered name never matches.
+    #[test]
+    fn guest_tool_refuses_an_mcp_name_the_builder_would_sanitize() {
+        let mut c = cfg();
+        let out = apply(
+            &mut c,
+            Target::GuestTool,
+            Op::Add,
+            "mcp__my-server__do.thing",
+        );
+        assert!(!out.changed, "a name the builder rewrites must be refused");
+        assert!(
+            out.message.contains("Refused") && out.message.contains("mcp__my_server__do_thing"),
+            "the refusal must name the character and the sanitized spelling: {}",
+            out.message
+        );
+        assert!(c.channels_config.guest_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn guest_tool_accepts_a_sanitized_mcp_name_with_the_note() {
+        let mut c = cfg();
+        let out = apply(
+            &mut c,
+            Target::GuestTool,
+            Op::Add,
+            "mcp__my_server__do_thing",
+        );
+        assert!(out.changed, "{}", out.message);
+        assert!(out.message.contains("loaded"), "{}", out.message);
+    }
+
+    #[test]
+    fn guest_tool_refuses_an_owner_only_tool() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestTool, Op::Add, "delegate");
+        assert!(!out.changed, "an owner-only tool must be refused");
+        assert!(
+            out.message.contains("owner-only"),
+            "the refusal must give the owner-only reason: {}",
+            out.message
+        );
+        assert!(c.channels_config.guest_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn guest_tool_remove_takes_out_an_unknown_name_already_on_disk() {
+        let mut c = cfg();
+        c.channels_config.guest_allowed_tools = vec!["nosuchtool".to_string()];
+        let out = apply(&mut c, Target::GuestTool, Op::Remove, "nosuchtool");
+        assert!(out.changed, "{}", out.message);
+        assert!(c.channels_config.guest_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn guest_command_rm_glob_is_stored_with_a_wide_warning() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestCommand, Op::Add, "rm*");
+        assert!(out.changed, "a wide glob is stored: {}", out.message);
+        assert_eq!(
+            c.channels_config.guest_allowed_commands,
+            vec!["rm*".to_string()]
+        );
+        assert!(
+            out.message.contains("starts with `rm`"),
+            "the warning must say what the glob matches: {}",
+            out.message
+        );
+    }
+
+    /// `glob_match` has no `?` support: `?` is a literal byte. A warning that
+    /// names a prefix for `rm?` would overstate the grant, since the gate
+    /// matches only the literal text `rm?`.
+    #[test]
+    fn guest_command_question_mark_is_described_as_literal_not_as_a_prefix() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestCommand, Op::Add, "rm?");
+        assert!(out.changed, "stored: {}", out.message);
+        assert!(
+            out.message.contains("matches literally"),
+            "the warning must say the gate matches `?` literally: {}",
+            out.message
+        );
+        assert!(
+            !out.message.contains("starts with"),
+            "`rm?` must not claim a prefix match: {}",
+            out.message
+        );
+    }
+
+    /// `rm*x*` needs a later `x` as well as the `rm` prefix, so the prefix
+    /// wording would overstate it. Neutral wording applies.
+    #[test]
+    fn guest_command_multi_wildcard_glob_uses_neutral_wording() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestCommand, Op::Add, "rm*x*");
+        assert!(out.changed, "stored: {}", out.message);
+        assert!(
+            out.message.contains("matches more than one command"),
+            "a pattern with two wildcards must use neutral wording: {}",
+            out.message
+        );
+        assert!(
+            !out.message.contains("starts with"),
+            "`rm*x*` must not claim a prefix match: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn guest_command_leading_wildcard_glob_does_not_name_an_empty_prefix() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestCommand, Op::Add, "*rm");
+        assert!(out.changed, "a wide glob is stored: {}", out.message);
+        assert_eq!(
+            c.channels_config.guest_allowed_commands,
+            vec!["*rm".to_string()]
+        );
+        assert!(
+            out.message.contains("matches more than one command"),
+            "a wildcard before any literal character cannot be described by a prefix, so the \
+             warning must stay neutral: {}",
+            out.message
+        );
+        assert!(
+            !out.message.contains("starts with ``"),
+            "`*rm` matches commands ending in `rm`, not commands starting with an empty \
+             prefix: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn guest_command_high_risk_glob_is_stored_with_a_risk_warning() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestCommand, Op::Add, "rm -rf *");
+        assert!(out.changed, "stored: {}", out.message);
+        assert!(
+            out.message.contains("high risk"),
+            "must warn as high risk: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn guest_command_narrow_glob_is_stored_without_warning() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::GuestCommand, Op::Add, "kubectl get *");
+        assert!(out.changed, "stored: {}", out.message);
+        assert!(
+            !out.message.contains('⚠'),
+            "a narrow, low-risk glob carries no warning: {}",
+            out.message
+        );
     }
 
     #[test]

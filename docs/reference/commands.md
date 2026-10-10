@@ -572,6 +572,19 @@ rantaiclaw permissions add command 'kubectl get *'  # ...but only these commands
 Adding `tool shell` without a `command` entry gives guests a shell with no allowed
 commands, which denies everything — the two are meant to be set together.
 
+Two rules govern what `add` accepts:
+
+- **Unknown guest tool names are refused.** `add tool <name>` accepts a built-in tool name
+  (the list is `BUILTIN_TOOL_NAMES` in `src/tools/mod.rs`), an `mcp__*` name (accepted with a
+  note, since it cannot be checked until that server is loaded), or a `skill_*` name (accepted
+  with a note, since it cannot be checked until that skill is loaded). An owner-only tool such
+  as `delegate` is refused, because guests can never use it. Any other name is refused and the
+  config is left unchanged. `remove` is not checked, so a bad entry already on disk can be removed.
+- **Wide or high-risk guest command globs are stored with a warning.** A glob whose command name
+  holds `*` or `?` (for example `rm*`, which matches every command whose text starts with `rm`),
+  or one the command classifier rates high risk (for example `rm -rf *`), is stored, and the
+  output says what it grants. Nothing is refused for breadth alone.
+
 ### `personality`
 
 | Subcommand | Description |
