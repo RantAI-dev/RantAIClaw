@@ -93,7 +93,8 @@ impl TuiAgentActor {
                     Some(TurnRequest::Cancel) => { /* no-op while idle */ }
                     Some(TurnRequest::Reload(config)) => {
                         match crate::agent::Agent::from_config(&config).await {
-                            Ok(new_agent) => {
+                            Ok(mut new_agent) => {
+                                new_agent.set_surface("tui");
                                 let mcp_tools_by_server = new_agent.mcp_tools_by_server();
                                 let mcp_servers_configured: Vec<String> =
                                     config.mcp_servers.keys().cloned().collect();
@@ -236,7 +237,8 @@ impl TuiAgentActor {
                     // Apply any reload that arrived during the turn.
                     if let Some(config) = self.pending_reload.take() {
                         match crate::agent::Agent::from_config(&config).await {
-                            Ok(new_agent) => {
+                            Ok(mut new_agent) => {
+                                new_agent.set_surface("tui");
                                 let mcp_tools_by_server = new_agent.mcp_tools_by_server();
                                 let mcp_servers_configured: Vec<String> =
                                     config.mcp_servers.keys().cloned().collect();

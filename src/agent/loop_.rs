@@ -1203,6 +1203,22 @@ fn reject_foreign_cron_delivery(
     }
 }
 
+/// The `channel` written to the audit line for a call. A surface that serves
+/// the operator's own UI names itself on the actor, so its lines are not
+/// recorded as `cli`. Every other caller writes the channel name it passes for
+/// behaviour, so chat lines still carry the chat channel.
+///
+/// The two values are not interchangeable: `src/agent/agent.rs` passes the
+/// behaviour name `cli` here, and that same value drives `default_backend_for`,
+/// the model-visible denial message and `record_decision`.
+fn audit_channel(audit_actor: &crate::security::AuditActor, channel_name: &str) -> String {
+    audit_actor
+        .surface
+        .as_deref()
+        .unwrap_or(channel_name)
+        .to_string()
+}
+
 /// Execute a single parsed tool call and return a structured result. Emits
 /// paired Start/End events, records observer events, and races the tool against
 /// `cancel` (returning `ToolLoopCancelled` if it fires mid-execution). `success`
@@ -1226,13 +1242,16 @@ pub(crate) async fn execute_one_tool_structured(
     approval_outcome: crate::security::ApprovalOutcome,
     // Identity of who asked for the call. Chat sends a sender id + role
     // (owner or guest); non-chat surfaces send `AuditActor::surface()`
-    // and the audit carries `user_id = None`, `role = None`.
+    // and the audit carries `user_id = None`, `role = None`. A surface that
+    // serves the operator's own UI sends `AuditActor::named_surface`, which
+    // also names the audit `channel`.
     audit_actor: &crate::security::AuditActor,
     // The live policy the autonomy gate reads. `None` means no policy is in
     // scope and the gate does nothing; every production caller passes `Some`.
     security: Option<&SecurityPolicy>,
 ) -> Result<ToolExecutionResult> {
     let id = Uuid::new_v4().to_string();
+    let audit_channel_name = audit_channel(audit_actor, channel_name);
 
     let Some(tool) = find_tool(tools_registry, &call.name) else {
         if let Some(tx) = events {
@@ -1252,7 +1271,7 @@ pub(crate) async fn execute_one_tool_structured(
                 .await;
         }
         crate::security::record_tool_call(crate::security::ToolCallRecord {
-            channel: channel_name.to_string(),
+            channel: audit_channel_name.clone(),
             sender: audit_actor.sender.clone(),
             role: audit_actor.role.clone(),
             tool: call.name.clone(),
@@ -1300,7 +1319,7 @@ pub(crate) async fn execute_one_tool_structured(
                 call.name
             );
             crate::security::record_tool_call(crate::security::ToolCallRecord {
-                channel: channel_name.to_string(),
+                channel: audit_channel_name.clone(),
                 sender: audit_actor.sender.clone(),
                 role: audit_actor.role.clone(),
                 tool: call.name.clone(),
@@ -1384,7 +1403,7 @@ pub(crate) async fn execute_one_tool_structured(
     }
 
     crate::security::record_tool_call(crate::security::ToolCallRecord {
-        channel: channel_name.to_string(),
+        channel: audit_channel_name.clone(),
         sender: audit_actor.sender.clone(),
         role: audit_actor.role.clone(),
         tool: call.name.clone(),
@@ -1438,6 +1457,7 @@ pub(crate) async fn execute_tool_calls_collecting(
     // scope and the gate does nothing; every production caller passes `Some`.
     security: Option<&SecurityPolicy>,
 ) -> Result<Vec<ToolExecutionResult>> {
+    let audit_channel_name = audit_channel(audit_actor, channel_name);
     // A guest turn must run serially so every call passes the gate below; the
     // parallel fast-path skips per-call checks.
     if parallel && guest_gate.is_none() {
@@ -1500,7 +1520,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                         .await;
                 }
                 crate::security::record_tool_call(crate::security::ToolCallRecord {
-                    channel: channel_name.to_string(),
+                    channel: audit_channel_name.clone(),
                     sender: audit_actor.sender.clone(),
                     role: audit_actor.role.clone(),
                     tool: call.name.clone(),
@@ -1543,7 +1563,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                         .await;
                 }
                 crate::security::record_tool_call(crate::security::ToolCallRecord {
-                    channel: channel_name.to_string(),
+                    channel: audit_channel_name.clone(),
                     sender: audit_actor.sender.clone(),
                     role: audit_actor.role.clone(),
                     tool: call.name.clone(),
@@ -1628,7 +1648,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                         denied_tool_message(&call.name)
                     };
                     crate::security::record_tool_call(crate::security::ToolCallRecord {
-                        channel: channel_name.to_string(),
+                        channel: audit_channel_name.clone(),
                         sender: audit_actor.sender.clone(),
                         role: audit_actor.role.clone(),
                         tool: call.name.clone(),
