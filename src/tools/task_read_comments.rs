@@ -17,6 +17,10 @@ impl TaskReadCommentsTool {
 
 #[async_trait]
 impl Tool for TaskReadCommentsTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "read_comments"
     }

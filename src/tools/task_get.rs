@@ -17,6 +17,10 @@ impl TaskGetTool {
 
 #[async_trait]
 impl Tool for TaskGetTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "get_task"
     }

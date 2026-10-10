@@ -48,6 +48,10 @@ impl Tool for RegistryEntryTool {
     fn spec(&self) -> ToolSpec {
         self.entry().spec()
     }
+
+    fn is_read_only_call(&self, args: &serde_json::Value) -> bool {
+        self.entry().is_read_only_call(args)
+    }
 }
 
 /// The tools of `registry` that `gate` permits a guest to call, in registry
@@ -67,4 +71,48 @@ pub(crate) fn permitted_tools(
             }) as Box<dyn Tool>
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read-only probe. It declares every call read-only, so a forwarder
+    /// that drops the declaration reads as refused.
+    struct ReadDeclaringProbe;
+
+    #[async_trait]
+    impl Tool for ReadDeclaringProbe {
+        fn name(&self) -> &str {
+            "read_declaring_probe"
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+        fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+            true
+        }
+    }
+
+    /// A guest turn runs on `permitted_tools`, not on the shared registry. If
+    /// the narrowed entry did not forward the declaration, a guest's read tools
+    /// would be refused under `ReadOnly` where they run today.
+    #[test]
+    fn registry_entry_forwards_the_read_only_declaration() {
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(ReadDeclaringProbe)]);
+        let gate = GuestGate::new(&["read_declaring_probe".to_string()], &[]);
+        let narrowed = permitted_tools(&registry, &gate);
+        assert_eq!(narrowed.len(), 1, "the gate permits the probe");
+        assert!(narrowed[0].is_read_only_call(&serde_json::json!({})));
+    }
 }

@@ -44,6 +44,10 @@ impl SkillsListTool {
 
 #[async_trait]
 impl Tool for SkillsListTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "skills_list"
     }
@@ -106,6 +110,10 @@ impl SkillViewTool {
 
 #[async_trait]
 impl Tool for SkillViewTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "skill_view"
     }
@@ -199,6 +207,10 @@ impl Default for SkillsSearchTool {
 
 #[async_trait]
 impl Tool for SkillsSearchTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "skills_search"
     }

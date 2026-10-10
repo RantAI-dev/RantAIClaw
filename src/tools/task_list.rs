@@ -18,6 +18,10 @@ impl TaskListTool {
 
 #[async_trait]
 impl Tool for TaskListTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "list_tasks"
     }

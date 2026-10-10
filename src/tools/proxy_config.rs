@@ -414,6 +414,17 @@ impl Tool for ProxyConfigTool {
         })
     }
 
+    /// `get` and `list_services` only read. `execute` treats a missing `action`
+    /// as `get` and lowercases it before matching, so this does the same.
+    fn is_read_only_call(&self, args: &Value) -> bool {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("get")
+            .to_ascii_lowercase();
+        matches!(action.as_str(), "get" | "list_services")
+    }
+
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let action = args
             .get("action")
@@ -490,6 +501,33 @@ mod tests {
         };
         config.save().await.unwrap();
         Arc::new(config)
+    }
+
+    /// `get` and `list_services` run under `ReadOnly` today, so they declare
+    /// themselves read-only. `set` and the other writers stay refused. A call
+    /// with no `action` runs `get` in `execute`, so it must declare read-only too.
+    #[test]
+    fn proxy_config_declares_only_its_read_actions_read_only() {
+        let tool = ProxyConfigTool::new(
+            Arc::new(Config::default()),
+            Arc::new(SecurityPolicy::default()),
+        );
+        for action in ["get", "list_services", "GET"] {
+            assert!(
+                tool.is_read_only_call(&json!({"action": action})),
+                "proxy_config {action} is a read"
+            );
+        }
+        assert!(
+            tool.is_read_only_call(&json!({})),
+            "a missing action defaults to get in execute, so it is a read too"
+        );
+        for action in ["set", "disable", "apply_env", "clear_env"] {
+            assert!(
+                !tool.is_read_only_call(&json!({"action": action})),
+                "proxy_config {action} writes and must not be read-only"
+            );
+        }
     }
 
     #[tokio::test]

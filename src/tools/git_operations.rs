@@ -439,6 +439,14 @@ impl Tool for GitOperationsTool {
         "git_operations"
     }
 
+    /// Only the read operations run under `ReadOnly`; the same list that
+    /// `is_read_only` names, so the gate and the operation table cannot drift.
+    fn is_read_only_call(&self, args: &serde_json::Value) -> bool {
+        args.get("operation")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|op| self.is_read_only(op))
+    }
+
     fn description(&self) -> &str {
         "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls."
     }

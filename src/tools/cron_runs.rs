@@ -31,6 +31,10 @@ struct RunView {
 
 #[async_trait]
 impl Tool for CronRunsTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_runs"
     }

@@ -503,7 +503,7 @@ Web console (`rantaiclaw ui start`) settings.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `level` | `supervised` | `readonly`, `supervised`, or `full` |
+| `level` | `supervised` | `readonly`, `supervised`, or `full`. Under `readonly` the agent loop runs only the tool calls a tool declares read-only; MCP tools and skill tools never run, and a refused call is audited as `read_only` |
 | `workspace_only` | `true` | restrict writes/command paths to workspace scope |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
 | `forbidden_paths` | `["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "/tmp", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]` (eighteen entries) | extra path denylist for the file tools, added to the built-in floor. The floor (system directories and credential directories) cannot be removed. The floor and this key are the only source: there is no `forbidden_paths.toml`. |

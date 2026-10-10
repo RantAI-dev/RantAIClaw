@@ -119,6 +119,10 @@ impl ImageInfoTool {
 
 #[async_trait]
 impl Tool for ImageInfoTool {
+    fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "image_info"
     }

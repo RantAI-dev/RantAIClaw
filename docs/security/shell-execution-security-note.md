@@ -28,6 +28,14 @@ données, établir des connexions réseau ou élever des privilèges.
 La vérification est faite avant toute exécution — il n'y a pas de chemin de
 contournement.
 
+Au-delà de `shell`, ce niveau s'applique à tous les outils : sous `ReadOnly`, un
+appel d'outil ne s'exécute que si l'outil déclare cet appel en lecture seule. La
+boucle agent refuse tout autre appel avant que le corps de l'outil ne démarre,
+donc les outils MCP et les outils de skill ne s'exécutent pas sous `ReadOnly`. Un
+nouvel outil intégré est refusé sous `ReadOnly` tant qu'il ne surcharge pas
+`is_read_only_call` pour retourner `true` sur ses appels en lecture seule. Le refus
+est journalisé dans l'audit comme `read_only`.
+
 ### 2.2 Validation de commande (`validate_command_execution`)
 
 Les commandes à risque moyen ou élevé requièrent que le paramètre `approved: true`

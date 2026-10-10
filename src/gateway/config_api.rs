@@ -4103,6 +4103,7 @@ mod tests {
             memory_search_mode: Arc::new("keyword".to_string()),
 
             tools_factory: Arc::new(|_: &Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
             webhook_secret_hash: None,
             pairing: Arc::new(crate::security::pairing::PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,

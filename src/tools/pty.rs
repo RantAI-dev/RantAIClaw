@@ -377,6 +377,14 @@ impl Tool for PtyTool {
         })
     }
 
+    /// `screen`, `wait` and `stop` only observe or end a session. `start` and
+    /// `send` launch or type into one. The read-only gate refuses those two
+    /// here, which is the same split `execute` makes below under read-only
+    /// autonomy, so declaring the three read-only keeps today's behaviour.
+    fn is_read_only_call(&self, args: &serde_json::Value) -> bool {
+        matches!(str_field(args, "action"), Some("screen" | "wait" | "stop"))
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let Some(action) = str_field(&args, "action") else {
             return Ok(fail("missing `action`"));

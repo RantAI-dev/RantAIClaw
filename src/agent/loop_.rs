@@ -1072,48 +1072,6 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
-/// When `silent` is true, suppresses stdout (for channel use).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn agent_turn(
-    provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-    provider_name: &str,
-    model: &str,
-    temperature: f64,
-    silent: bool,
-    multimodal_config: &crate::config::MultimodalConfig,
-    max_tool_iterations: usize,
-    ledger: Option<&crate::cost::CostTracker>,
-) -> Result<String> {
-    run_tool_call_loop(
-        provider,
-        history,
-        tools_registry,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        None,
-        "channel",
-        None, // internal helper — no origin chat
-        None,
-        None,
-        multimodal_config,
-        max_tool_iterations,
-        None,
-        None,
-        None,
-        ledger,
-        &crate::security::AuditActor::surface(),
-    )
-    .await
-}
-
 fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
     approval: Option<&ApprovalManager>,
@@ -1270,6 +1228,9 @@ pub(crate) async fn execute_one_tool_structured(
     // (owner or guest); non-chat surfaces send `AuditActor::surface()`
     // and the audit carries `user_id = None`, `role = None`.
     audit_actor: &crate::security::AuditActor,
+    // The live policy the autonomy gate reads. `None` means no policy is in
+    // scope and the gate does nothing; every production caller passes `Some`.
+    security: Option<&SecurityPolicy>,
 ) -> Result<ToolExecutionResult> {
     let id = Uuid::new_v4().to_string();
 
@@ -1308,6 +1269,55 @@ pub(crate) async fn execute_one_tool_structured(
             tool_call_id: call.tool_call_id.clone(),
         });
     };
+
+    // The one gate under `ReadOnly`: a call runs only when the tool declares
+    // this call read-only. It sits before `execute`, so no tool body starts,
+    // and it reads the live level so a mid-session preset switch applies to the
+    // next call. Refused calls are audited with `read_only` and never reach
+    // `execute`.
+    if let Some(policy) = security {
+        if policy.effective_autonomy() == crate::security::AutonomyLevel::ReadOnly
+            && !tool.is_read_only_call(&call.arguments)
+        {
+            if let Some(tx) = events {
+                let _ = tx
+                    .send(AgentEvent::ToolCallStart {
+                        id: id.clone(),
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::ToolCallEnd {
+                        id,
+                        ok: false,
+                        output_preview: "[denied: read-only mode]".into(),
+                    })
+                    .await;
+            }
+            let output = format!(
+                "Security policy: read-only mode, cannot perform '{}'",
+                call.name
+            );
+            crate::security::record_tool_call(crate::security::ToolCallRecord {
+                channel: channel_name.to_string(),
+                sender: audit_actor.sender.clone(),
+                role: audit_actor.role.clone(),
+                tool: call.name.clone(),
+                risk_level: "read_only".into(),
+                approval: crate::security::ApprovalOutcome::Denied,
+                allowed: false,
+                success: false,
+                duration_ms: 0,
+            });
+            return Ok(ToolExecutionResult {
+                name: call.name.clone(),
+                output,
+                success: false,
+                tool_call_id: call.tool_call_id.clone(),
+            });
+        }
+    }
 
     if let Some(tx) = events {
         let _ = tx
@@ -1424,6 +1434,9 @@ pub(crate) async fn execute_tool_calls_collecting(
     // passed — chat sets it in `channels/dispatch.rs`, non-chat callers
     // pass `AuditActor::surface()` and leave it empty.
     audit_actor: &crate::security::AuditActor,
+    // The live policy the autonomy gate reads. `None` means no policy is in
+    // scope and the gate does nothing; every production caller passes `Some`.
+    security: Option<&SecurityPolicy>,
 ) -> Result<Vec<ToolExecutionResult>> {
     // A guest turn must run serially so every call passes the gate below; the
     // parallel fast-path skips per-call checks.
@@ -1452,6 +1465,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 // silently.
                 crate::security::ApprovalOutcome::NotRequired,
                 audit_actor,
+                security,
             )
         });
         return futures_util::future::try_join_all(futures).await;
@@ -1654,6 +1668,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 channel_name,
                 approval_outcome,
                 audit_actor,
+                security,
             )
             .await?,
         );
@@ -1767,6 +1782,8 @@ pub(crate) async fn run_structured_loop(
     // then on to the audit log; chat sends a sender + role, non-chat surfaces
     // pass `AuditActor::surface()`.
     audit_actor: &crate::security::AuditActor,
+    // Live policy for the autonomy gate; `None` ⇒ no gate. Production callers pass `Some`.
+    security: Option<&SecurityPolicy>,
 ) -> Result<(String, Option<crate::providers::ProviderUsage>)> {
     // The daily ceiling, checked before the turn does any work. This is the
     // whole of the enforcement: a turn's size is not knowable before it runs, so
@@ -2007,6 +2024,7 @@ pub(crate) async fn run_structured_loop(
             cancellation_token.as_ref(),
             events.as_ref(),
             audit_actor,
+            security,
         )
         .await?;
 
@@ -2138,6 +2156,8 @@ pub(crate) async fn run_tool_call_loop(
     // Identity of who asked for the call. Threaded through to the audit log;
     // chat sends a sender + role, non-chat surfaces pass `AuditActor::surface()`.
     audit_actor: &crate::security::AuditActor,
+    // Live policy for the autonomy gate; `None` ⇒ no gate. Production callers pass `Some`.
+    security: Option<&SecurityPolicy>,
 ) -> Result<String> {
     let dispatcher: Box<dyn ToolDispatcher> = if provider.supports_native_tools() {
         Box::new(NativeToolDispatcher)
@@ -2174,6 +2194,7 @@ pub(crate) async fn run_tool_call_loop(
         events,
         ledger,
         audit_actor,
+        security,
     )
     .await;
 
@@ -2698,6 +2719,7 @@ pub async fn run_with_scope(
                 None,
                 ledger.as_deref(),
                 &crate::security::AuditActor::surface(),
+                Some(security.as_ref()),
             ),
         )
         .await?;
@@ -2836,6 +2858,7 @@ pub async fn run_with_scope(
                     None,
                     ledger.as_deref(),
                     &crate::security::AuditActor::surface(),
+                    Some(security.as_ref()),
                 ),
             )
             .await
@@ -3501,6 +3524,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3553,6 +3577,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await;
 
@@ -3610,6 +3635,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3654,6 +3680,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3785,6 +3812,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3973,6 +4001,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("batch completes");
@@ -3997,6 +4026,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("batch completes");
@@ -4085,6 +4115,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("batch completes");
@@ -4096,6 +4127,624 @@ mod tests {
         assert_eq!(
             record["action"]["approval"], "not_required",
             "nobody was asked, so the trail must not read as an approval: {text}"
+        );
+    }
+
+    /// Runs `call` against `tool` under `ReadOnly` through the loop's funnel and
+    /// reports whether `execute` ran. The funnel is what is under test, so
+    /// nothing here calls `execute` directly.
+    async fn runs_under_readonly(tool: Box<dyn Tool>, args: serde_json::Value) -> bool {
+        let policy =
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly);
+        let name = tool.name().to_string();
+        let tools: Vec<Box<dyn Tool>> = vec![tool];
+        let call = ParsedToolCall {
+            name,
+            arguments: args,
+            tool_call_id: None,
+        };
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "cli",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        // A refused call returns the read-only refusal and never runs the tool.
+        !results[0]
+            .output
+            .starts_with("Security policy: read-only mode")
+    }
+
+    /// Read tools that run under `ReadOnly` today must keep running: the gate
+    /// refuses an undeclared tool, so each of these has to declare its read
+    /// calls, or a read-only session loses its ability to look things up.
+    #[tokio::test]
+    async fn readonly_still_runs_the_read_only_builtin_tools() {
+        let security = Arc::new(SecurityPolicy::default());
+        let ws = tempfile::tempdir().expect("tempdir");
+        let config = Arc::new(crate::config::Config {
+            workspace_dir: ws.path().to_path_buf(),
+            ..crate::config::Config::default()
+        });
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::NoneMemory::new());
+
+        let cases: Vec<(&str, Box<dyn Tool>, serde_json::Value)> = vec![
+            (
+                "file_read",
+                Box::new(tools::FileReadTool::new(Arc::clone(&security))),
+                serde_json::json!({"path": "missing.txt"}),
+            ),
+            (
+                "glob_search",
+                Box::new(tools::GlobSearchTool::new(Arc::clone(&security))),
+                serde_json::json!({"pattern": "*.none"}),
+            ),
+            (
+                "memory_recall",
+                Box::new(tools::MemoryRecallTool::new(Arc::clone(&memory))),
+                serde_json::json!({"query": "anything"}),
+            ),
+            (
+                "cron_list",
+                Box::new(tools::CronListTool::new(Arc::clone(&config))),
+                serde_json::json!({}),
+            ),
+        ];
+        for (name, tool, args) in cases {
+            assert!(
+                runs_under_readonly(tool, args).await,
+                "{name} is a read tool and must still run under ReadOnly"
+            );
+        }
+    }
+
+    /// A skill tool carries no read-only declaration, so under `ReadOnly` the
+    /// loop refuses it and its shell command never runs. The marker file makes
+    /// "did not run" observable on disk, not only in the returned text.
+    #[tokio::test]
+    async fn readonly_refuses_a_skill_tool_through_the_loop() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let marker = ws.path().join("skill_marker.txt");
+        let tool = crate::tools::skill_tool::SkillToolAdapter::new(
+            "marker-skill",
+            crate::skills::SkillTool {
+                name: "touch".into(),
+                description: "writes a marker".into(),
+                kind: "shell".into(),
+                command: format!("touch {}", marker.display()),
+                args: std::collections::HashMap::new(),
+            },
+            Arc::new(SecurityPolicy::default()),
+        );
+        let policy =
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly);
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let call = ParsedToolCall {
+            name: "skill_marker_skill_touch".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "cli",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+
+        assert!(!results[0].success, "a refused skill tool reports failure");
+        assert!(
+            !marker.exists(),
+            "the skill's shell command must not run under ReadOnly"
+        );
+    }
+
+    /// An MCP tool carries no read-only declaration either, so under `ReadOnly`
+    /// the loop refuses it and the server never receives `tools/call`. The
+    /// `McpTool` is real: a POSIX `sh` server stands in for the stdio process and
+    /// touches a marker file on `tools/call`, so "did not run" is on disk.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn readonly_refuses_an_mcp_tool_through_the_loop() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let marker = ws.path().join("mcp_marker.txt");
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *initialize*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"capabilities":{{}}}}}}\n' "$id" ;;
+    *tools/call*) touch {marker}; printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"ok"}}]}}}}\n' "$id" ;;
+  esac
+done
+"#,
+            marker = marker.display()
+        );
+        let client = crate::mcp::client::McpClient::connect(
+            "marker",
+            "sh",
+            &["-c".to_string(), script],
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("fixture server connects");
+        let info = crate::mcp::client::McpToolInfo {
+            name: "touch".into(),
+            description: "writes a marker".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let tool = crate::mcp::tool::McpTool::new(Arc::new(client), info);
+        let qualified = tool.name().to_string();
+        assert_eq!(qualified, "mcp__marker__touch");
+
+        let policy =
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly);
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let call = ParsedToolCall {
+            name: qualified,
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "cli",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+
+        assert!(!results[0].success, "a refused MCP tool reports failure");
+        assert!(
+            results[0]
+                .output
+                .starts_with("Security policy: read-only mode"),
+            "the refusal text, not the server's reply: {}",
+            results[0].output
+        );
+        assert!(
+            !marker.exists(),
+            "the MCP server must not receive tools/call under ReadOnly"
+        );
+    }
+
+    /// `git_operations` keeps running its read operations under `ReadOnly`, and
+    /// the gate refuses the write operations. A real repo is needed so `status`
+    /// has something to report.
+    #[tokio::test]
+    async fn readonly_splits_git_operations_by_operation() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(ws.path())
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        let security = Arc::new(SecurityPolicy::default());
+        let git = || -> Box<dyn Tool> {
+            Box::new(tools::GitOperationsTool::new(
+                Arc::clone(&security),
+                ws.path().to_path_buf(),
+            ))
+        };
+
+        assert!(
+            runs_under_readonly(git(), serde_json::json!({"operation": "status"})).await,
+            "git status is a read and must still run under ReadOnly"
+        );
+        assert!(
+            !runs_under_readonly(
+                git(),
+                serde_json::json!({"operation": "commit", "message": "x"})
+            )
+            .await,
+            "git commit must be refused under ReadOnly"
+        );
+    }
+
+    /// `pty` runs `screen`, `wait` and `stop` under `ReadOnly` (they ran under
+    /// Strict before this gate, so this keeps that) and refuses `start`/`send`.
+    /// `screen` on a session that does not exist returns a failure without
+    /// touching tmux, so the run can be seen through the loop.
+    #[tokio::test]
+    async fn readonly_splits_pty_by_action() {
+        let security = Arc::new(SecurityPolicy::default());
+        let pty = || -> Box<dyn Tool> { Box::new(tools::PtyTool::new(Arc::clone(&security))) };
+        let missing = "rantaiclaw_no_such_session";
+
+        assert!(
+            runs_under_readonly(
+                pty(),
+                serde_json::json!({"action": "screen", "session": missing}),
+            )
+            .await,
+            "pty screen is a read and must still run under ReadOnly"
+        );
+        assert!(
+            !runs_under_readonly(
+                pty(),
+                serde_json::json!({"action": "send", "session": missing, "keys": ["x"]}),
+            )
+            .await,
+            "pty send must be refused under ReadOnly"
+        );
+    }
+
+    /// `composio` lists are reads; `execute` and `connect` act. The read calls
+    /// need a live API, so this asserts the declaration pair directly rather
+    /// than running the tool.
+    #[test]
+    fn composio_declares_only_its_list_actions_read_only() {
+        let composio =
+            tools::ComposioTool::new("test-key", None, Arc::new(SecurityPolicy::default()));
+        for action in ["list", "list_accounts", "connected_accounts"] {
+            assert!(
+                composio.is_read_only_call(&serde_json::json!({"action": action})),
+                "composio {action} is a read"
+            );
+        }
+        for action in ["execute", "connect"] {
+            assert!(
+                !composio.is_read_only_call(&serde_json::json!({"action": action})),
+                "composio {action} acts and must not be read-only"
+            );
+        }
+    }
+
+    /// The parallel fast path has its own call to the funnel. Two undeclared
+    /// calls batched in parallel under `ReadOnly` must both be refused and
+    /// neither may run, so the gate has to hold on that branch too.
+    #[tokio::test]
+    async fn readonly_refuses_calls_on_the_parallel_branch() {
+        let policy =
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadOnlyGateProbe {
+            ran: Arc::clone(&ran),
+        })];
+        let call = ParsedToolCall {
+            name: "readonly_gate_probe".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        let calls = vec![call.clone(), call];
+
+        let results = execute_tool_calls_collecting(
+            &calls,
+            &tools,
+            &NoopObserver,
+            None,
+            "cli",
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| !r.success
+                && r.output
+                    == "Security policy: read-only mode, cannot perform 'readonly_gate_probe'"),
+            "every parallel call must be refused: {:?}",
+            results.iter().map(|r| &r.output).collect::<Vec<_>>()
+        );
+        assert!(!ran.load(Ordering::SeqCst), "no refused call may run");
+    }
+
+    /// A call the `ReadOnly` gate refuses is audited as refused: `read_only`,
+    /// `allowed` false, `success` false, `approval` denied. The line that says
+    /// `executed` with `allowed: true` is written only after `execute` ran.
+    #[tokio::test]
+    async fn a_readonly_refusal_is_audited_as_refused_not_executed() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let policy =
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(AuditProbeTool {
+            ran: Arc::clone(&ran),
+        })];
+        let call = ParsedToolCall {
+            name: AUDIT_PROBE_TOOL.into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        assert!(!results[0].success);
+        assert!(!ran.load(Ordering::SeqCst), "the refused call must not run");
+
+        // Waits only for the one record this call writes; the audit append runs
+        // on a blocking worker, so the file is read until that line lands.
+        let (text, records) = audit_records_for_command(&log_path, AUDIT_PROBE_TOOL, 1).await;
+        assert_eq!(records.len(), 1, "one record for the refused call: {text}");
+        let record = &records[0];
+        assert_eq!(record["action"]["risk_level"], "read_only", "{text}");
+        assert_eq!(record["action"]["approval"], "denied", "{text}");
+        assert_eq!(record["action"]["allowed"], false, "{text}");
+        assert_eq!(record["result"]["success"], false, "{text}");
+        // Scope to this test's command: other tests append to the same file.
+        // Exactly one line for this command, and it is not `executed`.
+        let lines = text
+            .lines()
+            .filter(|l| l.contains(AUDIT_PROBE_TOOL))
+            .count();
+        assert_eq!(
+            lines, 1,
+            "a refused call writes exactly one line for its command: {text}"
+        );
+    }
+
+    /// A call the `ReadOnly` gate lets through is audited as run: `executed`,
+    /// `allowed` true, `approval` not required. This is the other half of the
+    /// refusal test above, so the audit cannot mark every call refused.
+    #[tokio::test]
+    async fn a_readonly_allowed_call_is_audited_as_executed() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let policy =
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadDeclaredAuditProbe {
+            ran: Arc::clone(&ran),
+        })];
+        let call = ParsedToolCall {
+            name: READ_AUDIT_PROBE_TOOL.into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        assert!(results[0].success, "a declared read runs under ReadOnly");
+        assert!(ran.load(Ordering::SeqCst), "the read must run");
+
+        let (text, records) = audit_records_for_command(&log_path, READ_AUDIT_PROBE_TOOL, 1).await;
+        assert_eq!(records.len(), 1, "one record for the run: {text}");
+        let record = &records[0];
+        assert_eq!(record["action"]["risk_level"], "executed", "{text}");
+        assert_eq!(record["action"]["allowed"], true, "{text}");
+        assert_eq!(record["result"]["success"], true, "{text}");
+    }
+
+    /// Name of the read-declaring probe the audit test uses. Its own name, so
+    /// the test picks its record out of a file other tests share.
+    const READ_AUDIT_PROBE_TOOL: &str = "audit_probe_read_only";
+
+    /// A tool that declares every call read-only and records whether it ran.
+    struct ReadDeclaredAuditProbe {
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ReadDeclaredAuditProbe {
+        fn name(&self) -> &str {
+            READ_AUDIT_PROBE_TOOL
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn is_read_only_call(&self, _args: &serde_json::Value) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "read".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// The gate is `ReadOnly`-only. The same undeclared tool that is refused
+    /// under `ReadOnly` must run under `Supervised` and `Full`, with the policy
+    /// in scope, so the gate changes nothing at those levels.
+    #[tokio::test]
+    async fn the_readonly_gate_does_nothing_under_supervised_or_full() {
+        for level in [
+            crate::security::AutonomyLevel::Supervised,
+            crate::security::AutonomyLevel::Full,
+        ] {
+            let policy = SecurityPolicy::default().with_autonomy(level);
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadOnlyGateProbe {
+                ran: Arc::clone(&ran),
+            })];
+            let call = ParsedToolCall {
+                name: "readonly_gate_probe".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: None,
+            };
+
+            let results = execute_tool_calls_collecting(
+                std::slice::from_ref(&call),
+                &tools,
+                &NoopObserver,
+                None,
+                "cli",
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                &crate::security::AuditActor::surface(),
+                Some(&policy),
+            )
+            .await
+            .expect("batch completes");
+
+            assert!(
+                ran.load(Ordering::SeqCst),
+                "{level:?}: an undeclared tool must run, the gate is ReadOnly-only"
+            );
+            assert_eq!(results[0].output, "did the thing", "{level:?}");
+        }
+    }
+
+    /// A tool that records whether `execute` ran. It declares nothing about
+    /// read-only calls, so under `ReadOnly` the loop must refuse it.
+    struct ReadOnlyGateProbe {
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ReadOnlyGateProbe {
+        fn name(&self) -> &str {
+            "readonly_gate_probe"
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "did the thing".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Under `ReadOnly` a tool that does not declare its call read-only is
+    /// refused by the loop, and its `execute` never runs.
+    #[tokio::test]
+    async fn readonly_refuses_an_undeclared_tool_without_running_it() {
+        let policy =
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadOnlyGateProbe {
+            ran: Arc::clone(&ran),
+        })];
+        let call = ParsedToolCall {
+            name: "readonly_gate_probe".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "cli",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+
+        assert!(!ran.load(Ordering::SeqCst), "a refused tool must not run");
+        assert!(!results[0].success);
+        assert_eq!(
+            results[0].output,
+            "Security policy: read-only mode, cannot perform 'readonly_gate_probe'",
         );
     }
 
@@ -4324,6 +4973,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .unwrap();
@@ -4361,6 +5011,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .unwrap();
@@ -4430,6 +5081,7 @@ mod tests {
             Some(&token),
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await;
 
@@ -4478,6 +5130,7 @@ mod tests {
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .unwrap();
@@ -4530,6 +5183,7 @@ mod tests {
             None,
             None,
             &audit_actor,
+            None,
         )
         .await
         .unwrap();
@@ -4591,6 +5245,7 @@ mod tests {
             None,
             None,
             &audit_actor,
+            None,
         )
         .await
         .unwrap();
@@ -5931,6 +6586,7 @@ Let me check the result."#;
             None,
             ledger,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
     }
@@ -6034,6 +6690,7 @@ Let me check the result."#;
             Some(events_tx), // events: Some
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("loop succeeds");
@@ -6137,6 +6794,7 @@ Let me check the result."#;
             Some(events_tx),
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("loop succeeds");
@@ -6212,6 +6870,7 @@ Let me check the result."#;
             None,
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("loop succeeds");
@@ -6308,6 +6967,7 @@ Let me check the result."#;
             Some(events_tx),
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await;
         assert!(res.is_err(), "expected cancellation error");
@@ -6361,6 +7021,7 @@ Let me check the result."#;
             Some(events_tx),
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .unwrap();
@@ -6414,6 +7075,7 @@ Let me check the result."#;
             Some(events_tx),
             None,
             &crate::security::AuditActor::surface(),
+            None,
         )
         .await
         .expect("loop completes");

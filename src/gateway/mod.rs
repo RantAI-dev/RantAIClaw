@@ -496,6 +496,9 @@ pub struct AppState {
     /// console chat path, which already constructs a fresh `Agent` (and so a
     /// fresh registry) per request.
     pub tools_factory: ToolsFactory,
+    /// The process-wide policy: the webhook gate reads its live autonomy level
+    /// and the tools share the same object. Built once in `start`.
+    pub security: Arc<SecurityPolicy>,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
@@ -564,36 +567,18 @@ pub struct AppState {
 fn build_tools_factory(
     runtime: Arc<dyn runtime::RuntimeAdapter>,
     mem: Arc<dyn Memory>,
+    // The one process-wide policy, shared with the webhook gate in `AppState`
+    // so the gate and the tools read the same autonomy level and rate budget.
+    security: Arc<SecurityPolicy>,
 ) -> ToolsFactory {
     // One long-lived policy for the process, refreshed per turn rather than
     // rebuilt. Rebuilding reset every piece of process state that hangs off it —
     // the rate-limit window most visibly, which is why `max_actions_per_hour`
-    // was unenforceable here.
-    //
-    // Lazily initialised on purpose: `build_tools_factory` receives no `Config`,
-    // so a hoisted `SecurityPolicy::default()` would carry `workspace_dir` from
-    // `Default` rather than from the real config, silently relocating the
-    // gateway's write root. `apply_config` deliberately does not carry
-    // `workspace_dir`, so the first turn must build from the real config.
-    let policy: Arc<Mutex<Option<Arc<SecurityPolicy>>>> = Arc::new(Mutex::new(None));
+    // was unenforceable here. The caller builds it from the real `Config`, so
+    // `workspace_dir` is the gateway's write root and not `Default`'s.
     Arc::new(move |config: &Config| {
-        let security = {
-            let mut slot = policy.lock();
-            match slot.as_ref() {
-                Some(p) => {
-                    p.apply_config(&config.autonomy);
-                    Arc::clone(p)
-                }
-                None => {
-                    let p = Arc::new(SecurityPolicy::from_config(
-                        &config.autonomy,
-                        &config.workspace_dir,
-                    ));
-                    *slot = Some(Arc::clone(&p));
-                    p
-                }
-            }
-        };
+        security.apply_config(&config.autonomy);
+        let security = Arc::clone(&security);
         let (composio_key, composio_entity_id) = if config.composio.enabled {
             (
                 config.composio.api_key.as_deref(),
@@ -684,7 +669,12 @@ pub fn build_gateway_router(
     ));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
-    let tools_factory = build_tools_factory(runtime, Arc::clone(&mem));
+    // Built from the real config, so `workspace_dir` is the gateway's write root.
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let tools_factory = build_tools_factory(runtime, Arc::clone(&mem), Arc::clone(&security));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -822,6 +812,7 @@ pub fn build_gateway_router(
         mem,
         memory_search_mode,
         tools_factory,
+        security,
         webhook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
@@ -1788,6 +1779,7 @@ async fn run_gateway_chat_with_multimodal(
         state.ledger.as_deref(),
         // Webhook: surface name only, no chat sender and no role.
         &crate::security::AuditActor::surface(),
+        Some(state.security.as_ref()),
     )
     .await?;
 
@@ -3166,6 +3158,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -3220,6 +3213,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -3591,6 +3585,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         }
     }
 
@@ -4009,6 +4004,7 @@ mod tests {
                     Box::new(crate::tools::FileReadTool::new(security)),
                 ]
             }),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let run = async {
@@ -4281,6 +4277,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let mut headers = HeaderMap::new();
@@ -4349,6 +4346,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let headers = HeaderMap::new();
@@ -4439,6 +4437,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let headers = HeaderMap::new();
@@ -4508,6 +4507,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let response = handle_webhook(
@@ -4561,6 +4561,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let mut headers = HeaderMap::new();
@@ -4619,6 +4620,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let mut headers = HeaderMap::new();
@@ -4712,6 +4714,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         }
     }
 
@@ -5486,6 +5489,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -5546,6 +5550,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let mut headers = HeaderMap::new();
@@ -5609,6 +5614,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
@@ -5708,6 +5714,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         }
     }
 
@@ -6234,7 +6241,11 @@ mod tests {
 
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
             Arc::from(runtime::create_runtime(&config.runtime).unwrap());
-        let factory = build_tools_factory(runtime, Arc::new(MockMemory));
+        let factory = build_tools_factory(
+            runtime,
+            Arc::new(MockMemory),
+            Arc::new(SecurityPolicy::default()),
+        );
 
         let args = |n: u32| serde_json::json!({ "path": format!("n{n}.txt"), "content": "hi" });
 
@@ -6281,7 +6292,11 @@ mod tests {
 
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
             Arc::from(runtime::create_runtime(&config.runtime).unwrap());
-        let factory = build_tools_factory(runtime, Arc::new(MockMemory));
+        let factory = build_tools_factory(
+            runtime,
+            Arc::new(MockMemory),
+            Arc::new(SecurityPolicy::default()),
+        );
 
         let args = serde_json::json!({ "path": "note.txt", "content": "hi" });
 
@@ -6496,6 +6511,7 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(webhook_prompt_tools),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         };
         let response = handle_webhook(
             State(state),
