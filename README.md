@@ -210,7 +210,10 @@ A stale document asserting an active security control is worse than silence, so:
 - **The tool-call audit trail is on, but `[security.audit]` still configures
   nothing.** Every tool call — executed and refused — now writes one JSON record to
   `<profile>/audit.log` (channel, tool name, approved, allowed, succeeded,
-  duration; never the arguments). A call refused under `readonly` is written with
+  duration; never the arguments). `channel` names the surface the call came from:
+  `cli`, `tui`, `console` (the web console, streaming and non-streaming), a chat channel
+  name such as `telegram` or `discord`, or one of the non-chat surfaces `webhook`, `delegate`
+  and `scheduler`. A call refused under `readonly` is written with
   `risk_level` `read_only`, `allowed` false and `success` false. What is *not* wired is the operator's
   `[security.audit]` block: `SecurityConfig` is not a field of `Config`, so that
   section is still an unknown top-level key and the trail runs on defaults

@@ -11,7 +11,7 @@ The blast radius surface. Every tool call routes through one approval gate befor
 - v0.6.50 Smart/Strict UX overhaul (inline Y/A/N prompt, plan-mode Strict, cascading approvals)
 - Command allowlist + path traversal + injection blocking
 - Rate limiting (default 20 actions/hour)
-- Tool-call audit log at `<profile>/audit.log` — one JSON record per call: channel, tool name, whether it was approved, whether it was allowed, whether it succeeded, and how long it took. Tool **arguments** are never recorded.
+- Tool-call audit log at `<profile>/audit.log` — one JSON record per call: channel (the surface the call came from: `cli`, `tui`, `console`, or a chat channel name), tool name, whether it was approved, whether it was allowed, whether it succeeded, and how long it took. Tool **arguments** are never recorded.
 
 ## v0.6.50 approval UX (Claude Code parity)
 

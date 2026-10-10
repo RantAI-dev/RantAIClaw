@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `channel` of a tool-call audit line names the surface that made the call. A call made from the
+  TUI or the web console was recorded as `cli`, the value the agent passes for its approval
+  behaviour. It now records `tui` or `console`; the chat, CLI, webhook, delegate and cron lines are
+  unchanged.
 - `rantaiclaw autonomy off` after `rantaiclaw autonomy manual` no longer leaves every tool
   prompting. Manual's `"*"` wildcard stayed in `always_ask` under `full`, so the gate kept asking
   for each call (a `glob_search` answered `Denied by user.`) while the CLI reported gating as off.

@@ -56,6 +56,9 @@ pub struct Agent {
     /// config. `None` for agents constructed via the bare builder
     /// (tests, custom embeds); always `Some` after `from_config`.
     security: Option<Arc<SecurityPolicy>>,
+    /// Surface this agent serves, written as the audit `channel` (`tui`,
+    /// `console`). `None` means the CLI, which keeps the `cli` value.
+    surface: Option<&'static str>,
     /// MCP server health snapshot taken during `from_config`. Used
     /// by the TUI's `/mcp` slash command to show which servers
     /// connected vs. failed without re-probing.
@@ -291,6 +294,9 @@ impl AgentBuilder {
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
             security: self.security,
+            // The builder carries no surface: the surfaces that name one call
+            // [`Agent::set_surface`] after they build the agent.
+            surface: None,
             mcp_health: Vec::new(),
             mcp_tools_by_server: std::collections::HashMap::new(),
             identity_config: self.identity_config.unwrap_or_default(),
@@ -605,6 +611,13 @@ impl Agent {
                 agent.ledger = crate::cost::ledger_for(config);
                 agent
             })
+    }
+
+    /// Name the surface this agent serves for the audit `channel`. Set after
+    /// `from_config` by the surfaces that build their agent through it (TUI,
+    /// console), which otherwise would write the CLI's `cli`.
+    pub fn set_surface(&mut self, surface: &'static str) {
+        self.surface = Some(surface);
     }
 
     /// Inject (or clear) the Layer-A tool-approval gate after construction.
@@ -1012,6 +1025,12 @@ impl Agent {
         // Layer-A manager); the console SSE surface injects a manager + a
         // web-modal backend so non-read-only tools require an in-browser
         // decision. Streaming goes through `events`.
+        // The audit `channel` names the surface this agent serves. The
+        // behaviour channel name stays `cli` below: only the audit line changes.
+        let audit_actor = match self.surface {
+            Some(name) => crate::security::AuditActor::named_surface(name),
+            None => crate::security::AuditActor::surface(),
+        };
         let result = crate::agent::loop_::run_structured_loop(
             self.provider.as_ref(),
             &mut self.history,
@@ -1035,7 +1054,7 @@ impl Agent {
             None,
             events.cloned(),
             self.ledger.as_deref(),
-            &crate::security::AuditActor::surface(),
+            &audit_actor,
             self.security.as_deref(),
         )
         .await;
@@ -1722,5 +1741,132 @@ mod tests {
             saw_cancelled_done,
             "expected Done {{ cancelled: true }} event"
         );
+    }
+
+    // ── Audit `channel` names the surface ──────────────────────────────────
+
+    /// Tool name only the audit-channel tests use, so each test can pick its
+    /// own record out of a file other tests append to.
+    const CHANNEL_PROBE_TOOL: &str = "audit_channel_probe";
+
+    /// A tool that does nothing but exist, so a scripted tool call reaches the
+    /// audit funnel through a real `Agent::turn`.
+    struct ChannelProbeTool;
+
+    #[async_trait]
+    impl Tool for ChannelProbeTool {
+        fn name(&self) -> &str {
+            CHANNEL_PROBE_TOOL
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Drive one real turn in which the model calls the probe tool once, with
+    /// the surface name set on the agent when `surface` is `Some`, and return
+    /// the `channel` field of the audit record the funnel wrote for that call.
+    async fn audit_channel_for_one_turn(surface: Option<&'static str>) -> String {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![
+                crate::providers::ChatResponse {
+                    usage: None,
+                    text: Some(String::new()),
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "tc1".into(),
+                        name: CHANNEL_PROBE_TOOL.into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+                crate::providers::ChatResponse {
+                    usage: None,
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                },
+            ]),
+        });
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(ChannelProbeTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+        // The production surfaces name themselves with `set_surface` after
+        // `from_config`; the test drives that same setter.
+        if let Some(name) = surface {
+            agent.set_surface(name);
+        }
+
+        let response = agent.turn("hi").await.expect("turn completes");
+        assert_eq!(response, "done");
+
+        for _ in 0..100 {
+            let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let record = text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|r| r["action"]["command"] == CHANNEL_PROBE_TOOL);
+            if let Some(record) = record {
+                return record["actor"]["channel"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no audit record for the probe tool was written");
+    }
+
+    /// The TUI's agent writes `tui` on the audit line, not the behaviour value
+    /// `cli` it passes to the loop.
+    #[tokio::test]
+    async fn tui_agent_audit_line_names_the_tui_surface() {
+        assert_eq!(audit_channel_for_one_turn(Some("tui")).await, "tui");
+    }
+
+    /// The console's agent writes `console`, the one name for both its
+    /// streaming and non-streaming endpoints.
+    #[tokio::test]
+    async fn console_agent_audit_line_names_the_console_surface() {
+        assert_eq!(audit_channel_for_one_turn(Some("console")).await, "console");
+    }
+
+    /// An agent with no surface name (the CLI path) keeps writing `cli`, as it
+    /// does today.
+    #[tokio::test]
+    async fn agent_without_a_surface_still_writes_cli() {
+        assert_eq!(audit_channel_for_one_turn(None).await, "cli");
     }
 }

@@ -674,6 +674,7 @@ async fn agent_chat_sync(
         crate::agent::Agent::from_config_with_mcp_pool(&config, state.observer.clone(), &mcp)
             .await
             .map_err(map_agent_error)?;
+    agent.set_surface("console");
     // A gated tool call on this path had no approval backend, so the loop fell
     // back to the one derived from the surface name — the interactive CLI
     // prompt. Running `rantaiclaw gateway` in a terminal made a tool call block
@@ -852,6 +853,7 @@ async fn agent_chat_stream(
     tokio::spawn(async move {
         match crate::agent::Agent::from_config_with_mcp_pool(&config, observer, &mcp).await {
             Ok(mut agent) => {
+                agent.set_surface("console");
                 // Same scoping as the non-streaming path: one agent per request,
                 // pointed at the conversation it is serving.
                 agent.set_conversation_id(scope_session_id.filter(|s: &String| !s.is_empty()));

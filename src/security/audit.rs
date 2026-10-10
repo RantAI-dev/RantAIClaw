@@ -228,14 +228,18 @@ pub struct ToolCallRecord {
 }
 
 /// Identity of who asked for a tool call, threaded from each entry point to
-/// the audit log. Chat sends a sender id + role (owner or guest); non-chat
-/// surfaces (CLI / scheduler / webhook / delegate) record their surface name
-/// on the actor's `channel` field, so the trail still says who triggered the
-/// call without filling `sender` or `role`.
+/// the audit log. Chat sends a sender id + role (owner or guest). A surface
+/// that serves the operator's own UI (`tui`, `console`) names itself in
+/// `surface`, and the audit `channel` is that name. Every other non-chat
+/// caller leaves `surface` empty and the audit `channel` is the value the
+/// caller passes for behaviour (`cli`, `scheduler`, `webhook`, `delegate`).
 #[derive(Debug, Clone, Default)]
 pub struct AuditActor {
     pub sender: Option<String>,
     pub role: Option<String>,
+    /// Surface name written as the audit `channel` when set. `None` leaves
+    /// the caller's channel name in place.
+    pub surface: Option<String>,
 }
 
 impl AuditActor {
@@ -245,15 +249,26 @@ impl AuditActor {
         Self {
             sender: Some(sender),
             role: Some(role.to_string()),
+            surface: None,
         }
     }
 
-    /// Non-chat surface: returns the default `AuditActor` with `sender` and
-    /// `role` left empty. The surface name is recorded separately on
-    /// `channel` at every call site, so this constructor carries no argument
-    /// and adds nothing to the actor.
+    /// Non-chat caller that leaves `sender`, `role` and `surface` empty. The
+    /// audit `channel` is the caller's channel name. This constructor takes
+    /// no argument so that it cannot name a surface; a caller that serves the
+    /// operator's own UI uses [`Self::named_surface`] instead.
     pub fn surface() -> Self {
         Self::default()
+    }
+
+    /// Non-chat caller that writes `name` as the audit `channel`, for a
+    /// surface whose behaviour channel name (`cli`) would otherwise be
+    /// recorded for a different surface. `name` is `tui` or `console`.
+    pub fn named_surface(name: &'static str) -> Self {
+        Self {
+            surface: Some(name.to_string()),
+            ..Self::default()
+        }
     }
 }
 
@@ -944,12 +959,11 @@ mod tests {
     // Pin the actual contract here so a future reader cannot quietly
     // re-introduce the half-truths.
 
-    /// `AuditActor::surface` takes no argument and returns the default. The
-    /// surface name is already recorded on `channel` at every call site, so
-    /// the constructor deliberately leaves `sender` and `role` empty. A
-    /// version that took the name and stuffed it onto `sender` (or
-    /// `user_id`) would change what existing audit readers parse — keep it
-    /// that way.
+    /// `AuditActor::surface` takes no argument and returns the default, so
+    /// the constructor leaves `sender`, `role` and `surface` empty. A version
+    /// that took a name and stuffed it onto `sender` (or `user_id`) would
+    /// change what existing audit readers parse, so a surface that names
+    /// itself uses `AuditActor::named_surface` instead.
     ///
     /// Written against the post-fix API (`surface()` with zero args). It will
     /// fail to compile against the pre-fix `surface(_name: &str)` signature;
@@ -971,6 +985,112 @@ mod tests {
         let default = AuditActor::default();
         assert_eq!(actor.sender, default.sender);
         assert_eq!(actor.role, default.role);
+        assert!(
+            actor.surface.is_none(),
+            "surface() must leave surface empty, got {:?}",
+            actor.surface
+        );
+        assert_eq!(actor.surface, default.surface);
+    }
+
+    /// Every production `Agent::from_config*` construction in the three files
+    /// pinned below (`tui/app.rs`, `tui/async_bridge.rs`,
+    /// `gateway/api_v1.rs`) must be followed by `set_surface`, or its audit
+    /// lines record the CLI's `cli` channel. Each file is pinned to its exact
+    /// construction count with a `set_surface` call inside the next few lines,
+    /// so a new site without one fails, and so does a new site that the pin
+    /// does not account for. Production halves only, as in the test above.
+    ///
+    /// Scope is those three files, not all of `src/`: a construction added in a
+    /// new file, written through a `use .. as` alias, or named by a new
+    /// `from_config_*` variant would not be seen. The pin covers every
+    /// production `Agent` construction that exists today; extending it is a
+    /// deliberate change to this list.
+    ///
+    /// Mutation: delete the `set_surface("console")` at
+    /// `src/gateway/api_v1.rs` (the streaming site) and this fails.
+    #[test]
+    fn every_production_agent_construction_in_the_pinned_files_names_its_surface() {
+        // `tui/app.rs` holds many `#[cfg(test)] mod` blocks, not one at the end,
+        // so cutting at the first marker would hide production code below it.
+        // Remove each test module by brace-matching from its opening brace.
+        const TEST_MODULE_MARKER: &str = "#[cfg(test)]\nmod ";
+        fn production_half(src: &str) -> String {
+            let mut out = String::new();
+            let mut rest = src;
+            while let Some(at) = rest.find(TEST_MODULE_MARKER) {
+                out.push_str(&rest[..at]);
+                let after = &rest[at..];
+                let open = after.find('{').unwrap_or(after.len());
+                let mut depth = 0usize;
+                let mut end = after.len();
+                for (i, ch) in after[open..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                rest = &after[end..];
+            }
+            out.push_str(rest);
+            out
+        }
+        // (file, number of production constructions, each needing set_surface)
+        const SITES: &[(&str, &str, usize)] = &[
+            ("tui/app.rs", include_str!("../tui/app.rs"), 1),
+            (
+                "tui/async_bridge.rs",
+                include_str!("../tui/async_bridge.rs"),
+                2,
+            ),
+            ("gateway/api_v1.rs", include_str!("../gateway/api_v1.rs"), 2),
+        ];
+        const CONSTRUCTORS: &[&str] = &[
+            "Agent::from_config(",
+            "Agent::from_config_with_mcp_pool(",
+            "Agent::from_config_with_observer(",
+        ];
+        // How many lines after a construction a `set_surface` may sit. The
+        // literal `"` is part of the match: every call site passes a string
+        // literal on the same line, so a mention of the setter in prose or in
+        // a call that passes a name cannot satisfy the window.
+        const WINDOW: usize = 8;
+        const SET_SURFACE: &str = "set_surface(\"";
+        for (name, src, expected) in SITES {
+            let production = production_half(src);
+            let lines: Vec<&str> = production.lines().collect();
+            let mut constructions = 0usize;
+            for (idx, line) in lines.iter().enumerate() {
+                let is_code = !line.trim_start().starts_with("//");
+                if is_code && CONSTRUCTORS.iter().any(|c| line.contains(c)) {
+                    constructions += 1;
+                    let end = (idx + WINDOW).min(lines.len());
+                    let named = lines[idx..end]
+                        .iter()
+                        .any(|l| !l.trim_start().starts_with("//") && l.contains(SET_SURFACE));
+                    assert!(
+                        named,
+                        "{name}:{} constructs an Agent without a set_surface call within \
+                         {WINDOW} lines; its audit lines would record `cli`",
+                        idx + 1
+                    );
+                }
+            }
+            assert_eq!(
+                constructions, *expected,
+                "{name} has {constructions} production Agent constructions; the pin says \
+                 {expected}. A decrease means a construction site went missing, or the \
+                 production-half cut above ate or missed lines: investigate, do not lower \
+                 the pin. Raise it only after confirming every new site calls set_surface"
+            );
+        }
     }
 
     /// Every production call site must have been migrated to the new
@@ -1002,7 +1122,7 @@ mod tests {
             assert!(
                 !production.contains("AuditActor::surface(\""),
                 "production of {name} still calls AuditActor::surface(\"...\"); \
-                 drop the argument — the surface name is already on `channel`"
+                 drop the argument; a surface that names itself uses `named_surface`"
             );
         }
     }

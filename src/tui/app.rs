@@ -8198,7 +8198,10 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // open the provider setup overlay, and let TurnRequest::Reload heal the
     // session in place once a working config is saved.
     let (mut agent, agent_boot_error) = match Agent::from_config(&app_config).await {
-        Ok(agent) => (Some(agent), None),
+        Ok(mut agent) => {
+            agent.set_surface("tui");
+            (Some(agent), None)
+        }
         Err(e) => {
             tracing::error!("agent failed to start: {e:#}");
             (None, Some(format!("{e:#}")))
