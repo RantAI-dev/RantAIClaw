@@ -263,6 +263,66 @@ pub use traits::Tool;
 pub use traits::{ToolResult, ToolSpec};
 pub use web_search_tool::WebSearchTool;
 
+/// Every built-in tool name `all_tools` can register: the union over all
+/// conditional registrations (browser, http_request, web_search, tasks,
+/// delegate, composio, the `remote-install` ssh/pty pair, and the
+/// profile-gated skill authoring tools). A guest grant must name one of these
+/// or an `mcp__`/`skill_` tool, or the gate can never match it.
+///
+/// `builtin_tool_names_match_the_full_registry` builds the fullest registry and
+/// asserts this list equals its names, so a tool added to `all_tools` without an
+/// entry here fails the test. Keep the two in step. That equality is a
+/// default-feature-set claim: `ssh` and `pty` are gated behind
+/// `remote-install`, so under `--no-default-features` the compiled registry is a
+/// subset of this list and the second assertion would fail.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "file_read",
+    "file_write",
+    "glob_search",
+    "cron_add",
+    "cron_list",
+    "cron_remove",
+    "cron_update",
+    "cron_run",
+    "cron_runs",
+    "memory_store",
+    "memory_recall",
+    "memory_forget",
+    "session_search",
+    "proxy_config",
+    "manage_permissions",
+    "issue_pairing_code",
+    "git_operations",
+    "pushover",
+    "browser_open",
+    "browser",
+    "http_request",
+    "web_search_tool",
+    "pdf_read",
+    "screenshot",
+    "image_info",
+    "ssh",
+    "pty",
+    "skills_list",
+    "skill_view",
+    "skills_search",
+    "skills_install",
+    "skills_install_deps",
+    "author_skill",
+    "composio",
+    "delegate",
+    "create_task",
+    "list_tasks",
+    "get_task",
+    "update_task_status",
+    "create_subtask",
+    "complete_subtask",
+    "review_task",
+    "add_comment",
+    "read_comments",
+];
+
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
@@ -861,6 +921,106 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 4);
+    }
+
+    /// The static list must equal the names the fullest registry produces, in
+    /// both directions. A tool added to `all_tools_with_runtime` without a
+    /// list entry fails the first check; a list entry for a tool that was
+    /// removed fails the second.
+    #[test]
+    fn builtin_tool_names_match_the_full_registry() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        // Everything the registry can gate on, switched on, so the build is the
+        // fullest one this config can produce.
+        let browser = BrowserConfig {
+            enabled: true,
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig {
+            enabled: true,
+            ..crate::config::HttpRequestConfig::default()
+        };
+        let mut root = test_config(&tmp);
+        root.web_search.enabled = true;
+        root.tasks.enabled = true;
+        root.agents.insert(
+            "helper".into(),
+            crate::config::DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "test-model".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+        let agents = root.agents.clone();
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            Some("test-composio-key"),
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &agents,
+            None,
+            &root,
+        );
+        let registry: std::collections::BTreeSet<&str> = tools.iter().map(|t| t.name()).collect();
+        let listed: std::collections::BTreeSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
+
+        // `author_skill` and `skills_install` are registered only when the
+        // active profile resolves (`ProfileManager::active()`). A machine with
+        // a read-only or unset config root does not resolve it, so they are
+        // not expected then. When it does resolve, they must be present.
+        let profile_resolved = crate::profile::ProfileManager::active().is_ok();
+        let profile_gated: &[&str] = &["author_skill", "skills_install"];
+        let mut expected_in_registry: std::collections::BTreeSet<&str> = listed.clone();
+        if !profile_resolved {
+            for name in profile_gated {
+                expected_in_registry.remove(name);
+            }
+        }
+        // `ssh` and `pty` are registered only under the `remote-install`
+        // feature, so a `--no-default-features` build does not produce them.
+        #[cfg(not(feature = "remote-install"))]
+        for name in ["ssh", "pty"] {
+            expected_in_registry.remove(name);
+        }
+
+        let missing_from_list: Vec<&&str> =
+            registry.iter().filter(|n| !listed.contains(**n)).collect();
+        let missing_from_registry: Vec<&&str> = expected_in_registry
+            .iter()
+            .filter(|n| !registry.contains(**n))
+            .collect();
+        assert!(
+            missing_from_list.is_empty(),
+            "registry tools missing from BUILTIN_TOOL_NAMES: {missing_from_list:?}"
+        );
+        assert!(
+            missing_from_registry.is_empty(),
+            "BUILTIN_TOOL_NAMES entries the full registry never produces: {missing_from_registry:?}"
+        );
+        assert_eq!(
+            BUILTIN_TOOL_NAMES.len(),
+            listed.len(),
+            "BUILTIN_TOOL_NAMES holds a duplicate"
+        );
     }
 
     #[test]

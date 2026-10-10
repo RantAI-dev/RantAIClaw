@@ -26,8 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   composio `list`, `list_accounts` and `connected_accounts` actions, and the `pty` `screen`, `wait`
   and `stop` actions. Under `supervised` and `full` nothing changes.
 
+### Added
+
+- `rantaiclaw permissions add command`, the TUI `/permissions` command and the `manage_permissions`
+  tool warn when a guest command glob is wide (its command name holds `*` or `?`, so `rm*` matches
+  every command starting with `rm`) or rated high risk (`rm -rf *`). The glob is still stored; the
+  warning says what it grants.
+
 ### Changed
 
+- An unknown guest tool name is refused by `permissions add tool`, the TUI `/permissions` command and
+  the `manage_permissions` tool. Accepted names are built-in tool names, `mcp__*` and `skill_*` names.
+  Owner-only tools such as `delegate` are refused too. Removing an existing entry still works, and a
+  config that already holds an unknown name loads as before.
 - Approval presets write two policy files (`autonomy.toml` and `command_allowlist.toml`),
   not three. An existing `forbidden_paths.toml` is ignored and left where it is. The
   profile clone no longer copies it. `~/.azure`, `~/.config/gcloud` and the profile
