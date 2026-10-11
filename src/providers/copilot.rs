@@ -13,7 +13,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, ProviderUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -134,6 +134,28 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    /// OpenAI chat-completions usage block; absent on some responses.
+    #[serde(default)]
+    usage: Option<ApiUsage>,
+}
+
+/// Token counts from the chat-completions `usage` block.
+#[derive(Debug, Deserialize)]
+struct ApiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+/// Map the endpoint's usage block to provider counts. Absent or all-zero
+/// counts yield `None`, never `Some(0)`.
+fn usage_from_api(usage: Option<&ApiUsage>) -> Option<ProviderUsage> {
+    let usage = usage?;
+    ProviderUsage::from_counts(
+        usage.prompt_tokens.unwrap_or(0),
+        usage.completion_tokens.unwrap_or(0),
+        usage.total_tokens.unwrap_or(0),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,6 +379,7 @@ impl CopilotProvider {
         }
 
         let api_response: ApiChatResponse = response.json().await?;
+        let usage = usage_from_api(api_response.usage.as_ref());
         let choice = api_response
             .choices
             .into_iter()
@@ -378,7 +401,7 @@ impl CopilotProvider {
             .collect();
 
         Ok(ProviderChatResponse {
-            usage: None,
+            usage,
             text: choice.message.content,
             tool_calls,
         })
@@ -669,6 +692,36 @@ impl Provider for CopilotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_completions_usage_maps_to_provider_counts() {
+        let api: ApiChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        )
+        .unwrap();
+        let usage = usage_from_api(api.usage.as_ref()).expect("usage is reported");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn chat_completions_usage_absent_block_maps_to_none() {
+        let api: ApiChatResponse =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"ok"}}]}"#).unwrap();
+        assert!(usage_from_api(api.usage.as_ref()).is_none());
+    }
+
+    #[test]
+    fn chat_completions_all_zero_usage_maps_to_none() {
+        let api: ApiChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
+        )
+        .unwrap();
+        assert!(usage_from_api(api.usage.as_ref()).is_none());
+    }
 
     #[test]
     fn new_without_token() {

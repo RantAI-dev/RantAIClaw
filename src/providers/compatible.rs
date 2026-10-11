@@ -4,7 +4,8 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    Provider, ProviderUsage, StreamChunk, StreamError, StreamOptions, StreamResult,
+    ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -272,6 +273,35 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    /// OpenAI chat-completions usage block; absent on some responses.
+    #[serde(default)]
+    usage: Option<ApiUsage>,
+}
+
+/// Token counts from the chat-completions `usage` block.
+#[derive(Debug, Deserialize)]
+struct ApiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+/// Map the endpoint's usage block to provider counts. Absent or all-zero
+/// counts yield `None`, never `Some(0)`.
+fn usage_from_api(usage: Option<&ApiUsage>) -> Option<ProviderUsage> {
+    let usage = usage?;
+    ProviderUsage::from_counts(
+        usage.prompt_tokens.unwrap_or(0),
+        usage.completion_tokens.unwrap_or(0),
+        usage.total_tokens.unwrap_or(0),
+    )
+}
+
+/// Asks an OpenAI-compatible endpoint to send a usage block on the final
+/// stream chunk.
+#[derive(Debug, Serialize)]
+struct IncludeUsage {
+    include_usage: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +464,8 @@ struct NativeChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<IncludeUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
@@ -590,7 +622,11 @@ pub(crate) fn split_for_streaming(text: &str) -> Vec<String> {
 /// Server-Sent Event stream chunk for OpenAI-compatible streaming.
 #[derive(Debug, Deserialize)]
 struct StreamChunkResponse {
+    #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Present on the final chunk when the request set `include_usage`.
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,6 +728,9 @@ fn parse_sse_line_full(line: &str) -> StreamResult<Option<ParsedSseLine>> {
 
         // Parse JSON delta
         let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+        // The final chunk of an `include_usage` stream has no choices and
+        // carries only the usage block.
+        let usage = chunk.usage.as_ref().and_then(|u| usage_from_api(Some(u)));
 
         if let Some(choice) = chunk.choices.first() {
             // Prefer delta.content; fall back to reasoning_content for
@@ -711,6 +750,16 @@ fn parse_sse_line_full(line: &str) -> StreamResult<Option<ParsedSseLine>> {
                 from_reasoning,
                 tool_calls: choice.delta.tool_calls.clone(),
                 finish_reason: choice.finish_reason.clone(),
+                usage,
+            }));
+        }
+        if usage.is_some() {
+            return Ok(Some(ParsedSseLine {
+                text: None,
+                from_reasoning: false,
+                tool_calls: None,
+                finish_reason: None,
+                usage,
             }));
         }
     }
@@ -728,6 +777,8 @@ struct ParsedSseLine {
     tool_calls: Option<Vec<StreamToolCallDelta>>,
     #[allow(dead_code)] // Reserved for future use (e.g., emit "[tool_use stop]" cues to TUI).
     finish_reason: Option<String>,
+    /// Usage from the final chunk, when the endpoint sent one.
+    usage: Option<ProviderUsage>,
 }
 
 /// Materialise an in-progress tool-call accumulator into the public
@@ -1589,6 +1640,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = usage_from_api(chat_response.usage.as_ref());
         let choice = chat_response
             .choices
             .into_iter()
@@ -1614,7 +1666,7 @@ impl Provider for OpenAiCompatibleProvider {
             .collect::<Vec<_>>();
 
         Ok(ProviderChatResponse {
-            usage: None,
+            usage,
             text,
             tool_calls,
         })
@@ -1644,6 +1696,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: Self::convert_messages_for_native(&effective_messages),
             temperature,
             stream: Some(false),
+            stream_options: None,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -1720,6 +1773,7 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let native_response: ApiChatResponse = response.json().await?;
+        let usage = usage_from_api(native_response.usage.as_ref());
         let message = native_response
             .choices
             .into_iter()
@@ -1727,7 +1781,10 @@ impl Provider for OpenAiCompatibleProvider {
             .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        Ok(Self::parse_native_response(message))
+        Ok(ProviderChatResponse {
+            usage,
+            ..Self::parse_native_response(message)
+        })
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1778,24 +1835,48 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             request.messages.to_vec()
         };
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: Self::convert_messages_for_native(&effective_messages),
-            temperature,
-            stream: Some(true),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-        };
-
         let url = self.chat_completions_url();
-        let response = self
-            .apply_auth_header(
+        let send = |stream_options: Option<IncludeUsage>| {
+            let native_request = NativeChatRequest {
+                model: model.to_string(),
+                messages: Self::convert_messages_for_native(&effective_messages),
+                temperature,
+                stream: Some(true),
+                stream_options,
+                tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                tools: tools.clone(),
+            };
+            self.apply_auth_header(
                 self.http_client().post(&url).json(&native_request),
                 &credential,
             )
             .header("Accept", "text/event-stream")
             .send()
-            .await?;
+        };
+
+        let mut response = send(Some(IncludeUsage {
+            include_usage: true,
+        }))
+        .await?;
+        // An endpoint that rejects `stream_options` must still stream: retry
+        // once without the field. The turn then reports no usage.
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let error = response.text().await.unwrap_or_default();
+            if error.contains("stream_options") {
+                tracing::warn!(
+                    "{} rejected stream_options; retrying the stream without usage reporting",
+                    self.name
+                );
+                response = send(None).await?;
+            } else {
+                anyhow::bail!(
+                    "{} API error ({}): {}",
+                    self.name,
+                    reqwest::StatusCode::BAD_REQUEST,
+                    super::sanitize_api_error(&error)
+                );
+            }
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1831,6 +1912,8 @@ impl Provider for OpenAiCompatibleProvider {
         // forward reasoning content to the user.
         let mut in_think = false;
         let mut think_partial = String::new();
+        // Usage arrives on the final chunk, when the endpoint sent one.
+        let mut usage: Option<ProviderUsage> = None;
         while let Some(item) = bytes_stream.next().await {
             let bytes = item?;
             push_decoded(&mut pending, &bytes, &mut buffer);
@@ -1841,6 +1924,9 @@ impl Provider for OpenAiCompatibleProvider {
                     Ok(Some(p)) => p,
                     _ => continue,
                 };
+                if parsed.usage.is_some() {
+                    usage = parsed.usage;
+                }
 
                 // Tool-call fragments: accumulate per-index. The first
                 // fragment for an index carries id+name; subsequent
@@ -1883,7 +1969,7 @@ impl Provider for OpenAiCompatibleProvider {
                     if text_tx.send(piece).await.is_err() {
                         let tool_calls = drain_tool_accumulator(tool_acc);
                         return Ok(ProviderChatResponse {
-                            usage: None,
+                            usage,
                             text: streamed_reply(full_text, reasoning_text, !tool_calls.is_empty()),
                             tool_calls,
                         });
@@ -1916,7 +2002,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let tool_calls = drain_tool_accumulator(tool_acc);
         Ok(ProviderChatResponse {
-            usage: None,
+            usage,
             text: streamed_reply(full_text, reasoning_text, !tool_calls.is_empty()),
             tool_calls,
         })
@@ -3414,6 +3500,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_reports_the_usage_the_endpoint_sent() {
+        let mut body = chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "ok",
+        }));
+        body["usage"] = serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+        });
+        let (_server, provider) = endpoint_answering(body).await;
+
+        let usage = chat_once(&provider).await.usage.expect("usage is reported");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[tokio::test]
+    async fn chat_without_a_usage_block_reports_none() {
+        let (_server, provider) = endpoint_answering(chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "ok",
+        })))
+        .await;
+
+        assert!(chat_once(&provider).await.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_all_zero_usage_reports_none() {
+        let mut body = chat_completion_body(serde_json::json!({
+            "role": "assistant",
+            "content": "ok",
+        }));
+        body["usage"] = serde_json::json!({
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        });
+        let (_server, provider) = endpoint_answering(body).await;
+
+        assert!(chat_once(&provider).await.usage.is_none());
+    }
+
+    #[tokio::test]
     async fn chat_drops_reasoning_when_the_response_has_a_tool_call() {
         let (_server, provider) = endpoint_answering(chat_completion_body(serde_json::json!({
             "role": "assistant",
@@ -3581,6 +3713,132 @@ mod tests {
             while rx.try_recv().is_ok() {}
         }
         response
+    }
+
+    /// A final usage-only chunk, as an endpoint sends when the request
+    /// set `stream_options.include_usage`.
+    fn usage_chunk(prompt: u64, completion: u64) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn stream_reports_usage_from_the_final_chunk() {
+        let response = stream_once(&[
+            delta(serde_json::json!({ "content": "hello" })),
+            usage_chunk(10, 5),
+        ])
+        .await;
+        let usage = response.usage.expect("the final chunk reports usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+        assert_eq!(response.text.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn stream_without_usage_chunk_reports_none() {
+        let response = stream_once(&[delta(serde_json::json!({ "content": "hello" }))]).await;
+        assert!(response.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_all_zero_usage_chunk_reports_none() {
+        let response = stream_once(&[
+            delta(serde_json::json!({ "content": "hello" })),
+            usage_chunk(0, 0),
+        ])
+        .await;
+        assert!(response.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_request_asks_for_usage_on_the_final_chunk() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                sse_body(&[delta(serde_json::json!({ "content": "hi" }))]).into_bytes(),
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "mock-reasoner",
+            &server.uri(),
+            Some("test-key"),
+            AuthStyle::Bearer,
+        );
+        let messages = [ChatMessage::user("read it")];
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        provider
+            .chat_stream(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "mock-model",
+                0.0,
+                tx,
+            )
+            .await
+            .expect("the mock streams");
+        let requests = server.received_requests().await.expect("recording enabled");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body is JSON");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_retries_without_stream_options_when_endpoint_rejects_them() {
+        let server = wiremock::MockServer::start().await;
+        // An endpoint that does not know `stream_options` rejects the
+        // request that carries it; the retry without the field must stream.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("stream_options"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                sse_body(&[delta(serde_json::json!({ "content": "still works" }))]).into_bytes(),
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "mock-reasoner",
+            &server.uri(),
+            Some("test-key"),
+            AuthStyle::Bearer,
+        );
+        let messages = [ChatMessage::user("read it")];
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let response = provider
+            .chat_stream(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "mock-model",
+                0.0,
+                tx,
+            )
+            .await
+            .expect("the stream still works without stream_options");
+        assert_eq!(response.text.as_deref(), Some("still works"));
+        assert!(response.usage.is_none());
     }
 
     fn streamed_tool_call() -> serde_json::Value {

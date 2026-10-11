@@ -422,6 +422,9 @@ Examples:
     /// Show system status (full details)
     Status,
 
+    /// Show today's token usage against the daily ceiling
+    Usage,
+
     /// Configure and manage scheduled tasks
     #[command(long_about = "\
 Configure and manage scheduled tasks.
@@ -2180,6 +2183,8 @@ async fn main() -> Result<()> {
 
         Some(Commands::Insights) => rantaiclaw::sessions::cli::insights(),
 
+        Some(Commands::Usage) => crate::cost::cli::usage(&config),
+
         Some(Commands::Personality { cmd }) => match cmd {
             PersonalityCommands::Show => rantaiclaw::persona::cli::show(),
             PersonalityCommands::List => rantaiclaw::persona::cli::list(),
@@ -3045,6 +3050,13 @@ mod tests {
             script.contains("rantaiclaw"),
             "completion script should reference binary name"
         );
+    }
+
+    #[test]
+    fn usage_cli_parses_to_the_usage_command() {
+        let cli =
+            Cli::try_parse_from(["rantaiclaw", "usage"]).expect("usage invocation should parse");
+        assert!(matches!(cli.command, Some(Commands::Usage)));
     }
 
     #[test]

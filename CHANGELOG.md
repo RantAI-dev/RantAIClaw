@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rantaiclaw usage` prints today's token total for the active workspace, the daily ceiling from
+  `[cost] max_tokens_per_day`, the percentage used, and per-model lines. A model with no configured
+  price reports "not reported", not `0.00`. It reads through the same tracker the ceiling uses.
 - `rantaiclaw permissions add command`, the TUI `/permissions` command and the `manage_permissions`
   tool warn when a guest command glob is wide (its command name holds `*` or `?`, so `rm*` matches
   every command starting with `rm`) or rated high risk (`rm -rf *`). The glob is still stored; the
@@ -47,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The daily token ceiling now counts turns on the OpenAI-compatible, Anthropic, OpenRouter, Ollama,
+  Copilot and Bedrock providers. Before, those turns were not recorded, so the ceiling could not
+  stop them. A provider that does not report token counts still adds nothing to the day's total.
 - The `channel` of a tool-call audit line names the surface that made the call. A call made from the
   TUI or the web console was recorded as `cli`, the value the agent passes for its approval
   behaviour. It now records `tui` or `console`; the chat, CLI, webhook, delegate and cron lines are

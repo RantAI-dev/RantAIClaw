@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, ProviderUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -14,8 +14,12 @@ use std::collections::BTreeMap;
 /// real repository.
 const PROJECT_URL: &str = "https://github.com/RantAI-dev/RantAIClaw";
 
+/// OpenRouter API base. Tests point `api_base` at a localhost fixture.
+const API_BASE: &str = "https://openrouter.ai/api/v1";
+
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    api_base: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +104,28 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
+    /// OpenAI chat-completions usage block; absent on some responses.
+    #[serde(default)]
+    usage: Option<ApiUsage>,
+}
+
+/// Token counts from the chat-completions `usage` block.
+#[derive(Debug, Deserialize)]
+struct ApiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+/// Map the endpoint's usage block to provider counts. Absent or all-zero
+/// counts yield `None`, never `Some(0)`.
+fn usage_from_api(usage: Option<&ApiUsage>) -> Option<ProviderUsage> {
+    let usage = usage?;
+    ProviderUsage::from_counts(
+        usage.prompt_tokens.unwrap_or(0),
+        usage.completion_tokens.unwrap_or(0),
+        usage.total_tokens.unwrap_or(0),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,7 +145,12 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            api_base: API_BASE.to_string(),
         }
+    }
+
+    fn chat_completions_url(&self) -> String {
+        format!("{}/chat/completions", self.api_base)
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -240,7 +271,7 @@ impl Provider for OpenRouterProvider {
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
             self.http_client()
-                .get("https://openrouter.ai/api/v1/auth/key")
+                .get(format!("{}/auth/key", self.api_base))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
                 .await?
@@ -281,7 +312,7 @@ impl Provider for OpenRouterProvider {
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
@@ -328,7 +359,7 @@ impl Provider for OpenRouterProvider {
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
@@ -373,7 +404,7 @@ impl Provider for OpenRouterProvider {
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
@@ -386,13 +417,17 @@ impl Provider for OpenRouterProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = usage_from_api(native_response.usage.as_ref());
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
+        Ok(ProviderChatResponse {
+            usage,
+            ..Self::parse_native_response(message)
+        })
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -423,26 +458,49 @@ impl Provider for OpenRouterProvider {
             )
         })?;
 
-        let tools = Self::convert_tools(request.tools);
-        let native_request = NativeChatRequestStreaming {
-            model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
-            temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-            stream: true,
+        let url = self.chat_completions_url();
+        let send = |stream_options: Option<StreamOptions>| {
+            let tools = Self::convert_tools(request.tools);
+            let native_request = NativeChatRequestStreaming {
+                model: model.to_string(),
+                messages: Self::convert_messages(request.messages),
+                temperature,
+                tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                tools,
+                stream: true,
+                stream_options,
+            };
+            self.http_client()
+                .post(&url)
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", PROJECT_URL)
+                .header("X-Title", "RantaiClaw")
+                .header("Accept", "text/event-stream")
+                .json(&native_request)
+                .send()
         };
 
-        let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", PROJECT_URL)
-            .header("X-Title", "RantaiClaw")
-            .header("Accept", "text/event-stream")
-            .json(&native_request)
-            .send()
-            .await?;
+        let mut response = send(Some(StreamOptions {
+            include_usage: true,
+        }))
+        .await?;
+        // An endpoint that rejects `stream_options` must still stream: retry
+        // once without the field. The turn then reports no usage.
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let error = response.text().await.unwrap_or_default();
+            if error.contains("stream_options") {
+                tracing::warn!(
+                    "OpenRouter rejected stream_options; retrying the stream without usage reporting"
+                );
+                response = send(None).await?;
+            } else {
+                anyhow::bail!(
+                    "OpenRouter API error ({}): {}",
+                    reqwest::StatusCode::BAD_REQUEST,
+                    super::sanitize_api_error(&error)
+                );
+            }
+        }
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenRouter", response).await);
@@ -450,6 +508,7 @@ impl Provider for OpenRouterProvider {
 
         let mut text_buf = String::new();
         let mut tool_acc: BTreeMap<usize, AccumulatedToolCall> = BTreeMap::new();
+        let mut usage: Option<ProviderUsage> = None;
         let mut sse_buffer = String::new();
         // Bytes carried over from a previous chunk that end mid-codepoint
         // (a multi-byte UTF-8 character split across two TCP/SSE chunks).
@@ -472,7 +531,13 @@ impl Provider for OpenRouterProvider {
                             sse_buffer.clear();
                             break;
                         }
-                        SsePayload::Delta(delta) => {
+                        SsePayload::Usage(u) => {
+                            record_usage(&mut usage, &u);
+                        }
+                        SsePayload::Delta(delta, chunk_usage) => {
+                            if let Some(u) = chunk_usage {
+                                record_usage(&mut usage, &u);
+                            }
                             if let Some(content) = delta.content {
                                 if !content.is_empty() {
                                     text_buf.push_str(&content);
@@ -517,7 +582,7 @@ impl Provider for OpenRouterProvider {
             .collect();
 
         Ok(ProviderChatResponse {
-            usage: None,
+            usage,
             text: if text_buf.is_empty() {
                 None
             } else {
@@ -586,7 +651,7 @@ impl Provider for OpenRouterProvider {
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", PROJECT_URL)
             .header("X-Title", "RantaiClaw")
@@ -599,13 +664,17 @@ impl Provider for OpenRouterProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = usage_from_api(native_response.usage.as_ref());
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
+        Ok(ProviderChatResponse {
+            usage,
+            ..Self::parse_native_response(message)
+        })
     }
 }
 
@@ -621,6 +690,14 @@ struct NativeChatRequestStreaming {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
     stream: bool,
+    /// Asks the endpoint to send a usage block on the final chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 /// One delta from an OpenAI-format SSE stream.
@@ -656,7 +733,11 @@ struct StreamChunkChoice {
 
 #[derive(Debug, Deserialize)]
 struct StreamChunkResponse {
+    #[serde(default)]
     choices: Vec<StreamChunkChoice>,
+    /// Present on the final chunk when the request set `include_usage`.
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 
 /// Tool-call accumulator: a tool call comes in fragments tagged by `index`.
@@ -671,7 +752,11 @@ struct AccumulatedToolCall {
 
 /// Result of parsing a single SSE line.
 enum SsePayload {
-    Delta(StreamDelta),
+    /// A content/tool delta, plus the usage block when the same chunk
+    /// carries one.
+    Delta(StreamDelta, Option<ApiUsage>),
+    /// A usage-only chunk (no choices) of an `include_usage` stream.
+    Usage(ApiUsage),
     Done,
 }
 
@@ -690,8 +775,18 @@ fn parse_sse_line(line: &str) -> Option<SsePayload> {
         return Some(SsePayload::Done);
     }
     let parsed: StreamChunkResponse = serde_json::from_str(data).ok()?;
-    let delta = parsed.choices.into_iter().next()?.delta;
-    Some(SsePayload::Delta(delta))
+    match parsed.choices.into_iter().next() {
+        Some(choice) => Some(SsePayload::Delta(choice.delta, parsed.usage)),
+        None => parsed.usage.map(SsePayload::Usage),
+    }
+}
+
+/// Keep the first real usage seen on the stream. A zero or empty usage
+/// block maps to `None` and must not clobber a usage already recorded.
+fn record_usage(slot: &mut Option<ProviderUsage>, api: &ApiUsage) {
+    if slot.is_none() {
+        *slot = usage_from_api(Some(api));
+    }
 }
 
 /// Append `chunk` to the carry-over `pending` buffer and decode the
@@ -723,6 +818,36 @@ fn push_decoded(pending: &mut Vec<u8>, chunk: &[u8], out: &mut String) {
 mod tests {
     use super::*;
     use crate::providers::traits::{ChatMessage, Provider};
+
+    #[test]
+    fn openai_usage_maps_to_provider_counts() {
+        let resp: NativeChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        )
+        .unwrap();
+        let usage = usage_from_api(resp.usage.as_ref()).expect("usage is reported");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn openai_absent_usage_block_maps_to_none() {
+        let resp: NativeChatResponse =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"ok"}}]}"#).unwrap();
+        assert!(usage_from_api(resp.usage.as_ref()).is_none());
+    }
+
+    #[test]
+    fn openai_all_zero_usage_maps_to_none() {
+        let resp: NativeChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
+        )
+        .unwrap();
+        assert!(usage_from_api(resp.usage.as_ref()).is_none());
+    }
 
     #[test]
     fn creates_with_key() {
@@ -987,8 +1112,206 @@ mod tests {
 
     fn delta_or_panic(payload: SsePayload) -> StreamDelta {
         match payload {
-            SsePayload::Delta(d) => d,
-            SsePayload::Done => panic!("expected delta, got DONE"),
+            SsePayload::Delta(d, _) => d,
+            SsePayload::Usage(_) | SsePayload::Done => panic!("expected delta"),
+        }
+    }
+
+    /// Provider aimed at a localhost fixture instead of openrouter.ai.
+    fn provider_at(server: &wiremock::MockServer) -> OpenRouterProvider {
+        let mut provider = OpenRouterProvider::new(Some("openrouter-test-credential"));
+        provider.api_base = format!("{}/api/v1", server.uri());
+        provider
+    }
+
+    /// One SSE event carrying a delta with `content`.
+    fn sse_content(content: &str) -> String {
+        let event = serde_json::json!({"choices": [{"delta": {"content": content}}]});
+        format!("data: {event}\n\n")
+    }
+
+    #[tokio::test]
+    async fn streaming_request_asks_for_usage_on_the_final_chunk() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse_content("ok").into_bytes(), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_at(&server);
+        let messages = [ChatMessage::user("hi")];
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        provider
+            .chat_stream(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "openai/gpt-4o",
+                0.0,
+                tx,
+            )
+            .await
+            .expect("stream against the fixture");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(reqs.len(), 1, "expected exactly one upstream request");
+        assert_eq!(reqs[0].url.path(), "/api/v1/chat/completions");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_retries_without_stream_options_when_endpoint_rejects_them() {
+        let server = wiremock::MockServer::start().await;
+        // A strict endpoint rejects the request that carries stream_options.
+        // The retry without the field must still stream, and usage stays None.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("stream_options"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse_content("still works").into_bytes(), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_at(&server);
+        let messages = [ChatMessage::user("hi")];
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let response = provider
+            .chat_stream(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "openai/gpt-4o",
+                0.0,
+                tx,
+            )
+            .await
+            .expect("the stream still works without stream_options");
+        assert_eq!(response.text.as_deref(), Some("still works"));
+        assert!(response.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_keeps_text_and_usage_from_a_chunk_that_carries_both() {
+        let server = wiremock::MockServer::start().await;
+        // One chunk holds a content delta and the usage block together.
+        let event = serde_json::json!({
+            "choices": [{"delta": {"content": "combined"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        });
+        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(body.into_bytes(), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_at(&server);
+        let messages = [ChatMessage::user("hi")];
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let response = provider
+            .chat_stream(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "openai/gpt-4o",
+                0.0,
+                tx,
+            )
+            .await
+            .expect("stream against the fixture");
+        assert_eq!(response.text.as_deref(), Some("combined"));
+        let usage = response.usage.expect("usage survives the combined chunk");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn stream_keeps_first_real_usage_when_a_later_chunk_is_zero() {
+        let server = wiremock::MockServer::start().await;
+        // A real usage block, then a trailing zero-usage block. The zero
+        // block maps to no usage and must not clobber the real one.
+        let real = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let zero = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        });
+        let body = format!(
+            "{}data: {real}\n\ndata: {zero}\n\ndata: [DONE]\n\n",
+            sse_content("ok")
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(body.into_bytes(), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_at(&server);
+        let messages = [ChatMessage::user("hi")];
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let response = provider
+            .chat_stream(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "openai/gpt-4o",
+                0.0,
+                tx,
+            )
+            .await
+            .expect("stream against the fixture");
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        let usage = response.usage.expect("first real usage survives");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn parse_sse_line_usage_only_chunk_returns_usage() {
+        // The final chunk of an include_usage stream carries no choices.
+        let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        match parse_sse_line(line).expect("usage chunk parses") {
+            SsePayload::Usage(u) => {
+                let usage = usage_from_api(Some(&u)).expect("usage is reported");
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(usage.output_tokens, 5);
+                assert_eq!(usage.total_tokens, 15);
+            }
+            _ => panic!("expected a usage payload"),
         }
     }
 

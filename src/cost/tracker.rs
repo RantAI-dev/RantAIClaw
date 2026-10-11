@@ -95,6 +95,23 @@ impl CostTracker {
         storage.get_daily_tokens()
     }
 
+    /// Today's usage broken down by model, from the same records the ceiling
+    /// is computed from. Unlike [`CostTracker::get_summary`], which is scoped
+    /// to this process's session, this covers every process that wrote today.
+    pub fn daily_by_model(&self) -> Result<HashMap<String, ModelStats>> {
+        let today = Utc::now().date_naive();
+        let mut records = Vec::new();
+        {
+            let storage = self.lock_storage();
+            storage.for_each_record(|record| {
+                if record.usage.timestamp.naive_utc().date() == today {
+                    records.push(record);
+                }
+            })?;
+        }
+        Ok(build_session_model_stats(&records))
+    }
+
     /// The price the operator configured for `model`, if any.
     pub fn price_for(&self, model: &str) -> Option<&crate::config::schema::ModelPrice> {
         self.config.prices.get(model)

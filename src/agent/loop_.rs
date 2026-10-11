@@ -6665,6 +6665,175 @@ Let me check the result."#;
         assert_eq!(ledger.daily_tokens().unwrap(), 54, "all three recorded");
     }
 
+    /// The provider reports the usage its endpoint sent, so the ceiling counts
+    /// every turn. Driven through a real OpenAI-compatible provider against a
+    /// localhost endpoint that reports 15 tokens per reply, under a 20-token
+    /// ceiling: turns 1 and 2 pass, turn 3 is refused, and the ledger holds two
+    /// records.
+    #[tokio::test]
+    async fn a_reporting_endpoint_is_counted_until_the_ceiling_refuses_a_turn() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "FAKE_REPLY_OK"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let provider =
+            crate::providers::compatible::OpenAiCompatibleProvider::new_no_responses_fallback(
+                "mock-endpoint",
+                &server.uri(),
+                Some("test-key"),
+                crate::providers::compatible::AuthStyle::Bearer,
+            );
+
+        let tmp = tempfile::TempDir::new().expect("temp workspace");
+        let ledger = ledger_with_ceiling(tmp.path(), 20);
+
+        for _ in 0..2 {
+            let mut history = vec![ChatMessage::user("hi")];
+            let tools_registry: Vec<Box<dyn Tool>> = vec![];
+            let multimodal = crate::config::MultimodalConfig::default();
+            run_tool_call_loop(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &NoopObserver,
+                "mock-endpoint",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                None,
+                None,
+                None,
+                &multimodal,
+                5,
+                None,
+                None,
+                None,
+                Some(&ledger),
+                &crate::security::AuditActor::surface(),
+                None,
+            )
+            .await
+            .expect("a turn inside the ceiling runs");
+        }
+        assert_eq!(ledger.daily_tokens().unwrap(), 30, "both turns recorded");
+
+        let mut history = vec![ChatMessage::user("hi")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let multimodal = crate::config::MultimodalConfig::default();
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &NoopObserver,
+            "mock-endpoint",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            None,
+            None,
+            &multimodal,
+            5,
+            None,
+            None,
+            None,
+            Some(&ledger),
+            &crate::security::AuditActor::surface(),
+            None,
+        )
+        .await
+        .expect_err("turn 3 must be refused by the ceiling");
+        assert!(
+            err.to_string().contains("Daily token ceiling reached"),
+            "the refusal must say why: {err}"
+        );
+
+        let records = std::fs::read_to_string(tmp.path().join("state").join("costs.jsonl"))
+            .expect("the ledger file exists");
+        assert_eq!(
+            records.lines().filter(|l| !l.trim().is_empty()).count(),
+            2,
+            "exactly two turns were recorded: {records}"
+        );
+    }
+
+    /// A provider that reports nothing leaves the ledger empty and refuses
+    /// nothing: `None` usage is never recorded as zero.
+    #[tokio::test]
+    async fn a_provider_that_reports_no_usage_records_nothing_and_is_not_refused() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "FAKE_REPLY_OK"}}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let provider =
+            crate::providers::compatible::OpenAiCompatibleProvider::new_no_responses_fallback(
+                "mock-endpoint",
+                &server.uri(),
+                Some("test-key"),
+                crate::providers::compatible::AuthStyle::Bearer,
+            );
+
+        let tmp = tempfile::TempDir::new().expect("temp workspace");
+        let ledger = ledger_with_ceiling(tmp.path(), 1);
+
+        for _ in 0..3 {
+            let mut history = vec![ChatMessage::user("hi")];
+            let tools_registry: Vec<Box<dyn Tool>> = vec![];
+            let multimodal = crate::config::MultimodalConfig::default();
+            run_tool_call_loop(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &NoopObserver,
+                "mock-endpoint",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                None,
+                None,
+                None,
+                &multimodal,
+                5,
+                None,
+                None,
+                None,
+                Some(&ledger),
+                &crate::security::AuditActor::surface(),
+                None,
+            )
+            .await
+            .expect("a silent provider is never refused");
+        }
+        assert_eq!(ledger.daily_tokens().unwrap(), 0, "nothing was recorded");
+        assert!(
+            !tmp.path().join("state").join("costs.jsonl").exists()
+                || std::fs::read_to_string(tmp.path().join("state").join("costs.jsonl"))
+                    .unwrap()
+                    .trim()
+                    .is_empty(),
+            "the ledger holds no records"
+        );
+    }
+
     /// No ledger at all — a bare-builder agent, or `[cost] enabled = false` —
     /// still runs. Accounting is opt-out, not a hard dependency of the loop.
     #[tokio::test]

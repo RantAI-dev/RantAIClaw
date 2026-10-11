@@ -6,7 +6,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, ToolCall as ProviderToolCall, ToolsPayload,
+    Provider, ProviderCapabilities, ProviderUsage, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -329,6 +329,29 @@ struct ConverseResponse {
     #[serde(default)]
     #[allow(dead_code)]
     stop_reason: Option<String>,
+    /// Token counts for the call; absent on some responses.
+    #[serde(default)]
+    usage: Option<ConverseUsage>,
+}
+
+/// Token counts from the Converse `usage` block.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConverseUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+/// Map the Converse usage block to provider counts. Absent or all-zero
+/// counts yield `None`, never `Some(0)`.
+fn usage_from_converse(usage: Option<&ConverseUsage>) -> Option<ProviderUsage> {
+    let usage = usage?;
+    ProviderUsage::from_counts(
+        usage.input_tokens.unwrap_or(0),
+        usage.output_tokens.unwrap_or(0),
+        usage.total_tokens.unwrap_or(0),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -643,6 +666,7 @@ impl BedrockProvider {
     // ── Response parsing ────────────────────────────────────────
 
     fn parse_converse_response(response: ConverseResponse) -> ProviderChatResponse {
+        let usage = usage_from_converse(response.usage.as_ref());
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
@@ -672,7 +696,7 @@ impl BedrockProvider {
         }
 
         ProviderChatResponse {
-            usage: None,
+            usage,
             text: if text_parts.is_empty() {
                 None
             } else {
@@ -912,6 +936,64 @@ impl Provider for BedrockProvider {
 mod tests {
     use super::*;
     use crate::providers::traits::ChatMessage;
+
+    #[test]
+    fn converse_usage_maps_to_provider_counts() {
+        let resp: ConverseResponse = serde_json::from_str(
+            r#"{
+                "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
+            }"#,
+        )
+        .unwrap();
+        let usage = BedrockProvider::parse_converse_response(resp)
+            .usage
+            .expect("usage is reported");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn converse_usage_total_is_filled_when_omitted() {
+        let resp: ConverseResponse = serde_json::from_str(
+            r#"{
+                "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+                "usage": {"inputTokens": 10, "outputTokens": 5}
+            }"#,
+        )
+        .unwrap();
+        let usage = BedrockProvider::parse_converse_response(resp)
+            .usage
+            .expect("usage is reported");
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn converse_absent_usage_block_maps_to_none() {
+        let resp: ConverseResponse = serde_json::from_str(
+            r#"{"output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}}}"#,
+        )
+        .unwrap();
+        assert!(BedrockProvider::parse_converse_response(resp)
+            .usage
+            .is_none());
+    }
+
+    #[test]
+    fn converse_all_zero_usage_maps_to_none() {
+        let resp: ConverseResponse = serde_json::from_str(
+            r#"{
+                "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+                "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+            }"#,
+        )
+        .unwrap();
+        assert!(BedrockProvider::parse_converse_response(resp)
+            .usage
+            .is_none());
+    }
 
     // ── SigV4 signing tests ─────────────────────────────────────
 

@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, ProviderUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -128,6 +128,28 @@ struct SystemBlock {
 struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
+    /// Messages API usage block; absent on some responses.
+    #[serde(default)]
+    usage: Option<NativeUsage>,
+}
+
+/// Token counts from the Messages API `usage` block.
+#[derive(Debug, Deserialize)]
+struct NativeUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+/// Map the Messages API usage block to provider counts. Absent or all-zero
+/// counts yield `None`, never `Some(0)`. The shape has no total, so
+/// `from_counts` fills it from input plus output.
+fn usage_from_native(usage: Option<&NativeUsage>) -> Option<ProviderUsage> {
+    let usage = usage?;
+    ProviderUsage::from_counts(
+        usage.input_tokens.unwrap_or(0),
+        usage.output_tokens.unwrap_or(0),
+        0,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,6 +381,7 @@ impl AnthropicProvider {
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+        let usage = usage_from_native(response.usage.as_ref());
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
@@ -390,7 +413,7 @@ impl AnthropicProvider {
         }
 
         ProviderChatResponse {
-            usage: None,
+            usage,
             text: if text_parts.is_empty() {
                 None
             } else {
@@ -564,6 +587,42 @@ impl Provider for AnthropicProvider {
 mod tests {
     use super::*;
     use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
+
+    #[test]
+    fn messages_usage_maps_to_provider_counts() {
+        let resp: NativeChatResponse = serde_json::from_str(
+            r#"{"content":[{"type":"text","text":"ok"}],
+                "usage":{"input_tokens":10,"output_tokens":5}}"#,
+        )
+        .unwrap();
+        let usage = AnthropicProvider::parse_native_response(resp)
+            .usage
+            .expect("usage is reported");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn messages_absent_usage_block_maps_to_none() {
+        let resp: NativeChatResponse =
+            serde_json::from_str(r#"{"content":[{"type":"text","text":"ok"}]}"#).unwrap();
+        assert!(AnthropicProvider::parse_native_response(resp)
+            .usage
+            .is_none());
+    }
+
+    #[test]
+    fn messages_all_zero_usage_maps_to_none() {
+        let resp: NativeChatResponse = serde_json::from_str(
+            r#"{"content":[{"type":"text","text":"ok"}],
+                "usage":{"input_tokens":0,"output_tokens":0}}"#,
+        )
+        .unwrap();
+        assert!(AnthropicProvider::parse_native_response(resp)
+            .usage
+            .is_none());
+    }
 
     #[test]
     fn creates_with_key() {
