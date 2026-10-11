@@ -4193,21 +4193,35 @@ impl Config {
     ///    wrong provider's key — which is what caused 401s after switching
     ///    providers in the console.
     pub fn resolve_key_for_provider(&self, provider: &str) -> Option<String> {
+        Self::resolve_stored_key(
+            &self.provider_api_keys,
+            self.default_provider.as_deref(),
+            self.api_key.as_deref(),
+            provider,
+        )
+    }
+
+    /// The stored-key lookup behind [`Config::resolve_key_for_provider`], over
+    /// the pieces alone. Channel paths hold these pieces without a live
+    /// `Config`, so both paths share this one order.
+    pub fn resolve_stored_key(
+        provider_api_keys: &HashMap<String, String>,
+        default_provider: Option<&str>,
+        top_level_api_key: Option<&str>,
+        provider: &str,
+    ) -> Option<String> {
         let canonical = crate::providers::normalize_provider_name(provider);
         for candidate in [canonical.as_str(), provider] {
-            if let Some(k) = self.provider_api_keys.get(candidate) {
+            if let Some(k) = provider_api_keys.get(candidate) {
                 let k = k.trim();
                 if !k.is_empty() {
                     return Some(k.to_string());
                 }
             }
         }
-        let default_canonical = self
-            .default_provider
-            .as_deref()
-            .map(crate::providers::normalize_provider_name);
+        let default_canonical = default_provider.map(crate::providers::normalize_provider_name);
         if default_canonical.as_deref() == Some(canonical.as_str()) {
-            if let Some(k) = self.api_key.as_deref() {
+            if let Some(k) = top_level_api_key {
                 let k = k.trim();
                 if !k.is_empty() {
                     return Some(k.to_string());

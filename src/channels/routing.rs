@@ -187,6 +187,7 @@ pub(crate) fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDef
         model: resolved_default_model(config),
         temperature: config.default_temperature,
         api_key: config.api_key.clone(),
+        provider_api_keys: Arc::new(config.provider_api_keys.clone()),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
         approval_owners: Arc::new(config.channels_config.approval_owners.clone()),
@@ -243,6 +244,9 @@ pub(crate) fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelR
         model: ctx.model.as_str().to_string(),
         temperature: ctx.temperature,
         api_key: ctx.api_key.clone(),
+        // No config on this path, so no stored keys to read: an empty map means
+        // a fallback resolves from its env vars alone, as it did before.
+        provider_api_keys: Arc::new(HashMap::new()),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
         approval_owners: Arc::clone(&ctx.approval_owners),
@@ -443,6 +447,14 @@ pub(crate) async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContex
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
         &next_defaults.reliability,
+        &|name| {
+            crate::config::Config::resolve_stored_key(
+                &next_defaults.provider_api_keys,
+                Some(next_defaults.default_provider.as_str()),
+                next_defaults.api_key.as_deref(),
+                name,
+            )
+        },
         &ctx.provider_runtime_options,
     ) {
         Ok(p) => p,
@@ -647,6 +659,9 @@ pub(crate) async fn get_or_create_provider(
         ctx.api_key.clone(),
         api_url.map(ToString::to_string),
         ctx.reliability.as_ref().clone(),
+        Arc::clone(&defaults.provider_api_keys),
+        defaults.default_provider.clone(),
+        defaults.api_key.clone(),
         ctx.provider_runtime_options.clone(),
     )
     .await?;
@@ -668,6 +683,9 @@ pub(crate) async fn create_resilient_provider_nonblocking(
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
+    provider_api_keys: Arc<HashMap<String, String>>,
+    default_provider: String,
+    top_level_api_key: Option<String>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let provider_name = provider_name.to_string();
@@ -677,6 +695,14 @@ pub(crate) async fn create_resilient_provider_nonblocking(
             api_key.as_deref(),
             api_url.as_deref(),
             &reliability,
+            &|name| {
+                crate::config::Config::resolve_stored_key(
+                    &provider_api_keys,
+                    Some(default_provider.as_str()),
+                    top_level_api_key.as_deref(),
+                    name,
+                )
+            },
             &provider_runtime_options,
         )
     })

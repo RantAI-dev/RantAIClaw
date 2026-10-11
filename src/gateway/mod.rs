@@ -642,11 +642,13 @@ pub fn build_gateway_router(
         gateway_provider_credential.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
+        &|name| config.resolve_key_for_provider(name),
         &providers::ProviderRuntimeOptions {
             auth_profile_override: None,
             rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
+            failover_announce: providers::FailoverAnnounce::default(),
         },
     )?);
     // Empty when unconfigured (no baked-in model): the gateway still starts and

@@ -153,6 +153,69 @@ impl AuthProfilesStore {
         &self.path
     }
 
+    /// Synchronous, read-only lookup of the token profile `provider` selects,
+    /// for the sync provider factory. Returns the decrypted token and its
+    /// `auth_kind` metadata. No lock is taken: the factory never writes, and the
+    /// async `load` path stays the one that does.
+    ///
+    /// The selection is `select_profile_id`, the same as `AuthService::get_profile`.
+    /// A missing, unreadable or unparsable store, another provider's profile, a
+    /// non-token profile, or an empty token answers `None`.
+    pub fn read_token_sync(
+        &self,
+        provider: &str,
+        profile_override: Option<&str>,
+    ) -> Option<(String, Option<String>)> {
+        let bytes = std::fs::read(&self.path).ok()?;
+        let persisted: PersistedAuthProfiles = serde_json::from_slice(&bytes).ok()?;
+
+        let data = AuthProfilesData {
+            schema_version: persisted.schema_version,
+            updated_at: Utc::now(),
+            active_profiles: persisted.active_profiles.clone(),
+            profiles: persisted
+                .profiles
+                .iter()
+                .map(|(id, p)| {
+                    (
+                        id.clone(),
+                        AuthProfile {
+                            id: id.clone(),
+                            provider: p.provider.clone(),
+                            profile_name: p.profile_name.clone(),
+                            kind: AuthProfileKind::Token,
+                            account_id: None,
+                            workspace_id: None,
+                            token_set: None,
+                            token: p.token.clone(),
+                            metadata: p.metadata.clone().into_iter().collect(),
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+
+        let profile_id = crate::auth::select_profile_id(&data, provider, profile_override)?;
+        let persisted_profile = persisted.profiles.get(&profile_id)?;
+        if persisted_profile.provider != provider
+            || parse_profile_kind(&persisted_profile.kind).ok()? != AuthProfileKind::Token
+        {
+            return None;
+        }
+
+        let (token, _) = self
+            .decrypt_optional(persisted_profile.token.as_deref())
+            .ok()?;
+        let token = token?.trim().to_string();
+        if token.is_empty() {
+            return None;
+        }
+        let kind = persisted_profile.metadata.get("auth_kind").cloned();
+        Some((token, kind))
+    }
+
     pub async fn load(&self) -> Result<AuthProfilesData> {
         let _lock = self.acquire_lock().await?;
         self.load_locked().await

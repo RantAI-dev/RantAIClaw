@@ -222,6 +222,10 @@ fn push_failure(
 // Loop invariant: `failures` accumulates every failed attempt so the final
 // error message gives operators a complete diagnostic trail.
 
+/// Told `(primary, answered)` when a fallback produced the reply. See
+/// [`ReliableProvider::with_failover_announce`].
+pub type FailoverCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Provider wrapper with retry, fallback, auth rotation, and model failover.
 pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
@@ -229,6 +233,9 @@ pub struct ReliableProvider {
     base_backoff_ms: u64,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Told `(primary, answered)` when a provider other than the first in the
+    /// chain produced the reply. `None` means nobody is listening.
+    failover_announce: Option<FailoverCallback>,
 }
 
 impl ReliableProvider {
@@ -242,6 +249,7 @@ impl ReliableProvider {
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
             model_fallbacks: HashMap::new(),
+            failover_announce: None,
         }
     }
 
@@ -249,6 +257,28 @@ impl ReliableProvider {
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
         self
+    }
+
+    /// Announce, through `announce`, a reply that came from a provider other
+    /// than the first in the chain. Retries and model failovers on the primary
+    /// are not announced: the primary still answered.
+    pub fn with_failover_announce(mut self, announce: FailoverCallback) -> Self {
+        self.failover_announce = Some(announce);
+        self
+    }
+
+    /// Fire the failover announcement for a reply from the entry at
+    /// `answered_index`, when that entry is not the primary (`providers[0]`).
+    fn announce_if_failover(&self, answered_index: usize, answered: &str) {
+        let Some(announce) = self.failover_announce.as_ref() else {
+            return;
+        };
+        if answered_index == 0 {
+            return;
+        }
+        if let Some((primary, _)) = self.providers.first() {
+            announce(primary, answered);
+        }
     }
 
     /// Build the list of models to try: [original, fallback1, fallback2, ...]
@@ -298,7 +328,7 @@ impl Provider for ReliableProvider {
         // immediately. On non-retryable error, break to next provider. On
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -316,6 +346,7 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            self.announce_if_failover(provider_index, provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -403,7 +434,7 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -421,6 +452,7 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            self.announce_if_failover(provider_index, provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -500,7 +532,7 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -519,6 +551,7 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            self.announce_if_failover(provider_index, provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -695,7 +728,7 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -713,6 +746,7 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            self.announce_if_failover(provider_index, provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -2183,5 +2217,135 @@ mod tests {
             "on the happy path, deltas pass through and there is no fallback emit"
         );
         assert_eq!(response.text.as_deref(), Some("Hello"));
+    }
+
+    // ── The failover announcement (audit 61, invariant 2) ─────────────────────
+
+    /// The `(primary, answered)` announcements a test recorded, in order.
+    type Recorded = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
+
+    /// A callback that records each `(primary, answered)` announcement, so a test
+    /// asserts on the invocation directly rather than on printed text.
+    fn recording_announcer() -> (Recorded, FailoverCallback) {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let announce: FailoverCallback = Arc::new(move |primary: &str, answered: &str| {
+            sink.lock()
+                .push((primary.to_string(), answered.to_string()));
+        });
+        (seen, announce)
+    }
+
+    /// The primary always fails and the fallback answers: the announcement fires
+    /// once, naming the primary asked and the fallback that answered.
+    #[tokio::test]
+    async fn announces_when_a_fallback_answers() {
+        let (seen, announce) = recording_announcer();
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "primary down",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "fallback down",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_failover_announce(announce);
+
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "from fallback");
+        assert_eq!(
+            *seen.lock(),
+            vec![("primary".to_string(), "fallback".to_string())]
+        );
+    }
+
+    /// The primary answers: nothing is announced.
+    #[tokio::test]
+    async fn no_announcement_when_the_primary_answers() {
+        let (seen, announce) = recording_announcer();
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "from primary",
+                        error: "unused",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_failover_announce(announce);
+
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "from primary");
+        assert!(seen.lock().is_empty(), "a primary answer is not a failover");
+    }
+
+    /// A transient failure the primary recovers from on retry is not a failover:
+    /// the primary is still the one that answered, so nothing is announced.
+    #[tokio::test]
+    async fn no_announcement_when_the_primary_recovers_on_retry() {
+        let (seen, announce) = recording_announcer();
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 1,
+                        response: "recovered",
+                        error: "transient",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            1,
+            1,
+        )
+        .with_failover_announce(announce);
+
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "recovered");
+        assert!(
+            seen.lock().is_empty(),
+            "a retry on the primary is not a failover"
+        );
     }
 }

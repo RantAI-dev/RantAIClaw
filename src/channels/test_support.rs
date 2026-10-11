@@ -497,6 +497,7 @@ pub(super) fn seeded_defaults_slot(
                 model: "default-model".to_string(),
                 temperature: 0.0,
                 api_key: None,
+                provider_api_keys: Arc::new(HashMap::new()),
                 api_url: None,
                 reliability: crate::config::ReliabilityConfig::default(),
                 approval_owners: Arc::new(vec![OWNER_SENDER.to_string()]),
