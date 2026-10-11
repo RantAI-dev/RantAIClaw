@@ -56,7 +56,7 @@ use futures_util::StreamExt;
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{AssistantContent, ToolFunction};
 use rig_core::completion::{
-    CompletionModel, CompletionRequest, Message as RigMessage, ToolDefinition,
+    CompletionModel, CompletionRequest, GetTokenUsage, Message as RigMessage, ToolDefinition,
 };
 use rig_core::one_or_many::OneOrMany;
 use rig_core::providers::{anthropic, gemini, openai};
@@ -654,6 +654,7 @@ where
         std::collections::HashMap::new();
     let mut tool_meta: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
+    let mut usage: Option<crate::providers::ProviderUsage> = None;
 
     let mut stream = std::pin::pin!(stream_resp);
     while let Some(item) = stream.next().await {
@@ -718,13 +719,9 @@ where
             } => {
                 reasoning.push_str(&delta);
             }
-            other @ StreamedAssistantContent::Final(_) => {
-                tracing::debug!(
-                    target: "rig_native",
-                    canonical,
-                    variant = ?std::mem::discriminant(&other),
-                    "ignoring stream variant"
-                );
+            StreamedAssistantContent::Final(response) => {
+                // The provider's final response carries the turn's usage.
+                usage = response.token_usage().and_then(|u| usage_from_rig(&u));
             }
         }
     }
@@ -746,7 +743,7 @@ where
 
     let tool_calls = dedupe_tool_calls_by_id(tool_calls);
     Ok(ChatResponse {
-        usage: None,
+        usage,
         text: reply_text(full_text, reasoning, !tool_calls.is_empty()),
         // rig may surface a tool call via both the immediate-complete event and
         // the delta path; collapse same-id duplicates before they reach the
@@ -1164,6 +1161,39 @@ mod tests {
             )
             .await
             .expect("stream against the mock")
+    }
+
+    /// The rig stream surfaces the provider's final usage, so a streamed turn
+    /// counts like a non-streamed one. The Anthropic fixture carries input
+    /// tokens on `message_start` and output tokens on `message_delta`.
+    #[tokio::test]
+    async fn anthropic_stream_reports_the_usage_the_endpoint_sent() {
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_u","type":"message","role":"assistant","model":"claude-3-haiku-20240307","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+
+        let response = anthropic_stream_of(sse).await;
+        let usage = response.usage.expect("the stream reports usage");
+        assert_eq!(usage.input_tokens, 4);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.total_tokens, 11);
     }
 
     /// The streaming twin of `flatten_assistant`: a thinking block followed by

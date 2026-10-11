@@ -241,7 +241,12 @@ Notes:
   the next one is refused with an error naming the numbers and this key.
 - Usage is appended to `<workspace>/state/costs.jsonl`. The day rolls over at
   UTC midnight.
+- The ceiling counts a turn only when the provider reports token counts. The
+  OpenAI-compatible, Anthropic, OpenRouter, Ollama, Copilot and Bedrock providers
+  report them; a provider that does not report them adds nothing to the day's total.
 - `enabled = false` turns off the ceiling **and** the usage record together.
+- `rantaiclaw usage` prints today's total against this ceiling. See
+  [commands](commands.md#usage).
 
 ### `[cost.prices]` — optional, reporting only
 

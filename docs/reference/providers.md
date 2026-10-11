@@ -62,6 +62,10 @@ stored in config, or remove the config key before relying on an env override.
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
 
+The OpenAI-compatible, Anthropic, OpenRouter, Ollama, Copilot and Bedrock providers
+report the token counts that feed the daily token ceiling (`[cost] max_tokens_per_day`);
+a provider that does not report them adds nothing to the day's total.
+
 ### Gemini Notes
 
 - Provider ID: `gemini` (aliases: `google`, `google-gemini`)

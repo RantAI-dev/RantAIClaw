@@ -52,6 +52,13 @@ rantaiclaw service start
 rantaiclaw service status
 ```
 
+5. Check today's token usage against the daily ceiling (UTC day). Turns are refused once the
+   ceiling is spent, so check this when a run stops with a ceiling error:
+
+```bash
+rantaiclaw usage
+```
+
 ## Health and State Signals
 
 | Signal | Command / File | Expected |

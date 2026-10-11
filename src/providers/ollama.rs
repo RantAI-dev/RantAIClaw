@@ -1,6 +1,6 @@
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatResponse, Provider, ProviderCapabilities, ToolCall,
+    ChatMessage, ChatResponse, Provider, ProviderCapabilities, ProviderUsage, ToolCall,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -63,6 +63,23 @@ struct Options {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     message: ResponseMessage,
+    /// Input tokens counted by the model, on the final native response.
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    /// Output tokens generated, on the final native response.
+    #[serde(default)]
+    eval_count: Option<u64>,
+}
+
+/// Map Ollama's native counts to provider counts. Absent or all-zero counts
+/// yield `None`, never `Some(0)`. The shape has no total, so `from_counts`
+/// fills it from input plus output.
+fn usage_from_native(response: &ApiChatResponse) -> Option<ProviderUsage> {
+    ProviderUsage::from_counts(
+        response.prompt_eval_count.unwrap_or(0),
+        response.eval_count.unwrap_or(0),
+        0,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -378,6 +395,40 @@ impl OllamaProvider {
         Ok(chat_response)
     }
 
+    /// Text form of a no-tools reply for `chat_with_history`'s String contract.
+    fn text_from_response(&self, response: ApiChatResponse) -> String {
+        // If model returned tool calls, format them for loop_.rs's parse_tool_calls
+        if !response.message.tool_calls.is_empty() {
+            tracing::debug!(
+                "Ollama returned {} tool call(s), formatting for loop parser",
+                response.message.tool_calls.len()
+            );
+            return self.format_tool_calls_for_loop(&response.message.tool_calls);
+        }
+
+        // Plain text response
+        let content = response.message.content;
+
+        // Handle edge case: model returned only "thinking" with no content or tool calls
+        // This is a model quirk - it stopped after reasoning without producing output
+        if content.is_empty() {
+            if let Some(thinking) = &response.message.thinking {
+                tracing::warn!(
+                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
+                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
+                );
+                // Return a message indicating the model's thought process but no action
+                return format!(
+                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
+                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
+                );
+            }
+            tracing::warn!("Ollama returned empty content with no tool calls");
+        }
+
+        content
+    }
+
     /// Convert Ollama tool calls to the JSON format expected by parse_tool_calls in loop_.rs
     ///
     /// Handles quirky model behavior where tool calls are wrapped:
@@ -543,36 +594,7 @@ impl Provider for OllamaProvider {
             )
             .await?;
 
-        // If model returned tool calls, format them for loop_.rs's parse_tool_calls
-        if !response.message.tool_calls.is_empty() {
-            tracing::debug!(
-                "Ollama returned {} tool call(s), formatting for loop parser",
-                response.message.tool_calls.len()
-            );
-            return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
-        }
-
-        // Plain text response
-        let content = response.message.content;
-
-        // Handle edge case: model returned only "thinking" with no content or tool calls
-        // This is a model quirk - it stopped after reasoning without producing output
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                // Return a message indicating the model's thought process but no action
-                return Ok(format!(
-                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                ));
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
-        }
-
-        Ok(content)
+        Ok(self.text_from_response(response))
     }
 
     async fn chat_with_tools(
@@ -599,6 +621,7 @@ impl Provider for OllamaProvider {
                 tools_opt,
             )
             .await?;
+        let usage = usage_from_native(&response);
 
         // Native tool calls returned by the model.
         if !response.message.tool_calls.is_empty() {
@@ -625,7 +648,7 @@ impl Provider for OllamaProvider {
                 Some(response.message.content)
             };
             return Ok(ChatResponse {
-                usage: None,
+                usage,
                 text,
                 tool_calls,
             });
@@ -640,7 +663,7 @@ impl Provider for OllamaProvider {
                     if thinking.len() > 100 { &thinking[..100] } else { thinking }
                 );
                 return Ok(ChatResponse {
-                    usage: None,
+                    usage,
                     text: Some(format!(
                         "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
                         if thinking.len() > 200 { &thinking[..200] } else { thinking }
@@ -651,7 +674,7 @@ impl Provider for OllamaProvider {
             tracing::warn!("Ollama returned empty content with no tool calls");
         }
         Ok(ChatResponse {
-            usage: None,
+            usage,
             text: Some(content),
             tool_calls: vec![],
         })
@@ -692,13 +715,23 @@ impl Provider for OllamaProvider {
             }
         }
 
-        // No tools — fall back to plain text chat.
-        let text = self
-            .chat_with_history(request.messages, model, temperature)
+        // No tools: plain text chat. Keep the full response so its usage counts
+        // reach the caller; `chat_with_history` would drop them in its String.
+        let (normalized_model, should_auth) = self.resolve_request_details(model)?;
+        let api_messages = self.convert_messages(request.messages);
+        let response = self
+            .send_request(
+                api_messages,
+                &normalized_model,
+                temperature,
+                should_auth,
+                None,
+            )
             .await?;
+        let usage = usage_from_native(&response);
         Ok(ChatResponse {
-            usage: None,
-            text: Some(text),
+            usage,
+            text: Some(self.text_from_response(response)),
             tool_calls: vec![],
         })
     }
@@ -800,6 +833,73 @@ mod tests {
         let args: serde_json::Value =
             serde_json::from_str(&resp.tool_calls[0].arguments).expect("arguments are JSON");
         assert_eq!(args["city"], "Jakarta");
+    }
+
+    /// Serve one `/api/chat` reply with `body` and return the chat result for a
+    /// no-tools request. The no-tools branch of `chat` is the agent's plain turn.
+    async fn no_tools_chat_usage(body: serde_json::Value) -> Option<ProviderUsage> {
+        use crate::providers::traits::ChatRequest as ProviderChatRequest;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(Some(&server.uri()), None);
+        let messages = vec![ChatMessage::user("hi")];
+        provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "llama3.2",
+                0.2,
+            )
+            .await
+            .expect("chat against the mock")
+            .usage
+    }
+
+    #[tokio::test]
+    async fn no_tools_chat_reports_native_usage_counts() {
+        let usage = no_tools_chat_usage(serde_json::json!({
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "hello"},
+            "done": true,
+            "prompt_eval_count": 12,
+            "eval_count": 7
+        }))
+        .await
+        .expect("usage is reported on the plain turn");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.total_tokens, 19);
+    }
+
+    #[tokio::test]
+    async fn no_tools_chat_all_zero_counts_report_none() {
+        let usage = no_tools_chat_usage(serde_json::json!({
+            "message": {"role": "assistant", "content": "hello"},
+            "done": true,
+            "prompt_eval_count": 0,
+            "eval_count": 0
+        }))
+        .await;
+        assert!(usage.is_none(), "zero counts must not become Some(0)");
+    }
+
+    #[tokio::test]
+    async fn no_tools_chat_absent_counts_report_none() {
+        let usage = no_tools_chat_usage(serde_json::json!({
+            "message": {"role": "assistant", "content": "hello"},
+            "done": true
+        }))
+        .await;
+        assert!(usage.is_none());
     }
 
     #[test]
@@ -922,6 +1022,36 @@ mod tests {
 
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json.get("think"), Some(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn native_usage_maps_to_provider_counts() {
+        let resp: ApiChatResponse = serde_json::from_str(
+            r#"{"message":{"role":"assistant","content":"ok"},
+                "prompt_eval_count":10,"eval_count":5}"#,
+        )
+        .unwrap();
+        let usage = usage_from_native(&resp).expect("usage is reported");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn native_absent_counts_map_to_none() {
+        let resp: ApiChatResponse =
+            serde_json::from_str(r#"{"message":{"role":"assistant","content":"ok"}}"#).unwrap();
+        assert!(usage_from_native(&resp).is_none());
+    }
+
+    #[test]
+    fn native_all_zero_counts_map_to_none() {
+        let resp: ApiChatResponse = serde_json::from_str(
+            r#"{"message":{"role":"assistant","content":"ok"},
+                "prompt_eval_count":0,"eval_count":0}"#,
+        )
+        .unwrap();
+        assert!(usage_from_native(&resp).is_none());
     }
 
     #[test]

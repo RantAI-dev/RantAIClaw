@@ -30,6 +30,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `service` | Manage user-level OS service lifecycle |
 | `doctor` | Run diagnostics and freshness checks |
 | `status` | Print current configuration and system summary |
+| `usage` | Print today's token usage against the daily ceiling |
 | `cron` | Manage scheduled tasks |
 | `models` | List and refresh provider model catalogs |
 | `providers` | List provider IDs, aliases, and active provider |
@@ -628,6 +629,26 @@ Browse the active profile's
 
 Cumulative session and message statistics for the active profile — the CLI parity command for
 the TUI's `/insights`. No subcommands.
+
+### `usage`
+
+Today's token usage for the active profile's workspace, read from the same record the daily
+ceiling is enforced against (`[cost] max_tokens_per_day`). No subcommands. Output shape:
+
+```text
+Token usage for 2026-10-11 (UTC)
+Tokens today: 2200
+Ceiling: 4000 (55% used)
+By model:
+  priced/model: 1800 tokens, 2 requests, cost $0.0126
+  unpriced/model: 400 tokens, 1 requests, cost not reported
+```
+
+- The day is the UTC day. Records from other surfaces sharing the workspace count.
+- A model with no `[cost.prices]` entry shows `cost not reported`, never `$0.0000`.
+- `[cost] max_tokens_per_day = 0` prints `Ceiling: none` and still counts the tokens.
+- `[cost] enabled = false` prints the date header and then `accounting off` as the only
+  substantive line: nothing is counted or enforced.
 
 ### `rollback`
 
