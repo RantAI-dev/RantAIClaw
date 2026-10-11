@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
+    /// Send the credential as `Authorization: Bearer` regardless of its prefix.
+    /// Set by [`AnthropicProvider::with_bearer`] for a stored profile whose
+    /// `auth_kind` says `authorization`; otherwise the `sk-ant-oat01-` prefix decides.
+    force_bearer: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +186,17 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
+            force_bearer: false,
+        }
+    }
+
+    /// Like [`AnthropicProvider::with_base_url`], but the credential is sent as
+    /// `Authorization: Bearer` whatever its prefix — for a stored profile whose
+    /// `auth_kind` is `authorization`. Rig's Anthropic client cannot send Bearer.
+    pub fn with_bearer(credential: Option<&str>, base_url: Option<&str>) -> Self {
+        Self {
+            force_bearer: true,
+            ..Self::with_base_url(credential, base_url)
         }
     }
 
@@ -194,7 +209,7 @@ impl AnthropicProvider {
         request: reqwest::RequestBuilder,
         credential: &str,
     ) -> reqwest::RequestBuilder {
-        if Self::is_setup_token(credential) {
+        if self.force_bearer || Self::is_setup_token(credential) {
             request
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("anthropic-beta", "oauth-2025-04-20")
@@ -1288,6 +1303,7 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
+            force_bearer: false,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

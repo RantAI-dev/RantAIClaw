@@ -2619,6 +2619,10 @@ pub async fn run_with_scope(
         rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        // The CLI prints the answer, so it also says when a fallback gave it.
+        failover_announce: providers::FailoverAnnounce(Some(Arc::new(|asked, answered| {
+            println!("{}", failover_notice(asked, answered));
+        }))),
     };
 
     let provider_credential = config.resolve_key_for_provider(provider_name);
@@ -2629,6 +2633,7 @@ pub async fn run_with_scope(
         &config.reliability,
         &config.model_routes,
         model_name,
+        &|name| config.resolve_key_for_provider(name),
         &provider_runtime_options,
     )?;
 
@@ -2972,9 +2977,36 @@ pub async fn run(
     .await
 }
 
+/// The one stdout line the CLI prints when a fallback provider answered. It
+/// names both providers so the operator can see the reply did not come from
+/// the one they asked for.
+fn failover_notice(asked: &str, answered: &str) -> String {
+    format!("note: the reply came from fallback provider {answered} (asked for {asked})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stdout line names the provider the operator asked for and the one
+    /// that answered, so a reply from a fallback is never silently attributed to
+    /// the primary.
+    #[test]
+    fn failover_notice_names_the_asked_and_the_answering_provider() {
+        let line = failover_notice(
+            "custom:http://127.0.0.1:9/v1",
+            "custom:http://127.0.0.1:18431/v1",
+        );
+        assert!(
+            line.contains("custom:http://127.0.0.1:9/v1"),
+            "the asked provider must be named: {line}"
+        );
+        assert!(
+            line.contains("custom:http://127.0.0.1:18431/v1"),
+            "the answering provider must be named: {line}"
+        );
+        assert!(!line.contains('\n'), "one line: {line:?}");
+    }
 
     /// The denial the model reads must state the outcome, not bury it.
     ///

@@ -179,6 +179,36 @@ OPENAI_API_KEY=sk-... rantaiclaw setup provider
    `default_provider` to a provider that runs keyless (for example
    `"openrouter"` or `"ollama"`), save, and relaunch.
 
+### `anthropic: ANTHROPIC_API_KEY required` or `<name>: no credential found`
+
+The Anthropic family found no credential. It checks these sources in order, and
+the first one present is used:
+
+1. A key stored in config for the provider name you typed (`[provider_api_keys]`).
+2. The active auth profile for `anthropic` (`rantaiclaw auth status` shows it).
+3. `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY`.
+4. `RANTAICLAW_API_KEY`, then `API_KEY`.
+
+The refusal names the provider string you typed. For `anthropic-custom:<url>` it
+reads `anthropic-custom:<url>: no credential found`, not `anthropic`. Fix it with
+any one source: export `ANTHROPIC_API_KEY`, run `rantaiclaw setup provider`, or
+`rantaiclaw auth paste-token --provider anthropic`.
+
+### `Custom API key not set` from a fallback provider
+
+Cause: a fallback in `reliability.fallback_providers` was reached after the primary
+failed, and no key was found for that fallback. The primary's key is never used for a
+fallback, so a key stored for the primary does not satisfy it. The message names the
+fallback's provider, for example `Custom API key not set`.
+
+Each fallback looks for its key under its own name: the entry in `[provider_api_keys]`
+for that name, then its env vars, then `RANTAICLAW_API_KEY` / `API_KEY`. To fix it, store
+the key for the fallback itself under `[provider_api_keys]`, keyed by the name written in
+`fallback_providers` (lowercased, for example `"custom:http://127.0.0.1:18431/v1"`), or
+export that provider's env var. The console's key field stores the key for the active
+provider only, so it does not set a fallback's key. Then `agent -m` answers from the fallback and prints a
+`note: the reply came from fallback provider ...` line.
+
 ### Gateway unreachable
 
 Checks:

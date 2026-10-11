@@ -319,6 +319,10 @@ pub(crate) struct ChannelRuntimeDefaults {
     pub(crate) model: String,
     pub(crate) temperature: f64,
     pub(crate) api_key: Option<String>,
+    /// `[provider_api_keys]`, read by a fallback provider for its own name.
+    /// Channel paths hold no live `Config`, so the map travels with the
+    /// defaults the same way `api_key` does.
+    pub(crate) provider_api_keys: Arc<HashMap<String, String>>,
     pub(crate) api_url: Option<String>,
     pub(crate) reliability: crate::config::ReliabilityConfig,
     /// Senders authorized to approve over a channel
@@ -1441,6 +1445,7 @@ pub(crate) async fn build_channel_runtime(
         rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        failover_announce: providers::FailoverAnnounce::default(),
     };
     let provider: Arc<dyn Provider> = Arc::from(
         routing::create_resilient_provider_nonblocking(
@@ -1448,6 +1453,9 @@ pub(crate) async fn build_channel_runtime(
             config.api_key.clone(),
             config.api_url.clone(),
             config.reliability.clone(),
+            Arc::new(config.provider_api_keys.clone()),
+            provider_name.clone(),
+            config.api_key.clone(),
             provider_runtime_options.clone(),
         )
         .await?,

@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- When a fallback provider answers, the CLI agent (`agent -m` and the REPL) prints one line on stdout
+  before the reply, naming the provider asked for and the fallback that answered. A reply from the primary
+  prints nothing new. Channels and the gateway do not print it.
 - An unknown guest tool name is refused by `permissions add tool`, the TUI `/permissions` command and
   the `manage_permissions` tool. Accepted names are built-in tool names, `mcp__*` and `skill_*` names.
   Owner-only tools such as `delegate` are refused too. Removing an existing entry still works, and a
@@ -50,6 +53,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `anthropic-custom:<url>` inherits the `anthropic` env vars. `ANTHROPIC_API_KEY` was ignored for a custom
+  Anthropic-format endpoint, which refused with `anthropic: ANTHROPIC_API_KEY required`. The refusal now names
+  the string typed and the variable to set.
+- A stored anthropic auth profile is used for inference. Before, `agent -p anthropic` with a profile from
+  `auth paste-token` and no env var refused with `ANTHROPIC_API_KEY required`. Credential order changed for the
+  anthropic family: config-stored key, then the active auth profile, then env vars, then the generic fallback.
+  Config stays on top. Other providers' profiles are still not used for inference.
+- A fallback provider (`reliability.fallback_providers`) uses the key stored for its own name in
+  `[provider_api_keys]`. Before, only env vars were read for a fallback, so a stored key was ignored and the
+  fallback refused with `API key not set`. Order: stored key, then that provider's env vars, then
+  `RANTAICLAW_API_KEY` / `API_KEY`. The primary's key is still never sent to a fallback.
 - The daily token ceiling now counts turns on the OpenAI-compatible, Anthropic, OpenRouter, Ollama,
   Copilot and Bedrock providers. Before, those turns were not recorded, so the ceiling could not
   stop them. A provider that does not report token counts still adds nothing to the day's total.

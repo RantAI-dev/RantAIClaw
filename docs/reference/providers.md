@@ -19,12 +19,56 @@ Runtime resolution order is:
 3. Generic fallback env vars: `RANTAICLAW_API_KEY` then `API_KEY`
 
 For resilient fallback chains (`reliability.fallback_providers`), each fallback
-provider resolves credentials independently. The primary provider's explicit
-credential is not reused for fallback providers.
+resolves its credential by its own name, in this order:
+
+1. The key stored in `[provider_api_keys]` for that fallback's name (the canonical
+   name, then the name as written in `fallback_providers`).
+2. That provider's env vars, as in step 2 above.
+3. The generic `RANTAICLAW_API_KEY` / `API_KEY`.
+
+The primary provider's key is never reused for a fallback. A key for one endpoint
+sent to another is a credential leak, so a fallback with no key anywhere is refused at
+call time with `<provider> API key not set`, and the chain moves on.
+
+When a fallback answers, the CLI agent (`agent -m` and the REPL) prints one line on
+stdout before the reply, naming the provider it asked for and the fallback that
+answered:
+
+```text
+note: the reply came from fallback provider custom:http://127.0.0.1:18431/v1 (asked for custom:http://127.0.0.1:9/v1)
+```
+
+A reply from the primary prints no such line. Channels and the gateway do not print
+it; the retry and failover detail is on stderr as before.
 
 Compatibility note: config-stored provider keys, including encrypted keys, remain
 above environment variables in credential precedence. Use env vars when no key is
 stored in config, or remove the config key before relying on an env override.
+
+### Anthropic family credential order
+
+`anthropic` and `anthropic-custom:<url>` resolve their credential from one list, in
+this order:
+
+1. The key stored in config for the name you typed: its `[provider_api_keys]` entry,
+   under the canonical name or the name as written, and the top-level `api_key` only
+   when that name is the default provider.
+2. The active auth profile for `anthropic`, written by `auth paste-token` or
+   `auth setup-token`. Its `auth_kind` decides the header: `authorization` goes out as
+   `Authorization: Bearer`, `api-key` as `x-api-key`.
+3. The env vars `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY`.
+4. The generic `RANTAICLAW_API_KEY`, then `API_KEY`.
+
+`anthropic-custom:<url>` inherits the `anthropic` env vars, so `ANTHROPIC_API_KEY`
+works for a custom Anthropic-format endpoint without a second key. Config is read under
+the custom name as typed only: the `anthropic` entry in `[provider_api_keys]` and the
+top-level `api_key` are not read for it. The auth profile is used for inference for
+`anthropic` only. A stored profile for any other provider is not used for inference;
+their keys come from config or env.
+
+With no credential in any source, the run refuses and names the string you typed and
+the variable to set, for example `anthropic-custom:http://…: no credential found — set
+ANTHROPIC_API_KEY, store a key in config, or paste an auth profile`.
 
 ## Provider Catalog
 

@@ -266,6 +266,21 @@ pub fn has_auth_profile(state_dir: &Path, provider: &str) -> bool {
         })
 }
 
+/// The token and `auth_kind` metadata of the anthropic token profile a provider
+/// should send, read synchronously for the sync provider factory.
+///
+/// Selection is `select_profile_id` — the override, then the active profile,
+/// then `default` — and it is the same selection `AuthService::get_profile`
+/// makes. Only a `token` profile carries an Anthropic credential here. A missing
+/// or unreadable store, a profile of another provider, or an empty token answers
+/// `None`; the caller then falls through to the env vars, as with no profile.
+pub fn anthropic_profile_token(
+    state_dir: &Path,
+    profile_override: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    AuthProfilesStore::new(state_dir, true).read_token_sync(ANTHROPIC_PROVIDER, profile_override)
+}
+
 pub fn state_dir_from_config(config: &Config) -> PathBuf {
     config
         .config_path

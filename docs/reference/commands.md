@@ -552,6 +552,11 @@ documented in [`providers.md`](providers.md).
 | `list` | List auth profiles |
 | `status` | Active profile and token expiry |
 
+A stored **anthropic** profile is used for inference: `agent -p anthropic` and an
+`anthropic-custom:<url>` provider send it when no config key is set and before any
+`ANTHROPIC_*` env var. Profiles stored for other providers are not used for inference.
+Order and header rules are in [`providers.md`](providers.md#anthropic-family-credential-order).
+
 ### `permissions`
 
 The per-role permission model shared by **all** multi-user channels. Owners get the full

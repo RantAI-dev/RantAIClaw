@@ -564,6 +564,7 @@ impl Agent {
             &config.reliability,
             &config.model_routes,
             &model_name,
+            &|name| config.resolve_key_for_provider(name),
         )?;
 
         let dispatcher_choice = config.agent.tool_dispatcher.as_str();

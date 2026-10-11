@@ -735,6 +735,18 @@ Notes:
   need a `set_api_key` on the `Provider` trait, which no implementer has. The
   migrator strips it.
 
+## `[reliability]`
+
+- `fallback_providers` — ordered list of providers tried, in turn, after the primary
+  fails. Each entry is a provider name or a `custom:<url>` / `anthropic-custom:<url>`
+  endpoint.
+
+Each fallback resolves its own credential by its own name, in this order: the key stored
+in `[provider_api_keys]` for that name, then that provider's env vars, then the generic
+`RANTAICLAW_API_KEY` / `API_KEY`. The primary's key is never reused for a fallback. A
+fallback with no key is refused at call time, and the chain moves on. The full order is in
+[`providers.md`](providers.md#credential-resolution-order).
+
 ## `[[model_routes]]` and `[[embedding_routes]]`
 
 Use route hints so integrations can keep stable names while model IDs evolve.
