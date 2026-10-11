@@ -67,7 +67,7 @@ top-level `api_key` are not read for it. The auth profile is used for inference 
 their keys come from config or env.
 
 With no credential in any source, the run refuses and names the string you typed and
-the variable to set, for example `anthropic-custom:http://…: no credential found — set
+the variable to set, for example `anthropic-custom:<url>: no credential found — set
 ANTHROPIC_API_KEY, store a key in config, or paste an auth profile`.
 
 ## Provider Catalog
