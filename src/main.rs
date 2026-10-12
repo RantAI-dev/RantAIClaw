@@ -3163,6 +3163,12 @@ async fn run_provisioner_headless(
     let prov_name = provisioner.name().to_string();
     let provisioner_category = provisioner.category();
 
+    // The summary is printed only once the caller has accepted the outcome.
+    // A provisioner reports "configured" before the post-check that can still
+    // refuse the run, so printing `Done` as it arrives would show a success
+    // line directly above the refusal.
+    let mut held_done_summary: Option<String> = None;
+
     // Drive the provisioner future and the event-render loop
     // CONCURRENTLY. The previous code only awaited the event loop;
     // `prov_future` was pinned but never polled, so it never ran until
@@ -3211,8 +3217,7 @@ async fn run_provisioner_headless(
                     let _ = std::io::stdout().flush();
                 }
                 ProvisionEvent::Done { summary } => {
-                    println!("\n✅ {summary}");
-                    let _ = std::io::stdout().flush();
+                    held_done_summary = Some(summary);
                 }
                 ProvisionEvent::Failed { error } => {
                     eprintln!("\n❌ {error}");
@@ -3300,8 +3305,11 @@ async fn run_provisioner_headless(
             // owner needs to be able to manage permissions from chat.
             Ok(onboard::provision::ProvisionOutcome::Configured) => {
                 if let Some(reason) = unusable_provider_after_headless_setup(&prov_name, config) {
-                    eprintln!("\n❌ {reason}");
                     anyhow::bail!("{reason}");
+                }
+                if let Some(summary) = held_done_summary.take() {
+                    println!("\n✅ {summary}");
+                    let _ = std::io::stdout().flush();
                 }
                 let finalize =
                     onboard::provision::finalize_channel(provisioner_category, profile, config);

@@ -988,7 +988,7 @@ fn credential_base_name(name: &str) -> &str {
 
 /// Whether `name` builds an Anthropic-format provider: the `anthropic` name and
 /// any `anthropic-custom:<url>` endpoint. The only providers whose stored auth
-/// profile is used for inference (plan 560, owner decision).
+/// profile is used for inference.
 fn is_anthropic_family(name: &str) -> bool {
     credential_base_name(name) == "anthropic"
 }
@@ -1153,7 +1153,7 @@ fn is_anthropic_setup_token(key: Option<&str>) -> bool {
 
 /// The refusal for an Anthropic-family name with no credential from any source.
 /// It names the provider string the operator typed and the variable that fixes
-/// it, so an `anthropic-custom:<url>` is not reported as `anthropic` (plan 560).
+/// it, so an `anthropic-custom:<url>` is not reported as `anthropic`.
 fn anthropic_missing_credential_error(name: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "{name}: no credential found — set ANTHROPIC_API_KEY, store a key in config, \
@@ -3535,7 +3535,7 @@ mod tests {
         );
     }
 
-    // ── Anthropic family: one credential order (plan 560 part B) ──────────
+    // ── Anthropic family: one credential order ──────────
     //
     // Order for `anthropic` and `anthropic-custom:<url>`: config-stored key
     // → active auth profile → provider env vars → generic RANTAICLAW_API_KEY.

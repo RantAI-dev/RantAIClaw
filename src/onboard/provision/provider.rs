@@ -725,6 +725,47 @@ mod tests {
         assert!(config.api_key.is_none());
     }
 
+    /// The provisioner still ends a configured run with its `Done` summary as
+    /// the final event. The headless runner holds that event and prints it only
+    /// after the caller's post-check, so the summary text is pinned here.
+    #[tokio::test]
+    async fn configured_run_ends_with_done_summary() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(pick_provider("openrouter")),
+                Answer::Text(""),
+                Answer::Pick(0), // default model
+            ],
+        )
+        .await;
+
+        assert!(t.configured(), "flow must configure, got {:?}", t.outcome);
+        let expected = format!(
+            "Provider configured: openrouter with model {}",
+            config.default_model.as_deref().unwrap_or("?")
+        );
+        match t.events.last() {
+            Some(super::ProvisionEvent::Done { summary }) => assert_eq!(summary, &expected),
+            other => panic!("the final event must be Done, got {other:?}"),
+        }
+        assert_eq!(
+            t.events
+                .iter()
+                .filter(|e| matches!(e, super::ProvisionEvent::Done { .. }))
+                .count(),
+            1,
+            "a configured run emits exactly one Done"
+        );
+    }
+
     /// The model step must offer what `models refresh` cached — the
     /// curated-only regression showed ~10 openrouter rows while /model
     /// offered 400 from the same cache on the same box.

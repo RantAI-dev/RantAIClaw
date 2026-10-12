@@ -278,6 +278,16 @@ fn headless_provider_setup_without_a_key_anywhere_fails_and_writes_nothing() {
         combined.contains("RANTAICLAW_API_KEY"),
         "the refusal must name a variable that would satisfy it; got:\n{combined}"
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Provider configured"),
+        "a run that refuses must not print a success line first; stdout:\n{stdout}"
+    );
+    assert_eq!(
+        combined.matches("but found no API key for it").count(),
+        1,
+        "the refusal must appear exactly once; got:\n{combined}"
+    );
 
     let after = std::fs::read(&config_path).expect("config.toml still readable");
     assert_eq!(
@@ -295,11 +305,17 @@ fn headless_provider_setup_succeeds_when_the_key_comes_from_the_environment() {
     let home = TempDir::new().expect("tempdir");
     let (config_path, _) = baseline_config(&home);
 
-    cmd(&home)
+    let assert = cmd(&home)
         .env("RANTAICLAW_API_KEY", "neutral-env-supplied-key")
         .args(["setup", "--non-interactive", "provider"])
         .assert()
         .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("Provider configured:"),
+        "a usable provider run must print its success line; stdout:\n{stdout}"
+    );
 
     let body = std::fs::read_to_string(&config_path).expect("config.toml readable");
     assert!(
