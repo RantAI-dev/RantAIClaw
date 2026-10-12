@@ -758,7 +758,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `hint` | _required_ | Task hint name (e.g. `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
-| `api_key` | unset | Optional API key override for this route's provider |
+| `api_key` | unset | Optional API key override for this route's provider (stored encrypted when `secrets.encrypt = true`) |
 
 ### `[[embedding_routes]]`
 
@@ -768,7 +768,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `provider` | _required_ | Embedding provider (`"none"`, `"openai"`, or `"custom:<url>"`) |
 | `model` | _required_ | Embedding model to use with that provider |
 | `dimensions` | unset | Optional embedding dimension override for this route |
-| `api_key` | unset | Optional API key override for this route's provider |
+| `api_key` | unset | Optional API key override for this route's provider (stored encrypted when `secrets.encrypt = true`) |
 
 ```toml
 [memory]

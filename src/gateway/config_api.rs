@@ -241,6 +241,13 @@ pub(crate) fn redact_config_secrets(cfg: &mut crate::config::Config) {
     for agent in cfg.agents.values_mut() {
         agent.api_key = None;
     }
+    // Route keys are provider credentials, encrypted at rest like the rest.
+    for route in &mut cfg.model_routes {
+        route.api_key = None;
+    }
+    for route in &mut cfg.embedding_routes {
+        route.api_key = None;
+    }
     // Channel credentials are secrets too — never return a live bot token over
     // the API (the connect flow already avoids echoing it).
     if let Some(tg) = cfg.channels_config.telegram.as_mut() {
@@ -2913,6 +2920,50 @@ mod tests {
             .and_then(|e| e.api_key.as_ref())
             .and_then(|k| k.value.as_ref())
             .is_none());
+    }
+
+    /// A route key is a provider credential: the typed redactor must clear it
+    /// itself, not rely on the key-name backstop, which only matches by name.
+    #[test]
+    fn config_api_response_carries_no_route_key_in_either_form() {
+        let mut cfg = Config::default();
+        cfg.model_routes.push(crate::config::ModelRouteConfig {
+            hint: "reasoning".into(),
+            provider: "openrouter".into(),
+            model: "provider/model-id".into(),
+            api_key: Some("sk-route-plain-5555".into()),
+        });
+        cfg.embedding_routes
+            .push(crate::config::EmbeddingRouteConfig {
+                hint: "semantic".into(),
+                provider: "openai".into(),
+                model: "text-embedding-3-small".into(),
+                dimensions: None,
+                api_key: Some("sk-embroute-plain-6666".into()),
+            });
+
+        redact_config_secrets(&mut cfg);
+        let typed = serde_json::to_string(&cfg).unwrap();
+        for leaked in ["sk-route-plain-5555", "sk-embroute-plain-6666"] {
+            assert!(!typed.contains(leaked), "typed redaction leaked: {typed}");
+        }
+        assert!(cfg.model_routes[0].api_key.is_none());
+        assert!(cfg.embedding_routes[0].api_key.is_none());
+
+        // Ciphertext is a credential too: a stored `enc2:` value must not
+        // reach the response in either form.
+        let mut stored = Config::default();
+        stored.model_routes.push(crate::config::ModelRouteConfig {
+            hint: "reasoning".into(),
+            provider: "openrouter".into(),
+            model: "provider/model-id".into(),
+            api_key: Some("enc2:0123abcd".into()),
+        });
+        let response = read_response(&stored);
+        assert!(
+            !response.to_string().contains("enc2:"),
+            "ciphertext reached the response: {response}"
+        );
     }
 
     #[test]

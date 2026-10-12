@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `git_operations` status, diff, log and branch, `proxy_config` `get` and `list_services`, the
   composio `list`, `list_accounts` and `connected_accounts` actions, and the `pty` `screen`, `wait`
   and `stop` actions. Under `supervised` and `full` nothing changes.
+- `[[model_routes]].api_key` and `[[embedding_routes]].api_key` are encrypted at rest like every
+  other provider key when `[secrets] encrypt` is on (the default). Before this, a route key was the
+  one provider credential written to `config.toml` as plaintext. The config API already withholds
+  it. Downgrade hazard: a config saved by this build holds `enc2:` route keys, and a binary from
+  before this change sends the literal `enc2:…` string as the route's key, so the route fails to
+  authenticate. Rolling back means reverting, then re-entering any route key saved in between.
+  Channel and tunnel tokens are still plaintext and are not part of this change.
 
 ### Added
 

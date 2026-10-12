@@ -84,6 +84,12 @@ The runtime sets a mode on several files and directories. These include:
 - The Copilot token cache keeps `access-token` and `api-key.json` at mode 0600, and its directory gets mode 0700. Both are best effort. The directory is `copilot` inside the platform config directory, or `rantaiclaw-copilot-<user>` in the temp directory when no config directory is found.
 - The pending OpenAI login file `auth-openai-pending.json` is written with mode 0600.
 
+### Credentials in `config.toml`
+
+When `[secrets] encrypt` is on (the default), these provider credentials are written as `enc2:` ciphertext and read back as plaintext: the top-level `api_key`, `[agents.*].api_key`, `[gateway_agents.*].api_key`, `[provider_api_keys]`, `[[model_routes]].api_key`, `[[embedding_routes]].api_key`, the knowledge and web-search keys, the `browser.computer_use` key, the literal skill keys, the MCP server `env` values, and `channels_config.telegram.bot_token`.
+
+The channel and tunnel tokens are not encrypted. They are stored as plaintext inside `config.toml`; the file is mode 0600, but its contents are not encrypted. The fields are `channels_config` bot, access, app and signing tokens and secrets for Discord, Slack, Mattermost, Matrix, WhatsApp, Linq, Nextcloud Talk, Lark (including its webhook `encrypt_key`), DingTalk, QQ and the webhook, the email and IRC passwords, and `tunnel.ngrok.auth_token` and `tunnel.cloudflare.token`. Protect that file as you would any credential store.
+
 The runtime sets no mode on the profile directories, `brain.db` or `sessions.db`, and the list above is not exhaustive for other files. For every path without a mode, the operator's umask decides. The `systemd --user` installer writes the unit file with no mode. The OpenRC installer, which runs as root and uses `/etc/rantaiclaw`, sets 0750 on the workspace and the log directory, and 0600 on `config.toml`, `.secret_key` and `auth-profiles.json`.
 
 ## Groups

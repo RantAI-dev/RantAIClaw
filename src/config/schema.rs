@@ -3837,6 +3837,14 @@ pub(crate) fn encrypt_config_secrets_in_raw(raw: &mut toml::Value, rantaiclaw_di
             }
         }
     }
+    // Arrays of tables with one credential field each.
+    for table in ["model_routes", "embedding_routes"] {
+        if let Some(entries) = raw.get_mut(table).and_then(toml::Value::as_array_mut) {
+            for entry in entries.iter_mut() {
+                changed += encrypt_raw_at_path(entry, &["api_key"], &store);
+            }
+        }
+    }
 
     // MCP server env: every value, not a name-shaped guess. A heuristic would
     // miss `DATABASE_URL` and `PGPASSWORD` — the same gap the config API's
@@ -4000,6 +4008,16 @@ pub(crate) fn decrypt_config_secrets(
     }
     for agent in config.gateway_agents.values_mut() {
         decrypt_optional_secret(store, &mut agent.api_key, "config.gateway_agents.*.api_key")?;
+    }
+    for route in &mut config.model_routes {
+        decrypt_optional_secret(store, &mut route.api_key, "config.model_routes[].api_key")?;
+    }
+    for route in &mut config.embedding_routes {
+        decrypt_optional_secret(
+            store,
+            &mut route.api_key,
+            "config.embedding_routes[].api_key",
+        )?;
     }
     for key in config.provider_api_keys.values_mut() {
         let mut wrapped = Some(std::mem::take(key));
@@ -5165,6 +5183,16 @@ impl Config {
                 &store,
                 &mut agent.api_key,
                 "config.gateway_agents.*.api_key",
+            )?;
+        }
+        for route in &mut config_to_save.model_routes {
+            encrypt_optional_secret(&store, &mut route.api_key, "config.model_routes[].api_key")?;
+        }
+        for route in &mut config_to_save.embedding_routes {
+            encrypt_optional_secret(
+                &store,
+                &mut route.api_key,
+                "config.embedding_routes[].api_key",
             )?;
         }
 
@@ -6717,6 +6745,21 @@ tool_dispatcher = "xml"
         config
             .provider_api_keys
             .insert("openrouter".into(), "neutral-provider-key-value".into());
+        // Route keys are provider credentials like the ones above: a model
+        // route and an embedding route each carry one.
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            provider: "openrouter".into(),
+            model: "provider/model-id".into(),
+            api_key: Some("neutral-model-route-key".into()),
+        });
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: Some("neutral-embedding-route-key".into()),
+        });
         config.channels_config.telegram = Some(
             serde_json::from_value(serde_json::json!({
                 "bot_token": "123456789:neutral-bot-token-value",
@@ -6787,10 +6830,30 @@ tool_dispatcher = "xml"
             "MCP server env value must be encrypted at rest: {}",
             stored.mcp_servers["example"].env["EXAMPLE_API_KEY"]
         );
+        assert!(
+            crate::security::SecretStore::is_encrypted(
+                stored.model_routes[0].api_key.as_ref().unwrap()
+            ),
+            "model route key must be encrypted at rest"
+        );
+        assert!(
+            crate::security::SecretStore::is_encrypted(
+                stored.embedding_routes[0].api_key.as_ref().unwrap()
+            ),
+            "embedding route key must be encrypted at rest"
+        );
 
         // One shared pass restores all of them.
         let store = crate::security::SecretStore::new(&dir, true);
         decrypt_config_secrets(&store, &mut stored).unwrap();
+        assert_eq!(
+            stored.model_routes[0].api_key.as_deref(),
+            Some("neutral-model-route-key")
+        );
+        assert_eq!(
+            stored.embedding_routes[0].api_key.as_deref(),
+            Some("neutral-embedding-route-key")
+        );
         assert_eq!(
             stored.provider_api_keys["openrouter"],
             "neutral-provider-key-value"
@@ -8786,6 +8849,19 @@ level = "full"
                     .collect(),
             },
         );
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            provider: "openrouter".into(),
+            model: "provider/model-id".into(),
+            api_key: Some("plain-model-route".into()),
+        });
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: Some("plain-embedding-route".into()),
+        });
         config.skills.entries.insert(
             "x".into(),
             SkillEntryConfig {
@@ -8809,6 +8885,8 @@ level = "full"
             "plain-bot-token",
             "plain-mcp-env",
             "plain-skill-literal",
+            "plain-model-route",
+            "plain-embedding-route",
         ];
 
         let mut raw: toml::Value = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
@@ -8865,6 +8943,14 @@ level = "full"
             "plain-mcp-env"
         );
         assert_eq!(
+            restored.model_routes[0].api_key.as_deref(),
+            Some("plain-model-route")
+        );
+        assert_eq!(
+            restored.embedding_routes[0].api_key.as_deref(),
+            Some("plain-embedding-route")
+        );
+        assert_eq!(
             restored.skills.entries["x"]
                 .api_key
                 .as_ref()
@@ -8875,6 +8961,212 @@ level = "full"
         );
 
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    /// Every property of `Config`, from its generated JSON Schema, whose name
+    /// is credential-shaped must be classified here: either encrypted at rest
+    /// (the three lists agree on it) or knowingly left in plaintext, with the
+    /// reason. A field added later with a credential name fails this test
+    /// until it is placed in one of the two sets. The hand-written comparison
+    /// above only checks the fields it already names, so it cannot see a new
+    /// one.
+    #[test]
+    async fn every_credential_shaped_config_field_is_classified() {
+        // Encrypted at rest. The save list, the raw list and the decrypt list
+        // all cover each of these.
+        const ENCRYPTED: &[&str] = &[
+            "api_key",
+            "agents.*.api_key",
+            "gateway_agents.*.api_key",
+            "model_routes.[].api_key",
+            "embedding_routes.[].api_key",
+            "knowledge.embedding_api_key",
+            "knowledge.vision_api_key",
+            "composio.api_key",
+            "browser.computer_use.api_key",
+            "web_search.brave_api_key",
+            "channels_config.telegram.bot_token",
+            "skills.entries.*.api_key",
+        ];
+        // Map values whose credential is the value, not a property name. The
+        // walk sees the map's own key but not its values, so this test cannot
+        // check them. They are covered by `raw_and_typed_secret_lists_cover_the_same_fields`
+        // (the raw list and the typed decrypt list) and by
+        // `decrypt_config_secrets_round_trips_every_drift_prone_field`. Listed here
+        // so the walk does not report them as unclassified.
+        const MAP_VALUE_CREDENTIALS: &[&str] = &["provider_api_keys", "mcp_servers.*.env"];
+        // Knowingly plaintext today, backlog of the route-keys plan. The channel
+        // tokens use the same mechanism as telegram but are not wired in this
+        // change: it touches the `src/channels` config shapes and the owner
+        // scoped the change to the route keys.
+        const PLAINTEXT_BACKLOG: &[&str] = &[
+            "channels_config.discord.bot_token",
+            "channels_config.slack.bot_token",
+            "channels_config.slack.app_token",
+            "channels_config.mattermost.bot_token",
+            "channels_config.matrix.access_token",
+            "channels_config.whatsapp.access_token",
+            "channels_config.whatsapp.verify_token",
+            "channels_config.whatsapp.app_secret",
+            "channels_config.linq.api_token",
+            "channels_config.linq.signing_secret",
+            "channels_config.nextcloud_talk.app_token",
+            "channels_config.nextcloud_talk.webhook_secret",
+            "channels_config.lark.app_secret",
+            "channels_config.lark.verification_token",
+            "channels_config.dingtalk.client_secret",
+            "channels_config.qq.app_secret",
+            "channels_config.webhook.secret",
+            // Webhook message decryption key. Same mechanism as the channel
+            // tokens above; out of this plan's scope.
+            "channels_config.lark.encrypt_key",
+            // Found by this walk and not in the plan's backlog: recorded here
+            // so they are not silently absent from the audit.
+            "channels_config.email.password",
+            "channels_config.irc.server_password",
+            "channels_config.irc.nickserv_password",
+            "channels_config.irc.sasl_password",
+            "tunnel.ngrok.auth_token",
+            "tunnel.cloudflare.token",
+        ];
+
+        // A credential-shaped name: the exact `api_key` / `key` / `token` /
+        // `secret` / `password`, or a suffix `_api_key`, `_key`, `_token`,
+        // `_secret`, `_password`. `password_hash` is already a hash and is not
+        // one. The plural count fields (`rate_limit_max_keys`,
+        // `idempotency_max_keys`) do not match: they end in `_keys`.
+        fn credential_shaped(name: &str) -> bool {
+            if name == "password_hash" {
+                return false;
+            }
+            matches!(name, "api_key" | "key" | "token" | "secret" | "password")
+                || ["_api_key", "_key", "_token", "_secret", "_password"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        }
+
+        // Walk the schema: follow `$ref`, `anyOf`/`oneOf`, `additionalProperties`
+        // and `items`, and record every property path. A segment is `*` for a map
+        // value and `[]` for an array item, so a route list is `model_routes.[]`.
+        fn walk(
+            node: &serde_json::Value,
+            root: &serde_json::Value,
+            path: &str,
+            depth: usize,
+            out: &mut Vec<(String, serde_json::Value)>,
+        ) {
+            if depth > 24 {
+                return;
+            }
+            if let Some(target) = node
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|r| root.pointer(r.trim_start_matches('#')))
+            {
+                return walk(target, root, path, depth + 1, out);
+            }
+            for key in ["anyOf", "oneOf"] {
+                if let Some(variants) = node.get(key).and_then(serde_json::Value::as_array) {
+                    for variant in variants {
+                        walk(variant, root, path, depth + 1, out);
+                    }
+                }
+            }
+            if let Some(props) = node
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            {
+                for (name, child) in props {
+                    let child_path = if path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{path}.{name}")
+                    };
+                    out.push((child_path.clone(), child.clone()));
+                    walk(child, root, &child_path, depth + 1, out);
+                }
+            }
+            if let Some(values) = node.get("additionalProperties").filter(|v| v.is_object()) {
+                walk(values, root, &format!("{path}.*"), depth + 1, out);
+            }
+            if let Some(items) = node.get("items").filter(|v| v.is_object()) {
+                walk(items, root, &format!("{path}.[]"), depth + 1, out);
+            }
+        }
+
+        let schema = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        let mut fields = Vec::new();
+        walk(&schema, &schema, "", 0, &mut fields);
+
+        // A string or nullable-string leaf, or an object that holds a
+        // credential (`skills.entries.*.api_key` is an object with `value`).
+        // Bools and numbers are never credentials, whatever their name.
+        let mut found: Vec<String> = fields
+            .iter()
+            .filter(|(path, schema)| {
+                let leaf = path.rsplit('.').next().unwrap_or(path);
+                if !credential_shaped(leaf) {
+                    return false;
+                }
+                let kind = schema.get("type");
+                let is_text = kind.is_some_and(|t| {
+                    t == "string"
+                        || t.as_array()
+                            .is_some_and(|a| a.iter().any(|x| x == "string"))
+                });
+                let is_object = kind == Some(&serde_json::json!("object"))
+                    || schema.get("$ref").is_some()
+                    || schema.get("anyOf").is_some();
+                is_text || is_object
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+
+        let encrypted: Vec<&str> = ENCRYPTED
+            .iter()
+            .chain(MAP_VALUE_CREDENTIALS.iter())
+            .copied()
+            .collect();
+
+        // A control: the walk must see the fields it is meant to classify, or an
+        // empty `unclassified` would mean nothing.
+        assert!(
+            found.len() >= 30,
+            "the schema walk found too few credential paths to mean anything: {found:?}"
+        );
+        assert!(
+            found.iter().any(|p| p == "model_routes.[].api_key")
+                && found.iter().any(|p| p == "skills.entries.*.api_key"),
+            "the walk must see the route keys and the skill key: {found:?}"
+        );
+
+        let mut unclassified: Vec<&str> = found
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !encrypted.contains(p) && !PLAINTEXT_BACKLOG.contains(p))
+            .collect();
+        unclassified.sort_unstable();
+        assert!(
+            unclassified.is_empty(),
+            "credential-shaped config fields are in neither set. Encrypt each one \
+             in save(), encrypt_config_secrets_in_raw and decrypt_config_secrets, \
+             then list it in ENCRYPTED; or list it in PLAINTEXT_BACKLOG with its \
+             reason: {unclassified:?}"
+        );
+
+        // The reverse: a set entry the schema no longer has is stale.
+        let stale: Vec<&str> = ENCRYPTED
+            .iter()
+            .chain(PLAINTEXT_BACKLOG.iter())
+            .copied()
+            .filter(|p| !found.iter().any(|f| f == p))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these set entries are no longer credential fields in the schema; remove them: {stale:?}"
+        );
     }
 
     #[test]
@@ -9857,6 +10149,84 @@ default_model = "legacy-model"
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(residue.is_empty(), "temp residue: {residue:?}");
+    }
+
+    /// A route key is written encrypted and read back as plaintext. The
+    /// `model_routes` slice the loaded config holds is what the routed
+    /// provider factory receives, so its key is the plaintext too.
+    #[test]
+    async fn route_keys_are_encrypted_on_save_and_plaintext_after_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut config = Config::default();
+        config.config_path = path.clone();
+        config.secrets.encrypt = true;
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            provider: "openrouter".into(),
+            model: "provider/model-id".into(),
+            api_key: Some("sk-route-plain-1111".into()),
+        });
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: Some("sk-embroute-plain-2222".into()),
+        });
+        config.save().await.unwrap();
+
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            !raw.contains("sk-route-plain-1111") && !raw.contains("sk-embroute-plain-2222"),
+            "a route key must not reach the file as plaintext: {raw}"
+        );
+        assert!(
+            raw.contains("enc2:"),
+            "the route keys must be stored as ciphertext: {raw}"
+        );
+
+        let loaded = Config::load_from_path(&path).await.unwrap();
+        assert_eq!(
+            loaded.model_routes[0].api_key.as_deref(),
+            Some("sk-route-plain-1111")
+        );
+        assert_eq!(
+            loaded.embedding_routes[0].api_key.as_deref(),
+            Some("sk-embroute-plain-2222")
+        );
+    }
+
+    /// `[secrets] encrypt = false` writes the route keys in plaintext, as it
+    /// does every other credential.
+    #[test]
+    async fn route_keys_stay_plaintext_when_encryption_is_off() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut config = Config::default();
+        config.config_path = path.clone();
+        config.secrets.encrypt = false;
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            provider: "openrouter".into(),
+            model: "provider/model-id".into(),
+            api_key: Some("sk-route-plain-3333".into()),
+        });
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: Some("sk-embroute-plain-4444".into()),
+        });
+        config.save().await.unwrap();
+
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            raw.contains("sk-route-plain-3333") && raw.contains("sk-embroute-plain-4444"),
+            "with encryption off the route keys are written as plaintext: {raw}"
+        );
+        assert!(!raw.contains("enc2:"), "no ciphertext when encrypt=false");
     }
 
     #[test]
