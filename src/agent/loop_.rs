@@ -7049,6 +7049,68 @@ Let me check the result."#;
         );
     }
 
+    /// A streamed turn with an events channel sends each piece to the stream
+    /// sink as it arrives. The reasoning of a tool step and of the answer step
+    /// must not be among the pieces, and the answer must still be streamed.
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_the_reply_and_never_the_reasoning() {
+        use crate::providers::compatible::reasoning_endpoint::{
+            ReasoningEndpoint, REASONING_MARKER,
+        };
+
+        let endpoint = ReasoningEndpoint::start(
+            "echo",
+            serde_json::json!({ "text": "hi" }),
+            "The answer is 42.",
+        )
+        .await;
+        let provider = endpoint.provider();
+        let mut history = vec![ChatMessage::user("call echo")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let observer = NoopObserver;
+        let (events_tx, mut events_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::events::AgentEvent>(64);
+
+        let reply = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-reasoner",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None, // test: no origin chat
+            None,
+            None,
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            Some(events_tx),
+            None,
+            &crate::security::AuditActor::surface(),
+            None,
+        )
+        .await
+        .expect("loop succeeds");
+
+        let mut chunks = Vec::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            if let crate::agent::events::AgentEvent::Chunk(s) = ev {
+                chunks.push(s);
+            }
+        }
+        assert_eq!(reply, "The answer is 42.");
+        assert!(
+            chunks.iter().all(|c| !c.contains(REASONING_MARKER)),
+            "reasoning reached the stream sink: {chunks:?}"
+        );
+        assert_eq!(chunks.concat(), "The answer is 42.", "chunks: {chunks:?}");
+    }
+
     /// A reasoning model answers a tool step with empty `content`, its
     /// reasoning and a tool call. The reasoning must not become the step's text:
     /// the loop would store it in the history and send it back on the next

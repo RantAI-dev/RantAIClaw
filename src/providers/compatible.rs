@@ -1958,11 +1958,13 @@ impl Provider for OpenAiCompatibleProvider {
                 if visible.is_empty() {
                     continue;
                 }
+                // Reasoning is held back, not sent: whether it is the reply is
+                // known only when the stream ends. See the send after the loop.
                 if parsed.from_reasoning {
                     reasoning_text.push_str(&visible);
-                } else {
-                    full_text.push_str(&visible);
+                    continue;
                 }
+                full_text.push_str(&visible);
                 // Pace out big chunks so TUI shows progressive streaming
                 // even when the server batches.
                 for piece in split_for_streaming(&visible) {
@@ -2001,9 +2003,19 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let tool_calls = drain_tool_accumulator(tool_acc);
+        let text = streamed_reply(full_text.clone(), reasoning_text, !tool_calls.is_empty());
+        // Nothing was sent during the stream when `full_text` is empty: every
+        // content piece is pushed to `full_text` before it is sent. So when the
+        // reply is the reasoning, it goes out here, once, to keep the pieces
+        // equal to the returned text.
+        if full_text.is_empty() {
+            if let Some(reply) = text.as_deref() {
+                let _ = text_tx.send(reply.to_string()).await;
+            }
+        }
         Ok(ProviderChatResponse {
             usage,
-            text: streamed_reply(full_text, reasoning_text, !tool_calls.is_empty()),
+            text,
             tool_calls,
         })
     }
@@ -3678,6 +3690,24 @@ mod tests {
     /// `hang_up` drops the receiving end before the stream starts, as a
     /// consumer that went away does.
     async fn stream_once_with(events: &[serde_json::Value], hang_up: bool) -> ProviderChatResponse {
+        stream_collecting(events, hang_up).await.response
+    }
+
+    /// One `chat_stream` call: what it returned, and every piece it sent on
+    /// `text_tx`, in order. The invariant under test is that the pieces joined
+    /// equal the returned text.
+    struct Streamed {
+        response: ProviderChatResponse,
+        pieces: Vec<String>,
+    }
+
+    impl Streamed {
+        fn pieces_joined(&self) -> String {
+            self.pieces.concat()
+        }
+    }
+
+    async fn stream_collecting(events: &[serde_json::Value], hang_up: bool) -> Streamed {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/chat/completions"))
@@ -3709,10 +3739,13 @@ mod tests {
             )
             .await
             .expect("the mock streams");
+        let mut pieces = Vec::new();
         if let Some(rx) = rx.as_mut() {
-            while rx.try_recv().is_ok() {}
+            while let Ok(piece) = rx.try_recv() {
+                pieces.push(piece);
+            }
         }
-        response
+        Streamed { response, pieces }
     }
 
     /// A final usage-only chunk, as an endpoint sends when the request
@@ -3926,6 +3959,104 @@ mod tests {
         assert!(response.tool_calls.is_empty());
         assert_eq!(response.text.as_deref(), Some("Only thinking."));
     }
+
+    /// The pieces sent to the consumer are the reply: reasoning that streamed
+    /// ahead of the answer is never among them.
+    #[tokio::test]
+    async fn stream_sends_only_the_content_when_reasoning_came_first() {
+        let streamed = stream_collecting(
+            &[
+                delta(
+                    serde_json::json!({ "content": "", "reasoning_content": "Thinking it over." }),
+                ),
+                delta(serde_json::json!({ "content": "1 " })),
+                delta(serde_json::json!({ "content": "line." })),
+            ],
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            streamed.pieces_joined(),
+            "1 line.",
+            "pieces: {:?}",
+            streamed.pieces
+        );
+        assert_eq!(streamed.response.text.as_deref(), Some("1 line."));
+    }
+
+    /// A stream with only reasoning has no reply in `content`, so the reasoning
+    /// is the reply. It is sent once, at the end, not as it arrived.
+    #[tokio::test]
+    async fn stream_sends_the_reasoning_once_when_there_is_nothing_else() {
+        let streamed = stream_collecting(
+            &[
+                delta(serde_json::json!({ "content": "", "reasoning_content": "Only " })),
+                delta(serde_json::json!({ "content": "", "reasoning_content": "thinking." })),
+            ],
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            streamed.pieces_joined(),
+            "Only thinking.",
+            "pieces: {:?}",
+            streamed.pieces
+        );
+        assert_eq!(streamed.response.text.as_deref(), Some("Only thinking."));
+    }
+
+    #[tokio::test]
+    async fn stream_sends_nothing_when_reasoning_ends_in_a_tool_call() {
+        let streamed = stream_collecting(
+            &[
+                delta(serde_json::json!({ "content": "", "reasoning_content": "The user asked " })),
+                delta(serde_json::json!({ "content": "", "reasoning_content": "me to read." })),
+                streamed_tool_call(),
+            ],
+            false,
+        )
+        .await;
+
+        assert!(streamed.pieces.is_empty(), "pieces: {:?}", streamed.pieces);
+        assert_eq!(streamed.response.text, None);
+        assert_eq!(streamed.response.tool_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_sends_the_content_written_next_to_a_tool_call() {
+        let streamed = stream_collecting(
+            &[
+                delta(serde_json::json!({ "reasoning_content": "Thinking. " })),
+                delta(serde_json::json!({ "content": "Checking that." })),
+                streamed_tool_call(),
+            ],
+            false,
+        )
+        .await;
+
+        assert_eq!(streamed.pieces_joined(), "Checking that.");
+        assert_eq!(streamed.response.text.as_deref(), Some("Checking that."));
+    }
+
+    /// The consumer hangs up before the first piece: the reply still comes back
+    /// as the content, and the reasoning does not come back with it.
+    #[tokio::test]
+    async fn stream_returns_only_the_content_when_the_consumer_hangs_up_mid_stream() {
+        let streamed = stream_collecting(
+            &[
+                delta(
+                    serde_json::json!({ "content": "", "reasoning_content": "Thinking it over." }),
+                ),
+                delta(serde_json::json!({ "content": "1 line." })),
+            ],
+            true,
+        )
+        .await;
+
+        assert_eq!(streamed.response.text.as_deref(), Some("1 line."));
+    }
 }
 
 /// A mock OpenAI-compatible endpoint that behaves like a reasoning model, for
@@ -3950,7 +4081,11 @@ pub(crate) mod reasoning_endpoint {
     }
 
     impl wiremock::Respond for Script {
-        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let streaming = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| body["stream"].as_bool())
+                .unwrap_or(false);
             let message = if self.requests_seen.fetch_add(1, Ordering::SeqCst) == 0 {
                 serde_json::json!({
                     "role": "assistant",
@@ -3972,10 +4107,46 @@ pub(crate) mod reasoning_endpoint {
                     "reasoning_content": format!("{REASONING_MARKER}: now I can answer."),
                 })
             };
+            if streaming {
+                // The same turn as SSE: the reasoning as one delta, then the
+                // content or tool call as its own event.
+                return wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse_for(&message).into_bytes(), "text/event-stream");
+            }
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }]
             }))
         }
+    }
+
+    /// The streamed form of one assistant `message`: its reasoning, then its
+    /// content, then its tool calls, as separate SSE deltas.
+    fn sse_for(message: &serde_json::Value) -> String {
+        let mut body = String::new();
+        let mut push = |delta: serde_json::Value| {
+            let event = serde_json::json!({ "choices": [{ "index": 0, "delta": delta }] });
+            body.push_str("data: ");
+            body.push_str(&event.to_string());
+            body.push_str("\n\n");
+        };
+        if let Some(reasoning) = message["reasoning_content"].as_str() {
+            push(serde_json::json!({ "reasoning_content": reasoning }));
+        }
+        if let Some(content) = message["content"].as_str().filter(|c| !c.is_empty()) {
+            push(serde_json::json!({ "content": content }));
+        }
+        if let Some(calls) = message["tool_calls"].as_array() {
+            for (index, call) in calls.iter().enumerate() {
+                push(serde_json::json!({ "tool_calls": [{
+                    "index": index,
+                    "id": call["id"],
+                    "type": "function",
+                    "function": call["function"],
+                }] }));
+            }
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
     }
 
     pub(crate) struct ReasoningEndpoint {
