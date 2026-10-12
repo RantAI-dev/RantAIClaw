@@ -126,6 +126,11 @@ const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 /// Keep this many most-recent non-system messages after compaction.
 const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
 
+/// Auto-compaction runs only from this history limit up. Each turn adds two messages
+/// (one user, one assistant), so below this limit the keep-window would summarise on
+/// nearly every turn, and a summariser call per turn costs more than the history it saves.
+const COMPACTION_MIN_HISTORY_LIMIT: usize = 8;
+
 /// Safety cap for compaction source transcript passed to the summarizer.
 const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 
@@ -243,6 +248,10 @@ async fn auto_compact_history(
     model: &str,
     max_history: usize,
 ) -> Result<bool> {
+    if max_history < COMPACTION_MIN_HISTORY_LIMIT {
+        return Ok(false);
+    }
+
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
         history.len().saturating_sub(1)
@@ -255,7 +264,9 @@ async fn auto_compact_history(
     }
 
     let start = if has_system { 1 } else { 0 };
-    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
+    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES
+        .min(non_system_count)
+        .min(max_history / 2);
     let compact_count = non_system_count.saturating_sub(keep_recent);
     if compact_count == 0 {
         return Ok(false);
@@ -7049,6 +7060,68 @@ Let me check the result."#;
         );
     }
 
+    /// A streamed turn with an events channel sends each piece to the stream
+    /// sink as it arrives. The reasoning of a tool step and of the answer step
+    /// must not be among the pieces, and the answer must still be streamed.
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_the_reply_and_never_the_reasoning() {
+        use crate::providers::compatible::reasoning_endpoint::{
+            ReasoningEndpoint, REASONING_MARKER,
+        };
+
+        let endpoint = ReasoningEndpoint::start(
+            "echo",
+            serde_json::json!({ "text": "hi" }),
+            "The answer is 42.",
+        )
+        .await;
+        let provider = endpoint.provider();
+        let mut history = vec![ChatMessage::user("call echo")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let observer = NoopObserver;
+        let (events_tx, mut events_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::events::AgentEvent>(64);
+
+        let reply = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-reasoner",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None, // test: no origin chat
+            None,
+            None,
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            Some(events_tx),
+            None,
+            &crate::security::AuditActor::surface(),
+            None,
+        )
+        .await
+        .expect("loop succeeds");
+
+        let mut chunks = Vec::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            if let crate::agent::events::AgentEvent::Chunk(s) = ev {
+                chunks.push(s);
+            }
+        }
+        assert_eq!(reply, "The answer is 42.");
+        assert!(
+            chunks.iter().all(|c| !c.contains(REASONING_MARKER)),
+            "reasoning reached the stream sink: {chunks:?}"
+        );
+        assert_eq!(chunks.concat(), "The answer is 42.", "chunks: {chunks:?}");
+    }
+
     /// A reasoning model answers a tool step with empty `content`, its
     /// reasoning and a tool call. The reasoning must not become the step's text:
     /// the loop would store it in the history and send it back on the next
@@ -7352,5 +7425,188 @@ Let me check the result."#;
         let (_tmp, mem) = seed().await;
         assert_eq!(clear_conversation_memory(&mem, None).await, 0);
         assert_eq!(mem.count(memory::SessionScope::Any).await.unwrap(), 4);
+    }
+
+    /// Counts summariser calls. Each call returns the same fixed marker, so a
+    /// test can tell a compacted history from an uncompacted one by its content.
+    struct SummaryCountingProvider {
+        calls: AtomicUsize,
+    }
+
+    const SUMMARY_MARKER: &str = "## Summary\nmarker";
+
+    impl SummaryCountingProvider {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Provider for SummaryCountingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system is not used by compaction");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                usage: None,
+                text: Some(SUMMARY_MARKER.to_string()),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    /// Drives a plain exchange the way the turn loop does: one user and one
+    /// assistant message per turn, then auto-compaction, then the hard trim.
+    /// Returns the turn numbers (1-based) on which compaction ran.
+    async fn drive_plain_exchange(
+        provider: &SummaryCountingProvider,
+        max_history: usize,
+        turns: usize,
+    ) -> (Vec<usize>, Vec<ChatMessage>) {
+        let mut history = vec![ChatMessage::system("system prompt")];
+        let mut compacted_on = Vec::new();
+        for turn in 1..=turns {
+            history.push(ChatMessage::user(format!("question {turn}")));
+            history.push(ChatMessage::assistant(format!("answer {turn}")));
+            if auto_compact_history(&mut history, provider, "model", max_history)
+                .await
+                .expect("compaction should not fail")
+            {
+                compacted_on.push(turn);
+            }
+            trim_history(&mut history, max_history);
+            assert!(
+                history.len() - 1 <= max_history,
+                "history exceeded the limit {max_history} after turn {turn}"
+            );
+        }
+        (compacted_on, history)
+    }
+
+    /// From a limit of 8 up, a plain exchange compacts once it passes the limit,
+    /// never on two turns in a row, and leaves a summary plus fewer messages than
+    /// the limit. Every failing row is reported, not just the first.
+    #[tokio::test]
+    async fn compaction_runs_from_limit_8_without_back_to_back_passes() {
+        let mut failures = Vec::new();
+        for max_history in [8usize, 10, 18, 19, 20, 22, 50] {
+            let provider = SummaryCountingProvider::new();
+            let (compacted_on, history) = drive_plain_exchange(&provider, max_history, 60).await;
+
+            if compacted_on.is_empty() {
+                failures.push(format!("limit {max_history}: compaction never ran"));
+                continue;
+            }
+            if compacted_on.windows(2).any(|pair| pair[1] - pair[0] < 2) {
+                failures.push(format!(
+                    "limit {max_history}: compacted on consecutive turns {compacted_on:?}"
+                ));
+            }
+            if provider.calls() != compacted_on.len() {
+                failures.push(format!(
+                    "limit {max_history}: {} summariser calls for {} compactions",
+                    provider.calls(),
+                    compacted_on.len()
+                ));
+            }
+            if !history.iter().any(|m| m.content.contains(SUMMARY_MARKER)) {
+                failures.push(format!(
+                    "limit {max_history}: no summary in the history after 60 turns"
+                ));
+            }
+            if history.len() > max_history {
+                failures.push(format!(
+                    "limit {max_history}: {} messages held, not fewer than the limit",
+                    history.len() - 1
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Below 8 the hard trim alone bounds the history: no summariser call, no
+    /// compaction, and the history never grows past the limit. Every failing row
+    /// is reported, not just the first.
+    #[tokio::test]
+    async fn compaction_is_skipped_below_limit_8_and_the_trim_bounds_history() {
+        let mut failures = Vec::new();
+        for max_history in [1usize, 2, 4, 7] {
+            let provider = SummaryCountingProvider::new();
+            let (compacted_on, history) = drive_plain_exchange(&provider, max_history, 60).await;
+
+            if !compacted_on.is_empty() {
+                failures.push(format!(
+                    "limit {max_history}: compaction ran on turns {compacted_on:?}"
+                ));
+            }
+            if provider.calls() != 0 {
+                failures.push(format!(
+                    "limit {max_history}: the summariser was called {} times",
+                    provider.calls()
+                ));
+            }
+            if history.len() - 1 != max_history {
+                failures.push(format!(
+                    "limit {max_history}: {} messages held after the trim",
+                    history.len() - 1
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// At limit 50 a compaction keeps the 20 most recent messages, as before.
+    #[tokio::test]
+    async fn compaction_at_limit_50_keeps_the_20_most_recent_messages() {
+        let provider = SummaryCountingProvider::new();
+        let mut history = vec![ChatMessage::system("system prompt")];
+        for turn in 1..=51 {
+            history.push(ChatMessage::user(format!("question {turn}")));
+            history.push(ChatMessage::assistant(format!("answer {turn}")));
+        }
+        assert_eq!(history.len() - 1, 102);
+
+        let compacted = auto_compact_history(&mut history, &provider, "model", 50)
+            .await
+            .unwrap();
+
+        assert!(compacted);
+        assert_eq!(provider.calls(), 1);
+        // system + summary envelope + the last 20 messages
+        assert_eq!(history.len(), 1 + 1 + 20);
+        assert_eq!(history[1].role, "system");
+        assert!(history[1].content.contains(SUMMARY_MARKER));
+        assert_eq!(history.last().unwrap().content, "answer 51");
+    }
+
+    /// A session that never passes its limit is never compacted, even when the
+    /// limit is at or above the threshold.
+    #[tokio::test]
+    async fn session_under_its_limit_is_never_compacted() {
+        let provider = SummaryCountingProvider::new();
+        let (compacted_on, history) = drive_plain_exchange(&provider, 50, 5).await;
+
+        assert!(compacted_on.is_empty());
+        assert_eq!(provider.calls(), 0);
+        assert_eq!(history.len() - 1, 10);
     }
 }

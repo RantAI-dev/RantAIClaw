@@ -57,9 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not three. An existing `forbidden_paths.toml` is ignored and left where it is. The
   profile clone no longer copies it. `~/.azure`, `~/.config/gcloud` and the profile
   `secrets` directories joined the built-in file-tool floor.
+- Automatic history compaction keeps fewer recent messages for `max_history_messages` from 19 to 39. The
+  kept window is now the smaller of 20 and half the limit, so more history is summarised per pass. Limits of
+  40 and up, including the default of 50, keep 20 as before. Below 8, only the hard trim runs, as before.
 
 ### Fixed
 
+- While a reply streamed, the model's reasoning showed in front of the answer. The saved reply was already clean; the streamed text was not. This applied to every surface that streams: the gateway chunk events, the TUI live preview and channel streaming. Only the reply is streamed now, and reasoning is sent once, at the end, when it is the whole reply.
 - `anthropic-custom:<url>` inherits the `anthropic` env vars. `ANTHROPIC_API_KEY` was ignored for a custom
   Anthropic-format endpoint, which refused with `anthropic: ANTHROPIC_API_KEY required`. The refusal now names
   the string typed and the variable to set.
@@ -95,6 +99,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   character near its start. The WARN line that names the rejected sender now cuts
   the id at four characters, not four bytes, so it no longer panics on a character
   split.
+- Automatic history compaction never ran for `max_history_messages` from 8 to 18. The kept window of 20 was
+  larger than the limit, so there was never anything left to compact. It now runs from 8 up.
+- The headless `setup <topic>` no longer prints `✅ Provider configured` before refusing. A provider
+  run with no usable API key printed the success line, then the refusal, and the refusal appeared twice.
+  The success line is now printed only once the credential check passes, and the refusal once.
+- `onboard` and quick setup wrote `$HOME/.rantaiclaw/config.toml` even when `RANTAICLAW_CONFIG_DIR` or an
+  active profile applied, while the agent read the resolved config. The answers were silently discarded.
+  Onboard now writes through the same resolver the loader uses. A v0.4 flat config is still read: it moves
+  into the active profile before the overwrite check, as before.
 - The knowledge base keyword search no longer fails on ordinary text. A question with `?`, a comma,
   an apostrophe, `@`, `+`, brackets, `-`, `:`, or a bare `AND`, `OR` or `NOT` returned nothing from the
   keyword side, and the failure was silent. The query is now reduced to its words, and a question

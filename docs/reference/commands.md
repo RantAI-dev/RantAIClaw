@@ -96,6 +96,8 @@ Single-topic examples:
 - `rantaiclaw setup knowledge` — set the Knowledge Base API keys (`[knowledge].embedding_api_key` / `vision_api_key`, encrypted at rest; vision falls back to the embedding key). Env `KB_EMBEDDING_API_KEY` / `KB_EXTRACT_VISION_API_KEY` override config at load, with `OPENROUTER_API_KEY` as the final fallback. See [config-reference.md](config.md) for the gateway `GET`/`PUT /api/v1/config/knowledge` endpoints.
 - `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (a three-minute window, the same as the console's; a timeout exits non-zero)
 
+`setup` writes the config it loaded, to the same file the agent reads: `RANTAICLAW_CONFIG_DIR` if set, otherwise the active profile's `config.toml`.
+
 `onboard` is the legacy entry point, kept for existing scripts. It is **not** an alias for `setup` — it is a separate command with its own flags (`--interactive`, `--channels-only`, `--api-key`, `--provider`, `--model`, `--memory`), documented below. New work should use `setup`.
 
 ### `onboard`
@@ -113,6 +115,7 @@ Single-topic examples:
 - If `config.toml` already exists, `onboard` asks for explicit confirmation before overwrite.
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
 - Use `rantaiclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
+- `onboard` writes `config.toml` to the same file the agent reads: `RANTAICLAW_CONFIG_DIR` if set, otherwise the active profile's `config.toml` (`~/.rantaiclaw/profiles/<name>/config.toml`). A v0.4 flat `~/.rantaiclaw/config.toml` is moved into the profile first and counts as the existing config.
 
 ### `agent`
 

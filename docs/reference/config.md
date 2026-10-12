@@ -107,6 +107,7 @@ Operational note for container users:
 Notes:
 
 - Setting `max_tool_iterations = 0` falls back to safe default `10`.
+- Automatic compaction runs once history passes `max_history_messages`, from a limit of 8 up. It summarises the older messages and keeps the most recent half of the limit, up to 20 messages. Below 8, the oldest messages are dropped without a summary.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 
