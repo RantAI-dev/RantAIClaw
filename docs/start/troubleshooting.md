@@ -152,6 +152,17 @@ Persist in your shell profile if needed.
 
 ## Runtime / Gateway
 
+### I ran onboard and the agent still has no provider
+
+Cause: older builds wrote `onboard`'s answers to `$HOME/.rantaiclaw/config.toml` even when
+`RANTAICLAW_CONFIG_DIR` was set, while the agent read the config from the resolved directory. The
+answers were saved, but to a file the agent never loaded.
+
+Check whether `RANTAICLAW_CONFIG_DIR` is set in the shell that runs the agent (`echo $RANTAICLAW_CONFIG_DIR`).
+If it is, the config the agent reads is `$RANTAICLAW_CONFIG_DIR/config.toml`. Re-run `rantaiclaw onboard` on
+this build: it writes that file. Otherwise the agent reads the active profile's
+`~/.rantaiclaw/profiles/<name>/config.toml`, and `onboard` writes it there too.
+
 ### Startup fails with `openai: OPENAI_API_KEY required` (or anthropic / gemini)
 
 Cause: the config names a provider that cannot start without an API key, and

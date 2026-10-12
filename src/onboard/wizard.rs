@@ -606,30 +606,6 @@ pub async fn run_quick_setup(
     memory_backend: Option<&str>,
     force: bool,
 ) -> Result<Config> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-
-    run_quick_setup_with_home(
-        credential_override,
-        provider,
-        model_override,
-        memory_backend,
-        force,
-        &home,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_lines)]
-async fn run_quick_setup_with_home(
-    credential_override: Option<&str>,
-    provider: Option<&str>,
-    model_override: Option<&str>,
-    memory_backend: Option<&str>,
-    force: bool,
-    home: &Path,
-) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -639,11 +615,21 @@ async fn run_quick_setup_with_home(
     );
     println!();
 
-    let rantaiclaw_dir = crate::profile::paths::root_for_home(home);
-    let workspace_dir = rantaiclaw_dir.join("workspace");
-    let config_path = rantaiclaw_dir.join("config.toml");
+    // Mirror `Config::load_or_init`: a v0.4 flat config moves into the active
+    // profile before the overwrite guard looks at the resolved path.
+    if let Err(e) = crate::profile::migration::maybe_migrate_legacy_layout() {
+        tracing::warn!("legacy-layout migration failed: {e:#}; continuing with current layout");
+    }
+    // The same resolver the loader uses, so the next command reads the file
+    // this writes (RANTAICLAW_CONFIG_DIR, the workspace marker and the active
+    // profile all apply).
+    let (config_path, workspace_dir) = crate::config::Config::resolve_active_paths().await?;
+    let config_dir = config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
 
     ensure_onboard_overwrite_allowed(&config_path, force)?;
+    fs::create_dir_all(config_dir).context("Failed to create config directory")?;
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
@@ -785,7 +771,7 @@ async fn run_quick_setup_with_home(
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
         println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
-        println!("    2. Or edit:           ~/.rantaiclaw/config.toml");
+        println!("    2. Or edit:           {}", config_path.display());
         println!("    3. Chat:              rantaiclaw agent -m \"Hello!\"");
         println!("    4. Gateway:           rantaiclaw gateway");
     } else {
@@ -5776,15 +5762,12 @@ mod tests {
 
     /// Pin the process `HOME` at `tmp` and prove the pin took.
     ///
-    /// `run_quick_setup_with_home` takes `home` as a parameter, and every write
-    /// it makes honours it — except the last one. `persist_workspace_selection`
-    /// reaches `persist_active_workspace_config_dir`, which resolves the default
-    /// config dir from the process `HOME` (`UserDirs::new()`), not from that
-    /// parameter. Unpinned, the two disagree: `config_dir` follows `tmp` while
-    /// the destination follows the real home, so the run drops an
-    /// `active_workspace.toml` into the operator's own `~/.rantaiclaw/` naming a
-    /// tempdir that is deleted moments later. The runtime then has to recognise
-    /// and ignore that marker on every launch.
+    /// `run_quick_setup` resolves its config dir from the process `HOME` when
+    /// no `RANTAICLAW_CONFIG_DIR` is set, and `persist_workspace_selection`
+    /// writes the active-workspace marker under that same default dir. Unpinned,
+    /// the run would drop an `active_workspace.toml` into the operator's own
+    /// `~/.rantaiclaw/` naming a tempdir that is deleted moments later. The
+    /// runtime then has to recognise and ignore that marker on every launch.
     ///
     /// Caller must hold `test_env::ENV_LOCK` first — `HOME` is process-global.
     /// Hold the returned guard for the whole test.
@@ -5807,14 +5790,15 @@ mod tests {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _home = pin_home(&tmp);
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path().join("cfg"));
+        let _ws = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
-        let config = run_quick_setup_with_home(
+        let config = run_quick_setup(
             Some("sk-issue946"),
             Some("openrouter"),
             Some("custom-model-946"),
             Some("sqlite"),
             false,
-            tmp.path(),
         )
         .await
         .unwrap();
@@ -5833,14 +5817,15 @@ mod tests {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _home = pin_home(&tmp);
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path().join("cfg"));
+        let _ws = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
-        let config = run_quick_setup_with_home(
+        let config = run_quick_setup(
             Some("sk-issue946"),
             Some("anthropic"),
             None,
             Some("sqlite"),
             false,
-            tmp.path(),
         )
         .await
         .unwrap();
@@ -5852,8 +5837,12 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_existing_config_requires_force_when_non_interactive() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
-        let rantaiclaw_dir = tmp.path().join(".rantaiclaw");
+        let _home = pin_home(&tmp);
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path().join("cfg"));
+        let _ws = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let rantaiclaw_dir = tmp.path().join("cfg");
         let config_path = rantaiclaw_dir.join("config.toml");
 
         tokio::fs::create_dir_all(&rantaiclaw_dir).await.unwrap();
@@ -5861,13 +5850,12 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run_quick_setup_with_home(
+        let err = run_quick_setup(
             Some("sk-existing"),
             Some("openrouter"),
             Some("custom-model"),
             Some("sqlite"),
             false,
-            tmp.path(),
         )
         .await
         .expect_err("quick setup should refuse overwrite without --force");
@@ -5882,7 +5870,9 @@ mod tests {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _home = pin_home(&tmp);
-        let rantaiclaw_dir = tmp.path().join(".rantaiclaw");
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path().join("cfg"));
+        let _ws = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let rantaiclaw_dir = tmp.path().join("cfg");
         let config_path = rantaiclaw_dir.join("config.toml");
 
         tokio::fs::create_dir_all(&rantaiclaw_dir).await.unwrap();
@@ -5893,13 +5883,12 @@ mod tests {
         .await
         .unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = run_quick_setup(
             Some("sk-force"),
             Some("openrouter"),
             Some("custom-model-fresh"),
             Some("sqlite"),
             true,
-            tmp.path(),
         )
         .await
         .expect("quick setup should overwrite existing config with --force");
@@ -5911,6 +5900,81 @@ mod tests {
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
         assert!(config_raw.contains("default_provider = \"openrouter\""));
         assert!(config_raw.contains("default_model = \"custom-model-fresh\""));
+    }
+
+    /// With `RANTAICLAW_CONFIG_DIR` set, quick setup writes into that dir, and
+    /// the next `load_or_init` in the same environment reads the same file.
+    #[tokio::test]
+    async fn quick_setup_writes_the_config_dir_the_loader_reads() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _home = pin_home(&tmp);
+        let config_dir = tmp.path().join("custom-config-dir");
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", &config_dir);
+        let _ws = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        let config = run_quick_setup(
+            Some("sk-target-unit"),
+            Some("anthropic"),
+            Some("target-model-unit"),
+            Some("sqlite"),
+            false,
+        )
+        .await
+        .expect("quick setup should write the resolved config");
+
+        assert_eq!(config.config_path, config_dir.join("config.toml"));
+        assert!(
+            !tmp.path().join(".rantaiclaw/config.toml").exists(),
+            "the flat HOME path must not be the write target"
+        );
+        let raw = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(raw.contains("default_provider = \"anthropic\""));
+        assert!(raw.contains("default_model = \"target-model-unit\""));
+
+        let loaded = crate::config::Config::load_or_init().await.unwrap();
+        assert_eq!(loaded.config_path, config_dir.join("config.toml"));
+        assert_eq!(loaded.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(loaded.default_model.as_deref(), Some("target-model-unit"));
+    }
+
+    /// The API key quick setup receives is stored encrypted, as on every other
+    /// save path: the raw file holds `enc2:` and not the plaintext.
+    #[tokio::test]
+    async fn quick_setup_stores_the_api_key_encrypted() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _home = pin_home(&tmp);
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path().join("cfg"));
+        let _ws = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        let config = run_quick_setup(
+            Some("sk-plain-unit-key"),
+            Some("openrouter"),
+            Some("enc-model-unit"),
+            Some("sqlite"),
+            false,
+        )
+        .await
+        .expect("quick setup should write the config");
+
+        let raw = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            !raw.contains("sk-plain-unit-key"),
+            "the plaintext key must not reach config.toml"
+        );
+        let stored = raw
+            .lines()
+            .find(|l| l.trim_start().starts_with("api_key"))
+            .expect("api_key line present");
+        assert!(
+            stored.contains("enc2:"),
+            "api_key must be stored with the enc2: prefix, got {stored:?}"
+        );
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────

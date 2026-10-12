@@ -129,7 +129,7 @@ pub fn render_completion_banner(next_steps: &[&str]) -> String {
 }
 
 /// Print the wizard completion banner. Called at the success path of
-/// `run_wizard`, `run_quick_setup_with_home`, and `run_channels_repair_wizard`.
+/// `run_wizard`, `run_quick_setup`, and `run_channels_repair_wizard`.
 pub fn print_completion_banner(next_steps: &[&str]) {
     print!("{}", render_completion_banner(next_steps));
 }
