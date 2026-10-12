@@ -742,9 +742,18 @@ where
     }
 
     let tool_calls = dedupe_tool_calls_by_id(tool_calls);
+    let text = reply_text(full_text.clone(), reasoning, !tool_calls.is_empty());
+    // Reasoning is never streamed, so when it is the reply nothing was sent
+    // yet (`full_text` is empty: only `Text` items are sent). Send it once, so
+    // the pieces on `text_tx` equal the returned text.
+    if full_text.is_empty() {
+        if let Some(reply) = text.as_deref() {
+            let _ = text_tx.send(reply.to_string()).await;
+        }
+    }
     Ok(ChatResponse {
         usage,
-        text: reply_text(full_text, reasoning, !tool_calls.is_empty()),
+        text,
         // rig may surface a tool call via both the immediate-complete event and
         // the delta path; collapse same-id duplicates before they reach the
         // next request (OpenAI 400s on duplicate tool_call ids).
@@ -1131,6 +1140,24 @@ mod tests {
     }
 
     async fn anthropic_stream_of(sse: &str) -> ChatResponse {
+        anthropic_stream_collecting(sse, false).await.response
+    }
+
+    /// One streamed call: what it returned, and every piece it sent on
+    /// `text_tx`, in order. `hang_up` drops the receiving end first.
+    #[derive(Debug)]
+    struct Streamed {
+        response: ChatResponse,
+        pieces: Vec<String>,
+    }
+
+    impl Streamed {
+        fn pieces_joined(&self) -> String {
+            self.pieces.concat()
+        }
+    }
+
+    async fn anthropic_stream_collecting(sse: &str, hang_up: bool) -> Streamed {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/messages"))
@@ -1147,9 +1174,10 @@ mod tests {
                 .expect("construct");
         let messages = vec![ChatMessage::user("weather in Jakarta?")];
         let tools = vec![probe_tool()];
-        let (tx, _rx) = mpsc::channel::<String>(16);
+        let (tx, rx) = mpsc::channel::<String>(16);
+        let mut rx = (!hang_up).then_some(rx);
 
-        provider
+        let response = provider
             .chat_stream(
                 ChatRequest {
                     messages: &messages,
@@ -1160,7 +1188,163 @@ mod tests {
                 tx,
             )
             .await
-            .expect("stream against the mock")
+            .expect("stream against the mock");
+        let mut pieces = Vec::new();
+        if let Some(rx) = rx.as_mut() {
+            while let Ok(piece) = rx.try_recv() {
+                pieces.push(piece);
+            }
+        }
+        Streamed { response, pieces }
+    }
+
+    /// Anthropic SSE for one `thinking` block with `thinking` as its text,
+    /// optionally followed by a `text` block with `answer`, or by a tool call.
+    fn anthropic_thinking_sse(thinking: &str, after: &str) -> String {
+        let start = r#"{"type":"message_start","message":{"id":"msg_r","type":"message","role":"assistant","model":"claude-3-haiku-20240307","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":1}}}"#;
+        format!(
+            concat!(
+                "event: message_start\ndata: {start}\n\n",
+                "event: content_block_start\n",
+                r#"data: {{"type":"content_block_start","index":0,"content_block":{{"type":"thinking","thinking":"","signature":""}}}}"#,
+                "\n\n",
+                "event: content_block_delta\n",
+                r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{thinking}"}}}}"#,
+                "\n\n",
+                "event: content_block_stop\n",
+                r#"data: {{"type":"content_block_stop","index":0}}"#,
+                "\n\n",
+                "{after}",
+                "event: message_delta\n",
+                r#"data: {{"type":"message_delta","delta":{{"stop_reason":"end_turn","stop_sequence":null}},"usage":{{"output_tokens":7}}}}"#,
+                "\n\n",
+                "event: message_stop\n",
+                r#"data: {{"type":"message_stop"}}"#,
+                "\n\n",
+            ),
+            start = start,
+            thinking = thinking,
+            after = after,
+        )
+    }
+
+    /// A text block with `text`, as the Anthropic stream sends it at index 1.
+    fn anthropic_text_block_sse(text: &str) -> String {
+        format!(
+            concat!(
+                "event: content_block_start\n",
+                r#"data: {{"type":"content_block_start","index":1,"content_block":{{"type":"text","text":""}}}}"#,
+                "\n\n",
+                "event: content_block_delta\n",
+                r#"data: {{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{text}"}}}}"#,
+                "\n\n",
+                "event: content_block_stop\n",
+                r#"data: {{"type":"content_block_stop","index":1}}"#,
+                "\n\n",
+            ),
+            text = text,
+        )
+    }
+
+    /// A tool call block at index 1, as the Anthropic stream sends it.
+    fn anthropic_tool_block_sse() -> String {
+        concat!(
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Jakarta\"}"}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n\n",
+        )
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_sends_only_the_text_when_thinking_came_first() {
+        let streamed = anthropic_stream_collecting(
+            &anthropic_thinking_sse("Thinking it over.", &anthropic_text_block_sse("1 line.")),
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            streamed.pieces_joined(),
+            "1 line.",
+            "pieces: {:?}",
+            streamed.pieces
+        );
+        assert_eq!(streamed.response.text.as_deref(), Some("1 line."));
+    }
+
+    /// Thinking with no text: the thinking is the reply, and it is sent once.
+    /// `rig_native` sent only `Text` items, so before the fix nothing was sent.
+    /// The assertion is the invariant itself: the pieces equal the returned
+    /// text, whatever that text is.
+    #[tokio::test]
+    async fn anthropic_stream_sends_the_thinking_once_when_there_is_nothing_else() {
+        let streamed =
+            anthropic_stream_collecting(&anthropic_thinking_sse("Only thinking.", ""), false).await;
+
+        let reply = streamed.response.text.clone().unwrap_or_default();
+        assert!(
+            reply.contains("Only thinking."),
+            "the thinking is the reply: {streamed:?}"
+        );
+        assert_eq!(
+            streamed.pieces_joined(),
+            reply,
+            "pieces: {:?}",
+            streamed.pieces
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_sends_nothing_when_thinking_ends_in_a_tool_call() {
+        let streamed = anthropic_stream_collecting(
+            &anthropic_thinking_sse(
+                "The user wants the weather. I should call the tool.",
+                &anthropic_tool_block_sse(),
+            ),
+            false,
+        )
+        .await;
+
+        assert!(streamed.pieces.is_empty(), "pieces: {:?}", streamed.pieces);
+        assert_eq!(streamed.response.text, None);
+        assert_eq!(streamed.response.tool_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_sends_the_text_written_next_to_a_tool_call() {
+        let streamed = anthropic_stream_collecting(
+            &anthropic_thinking_sse(
+                "Thinking.",
+                &format!(
+                    "{}{}",
+                    anthropic_text_block_sse("Checking that."),
+                    anthropic_tool_block_sse()
+                ),
+            ),
+            false,
+        )
+        .await;
+
+        assert_eq!(streamed.pieces_joined(), "Checking that.");
+        assert_eq!(streamed.response.text.as_deref(), Some("Checking that."));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_returns_only_the_text_when_the_consumer_hangs_up() {
+        let streamed = anthropic_stream_collecting(
+            &anthropic_thinking_sse("Thinking it over.", &anthropic_text_block_sse("1 line.")),
+            true,
+        )
+        .await;
+
+        assert_eq!(streamed.response.text.as_deref(), Some("1 line."));
     }
 
     /// The rig stream surfaces the provider's final usage, so a streamed turn
