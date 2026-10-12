@@ -27,7 +27,7 @@ impl KbStore for SqliteStore {
         self.update_document_impl(doc).await
     }
 
-    async fn delete_document(&self, id: &DocumentId, soft: bool) -> KbResult<()> {
+    async fn delete_document(&self, id: &DocumentId, soft: bool) -> KbResult<bool> {
         self.delete_document_impl(id, soft).await
     }
 

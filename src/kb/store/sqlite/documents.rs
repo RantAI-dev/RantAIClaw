@@ -159,19 +159,30 @@ impl SqliteStore {
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }
 
-    pub(crate) async fn delete_document_impl(&self, id: &DocumentId, soft: bool) -> KbResult<()> {
+    /// Soft- or hard-delete a live document. `true` when a live row was
+    /// deleted, `false` when the id matched no live row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`KbError`] when the SQLite statement or transaction fails.
+    pub(crate) async fn delete_document_impl(&self, id: &DocumentId, soft: bool) -> KbResult<bool> {
         let conn = self.conn.clone();
         let id = id.0.clone();
-        tokio::task::spawn_blocking(move || -> KbResult<()> {
+        tokio::task::spawn_blocking(move || -> KbResult<bool> {
             let mut conn = conn.blocking_lock();
+            // The `deleted_at IS NULL` filter is GET's notion of an existing
+            // document (`get_document_impl`): an unknown id and an already
+            // soft-deleted id both count as not found, so neither mode reports
+            // a second success or touches the row again.
             if soft {
-                conn.execute(
+                let updated = conn.execute(
                     "UPDATE document
                      SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
                          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                     WHERE id = ?1",
+                     WHERE id = ?1 AND deleted_at IS NULL",
                     params![id],
                 )?;
+                Ok(updated > 0)
             } else {
                 // Hard delete: drop the document AND its chunks + vectors
                 // atomically. `chunk_vec` (vec0) has no foreign key, so neither a
@@ -180,6 +191,16 @@ impl SqliteStore {
                 // ingest collides on rowid reuse
                 // (`UNIQUE constraint failed on chunk_vec primary key`).
                 let tx = conn.transaction()?;
+                // The live-row check comes first, in the same transaction, so a
+                // miss deletes no chunk or vector.
+                let live: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM document WHERE id = ?1 AND deleted_at IS NULL",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                if live == 0 {
+                    return Ok(false);
+                }
                 {
                     let mut stmt = tx.prepare("SELECT rowid FROM chunk WHERE document_id = ?1")?;
                     let rowids: Vec<i64> = stmt
@@ -192,7 +213,10 @@ impl SqliteStore {
                     }
                     drop(del_vec);
                     tx.execute("DELETE FROM chunk WHERE document_id = ?1", params![id])?;
-                    tx.execute("DELETE FROM document WHERE id = ?1", params![id])?;
+                    tx.execute(
+                        "DELETE FROM document WHERE id = ?1 AND deleted_at IS NULL",
+                        params![id],
+                    )?;
                     // Also clear this document's knowledge-graph rows, then GC any
                     // entity left with zero mentions — otherwise a hard delete
                     // orphans entity/mention/relation rows (mirrors
@@ -211,8 +235,8 @@ impl SqliteStore {
                     )?;
                 }
                 tx.commit()?;
+                Ok(true)
             }
-            Ok(())
         })
         .await
         .map_err(|e| KbError::Other(format!("join: {e}")))?

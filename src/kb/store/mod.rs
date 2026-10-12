@@ -45,7 +45,11 @@ pub trait KbStore: Send + Sync {
     async fn create_document(&self, doc: &Document) -> KbResult<()>;
     async fn get_document(&self, id: &DocumentId) -> KbResult<Option<Document>>;
     async fn update_document(&self, doc: &Document) -> KbResult<()>;
-    async fn delete_document(&self, id: &DocumentId, soft: bool) -> KbResult<()>;
+    /// Delete a live document, soft (mark) or hard (remove with its chunks and
+    /// vectors). Returns `true` when a live row was deleted, `false` when the
+    /// id matched no live document: unknown, or already soft-deleted. A
+    /// soft-deleted document is not found here, the same as for `get_document`.
+    async fn delete_document(&self, id: &DocumentId, soft: bool) -> KbResult<bool>;
     async fn list_documents(&self, organization_id: Option<&str>) -> KbResult<Vec<Document>>;
     async fn record_retrieval_hits(&self, ids: &[DocumentId]) -> KbResult<()>;
 

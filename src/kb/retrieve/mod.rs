@@ -407,8 +407,9 @@ impl Retriever {
     }
 
     /// BM25 lexical arm. Fail-soft: on store error, returns empty list and
-    /// logs at debug level — caller treats absence of BM25 hits as "vector
-    /// only" mode.
+    /// logs at warn level — caller treats absence of BM25 hits as "vector
+    /// only" mode. The query text is left out of the log: queries can hold
+    /// secrets, and the error alone says what failed.
     async fn run_bm25_arm(
         &self,
         query: &str,
@@ -420,7 +421,7 @@ impl Retriever {
         match self.store.bm25_search(query, fetch_limit).await {
             Ok(hits) => Ok(hits),
             Err(e) => {
-                tracing::debug!(target: "kb::retrieve", error = %e, "bm25 arm failed, falling back to vector-only");
+                tracing::warn!(target: "kb::retrieve", error = %e, "bm25 arm failed, falling back to vector-only");
                 Ok(Vec::new())
             }
         }

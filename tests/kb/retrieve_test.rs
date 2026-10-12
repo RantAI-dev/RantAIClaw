@@ -206,8 +206,8 @@ impl KbStore for FakeStore {
     async fn update_document(&self, _doc: &Document) -> KbResult<()> {
         Ok(())
     }
-    async fn delete_document(&self, _id: &DocumentId, _soft: bool) -> KbResult<()> {
-        Ok(())
+    async fn delete_document(&self, _id: &DocumentId, _soft: bool) -> KbResult<bool> {
+        Ok(false)
     }
     async fn list_documents(&self, _organization_id: Option<&str>) -> KbResult<Vec<Document>> {
         Ok(Vec::new())
@@ -1057,4 +1057,110 @@ mod format_tests {
             "no-section entry has no trailing colon"
         );
     }
+}
+
+// ---- BM25 arm on a real store --------------------------------------------
+
+/// Embedder whose query vector points along axis 3, so every chunk stored
+/// along axis 0 has cosine similarity 0 with it. The vector arm then returns
+/// nothing above the similarity floor, and any hit the retriever returns must
+/// have come from the keyword arm.
+struct OrthogonalEmbedder;
+
+#[async_trait]
+impl EmbeddingProvider for OrthogonalEmbedder {
+    fn model(&self) -> &str {
+        "orthogonal-model"
+    }
+    fn dim(&self) -> usize {
+        4
+    }
+    async fn embed_query(&self, _text: &str) -> KbResult<Vec<f32>> {
+        Ok(vec![0.0, 0.0, 0.0, 1.0])
+    }
+    async fn embed_many(&self, texts: &[String]) -> KbResult<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![0.0, 0.0, 0.0, 1.0]).collect())
+    }
+}
+
+#[tokio::test]
+async fn keyword_arm_returns_hits_for_a_punctuated_question() {
+    // Regression: a question with `?` or `,` made the keyword arm fail on FTS5
+    // syntax, and the failure was swallowed, so the retriever returned nothing.
+    // The vector arm is silenced (orthogonal query), so the hit must be BM25's.
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sqlite = Arc::new(
+        SqliteStore::open(tmp.path().join("kb.db"), 4)
+            .await
+            .unwrap(),
+    );
+    let doc = Document {
+        id: DocumentId("rantaiclaw_doc_refund".into()),
+        title: "Refund Policy".into(),
+        content: "refund policy".into(),
+        categories: vec!["FAQ".into()],
+        subcategory: None,
+        metadata: serde_json::json!({}),
+        s3_key: None,
+        file_type: None,
+        mime_type: None,
+        file_size: None,
+        organization_id: None,
+        created_by: None,
+        session_id: None,
+        artifact_type: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+        retention_days: None,
+        retrieval_count: 0,
+        last_retrieved_at: None,
+    };
+    sqlite.create_document(&doc).await.unwrap();
+    let chunk = Chunk {
+        content: "Refunds are accepted within the refund window of thirty days.".into(),
+        metadata: rantaiclaw::kb::ChunkMetadata {
+            document_title: doc.title.clone(),
+            category: "FAQ".into(),
+            subcategory: None,
+            section: None,
+            chunk_index: 0,
+            contextual_prefix: None,
+        },
+    };
+    sqlite
+        .store_chunks(
+            &doc.id,
+            &[chunk],
+            &[vec![1.0, 0.0, 0.0, 0.0]],
+            "rantaiclaw_test_model_a",
+        )
+        .await
+        .unwrap();
+
+    let mut cfg = test_cfg();
+    cfg.hybrid_bm25_enabled = true;
+    let retriever = Retriever::new(
+        cfg,
+        sqlite.clone() as Arc<dyn KbStore>,
+        Arc::new(OrthogonalEmbedder),
+    );
+    let opts = RetrieveOptions {
+        min_similarity: Some(0.30),
+        ..RetrieveOptions::default()
+    };
+    let result = retriever
+        .retrieve("what is the refund window?", opts)
+        .await
+        .expect("retrieve must succeed");
+    assert!(
+        result
+            .chunks
+            .iter()
+            .any(|c| c.content.contains("refund window")),
+        "keyword arm must return the chunk for a punctuated question; got {:?}",
+        result.chunks.iter().map(|c| &c.content).collect::<Vec<_>>()
+    );
 }

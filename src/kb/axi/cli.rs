@@ -36,7 +36,7 @@ use crate::kb::retrieve::format::format_context_for_prompt;
 use crate::kb::retrieve::{RetrieveOptions, Retriever, SourceRef};
 use crate::kb::store::sqlite::SqliteStore;
 use crate::kb::store::{Graph, IntelligenceStore, KbStore};
-use crate::kb::{Document, DocumentId, KbConfig, KbResult, SearchResult};
+use crate::kb::{Document, DocumentId, KbConfig, KbGroupSummary, KbResult, SearchResult};
 
 /// Per-chunk preview width in the TOON `chunks` table. The table is a
 /// machine-readable index; the full chunk text reaches the agent through the
@@ -244,7 +244,7 @@ impl KbCommand {
             Self::Status { .. } | Self::Enable | Self::Disable => unreachable!(),
             Self::Intelligence { document_id, json } => {
                 let intel: Arc<dyn IntelligenceStore> = concrete;
-                cmd_intelligence(intel, document_id, json).await
+                cmd_intelligence(store, intel, document_id, json).await
             }
             Self::Graph { group, limit, json } => {
                 let intel: Arc<dyn IntelligenceStore> = concrete;
@@ -331,6 +331,37 @@ async fn cmd_search(
     Ok(0)
 }
 
+/// Map each `--group` name to the id of the group it names. A name can match
+/// more than one group, since group names are not unique: every match is
+/// returned, so the document joins all of them. The outer `Result` is the
+/// store failing; the inner `Err` carries the first name no group has.
+///
+/// # Errors
+///
+/// Returns a [`KbError`] when the group list cannot be read from the store.
+async fn resolve_group_names(
+    store: &dyn KbStore,
+    names: &[String],
+) -> KbResult<Result<Vec<String>, String>> {
+    if names.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    let groups = store.list_groups().await?;
+    let mut ids: Vec<String> = Vec::new();
+    for name in names {
+        let matches: Vec<&KbGroupSummary> = groups.iter().filter(|g| &g.name == name).collect();
+        if matches.is_empty() {
+            return Ok(Err(name.clone()));
+        }
+        for g in matches {
+            if !ids.contains(&g.id) {
+                ids.push(g.id.clone());
+            }
+        }
+    }
+    Ok(Ok(ids))
+}
+
 async fn cmd_ingest(
     cfg: &KbConfig,
     store: Arc<dyn KbStore>,
@@ -342,6 +373,18 @@ async fn cmd_ingest(
     json: bool,
 ) -> KbResult<i32> {
     let started = std::time::Instant::now();
+    // 0. Resolve every `--group` name before any work. The HTTP ingest checks
+    //    its group ids before the expensive steps for the same reason: a typo
+    //    should cost nothing, not an embedding round trip and a stored document.
+    //    `--group` takes names here, as it always has on the CLI; HTTP takes ids.
+    let group_ids = match resolve_group_names(store.as_ref(), &groups).await? {
+        Ok(ids) => ids,
+        Err(missing) => {
+            print_error_toon("not_found", &format!("group {missing} not found"));
+            return Ok(1);
+        }
+    };
+
     // 1. Extract content from disk.
     let processed = process_file(cfg, &path, ProcessingOptions::default()).await?;
 
@@ -449,6 +492,12 @@ async fn cmd_ingest(
         &crate::kb::chunk::prepare::tagged_model(embedder.model()),
     )
     .await?;
+
+    // Attach after the document is stored, as the HTTP ingest does: the store's
+    // membership insert checks the document exists, so it must come second.
+    for group_id in &group_ids {
+        store.add_document_to_group(&doc_id.0, group_id).await?;
+    }
 
     // Document intelligence: gated on the `intelligence_enabled` flag (off by
     // default). Unlike the HTTP ingest — which detaches via `tokio::spawn` so
@@ -589,7 +638,12 @@ async fn cmd_get(store: Arc<dyn KbStore>, id: String, json: bool) -> KbResult<i3
 
 async fn cmd_delete(store: Arc<dyn KbStore>, id: String, hard: bool) -> KbResult<i32> {
     let soft = !hard;
-    store.delete_document(&DocumentId(id.clone()), soft).await?;
+    // Nothing deleted means the id names no live document (unknown, or already
+    // soft-deleted). Say so as cmd_get does, instead of printing a success row.
+    if !store.delete_document(&DocumentId(id.clone()), soft).await? {
+        print_error_toon("not_found", &format!("document {id} not found"));
+        return Ok(1);
+    }
     let row = serde_json::json!({
         "id": id,
         "mode": if hard { "hard" } else { "soft" },
@@ -678,10 +732,21 @@ async fn cmd_re_embed(
 }
 
 async fn cmd_intelligence(
+    store: Arc<dyn KbStore>,
     intel: Arc<dyn IntelligenceStore>,
     document_id: String,
     json: bool,
 ) -> KbResult<i32> {
+    // Check the document first, as the HTTP handler does: an unknown id is an
+    // error, not an empty graph.
+    if store
+        .get_document(&DocumentId(document_id.clone()))
+        .await?
+        .is_none()
+    {
+        print_error_toon("not_found", &format!("document {document_id} not found"));
+        return Ok(1);
+    }
     let (entities, relations) = intel.intelligence_for_document(&document_id).await?;
     if json {
         let payload = serde_json::json!({

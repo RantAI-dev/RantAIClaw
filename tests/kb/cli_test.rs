@@ -296,6 +296,78 @@ async fn kb_get_nonexistent_returns_error_toon_and_exit_1() {
 }
 
 #[tokio::test]
+async fn kb_delete_unknown_id_returns_error_toon_and_exit_1() {
+    // Regression: `kb delete <unknown>` printed a success row and exited 0.
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let _store = SqliteStore::open(&db, 4).await.unwrap();
+
+    let (code, stdout, stderr) = run_kb(&db, &["delete", "rantaiclaw_missing"]);
+    assert_eq!(code, 1, "unknown id must exit 1; stderr={stderr}");
+    assert!(
+        stdout.starts_with("error[1]{code,message}"),
+        "expected TOON error header, got: {stdout}"
+    );
+    assert!(stdout.contains("not_found"));
+    assert!(stdout.contains("rantaiclaw_missing"));
+    assert!(
+        !stdout.contains("result["),
+        "no success row may be printed: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn kb_delete_already_soft_deleted_id_returns_error_toon_and_exit_1() {
+    // A soft-deleted document is "not found" for GET, so the same rule applies
+    // to a second delete: it must not report a fresh success.
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let store = SqliteStore::open(&db, 4).await.unwrap();
+    store
+        .create_document(&sample_doc("rantaiclaw_doc_twice", "Twice"))
+        .await
+        .unwrap();
+    store
+        .delete_document(
+            &rantaiclaw::kb::DocumentId("rantaiclaw_doc_twice".into()),
+            true,
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let (code, stdout, _stderr) = run_kb(&db, &["delete", "rantaiclaw_doc_twice"]);
+    assert_eq!(code, 1, "second delete must exit 1");
+    assert!(
+        stdout.starts_with("error[1]{code,message}"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("not_found"));
+}
+
+#[tokio::test]
+async fn kb_intelligence_unknown_id_returns_error_toon_and_exit_1() {
+    // Regression: `kb intelligence <unknown>` printed empty entities/relations
+    // and exited 0, where HTTP answers 404.
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let _store = SqliteStore::open(&db, 4).await.unwrap();
+
+    let (code, stdout, stderr) = run_kb(&db, &["intelligence", "rantaiclaw_missing"]);
+    assert_eq!(code, 1, "unknown id must exit 1; stderr={stderr}");
+    assert!(
+        stdout.starts_with("error[1]{code,message}"),
+        "expected TOON error header, got: {stdout}"
+    );
+    assert!(stdout.contains("not_found"));
+    assert!(stdout.contains("rantaiclaw_missing"));
+    assert!(
+        !stdout.contains("entities["),
+        "no empty entity table may be printed: {stdout}"
+    );
+}
+
+#[tokio::test]
 async fn kb_get_existing_returns_document_toon() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("kb.db");
@@ -785,4 +857,102 @@ fn kb_status_reports_disabled_state() {
     );
     assert!(stdout.starts_with("status["), "TOON status block: {stdout}");
     assert!(stdout.contains("false"), "reports disabled: {stdout}");
+}
+
+/// `kb ingest --group <name>` must attach the new document to the named group.
+/// Before the fix the name was written only into `metadata["groups"]`, so the
+/// group listed nothing.
+#[tokio::test]
+async fn kb_ingest_group_attaches_document_to_the_named_group() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let store = SqliteStore::open(&db, 4).await.unwrap();
+    let group = store.create_group("Onboarding", None, None).await.unwrap();
+    drop(store);
+
+    let md = tmp.path().join("doc.md");
+    std::fs::write(&md, "# Onboarding\nWelcome to the team.").unwrap();
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, stderr) = run_kb_with_env(
+        &db,
+        &["ingest", md.to_str().unwrap(), "--group", "Onboarding"],
+        &mock_env,
+    );
+    assert_eq!(
+        code, 0,
+        "ingest must succeed: stdout={stdout} stderr={stderr}"
+    );
+
+    let store = SqliteStore::open(&db, 4).await.unwrap();
+    let members = store.list_group_documents(&group.id).await.unwrap();
+    assert_eq!(
+        members.len(),
+        1,
+        "the ingested document must be a member of the named group"
+    );
+    assert_eq!(members[0].title, "doc");
+}
+
+/// `kb ingest --group <unknown>` must fail before any embedding call and store
+/// no document. The embedder is a wiremock server, so its request count is
+/// the number of embedding calls.
+#[tokio::test]
+async fn kb_ingest_unknown_group_errors_before_embedding_and_stores_nothing() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let store = SqliteStore::open(&db, 4).await.unwrap();
+    drop(store);
+
+    let md = tmp.path().join("doc.md");
+    std::fs::write(&md, "# Onboarding\nWelcome to the team.").unwrap();
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, _stderr) = run_kb_with_env(
+        &db,
+        &["ingest", md.to_str().unwrap(), "--group", "NoSuchGroup"],
+        &mock_env,
+    );
+    assert_eq!(code, 1, "unknown group must exit 1: {stdout}");
+    assert!(
+        stdout.starts_with("error[1]{code,message}"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("not_found"));
+    assert!(stdout.contains("NoSuchGroup"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "an unknown group must fail before any embedding call; got {} calls",
+        requests.len()
+    );
+
+    let store = SqliteStore::open(&db, 4).await.unwrap();
+    let docs = store.list_documents(None).await.unwrap();
+    assert!(docs.is_empty(), "no document may be stored: {docs:?}");
 }

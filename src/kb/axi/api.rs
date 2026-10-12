@@ -949,10 +949,14 @@ async fn delete_doc(
     let ctx = ensure_kb_ctx(&state).await?;
     let hard = q.hard.unwrap_or(false);
     let soft = !hard;
-    ctx.store
+    let deleted = ctx
+        .store
         .delete_document(&DocumentId(id.clone()), soft)
         .await
         .map_err(ApiError::from)?;
+    if !deleted {
+        return Err(ApiError::not_found(format!("document {id} not found")).into());
+    }
     Ok(Json(DeleteResponse {
         id,
         mode: if hard { "hard" } else { "soft" },

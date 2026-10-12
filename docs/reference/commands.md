@@ -403,8 +403,10 @@ Extract, chunk, embed, and store a file.
 |---|---|---|
 | `--title <t>` | Override document title | file stem |
 | `--category <c>` | Add to categories (repeatable) | _none_ |
-| `--group <id>` | Add to knowledge-base groups (repeatable) | _none_ |
+| `--group <name>` | Add to a knowledge-base group by name (repeatable). The group must exist; the document is attached to it once stored | _none_ |
 | `--json` | Emit JSON instead of TOON | `false` |
+
+An unknown `--group` name exits `1` with a TOON `error[not_found]` block naming the group, before the file is read or embedded, and nothing is stored. `--group` takes names here; the HTTP ingest takes group ids.
 
 Supported file types depend on feature flags — see [kb.md](kb.md#ingest-a-document).
 
@@ -428,6 +430,8 @@ Show one document. Exits `1` with a TOON `error[not_found]` block when the ID is
 #### `kb delete <id>`
 
 Soft-delete by default (sets `deleted_at`, hides from search). `--hard` permanently removes the document and its chunks.
+
+An unknown ID, or one already soft-deleted, exits `1` with a TOON `error[not_found]` block naming the ID, in either mode. Nothing is deleted.
 
 | Flag | Description | Default |
 |---|---|---|

@@ -95,6 +95,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   character near its start. The WARN line that names the rejected sender now cuts
   the id at four characters, not four bytes, so it no longer panics on a character
   split.
+- The knowledge base keyword search no longer fails on ordinary text. A question with `?`, a comma,
+  an apostrophe, `@`, `+`, brackets, `-`, `:`, or a bare `AND`, `OR` or `NOT` returned nothing from the
+  keyword side, and the failure was silent. The query is now reduced to its words, and a question
+  matches chunks that hold some of its words, ranked by BM25. Words are joined with OR where the raw text
+  was an implicit AND, so a plain-language question now matches more chunks than before. A failure in the
+  keyword search is logged at `warn`, without the query text.
+- `kb delete` and `kb intelligence` on an unknown document id exit `1` with a `not_found` error instead of
+  printing a success or an empty result. `kb delete` of an already soft-deleted document is also not found.
+  HTTP `DELETE` of an unknown document answers 404, as `GET` and `intelligence` already did.
+- `kb ingest --group <name>` checks that the group exists before the file is read or embedded, and attaches
+  the document to it once stored. Before, the name was recorded in the document's metadata only, so the group
+  never listed the document.
 
 ## [0.33.0-alpha] — 2026-10-08
 

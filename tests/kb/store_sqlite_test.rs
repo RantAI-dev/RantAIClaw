@@ -838,3 +838,193 @@ async fn group_scoped_search_finds_chunks_far_outside_global_topk() {
             .collect::<Vec<_>>()
     );
 }
+
+/// Seed one document whose chunks hold the given words, one chunk per word,
+/// so a query that finds a word can only find that word's chunk.
+async fn seed_bm25_words(store: &SqliteStore, words: &[&str]) {
+    let doc = sample_doc("rantaiclaw_doc_bm25_text", "Text Doc");
+    store.create_document(&doc).await.unwrap();
+    let chunks: Vec<Chunk> = words
+        .iter()
+        .enumerate()
+        .map(|(i, w)| Chunk {
+            content: format!("the policy mentions {w} here"),
+            metadata: ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: i,
+                contextual_prefix: None,
+            },
+        })
+        .collect();
+    let embeds: Vec<Vec<f32>> = words.iter().map(|_| ones(4)).collect();
+    store
+        .store_chunks(&doc.id, &chunks, &embeds, "rantaiclaw_test_model_a")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn bm25_search_accepts_text_a_person_types() {
+    // Regression: the query was bound to FTS5 MATCH raw, so `?`, `,`, `@`,
+    // `+`, `:`, bare `AND` and a stray `"` failed as FTS5 syntax errors and the
+    // keyword arm returned nothing. Each query below must return Ok and find
+    // the chunk that holds one of its surviving words.
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    seed_bm25_words(
+        &store,
+        &[
+            "refund", "window", "example", "com", "c", "key", "value", "b",
+        ],
+    )
+    .await;
+
+    // (query, a word from the query that must be found)
+    let cases: &[(&str, &str)] = &[
+        ("what is the refund window?", "refund"),
+        ("refund, window.", "window"),
+        ("user@example.com", "example"),
+        ("c++", "c"),
+        ("(refund)", "refund"),
+        ("a-b", "b"),
+        ("key:value", "key"),
+        ("refund AND window", "window"),
+        ("\"refund", "refund"),
+        ("refund*", "refund"),
+    ];
+    for (query, word) in cases {
+        let hits = store
+            .bm25_search(query, 10)
+            .await
+            .unwrap_or_else(|e| panic!("query {query:?} must not error: {e}"));
+        assert!(
+            hits.iter().any(|h| h.content.contains(word)),
+            "query {query:?} must find the chunk holding {word:?}; got {hits:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bm25_search_returns_empty_without_error_when_query_has_no_word() {
+    // Punctuation-only and stopword-only queries carry no word to search for.
+    // `bm25_search_impl` returns the empty list before SQLite is touched, so
+    // these cannot error. `it's` and `NOT` are English stopwords (terms.rs
+    // STOPWORDS_EN), so they reach the same empty result as bare punctuation.
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    seed_bm25_words(&store, &["refund"]).await;
+
+    for query in ["?!.,;:", "()\"'", "   ", "it's", "NOT"] {
+        let hits = store
+            .bm25_search(query, 10)
+            .await
+            .unwrap_or_else(|e| panic!("query {query:?} must not error: {e}"));
+        assert!(hits.is_empty(), "query {query:?} must return no hits");
+    }
+}
+
+#[tokio::test]
+async fn delete_reports_not_found_for_unknown_id_soft_and_hard() {
+    // Regression: `delete_document` returned Ok(()) whatever the row count, so
+    // a delete of an id that matched nothing looked like a success.
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let missing = DocumentId("rantaiclaw_doc_nosuch".into());
+    assert!(
+        !store
+            .delete_document(&missing, /* soft */ true)
+            .await
+            .unwrap(),
+        "soft delete of an unknown id must report nothing deleted"
+    );
+    assert!(
+        !store
+            .delete_document(&missing, /* soft */ false)
+            .await
+            .unwrap(),
+        "hard delete of an unknown id must report nothing deleted"
+    );
+}
+
+#[tokio::test]
+async fn delete_reports_not_found_for_soft_deleted_id_soft_and_hard() {
+    // A soft-deleted document is not found for GET, so it is not found for
+    // delete either, in both modes. The second delete must not report a
+    // fresh success or touch the row again.
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("rantaiclaw_doc_gone", "Gone");
+    store.create_document(&doc).await.unwrap();
+    assert!(store.delete_document(&doc.id, true).await.unwrap());
+    assert!(
+        !store.delete_document(&doc.id, true).await.unwrap(),
+        "soft delete of a soft-deleted id must report nothing deleted"
+    );
+    assert!(
+        !store.delete_document(&doc.id, false).await.unwrap(),
+        "hard delete of a soft-deleted id must report nothing deleted"
+    );
+}
+
+#[tokio::test]
+async fn hard_delete_of_live_document_removes_its_chunks_and_vectors() {
+    // A real delete still removes chunks and vectors, and reports the row gone.
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("rantaiclaw_doc_live", "Live");
+    store.create_document(&doc).await.unwrap();
+    let chunks = vec![Chunk {
+        content: "live chunk".into(),
+        metadata: ChunkMetadata {
+            document_title: doc.title.clone(),
+            category: "FAQ".into(),
+            subcategory: None,
+            section: None,
+            chunk_index: 0,
+            contextual_prefix: None,
+        },
+    }];
+    store
+        .store_chunks(&doc.id, &chunks, &[ones(4)], "rantaiclaw_test_model_a")
+        .await
+        .unwrap();
+    assert_eq!(store.chunk_count(&doc.id).await.unwrap(), 1);
+
+    assert!(
+        store.delete_document(&doc.id, false).await.unwrap(),
+        "hard delete of a live id must report one document deleted"
+    );
+    assert_eq!(store.chunk_count(&doc.id).await.unwrap(), 0);
+    assert!(store.get_document(&doc.id).await.unwrap().is_none());
+    // The vector row is gone too: a vector search finds nothing for the id.
+    let hits = store
+        .search_by_vector(
+            &ones(4),
+            10,
+            &SearchFilter {
+                category: None,
+                group_ids: Vec::new(),
+                document_ids: None,
+                min_similarity: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().all(|h| h.document_id != doc.id),
+        "hard delete must clear the chunk_vec rows: {hits:?}"
+    );
+}
