@@ -173,7 +173,7 @@ The CLI is the "axi-cli" surface: idempotent, never interactive, defaults to TOO
 | `kb delete <id>` | Soft-delete a document (sets `deleted_at`). `--hard` for permanent |
 | `kb drift` | Report chunks embedded with a stale model. `--json` |
 | `kb re-embed` | Re-embed chunks. `--include-current`, `--dry-run`, `--batch-size`, `--json` |
-| `kb intelligence <document_id>` | Per-document extracted entities + relations. `--json` |
+| `kb intelligence <document_id>` | Per-document extracted entities + relations. `--json`. An unknown ID exits `1` with a TOON `error[not_found]` block |
 | `kb graph` | Cross-document knowledge graph. `--group`, `--limit`, `--json` |
 
 Exit codes:

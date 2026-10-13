@@ -31,11 +31,15 @@ pub(super) async fn resolve_unique_entry(
     // store would let a guest probe substrings across every conversation, and the
     // ambiguity error below would name keys the guest has no business seeing. A
     // turn with no view has nothing to read, so it finds no candidate at all.
+    //
+    // `list_all`, not `list`: the note being replaced or forgotten can be any
+    // entry in scope, including one older than the newest page of 1000. The
+    // view still bounds the read, since `Conversation` and `Any` are the scope.
     let entries = match crate::memory::current_memory_view() {
-        Some(crate::memory::MemoryView::All) => memory.list(None, SessionScope::Any).await,
+        Some(crate::memory::MemoryView::All) => memory.list_all(None, SessionScope::Any).await,
         Some(crate::memory::MemoryView::Only(key)) => {
             memory
-                .list(None, SessionScope::Conversation(key.as_str()))
+                .list_all(None, SessionScope::Conversation(key.as_str()))
                 .await
         }
         None => Ok(Vec::new()),
@@ -848,6 +852,101 @@ mod tests {
             .unwrap_or_default()
             .contains("nothing to replace"));
         assert!(mem.get("k").await.unwrap().is_none());
+    }
+
+    /// Seeds `count` shared core notes through the CLI's own factory, the store
+    /// the operator's CLI and the agent share. The first one stored is the
+    /// oldest and sits outside the newest page of 1000 that `list` returns.
+    async fn store_with_one_page_of_notes_behind(count: usize) -> (TempDir, Arc<dyn Memory>) {
+        let tmp = TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory_for_cli("sqlite", tmp.path()).unwrap());
+        mem.store(
+            "oldest_note",
+            "the vault code is kept in the blue box",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        for i in 1..count {
+            mem.store(
+                &format!("note_{i:04}"),
+                &format!("routine note number {i}"),
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        (tmp, mem)
+    }
+
+    /// `replaces` names text only the oldest note holds. The lookup reads the
+    /// whole store, so that note is found and replaced, not reported as absent.
+    #[tokio::test]
+    async fn replaces_finds_and_supersedes_a_note_older_than_one_page() {
+        let (tmp, mem) = store_with_one_page_of_notes_behind(1_001).await;
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = execute_in_all_view(
+            &tool,
+            json!({
+                "key": "new_vault_code",
+                "content": "the vault code is kept in the green box",
+                "replaces": "blue box",
+            }),
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            mem.get("oldest_note").await.unwrap().is_none(),
+            "the oldest note must be superseded"
+        );
+    }
+
+    /// A guest's `replaces` lookup reads only that guest's conversation. With
+    /// 1001 notes of another conversation in the store, the lookup finds no
+    /// candidate, and its error names none of those keys.
+    #[tokio::test]
+    async fn a_guest_replaces_lookup_finds_no_candidate_and_names_no_key() {
+        use crate::memory::{MemoryView, MEMORY_VIEW};
+
+        let tmp = TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory_for_cli("sqlite", tmp.path()).unwrap());
+        for i in 0..1_001 {
+            mem.store(
+                &format!("other_chat_{i:04}"),
+                "the deploy runbook lives in another chat",
+                MemoryCategory::Conversation,
+                Some("chat:other"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = MEMORY_VIEW
+            .scope(MemoryView::Only("chat:guest".into()), async {
+                tool.execute(json!({
+                    "key": "new_key",
+                    "content": "something else",
+                    "replaces": "deploy runbook",
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("nothing to replace"), "{error}");
+        assert!(
+            !error.contains("other_chat_"),
+            "must not name a key from outside the view: {error}"
+        );
     }
 
     #[tokio::test]

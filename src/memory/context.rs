@@ -303,6 +303,13 @@ mod tests {
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(vec![])
         }
+        async fn list_all(
+            &self,
+            _c: Option<&MemoryCategory>,
+            _s: SessionScope<'_>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self.entries.clone())
+        }
         async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
@@ -798,6 +805,13 @@ mod tests {
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             self.inner.list(c, s).await
         }
+        async fn list_all(
+            &self,
+            c: Option<&MemoryCategory>,
+            s: SessionScope<'_>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner.list_all(c, s).await
+        }
         async fn forget(&self, k: &str) -> anyhow::Result<bool> {
             self.inner.forget(k).await
         }
@@ -814,6 +828,21 @@ mod tests {
             inner: memory_of(entries),
             calls: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// A wrapper must forward `list_all` to the memory it wraps. Without the
+    /// forward, the trait default calls the wrapper's own `list`, and the
+    /// wrapped backend's cap comes back: the whole-store reads would see a page.
+    #[tokio::test]
+    async fn a_wrapper_forwards_the_uncapped_read_to_the_memory_it_wraps() {
+        let entries: Vec<MemoryEntry> = (0..1_001)
+            .map(|i| entry(&format!("k{i}"), "v", 1.0))
+            .collect();
+        let mem = counting_memory_of(entries);
+
+        let all = mem.list_all(None, SessionScope::Any).await.unwrap();
+
+        assert_eq!(all.len(), 1_001, "list_all must reach the wrapped store");
     }
 
     /// The block says what it is before it lists anything: the notes are data,

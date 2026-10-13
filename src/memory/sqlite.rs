@@ -1158,88 +1158,20 @@ impl Memory for SqliteMemory {
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         // Callers render `list().len()` as a total. It is not one past this
         // cap — `count()` is — so anything reporting a total has to ask for it
-        // rather than trusting the length of this page.
+        // rather than trusting the length of this page, or use `list_all`.
         const DEFAULT_LIST_LIMIT: i64 = 1000;
+        self.list_limited(category, scope, DEFAULT_LIST_LIMIT).await
+    }
 
-        let conn = self.conn.clone();
-        let category = category.cloned();
-        let owned_scope = OwnedSessionScope::from(&scope);
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
-            let mut results = Vec::new();
-
-            let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
-                Ok(MemoryEntry {
-                    id: row.get(0)?,
-                    key: row.get(1)?,
-                    content: row.get(2)?,
-                    category: Self::str_to_category(&row.get::<_, String>(3)?),
-                    timestamp: row.get(4)?,
-                    session_id: row.get(5)?,
-                    score: None,
-                })
-            };
-
-            // Build the WHERE clause around the scope once. The category
-            // branch already pinned `?1` to the category literal and `?2` to
-            // the limit; the unscoped branch has only the limit (`?1`).
-            // Either way the scope's `?` parameter sits at index 2 in the
-            // category branch and is absent from the other, so the SQL shape
-            // is split rather than concatenated with a stray `?`.
-            match (&category, owned_scope.as_scope()) {
-                (Some(cat), scope_now) => {
-                    let cat_str = Self::category_to_str(cat);
-                    let (scope_clause, scope_param) = match scope_now {
-                        SessionScope::Any => (String::new(), None),
-                        SessionScope::Private => (" AND session_id IS NULL".to_string(), None),
-                        SessionScope::Conversation(sid) => {
-                            (" AND session_id = ?3".to_string(), Some(sid.to_string()))
-                        }
-                    };
-                    let sql = format!(
-                        "SELECT id, key, content, category, created_at, session_id FROM memories
-                         WHERE category = ?1{scope_clause}
-                         ORDER BY updated_at DESC LIMIT ?2"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows = if let Some(sid) = scope_param {
-                        stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT, sid], row_mapper)?
-                    } else {
-                        stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?
-                    };
-                    for row in rows {
-                        results.push(row?);
-                    }
-                }
-                (None, scope_now) => {
-                    let (scope_clause, scope_param) = match scope_now {
-                        SessionScope::Any => (String::new(), None),
-                        SessionScope::Private => (" AND session_id IS NULL".to_string(), None),
-                        SessionScope::Conversation(sid) => {
-                            (" AND session_id = ?2".to_string(), Some(sid.to_string()))
-                        }
-                    };
-                    let sql = format!(
-                        "SELECT id, key, content, category, created_at, session_id FROM memories
-                         WHERE 1 = 1{scope_clause}
-                         ORDER BY updated_at DESC LIMIT ?1"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows = if let Some(sid) = scope_param {
-                        stmt.query_map(params![DEFAULT_LIST_LIMIT, sid], row_mapper)?
-                    } else {
-                        stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?
-                    };
-                    for row in rows {
-                        results.push(row?);
-                    }
-                }
-            }
-
-            Ok(results)
-        })
-        .await?
+    async fn list_all(
+        &self,
+        category: Option<&MemoryCategory>,
+        scope: SessionScope<'_>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // SQLite reads a negative LIMIT as no limit. Deletes, counts and key
+        // lookups read through here, so the newest-1000 page is never taken for
+        // the whole store.
+        self.list_limited(category, scope, -1).await
     }
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
@@ -1288,6 +1220,100 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
             .await
             .unwrap_or(false)
+    }
+}
+
+impl SqliteMemory {
+    /// The shared body of [`Memory::list`] and [`Memory::list_all`].
+    ///
+    /// `limit` is bound as the SQL `LIMIT`: `1000` for a page, `-1` for every row
+    /// in scope. The scope clause is the only filter, so a page and the full read
+    /// see the same rows in the same order.
+    async fn list_limited(
+        &self,
+        category: Option<&MemoryCategory>,
+        scope: SessionScope<'_>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let category = category.cloned();
+        let owned_scope = OwnedSessionScope::from(&scope);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut results = Vec::new();
+
+            let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                })
+            };
+
+            // Build the WHERE clause around the scope once. The category
+            // branch already pinned `?1` to the category literal and `?2` to
+            // the limit; the unscoped branch has only the limit (`?1`).
+            // Either way the scope's `?` parameter sits at index 2 in the
+            // category branch and is absent from the other, so the SQL shape
+            // is split rather than concatenated with a stray `?`.
+            match (&category, owned_scope.as_scope()) {
+                (Some(cat), scope_now) => {
+                    let cat_str = Self::category_to_str(cat);
+                    let (scope_clause, scope_param) = match scope_now {
+                        SessionScope::Any => (String::new(), None),
+                        SessionScope::Private => (" AND session_id IS NULL".to_string(), None),
+                        SessionScope::Conversation(sid) => {
+                            (" AND session_id = ?3".to_string(), Some(sid.to_string()))
+                        }
+                    };
+                    let sql = format!(
+                        "SELECT id, key, content, category, created_at, session_id FROM memories
+                         WHERE category = ?1{scope_clause}
+                         ORDER BY updated_at DESC LIMIT ?2"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = if let Some(sid) = scope_param {
+                        stmt.query_map(params![cat_str, limit, sid], row_mapper)?
+                    } else {
+                        stmt.query_map(params![cat_str, limit], row_mapper)?
+                    };
+                    for row in rows {
+                        results.push(row?);
+                    }
+                }
+                (None, scope_now) => {
+                    let (scope_clause, scope_param) = match scope_now {
+                        SessionScope::Any => (String::new(), None),
+                        SessionScope::Private => (" AND session_id IS NULL".to_string(), None),
+                        SessionScope::Conversation(sid) => {
+                            (" AND session_id = ?2".to_string(), Some(sid.to_string()))
+                        }
+                    };
+                    let sql = format!(
+                        "SELECT id, key, content, category, created_at, session_id FROM memories
+                         WHERE 1 = 1{scope_clause}
+                         ORDER BY updated_at DESC LIMIT ?1"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = if let Some(sid) = scope_param {
+                        stmt.query_map(params![limit, sid], row_mapper)?
+                    } else {
+                        stmt.query_map(params![limit], row_mapper)?
+                    };
+                    for row in rows {
+                        results.push(row?);
+                    }
+                }
+            }
+
+            Ok(results)
+        })
+        .await?
     }
 }
 

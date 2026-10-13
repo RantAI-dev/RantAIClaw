@@ -349,6 +349,25 @@ async fn kb_get_existing_returns_document() {
 }
 
 #[tokio::test]
+async fn kb_delete_unknown_document_is_404() {
+    // Regression: the store reported success for an id that matched no row,
+    // so DELETE answered 200 `{mode}` for a document that never existed.
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(format!(
+            "{}/api/v1/kb/documents/rantaiclaw_doc_missing",
+            h.base_url
+        ))
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(resp.status(), 404, "unknown id must not answer 200");
+    let body: Value = resp.json().await.expect("error body");
+    assert_eq!(body["error"], "not_found");
+}
+
+#[tokio::test]
 async fn kb_delete_soft_hides_doc_from_list_and_get() {
     let h = start_harness(|store| {
         Box::pin(async move {

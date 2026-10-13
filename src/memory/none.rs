@@ -51,6 +51,14 @@ impl Memory for NoneMemory {
         Ok(Vec::new())
     }
 
+    async fn list_all(
+        &self,
+        _category: Option<&MemoryCategory>,
+        _scope: SessionScope<'_>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+
     async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -85,6 +93,11 @@ mod tests {
             .is_empty());
         assert!(memory
             .list(None, SessionScope::Any)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(memory
+            .list_all(None, SessionScope::Any)
             .await
             .unwrap()
             .is_empty());

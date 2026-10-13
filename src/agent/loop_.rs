@@ -338,8 +338,10 @@ async fn clear_conversation_memory(mem: &dyn Memory, view: Option<&memory::Memor
     in_memory_view(view, async {
         let mut cleared = 0;
         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
+            // `list_all`, not `list`: `/clear` deletes every note in the view,
+            // and a page of the newest 1000 would leave older notes behind.
             let entries = mem
-                .list(Some(&category), memory::SessionScope::Any)
+                .list_all(Some(&category), memory::SessionScope::Any)
                 .await
                 .unwrap_or_default();
             for entry in entries {
@@ -7425,6 +7427,41 @@ Let me check the result."#;
         let (_tmp, mem) = seed().await;
         assert_eq!(clear_conversation_memory(&mem, None).await, 0);
         assert_eq!(mem.count(memory::SessionScope::Any).await.unwrap(), 4);
+    }
+
+    /// `/clear` removes every conversation note in the run's view, not the newest
+    /// page of 1000. With 1001 conversation notes, the one outside the page used
+    /// to survive and the count read 1000. A core note stays.
+    #[tokio::test]
+    async fn clear_conversation_memory_removes_every_note_beyond_one_page() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem = memory::create_memory_for_cli("sqlite", tmp.path()).unwrap();
+        for i in 0..1_001 {
+            mem.store(
+                &format!("chat_note_{i:04}"),
+                "a conversation note",
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        mem.store("core_note", "a core note", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let cleared = clear_conversation_memory(mem.as_ref(), Some(&memory::MemoryView::All)).await;
+
+        assert_eq!(cleared, 1_001, "every conversation note must be cleared");
+        assert!(
+            mem.get("core_note").await.unwrap().is_some(),
+            "a core note survives /clear"
+        );
+        assert_eq!(
+            mem.count(memory::SessionScope::Any).await.unwrap(),
+            1,
+            "only the core note remains"
+        );
     }
 
     /// Counts summariser calls. Each call returns the same fixed marker, so a

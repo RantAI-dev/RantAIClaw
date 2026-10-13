@@ -63,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `memory clear` and `/clear` stopped at 1000 entries and reported the rest as gone: with 1001 notes one stayed, and the summary still said everything was cleared. A lookup by key prefix (`memory get`, `memory clear --key`) or by text (`memory_store` `replaces`) missed notes older than the newest 1000.
 - While a reply streamed, the model's reasoning showed in front of the answer. The saved reply was already clean; the streamed text was not. This applied to every surface that streams: the gateway chunk events, the TUI live preview and channel streaming. Only the reply is streamed now, and reasoning is sent once, at the end, when it is the whole reply.
 - `anthropic-custom:<url>` inherits the `anthropic` env vars. `ANTHROPIC_API_KEY` was ignored for a custom
   Anthropic-format endpoint, which refused with `anthropic: ANTHROPIC_API_KEY required`. The refusal now names
@@ -108,6 +109,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   active profile applied, while the agent read the resolved config. The answers were silently discarded.
   Onboard now writes through the same resolver the loader uses. A v0.4 flat config is still read: it moves
   into the active profile before the overwrite check, as before.
+- The knowledge base keyword search no longer fails on ordinary text. A question with `?`, a comma,
+  an apostrophe, `@`, `+`, brackets, `-`, `:`, or a bare `AND`, `OR` or `NOT` returned nothing from the
+  keyword side, and the failure was silent. The query is now reduced to its words, and a question
+  matches chunks that hold some of its words, ranked by BM25. Words are joined with OR where the raw text
+  was an implicit AND, so a plain-language question now matches more chunks than before. A failure in the
+  keyword search is logged at `warn`, without the query text.
+- `kb delete` and `kb intelligence` on an unknown document id exit `1` with a `not_found` error instead of
+  printing a success or an empty result. `kb delete` of an already soft-deleted document is also not found.
+  HTTP `DELETE` of an unknown document answers 404, as `GET` and `intelligence` already did.
+- `kb ingest --group <name>` checks that the group exists before the file is read or embedded, and attaches
+  the document to it once stored. Before, the name was recorded in the document's metadata only, so the group
+  never listed the document.
 
 ## [0.33.0-alpha] — 2026-10-08
 
