@@ -10501,6 +10501,7 @@ mod autonomy_keybinding_tests {
             channel: "tui".to_string(),
             reply_target: String::new(),
             created_at: 0,
+            always_available: false,
         });
 
         press_shift_tab(&mut app).await;

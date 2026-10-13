@@ -122,6 +122,15 @@ impl ApprovalManager {
         }
     }
 
+    /// Would an "Always" answer for `tool` actually skip its next prompt? True
+    /// only when nothing forces the prompt: `always_ask` (including Manual's
+    /// `"*"`) is checked before the session allowlist, so an Always there would
+    /// be overridden. The gateway reads this to tell the console whether to offer
+    /// Always on the modal.
+    pub fn always_available_for(&self, tool_name: &str) -> bool {
+        !self.forces_prompt(tool_name)
+    }
+
     /// Does `tool` skip the prompt outright? Live counterpart of
     /// [`Self::forces_prompt`].
     fn pre_approved(&self, tool_name: &str) -> bool {
@@ -519,6 +528,66 @@ mod tests {
             mgr.needs_approval("file_read"),
             "switching Smart -> Manual must start prompting even though the \
              autonomy level did not change"
+        );
+    }
+
+    #[test]
+    fn always_available_is_false_when_the_tool_is_forced_to_prompt() {
+        // Manual's wildcard forces every tool to prompt, so an Always answer
+        // would be overridden on the next call: the modal must not offer it.
+        let manual = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["*".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&manual);
+        assert!(!mgr.always_available_for("shell"));
+        assert!(!mgr.always_available_for("http_request"));
+    }
+
+    #[test]
+    fn always_available_is_true_when_a_session_grant_would_skip_the_prompt() {
+        let smart = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec![],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&smart);
+        assert!(mgr.always_available_for("shell"));
+    }
+
+    #[test]
+    fn always_available_is_false_for_a_tool_named_in_always_ask() {
+        let ssh_forced = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["ssh".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&ssh_forced);
+        assert!(!mgr.always_available_for("ssh"));
+        assert!(mgr.always_available_for("shell"));
+    }
+
+    #[test]
+    fn always_available_follows_a_live_switch_to_manual() {
+        let smart = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec![],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let policy = Arc::new(crate::security::SecurityPolicy::default());
+        policy.apply_config(&smart);
+        let mgr = ApprovalManager::from_config(&smart).with_policy(Arc::clone(&policy));
+        assert!(mgr.always_available_for("shell"));
+
+        policy.apply_config(&crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["*".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
+        assert!(
+            !mgr.always_available_for("shell"),
+            "Always must stop being offered once Manual is in force"
         );
     }
 

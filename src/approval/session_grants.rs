@@ -27,13 +27,52 @@ const MAX_GRANT_SESSIONS: usize = 1000;
 /// them.
 struct SessionGrants {
     map: Mutex<HashMap<String, HashSet<String>>>,
+    /// Command basenames granted "Always" for a session, kept apart from the
+    /// tool names: a command grant only answers the unallowed-command prompt
+    /// in the shell tool, and must never be read back as a tool grant.
+    commands: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl SessionGrants {
     fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            commands: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn granted_commands(&self, session_id: &str) -> Vec<String> {
+        if session_id.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut names: Vec<String> = self
+            .commands
+            .lock()
+            .get(session_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn record_command(&self, session_id: &str, basename: &str) {
+        let basename = basename.trim();
+        if session_id.trim().is_empty() || basename.is_empty() {
+            return;
+        }
+        let mut commands = self.commands.lock();
+        if !commands.contains_key(session_id) && commands.len() >= MAX_GRANT_SESSIONS {
+            tracing::warn!(
+                session_id = %session_id,
+                cap = MAX_GRANT_SESSIONS,
+                "web approval command grant not persisted: session cap reached"
+            );
+            return;
+        }
+        commands
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(basename.to_string());
     }
 
     fn granted_tools(&self, session_id: &str) -> Vec<String> {
@@ -67,10 +106,12 @@ impl SessionGrants {
 
     fn clear(&self, session_id: &str) {
         self.map.lock().remove(session_id);
+        self.commands.lock().remove(session_id);
     }
 
     fn clear_all(&self) {
         self.map.lock().clear();
+        self.commands.lock().clear();
     }
 }
 
@@ -80,6 +121,19 @@ static SESSION_GRANTS: LazyLock<SessionGrants> = LazyLock::new(SessionGrants::ne
 /// An empty/blank session id owns no grants.
 pub fn session_granted_tools(session_id: &str) -> Vec<String> {
     SESSION_GRANTS.granted_tools(session_id)
+}
+
+/// Command basenames this session has granted "Always" for the unallowed-command
+/// prompt. Used to seed each new turn's shell policy. An empty session id owns none.
+pub fn session_granted_commands(session_id: &str) -> Vec<String> {
+    SESSION_GRANTS.granted_commands(session_id)
+}
+
+/// Record one command basename as granted "Always" for a session. Called at the
+/// moment the operator answers Always, never after the turn, so an Approve (once)
+/// answer cannot leave a grant behind.
+pub fn record_session_command(session_id: &str, basename: &str) {
+    SESSION_GRANTS.record_command(session_id, basename);
 }
 
 /// Merge a turn's "Always" grants into the session's persistent set. No-op when
@@ -108,6 +162,73 @@ pub fn clear_all_session_grants() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_grant_round_trips_within_its_session() {
+        let grants = SessionGrants::new();
+        let sid = "sess-cmd-round-trip-3d91";
+        assert!(grants.granted_commands(sid).is_empty());
+        grants.record_command(sid, "hostname");
+        grants.record_command(sid, "hostname");
+        grants.record_command(sid, "uname");
+        assert_eq!(
+            grants.granted_commands(sid),
+            vec!["hostname".to_string(), "uname".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_grant_is_not_visible_as_a_tool_grant_or_the_reverse() {
+        let grants = SessionGrants::new();
+        let sid = "sess-cmd-vs-tool-5c20";
+        grants.record(sid, &HashSet::from(["browser".to_string()]));
+        grants.record_command(sid, "hostname");
+        assert_eq!(grants.granted_tools(sid), vec!["browser".to_string()]);
+        assert_eq!(grants.granted_commands(sid), vec!["hostname".to_string()]);
+    }
+
+    #[test]
+    fn empty_command_or_session_is_never_keyed() {
+        let grants = SessionGrants::new();
+        grants.record_command("", "hostname");
+        grants.record_command("sess-cmd-empty-name-8e13", "   ");
+        assert!(grants.commands.lock().is_empty());
+    }
+
+    #[test]
+    fn command_grants_are_cleared_with_their_session_only() {
+        let grants = SessionGrants::new();
+        let a = "sess-cmd-clear-a-61f4";
+        let b = "sess-cmd-clear-b-61f4";
+        grants.record_command(a, "hostname");
+        grants.record_command(b, "uname");
+        grants.clear(a);
+        assert!(grants.granted_commands(a).is_empty());
+        assert_eq!(grants.granted_commands(b), vec!["uname".to_string()]);
+    }
+
+    #[test]
+    fn clear_all_empties_command_grants_too() {
+        let grants = SessionGrants::new();
+        grants.record_command("sess-cmd-all-a-02dd", "hostname");
+        grants.clear_all();
+        assert!(grants.granted_commands("sess-cmd-all-a-02dd").is_empty());
+    }
+
+    #[test]
+    fn new_command_session_past_the_cap_is_not_recorded() {
+        let grants = SessionGrants::new();
+        for n in 0..MAX_GRANT_SESSIONS {
+            grants.record_command(&format!("sess-cmd-cap-{n}"), "hostname");
+        }
+        grants.record_command("sess-cmd-cap-over", "hostname");
+        assert!(grants.granted_commands("sess-cmd-cap-over").is_empty());
+        grants.record_command("sess-cmd-cap-0", "hostname");
+        assert_eq!(
+            grants.granted_commands("sess-cmd-cap-0"),
+            vec!["hostname".to_string()]
+        );
+    }
 
     #[test]
     fn empty_session_id_is_never_keyed() {

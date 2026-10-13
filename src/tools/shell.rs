@@ -362,8 +362,11 @@ impl Tool for ShellTool {
                     if let Some(basename) = self.security.first_unallowed_basename(command) {
                         // Case 1: an unallowed basename in the chain — approve it,
                         // add to the runtime allowlist, and re-validate.
+                        // Always here records a command grant for the conversation
+                        // (see the gateway), so the request is flagged as one that
+                        // Always can hold for.
                         let decision = approvals
-                            .request_decision_in(
+                            .request_decision_in_always(
                                 uuid::Uuid::new_v4(),
                                 basename.clone(),
                                 command.to_string(),

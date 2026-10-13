@@ -810,9 +810,18 @@ async fn agent_chat_stream(
         body.render_mode.as_deref(),
     );
     let req_session_id = body.session_id.clone();
+    // The conversation's id is known before the turn starts, even for the first
+    // message of a new conversation (the client sends none). Without it the
+    // turn's Always grants have no key to be recorded under, and the next message
+    // starts from nothing. A generated id is brand-new, so it persists below.
+    let history_session_id = Some(
+        body.session_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+    );
+    let stream_session_id = history_session_id.clone();
     let scope_session_id = req_session_id.clone();
-    // Empty string is not a real session id — don't seed/harvest grants under `""`.
-    let history_session_id = body.session_id.clone().filter(|s| !s.is_empty());
     // Snapshot, at turn start, whether the named session already exists — so the
     // persist step below can tell a brand-new session (create it) from one that
     // was deleted mid-turn (do not resurrect it).
@@ -875,6 +884,9 @@ async fn agent_chat_stream(
                     let manager = std::sync::Arc::new(
                         crate::approval::ApprovalManager::from_config(&autonomy),
                     );
+                    // Shared with the shell forwarder below, which reads the live
+                    // policy when it decides whether an Always answer can hold.
+                    let manager_for_fwd = manager.clone();
                     // Carry "Always" grants from earlier messages in this
                     // conversation so they persist across turns (TUI parity —
                     // each SSE turn otherwise rebuilds a fresh manager).
@@ -903,20 +915,57 @@ async fn agent_chat_stream(
                     // blocks forever — no UI is subscribed to resolve it.
                     if let Some(sec) = agent.security() {
                         sec.set_pending(web_approvals.clone());
+                        // Carry this conversation's command grants into the shell
+                        // policy. Those names skip the unallowed-command prompt only:
+                        // argument, forbidden-path and risk checks still run per call.
+                        if let Some(sid) = history_session_id.as_deref() {
+                            for name in
+                                crate::approval::session_grants::session_granted_commands(sid)
+                            {
+                                if let Err(err) = sec.add_runtime_command(&name, false) {
+                                    tracing::warn!(
+                                        target: "api_v1",
+                                        error = %err,
+                                        "granted command not re-seeded; the next call will prompt"
+                                    );
+                                }
+                            }
+                        }
                     }
                     let mut shell_rx = web_approvals.subscribe();
                     let mut resolved_rx = web_approvals.subscribe_resolved();
                     let fwd_tx = events_tx.clone();
                     let turn_scope_for_fwd = turn_scope.clone();
+                    let fwd_manager = manager_for_fwd.clone();
+                    let fwd_session_id = history_session_id.clone();
                     shell_approval_forwarder = Some(tokio::spawn(async move {
                         use tokio::sync::broadcast::error::RecvError;
+                        // This turn's forwarded shell requests, by id: the basename
+                        // and whether Always could hold for it. Read at resolve time
+                        // to decide whether an Always answer becomes a command grant.
+                        let mut forwarded: std::collections::HashMap<uuid::Uuid, (String, bool)> =
+                            std::collections::HashMap::new();
                         loop {
                             tokio::select! {
                                 r = shell_rx.recv() => match r {
                                     // Only this turn's own shell (Layer-B) requests;
                                     // forward the UUID (not the basename) so two turns
                                     // waiting on the same command stay distinguishable.
-                                    Ok(req) if forward_to_this_stream(&req, &turn_scope_for_fwd) => {
+                                    Ok(req) if forward_to_this_stream(&req, &turn_scope_for_fwd)
+                                        // The Layer-A backend registers its own modal
+                                        // request under its UUID as the basename
+                                        // (web_approval.rs), and already emitted the
+                                        // event for it. A shell basename is never a
+                                        // UUID, so skip those to keep one event per
+                                        // request.
+                                        && req.basename != req.id.to_string() =>
+                                    {
+                                        let always_available = req.always_available
+                                            && fwd_manager.always_available_for("shell");
+                                        forwarded.insert(
+                                            req.id,
+                                            (req.basename.clone(), always_available),
+                                        );
                                         let _ = fwd_tx
                                             .send(crate::agent::AgentEvent::ApprovalRequest {
                                                 id: req.id.to_string(),
@@ -925,6 +974,7 @@ async fn agent_chat_stream(
                                                     "command": req.full_command,
                                                     "basename": req.basename,
                                                 }),
+                                                always_available,
                                             })
                                             .await;
                                     }
@@ -944,6 +994,20 @@ async fn agent_chat_stream(
                                             info.decision,
                                             crate::security::Decision::Deny
                                         );
+                                        // Only an explicit, live Always on a request that
+                                        // could hold for the conversation becomes a grant.
+                                        // Once, Deny and timeouts record nothing.
+                                        if let Some((basename, true)) = forwarded.remove(&info.id) {
+                                            if info.decision == crate::security::Decision::Session
+                                                && !info.timed_out
+                                            {
+                                                if let Some(sid) = fwd_session_id.as_deref() {
+                                                    crate::approval::session_grants::record_session_command(
+                                                        sid, &basename,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         let _ = fwd_tx
                                             .send(crate::agent::AgentEvent::ApprovalResolved {
                                                 id: info.id.to_string(),
@@ -1080,7 +1144,7 @@ async fn agent_chat_stream(
                         // the `done` event with nothing logged to explain it.
                         match open_session_store() {
                             Ok(mut store) => {
-                                let exists_now = req_session_id
+                                let exists_now = stream_session_id
                                     .as_deref()
                                     .filter(|s| !s.is_empty())
                                     .map(|sid| store.session_exists(sid).unwrap_or(true))
@@ -1088,7 +1152,7 @@ async fn agent_chat_stream(
                                 if should_persist(session_existed_at_start, exists_now) {
                                     match store.record_api_turn(
                                         &model,
-                                        req_session_id.as_deref(),
+                                        stream_session_id.as_deref(),
                                         &user_message,
                                         &persisted_text,
                                     ) {
@@ -1133,11 +1197,17 @@ async fn agent_chat_stream(
                 // The agent is paused awaiting in-browser approval. The client
                 // renders a modal and resolves it via `POST /api/v1/approvals/{id}`,
                 // which unblocks the paused turn (the stream then resumes).
-                crate::agent::AgentEvent::ApprovalRequest { id, tool, args } => serde_json::json!({
+                crate::agent::AgentEvent::ApprovalRequest {
+                    id,
+                    tool,
+                    args,
+                    always_available,
+                } => serde_json::json!({
                     "type": "approval_request",
                     "id": id,
                     "tool": tool,
                     "args": args,
+                    "always_available": always_available,
                 }),
                 // A pending approval was answered or expired — the client closes
                 // the modal instead of leaving dead approve/deny buttons.
@@ -2938,6 +3008,191 @@ mod tests {
             .collect()
     }
 
+    /// A local OpenAI-compatible server for the console tests. Each request
+    /// whose history has no tool result yet gets one `shell` tool call for the
+    /// configured command; once a result is back it answers in text. The
+    /// command is set per test, so the same server drives the allowlist, the
+    /// medium-risk and the forbidden-argument cases.
+    struct ShellToolScript {
+        command: Arc<parking_lot::Mutex<String>>,
+        requests: Arc<parking_lot::Mutex<usize>>,
+        addr: std::net::SocketAddr,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    #[derive(Clone)]
+    struct ShellToolScriptState {
+        command: Arc<parking_lot::Mutex<String>>,
+        requests: Arc<parking_lot::Mutex<usize>>,
+    }
+
+    async fn shell_tool_script_answer(
+        axum::extract::State(state): axum::extract::State<ShellToolScriptState>,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use std::fmt::Write;
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        *state.requests.lock() += 1;
+        let has_tool_result = request["messages"]
+            .as_array()
+            .is_some_and(|msgs| msgs.iter().any(|m| m["role"] == "tool"));
+        let frames = if has_tool_result {
+            vec![serde_json::json!({
+                "choices": [{ "index": 0, "delta": { "content": "done" }, "finish_reason": null }]
+            })]
+        } else {
+            let command = state.command.lock().clone();
+            let arguments = serde_json::json!({ "command": command }).to_string();
+            vec![serde_json::json!({
+                "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                    "index": 0,
+                    "id": "call_shell_1",
+                    "type": "function",
+                    "function": { "name": "shell", "arguments": arguments }
+                }] }, "finish_reason": null }]
+            })]
+        };
+        let finish_reason = if has_tool_result {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        let mut body = String::new();
+        for frame in frames {
+            let _ = write!(body, "data: {frame}\n\n");
+        }
+        let _ = write!(
+            body,
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }] })
+        );
+        (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+            .into_response()
+    }
+
+    impl ShellToolScript {
+        async fn start() -> Self {
+            let command = Arc::new(parking_lot::Mutex::new(String::new()));
+            let requests = Arc::new(parking_lot::Mutex::new(0usize));
+            let app = axum::Router::new()
+                .fallback(shell_tool_script_answer)
+                .with_state(ShellToolScriptState {
+                    command: Arc::clone(&command),
+                    requests: Arc::clone(&requests),
+                });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind local port");
+            let addr = listener.local_addr().expect("local addr");
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            Self {
+                command,
+                requests,
+                addr,
+                _task: task,
+            }
+        }
+
+        fn provider(&self) -> String {
+            format!("custom:http://{}", self.addr)
+        }
+
+        fn ask_for(&self, command: &str) {
+            *self.command.lock() = command.to_string();
+        }
+    }
+
+    /// Send one console chat message through the streaming handler and read its
+    /// SSE frames as they arrive, to `done`. A turn paused on an approval does not
+    /// end its body until the approval is answered, so the frames are read as they
+    /// come instead of collected. The first `approval_request` is answered with
+    /// `resolve` (`Some((approve, always))`), or denied when `None`. Returns the
+    /// events and the first prompt, if any.
+    async fn drive_console_turn(
+        state: &AppState,
+        provider: &str,
+        session_id: Option<String>,
+        message: &str,
+        resolve: Option<(bool, bool)>,
+    ) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
+        use http_body_util::BodyExt;
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "text/event-stream".parse().unwrap());
+        let response = agent_chat_dispatch(
+            State(state.clone()),
+            headers,
+            Query(ChatQuery::default()),
+            Json(ChatRequestBody {
+                message: message.to_string(),
+                model: None,
+                provider: Some(provider.to_string()),
+                temperature: None,
+                session_id,
+                context: None,
+                render_mode: None,
+            }),
+        )
+        .await
+        .expect("sse response");
+        let mut body = response.into_body();
+        let mut buffer = String::new();
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        let mut prompt: Option<serde_json::Value> = None;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(20), body.frame())
+                .await
+                .expect("turn produced a frame before the deadline");
+            let Some(frame) = frame else { break };
+            let frame = frame.expect("body frame");
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            buffer.push_str(&String::from_utf8_lossy(&data));
+            while let Some(end) = buffer.find("\n\n") {
+                let block: String = buffer.drain(..end + 2).collect();
+                for line in block.lines() {
+                    let Some(json) = line.strip_prefix("data: ") else {
+                        continue;
+                    };
+                    let Ok(ev) = serde_json::from_str::<serde_json::Value>(json) else {
+                        continue;
+                    };
+                    if ev["type"] == "approval_request" {
+                        if prompt.is_none() {
+                            prompt = Some(ev.clone());
+                        }
+                        // Answer every prompt, not only the first. A prompt left
+                        // unanswered parks the turn, and the test then waits forever.
+                        // A test that only reads the prompt denies it, which cancels
+                        // the turn.
+                        let (approve, always) = resolve.unwrap_or((false, false));
+                        let id = ev["id"].as_str().expect("approval id").to_string();
+                        let _ = resolve_approval(
+                            State(state.clone()),
+                            HeaderMap::new(),
+                            Path(id),
+                            Json(ApprovalDecisionBody { approve, always }),
+                        )
+                        .await;
+                    }
+                    let is_done = ev["type"] == "done";
+                    events.push(ev);
+                    if is_done {
+                        return (events, prompt);
+                    }
+                }
+            }
+        }
+        (events, prompt)
+    }
+
     #[test]
     fn record_api_chat_session_persists_user_and_assistant_messages() {
         let mut store = crate::sessions::SessionStore::in_memory().unwrap();
@@ -3790,6 +4045,463 @@ mod tests {
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
+    /// `test_state` with the local mock's placeholder key set. The mock server
+    /// does not check it, but the custom provider refuses to start without one.
+    fn scripted_state() -> AppState {
+        let state = test_state();
+        state.config.lock().api_key = Some("mock-key".to_string());
+        state
+    }
+
+    /// The command an approval prompt asks about.
+    fn prompt_command(prompt: &serde_json::Value) -> String {
+        prompt["args"]["command"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// How many `approval_request` events a turn emitted.
+    fn approval_request_count(events: &[serde_json::Value]) -> usize {
+        events
+            .iter()
+            .filter(|e| e["type"] == "approval_request")
+            .count()
+    }
+
+    fn done_session_id(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .rfind(|e| e["type"] == "done")
+            .and_then(|e| e["session_id"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A session id no other test uses. The grant store is process-wide, so each
+    /// test keys its own conversation rather than sharing one.
+    fn fresh_session_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    #[tokio::test]
+    async fn console_always_for_an_unallowed_command_holds_for_the_next_message() {
+        // Invariant: Always on an unallowed command runs it without a prompt for
+        // the rest of this conversation. Message 2 must run `hostname` unprompted.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("hostname");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "run it",
+            Some((true, true)),
+        )
+        .await;
+        assert!(prompt.is_some(), "message 1 must prompt: {first:?}");
+        assert_eq!(prompt_command(&prompt.unwrap()), "hostname");
+
+        let (second, second_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(sid.clone()), "again", None).await;
+        assert!(
+            second_prompt.is_none(),
+            "Always must hold for the conversation; message 2 prompted: {second:?}"
+        );
+        let ran = second
+            .iter()
+            .any(|e| e["type"] == "tool_call_end" && e["ok"] == true);
+        assert!(ran, "message 2 must run the command: {second:?}");
+    }
+
+    #[tokio::test]
+    async fn console_always_holds_when_the_conversation_began_without_a_session_id() {
+        // The drive's failing case: message 1 has no session id, so the id only
+        // exists once the turn is persisted. Message 2 uses the done event's id.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+
+        script.ask_for("hostname");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            None,
+            "run it",
+            Some((true, true)),
+        )
+        .await;
+        assert!(prompt.is_some(), "message 1 must prompt: {first:?}");
+        let sid = done_session_id(&first);
+        assert!(
+            !sid.is_empty(),
+            "message 1 must return a session id: {first:?}"
+        );
+
+        let (second, second_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(sid), "again", None).await;
+        assert!(
+            second_prompt.is_none(),
+            "Always from a first message must hold in the next message: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_approve_once_for_an_unallowed_command_prompts_again_next_message() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("hostname");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "run it",
+            Some((true, false)),
+        )
+        .await;
+        assert!(prompt.is_some(), "message 1 must prompt: {first:?}");
+
+        let (second, second_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(sid), "again", None).await;
+        assert!(
+            second_prompt.is_some(),
+            "Approve (once) must not hold for the next message: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_always_in_one_conversation_does_not_reach_another() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let session_a = fresh_session_id();
+        let session_b = fresh_session_id();
+
+        script.ask_for("hostname");
+        let (a, a_prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(session_a),
+            "run it",
+            Some((true, true)),
+        )
+        .await;
+        assert!(a_prompt.is_some(), "session A must prompt: {a:?}");
+
+        let (b, b_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(session_b), "run it", None).await;
+        assert!(
+            b_prompt.is_some(),
+            "an Always in session A must not reach session B: {b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_always_is_cleared_when_the_autonomy_preset_changes() {
+        // The tightening chokepoint (`apply_preset_to_config`) drops every session's
+        // grants, so the next message prompts again.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("hostname");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "run it",
+            Some((true, true)),
+        )
+        .await;
+        assert!(prompt.is_some(), "message 1 must prompt: {first:?}");
+
+        let mut cfg = state.config.lock().clone();
+        crate::approval::policy_writer::apply_preset_to_config(
+            &mut cfg,
+            crate::approval::policy_writer::PolicyPreset::Smart,
+        );
+
+        let (second, second_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(sid), "again", None).await;
+        assert!(
+            second_prompt.is_some(),
+            "a preset change must revoke the Always grant: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_always_is_gone_once_its_session_is_deleted() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+
+        script.ask_for("hostname");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            None,
+            "run it",
+            Some((true, true)),
+        )
+        .await;
+        assert!(prompt.is_some(), "message 1 must prompt: {first:?}");
+        let sid = done_session_id(&first);
+        assert!(!sid.is_empty());
+
+        let _ = sessions_delete(State(state.clone()), HeaderMap::new(), Path(sid.clone()))
+            .await
+            .expect("delete ok");
+
+        assert!(
+            crate::approval::session_grants::session_granted_commands(&sid).is_empty(),
+            "a deleted session must keep no command grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_medium_risk_prompt_offers_no_always_and_asks_every_time() {
+        // `git commit` is allowed but medium risk: its prompt must say Always does
+        // not hold, and the next message must prompt again.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("git commit -m probe");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "commit",
+            Some((true, true)),
+        )
+        .await;
+        let prompt = prompt.expect("message 1 must prompt for a medium-risk command");
+        assert_eq!(
+            prompt["always_available"], false,
+            "a medium-risk prompt must say Always does not hold: {first:?}"
+        );
+
+        let (second, second_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(sid), "commit again", None).await;
+        assert!(
+            second_prompt.is_some(),
+            "a medium-risk prompt must ask again on the next message: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_smart_prompt_for_an_unallowed_command_says_always_is_available() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+
+        script.ask_for("hostname");
+        let (events, prompt) =
+            drive_console_turn(&state, &script.provider(), None, "run it", None).await;
+        let prompt = prompt.expect("an unallowed command prompts under Smart");
+        assert_eq!(
+            prompt["always_available"], true,
+            "Smart's unallowed-command prompt must say Always holds: {events:?}"
+        );
+        assert_eq!(
+            approval_request_count(&events),
+            1,
+            "Smart's one shell request must be one event: {events:?}"
+        );
+    }
+
+    /// Manual preset on a fresh console state. The preset overwrites
+    /// `allowed_commands` from its bundle, so `allowed` is set after it.
+    fn manual_console_state(allowed: &[&str]) -> AppState {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("test-sse".to_string());
+        config.default_model = Some("test-model".to_string());
+        config.gateway.require_pairing = false;
+        crate::approval::policy_writer::apply_preset_to_config(
+            &mut config,
+            crate::approval::policy_writer::PolicyPreset::Manual,
+        );
+        config.autonomy.allowed_commands = allowed.iter().map(|c| (*c).to_string()).collect();
+        config.api_key = Some("mock-key".to_string());
+        let mut state = test_state();
+        state.config = Arc::new(parking_lot::Mutex::new(config));
+        state
+    }
+
+    #[tokio::test]
+    async fn console_manual_preset_says_always_is_unavailable_and_emits_one_event_per_request() {
+        // Manual forces every tool to prompt, so Always cannot hold. This command is
+        // allowlisted, so exactly one pending request reaches the shell gate (the
+        // Layer-A tool gate exempts `shell`). Before the fix, that one request also
+        // produced a second `approval_request` with the same id, echoed by the shell
+        // forwarder. One event per request is the regression check.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = manual_console_state(&["echo"]);
+        let script = ShellToolScript::start().await;
+
+        script.ask_for("echo hi");
+        let (events, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            None,
+            "say hi",
+            Some((true, true)),
+        )
+        .await;
+        let prompt = prompt.expect("Manual prompts");
+        assert_eq!(
+            prompt["always_available"], false,
+            "Manual must say Always does not hold: {events:?}"
+        );
+        assert_eq!(
+            approval_request_count(&events),
+            1,
+            "one pending request must produce one approval_request event: {events:?}"
+        );
+        let ran = events
+            .iter()
+            .any(|e| e["type"] == "tool_call_end" && e["ok"] == true);
+        assert!(ran, "the approved command must run: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn console_manual_unallowed_command_raises_two_prompts_with_distinct_ids() {
+        // An unallowed command passes two gates under Manual: the Layer-A tool gate
+        // (`always_ask = ["*"]` keeps it on `shell`) and then the Layer-B command
+        // gate. Each is one pending request, so each must produce exactly one event,
+        // and the two ids must differ. Both prompts are approved in order so the turn
+        // completes.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = manual_console_state(&["echo"]);
+        let script = ShellToolScript::start().await;
+
+        script.ask_for("hostname");
+        let (events, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            None,
+            "run it",
+            Some((true, true)),
+        )
+        .await;
+        assert!(prompt.is_some(), "Manual prompts: {events:?}");
+
+        let prompts: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["type"] == "approval_request")
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "one Layer-A and one Layer-B request must give two events: {events:?}"
+        );
+        let first_id = prompts[0]["id"].as_str().expect("first id");
+        let second_id = prompts[1]["id"].as_str().expect("second id");
+        assert_ne!(
+            first_id, second_id,
+            "the two requests must not share an id: {events:?}"
+        );
+        for p in &prompts {
+            assert_eq!(
+                p["always_available"], false,
+                "Manual must say Always does not hold: {events:?}"
+            );
+        }
+        let ran = events
+            .iter()
+            .any(|e| e["type"] == "tool_call_end" && e["ok"] == true);
+        assert!(
+            ran,
+            "both approved gates must let the command run: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn granted_command_still_refused_for_a_credential_path_argument() {
+        // A conversation grant names the command only. Message 2 runs the granted
+        // `hostname` against a credential directory, where the credential-dir
+        // check is a hard block: it refuses before any gate runs, so there is
+        // no approval_request and tool_call_end ok == false. The grant would
+        // have answered the unallowed-basename gate, but the refusal runs
+        // before that gate is reached. Nothing spawns, so OS permissions do
+        // not decide the outcome.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("hostname");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "run it",
+            Some((true, true)),
+        )
+        .await;
+        assert!(prompt.is_some(), "message 1 must prompt: {first:?}");
+
+        script.ask_for("hostname ~/.ssh/config");
+        let (second, second_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(sid), "read it", None).await;
+        let prompts = second
+            .iter()
+            .filter(|e| e["type"] == "approval_request")
+            .count();
+        assert_eq!(
+            prompts, 0,
+            "a granted name must not prompt for a credential path: {second:?}"
+        );
+        assert!(second_prompt.is_none(), "no prompt expected: {second:?}");
+        // A spawned command's own failure also reports ok == false, so the
+        // refusal is asserted by its text: the credential refusal names the
+        // literal `~/.ssh` form (not the expanded $HOME), so the substring is
+        // host-independent.
+        let refusal = second
+            .iter()
+            .find(|e| e["type"] == "tool_call_end")
+            .unwrap_or_else(|| panic!("message 2 must end a tool call: {second:?}"));
+        assert_eq!(
+            refusal["ok"], false,
+            "the credential-path call must be refused: {second:?}"
+        );
+        let preview = refusal["output_preview"].as_str().unwrap_or_default();
+        assert!(
+            preview.contains("Command blocked: it names ~/.ssh, which is a credential directory"),
+            "the refusal text must come from the credential check, not the spawned command: {preview:?}"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_approval_endpoint_resolves_pending_request() {
         let state = test_state();
@@ -3933,6 +4645,7 @@ mod tests {
             channel: channel.into(),
             reply_target: reply_target.into(),
             created_at: 0,
+            always_available: false,
         };
         assert!(forward_to_this_stream(&mk("t1", "console"), "t1"));
         assert!(!forward_to_this_stream(&mk("t2", "console"), "t1"));
