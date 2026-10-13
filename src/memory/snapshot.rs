@@ -271,8 +271,11 @@ pub struct CoreBlockUsage {
 /// `max_chars`, the tool reads `used_chars` to size the over-budget notice
 /// and `total`/`projected` to name the omitted entries.
 pub async fn core_block_usage(memory: &dyn Memory) -> Result<CoreBlockUsage> {
+    // `list_all`, not `list`: `total` and `used_chars` are sums over every core
+    // note the block would hold. A page of the newest 1000 would undercount, and
+    // the capacity notice would name too few notes as left out.
     let entries = memory
-        .list(
+        .list_all(
             Some(&super::MemoryCategory::Core),
             super::SessionScope::Private,
         )
@@ -1421,5 +1424,26 @@ Rule 3: Protect the user.
         assert_eq!(usage.total, 3);
         // `- owner_0: v\n` is 13 chars; three of them.
         assert_eq!(usage.used_chars, 3 * 13);
+    }
+    /// The core block counts every core note, not the newest page of 1000. With
+    /// 1001 core notes, the one outside the page used to go uncounted, so
+    /// `total` read 1000.
+    #[tokio::test]
+    async fn core_block_usage_counts_every_core_note_beyond_one_page() {
+        let tmp = TempDir::new().unwrap();
+        let mem = crate::memory::create_memory_for_cli("sqlite", tmp.path()).unwrap();
+        for i in 0..1_001 {
+            mem.store(
+                &format!("core_{i:04}"),
+                "v",
+                crate::memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let usage = core_block_usage(mem.as_ref()).await.unwrap();
+        assert_eq!(usage.total, 1_001, "every core note must be counted");
     }
 }

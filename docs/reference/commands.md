@@ -342,6 +342,11 @@ with `Accept: text/event-stream` or `?stream=1`; see
 - `rantaiclaw memory stats`
 - `rantaiclaw memory clear [--key <key>] [--category <name>] [--yes]`
 
+`list` shows a page: the newest entries, with the total in its header. `clear`
+removes every matching entry, with or without `--category`; it is not limited to
+the page `list` shows. `get` and `clear --key` match a key prefix against the whole
+store, so an older note is found by its prefix too.
+
 `add` screens content the same way the agent's own writes are screened: invisible
 characters are stripped, credential-shaped tokens are redacted, and content
 carrying the `[Memory context]` header is refused.

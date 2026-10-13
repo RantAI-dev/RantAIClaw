@@ -129,11 +129,30 @@ pub trait Memory: Send + Sync {
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>>;
 
     /// List all memory keys, filtered by category and `scope`.
+    ///
+    /// A backend may cap this read to a page (sqlite returns the newest 1000).
+    /// A caller that needs every entry in scope, to delete, count, or look one
+    /// up, uses [`Memory::list_all`]; `list` is for output that says it is a page.
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
         scope: SessionScope<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
+
+    /// Every entry in `category` and `scope`, with no page cap.
+    ///
+    /// Same filters as [`Memory::list`]: the scope and the memory view bound the
+    /// read exactly as they bound `list`. The default delegates to `list`, so a
+    /// backend that never caps has nothing to override. A wrapper around another
+    /// `Memory` must forward this method explicitly, or the wrapped backend's
+    /// cap comes back through the default.
+    async fn list_all(
+        &self,
+        category: Option<&MemoryCategory>,
+        scope: SessionScope<'_>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.list(category, scope).await
+    }
 
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;

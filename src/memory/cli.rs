@@ -118,6 +118,21 @@ async fn handle_list(
     Ok(())
 }
 
+/// Every entry whose key starts with `prefix`, over the whole store.
+///
+/// `list_all`, not `list`: `list` is a page of the newest 1000, and a prefix
+/// lookup that reads only that page cannot find an older key.
+async fn keys_with_prefix(
+    mem: &dyn Memory,
+    prefix: &str,
+) -> Result<Vec<super::traits::MemoryEntry>> {
+    let all = mem.list_all(None, crate::memory::SessionScope::Any).await?;
+    Ok(all
+        .into_iter()
+        .filter(|e| e.key.starts_with(prefix))
+        .collect())
+}
+
 async fn handle_get(config: &Config, key: &str) -> Result<()> {
     let mem = create_cli_memory(config)?;
 
@@ -127,13 +142,14 @@ async fn handle_get(config: &Config, key: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Fall back to prefix match so users can copy partial keys from `list`.
-    let all = mem.list(None, crate::memory::SessionScope::Any).await?;
-    let matches: Vec<_> = all.iter().filter(|e| e.key.starts_with(key)).collect();
+    // Fall back to prefix match so users can copy partial keys from `list`. The
+    // match is over every entry: `list` is a page, and an older key is found
+    // only through `list_all`.
+    let matches = keys_with_prefix(mem.as_ref(), key).await?;
 
     match matches.len() {
         0 => println!("No memory entry found for key: {key}"),
-        1 => print_entry(matches[0]),
+        1 => print_entry(&matches[0]),
         n => {
             println!("Prefix '{key}' matched {n} entries:\n");
             for entry in matches {
@@ -391,10 +407,12 @@ async fn handle_clear(
         return result;
     }
 
-    // Batch deletion by category (or all).
+    // Batch deletion by category (or all). `list_all`, not `list`: `list` is a
+    // page of the newest 1000, and the count, the prompt and the summary below
+    // are about every entry in scope.
     let cat = category.as_deref().map(parse_category);
     let entries = mem
-        .list(cat.as_ref(), crate::memory::SessionScope::Any)
+        .list_all(cat.as_ref(), crate::memory::SessionScope::Any)
         .await?;
 
     if entries.is_empty() {
@@ -447,8 +465,7 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
     let target = if mem.get(key).await?.is_some() {
         key.to_string()
     } else {
-        let all = mem.list(None, crate::memory::SessionScope::Any).await?;
-        let matches: Vec<_> = all.iter().filter(|e| e.key.starts_with(key)).collect();
+        let matches = keys_with_prefix(mem, key).await?;
         match matches.len() {
             0 => {
                 println!("No memory entry found for key: {key}");
@@ -714,6 +731,137 @@ mod tests {
         let refused = handle_add(&config, "other_key", "no view", "core").await;
         assert!(refused.is_err(), "a write with no view must be refused");
         assert!(mem.get("other_key").await.unwrap().is_none());
+    }
+
+    /// Seeds `count` core notes through the CLI's own factory. The first one
+    /// stored, `alpha_oldest`, is the oldest; with more than one page of notes
+    /// it sits outside the newest 1000 that `Memory::list` returns on sqlite.
+    /// The rest are `beta_NNNN`, so `alpha_o` is a prefix of exactly one key and
+    /// not a whole key.
+    async fn seed_core_notes(config: &Config, count: usize) {
+        let mem = create_cli_memory(config).unwrap();
+        for i in 0..count {
+            let key = if i == 0 {
+                "alpha_oldest".to_string()
+            } else {
+                format!("beta_{i:04}")
+            };
+            mem.store(
+                &key,
+                &format!("note number {i}"),
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// `memory clear` with no category deletes every entry, not the newest page
+    /// of 1000. With 1001 notes one used to remain, and the summary said
+    /// `1000/1000`.
+    #[tokio::test]
+    async fn clear_all_removes_every_entry_beyond_one_page() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = sqlite_config(&tmp);
+        seed_core_notes(&config, 1001).await;
+
+        handle_command(
+            crate::MemoryCommands::Clear {
+                key: None,
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let mem = create_cli_memory(&config).unwrap();
+        assert_eq!(
+            mem.count(crate::memory::SessionScope::Any).await.unwrap(),
+            0,
+            "every note must be gone, the oldest included"
+        );
+    }
+
+    /// `memory list` still shows a page: `list` returns the newest 1000 of 1001,
+    /// and `count` supplies the "of 1001" total its output prints. The listing is
+    /// a page on purpose, so it keeps the capped read.
+    #[tokio::test]
+    async fn list_still_reads_a_page_and_counts_the_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = sqlite_config(&tmp);
+        seed_core_notes(&config, 1001).await;
+
+        let mem = create_cli_memory(&config).unwrap();
+        let page = mem
+            .list(None, crate::memory::SessionScope::Any)
+            .await
+            .unwrap();
+        let total = mem.count(crate::memory::SessionScope::Any).await.unwrap();
+
+        assert_eq!(page.len(), 1000, "the listing stays a page");
+        assert_eq!(total, 1001, "the \"of M\" total is the whole store");
+        assert!(
+            page.iter().all(|e| e.key != "alpha_oldest"),
+            "the oldest note is outside the listed page"
+        );
+    }
+
+    /// `memory get <prefix>` finds the oldest note, which sits outside the newest
+    /// page of 1000. Before, the prefix was looked up in that page and printed
+    /// "No memory entry found".
+    #[tokio::test]
+    async fn get_by_prefix_finds_a_note_older_than_one_page() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = sqlite_config(&tmp);
+        seed_core_notes(&config, 1001).await;
+
+        let mem = create_cli_memory(&config).unwrap();
+        let page = mem
+            .list(None, crate::memory::SessionScope::Any)
+            .await
+            .unwrap();
+        assert!(
+            page.iter().all(|e| e.key != "alpha_oldest"),
+            "the test must put the oldest note outside the page"
+        );
+
+        // Only `alpha_oldest` starts with `alpha_o`, so the prefix is one match.
+        let matches = keys_with_prefix(mem.as_ref(), "alpha_o").await.unwrap();
+        assert_eq!(matches.len(), 1, "the oldest note must be found by prefix");
+        assert_eq!(matches[0].key, "alpha_oldest");
+    }
+
+    /// `memory clear --key <prefix>` deletes the oldest note found by its prefix.
+    #[tokio::test]
+    async fn clear_by_prefix_removes_a_note_older_than_one_page() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = sqlite_config(&tmp);
+        seed_core_notes(&config, 1001).await;
+
+        handle_command(
+            crate::MemoryCommands::Clear {
+                key: Some("alpha_o".into()),
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let mem = create_cli_memory(&config).unwrap();
+        assert!(
+            mem.get("alpha_oldest").await.unwrap().is_none(),
+            "the oldest note must be deleted by its prefix"
+        );
+        assert_eq!(
+            mem.count(crate::memory::SessionScope::Any).await.unwrap(),
+            1000,
+            "only that one note goes"
+        );
     }
 
     /// The CLI borrowed the migration factory, so an operator running
