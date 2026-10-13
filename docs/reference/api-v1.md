@@ -269,6 +269,13 @@ is on, i.e. `channels_config.autonomous_tools` is not set.
   { "approve": true }
   ```
   `true` approves the tool call once; `false` denies it.
+  `"always": true` with `"approve": true` is Always. For a command outside the
+  allowlist it holds until the conversation ends: the same command runs without
+  a prompt in the next message of that conversation, and nowhere else. Always
+  does not persist past the conversation, a gateway restart, or an autonomy
+  preset change. The `always_available` field on the `approval_request` event
+  says whether the modal should offer it. Medium-risk prompts, and tools forced
+  to prompt by `always_ask` or Manual, ask every time.
 - **Response** `200`:
   ```json
   { "resolved": true, "id": "...", "approved": true }

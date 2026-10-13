@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The console's `approval_request` event carries `always_available`. It is `true` when an Always answer holds for the rest of the conversation, and `false` when the modal should not offer Always (a medium-risk prompt, or a tool forced to prompt by `always_ask` or Manual).
 - `rantaiclaw usage` prints today's token total for the active workspace, the daily ceiling from
   `[cost] max_tokens_per_day`, the percentage used, and per-model lines. A model with no configured
   price reports "not reported", not `0.00`. It reads through the same tracker the ceiling uses.
@@ -63,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- In the console's approval modal, Always did nothing beyond the current reply: the next message asked again. Always on a command outside the allowlist now holds until the conversation ends. It does not carry into another conversation, and it is cleared when the conversation is deleted or the autonomy preset changes. Medium-risk prompts and tools forced to prompt still ask every time.
 - `memory clear` and `/clear` stopped at 1000 entries and reported the rest as gone: with 1001 notes one stayed, and the summary still said everything was cleared. A lookup by key prefix (`memory get`, `memory clear --key`) or by text (`memory_store` `replaces`) missed notes older than the newest 1000.
 - While a reply streamed, the model's reasoning showed in front of the answer. The saved reply was already clean; the streamed text was not. This applied to every surface that streams: the gateway chunk events, the TUI live preview and channel streaming. Only the reply is streamed now, and reasoning is sent once, at the end, when it is the whole reply.
 - `anthropic-custom:<url>` inherits the `anthropic` env vars. `ANTHROPIC_API_KEY` was ignored for a custom

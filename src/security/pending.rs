@@ -64,6 +64,11 @@ pub struct PendingRequest {
     pub reply_target: String,
     /// Unix epoch seconds when the request was created.
     pub created_at: u64,
+    /// True when an "Always" answer to this request may hold for the rest of the
+    /// conversation. Only the shell unallowed-command gate sets it (via
+    /// [`PendingApprovals::request_decision_in_always`]). Defaults to false, so
+    /// every other prompt, and every medium-risk one, offers no Always effect.
+    pub always_available: bool,
 }
 
 /// A resolution event, broadcast to `subscribe_resolved` listeners when a pending
@@ -131,6 +136,7 @@ impl PendingRequest {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            always_available: false,
         }
     }
 }
@@ -262,13 +268,43 @@ impl PendingApprovals {
         channel: impl Into<String>,
         reply_target: impl Into<String>,
     ) -> Decision {
-        let request = PendingRequest::new_with_id(
+        self.request_decision_with(id, basename, full_command, channel, reply_target, false)
+            .await
+    }
+
+    /// As [`request_decision_in`](Self::request_decision_in), for the shell
+    /// unallowed-command gate only: its "Always" answer is recorded as a command
+    /// grant and holds for the rest of the conversation, so the request is
+    /// flagged `always_available`. Every other caller keeps the deny default.
+    pub async fn request_decision_in_always(
+        &self,
+        id: Uuid,
+        basename: impl Into<String>,
+        full_command: impl Into<String>,
+        channel: impl Into<String>,
+        reply_target: impl Into<String>,
+    ) -> Decision {
+        self.request_decision_with(id, basename, full_command, channel, reply_target, true)
+            .await
+    }
+
+    async fn request_decision_with(
+        &self,
+        id: Uuid,
+        basename: impl Into<String>,
+        full_command: impl Into<String>,
+        channel: impl Into<String>,
+        reply_target: impl Into<String>,
+        always_available: bool,
+    ) -> Decision {
+        let mut request = PendingRequest::new_with_id(
             id,
             basename.into(),
             full_command.into(),
             channel.into(),
             reply_target.into(),
         );
+        request.always_available = always_available;
         let id = request.id;
         // Kept for the resolution broadcast on the auto-deny path (the snapshot
         // entry is gone by the time the deadline fires and cleanup runs).

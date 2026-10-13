@@ -35,7 +35,7 @@ Event types:
 | `memory_recalled` | `keys` | Keys of stored memories injected into this turn's prompt. Emitted before the first chunk. |
 | `tool_call_start` | `id`, `name`, `args` | Agent started a tool call. |
 | `tool_call_end` | `id`, `ok`, `output_preview` | Agent finished a tool call. |
-| `approval_request` | `id`, `tool`, `args` | Agent paused awaiting an in-browser approval. Resolve via `POST /api/v1/approvals/{id}`; the stream resumes after. |
+| `approval_request` | `id`, `tool`, `args`, `always_available` | Agent paused awaiting an in-browser approval. Resolve via `POST /api/v1/approvals/{id}`; the stream resumes after. `always_available` is `true` when an Always answer holds for the rest of the conversation, and `false` when the modal should not offer Always (a medium-risk prompt, or a tool forced to prompt by `always_ask` or Manual). |
 | `approval_resolved` | `id`, `approved`, `timed_out` | The approval identified by `id` was answered (`approved` true/false) or expired (`timed_out` true). Close the modal. Scoped to the turn that raised the request. |
 | `error` | `message` | Non-recoverable turn error. |
 | `reload_complete` | — | Informational: a config reload completed (benign for a per-request gateway agent). |

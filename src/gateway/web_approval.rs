@@ -58,7 +58,7 @@ impl WebModalApprovalBackend {
 
 #[async_trait::async_trait]
 impl ApprovalBackend for WebModalApprovalBackend {
-    async fn decide(&self, _mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
+    async fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
         let id = Uuid::new_v4();
         // Tell the browser to show the modal. If the SSE receiver is gone the
         // client can't answer → fail closed (deny), never run the tool.
@@ -68,6 +68,7 @@ impl ApprovalBackend for WebModalApprovalBackend {
                 id: id.to_string(),
                 tool: request.tool_name.clone(),
                 args: request.arguments.clone(),
+                always_available: mgr.always_available_for(&request.tool_name),
             })
             .await
             .is_err()
@@ -214,6 +215,42 @@ mod tests {
         };
         assert!(resolve(&relay, &id, true, true));
         assert_eq!(decide.await.unwrap(), ApprovalResponse::Always);
+    }
+
+    #[tokio::test]
+    async fn modal_event_says_always_is_unavailable_when_the_tool_is_forced_to_prompt() {
+        // Under Manual every tool is forced to prompt, so the Layer-A modal must
+        // not claim an Always answer will hold.
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let backend = WebModalApprovalBackend::new(relay.clone(), tx, CancellationToken::new());
+        let mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            always_ask: vec!["*".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
+        let request = ApprovalRequest {
+            tool_name: "web_search".into(),
+            arguments: serde_json::json!({ "query": "rust" }),
+        };
+        let decide = tokio::spawn(async move { backend.decide(&mgr, &request).await });
+        let ev = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("event within deadline")
+            .expect("event present");
+        let id = match ev {
+            AgentEvent::ApprovalRequest {
+                id,
+                always_available,
+                ..
+            } => {
+                assert!(!always_available, "Manual must say Always is unavailable");
+                id
+            }
+            other => panic!("expected ApprovalRequest, got {other:?}"),
+        };
+        assert!(resolve(&relay, &id, true, false));
+        assert_eq!(decide.await.unwrap(), ApprovalResponse::Yes);
     }
 
     #[tokio::test]

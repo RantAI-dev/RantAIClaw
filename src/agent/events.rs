@@ -42,6 +42,11 @@ pub enum AgentEvent {
         tool: String,
         /// Tool arguments (for display in the modal).
         args: serde_json::Value,
+        /// True when an "Always" answer to this prompt will hold for the rest of
+        /// the conversation. False when the prompt is forced (`always_ask`,
+        /// Manual) or is a medium-risk prompt, where Always only approves the
+        /// current call. The console hides the Always button on false.
+        always_available: bool,
     },
 
     /// A pending in-browser approval was answered (or expired). Lets the console
