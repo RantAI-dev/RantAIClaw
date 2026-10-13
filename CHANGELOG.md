@@ -113,11 +113,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an apostrophe, `@`, `+`, brackets, `-`, `:`, or a bare `AND`, `OR` or `NOT` returned nothing from the
   keyword side, and the failure was silent. The query is now reduced to its words, and a question
   matches chunks that hold some of its words, ranked by BM25. Words are joined with OR where the raw text
-  was an implicit AND, so a plain-language question now matches more chunks than before. A failure in the
+  was an implicit AND, so a plain-language question now matches more chunks than before. Common function
+  words are dropped, and at most eight words of a query are used, as memory recall does. A failure in the
   keyword search is logged at `warn`, without the query text.
 - `kb delete` and `kb intelligence` on an unknown document id exit `1` with a `not_found` error instead of
-  printing a success or an empty result. `kb delete` of an already soft-deleted document is also not found.
-  HTTP `DELETE` of an unknown document answers 404, as `GET` and `intelligence` already did.
+  printing a success or an empty result. A soft delete of an already soft-deleted document is also not found.
+  `--hard` removes a document whether or not it was soft-deleted first. HTTP `DELETE` of an unknown document
+  answers 404, as `GET` and `intelligence` already did.
 - `kb ingest --group <name>` checks that the group exists before the file is read or embedded, and attaches
   the document to it once stored. Before, the name was recorded in the document's metadata only, so the group
   never listed the document.

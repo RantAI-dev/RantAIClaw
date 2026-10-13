@@ -346,6 +346,39 @@ async fn kb_delete_already_soft_deleted_id_returns_error_toon_and_exit_1() {
 }
 
 #[tokio::test]
+async fn kb_delete_hard_removes_a_soft_deleted_document() {
+    // `--hard` must reach a document that was soft-deleted first: the store
+    // had filtered it out, so the CLI answered not_found and kept the row.
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let store = SqliteStore::open(&db, 4).await.unwrap();
+    store
+        .create_document(&sample_doc("rantaiclaw_doc_hardgone", "HardGone"))
+        .await
+        .unwrap();
+    store
+        .delete_document(
+            &rantaiclaw::kb::DocumentId("rantaiclaw_doc_hardgone".into()),
+            true,
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let (soft_code, soft_stdout, _) = run_kb(&db, &["delete", "rantaiclaw_doc_hardgone"]);
+    assert_eq!(soft_code, 1, "soft delete of a soft-deleted id must exit 1");
+    assert!(soft_stdout.contains("not_found"));
+
+    let (code, stdout, stderr) = run_kb(&db, &["delete", "--hard", "rantaiclaw_doc_hardgone"]);
+    assert_eq!(code, 0, "hard delete must succeed; stderr={stderr}");
+    assert!(
+        stdout.starts_with("result[1]{id,mode}"),
+        "expected delete result TOON, got: {stdout}"
+    );
+    assert!(stdout.contains("hard"), "got: {stdout}");
+}
+
+#[tokio::test]
 async fn kb_intelligence_unknown_id_returns_error_toon_and_exit_1() {
     // Regression: `kb intelligence <unknown>` printed empty entities/relations
     // and exited 0, where HTTP answers 404.
