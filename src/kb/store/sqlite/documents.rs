@@ -159,8 +159,9 @@ impl SqliteStore {
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }
 
-    /// Soft- or hard-delete a live document. `true` when a live row was
-    /// deleted, `false` when the id matched no live row.
+    /// Soft- or hard-delete a document. A soft delete takes only a live row;
+    /// a hard delete removes any existing row, live or soft-deleted. `true`
+    /// when a row was deleted, `false` when the id matched no row in that mode.
     ///
     /// # Errors
     ///
@@ -170,10 +171,9 @@ impl SqliteStore {
         let id = id.0.clone();
         tokio::task::spawn_blocking(move || -> KbResult<bool> {
             let mut conn = conn.blocking_lock();
-            // The `deleted_at IS NULL` filter is GET's notion of an existing
-            // document (`get_document_impl`): an unknown id and an already
-            // soft-deleted id both count as not found, so neither mode reports
-            // a second success or touches the row again.
+            // The soft path filters on `deleted_at IS NULL`: an unknown id and an
+            // already soft-deleted id both count as not found, so a second soft
+            // delete reports no success and does not touch the row again.
             if soft {
                 let updated = conn.execute(
                     "UPDATE document
@@ -191,14 +191,14 @@ impl SqliteStore {
                 // ingest collides on rowid reuse
                 // (`UNIQUE constraint failed on chunk_vec primary key`).
                 let tx = conn.transaction()?;
-                // The live-row check comes first, in the same transaction, so a
+                // The row check comes first, in the same transaction, so a
                 // miss deletes no chunk or vector.
-                let live: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM document WHERE id = ?1 AND deleted_at IS NULL",
+                let found: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM document WHERE id = ?1",
                     params![id],
                     |r| r.get(0),
                 )?;
-                if live == 0 {
+                if found == 0 {
                     return Ok(false);
                 }
                 {
@@ -213,10 +213,7 @@ impl SqliteStore {
                     }
                     drop(del_vec);
                     tx.execute("DELETE FROM chunk WHERE document_id = ?1", params![id])?;
-                    tx.execute(
-                        "DELETE FROM document WHERE id = ?1 AND deleted_at IS NULL",
-                        params![id],
-                    )?;
+                    tx.execute("DELETE FROM document WHERE id = ?1", params![id])?;
                     // Also clear this document's knowledge-graph rows, then GC any
                     // entity left with zero mentions — otherwise a hard delete
                     // orphans entity/mention/relation rows (mirrors

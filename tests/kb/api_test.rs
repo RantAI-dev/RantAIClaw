@@ -368,6 +368,63 @@ async fn kb_delete_unknown_document_is_404() {
 }
 
 #[tokio::test]
+async fn kb_delete_hard_unknown_document_is_404() {
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(format!(
+            "{}/api/v1/kb/documents/rantaiclaw_doc_missing?hard=true",
+            h.base_url
+        ))
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(resp.status(), 404, "unknown id must not answer 200");
+    let body: Value = resp.json().await.expect("error body");
+    assert_eq!(body["error"], "not_found");
+}
+
+#[tokio::test]
+async fn kb_delete_hard_after_soft_delete_answers_200() {
+    // A soft delete hides the document; the operator's follow-up `?hard=true`
+    // must still remove it and answer 200 in hard mode.
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            store
+                .create_document(&sample_doc("rantaiclaw_doc_hard_after", "HardAfter"))
+                .await
+                .expect("seed");
+        })
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/v1/kb/documents/rantaiclaw_doc_hard_after",
+        h.base_url
+    );
+
+    let soft = client.delete(&url).send().await.expect("soft delete");
+    assert_eq!(
+        soft.status(),
+        200,
+        "soft delete of a live id must answer 200"
+    );
+
+    let hard = client
+        .delete(format!("{url}?hard=true"))
+        .send()
+        .await
+        .expect("hard delete");
+    assert_eq!(
+        hard.status(),
+        200,
+        "hard delete after soft delete must answer 200"
+    );
+    let body: Value = hard.json().await.expect("json body");
+    assert_eq!(body["mode"], "hard");
+}
+
+#[tokio::test]
 async fn kb_delete_soft_hides_doc_from_list_and_get() {
     let h = start_harness(|store| {
         Box::pin(async move {

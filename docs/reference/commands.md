@@ -439,7 +439,7 @@ Show one document. Exits `1` with a TOON `error[not_found]` block when the ID is
 
 Soft-delete by default (sets `deleted_at`, hides from search). `--hard` permanently removes the document and its chunks.
 
-An unknown ID, or one already soft-deleted, exits `1` with a TOON `error[not_found]` block naming the ID, in either mode. Nothing is deleted.
+An unknown ID exits `1` with a TOON `error[not_found]` block naming the ID, in either mode. A soft delete of a document that is already soft-deleted is also not found and deletes nothing. `--hard` removes the document whether or not it was soft-deleted first.
 
 | Flag | Description | Default |
 |---|---|---|

@@ -6,8 +6,11 @@
 use chrono::Utc;
 use tempfile::TempDir;
 
+use rantaiclaw::kb::intelligence::types::{
+    Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,
+};
 use rantaiclaw::kb::store::sqlite::SqliteStore;
-use rantaiclaw::kb::store::{store_document_with_chunks, KbStore, SearchFilter};
+use rantaiclaw::kb::store::{store_document_with_chunks, IntelligenceStore, KbStore, SearchFilter};
 use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId};
 
 fn ones(dim: usize) -> Vec<f32> {
@@ -956,24 +959,104 @@ async fn delete_reports_not_found_for_unknown_id_soft_and_hard() {
 }
 
 #[tokio::test]
-async fn delete_reports_not_found_for_soft_deleted_id_soft_and_hard() {
-    // A soft-deleted document is not found for GET, so it is not found for
-    // delete either, in both modes. The second delete must not report a
-    // fresh success or touch the row again.
+async fn hard_delete_removes_a_soft_deleted_document_with_its_cascade() {
+    // A soft-deleted document is not found for GET or for a second soft
+    // delete, but `--hard` must still remove the row, its chunks, its vectors
+    // and its graph rows: the operator can always remove a document for good.
     let tmp = TempDir::new().unwrap();
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
         .await
         .unwrap();
     let doc = sample_doc("rantaiclaw_doc_gone", "Gone");
     store.create_document(&doc).await.unwrap();
+    let chunks = vec![Chunk {
+        content: "gone chunk".into(),
+        metadata: ChunkMetadata {
+            document_title: doc.title.clone(),
+            category: "FAQ".into(),
+            subcategory: None,
+            section: None,
+            chunk_index: 0,
+            contextual_prefix: None,
+        },
+    }];
+    store
+        .store_chunks(&doc.id, &chunks, &[ones(4)], "rantaiclaw_test_model_a")
+        .await
+        .unwrap();
+    let entity_id = store
+        .upsert_entity(&Entity {
+            id: "rantaiclaw_entity_gone".into(),
+            canonical_key: "rantaiclaw_gone:Product".into(),
+            name: "RantaiClawGone".into(),
+            entity_type: EntityType::Product,
+            confidence: 0.9,
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    store
+        .add_mention(&EntityMention {
+            id: "rantaiclaw_mention_gone".into(),
+            entity_id: entity_id.clone(),
+            document_id: doc.id.0.clone(),
+            chunk_index: Some(0),
+            context: None,
+            source: ExtractSource::Llm,
+        })
+        .await
+        .unwrap();
+    store
+        .add_relation(&Relation {
+            id: "rantaiclaw_relation_gone".into(),
+            source_entity_id: entity_id.clone(),
+            target_entity_id: entity_id,
+            relation_type: RelationType::RelatedTo,
+            confidence: 0.9,
+            document_id: doc.id.0.clone(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
     assert!(store.delete_document(&doc.id, true).await.unwrap());
     assert!(
         !store.delete_document(&doc.id, true).await.unwrap(),
         "soft delete of a soft-deleted id must report nothing deleted"
     );
     assert!(
-        !store.delete_document(&doc.id, false).await.unwrap(),
-        "hard delete of a soft-deleted id must report nothing deleted"
+        store.delete_document(&doc.id, false).await.unwrap(),
+        "hard delete of a soft-deleted id must report one document deleted"
+    );
+
+    let conn = rusqlite::Connection::open(tmp.path().join("kb.db")).unwrap();
+    let count = |sql: &str| -> i64 {
+        conn.query_row(sql, [doc.id.0.as_str()], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM document WHERE id = ?1"),
+        0,
+        "hard delete must remove the document row"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM chunk WHERE document_id = ?1"),
+        0,
+        "hard delete must remove the chunk rows"
+    );
+    let vec_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunk_vec", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(vec_rows, 0, "hard delete must clear the chunk_vec rows");
+    let (entities, relations) = store.intelligence_for_document(&doc.id.0).await.unwrap();
+    assert!(
+        entities.is_empty() && relations.is_empty(),
+        "hard delete must clear the graph rows: {entities:?} {relations:?}"
+    );
+    assert_eq!(
+        store.graph(None, 10).await.unwrap().total_entities,
+        0,
+        "hard delete must GC the entity left with no mentions"
     );
 }
 

@@ -638,8 +638,9 @@ async fn cmd_get(store: Arc<dyn KbStore>, id: String, json: bool) -> KbResult<i3
 
 async fn cmd_delete(store: Arc<dyn KbStore>, id: String, hard: bool) -> KbResult<i32> {
     let soft = !hard;
-    // Nothing deleted means the id names no live document (unknown, or already
-    // soft-deleted). Say so as cmd_get does, instead of printing a success row.
+    // Nothing deleted means the id matched no row in this mode: unknown, or,
+    // for a soft delete, already soft-deleted. Say so as cmd_get does, instead
+    // of printing a success row.
     if !store.delete_document(&DocumentId(id.clone()), soft).await? {
         print_error_toon("not_found", &format!("document {id} not found"));
         return Ok(1);
