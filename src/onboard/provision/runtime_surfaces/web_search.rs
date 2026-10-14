@@ -78,16 +78,19 @@ impl TuiProvisioner for WebSearchProvisioner {
                     "Disabled".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let sel = recv_selection(&mut responses).await?;
-        let (provider, provider_key) = match sel.first().copied().unwrap_or(0) {
-            0 => ("duckduckgo".to_string(), None),
-            1 => ("tavily".to_string(), Some("tavily".to_string())),
-            2 => ("serper".to_string(), Some("serper".to_string())),
-            3 => ("brave".to_string(), Some("brave".to_string())),
+        // An empty answer is not a search provider: it takes the `_` arm, which
+        // turns search off. It must not reach row 0 (duckduckgo).
+        let (provider, provider_key) = match sel.first().copied() {
+            Some(0) => ("duckduckgo".to_string(), None),
+            Some(1) => ("tavily".to_string(), Some("tavily".to_string())),
+            Some(2) => ("serper".to_string(), Some("serper".to_string())),
+            Some(3) => ("brave".to_string(), Some("brave".to_string())),
             _ => ("none".to_string(), None),
         };
 

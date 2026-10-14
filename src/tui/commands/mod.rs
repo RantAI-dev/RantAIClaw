@@ -211,7 +211,6 @@ impl CommandRegistry {
         self.register(Box::new(agent::StopCommand));
         self.register(Box::new(agent::ContinueCommand));
         self.register(Box::new(config::StatusCommand));
-        self.register(Box::new(config::DebugCommand));
         self.register(Box::new(config::ConfigCommand));
         self.register(Box::new(config::DoctorCommand));
         self.register(Box::new(config::ChannelsCommand));

@@ -48,6 +48,7 @@ fn choose_event_sets_active_choose_state() {
             "Off".into(),
         ],
         multi: false,
+        filterable: false,
     });
     assert!(s.active_choose().is_some());
     let c = s.active_choose().unwrap();
@@ -66,6 +67,7 @@ fn choose_single_select_submits_one_index() {
         label: "x".into(),
         options: vec!["a".into(), "b".into(), "c".into()],
         multi: false,
+        filterable: false,
     });
     s.choose_move_down();
     s.choose_move_down();
@@ -86,6 +88,7 @@ fn choose_multi_select_toggles_with_space() {
         label: "x".into(),
         options: vec!["a".into(), "b".into(), "c".into()],
         multi: true,
+        filterable: false,
     });
     s.choose_toggle();
     s.choose_move_down();
@@ -103,6 +106,7 @@ fn choose_single_select_ignores_toggle() {
         label: "x".into(),
         options: vec!["a".into(), "b".into()],
         multi: false,
+        filterable: false,
     });
     s.choose_toggle();
     let (_, sel) = s.submit_choose().unwrap();
@@ -117,6 +121,7 @@ fn choose_move_up_at_zero_stays_at_zero() {
         label: "x".into(),
         options: vec!["a".into(), "b".into()],
         multi: false,
+        filterable: false,
     });
     s.choose_move_up();
     assert_eq!(s.active_choose().unwrap().cursor, 0);

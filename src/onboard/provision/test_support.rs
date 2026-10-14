@@ -15,6 +15,8 @@ use anyhow::Result;
 pub enum Answer {
     Text(&'static str),
     Pick(usize),
+    /// A choose answered with no selection (what a filter with no hits sends).
+    Empty,
 }
 
 pub struct Transcript {
@@ -72,6 +74,7 @@ pub async fn drive(
         let r = match a {
             Answer::Text(t) => ProvisionResponse::Text(t.to_string()),
             Answer::Pick(i) => ProvisionResponse::Selection(vec![i]),
+            Answer::Empty => ProvisionResponse::Selection(Vec::new()),
         };
         resp_tx.send(r).await.expect("queue answer");
     }

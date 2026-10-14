@@ -99,6 +99,7 @@ impl TuiProvisioner for IMessageProvisioner {
                 label: "Have you granted Full Disk Access?".into(),
                 options: vec!["Yes — continue".to_string(), "No — cancel".to_string()],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

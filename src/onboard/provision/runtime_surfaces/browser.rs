@@ -76,14 +76,16 @@ impl TuiProvisioner for BrowserProvisioner {
                     "Computer Use (Anthropic)".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let sel = recv_selection(&mut responses).await?;
-        let (enabled, backend) = match sel.first().copied().unwrap_or(0) {
-            1 => (true, "agent_browser".to_string()),
-            2 => (true, "computer_use".to_string()),
+        // An empty answer takes the disabled branch, the same as option 0.
+        let (enabled, backend) = match sel.first().copied() {
+            Some(1) => (true, "agent_browser".to_string()),
+            Some(2) => (true, "computer_use".to_string()),
             _ => (false, "agent_browser".to_string()),
         };
 

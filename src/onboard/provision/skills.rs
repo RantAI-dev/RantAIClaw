@@ -108,6 +108,7 @@ impl TuiProvisioner for SkillsProvisioner {
                 label: "Install the 5-skill starter pack?".into(),
                 options: vec!["Yes — install starter pack".to_string(), "Skip".to_string()],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

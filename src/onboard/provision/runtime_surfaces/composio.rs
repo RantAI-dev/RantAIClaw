@@ -138,6 +138,7 @@ impl TuiProvisioner for ComposioProvisioner {
                     "None".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

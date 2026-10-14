@@ -169,6 +169,7 @@ impl TuiProvisioner for DiscordProvisioner {
                     "Respond to all (including other bots)".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

@@ -21,6 +21,18 @@ fn model_entries_for_provider(
     provider: &str,
     workspace_dir: Option<&std::path::Path>,
 ) -> Vec<ModelEntry> {
+    model_entries_for_provider_with_active(provider, workspace_dir, "")
+}
+
+/// [`model_entries_for_provider`] plus the active model when the catalog lacks
+/// it, so the row the operator is on is always in the picker. The list is the
+/// same one the setup model step offers
+/// (`onboard::wizard::provider_model_list`).
+fn model_entries_for_provider_with_active(
+    provider: &str,
+    workspace_dir: Option<&std::path::Path>,
+    active_model: &str,
+) -> Vec<ModelEntry> {
     let curated = crate::onboard::wizard::curated_models_for_provider(provider);
 
     let Some(workspace_dir) = workspace_dir else {
@@ -43,8 +55,7 @@ fn model_entries_for_provider(
             .unwrap_or_default()
     };
 
-    crate::onboard::wizard::provider_model_catalog(workspace_dir, provider)
-        .models
+    crate::onboard::wizard::provider_model_list(workspace_dir, provider, active_model)
         .into_iter()
         .map(|model_id| ModelEntry {
             description: describe(&model_id),
@@ -57,11 +68,36 @@ fn model_entries_for_provider(
 /// Split a `/model` target into `(provider, model)`.
 ///
 /// Picker keys are always `provider:model` (`ModelEntry::target()`), but
-/// model ids may themselves contain `:` (ollama `llama3:8b`), so only the
-/// first segment is the provider. A bare string with no `:` (or an empty
-/// first segment) names a model only — the caller keeps the current
-/// provider.
+/// model ids may themselves contain `:` (ollama `llama3:8b`), so for an
+/// ordinary provider only the first segment is the provider. A bare string
+/// with no `:` (or an empty first segment) names a model only — the caller
+/// keeps the current provider.
+///
+/// A `custom:<base url>` provider is the exception: its name embeds a URL, so
+/// it contains colons of its own (`custom:http://host:port/v1`). When the
+/// target starts with `custom:` and the rest holds a `://`, the provider is the
+/// whole `custom:<url>` and the model follows the first `:` after the URL's
+/// last `/`. The limit: a base URL with no path, or a model id containing `/`,
+/// is not read correctly, the same ambiguity a typed target always had. A `custom:model`
+/// with no URL has no embedded name and splits on its first colon.
 pub(crate) fn split_model_target(target: &str) -> (Option<&str>, &str) {
+    if let Some(rest) = target.strip_prefix("custom:") {
+        if rest.contains("://") {
+            // The URL's path ends at its last `/`; the model follows the first
+            // `:` after that. Splitting at the very last `:` would wrongly cut a
+            // model id such as `llama3:8b`.
+            if let Some(slash) = rest.rfind('/') {
+                if let Some(colon) = rest[slash..].find(':') {
+                    let cut = slash + colon;
+                    let (url, model) = (&rest[..cut], &rest[cut + 1..]);
+                    if !url.is_empty() && !model.is_empty() {
+                        let provider_len = "custom:".len() + url.len();
+                        return (Some(&target[..provider_len]), model);
+                    }
+                }
+            }
+        }
+    }
     match target.split_once(':') {
         Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
             (Some(provider), model)
@@ -105,10 +141,18 @@ impl CommandHandler for ModelCommand {
             ctx.available_providers.clone()
         };
 
+        // The active model belongs to one provider. It is appended only to that
+        // provider's list, never to another's.
+        let (active_provider, active_model) = split_model_target(&ctx.model);
         for provider in &providers {
-            entries.extend(model_entries_for_provider(
+            let active = match active_provider {
+                Some(ap) if ap == provider => active_model,
+                _ => "",
+            };
+            entries.extend(model_entries_for_provider_with_active(
                 provider,
                 ctx.workspace_dir.as_deref(),
+                active,
             ));
         }
 
@@ -122,12 +166,23 @@ impl CommandHandler for ModelCommand {
             })
             .collect();
 
+        // The empty text must be true. With no provider configured, setup is
+        // the fix. With a provider configured but no models listed, the operator
+        // can still name one: `/model <provider:model>` sets it.
+        let known_provider = providers.iter().find(|p| !p.is_empty());
+        let empty_hint = match known_provider {
+            Some(provider) => format!(
+                "No models are known for {provider}. Set one by name with `/model <provider:model>`."
+            ),
+            None => "No providers with credentials detected. Run `rantaiclaw setup provider`."
+                .to_string(),
+        };
         let picker = ListPicker::new(
             ListPickerKind::Model,
             "Select Model",
             items,
             Some(&ctx.model),
-            "No providers with credentials detected. Run `rantaiclaw setup provider`.",
+            empty_hint,
         );
         Ok(CommandResult::OpenListPicker(picker))
     }
@@ -298,6 +353,31 @@ mod tests {
         assert_eq!(split_model_target("x:"), (None, "x:"));
     }
 
+    /// A `custom:<url>` provider name embeds a URL and so contains colons.
+    /// Picker rows for it are `custom:<url>:<model>`, and the split must return
+    /// the whole `custom:<url>` as the provider.
+    #[test]
+    fn split_target_custom_endpoint_keeps_its_url_as_the_provider() {
+        assert_eq!(
+            split_model_target("custom:http://127.0.0.1:28521/v1:llama-a"),
+            (Some("custom:http://127.0.0.1:28521/v1"), "llama-a")
+        );
+        assert_eq!(
+            split_model_target("custom:http://h:1/v1:llama3:8b"),
+            (Some("custom:http://h:1/v1"), "llama3:8b")
+        );
+    }
+
+    /// Without a URL there is no embedded provider name: the legacy form
+    /// `custom:model` splits on its first colon, as every other provider does.
+    #[test]
+    fn split_target_custom_without_a_url_splits_on_the_first_colon() {
+        assert_eq!(
+            split_model_target("custom:model"),
+            (Some("custom"), "model")
+        );
+    }
+
     #[test]
     fn model_command_with_empty_args_opens_picker() {
         let cmd = ModelCommand;
@@ -380,6 +460,144 @@ mod tests {
         assert_eq!(
             entry.description, curated_desc,
             "catalog supplies the ID, curated supplies the description"
+        );
+    }
+
+    /// On a `custom:<url>` session the `/model` picker, run end to end, offers
+    /// the endpoint's cached models plus the active one, once each. The active
+    /// model's provider is the whole `custom:<url>`, not `custom`.
+    #[test]
+    fn picker_on_a_custom_session_offers_the_cache_and_the_active_model_once() {
+        let url = "custom:http://127.0.0.1:28521/v1";
+        let workspace = workspace_with_cached_models(url, &["llama-a", "llama-b", "llama-c"]);
+        let mut ctx = test_context();
+        ctx.available_providers = vec![url.to_string()];
+        ctx.model = format!("{url}:my-own-model");
+        ctx.workspace_dir = Some(workspace.path().to_path_buf());
+
+        let CommandResult::OpenListPicker(picker) = ModelCommand.execute("", &mut ctx).unwrap()
+        else {
+            panic!("expected OpenListPicker");
+        };
+        let keys: Vec<String> = picker
+            .entries()
+            .iter()
+            .filter_map(|e| e.as_item().map(|i| i.key.clone()))
+            .collect();
+
+        assert_eq!(keys.len(), 4, "3 cached + the active model: {keys:?}");
+        for id in ["llama-a", "llama-b", "llama-c", "my-own-model"] {
+            assert!(
+                keys.contains(&format!("{url}:{id}")),
+                "{id} is offered: {keys:?}"
+            );
+        }
+    }
+
+    /// Boot path: `rantaiclaw chat` starts with `ctx.model` = `provider:model`
+    /// (the label `boot_model_label` builds). The picker must then offer the
+    /// catalog plus the active model, not the catalog alone.
+    #[test]
+    fn picker_at_boot_with_a_full_label_offers_the_catalog_plus_the_active_model() {
+        let models: Vec<String> = (0..150).map(|i| format!("openai/cached-{i:03}")).collect();
+        let refs: Vec<&str> = models.iter().map(String::as_str).collect();
+        let workspace = workspace_with_cached_models("openai", &refs);
+        let mut ctx = test_context();
+        ctx.available_providers = vec!["openai".to_string()];
+        ctx.model = "openai:openai/active-model".to_string();
+        ctx.workspace_dir = Some(workspace.path().to_path_buf());
+
+        let CommandResult::OpenListPicker(picker) = ModelCommand.execute("", &mut ctx).unwrap()
+        else {
+            panic!("expected OpenListPicker");
+        };
+        let keys: Vec<String> = picker
+            .entries()
+            .iter()
+            .filter_map(|e| e.as_item().map(|i| i.key.clone()))
+            .collect();
+
+        assert_eq!(keys.len(), 151, "150 cached + the active model");
+        assert!(keys.contains(&"openai:openai/active-model".to_string()));
+    }
+
+    /// The picker offers a 150-model catalog and the active model: 151 rows,
+    /// not the 120 the setup step used to cap at.
+    #[test]
+    fn picker_offers_the_whole_catalog_plus_the_active_model() {
+        let models: Vec<String> = (0..150).map(|i| format!("openai/cached-{i:03}")).collect();
+        let refs: Vec<&str> = models.iter().map(String::as_str).collect();
+        let workspace = workspace_with_cached_models("openai", &refs);
+
+        let entries = model_entries_for_provider_with_active(
+            "openai",
+            Some(workspace.path()),
+            "openai/active-model",
+        );
+
+        assert_eq!(entries.len(), 151);
+        assert!(entries.iter().any(|e| e.model_id == "openai/active-model"));
+    }
+
+    /// `custom:<url>` with a cache of 3: the picker offers those 3 and the
+    /// active model. Before, the picker was empty for a custom provider.
+    #[test]
+    fn picker_offers_a_custom_endpoints_cached_models_and_the_active_one() {
+        let workspace = workspace_with_cached_models(
+            "custom:http://localhost:1234",
+            &["llama-a", "llama-b", "llama-c"],
+        );
+
+        let entries = model_entries_for_provider_with_active(
+            "custom:http://localhost:1234",
+            Some(workspace.path()),
+            "my-own-model",
+        );
+
+        let ids: Vec<&str> = entries.iter().map(|e| e.model_id.as_str()).collect();
+        assert_eq!(ids, vec!["llama-a", "llama-b", "llama-c", "my-own-model"]);
+    }
+
+    /// A provider is known but its list is empty: the picker must not say "no
+    /// providers with credentials" (that is false, the provider is configured);
+    /// it says no models are known and how to set one by name.
+    #[test]
+    fn empty_picker_for_a_known_provider_says_no_models_are_known() {
+        let mut ctx = test_context();
+        ctx.available_providers = vec!["some-unlisted-provider".to_string()];
+        ctx.workspace_dir = Some(tempfile::TempDir::new().unwrap().keep());
+
+        let CommandResult::OpenListPicker(picker) = ModelCommand.execute("", &mut ctx).unwrap()
+        else {
+            panic!("expected OpenListPicker");
+        };
+
+        assert!(
+            picker.empty_hint.contains("some-unlisted-provider")
+                && picker.empty_hint.contains("/model <provider:model>"),
+            "the hint names the provider and the by-name form: {}",
+            picker.empty_hint
+        );
+        assert!(!picker.empty_hint.contains("No providers with credentials"));
+    }
+
+    /// No provider is configured at all: the picker keeps the setup hint, which
+    /// is true in this case.
+    #[test]
+    fn empty_picker_with_no_provider_points_to_setup() {
+        let mut ctx = test_context();
+        ctx.available_providers = Vec::new();
+        ctx.model = String::new();
+
+        let CommandResult::OpenListPicker(picker) = ModelCommand.execute("", &mut ctx).unwrap()
+        else {
+            panic!("expected OpenListPicker");
+        };
+
+        assert!(
+            picker.empty_hint.contains("No providers with credentials"),
+            "{}",
+            picker.empty_hint
         );
     }
 

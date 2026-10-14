@@ -39,6 +39,10 @@ pub enum ProvisionEvent {
         label: String,
         options: Vec<String>,
         multi: bool,
+        /// The renderer may narrow `options` by typed text. Only a long list
+        /// asks for it (the model step, with the whole provider catalog); a
+        /// renderer without a filter ignores it and shows the list as it is.
+        filterable: bool,
     },
     Done {
         summary: String,

@@ -79,6 +79,14 @@ pub enum AgentEvent {
     /// Non-recoverable error. Followed by `Done { cancelled: false, final_text: "" }`.
     Error(String),
 
+    /// The actor could not rebuild the agent for a `TurnRequest::Reload`. The
+    /// previous agent is still in place and keeps answering; the TUI shows the
+    /// error and drops any model switch that was waiting on this reload.
+    ReloadFailed {
+        /// Why the agent could not be built, as the factory reported it.
+        error: String,
+    },
+
     /// The actor finished rebuilding the agent after a `TurnRequest::Reload`.
     /// Carries fresh snapshots that the TUI keeps cached (so views like
     /// `/mcp` reflect the new state without re-probing). Emitted at

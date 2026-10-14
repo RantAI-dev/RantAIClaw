@@ -148,6 +148,7 @@ async fn choose(
             label,
             options,
             multi: false,
+            filterable: false,
         })
         .await
         .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;

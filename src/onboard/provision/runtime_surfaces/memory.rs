@@ -77,13 +77,16 @@ impl TuiProvisioner for MemoryProvisioner {
                     "none (no memory)".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let sel = recv_selection(&mut responses).await?;
-        let backend = match sel.first().copied().unwrap_or(0) {
-            0 => "sqlite",
+        // An empty answer is "none", never row 0 (sqlite): it must not pick a
+        // backend the operator did not choose.
+        let backend = match sel.first().copied() {
+            Some(0) => "sqlite",
             _ => "none",
         }
         .to_string();

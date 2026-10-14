@@ -153,6 +153,7 @@ impl TuiProvisioner for TelegramProvisioner {
                     "Respond to every group message (DMs always)".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

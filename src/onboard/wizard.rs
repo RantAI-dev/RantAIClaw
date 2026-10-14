@@ -56,7 +56,6 @@ const BANNER: &str = r"
     ⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
 ";
 
-pub(crate) const LIVE_MODEL_MAX_OPTIONS: usize = 120;
 const MODEL_PREVIEW_LIMIT: usize = 20;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
@@ -2003,6 +2002,26 @@ pub(crate) fn provider_model_catalog(workspace_dir: &Path, provider_name: &str) 
     }
 }
 
+/// The model list for one provider, as the `/model` picker and the setup model
+/// step both offer it: the provider's whole catalog (cache, else curated) in
+/// catalog order, plus the active model when the catalog does not list it. The
+/// active model is appended last so an operator on a model the catalog lacks
+/// still sees it and can keep it.
+///
+/// The gateway does not use this: it keeps [`provider_model_catalog`] as it is.
+pub(crate) fn provider_model_list(
+    workspace_dir: &Path,
+    provider_name: &str,
+    active_model: &str,
+) -> Vec<String> {
+    let mut models = provider_model_catalog(workspace_dir, provider_name).models;
+    let active = active_model.trim();
+    if !active.is_empty() && !models.iter().any(|m| m == active) {
+        models.push(active.to_string());
+    }
+    models
+}
+
 pub(crate) fn humanize_age(age_secs: u64) -> String {
     if age_secs < 60 {
         format!("{age_secs}s")
@@ -2939,20 +2958,13 @@ pub(crate) fn setup_provider(
             if let Some(cached) =
                 load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)?
             {
-                let shown_count = cached.models.len().min(LIVE_MODEL_MAX_OPTIONS);
+                let shown_count = cached.models.len();
                 print_bullet(&format!(
                     "Found cached models ({shown_count}) updated {} ago.",
                     humanize_age(cached.age_secs)
                 ));
 
-                live_options = Some(build_model_options(
-                    cached
-                        .models
-                        .into_iter()
-                        .take(LIVE_MODEL_MAX_OPTIONS)
-                        .collect(),
-                    "cached",
-                ));
+                live_options = Some(build_model_options(cached.models, "cached"));
             }
 
             let should_fetch_now = Confirm::new()
@@ -2978,21 +2990,9 @@ pub(crate) fn setup_provider(
                         )?;
 
                         let fetched_count = live_model_ids.len();
-                        let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
-                        let shown_models: Vec<String> = live_model_ids
-                            .into_iter()
-                            .take(LIVE_MODEL_MAX_OPTIONS)
-                            .collect();
+                        print_bullet(&format!("Fetched {fetched_count} live models."));
 
-                        if shown_count < fetched_count {
-                            print_bullet(&format!(
-                                "Fetched {fetched_count} models. Showing first {shown_count}."
-                            ));
-                        } else {
-                            print_bullet(&format!("Fetched {shown_count} live models."));
-                        }
-
-                        live_options = Some(build_model_options(shown_models, "live"));
+                        live_options = Some(build_model_options(live_model_ids, "live"));
                     }
                     Ok(_) => {
                         print_bullet("Provider returned no models; using curated list.");
@@ -3012,14 +3012,8 @@ pub(crate) fn setup_provider(
                                     humanize_age(stale.age_secs)
                                 ));
 
-                                live_options = Some(build_model_options(
-                                    stale
-                                        .models
-                                        .into_iter()
-                                        .take(LIVE_MODEL_MAX_OPTIONS)
-                                        .collect(),
-                                    "stale-cache",
-                                ));
+                                live_options =
+                                    Some(build_model_options(stale.models, "stale-cache"));
                             }
                         }
                     }
@@ -6605,6 +6599,58 @@ mod tests {
             cat.models.iter().any(|m| m == "gpt-5.5"),
             "curated openai list must include the default model"
         );
+    }
+
+    // ── one list for `/model` and the setup model step ───────────
+
+    /// A 150-model cache: the list must offer all 150 plus the active model,
+    /// with no 120-row cap (the setup step used to show 120 of these).
+    #[test]
+    fn provider_model_list_offers_the_whole_cache_plus_the_active_model() {
+        let models: Vec<String> = (0..150).map(|i| format!("openai/cached-{i:03}")).collect();
+        let refs: Vec<&str> = models.iter().map(String::as_str).collect();
+        let dir = workspace_with_cached_models("openai", &refs);
+
+        let list = provider_model_list(dir.path(), "openai", "openai/active-model");
+
+        assert_eq!(list.len(), 151, "150 cached + the active model");
+        assert!(list.iter().any(|m| m == "openai/cached-149"));
+        assert!(list.iter().any(|m| m == "openai/active-model"));
+    }
+
+    /// `custom:<url>` reads its cache like any other provider, and the active
+    /// model is appended when the cache lacks it.
+    #[test]
+    fn provider_model_list_reads_a_custom_endpoints_cache() {
+        let dir = workspace_with_cached_models(
+            "custom:http://localhost:1234",
+            &["llama-a", "llama-b", "llama-c"],
+        );
+
+        let list = provider_model_list(dir.path(), "custom:http://localhost:1234", "my-own-model");
+
+        assert_eq!(list, vec!["llama-a", "llama-b", "llama-c", "my-own-model"]);
+    }
+
+    /// The active model already in the catalog is not offered twice.
+    #[test]
+    fn provider_model_list_does_not_duplicate_an_active_model_in_the_catalog() {
+        let dir = workspace_with_cached_models("openai", &["gpt-a", "gpt-b"]);
+
+        let list = provider_model_list(dir.path(), "openai", "gpt-b");
+
+        assert_eq!(list, vec!["gpt-a", "gpt-b"]);
+    }
+
+    /// The gateway's catalog is not changed by the shared list: it still
+    /// returns the cache alone, with no active model appended.
+    #[test]
+    fn gateway_catalog_is_unchanged_by_the_shared_list() {
+        let dir = workspace_with_cached_models("openai", &["gpt-a"]);
+
+        let catalog = provider_model_catalog(dir.path(), "openai");
+
+        assert_eq!(catalog.models, vec!["gpt-a"]);
     }
 
     // ── the catalog must not invent models ───────────────────────

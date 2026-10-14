@@ -79,28 +79,30 @@ impl TuiProvisioner for TunnelProvisioner {
                     "Custom command".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let sel = recv_selection(&mut responses).await?;
-        let provider = sel.first().copied().unwrap_or(0);
+        // An empty answer is "none", not row 0.
+        let provider = sel.first().copied();
 
         // Seed from the existing tunnel config so an empty answer keeps the stored
         // credential instead of wiping it — only the provider selection and any
         // freshly-entered secret change.
         let mut tunnel_cfg = config.tunnel.clone();
         tunnel_cfg.provider = match provider {
-            1 => "cloudflare",
-            2 => "tailscale",
-            3 => "ngrok",
-            4 => "custom",
+            Some(1) => "cloudflare",
+            Some(2) => "tailscale",
+            Some(3) => "ngrok",
+            Some(4) => "custom",
             _ => "none",
         }
         .to_string();
 
         match provider {
-            1 => {
+            Some(1) => {
                 // Cloudflare
                 match validate_command_on_path("cloudflared") {
                     Ok(_) => {
@@ -143,7 +145,7 @@ impl TuiProvisioner for TunnelProvisioner {
                     });
                 }
             }
-            2 => {
+            Some(2) => {
                 // Tailscale
                 match validate_command_on_path("tailscale") {
                     Ok(_) => {
@@ -178,6 +180,7 @@ impl TuiProvisioner for TunnelProvisioner {
                             "Serve (tailnet only)".to_string(),
                         ],
                         multi: false,
+                        filterable: false,
                     },
                 )
                 .await?;
@@ -208,7 +211,7 @@ impl TuiProvisioner for TunnelProvisioner {
                     },
                 });
             }
-            3 => {
+            Some(3) => {
                 // ngrok
                 match validate_command_on_path("ngrok") {
                     Ok(_) => {
@@ -252,7 +255,7 @@ impl TuiProvisioner for TunnelProvisioner {
                     });
                 }
             }
-            4 => {
+            Some(4) => {
                 // Custom command
                 send(
                     &events,

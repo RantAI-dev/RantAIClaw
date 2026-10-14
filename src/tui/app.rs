@@ -415,6 +415,11 @@ pub struct TuiApp {
     /// the user doesn't have to type `/allow X`. Resolves via
     /// `security.pending().resolve_by_basename(...)` and clears here.
     pub pending_approval: Option<crate::security::PendingRequest>,
+    /// The `provider:model` a `/model` switch asked for, held until the reload
+    /// it triggered completes. Only that reload adopts it into `context.model`;
+    /// reloads from other paths (wizard save, external edit, skill toggle) leave
+    /// it alone, so an unrelated `ReloadComplete` never moves the status bar.
+    pub pending_model: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -579,6 +584,7 @@ impl TuiApp {
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
             pending_approval: None,
+            pending_model: None,
         })
     }
 
@@ -1739,6 +1745,29 @@ impl TuiApp {
                     }
                 }
             }
+            // Typed text narrows a filterable choose (the model list). Space is
+            // left to the multi-select toggle, so it only types into a single
+            // choose's filter.
+            KeyCode::Char(c)
+                if self.setup_overlay.as_ref().is_some_and(|o| {
+                    o.active_choose()
+                        .is_some_and(|ch| ch.filterable && (c != ' ' || !ch.multi))
+                }) =>
+            {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.push_filter_char(c);
+                }
+            }
+            KeyCode::Backspace
+                if self
+                    .setup_overlay
+                    .as_ref()
+                    .is_some_and(|o| o.active_choose().is_some_and(|ch| ch.filterable)) =>
+            {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.pop_filter_char();
+                }
+            }
             // Char input — route to overlay input when a prompt is active.
             KeyCode::Char(c)
                 if self.setup_overlay.is_some()
@@ -2408,19 +2437,33 @@ impl TuiApp {
     /// the same config. One redundant agent rebuild per manual switch — a
     /// human-frequency event, not worth another memo flag to suppress.
     fn apply_model_selection(&mut self, target: &str) {
-        self.context.model = target.to_string();
-        // The previous `last_error` (e.g. "model unavailable") may have
-        // been caused by the model we are leaving.
-        self.context.last_error = None;
-        let msg = format!("Model set to: {target}");
-        let _ = self.context.append_system_message(&msg);
-        self.scrollback_queue.push(("system".to_string(), msg));
-
         let (provider, model) = super::commands::split_model_target(target);
+
+        // The config this switch would produce. Nothing is written until the
+        // build check below has passed on it.
+        let mut next = self.config.clone();
         if let Some(provider) = provider {
-            self.config.default_provider = Some(provider.to_string());
+            next.default_provider = Some(provider.to_string());
         }
-        self.config.default_model = Some(model.to_string());
+        next.default_model = Some(model.to_string());
+
+        // Build the provider the new config would use, through the same factory
+        // and argument order `Agent::from_config_with_observer` uses. A target the
+        // agent cannot be built with is refused here: nothing is saved, the
+        // status bar keeps the model the agent runs, and no Reload is sent.
+        if let Err(e) = check_model_buildable(&next) {
+            let msg = format!("Model not changed: {e}");
+            self.context.last_error = Some(msg.clone());
+            let _ = self.context.append_system_message(&msg);
+            self.scrollback_queue.push(("system".to_string(), msg));
+            return;
+        }
+
+        // The status bar moves only when the actor reports the new agent is in
+        // place (`ReloadComplete`). Until then the agent runs the old model, so
+        // the pending target is held here and adopted only by that reload.
+        self.config = next;
+        self.pending_model = Some(target.to_string());
 
         // `self.config` is the decrypted in-memory config (the same one the
         // provisioner save path clones), so the `Reload` hands the agent
@@ -2711,6 +2754,16 @@ impl TuiApp {
             AgentEvent::Error(msg) => {
                 self.finalize_error(msg);
             }
+            AgentEvent::ReloadFailed { error } => {
+                // The previous agent is still running and answers the next
+                // prompt. A model switch waiting on this reload is dropped, so
+                // the status bar keeps naming the model the agent runs.
+                self.pending_model = None;
+                let msg = format!("Model not changed: the agent could not be rebuilt: {error}");
+                self.context.last_error = Some(msg.clone());
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".to_string(), msg));
+            }
             AgentEvent::ReloadComplete {
                 mcp_servers_configured,
                 mcp_tools_by_server,
@@ -2722,6 +2775,16 @@ impl TuiApp {
                 // turn — this just keeps the UI's view in sync.
                 self.context.mcp_servers_configured = mcp_servers_configured.into_iter().collect();
                 self.context.mcp_tools_by_server = mcp_tools_by_server;
+                // A `/model` switch is in place now: the status bar names it and
+                // the note says so. Reloads from other paths carry no pending
+                // model and leave the status bar as it was.
+                if let Some(target) = self.pending_model.take() {
+                    self.context.model = target.clone();
+                    self.context.last_error = None;
+                    let msg = format!("Model set to: {target}");
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".to_string(), msg));
+                }
                 // Re-subscribe to the new SecurityPolicy's pending-
                 // approval broadcast. The old subscriber was bound to
                 // the previous registry, which the new shell tool
@@ -5988,6 +6051,7 @@ pub(super) mod test_support {
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
             pending_approval: None,
+            pending_model: None,
         }
     }
 
@@ -8185,6 +8249,34 @@ pub(crate) fn channels_differ(before: Option<&String>, after: Option<&String>) -
     }
 }
 
+/// Whether the agent can be built from `config`, judged by the same provider
+/// factory and argument order `Agent::from_config_with_observer` uses
+/// (`src/agent/agent.rs`). Construction only: no request is sent to the
+/// provider. The qwen and MiniMax OAuth resolution this factory performs runs
+/// on every agent build already (launch and every reload), so this check adds
+/// no network request class.
+pub(crate) fn check_model_buildable(config: &crate::config::Config) -> anyhow::Result<()> {
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model_name = config
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("no model is set"))?;
+    let provider_credential = config.resolve_key_for_provider(provider_name);
+    crate::providers::create_routed_provider(
+        provider_name,
+        provider_credential.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &config.model_routes,
+        model_name,
+        &|name| config.resolve_key_for_provider(name),
+    )
+    .map(|_| ())
+    .map_err(|e| anyhow::anyhow!("{provider_name} cannot run this model: {e:#}"))
+}
+
 /// Whether the active provider can actually send a message: it has a key
 /// resolved the way the send paths resolve it, or it is a local provider that
 /// needs none. `None` when there is no `default_provider` to judge.
@@ -9204,6 +9296,7 @@ mod tests {
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
             pending_approval: None,
+            pending_model: None,
         };
         (app, req_rx)
     }
@@ -9233,8 +9326,10 @@ mod tests {
 
         app.apply_model_selection("openrouter:meta/llama-4-scout");
 
-        // Label updated synchronously.
-        assert_eq!(app.context.model, "openrouter:meta/llama-4-scout");
+        // The status bar does not change until the actor reports the new agent
+        // is in place (`ReloadComplete`): until then the agent still runs the
+        // old model, and the label must keep saying so.
+        assert_eq!(app.context.model, "anthropic:old-model");
 
         // The reload carries the new pair. Save happens before the send in
         // the same task, so once this arrives the file must exist too.
@@ -9256,6 +9351,162 @@ mod tests {
         );
     }
 
+    /// `/model nosuch:xyz` used to save `default_provider = "nosuch"` and
+    /// reload into a build that fails, so the next launch opened setup. A
+    /// target that cannot be built is refused before anything is saved or
+    /// reloaded, and the status bar and the config keep what they had.
+    #[tokio::test]
+    async fn model_selection_refuses_a_provider_that_cannot_run() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+
+        app.apply_model_selection("nosuch:xyz");
+
+        assert_eq!(
+            app.context.model, "openai:old-model",
+            "the status bar keeps the model the agent is running"
+        );
+        assert_eq!(
+            app.config.default_provider.as_deref(),
+            Some("openai"),
+            "the in-memory config keeps the provider it had"
+        );
+        assert_eq!(app.config.default_model.as_deref(), Some("old-model"));
+        assert!(
+            app.context
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("nosuch")),
+            "the refusal names the provider: {:?}",
+            app.context.last_error
+        );
+        assert!(
+            !tmp.path().join("config.toml").exists(),
+            "nothing is saved for a refused target"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), req_rx.recv())
+                .await
+                .is_err(),
+            "no Reload is sent for a refused target"
+        );
+    }
+
+    /// The status bar follows the agent: it moves only when the reload that a
+    /// `/model` switch triggered reports the new agent in place.
+    #[tokio::test]
+    async fn status_bar_adopts_the_model_only_when_the_reload_completes() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, _req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+
+        app.apply_model_selection("openai:new-model");
+        assert_eq!(app.context.model, "openai:old-model", "not yet in place");
+
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(app.context.model, "openai:new-model");
+        assert!(
+            app.pending_model.is_none(),
+            "the pending switch is consumed"
+        );
+    }
+
+    /// A reload from another path (wizard save, external edit, skill toggle)
+    /// completes with no `/model` switch pending: the status bar must not move.
+    #[tokio::test]
+    async fn unrelated_reload_leaves_the_status_bar_alone() {
+        let (mut app, _req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:current",
+        );
+        assert!(app.pending_model.is_none());
+
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+
+        assert_eq!(app.context.model, "openai:current");
+    }
+
+    /// A rebuild that fails leaves the previous agent running, so the status bar
+    /// keeps its model, and the error reaches the chat.
+    #[tokio::test]
+    async fn failed_rebuild_keeps_the_status_bar_and_says_why() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, _req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+
+        app.apply_model_selection("openai:new-model");
+        app.handle_agent_event(AgentEvent::ReloadFailed {
+            error: "boom".to_string(),
+        });
+
+        assert_eq!(app.context.model, "openai:old-model");
+        assert!(app.pending_model.is_none());
+        let err = app.context.last_error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("boom"),
+            "the chat error names the cause: {err}"
+        );
+    }
+
+    /// On a `custom:<url>` session, a picker row (`custom:<url>:<model>`) is a
+    /// real switch: the saved config keeps the whole endpoint as the provider
+    /// and the row's model, and the build check accepts it.
+    #[tokio::test]
+    async fn model_selection_on_a_custom_session_saves_the_endpoint_and_the_model() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let url = "custom:http://127.0.0.1:28521/v1";
+        let (mut app, mut req_rx) =
+            make_app_with_bridge_from_store(SessionStore::in_memory().expect("store"), url);
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some(url.to_string());
+        app.config.default_model = Some("llama-a".to_string());
+
+        app.apply_model_selection(&format!("{url}:llama-b"));
+
+        assert!(
+            app.context.last_error.is_none(),
+            "the build check accepts the endpoint: {:?}",
+            app.context.last_error
+        );
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), req_rx.recv())
+            .await
+            .expect("reload sent within 5s")
+            .expect("bridge channel open");
+        let TurnRequest::Reload(config) = req else {
+            panic!("expected TurnRequest::Reload");
+        };
+        assert_eq!(config.default_provider.as_deref(), Some(url));
+        assert_eq!(config.default_model.as_deref(), Some("llama-b"));
+    }
+
     #[tokio::test]
     async fn bare_model_switch_keeps_the_current_provider() {
         let tmp = tempfile::TempDir::new().expect("tmp");
@@ -9266,6 +9517,8 @@ mod tests {
         app.config.config_path = tmp.path().join("config.toml");
         app.config.workspace_dir = tmp.path().to_path_buf();
         app.config.default_provider = Some("anthropic".to_string());
+        // A build needs a credential: an operator switching to anthropic has one.
+        app.config.api_key = Some("sk-ant-test-placeholder".to_string());
 
         app.apply_model_selection("claude-opus-5");
 

@@ -100,7 +100,6 @@ pub struct TuiContext {
     /// Transient neutral status-line notice (e.g. "⧉ copied 4 lines").
     /// Rendered when no error is pending; cleared on the next submit.
     pub status_notice: Option<String>,
-    pub debug_mode: bool,
     /// Outbound channel to the `TuiAgentActor` for submitting turn requests.
     pub req_tx: mpsc::Sender<TurnRequest>,
     /// Inbound channel from the `TuiAgentActor` for draining agent events.
@@ -265,7 +264,6 @@ impl TuiContext {
             started_at: std::time::Instant::now(),
             last_error: None,
             status_notice: None,
-            debug_mode: false,
             req_tx,
             events_rx,
             queued_turns: 0,

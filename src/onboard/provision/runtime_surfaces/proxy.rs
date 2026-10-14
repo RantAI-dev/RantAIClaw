@@ -75,6 +75,7 @@ impl TuiProvisioner for ProxyProvisioner {
                     "Yes — for selected services".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
@@ -160,6 +161,7 @@ impl TuiProvisioner for ProxyProvisioner {
                             "skills".to_string(),
                         ],
                         multi: true,
+                        filterable: false,
                     },
                 )
                 .await?;

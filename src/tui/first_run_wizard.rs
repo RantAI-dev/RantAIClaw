@@ -291,6 +291,8 @@ impl FirstRunWizard {
             multi: true,
             cursor: 0,
             selected: Vec::new(),
+            filterable: false,
+            query: String::new(),
         });
     }
 
