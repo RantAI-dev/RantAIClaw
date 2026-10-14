@@ -106,6 +106,45 @@ pub fn messages_to_turns(messages: &[Message]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Prefix of the compaction summary row the TUI writes as its one `system`
+/// row that is real context.
+const COMPACTION_SUMMARY_PREFIX: &str = "[Compacted summary of earlier conversation]";
+
+/// Stored session messages as `(role, content)` turns for seeding the TUI
+/// agent's history: only the conversational turns, in order.
+///
+/// Screen notes and error lines are not turns. They are recognised by role
+/// (`note`, and the legacy `system` rows), and by the fixed prefixes the TUI
+/// writes for failed replies, since rows written before the `note` role carry
+/// no other marker. A compaction summary is context and is returned as a
+/// `user` turn, never as `system`: a `system` turn would stop the real system
+/// prompt from being built.
+pub fn turns_for_history(messages: &[Message]) -> Vec<(String, String)> {
+    messages
+        .iter()
+        .filter_map(|m| {
+            let content = m.content.as_str();
+            if content.trim().is_empty() {
+                return None;
+            }
+            match m.role.as_str() {
+                "user" => Some(("user".to_string(), m.content.clone())),
+                "assistant" if is_error_line(content) => None,
+                "assistant" => Some(("assistant".to_string(), m.content.clone())),
+                "system" if content.starts_with(COMPACTION_SUMMARY_PREFIX) => {
+                    Some(("user".to_string(), m.content.clone()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Whether an assistant row is an error line the TUI wrote, not a model reply.
+fn is_error_line(content: &str) -> bool {
+    content.starts_with("✗ ") || content.starts_with("[no response from model")
+}
+
 /// Search result from FTS5
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -135,5 +174,55 @@ mod tests {
         let msg = Message::assistant("sess-1", "hi there");
         assert_eq!(msg.role, "assistant");
         assert_eq!(msg.content, "hi there");
+    }
+    fn row(role: &str, content: &str) -> Message {
+        Message {
+            id: 0,
+            session_id: "s".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn turns_for_history_keeps_only_conversational_turns() {
+        let messages = vec![
+            row("note", "Resumed session 12176d39 (4 messages)"),
+            row("system", "Removed 2 message(s)."),
+            row("user", "first question"),
+            row("assistant", "first answer"),
+            row("assistant", "✗ provider timed out"),
+            row(
+                "assistant",
+                "[no response from model — try /retry or rephrase]",
+            ),
+            row("note", "Model set to: openai:gpt-x"),
+            row("user", "second question"),
+            row("assistant", "second answer"),
+        ];
+        assert_eq!(
+            turns_for_history(&messages),
+            vec![
+                ("user".to_string(), "first question".to_string()),
+                ("assistant".to_string(), "first answer".to_string()),
+                ("user".to_string(), "second question".to_string()),
+                ("assistant".to_string(), "second answer".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn turns_for_history_sends_a_compaction_summary_as_user_context() {
+        let summary = "[Compacted summary of earlier conversation]\n\nwe chose sqlite";
+        let messages = vec![row("system", summary), row("user", "next")];
+        assert_eq!(
+            turns_for_history(&messages),
+            vec![
+                ("user".to_string(), summary.to_string()),
+                ("user".to_string(), "next".to_string()),
+            ]
+        );
     }
 }

@@ -144,6 +144,11 @@ impl MockLlm {
         );
     }
 
+    /// Every `(role, content)` the model was sent, in order.
+    pub(crate) fn messages_for_test(&self) -> Vec<(String, String)> {
+        self.messages()
+    }
+
     fn messages(&self) -> Vec<(String, String)> {
         self.requests
             .lock()

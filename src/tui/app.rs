@@ -2033,6 +2033,9 @@ impl TuiApp {
         self.scrollback_queue
             .push(("user".to_string(), text.clone()));
 
+        // A reseed held back from an earlier command goes first, so this
+        // prompt is answered from the session the screen shows.
+        self.context.flush_pending_reseed().await;
         // Dispatch to the actor. If the bridge is closed (e.g. actor has
         // exited), surface a visible error but do not propagate — the TUI
         // should remain responsive so the user can /quit cleanly.
@@ -2814,13 +2817,22 @@ impl TuiApp {
 
                 // Persist the new shape so it survives restart (only when a
                 // session is bound — compaction always runs on an active one).
+                // Seam invariant: an in-memory `Message.id` equals its stored
+                // row id. `replace_messages` re-numbers every row, so the ids
+                // it returns are copied back here; a stale id would match
+                // every stored row in a later `/undo` or `/retry` cut.
                 if let Some(sid) = self.context.session_id.clone() {
-                    if let Err(e) = self
+                    match self
                         .context
                         .session_store
                         .replace_messages(&sid, &self.context.messages)
                     {
-                        tracing::warn!("failed to persist compacted history: {e}");
+                        Ok(ids) => {
+                            for (msg, id) in self.context.messages.iter_mut().zip(ids) {
+                                msg.id = id;
+                            }
+                        }
+                        Err(e) => tracing::warn!("failed to persist compacted history: {e}"),
                     }
                 }
 
@@ -2911,10 +2923,15 @@ impl TuiApp {
 
         // Persist and display the assistant reply. A store failure should not
         // crash the loop — surface it as a visible error and keep running.
-        let persist_ok = match self
-            .context
-            .append_assistant_message_with_tools(&body, tool_calls_json)
-        {
+        // A `[no response from model` line is the TUI's own error text, not a
+        // reply; it is stored as a note so the model never receives it.
+        let persisted = if body.starts_with("[no response from model") {
+            self.context.append_note_message(&body)
+        } else {
+            self.context
+                .append_assistant_message_with_tools(&body, tool_calls_json)
+        };
+        let persist_ok = match persisted {
             Ok(()) => true,
             Err(e) => {
                 self.context.last_error = Some(format!("failed to persist reply: {e}"));
@@ -2986,7 +3003,7 @@ impl TuiApp {
             .clone()
             .unwrap_or_else(|| "openrouter".to_string());
         let (chat_body, status_line) = format_agent_error(&msg, &provider_hint);
-        if let Err(e) = self.context.append_assistant_message(&chat_body) {
+        if let Err(e) = self.context.append_note_message(&chat_body) {
             self.context.last_error = Some(format!("failed to persist error: {e}"));
         } else {
             self.context.last_error = Some(status_line);
@@ -2999,7 +3016,11 @@ impl TuiApp {
 
     /// Handle a slash command (text after the leading `/`).
     pub async fn handle_command(&mut self, cmd: &str) -> Result<()> {
-        match self.command_registry.dispatch(cmd, &mut self.context)? {
+        let dispatched = self.command_registry.dispatch(cmd, &mut self.context);
+        // A reseed a command queued must reach the agent before any request
+        // the command dispatches, and before the next prompt.
+        self.context.flush_pending_reseed().await;
+        match dispatched? {
             CmdResult::Quit => {
                 self.state = AppState::Quitting;
             }
@@ -3047,6 +3068,17 @@ impl TuiApp {
             CmdResult::Resubmit(text) => {
                 self.dispatch_resubmit(text).await;
             }
+            CmdResult::RetryLast(text) => {
+                // A retry refused mid-stream must change nothing, so the old
+                // reply is dropped only once the resubmit can go out.
+                if matches!(self.state, AppState::Ready) {
+                    if let Err(e) = self.context.drop_last_reply() {
+                        self.context.last_error = Some(format!("retry failed: {e}"));
+                        return Ok(());
+                    }
+                }
+                self.dispatch_resubmit(text).await;
+            }
             CmdResult::SetModel(target) => {
                 self.apply_model_selection(&target);
             }
@@ -3084,6 +3116,31 @@ impl TuiApp {
                             .to_string();
                     let _ = self.context.append_system_message(&msg);
                     self.scrollback_queue.push(("system".to_string(), msg));
+                }
+            }
+            CmdResult::Compact { keep_last } => {
+                // A history reseed held for the agent goes first, so the
+                // compaction runs on the session the screen shows.
+                self.context.flush_pending_reseed().await;
+                match self
+                    .context
+                    .req_tx
+                    .send(TurnRequest::Compact { keep_last })
+                    .await
+                {
+                    Ok(()) => {
+                        let msg = format!(
+                            "Compacting older turns (preserving last {keep_last} verbatim). \
+                             Summary streams below…"
+                        );
+                        let _ = self.context.append_system_message(&msg);
+                        self.scrollback_queue.push(("system".to_string(), msg));
+                    }
+                    Err(e) => {
+                        self.context.last_error = Some(format!(
+                            "Failed to dispatch /compress: {e}. Is the agent loop running?"
+                        ));
+                    }
                 }
             }
             CmdResult::CancelTurnWithMessage(msg) => {
@@ -3212,6 +3269,11 @@ impl TuiApp {
                     self.context.last_error = Some(format!("load_session failed: {e}"));
                     return;
                 }
+                // The agent takes the picked session's turns in place of the
+                // ones it held, so the next prompt is that session's.
+                self.context
+                    .reseed_agent(&crate::sessions::turns_for_history(&self.context.messages));
+                self.context.flush_pending_reseed().await;
                 let short = &session.id[..session.id.len().min(8)];
                 let msg = format!(
                     "Resumed session {short} ({} messages)",
@@ -4331,6 +4393,7 @@ impl TuiApp {
                 );
             }
             AppState::Ready => {
+                self.context.flush_pending_reseed().await;
                 if let Err(e) = self
                     .context
                     .req_tx
@@ -8143,7 +8206,7 @@ pub(crate) fn provider_key_status(c: &crate::config::Config) -> Option<bool> {
 fn restore_resumed_session(agent: &mut Agent, resume_id: &str) {
     match crate::sessions::cli::open_store().and_then(|s| s.get_messages(resume_id)) {
         Ok(msgs) => {
-            let prior = crate::sessions::messages_to_turns(&msgs);
+            let prior = crate::sessions::turns_for_history(&msgs);
             if !prior.is_empty() {
                 // Rebuilding the system prompt reads the view, and the actor
                 // sets it only around each turn. The TUI is the operator's own
@@ -9261,7 +9324,7 @@ mod tests {
         // /new clears the chat, then appends a system "Started new session"
         // confirmation line — so messages == 1, not 0. The session id flips.
         assert_eq!(app.context.messages.len(), 1);
-        assert_eq!(app.context.messages[0].role, "system");
+        assert_eq!(app.context.messages[0].role, "note");
         assert_ne!(app.context.session_id, first_session_id);
     }
 }
@@ -9840,6 +9903,7 @@ mod submit_tests {
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
+            TurnRequest::SetHistory(_) => panic!("expected Submit, got SetHistory"),
         }
     }
 
@@ -9897,6 +9961,7 @@ mod submit_tests {
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
+            TurnRequest::SetHistory(_) => panic!("expected Submit, got SetHistory"),
         }
     }
 
@@ -10371,12 +10436,20 @@ mod retry_tests {
         // The user message is retained; the old assistant reply is gone.
         assert_eq!(app.context.messages.len(), 1);
         assert_eq!(app.context.messages[0].content, "previous prompt");
+        // The agent is reseeded with the turns before the retried one, then
+        // the same text is submitted.
+        let reseed = req_rx.recv().await.expect("reseed should dispatch");
+        assert!(
+            matches!(reseed, TurnRequest::SetHistory(ref t) if t.is_empty()),
+            "expected SetHistory with no turns before the retried one, got {reseed:?}"
+        );
         let req = req_rx.recv().await.expect("resubmit should dispatch");
         match req {
             TurnRequest::Submit { text, .. } => assert_eq!(text, "previous prompt"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
+            TurnRequest::SetHistory(_) => panic!("expected Submit, got SetHistory"),
         }
         assert!(app.context.last_error.is_none());
     }
@@ -10418,8 +10491,8 @@ mod retry_tests {
         // CommandResult::Message now appends as a system chat message
         // (instead of the single-line error slot) so multi-line content
         // renders properly.
-        let last_msg = app.context.messages.last().expect("system message");
-        assert_eq!(last_msg.role, "system");
+        let last_msg = app.context.messages.last().expect("note message");
+        assert_eq!(last_msg.role, "note");
         assert!(
             last_msg.content.contains("No previous response"),
             "got {:?}",
@@ -10438,6 +10511,685 @@ mod retry_tests {
 /// The oracle throughout is the preset actually written to disk under a
 /// `TempDir`, not a flag or a mock — `cycle_autonomy_preset`'s whole effect is
 /// that write.
+#[cfg(test)]
+mod session_history_tests {
+    use super::*;
+    use crate::sessions::{Message, SessionStore};
+    use crate::tui::async_bridge::TurnRequest;
+    use crate::tui::context::TuiContext;
+    use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+
+    use super::test_support::app_with_context as make_app_with_context;
+
+    /// Stores `pairs` as one session in `store`, returning its id.
+    fn store_session(store: &SessionStore, pairs: &[(&str, &str)]) -> String {
+        let session = store.new_session("mock-model", "tui").expect("session");
+        for (role, content) in pairs {
+            store
+                .append_message(&Message {
+                    id: 0,
+                    session_id: session.id.clone(),
+                    role: (*role).to_string(),
+                    content: (*content).to_string(),
+                    tool_calls: None,
+                    timestamp: chrono::Utc::now().timestamp(),
+                })
+                .expect("message");
+        }
+        session.id
+    }
+
+    /// Opens the session picker on `key` and presses Enter, as the user does.
+    async fn pick_session(app: &mut TuiApp, key: &str) {
+        let item = ListPickerItem {
+            key: key.to_string(),
+            primary: key.to_string(),
+            secondary: String::new(),
+            disabled: false,
+        };
+        app.list_picker = Some(ListPicker::new(
+            ListPickerKind::Session,
+            "Resume Session",
+            vec![item],
+            Some(key),
+            "No past sessions to resume.",
+        ));
+        app.dispatch_list_picker_selection().await;
+    }
+
+    /// `/undo` removes the exchange from the store as well as the screen, and
+    /// the agent is reseeded so the undone turns are not sent.
+    #[tokio::test]
+    async fn undo_removes_the_exchange_from_the_store_and_the_agent() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("kept question").unwrap();
+        app.context.append_assistant_message("kept answer").unwrap();
+        app.context.append_user_message("undone question").unwrap();
+        app.context
+            .append_assistant_message("undone answer")
+            .unwrap();
+        let sid = app.context.session_id.clone().expect("bound session");
+
+        app.handle_command("undo").await.unwrap();
+
+        // The store keeps the kept exchange, and the screen note that reports
+        // the removal (a note, not a turn). The undone rows are gone.
+        let stored: Vec<(String, String)> = app
+            .context
+            .session_store
+            .get_messages(&sid)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.role, m.content))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("user".to_string(), "kept question".to_string()),
+                ("assistant".to_string(), "kept answer".to_string()),
+                ("note".to_string(), "Removed 2 message(s).".to_string()),
+            ],
+            "the DB keeps the kept exchange and the note"
+        );
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert_eq!(
+                turns,
+                [
+                    ("user".to_string(), "kept question".to_string()),
+                    ("assistant".to_string(), "kept answer".to_string()),
+                ]
+            ),
+            other => panic!("expected SetHistory, got {other:?}"),
+        }
+    }
+
+    /// `/retry` keeps the user turn once and drops the old reply, from the
+    /// screen, the store, and the agent. The retried text is submitted again,
+    /// so the agent's history must not already hold it.
+    #[tokio::test]
+    async fn retry_drops_the_old_reply_from_the_store_and_the_agent() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("earlier question").unwrap();
+        app.context
+            .append_assistant_message("earlier answer")
+            .unwrap();
+        app.context.append_user_message("the question").unwrap();
+        app.context.append_assistant_message("old reply").unwrap();
+        let sid = app.context.session_id.clone().expect("bound session");
+        app.state = AppState::Ready;
+
+        app.handle_command("retry").await.unwrap();
+
+        let stored: Vec<(String, String)> = app
+            .context
+            .session_store
+            .get_messages(&sid)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.role, m.content))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("user".to_string(), "earlier question".to_string()),
+                ("assistant".to_string(), "earlier answer".to_string()),
+                ("user".to_string(), "the question".to_string()),
+            ],
+            "the DB keeps the retried user turn once and not the old reply"
+        );
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert_eq!(
+                turns,
+                [
+                    ("user".to_string(), "earlier question".to_string()),
+                    ("assistant".to_string(), "earlier answer".to_string()),
+                ],
+                "the agent holds the history before the retried turn"
+            ),
+            other => panic!("expected SetHistory first, got {other:?}"),
+        }
+        match req_rx.try_recv() {
+            Ok(TurnRequest::Submit { text, .. }) => assert_eq!(text, "the question"),
+            other => panic!("expected the retried Submit, got {other:?}"),
+        }
+    }
+
+    /// `/undo` after a failed turn removes the failed question and its note,
+    /// and keeps the exchange before it.
+    #[tokio::test]
+    async fn undo_after_a_failed_turn_removes_the_question_and_the_note() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("Q1").unwrap();
+        app.context.append_assistant_message("A1").unwrap();
+        app.context.append_user_message("Q2").unwrap();
+        app.context
+            .append_note_message("✗ provider timed out")
+            .unwrap();
+        let sid = app.context.session_id.clone().expect("bound session");
+
+        app.handle_command("undo").await.unwrap();
+
+        let stored: Vec<String> = app
+            .context
+            .session_store
+            .get_messages(&sid)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(stored[..2], ["Q1", "A1"], "the earlier exchange stays");
+        assert_eq!(stored[2], "Removed 2 message(s).");
+        assert_eq!(stored.len(), 3, "Q2 and the failed note are gone");
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert_eq!(turns.len(), 2),
+            other => panic!("expected SetHistory, got {other:?}"),
+        }
+    }
+
+    /// After a compaction, `/undo` must touch only the undone exchange in the
+    /// store. The kept turns carried pre-compaction ids into the screen; the
+    /// store re-numbered them, so a stale id used to match every stored row
+    /// and delete the whole session.
+    #[tokio::test]
+    async fn undo_after_compaction_removes_only_the_undone_exchange() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("old Q").unwrap();
+        app.context.append_assistant_message("old A").unwrap();
+        app.context.append_user_message("kept Q").unwrap();
+        app.context.append_assistant_message("kept A").unwrap();
+        app.context.append_user_message("undone Q").unwrap();
+        app.context.append_assistant_message("undone A").unwrap();
+        let sid = app.context.session_id.clone().expect("bound session");
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: vec![],
+            cancelling: false,
+            turn_started_at: std::time::Instant::now(),
+        };
+        app.handle_agent_event(AgentEvent::CompactionComplete {
+            summary: "we talked".into(),
+            original_count: 6,
+            kept_count: 4,
+            keep_last: 2,
+        });
+        req_rx.try_recv().ok();
+
+        app.handle_command("undo").await.unwrap();
+
+        let stored: Vec<String> = app
+            .context
+            .session_store
+            .get_messages(&sid)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        let screen: Vec<String> = app
+            .context
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            stored, screen,
+            "the store holds exactly what the screen shows after /undo"
+        );
+        assert!(
+            stored.iter().any(|c| c == "kept A"),
+            "the kept exchange survives the undo: {stored:?}"
+        );
+    }
+
+    /// After a compaction, `/retry` cuts only the reply after the last user
+    /// turn, and the rows before it stay in the store.
+    #[tokio::test]
+    async fn retry_after_compaction_cuts_only_the_last_reply() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("old Q").unwrap();
+        app.context.append_assistant_message("old A").unwrap();
+        app.context.append_user_message("kept Q").unwrap();
+        app.context.append_assistant_message("kept A").unwrap();
+        app.context.append_user_message("last Q").unwrap();
+        app.context.append_assistant_message("last A").unwrap();
+        let sid = app.context.session_id.clone().expect("bound session");
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: vec![],
+            cancelling: false,
+            turn_started_at: std::time::Instant::now(),
+        };
+        app.handle_agent_event(AgentEvent::CompactionComplete {
+            summary: "we talked".into(),
+            original_count: 6,
+            kept_count: 4,
+            keep_last: 2,
+        });
+        req_rx.try_recv().ok();
+        app.state = AppState::Ready;
+
+        app.handle_command("retry").await.unwrap();
+
+        let stored: Vec<String> = app
+            .context
+            .session_store
+            .get_messages(&sid)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        let screen: Vec<String> = app
+            .context
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(stored, screen, "store and screen agree after /retry");
+        assert!(
+            stored.iter().any(|c| c == "kept A"),
+            "the kept exchange survives the retry: {stored:?}"
+        );
+        assert!(
+            !stored.iter().any(|c| c == "last A"),
+            "the reply to the retried question is gone: {stored:?}"
+        );
+    }
+
+    /// The reseed is not lost when the bridge is busy: with the channel full,
+    /// `/new` still reaches the agent before the next prompt, so the next
+    /// request never carries the session that was just ended.
+    #[tokio::test]
+    async fn new_reseed_survives_a_full_request_channel() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("old question").unwrap();
+        app.context.append_assistant_message("old answer").unwrap();
+        // Fill the bridge (capacity 4 in the test context).
+        for i in 0..4 {
+            app.context
+                .req_tx
+                .try_send(TurnRequest::Cancel)
+                .unwrap_or_else(|_| panic!("fill slot {i}"));
+        }
+
+        // The actor drains the bridge while the command runs, so the held
+        // reseed can go out. Collect what arrives, in order.
+        let drain = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(req) = req_rx.recv().await {
+                let is_reseed = matches!(req, TurnRequest::SetHistory(_));
+                seen.push(req);
+                if is_reseed {
+                    break;
+                }
+            }
+            seen
+        });
+
+        app.handle_command("new").await.unwrap();
+
+        // Bounded: a reseed that never arrives must fail the test, not hang it.
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("the drainer should finish; a lost reseed never arrives")
+            .unwrap();
+        let reseed_at = seen
+            .iter()
+            .position(|r| matches!(r, TurnRequest::SetHistory(_)))
+            .expect("the reseed was lost");
+        assert_eq!(
+            reseed_at, 4,
+            "the reseed follows the four fillers, not before them"
+        );
+        assert!(app.context.last_error.is_none());
+    }
+
+    /// A reseed held back must not overwrite a newer one that got through: if
+    /// room opens and a later reseed is sent, the older held one is dropped,
+    /// so the agent ends with the newest history.
+    #[tokio::test]
+    async fn a_held_older_reseed_does_not_overwrite_a_newer_one() {
+        let (mut ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        // Fill the bridge so the next reseed is held.
+        for _ in 0..4 {
+            ctx.req_tx.try_send(TurnRequest::Cancel).unwrap();
+        }
+        ctx.reseed_agent(&[("user".to_string(), "older".to_string())]);
+        // Room opens, and a newer reseed gets through first.
+        for _ in 0..4 {
+            assert!(matches!(req_rx.try_recv(), Ok(TurnRequest::Cancel)));
+        }
+        ctx.reseed_agent(&[("user".to_string(), "newer".to_string())]);
+        ctx.flush_pending_reseed().await;
+
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert_eq!(
+                turns,
+                [("user".to_string(), "newer".to_string())],
+                "the agent must end with the newest history"
+            ),
+            other => panic!("expected the newer SetHistory, got {other:?}"),
+        }
+        assert!(
+            req_rx.try_recv().is_err(),
+            "the older held reseed must not be sent after the newer one"
+        );
+    }
+
+    /// A `/compress` issued while a reseed is held reaches the agent after the
+    /// reseed, so the compaction runs on the session the screen shows and the
+    /// later reseed cannot overwrite its result.
+    #[tokio::test]
+    async fn compress_issued_while_a_reseed_is_held_follows_the_reseed() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("Q1").unwrap();
+        app.context.append_assistant_message("A1").unwrap();
+        for i in 0..15 {
+            app.context.messages.push(crate::sessions::Message {
+                id: 0,
+                session_id: app.context.session_id.clone().unwrap_or_default(),
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("msg-{i}"),
+                tool_calls: None,
+                timestamp: 0,
+            });
+        }
+        // Fill the bridge, then hold a reseed behind it.
+        for _ in 0..4 {
+            app.context.req_tx.try_send(TurnRequest::Cancel).unwrap();
+        }
+        app.context
+            .reseed_agent(&[("user".to_string(), "older".to_string())]);
+        assert!(app.context.pending_reseed.is_some(), "the reseed is held");
+        // One slot frees, so the compaction can be sent but the held reseed
+        // still has to wait for its own flush point.
+        assert!(matches!(req_rx.recv().await, Some(TurnRequest::Cancel)));
+
+        // Collect everything the agent receives, in order, until the
+        // channel goes quiet: a reseed sent after the compaction is seen too.
+        let drain = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok(Some(req)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), req_rx.recv()).await
+            {
+                seen.push(req);
+            }
+            seen
+        });
+
+        app.handle_command("compress").await.unwrap();
+
+        let seen = drain.await.unwrap();
+        let reseed_at = seen
+            .iter()
+            .position(|r| matches!(r, TurnRequest::SetHistory(_)))
+            .expect("the held reseed reaches the agent");
+        let compact_at = seen
+            .iter()
+            .position(|r| matches!(r, TurnRequest::Compact { .. }))
+            .expect("the compaction reaches the agent");
+        assert!(
+            reseed_at < compact_at,
+            "the reseed must precede the compaction: {seen:?}"
+        );
+    }
+
+    /// A reseed the agent can no longer receive (the actor has gone) is
+    /// reported in the status line, not dropped silently.
+    #[tokio::test]
+    async fn reseed_to_a_closed_agent_is_reported_not_dropped() {
+        let (ctx, req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("old question").unwrap();
+        app.context.append_assistant_message("old answer").unwrap();
+        drop(req_rx);
+
+        app.handle_command("new").await.unwrap();
+
+        let err = app.context.last_error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("history not reseeded"),
+            "a dead agent must be surfaced, got {err:?}"
+        );
+    }
+
+    /// A failed first turn leaves `[user, note]`. `/retry` re-asks that
+    /// question: the note is not a reply, so the retry is not refused.
+    #[tokio::test]
+    async fn retry_after_a_failed_first_turn_resubmits_the_question() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("the question").unwrap();
+        app.context
+            .append_note_message("✗ provider timed out")
+            .unwrap();
+        app.state = AppState::Ready;
+
+        app.handle_command("retry").await.unwrap();
+
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert!(turns.is_empty(), "{turns:?}"),
+            other => panic!("expected SetHistory, got {other:?}"),
+        }
+        match req_rx.try_recv() {
+            Ok(TurnRequest::Submit { text, .. }) => assert_eq!(text, "the question"),
+            other => panic!("expected the retried Submit, got {other:?}"),
+        }
+        assert!(app.context.last_error.is_none());
+    }
+
+    /// After an earlier exchange, a failed turn leaves `[Q1, A1, Q2, note]`.
+    /// `/retry` re-asks Q2 and leaves the real reply A1 untouched on screen,
+    /// in the store, and in the next request.
+    #[tokio::test]
+    async fn retry_after_a_failed_turn_keeps_the_earlier_exchange() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("Q1").unwrap();
+        app.context.append_assistant_message("A1").unwrap();
+        app.context.append_user_message("Q2").unwrap();
+        app.context
+            .append_note_message("✗ provider timed out")
+            .unwrap();
+        let sid = app.context.session_id.clone().expect("bound session");
+        app.state = AppState::Ready;
+
+        app.handle_command("retry").await.unwrap();
+
+        let screen: Vec<(&str, &str)> = app
+            .context
+            .messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            screen,
+            [("user", "Q1"), ("assistant", "A1"), ("user", "Q2")]
+        );
+        let stored: Vec<(String, String)> = app
+            .context
+            .session_store
+            .get_messages(&sid)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.role, m.content))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("user".to_string(), "Q1".to_string()),
+                ("assistant".to_string(), "A1".to_string()),
+                ("user".to_string(), "Q2".to_string()),
+            ],
+            "the DB keeps A1 and drops the failed note"
+        );
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert_eq!(
+                turns,
+                [
+                    ("user".to_string(), "Q1".to_string()),
+                    ("assistant".to_string(), "A1".to_string()),
+                ],
+                "the next request carries A1 and not Q2"
+            ),
+            other => panic!("expected SetHistory, got {other:?}"),
+        }
+        match req_rx.try_recv() {
+            Ok(TurnRequest::Submit { text, .. }) => assert_eq!(text, "Q2"),
+            other => panic!("expected the retried Submit, got {other:?}"),
+        }
+    }
+
+    /// A cancelled turn leaves `[Q1, A1, Q2]` with no reply to Q2. `/retry`
+    /// re-asks Q2 and keeps A1.
+    #[tokio::test]
+    async fn retry_after_a_cancelled_turn_resubmits_the_unanswered_question() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("Q1").unwrap();
+        app.context.append_assistant_message("A1").unwrap();
+        app.context.append_user_message("Q2").unwrap();
+        let sid = app.context.session_id.clone().expect("bound session");
+        app.state = AppState::Ready;
+
+        app.handle_command("retry").await.unwrap();
+
+        let stored = app.context.session_store.get_messages(&sid).unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["Q1", "A1", "Q2"],
+            "nothing is cut when no reply to Q2 exists"
+        );
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert_eq!(turns.len(), 2),
+            other => panic!("expected SetHistory, got {other:?}"),
+        }
+        match req_rx.try_recv() {
+            Ok(TurnRequest::Submit { text, .. }) => assert_eq!(text, "Q2"),
+            other => panic!("expected the retried Submit, got {other:?}"),
+        }
+    }
+
+    /// A compacted session, picked from the list, sends its summary and the
+    /// real system prompt, and the notes around it do not reach the model.
+    #[tokio::test]
+    async fn picking_a_compacted_session_sends_the_summary_as_context() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        let summary = "[Compacted summary of earlier conversation]\n\nwe chose sqlite\n\n[End compacted summary]";
+        let session = store_session(
+            &app.context.session_store,
+            &[
+                ("note", "Resumed session 12176d39 (4 messages)"),
+                ("system", summary),
+                ("user", "the next question"),
+                ("assistant", "the next answer"),
+            ],
+        );
+        app.state = AppState::Ready;
+
+        pick_session(&mut app, &session).await;
+
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert_eq!(
+                turns,
+                [
+                    ("user".to_string(), summary.to_string()),
+                    ("user".to_string(), "the next question".to_string()),
+                    ("assistant".to_string(), "the next answer".to_string()),
+                ],
+                "the summary is context; the resume note is not sent"
+            ),
+            other => panic!("expected SetHistory, got {other:?}"),
+        }
+    }
+
+    /// A `/retry` refused mid-stream changes nothing: the old reply stays on
+    /// screen and in the store, and the agent is not reseeded.
+    #[tokio::test]
+    async fn retry_refused_while_streaming_leaves_the_exchange_intact() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("the question").unwrap();
+        app.context.append_assistant_message("old reply").unwrap();
+        let sid = app.context.session_id.clone().expect("bound session");
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: vec![],
+            cancelling: false,
+            turn_started_at: std::time::Instant::now(),
+        };
+
+        app.handle_command("retry").await.unwrap();
+
+        assert_eq!(app.context.messages.len(), 2, "the screen keeps the reply");
+        let stored = app.context.session_store.get_messages(&sid).unwrap();
+        assert_eq!(stored.len(), 2, "the store keeps the reply");
+        assert!(req_rx.try_recv().is_err(), "nothing is sent to the agent");
+        assert!(app
+            .context
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Cannot retry"));
+    }
+
+    /// Picking a session sends its conversational turns to the agent, and none
+    /// of the session that was on screen before.
+    #[tokio::test]
+    async fn picking_a_session_reseeds_the_agent_with_its_turns_only() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        let session_a = store_session(
+            &app.context.session_store,
+            &[
+                ("user", "a first question"),
+                ("assistant", "a first answer"),
+                ("note", "Model set to: mock-model"),
+                ("user", "a second question"),
+                ("assistant", "a second answer"),
+            ],
+        );
+        let session_b = store_session(
+            &app.context.session_store,
+            &[("user", "b question"), ("assistant", "b answer")],
+        );
+        // The screen is on B, so the agent holds B's turns.
+        app.context.session_id = Some(session_b);
+        app.state = AppState::Ready;
+
+        pick_session(&mut app, &session_a).await;
+
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => {
+                let shape: Vec<(&str, &str)> = turns
+                    .iter()
+                    .map(|(r, c)| (r.as_str(), c.as_str()))
+                    .collect();
+                assert_eq!(
+                    shape,
+                    [
+                        ("user", "a first question"),
+                        ("assistant", "a first answer"),
+                        ("user", "a second question"),
+                        ("assistant", "a second answer"),
+                    ],
+                    "the picked session's turns, in order, and no note"
+                );
+            }
+            other => panic!("expected SetHistory, got {other:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod autonomy_keybinding_tests {
     use super::test_support::app_with_profile_root;

@@ -465,23 +465,11 @@ impl CommandHandler for CompressCommand {
             )));
         }
 
-        // Dispatch — non-blocking because the actor is on the same
-        // tokio runtime. The agent streams its summary back as Chunk
-        // events and emits `CompactionComplete` when the swap is
-        // ready; the TUI event handler picks both up.
-        if let Err(e) = ctx
-            .req_tx
-            .try_send(crate::tui::async_bridge::TurnRequest::Compact { keep_last })
-        {
-            return Ok(CommandResult::Message(format!(
-                "Failed to dispatch /compress: {e}. Is the agent loop running?"
-            )));
-        }
-
-        Ok(CommandResult::Message(format!(
-            "Compacting older turns (preserving last {keep_last} verbatim). \
-             Summary streams below…"
-        )))
+        // The dispatcher sends the compaction, after any history reseed still
+        // held for the agent, and prints the confirmation. The agent streams
+        // its summary back as Chunk events and emits `CompactionComplete`
+        // when the swap is ready; the TUI event handler picks both up.
+        Ok(CommandResult::Compact { keep_last })
     }
 }
 
@@ -1038,25 +1026,20 @@ mod tests {
             });
         }
         let res = CompressCommand.execute("", &mut ctx).unwrap();
+        // The command asks the dispatcher to send the compaction, with the
+        // default keep_last; it sends nothing itself.
         match res {
-            CommandResult::Message(msg) => {
-                assert!(msg.contains("Compacting"), "got:\n{msg}");
-            }
-            _ => panic!("expected Message"),
-        }
-        // Verify the actor would receive a TurnRequest::Compact with the
-        // default keep_last.
-        match req_rx.try_recv() {
-            Ok(crate::tui::async_bridge::TurnRequest::Compact { keep_last }) => {
+            CommandResult::Compact { keep_last } => {
                 assert_eq!(keep_last, COMPRESS_DEFAULT_KEEP_LAST);
             }
-            other => panic!("expected Compact, got {other:?}"),
+            other => panic!("expected CmdResult::Compact, got {other:?}"),
         }
+        assert!(req_rx.try_recv().is_err(), "the command must not send");
     }
 
     #[test]
     fn compress_custom_keep_last_arg_is_parsed() {
-        let (mut ctx, mut req_rx, _e) = TuiContext::test_context();
+        let (mut ctx, _req_rx, _e) = TuiContext::test_context();
         for i in 0..15 {
             ctx.messages.push(crate::sessions::Message {
                 id: 0,
@@ -1067,12 +1050,9 @@ mod tests {
                 timestamp: 0,
             });
         }
-        CompressCommand.execute("4", &mut ctx).unwrap();
-        match req_rx.try_recv() {
-            Ok(crate::tui::async_bridge::TurnRequest::Compact { keep_last }) => {
-                assert_eq!(keep_last, 4);
-            }
-            other => panic!("expected Compact, got {other:?}"),
+        match CompressCommand.execute("4", &mut ctx).unwrap() {
+            CommandResult::Compact { keep_last } => assert_eq!(keep_last, 4),
+            other => panic!("expected CmdResult::Compact, got {other:?}"),
         }
     }
 }

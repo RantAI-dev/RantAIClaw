@@ -15,5 +15,6 @@ pub use store::{
     derive_session_title, normalize_set_title, SessionRef, SessionStats, SessionStore,
 };
 pub use types::{
-    messages_to_turns, ConversationSessionRow, Message, SearchResult, Session, SessionMeta,
+    messages_to_turns, turns_for_history, ConversationSessionRow, Message, SearchResult, Session,
+    SessionMeta,
 };

@@ -64,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The terminal chat kept sending the model the conversation the screen had cleared, undone or
+  switched away from, lost every earlier turn after a model switch, and replaced the real system
+  prompt with a screen note on resume.
+- `/undo` and `/retry` now also fix the stored session, a model switch keeps the conversation, screen
+  notes and error lines are never sent, and `chat --resume` accepts a unique prefix or refuses unknown
+  and ambiguous ids before the chat opens.
 - `proxy_config` saved and applied a proxy that could not be reached, which stopped every provider call without saying why; `set` and `apply_env` now probe each URL that would take effect with a 3 second TCP connect and refuse the first that fails, naming the redacted URL and changing nothing.
 - `doctor` passed an MCP server that was on PATH but could not start. It now starts each configured server, completes the initialize handshake and lists tools under a 10-second per-server deadline, and names the failing server and the step that failed; `--offline` keeps the PATH-only scan.
 - The shell security note claimed an automatic Landlock sandbox with a Firejail fallback that the code does not have. The note is rewritten in English and states the controls that exist: the command allowlist, the credential-directory refusal, the central read-only gate, the per-hour action budget, the 600 s timeout, the 1 MiB output cap, and `[runtime].kind`.

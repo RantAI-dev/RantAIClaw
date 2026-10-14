@@ -335,6 +335,25 @@ impl SessionStore {
         Ok(removed > 0)
     }
 
+    /// Delete the messages of `session_id` whose row id is at or after
+    /// `from_id`, and set `message_count` to the rows that remain. Used by
+    /// `/undo` and `/retry` to drop the last exchange from the stored session.
+    /// Returns how many rows were deleted.
+    pub fn delete_messages_from(&mut self, session_id: &str, from_id: i64) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND id >= ?2",
+            params![session_id, from_id],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET message_count = \
+             (SELECT COUNT(*) FROM messages WHERE session_id = ?1) WHERE id = ?1",
+            params![session_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Every session id for one conversation_key, ordered newest first.
     /// Caller still has to fetch each session's metadata if it needs it; this
     /// helper only returns ids so the DELETE handler can fan out grant
@@ -505,12 +524,19 @@ impl SessionStore {
     /// Atomically deletes the existing rows + inserts the new set + sets
     /// `message_count` to match. `session_id` on each input `Message` is
     /// rewritten so callers don't have to thread it through.
-    pub fn replace_messages(&mut self, session_id: &str, messages: &[Message]) -> Result<()> {
+    ///
+    /// Every row is re-inserted, so every row id changes. The new ids are
+    /// returned in input order; the caller must store them on its in-memory
+    /// messages. The seam invariant is that an in-memory `Message.id` equals
+    /// its stored row id, and any bulk rewrite must refresh it (see the
+    /// compaction site in `app.rs`).
+    pub fn replace_messages(&mut self, session_id: &str, messages: &[Message]) -> Result<Vec<i64>> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM messages WHERE session_id = ?1",
             params![session_id],
         )?;
+        let mut ids = Vec::with_capacity(messages.len());
         for msg in messages {
             tx.execute(
                 "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) \
@@ -523,13 +549,14 @@ impl SessionStore {
                     msg.timestamp
                 ],
             )?;
+            ids.push(tx.last_insert_rowid());
         }
         tx.execute(
             "UPDATE sessions SET message_count = ?1 WHERE id = ?2",
             params![messages.len() as i64, session_id],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(ids)
     }
 
     /// Atomically record one API chat turn: continue-or-create the session,

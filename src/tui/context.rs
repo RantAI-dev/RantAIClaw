@@ -108,6 +108,9 @@ pub struct TuiContext {
     /// Number of turn requests currently queued at the actor (submitted but
     /// not yet completed). Incremented on submit, decremented on `Done`.
     pub queued_turns: usize,
+    /// A history reseed the request channel was full for. Sent by
+    /// `flush_pending_reseed` before the next request.
+    pub pending_reseed: Option<Vec<(String, String)>>,
     /// Canonical names of providers detected as enabled (have an API key
     /// configured) when the TUI launched. Used by `/model` to populate
     /// the model picker. First entry is the primary/default provider.
@@ -266,6 +269,7 @@ impl TuiContext {
             req_tx,
             events_rx,
             queued_turns: 0,
+            pending_reseed: None,
             available_providers: Vec::new(),
             workspace_dir: None,
             available_skills: Vec::new(),
@@ -651,8 +655,8 @@ impl TuiContext {
     pub fn append_user_message(&mut self, content: &str) -> Result<()> {
         let is_first_message = self.messages.is_empty();
         let sid = self.ensure_session_id()?;
-        let msg = Message::user(&sid, content);
-        self.session_store.append_message(&msg)?;
+        let mut msg = Message::user(&sid, content);
+        msg.id = self.session_store.append_message(&msg)?;
         self.messages.push(msg);
 
         if is_first_message {
@@ -664,22 +668,28 @@ impl TuiContext {
         Ok(())
     }
 
-    /// Append a system-role message (used for inline command output like
-    /// `/usage`, `/sessions`, etc.). Persisted to the session store so
-    /// scrollback + resume still show the line.
+    /// Append a screen note (inline command output like `/usage`, `/sessions`,
+    /// etc.). Persisted with role `note` so scrollback and resume still show
+    /// the line, while the model never receives it as a conversational turn.
     pub fn append_system_message(&mut self, content: &str) -> Result<()> {
         let sid = self.ensure_session_id()?;
-        let msg = Message {
+        let mut msg = Message {
             id: 0,
             session_id: sid,
-            role: "system".to_string(),
+            role: "note".to_string(),
             content: content.to_string(),
             tool_calls: None,
             timestamp: chrono::Utc::now().timestamp(),
         };
-        self.session_store.append_message(&msg)?;
+        msg.id = self.session_store.append_message(&msg)?;
         self.messages.push(msg);
         Ok(())
+    }
+
+    /// Append an error line the TUI authored for a failed turn. Stored as a
+    /// `note` so it is never sent back to the model as a reply.
+    pub fn append_note_message(&mut self, content: &str) -> Result<()> {
+        self.append_system_message(content)
     }
 
     /// Append an assistant message to the in-memory list and persist it.
@@ -699,7 +709,7 @@ impl TuiContext {
         let sid = self.ensure_session_id()?;
         let mut msg = Message::assistant(&sid, content);
         msg.tool_calls = tool_calls_json;
-        self.session_store.append_message(&msg)?;
+        msg.id = self.session_store.append_message(&msg)?;
         self.messages.push(msg);
         Ok(())
     }
@@ -713,6 +723,90 @@ impl TuiContext {
         // History replaced wholesale — selection anchors are stale.
         self.selection = None;
         Ok(())
+    }
+
+    /// Drop the last exchange from the screen and the stored session: the last
+    /// user row and everything after it (its reply, and any note the failed
+    /// turn left). Returns how many rows went, or `0` when there is no user
+    /// row to cut from. The screen and the store drop the same rows.
+    pub fn drop_last_exchange(&mut self) -> Result<usize> {
+        let Some(cut) = self.messages.iter().rposition(|m| m.role == "user") else {
+            return Ok(0);
+        };
+        let from_id = self.messages[cut].id;
+        let removed = self.messages.len() - cut;
+        if let Some(sid) = self.session_id.clone() {
+            self.session_store.delete_messages_from(&sid, from_id)?;
+        }
+        self.messages.truncate(cut);
+        Ok(removed)
+    }
+
+    /// Drop what followed the last user turn (its reply, or the note a failed
+    /// turn left) from the screen and the stored session. The user turn stays:
+    /// the retry is sent again without being appended. The agent is reseeded
+    /// with the turns before that user turn, since the retry sends it again.
+    /// Returns `false` when there is no user turn to retry.
+    pub fn drop_last_reply(&mut self) -> Result<bool> {
+        let Some(user) = self.messages.iter().rposition(|m| m.role == "user") else {
+            return Ok(false);
+        };
+        let first_after = user + 1;
+        if let Some(sid) = self.session_id.clone() {
+            if let Some(after) = self.messages.get(first_after) {
+                self.session_store.delete_messages_from(&sid, after.id)?;
+            }
+        }
+        self.messages.truncate(first_after);
+        let before_turn = crate::sessions::turns_for_history(&self.messages[..user]);
+        self.reseed_agent(&before_turn);
+        Ok(true)
+    }
+
+    /// Tell the agent actor to replace its history with `turns`, the
+    /// conversational turns of the session the screen now shows. Sent on the
+    /// same channel as `Submit`, so the next prompt is sent with them.
+    ///
+    /// This runs from sync command code, so it cannot await. A reseed the
+    /// channel cannot take now is held in `pending_reseed` and sent by
+    /// [`TuiContext::flush_pending_reseed`], which the async caller awaits
+    /// before any request goes out. A closed channel means the actor is gone,
+    /// so it is surfaced in `last_error` rather than dropped.
+    pub fn reseed_agent(&mut self, turns: &[(String, String)]) {
+        match self
+            .req_tx
+            .try_send(TurnRequest::SetHistory(turns.to_vec()))
+        {
+            Ok(()) => {
+                // This reseed supersedes any held earlier one: sending the
+                // held one afterwards would put the agent back on old history.
+                self.pending_reseed = None;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Newest wins: a later reseed replaces an unsent earlier one.
+                self.pending_reseed = Some(turns.to_vec());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.last_error = Some("agent bridge closed: history not reseeded".to_string());
+            }
+        }
+    }
+
+    /// Send a reseed that `reseed_agent` had to hold, awaiting room in the
+    /// channel. Call before dispatching any request, so the agent sees the
+    /// reseed first. A closed channel is surfaced in `last_error`.
+    pub async fn flush_pending_reseed(&mut self) {
+        let Some(turns) = self.pending_reseed.take() else {
+            return;
+        };
+        if self
+            .req_tx
+            .send(TurnRequest::SetHistory(turns))
+            .await
+            .is_err()
+        {
+            self.last_error = Some("agent bridge closed: history not reseeded".to_string());
+        }
     }
 
     /// End the current session and start a fresh one, clearing in-memory state.
@@ -1035,6 +1129,26 @@ mod tests {
     }
 
     #[test]
+    fn screen_notes_and_error_lines_are_stored_as_notes_not_turns() {
+        let mut ctx = in_memory_context("test-model");
+
+        ctx.append_user_message("hello").unwrap();
+        ctx.append_system_message("Model set to: openai:gpt-x")
+            .unwrap();
+        ctx.append_note_message("✗ provider timed out").unwrap();
+        ctx.append_assistant_message("world").unwrap();
+
+        let stored = ctx
+            .session_store
+            .get_messages(ctx.session_id.as_deref().unwrap())
+            .unwrap();
+        let roles: Vec<&str> = stored.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "note", "note", "assistant"]);
+        assert_eq!(stored[2].content, "✗ provider timed out");
+        assert_eq!(stored[3].content, "world");
+    }
+
+    #[test]
     fn context_loads_existing_messages() {
         let store = SessionStore::in_memory().expect("in-memory store");
         let session = store.new_session("test-model", "tui").unwrap();
@@ -1071,6 +1185,7 @@ mod tests {
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
+            TurnRequest::SetHistory(_) => panic!("expected Submit, got SetHistory"),
         }
         events_tx
             .try_send(AgentEvent::Chunk("ok".into()))

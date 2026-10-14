@@ -2207,7 +2207,19 @@ async fn main() -> Result<()> {
                 } else if let Some(m) = config.default_model.clone() {
                     tui_config.model = m;
                 }
-                tui_config.resume_session = resume;
+                // Resolve `--resume` to an existing session before the TUI
+                // opens. A raw, unknown or ambiguous id used to bind as-is and
+                // fail at the first message; now it exits here, with nothing
+                // written.
+                tui_config.resume_session = match resume {
+                    Some(id) => {
+                        let store = rantaiclaw::sessions::cli::open_store()?;
+                        Some(rantaiclaw::sessions::cli::resolve_session_for_resume(
+                            &store, &id,
+                        )?)
+                    }
+                    None => None,
+                };
 
                 if let Some(msg) = message {
                     // Single-shot path delegates to the same agent loop the
