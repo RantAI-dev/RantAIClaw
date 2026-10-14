@@ -82,17 +82,16 @@ pub struct TuiContext {
     /// lines. Cleared on click, Esc, copy, and any history replacement
     /// (`/compress`, `/clear`) — anchors don't survive those.
     pub selection: Option<super::selection::Selection>,
-    /// `None` until a provider reports usage for this session.
+    /// Token counts summed over every turn of this session; `None` until a
+    /// provider reports usage for it. Reset by `/new` and by picking another
+    /// session. The sessions store keeps no per-turn usage, so a resumed
+    /// session starts unreported.
     ///
     /// Not a zeroed tally: a turn that used zero tokens does not exist, so a
     /// rendered `0` could only ever mean "nobody told us" — and half the
     /// backends (and every tool-only turn) tell us nothing. Every surface that
     /// reads this must say so rather than print the zero.
     pub token_usage: Option<TokenUsage>,
-    /// Total context window of the active model, in tokens. Used by the
-    /// status bar to display a `used/window  pct%` meter. `None` when the
-    /// provider didn't surface a window size.
-    pub context_window: Option<u64>,
     /// When the TUI session started — used by the status bar to display a
     /// compact `1h2m` / `34m` / `12s` age label.
     pub started_at: std::time::Instant,
@@ -260,7 +259,6 @@ impl TuiContext {
             last_chat_provenance: Vec::new(),
             selection: None,
             token_usage: None,
-            context_window: None,
             started_at: std::time::Instant::now(),
             last_error: None,
             status_notice: None,
@@ -900,6 +898,20 @@ mod tests {
             "curl http://[::1]:8080/x\ngrep '[' file\nmore\nlines\nhere\nand more".to_string();
         let marker = ctx.register_paste(content.clone());
         assert_eq!(ctx.expand_pending_pastes(marker), content);
+    }
+
+    /// `/new` starts "this session" over: the next session's total is
+    /// unreported until a provider reports usage for it.
+    #[test]
+    fn new_session_resets_the_usage_total() {
+        let mut ctx = in_memory_context("m");
+        ctx.token_usage = Some(TokenUsage {
+            prompt_tokens: 33,
+            completion_tokens: 21,
+            total_tokens: 54,
+        });
+        ctx.clear_session().unwrap();
+        assert!(ctx.token_usage.is_none());
     }
 
     /// `/new` clears held pastes so they cannot leak into the next message.

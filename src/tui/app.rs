@@ -2738,11 +2738,23 @@ impl TuiApp {
                     .append_system_message(&render_recalled_memories(&keys));
             }
             AgentEvent::Usage(u) => {
-                // Map the agent's cost::TokenUsage onto the TUI's tally shape.
-                self.context.token_usage = Some(TokenUsage {
+                // One event per turn. "This session" is the sum over the
+                // turns, so each turn adds to the total rather than replacing
+                // it; the first reported turn starts the total.
+                let turn = TokenUsage {
                     prompt_tokens: u.input_tokens,
                     completion_tokens: u.output_tokens,
                     total_tokens: u.total_tokens,
+                };
+                self.context.token_usage = Some(match self.context.token_usage.take() {
+                    Some(total) => TokenUsage {
+                        prompt_tokens: total.prompt_tokens.saturating_add(turn.prompt_tokens),
+                        completion_tokens: total
+                            .completion_tokens
+                            .saturating_add(turn.completion_tokens),
+                        total_tokens: total.total_tokens.saturating_add(turn.total_tokens),
+                    },
+                    None => turn,
                 });
             }
             AgentEvent::Done {
@@ -3324,6 +3336,9 @@ impl TuiApp {
                 self.context.session_id = Some(session.id.clone());
                 self.context.model = session.model.clone();
                 self.context.messages.clear();
+                // Another session's total is not this session's: the store
+                // keeps no per-turn usage, so the picked one starts unreported.
+                self.context.token_usage = None;
                 // History replaced (resume) — selection anchors are stale.
                 self.context.selection = None;
                 self.selection_drag_anchor = None;
@@ -4991,31 +5006,17 @@ impl TuiApp {
                 Span::styled(err.clone(), Style::default().fg(Color::Rgb(255, 123, 123))),
             ])
         } else {
-            // Compact context-window meter — pretty-prints big numbers.
+            // Session token total, pretty-printed.
             //
             // `—` when the provider reported nothing. It used to render `0`,
             // which reads as a measured zero; a turn that consumed no tokens
             // does not exist, so the only thing that zero ever meant was
-            // "unknown". The percentage goes with it: a percentage of an
-            // unknown numerator is not a number.
-            let used = self.context.token_usage.as_ref().map(|u| u.total_tokens);
-            let used_label = used.map_or_else(|| "—".to_string(), format_tokens);
-            // Approximate context window from configured value if available.
-            let window = self.context.context_window.unwrap_or(0);
-            let window_label = if window > 0 {
-                format!("/{}", format_tokens(window))
-            } else {
-                String::new()
-            };
-            // Integer math, rounded half-up. The float version rendered the
-            // same number and needed two lint exemptions for casts that can
-            // truncate or lose a sign; token counts are u64 and a percentage of
-            // them fits, so neither hazard has to exist here.
-            let pct = used.and_then(|used| {
-                used.saturating_mul(100)
-                    .saturating_add(window / 2)
-                    .checked_div(window)
-            });
+            // "unknown".
+            let used_label = self
+                .context
+                .token_usage
+                .as_ref()
+                .map_or_else(|| "—".to_string(), |u| format_tokens(u.total_tokens));
 
             // Session age in human time.
             let age_secs = self.context.started_at.elapsed().as_secs();
@@ -5030,17 +5031,7 @@ impl TuiApp {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("  │  ", muted),
-                Span::styled(
-                    format!("{used_label}{window_label}"),
-                    Style::default().fg(Color::Rgb(126, 226, 179)),
-                ),
-                Span::styled(
-                    match pct {
-                        Some(pct) if window > 0 => format!("  {pct}%"),
-                        _ => String::new(),
-                    },
-                    muted,
-                ),
+                Span::styled(used_label, Style::default().fg(Color::Rgb(126, 226, 179))),
                 Span::styled("  │  ", muted),
                 Span::styled(format!("{} msgs", self.context.messages.len()), muted),
                 Span::styled("  │  ", muted),
@@ -6967,8 +6958,9 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
             Span::styled(notice.clone(), muted),
         ])
     } else {
-        // `—` when nothing was reported — see the meter above for why a zero
-        // here would be a claim rather than a measurement.
+        // `—` when nothing was reported — see the session token total in
+        // render_status above for why a zero here would be a claim rather
+        // than a measurement.
         let used_label = ctx
             .token_usage
             .as_ref()
@@ -10429,6 +10421,26 @@ mod drain_tests {
         assert_eq!(app.context.messages.last().unwrap().content, "answer");
     }
 
+    /// "This session" on `/usage` is the sum of every turn, not the last one:
+    /// three turns of 11/7/18 total 33/21/54.
+    #[test]
+    fn usage_events_sum_across_turns_in_the_session() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        for _ in 0..3 {
+            app.handle_agent_event(AgentEvent::Usage(crate::cost::TokenUsage::new(
+                "mock-model",
+                11,
+                7,
+                None,
+            )));
+        }
+        let total = app.context.token_usage.as_ref().expect("reported");
+        assert_eq!(total.prompt_tokens, 33);
+        assert_eq!(total.completion_tokens, 21);
+        assert_eq!(total.total_tokens, 54);
+    }
+
     #[tokio::test]
     async fn drain_events_done_cancelled_appends_marker_using_local_partial() {
         let (ctx, _req_rx, events_tx) = TuiContext::test_context();
@@ -11440,6 +11452,28 @@ mod session_history_tests {
             }
             other => panic!("expected SetHistory, got {other:?}"),
         }
+    }
+
+    /// Switching sessions starts "this session" over: the total counted on
+    /// the screen before the pick belonged to a different session. Resumed
+    /// sessions start unreported because the store keeps no per-turn usage.
+    #[tokio::test]
+    async fn picking_a_session_resets_the_usage_total() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        let session_a = store_session(&app.context.session_store, &[("user", "a question")]);
+        app.context.token_usage = Some(crate::tui::context::TokenUsage {
+            prompt_tokens: 33,
+            completion_tokens: 21,
+            total_tokens: 54,
+        });
+
+        pick_session(&mut app, &session_a).await;
+
+        assert!(
+            app.context.token_usage.is_none(),
+            "a picked session starts unreported, not with the previous total"
+        );
     }
 }
 
