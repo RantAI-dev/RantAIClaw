@@ -151,6 +151,7 @@ impl TuiProvisioner for IrcProvisioner {
                 label: "Use TLS?".into(),
                 options: vec!["Yes — TLS (recommended)".to_string(), "No".to_string()],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

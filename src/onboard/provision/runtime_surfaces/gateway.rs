@@ -74,6 +74,7 @@ impl TuiProvisioner for GatewayProvisioner {
                 label: "Configure the webhook gateway?".into(),
                 options: vec!["No — leave it as is".to_string(), "Yes".to_string()],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
@@ -143,6 +144,7 @@ impl TuiProvisioner for GatewayProvisioner {
                         "Yes, bind publicly".to_string(),
                     ],
                     multi: false,
+                    filterable: false,
                 },
             )
             .await?;
@@ -162,6 +164,7 @@ impl TuiProvisioner for GatewayProvisioner {
                 label: "Require device pairing before accepting requests?".into(),
                 options: vec!["Yes (recommended)".to_string(), "No — open".to_string()],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

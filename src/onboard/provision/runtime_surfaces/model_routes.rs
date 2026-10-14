@@ -85,6 +85,7 @@ impl TuiProvisioner for ModelRoutesProvisioner {
                     label: "Model routes".into(),
                     options: vec!["Add a route".to_string(), "Done".to_string()],
                     multi: false,
+                    filterable: false,
                 },
             )
             .await?;

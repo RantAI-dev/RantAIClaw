@@ -74,12 +74,18 @@ impl TuiProvisioner for SecretsProvisioner {
                     "No — store in plain text".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let sel = recv_selection(&mut responses).await?;
-        let encrypt = sel.first().copied() != Some(1);
+        let Some(&choice) = sel.first() else {
+            return Ok(ProvisionOutcome::Aborted(
+                "no secrets option was selected".to_string(),
+            ));
+        };
+        let encrypt = choice != 1;
 
         config.secrets = SecretsConfig { encrypt };
 

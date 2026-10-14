@@ -199,6 +199,7 @@ impl TuiProvisioner for MattermostProvisioner {
                     "Channel root".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

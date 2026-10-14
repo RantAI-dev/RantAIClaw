@@ -72,6 +72,7 @@ impl TuiProvisioner for AgentsProvisioner {
                 label: "Enable built-in delegate agents (multi-select)".into(),
                 options: built_in.iter().map(|s| s.to_string()).collect(),
                 multi: true,
+                filterable: false,
             },
         )
         .await?;
@@ -104,6 +105,7 @@ impl TuiProvisioner for AgentsProvisioner {
                 label: "Add a custom delegate agent?".into(),
                 options: vec!["No".to_string(), "Yes".to_string()],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

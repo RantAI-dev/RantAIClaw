@@ -40,6 +40,32 @@ use std::io::{IsTerminal, Write};
 use tracing::{info, warn};
 use tracing_subscriber::fmt;
 
+/// The model label the TUI starts with, for `rantaiclaw chat`.
+///
+/// An explicit `--model` flag is used verbatim. Otherwise the configured
+/// default is labelled `provider:model` when both are set, which is the same
+/// spelling `/model` and the wizard save store. Returns `None` when there is
+/// nothing to show, so `TuiConfig`'s own default applies and `run_tui` falls
+/// back to the saved config.
+#[cfg(feature = "tui")]
+fn boot_model_label(
+    flag: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<String> {
+    if let Some(flag) = flag {
+        return Some(flag.to_string());
+    }
+    match (
+        provider.filter(|p| !p.is_empty()),
+        model.filter(|m| !m.is_empty()),
+    ) {
+        (Some(p), Some(m)) => Some(format!("{p}:{m}")),
+        (None, Some(m)) => Some(m.to_string()),
+        _ => None,
+    }
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !(0.0..=2.0).contains(&t) {
@@ -2201,10 +2227,14 @@ async fn main() -> Result<()> {
                 use rantaiclaw::tui::{run_tui, TuiConfig};
 
                 let mut tui_config = TuiConfig::default();
-                // Prefer explicit --model flag, then user's configured default_model.
-                if let Some(m) = model {
-                    tui_config.model = m;
-                } else if let Some(m) = config.default_model.clone() {
+                // Prefer explicit --model flag, then user's configured default.
+                // The configured default is labelled `provider:model`, the same
+                // spelling the status bar takes after any `/model` switch.
+                if let Some(m) = boot_model_label(
+                    model.as_deref(),
+                    config.default_provider.as_deref(),
+                    config.default_model.as_deref(),
+                ) {
                     tui_config.model = m;
                 }
                 // Resolve `--resume` to an existing session before the TUI
@@ -2870,7 +2900,54 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "tui")]
+    use super::boot_model_label;
     use super::{headless_choice, unusable_provider_after_headless_setup, HeadlessChoice};
+
+    /// The status bar's boot label must match the `provider:model` spelling the
+    /// `/model` path stores, so the picker can find the active model.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn boot_label_flag_wins_verbatim() {
+        assert_eq!(
+            boot_model_label(Some("bare-flag"), Some("openai"), Some("audit-model")).as_deref(),
+            Some("bare-flag"),
+            "an explicit flag is the operator's spelling and is not rewritten"
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn boot_label_provider_and_model_is_provider_colon_model() {
+        assert_eq!(
+            boot_model_label(None, Some("openai"), Some("audit-model")).as_deref(),
+            Some("openai:audit-model")
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn boot_label_model_alone_stays_bare() {
+        assert_eq!(
+            boot_model_label(None, None, Some("audit-model")).as_deref(),
+            Some("audit-model")
+        );
+        assert_eq!(
+            boot_model_label(None, Some(""), Some("audit-model")).as_deref(),
+            Some("audit-model"),
+            "an empty provider counts as no provider"
+        );
+    }
+
+    /// Neither set: no label, so `TuiConfig`'s default applies and `run_tui`
+    /// substitutes the saved config (its own fallback, app.rs `run_tui`).
+    #[cfg(feature = "tui")]
+    #[test]
+    fn boot_label_neither_set_is_none_so_run_tui_falls_back() {
+        assert_eq!(boot_model_label(None, None, None), None);
+        assert_eq!(boot_model_label(None, Some("openai"), None), None);
+        assert_eq!(boot_model_label(None, Some(""), Some("")), None);
+    }
 
     fn config_with_provider(name: &str) -> Config {
         Config {

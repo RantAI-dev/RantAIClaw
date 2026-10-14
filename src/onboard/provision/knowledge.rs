@@ -81,12 +81,15 @@ impl TuiProvisioner for KnowledgeProvisioner {
                 label: "Enable Knowledge Base? (agent can search documents you ingest)".into(),
                 options: vec!["Enable".into(), "Skip (leave disabled)".into()],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let selection = recv_selection(&mut responses).await?;
-        if selection.first().copied().unwrap_or(0) == 1 {
+        // Only an explicit "Enable" (row 0) continues; an empty answer takes the
+        // skip branch, leaving the Knowledge Base disabled.
+        if selection.first().copied() != Some(0) {
             send(
                 &events,
                 ProvisionEvent::Done {
@@ -117,13 +120,15 @@ impl TuiProvisioner for KnowledgeProvisioner {
                         "Skip (leave disabled)".into(),
                     ],
                     multi: false,
+                    filterable: false,
                 },
             )
             .await?;
             let sel = recv_selection(&mut responses).await?;
-            match sel.first().copied().unwrap_or(0) {
-                0 => config.api_key.clone(),
-                1 => prompt_embedding_key(&events, &mut responses).await?,
+            // An empty answer is "skip" (`_`), never the stored-key row.
+            match sel.first().copied() {
+                Some(0) => config.api_key.clone(),
+                Some(1) => prompt_embedding_key(&events, &mut responses).await?,
                 _ => None,
             }
         } else {
@@ -134,12 +139,14 @@ impl TuiProvisioner for KnowledgeProvisioner {
                     label: "Embedding API key source".into(),
                     options: vec!["Enter a key".into(), "Skip (leave disabled)".into()],
                     multi: false,
+                    filterable: false,
                 },
             )
             .await?;
             let sel = recv_selection(&mut responses).await?;
-            match sel.first().copied().unwrap_or(0) {
-                0 => prompt_embedding_key(&events, &mut responses).await?,
+            // An empty answer is "skip" (`_`), never the enter-a-key row.
+            match sel.first().copied() {
+                Some(0) => prompt_embedding_key(&events, &mut responses).await?,
                 _ => None,
             }
         };
@@ -180,10 +187,12 @@ impl TuiProvisioner for KnowledgeProvisioner {
                     "Skip OCR".into(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
+        // An empty answer is "Skip OCR" (row 2): no key is stored, so nothing unseen is written.
         let vis_sel = recv_selection(&mut responses).await?;
         let vision_key: Option<String> = match vis_sel.first().copied().unwrap_or(2) {
             0 => Some(embedding_key.clone()),
@@ -249,5 +258,41 @@ async fn prompt_embedding_key(
         Ok(None)
     } else {
         Ok(Some(trimmed.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+    use crate::onboard::provision::ProvisionEvent;
+
+    /// An empty answer at "Enable Knowledge Base?" must leave it disabled and
+    /// must not ask for an embedding key.
+    #[tokio::test]
+    async fn empty_enable_answer_leaves_the_knowledge_base_disabled() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+
+        let t = drive(
+            &super::KnowledgeProvisioner,
+            &mut config,
+            &profile,
+            vec![Answer::Empty],
+        )
+        .await;
+
+        // The embedding-key flow asks through the `emb_src` choose and the
+        // `emb_key` prompt; neither may appear for an empty enable answer.
+        let asked_for_key = t.events.iter().any(|e| {
+            matches!(e, ProvisionEvent::Choose { id, .. } if id == "emb_src")
+                || matches!(e, ProvisionEvent::Prompt { id, .. } if id == "emb_key")
+        });
+        assert!(
+            !asked_for_key,
+            "an empty enable answer must not reach the embedding-key prompts"
+        );
+        assert!(t.configured(), "the skip branch completes: {:?}", t.outcome);
     }
 }

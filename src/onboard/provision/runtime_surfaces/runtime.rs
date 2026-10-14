@@ -76,6 +76,7 @@ impl TuiProvisioner for RuntimeProvisioner {
                     "docker".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
@@ -169,6 +170,7 @@ impl TuiProvisioner for RuntimeProvisioner {
                     label: "Mount workspace into container?".into(),
                     options: vec!["Yes (recommended)".to_string(), "No".to_string()],
                     multi: false,
+                    filterable: false,
                 },
             )
             .await?;

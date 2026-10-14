@@ -91,12 +91,17 @@ impl TuiProvisioner for ProviderProvisioner {
                 label: "Select provider category".into(),
                 options: tiers.clone(),
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let tier_sel = recv_selection(&mut responses).await?;
-        let tier_idx = tier_sel.first().copied().unwrap_or(0);
+        let Some(&tier_idx) = tier_sel.first() else {
+            return Ok(ProvisionOutcome::Aborted(
+                "no provider tier was selected".to_string(),
+            ));
+        };
 
         // ── Provider selection ─────────────────────────────────────
         let providers: Vec<(&str, &str)> = crate::onboard::wizard::PROVIDER_SETUP_TIERS
@@ -154,18 +159,81 @@ impl TuiProvisioner for ProviderProvisioner {
 
             let api_key = recv_text(&mut responses).await?;
 
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "custom_model".into(),
-                    label: "Model name (e.g. llama3, gpt-4o)".into(),
-                    default: Some("default".into()),
-                    secret: false,
-                },
+            // The endpoint's cached models, under the same key `/model` reads
+            // (`custom:<base url>`). When there are some, they are offered as a
+            // Choose with a typed-name row last; with none, the name is typed.
+            let endpoint_key = format!("custom:{base_url}");
+            // The active model is offered only on the endpoint the config already
+            // names, the same rule the main step uses for its provider.
+            let active_model = if config.default_provider.as_deref() == Some(endpoint_key.as_str())
+            {
+                config.default_model.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let cached = crate::onboard::wizard::provider_model_list(
+                &config.workspace_dir,
+                &endpoint_key,
+                &active_model,
+            );
+            // With no catalog to choose from, the name is typed. The gate is the
+            // catalog alone: the active model is not a catalog entry, so it must
+            // not turn an empty cache into a one-row picker.
+            let catalog_is_empty = crate::onboard::wizard::provider_model_catalog(
+                &config.workspace_dir,
+                &endpoint_key,
             )
-            .await?;
-
-            let model = recv_text(&mut responses).await?;
+            .models
+            .is_empty();
+            let typed_name_row = "type a model name";
+            let model = if catalog_is_empty {
+                send(
+                    &events,
+                    ProvisionEvent::Prompt {
+                        id: "custom_model".into(),
+                        label: "Model name (e.g. llama3, gpt-4o)".into(),
+                        default: Some("default".into()),
+                        secret: false,
+                    },
+                )
+                .await?;
+                recv_text(&mut responses).await?
+            } else {
+                let mut options = cached.clone();
+                options.push(typed_name_row.to_string());
+                send(
+                    &events,
+                    ProvisionEvent::Choose {
+                        id: "custom_model".into(),
+                        label: "Select the endpoint's model".into(),
+                        options,
+                        multi: false,
+                        filterable: true,
+                    },
+                )
+                .await?;
+                let picked = recv_selection(&mut responses).await?;
+                let Some(&idx) = picked.first() else {
+                    return Ok(ProvisionOutcome::Aborted(
+                        "no model was selected".to_string(),
+                    ));
+                };
+                if idx < cached.len() {
+                    cached[idx].clone()
+                } else {
+                    send(
+                        &events,
+                        ProvisionEvent::Prompt {
+                            id: "custom_model".into(),
+                            label: "Model name (e.g. llama3, gpt-4o)".into(),
+                            default: Some("default".into()),
+                            secret: false,
+                        },
+                    )
+                    .await?;
+                    recv_text(&mut responses).await?
+                }
+            };
             let model = if model.trim().is_empty() {
                 "default".to_string()
             } else {
@@ -210,12 +278,17 @@ impl TuiProvisioner for ProviderProvisioner {
                 label: "Select AI provider".into(),
                 options: provider_labels.clone(),
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let provider_sel = recv_selection(&mut responses).await?;
-        let provider_idx = provider_sel.first().copied().unwrap_or(0);
+        let Some(&provider_idx) = provider_sel.first() else {
+            return Ok(ProvisionOutcome::Aborted(
+                "no provider was selected".to_string(),
+            ));
+        };
         let (provider_name, _provider_label) = providers
             .get(provider_idx)
             .copied()
@@ -313,6 +386,7 @@ impl TuiProvisioner for ProviderProvisioner {
                                 "Abort setup (nothing will be saved)".into(),
                             ],
                             multi: false,
+                            filterable: false,
                         },
                     )
                     .await?;
@@ -414,6 +488,7 @@ impl TuiProvisioner for ProviderProvisioner {
                                     "Abort setup".into(),
                                 ],
                                 multi: false,
+                                filterable: false,
                             },
                         )
                         .await?;
@@ -483,16 +558,23 @@ impl TuiProvisioner for ProviderProvisioner {
         )
         .await?;
 
-        // Read the same catalog every other surface uses (`/model` picker,
-        // gateway, channel routing): cached live models when `models
-        // refresh`/the wizard has written them, curated otherwise. This
-        // used to read the curated list alone — ~10 rows for openrouter
-        // while the same binary's /model picker offered 400 from the cache.
-        // Capped like the CLI wizard's Select: the setup Choose overlay has
-        // no filter box, and the full openrouter list is 400 rows.
-        let catalog =
-            crate::onboard::wizard::provider_model_catalog(&config.workspace_dir, provider_name);
-        let source = catalog.source;
+        // The same list the `/model` picker offers: the provider's whole
+        // catalog (cache, else curated) plus the active model when the catalog
+        // lacks it. No cap: the setup Choose filters by typing, so the full
+        // list is usable (`ProvisionEvent::Choose { filterable }`).
+        let active_model = if config.default_provider.as_deref() == Some(provider_name) {
+            config.default_model.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let model_list = crate::onboard::wizard::provider_model_list(
+            &config.workspace_dir,
+            provider_name,
+            &active_model,
+        );
+        let source =
+            crate::onboard::wizard::provider_model_catalog(&config.workspace_dir, provider_name)
+                .source;
         let curated = crate::onboard::wizard::curated_models_for_provider(provider_name);
         let describe = |id: &str| {
             curated
@@ -500,7 +582,7 @@ impl TuiProvisioner for ProviderProvisioner {
                 .find(|(curated_id, _)| curated_id == id)
                 .map(|(_, description)| description.clone())
         };
-        let (model_ids, model_labels): (Vec<String>, Vec<String>) = if catalog.models.is_empty() {
+        let (model_ids, model_labels): (Vec<String>, Vec<String>) = if model_list.is_empty() {
             // No cache and no curated list — fall back to a single
             // "default" option so the user still has something to pick.
             let fallback = crate::onboard::wizard::default_model_for_provider(provider_name);
@@ -509,13 +591,12 @@ impl TuiProvisioner for ProviderProvisioner {
                 vec![format!("{fallback} (default)")],
             )
         } else {
-            catalog
-                .models
+            model_list
                 .into_iter()
-                .take(crate::onboard::wizard::LIVE_MODEL_MAX_OPTIONS)
                 .map(|id| {
                     let label = match describe(&id) {
                         Some(desc) => format!("{id}  —  {desc}"),
+                        None if id == active_model => format!("{id}  (active)"),
                         None => format!("{id}  ({source})"),
                     };
                     (id, label)
@@ -530,16 +611,24 @@ impl TuiProvisioner for ProviderProvisioner {
                 label: "Select default model".into(),
                 options: model_labels,
                 multi: false,
+                filterable: true,
             },
         )
         .await?;
 
+        // An empty selection means no model was chosen (a filter with no hits).
+        // Abort rather than write a model the operator never saw. An index
+        // outside the list is an error for the same reason, not a silent default.
         let model_sel = recv_selection(&mut responses).await?;
-        let model_idx = model_sel.first().copied().unwrap_or(0);
+        let Some(&model_idx) = model_sel.first() else {
+            return Ok(ProvisionOutcome::Aborted(
+                "no model was selected".to_string(),
+            ));
+        };
         let model = model_ids
             .get(model_idx)
             .cloned()
-            .unwrap_or_else(|| crate::onboard::wizard::default_model_for_provider(provider_name));
+            .ok_or_else(|| anyhow::anyhow!("model choice {model_idx} is not in the list"))?;
 
         // ── Write config ────────────────────────────────────────────
         config.default_provider = Some(provider_name.to_string());
@@ -609,6 +698,14 @@ mod tests {
     // a hardcoded row index silently repoints these tests at a different
     // provider whenever the table gains or reorders an entry.
     const PICK_TIER_RECOMMENDED: usize = 0;
+    /// The tier with no providers is the custom-endpoint branch.
+    fn custom_tier() -> usize {
+        crate::onboard::wizard::PROVIDER_SETUP_TIERS
+            .iter()
+            .position(|t| t.providers.is_empty())
+            .expect("the shared table has a custom-endpoint tier")
+    }
+
     fn pick_provider(id: &str) -> usize {
         crate::onboard::wizard::PROVIDER_SETUP_TIERS[PICK_TIER_RECOMMENDED]
             .providers
@@ -813,6 +910,203 @@ mod tests {
         );
         assert!(t.configured(), "flow must configure, got {:?}", t.outcome);
         assert_eq!(config.default_model.as_deref(), Some(cache_only));
+    }
+
+    /// The setup model step offers the same list as `/model`: the whole cache
+    /// (no 120-row cap) plus the active model. Here the active model is the
+    /// default the step would otherwise drop.
+    #[tokio::test]
+    async fn model_step_offers_the_whole_cache_without_a_cap() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+
+        let models: Vec<String> = (0..150)
+            .map(|i| format!("openrouter/cached-{i:03}"))
+            .collect();
+        crate::onboard::wizard::cache_live_models_for_provider(tmp.path(), "openrouter", &models)
+            .expect("write cache");
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(pick_provider("openrouter")),
+                Answer::Text(""), // keyless — openrouter builds without a key
+                Answer::Pick(0),
+            ],
+        )
+        .await;
+
+        let count = t
+            .events
+            .iter()
+            .find_map(|e| match e {
+                super::ProvisionEvent::Choose { id, options, .. } if id == "model" => {
+                    Some(options.len())
+                }
+                _ => None,
+            })
+            .expect("the model Choose is emitted");
+        assert_eq!(count, 150, "the whole cache is offered, not the first 120");
+    }
+
+    /// A model choose answered with no selection (a filter with no hits, sent
+    /// as an empty answer) must not write a model. It used to take catalog row
+    /// 0, a model the operator never saw.
+    #[tokio::test]
+    async fn empty_model_selection_writes_no_model() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+
+        let models: Vec<String> = (0..3).map(|i| format!("openrouter/cached-{i}")).collect();
+        crate::onboard::wizard::cache_live_models_for_provider(tmp.path(), "openrouter", &models)
+            .expect("write cache");
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(pick_provider("openrouter")),
+                Answer::Text(""),
+                Answer::Empty,
+            ],
+        )
+        .await;
+
+        assert!(
+            !t.configured(),
+            "an empty model selection must not complete setup: {:?}",
+            t.outcome
+        );
+        assert_eq!(
+            config.default_model, None,
+            "no model is written for an empty selection"
+        );
+    }
+
+    /// The custom endpoint's model step, re-run on the endpoint the config
+    /// already names, offers the cache plus the active model when the cache
+    /// lacks it, and the typed-name row stays last. Matches the main step.
+    #[tokio::test]
+    async fn custom_endpoint_model_step_offers_the_active_model_when_absent_from_cache() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+
+        let base = "http://localhost:1234";
+        let endpoint = format!("custom:{base}");
+        crate::onboard::wizard::cache_live_models_for_provider(
+            tmp.path(),
+            &endpoint,
+            &["llama-a".to_string(), "llama-b".to_string()],
+        )
+        .expect("write cache");
+        config.default_provider = Some(endpoint.clone());
+        config.default_model = Some("my-active".to_string());
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(custom_tier()),
+                Answer::Text(base),
+                Answer::Text(""),
+                Answer::Pick(0),
+            ],
+        )
+        .await;
+
+        let offered = t
+            .events
+            .iter()
+            .find_map(|e| match e {
+                super::ProvisionEvent::Choose { id, options, .. } if id == "custom_model" => {
+                    Some(options.clone())
+                }
+                _ => None,
+            })
+            .expect("the custom endpoint's model Choose is emitted");
+        assert_eq!(
+            offered.len(),
+            4,
+            "2 cached + active + typed-name row: {offered:?}"
+        );
+        assert!(
+            offered.iter().any(|o| o.contains("my-active")),
+            "{offered:?}"
+        );
+        assert!(
+            offered.last().is_some_and(|o| o.contains("type")),
+            "{offered:?}"
+        );
+    }
+
+    /// A `custom:` provider's model step offers the endpoint's cached models
+    /// (the same cache the picker reads) and still accepts a typed name.
+    #[tokio::test]
+    async fn custom_endpoint_model_step_offers_its_cache_and_a_typed_name() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+
+        let base = "http://localhost:1234";
+        crate::onboard::wizard::cache_live_models_for_provider(
+            tmp.path(),
+            &format!("custom:{base}"),
+            &[
+                "llama-a".to_string(),
+                "llama-b".to_string(),
+                "llama-c".to_string(),
+            ],
+        )
+        .expect("write cache");
+
+        // The custom step offers the cache as a Choose, with a typed-name row
+        // last. Picking that row (index == cached count) asks for the name.
+        let typed_row = 3; // three cached models, then the typed-name row
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(custom_tier()),
+                Answer::Text(base),
+                Answer::Text(""), // key — none
+                Answer::Pick(typed_row),
+                Answer::Text("typed-x"), // the typed name
+            ],
+        )
+        .await;
+
+        let offered = t
+            .events
+            .iter()
+            .find_map(|e| match e {
+                super::ProvisionEvent::Choose { id, options, .. } if id == "custom_model" => {
+                    Some(options.clone())
+                }
+                _ => None,
+            })
+            .expect("the custom endpoint's cache is offered as a model Choose");
+        assert!(offered.iter().any(|o| o.contains("llama-a")), "{offered:?}");
+        assert!(offered.iter().any(|o| o.contains("llama-c")), "{offered:?}");
+        assert!(
+            offered.last().is_some_and(|o| o.contains("type")),
+            "the last row takes a typed name: {offered:?}"
+        );
+        assert!(t.configured(), "flow must configure, got {:?}", t.outcome);
+        assert_eq!(config.default_model.as_deref(), Some("typed-x"));
     }
 
     /// The gate consults the same oracle boot uses — including the

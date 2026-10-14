@@ -37,6 +37,10 @@ pub struct ActiveChoose {
     pub multi: bool,
     pub cursor: usize,
     pub selected: Vec<usize>,
+    /// Whether typed text narrows `options` (see `ProvisionEvent::Choose`).
+    pub filterable: bool,
+    /// Typed text that narrows the visible options. Empty shows every option.
+    pub query: String,
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +128,7 @@ impl SetupOverlayState {
                 label,
                 options,
                 multi,
+                filterable,
             } => {
                 let n = options.len();
                 self.choose = Some(ActiveChoose {
@@ -135,6 +140,8 @@ impl SetupOverlayState {
                     multi,
                     cursor: 0,
                     selected: Vec::new(),
+                    filterable,
+                    query: String::new(),
                 });
             }
             ProvisionEvent::Done { summary } => {
@@ -178,7 +185,7 @@ impl SetupOverlayState {
 
     pub fn choose_move_down(&mut self) {
         if let Some(c) = self.choose.as_mut() {
-            if c.cursor + 1 < c.options.len() {
+            if c.cursor + 1 < visible_count(c) {
                 c.cursor += 1;
             }
         }
@@ -199,7 +206,7 @@ impl SetupOverlayState {
     pub fn choose_page_down(&mut self) {
         let step = self.last_choose_viewport.saturating_sub(1).max(1) as usize;
         if let Some(c) = self.choose.as_mut() {
-            let last = c.options.len().saturating_sub(1);
+            let last = visible_count(c).saturating_sub(1);
             c.cursor = (c.cursor + step).min(last);
         }
         self.clamp_choose_scroll_to_cursor();
@@ -216,7 +223,7 @@ impl SetupOverlayState {
     /// Jump cursor to the last option.
     pub fn choose_end(&mut self) {
         if let Some(c) = self.choose.as_mut() {
-            c.cursor = c.options.len().saturating_sub(1);
+            c.cursor = visible_count(c).saturating_sub(1);
         }
         self.clamp_choose_scroll_to_cursor();
     }
@@ -256,9 +263,61 @@ impl SetupOverlayState {
         }
     }
 
+    /// The options a choose shows, as `(index in the full list, option)`.
+    /// A filterable choose narrows them by the typed query, case-insensitively;
+    /// any other choose shows all of them. Rendering and submission both read
+    /// this, so what the operator sees is what Enter picks.
+    pub fn visible_choose_rows(&self) -> Vec<(usize, String)> {
+        let Some(c) = self.choose.as_ref() else {
+            return Vec::new();
+        };
+        let needle = c.query.to_lowercase();
+        c.options
+            .iter()
+            .enumerate()
+            .filter(|(_, opt)| !c.filterable || opt.to_lowercase().contains(&needle))
+            .map(|(i, opt)| (i, opt.clone()))
+            .collect()
+    }
+
+    /// Append a typed character to a filterable choose's query and bring the
+    /// cursor back to the first visible row. A non-filterable choose ignores it.
+    pub fn push_filter_char(&mut self, ch: char) {
+        if let Some(c) = self.choose.as_mut().filter(|c| c.filterable) {
+            c.query.push(ch);
+            c.cursor = 0;
+        }
+        self.choose_scroll = 0;
+    }
+
+    /// Remove the last character of a filterable choose's query.
+    pub fn pop_filter_char(&mut self) {
+        if let Some(c) = self.choose.as_mut().filter(|c| c.filterable) {
+            c.query.pop();
+            c.cursor = 0;
+        }
+        self.choose_scroll = 0;
+    }
+
     pub fn submit_choose(&mut self) -> Option<(String, Vec<usize>)> {
+        // A single choose with no visible row has nothing to pick. Enter must
+        // not submit the cursor's stale index (an option not shown), and must
+        // not close the picker either: the operator stays on it to change the
+        // filter. A multi choose with nothing ticked is a real answer (none).
+        let visible = self.visible_choose_rows();
+        let c_ref = self.choose.as_ref()?;
+        if !c_ref.multi && visible.is_empty() {
+            return None;
+        }
         let c = self.choose.take()?;
-        let sel = if c.multi { c.selected } else { vec![c.cursor] };
+        let sel = if c.multi {
+            c.selected
+        } else {
+            match visible.get(c.cursor) {
+                Some((original, _)) => vec![*original],
+                None => Vec::new(),
+            }
+        };
         // Reset scroll so the next choose picker starts at the top.
         self.choose_scroll = 0;
         Some((c.id, sel))
@@ -378,7 +437,7 @@ impl SetupOverlayState {
             .choose
             .as_ref()
             .map(|c| {
-                u16::try_from(c.options.len())
+                u16::try_from(visible_count(c))
                     .unwrap_or(u16::MAX)
                     .saturating_add(4)
             }) // section + headline + rule + spacer
@@ -574,7 +633,7 @@ impl SetupOverlayState {
         // in long lists. Without this, ClawHub's 20-skill picker felt
         // bottomless on first-time setup.
         let kind_label = if c.multi { "MULTI · CHOOSE" } else { "CHOOSE" };
-        let total = c.options.len();
+        let total = visible_count(c);
         let pos_text = if c.multi {
             format!("{}/{} · {} selected", c.cursor + 1, total, c.selected.len())
         } else {
@@ -630,7 +689,7 @@ impl SetupOverlayState {
 
         // Clamp scroll one more time at render — handles initial render
         // before any cursor key has been pressed.
-        let total = c.options.len();
+        let total = visible_count(c);
         let max_scroll = total.saturating_sub(viewport.max(1));
         if self.choose_scroll > max_scroll {
             self.choose_scroll = max_scroll;
@@ -651,14 +710,17 @@ impl SetupOverlayState {
 
         let visible_count = total.min(viewport);
         let mut option_lines: Vec<Line> = Vec::with_capacity(visible_count);
+        // The rows shown, each with its index in the full list. The cursor is a
+        // row; `selected` is by full-list index.
+        let rows = self.visible_choose_rows();
         for offset in 0..visible_count {
             let i = self.choose_scroll + offset;
             if i >= total {
                 break;
             }
-            let opt = &c.options[i];
+            let (original, opt) = &rows[i];
             let is_cursor = i == c.cursor;
-            let is_checked = c.selected.contains(&i);
+            let is_checked = c.selected.contains(original);
 
             let arrow = if is_cursor { "▸" } else { " " };
             let arrow_style = if is_cursor {
@@ -694,7 +756,7 @@ impl SetupOverlayState {
                 Style::default().fg(muted)
             };
 
-            let label = truncate_to_width(opt, label_width);
+            let label = truncate_to_width(opt.as_str(), label_width);
 
             option_lines.push(Line::from(vec![
                 Span::styled(format!(" {arrow}  "), arrow_style),
@@ -907,6 +969,19 @@ impl SetupOverlayState {
     }
 }
 
+/// How many rows a choose shows: every option, or only those matching a
+/// filterable choose's query. The cursor and the scroll math range over this.
+fn visible_count(c: &ActiveChoose) -> usize {
+    if !c.filterable {
+        return c.options.len();
+    }
+    let needle = c.query.to_lowercase();
+    c.options
+        .iter()
+        .filter(|opt| opt.to_lowercase().contains(&needle))
+        .count()
+}
+
 /// Truncate `s` to fit within `max_cols` display columns, appending an
 /// ellipsis when shortened. Counts unicode characters (not bytes), but
 /// treats every char as one column — fine for the Latin-heavy skill /
@@ -1010,8 +1085,104 @@ mod tests {
             label: "Pick one".into(),
             options: opts.iter().map(|x| (*x).to_string()).collect(),
             multi,
+            filterable: false,
         });
         s
+    }
+
+    fn open_filterable_choose(opts: &[&str]) -> SetupOverlayState {
+        let mut s = SetupOverlayState::new("test");
+        s.handle_event(ProvisionEvent::Choose {
+            id: "model".into(),
+            label: "Select default model".into(),
+            options: opts.iter().map(|x| (*x).to_string()).collect(),
+            multi: false,
+            filterable: true,
+        });
+        s
+    }
+
+    /// Typing narrows a filterable choose to the matching options, and Enter
+    /// returns the index of the option in the full list, not the row shown.
+    #[test]
+    fn typing_narrows_a_filterable_choose_and_submit_returns_the_full_index() {
+        let mut s = open_filterable_choose(&["gpt-4o", "claude-opus", "gpt-5", "llama-3"]);
+
+        s.push_filter_char('g');
+        s.push_filter_char('p');
+        s.push_filter_char('t');
+
+        let visible: Vec<String> = s
+            .visible_choose_rows()
+            .into_iter()
+            .map(|(_, o)| o)
+            .collect();
+        assert_eq!(visible, vec!["gpt-4o".to_string(), "gpt-5".to_string()]);
+
+        s.choose_move_down(); // onto "gpt-5"
+        let (_, sel) = s.submit_choose().expect("a choose is open");
+        assert_eq!(
+            sel,
+            vec![2],
+            "the index is into the full list, not the filtered row"
+        );
+    }
+
+    /// The filter is case-insensitive and Backspace widens it again.
+    #[test]
+    fn filter_is_case_insensitive_and_backspace_widens_it() {
+        let mut s = open_filterable_choose(&["OpenAI/GPT", "anthropic/claude", "other"]);
+
+        s.push_filter_char('G');
+        s.push_filter_char('P');
+        assert_eq!(s.visible_choose_rows().len(), 1);
+
+        s.pop_filter_char();
+        s.pop_filter_char();
+        assert_eq!(
+            s.visible_choose_rows().len(),
+            3,
+            "an empty query shows every option"
+        );
+    }
+
+    /// A non-filterable choose ignores typed text: the list stays as it is.
+    #[test]
+    fn a_non_filterable_choose_does_not_narrow() {
+        let mut s = open_choose(&["alpha", "beta"], false);
+        s.push_filter_char('a');
+        assert_eq!(s.visible_choose_rows().len(), 2);
+    }
+
+    /// A filter that matches nothing submits nothing, so an empty query cannot
+    /// pick a row the operator did not see.
+    #[test]
+    fn a_filter_that_matches_nothing_submits_no_option() {
+        let mut s = open_filterable_choose(&["alpha", "beta"]);
+        s.push_filter_char('z');
+        assert!(s.visible_choose_rows().is_empty());
+        assert!(
+            s.submit_choose().is_none_or(|(_, sel)| sel.is_empty()),
+            "no visible row means no selection"
+        );
+    }
+
+    /// Enter on a filter with no hits must not close the choose: there is no
+    /// option to pick, so the picker stays open and nothing is submitted. A
+    /// close here is what let an empty selection reach the provisioner.
+    #[test]
+    fn enter_on_an_empty_filter_keeps_the_choose_open() {
+        let mut s = open_filterable_choose(&["alpha", "beta"]);
+        s.push_filter_char('z');
+
+        assert!(
+            s.submit_choose().is_none(),
+            "nothing is submitted for a filter with no hits"
+        );
+        assert!(
+            s.active_choose().is_some(),
+            "the choose stays open so the operator can change the filter"
+        );
     }
 
     fn open_prompt(secret: bool) -> SetupOverlayState {

@@ -84,6 +84,7 @@ impl TuiProvisioner for EmbeddingRoutesProvisioner {
                     label: "Embedding routes".into(),
                     options: vec!["Add a route".to_string(), "Done".to_string()],
                     multi: false,
+                    filterable: false,
                 },
             )
             .await?;

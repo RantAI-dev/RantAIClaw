@@ -61,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic history compaction keeps fewer recent messages for `max_history_messages` from 19 to 39. The
   kept window is now the smaller of 20 and half the limit, so more history is summarised per pass. Limits of
   40 and up, including the default of 50, keep 20 as before. Below 8, only the hard trim runs, as before.
+- `/config` sets nothing. The `model` and `debug` keys are gone: `/config model` changes no setting and
+  answers that the model is changed with `/model`, and the debug toggle is removed with the `/config debug`
+  key, the `/debug` command and the `/status` Debug row. `/model <provider:model>` changes the model.
 
 ### Fixed
 
@@ -90,6 +93,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The daily token ceiling now counts turns on the OpenAI-compatible, Anthropic, OpenRouter, Ollama,
   Copilot and Bedrock providers. Before, those turns were not recorded, so the ceiling could not
   stop them. A provider that does not report token counts still adds nothing to the day's total.
+- `/model` saved a provider and model name that could not be built, which left the next launch unable to
+  run and put the operator back in setup. The TUI now builds the provider through the same factory the
+  agent uses before anything is written, and a target it refuses answers `Model not changed: <provider>
+  cannot run this model: <reason>`, leaving the saved model and the running agent as they were. The status
+  bar changes only once the agent reports the new model in place; a rebuild that fails says
+  `Model not changed: the agent could not be rebuilt: <reason>` in the chat and keeps the old model.
+- The setup model step offered fewer models than `/model`: it listed the curated catalog and cut the list
+  at 120 rows. Both surfaces now read one list, the provider's whole catalog (the cache when it holds
+  models, else the curated list) plus the active model when the catalog does not already hold it. The setup
+  step narrows that list by typing, so the 120-row cap is gone, and a `custom:<base-url>` endpoint offers
+  its cached models with a row to type a name instead.
 - The `channel` of a tool-call audit line names the surface that made the call. A call made from the
   TUI or the web console was recorded as `cli`, the value the agent passes for its approval
   behaviour. It now records `tui` or `console`; the chat, CLI, webhook, delegate and cron lines are

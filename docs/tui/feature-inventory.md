@@ -49,7 +49,7 @@ takes over.
 | Widget               | Trigger                                | Navigation                                        | Status |
 | -------------------- | -------------------------------------- | ------------------------------------------------- | ------ |
 | Slash autocomplete   | Typing `/` (with no spaces yet)        | `Up`/`Down` cycle, `Tab` complete, `Enter` complete-then-submit, `Esc` dismiss. Filters by prefix on every keystroke. | ✅ live |
-| Model picker         | `/model` (no args)                     | `Up`/`Down` navigate (wraps), `Enter` select, `Esc` cancel. Pre-selects current `provider:model`. Built from curated lists for enabled providers. | ✅ live (added this session) |
+| Model picker         | `/model` (no args)                     | `Up`/`Down` navigate (wraps), typing filters the visible rows, `Enter` select, `Esc` cancel. Pre-selects current `provider:model`. Lists each enabled provider's whole catalog (cached models, else the curated list) plus the active model when the catalog lacks it. A `custom:<base-url>` provider lists that endpoint's cached models, and `custom:<url>:<model>` is a valid target. The empty text is true: a configured provider with no known models says so and points at `/model <provider:model>`; with no provider at all it points at `rantaiclaw setup provider`. | ✅ live (added this session) |
 | Help overlay (`/help`)| `/help`                               | **Read-only** — `Esc`/`Tab` accepted by handler but content is now flushed to scrollback as a plain block (no live nav). | ⚠️ degraded — was a tabbed modal pre-inline rewrite, now just dumps to scrollback |
 | Streaming spinner    | While `AppState::Streaming`            | None — passive UI element with Braille frames and live snippet. | ✅ live |
 
@@ -82,8 +82,7 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 | Command       | Aliases    | Description                                                | Output        | Args |
 | ------------- | ---------- | ---------------------------------------------------------- | ------------- | ---- |
 | `/status`     |            | Show current session and agent status.                     | scrollback    | none |
-| `/debug`      |            | Toggle debug mode.                                         | scrollback    | none |
-| `/config`     |            | Inspect or set configuration values.                       | scrollback    | `[key] [value]` |
+| `/config`     |            | Inspect configuration values. It sets nothing: the model is changed with `/model`, everything else with `/setup`. | scrollback    | `[key]` |
 | `/doctor`     |            | Run diagnostics and health checks.                         | scrollback    | none |
 | `/platforms`  |            | Show active communication platforms.                       | scrollback    | none |
 
@@ -108,8 +107,18 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 
 | Command       | Aliases    | Description                                                | Output                         | Args |
 | ------------- | ---------- | ---------------------------------------------------------- | ------------------------------ | ---- |
-| `/model`      |            | Pick or change the active model. Persists `default_provider`/`default_model` to config and hot-reloads the running agent — the next turn uses the new model. | **interactive picker** (no args) / scrollback msg (with args) | `[provider:model]` |
+| `/model`      |            | Pick or change the active model. Builds the provider first, then saves `default_provider`/`default_model` and reloads the running agent. | **interactive picker** (no args) / scrollback msg (with args) | `[provider:model]` |
 | `/usage`      |            | Show token usage statistics.                               | scrollback                     | none |
+
+`/model <provider:model>` is refused before anything is written. The TUI builds the provider through the
+same factory the agent uses, so a target that cannot run (`/model nosuch:xyz`) answers `Model not
+changed: <provider> cannot run this model: <reason>`: nothing is saved, no reload is sent, and the
+status bar keeps naming the model the agent runs.
+
+The status bar moves only when the reload reports the new agent in place. Until then the agent is still
+on the old model, so a `/model` switch that is still loading does not change the label. If the rebuild
+fails, the chat says `Model not changed: the agent could not be rebuilt: <reason>` and the status bar
+keeps the old model.
 
 ### Other
 
@@ -143,7 +152,7 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 | ------------------------- | -------- |
 | Profile selection         | `--profile <name>` CLI flag or `RANTAICLAW_PROFILE` env. The TUI reads the active profile's `config.toml` at launch. |
 | Available providers list  | `default_provider` + any unique providers in `model_routes`, exposed via `ctx.available_providers` and consumed by the model picker. |
-| Status-bar model display  | Reflects `default_provider:default_model` from config (overridden by `--model` flag if given, or by `/model` selection at runtime). |
+| Status-bar model display  | Reflects `default_provider:default_model` from config (overridden by `--model` flag if given, or by `/model` selection at runtime). A `/model` selection moves it only once the reload reports the new agent in place, so the label always names the model the agent is actually running. |
 | Tracing                   | TUI tick logs go to `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log` (avoids alt-screen corruption). |
 
 ---
@@ -158,7 +167,7 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 | `/personality`                       | Switch by typing name.                                          | Up/Down preset picker (executive-assistant, friendly-companion, …). |
 | `/cron`                              | Subcommand-style scrollback output.                             | Up/Down cron-job picker with edit/delete/run-now actions. |
 | `/memory`                            | List/get/clear via subcommands.                                 | Up/Down memory entry list with preview pane. |
-| `/config`                            | `key = value` text edits.                                       | Up/Down list of editable keys; `Enter` to enter edit mode. |
+| `/config`                            | Shows current values in an inspector; sets nothing.            | Could gain a filter over the config tree. |
 | `/doctor`                            | Static report.                                                  | Up/Down list of findings; `Enter` to expand a finding's hint. |
 | `/insights`                          | Static stats block.                                             | Could swap to a small dashboard pane. |
 | Status bar (`/sb`/`/statusbar`)     | Toggle on/off only.                                             | Could pick between brief/full layouts. |

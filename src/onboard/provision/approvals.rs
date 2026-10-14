@@ -86,6 +86,7 @@ impl TuiProvisioner for ApprovalsProvisioner {
                 label: "Approval tier".into(),
                 options,
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

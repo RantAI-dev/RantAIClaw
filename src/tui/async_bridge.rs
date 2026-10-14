@@ -161,6 +161,12 @@ impl TuiAgentActor {
                             }
                             Err(e) => {
                                 tracing::error!("failed to reload agent: {e}");
+                                let _ = self
+                                    .events_tx
+                                    .send(crate::agent::events::AgentEvent::ReloadFailed {
+                                        error: format!("{e:#}"),
+                                    })
+                                    .await;
                             }
                         }
                     }
@@ -320,6 +326,12 @@ impl TuiAgentActor {
                             }
                             Err(e) => {
                                 tracing::error!("failed to reload agent post-turn: {e}");
+                                let _ = self
+                                    .events_tx
+                                    .send(crate::agent::events::AgentEvent::ReloadFailed {
+                                        error: format!("{e:#}"),
+                                    })
+                                    .await;
                             }
                         }
                     }
@@ -976,6 +988,65 @@ mod tests {
         ] {
             assert!(all.contains(kept), "{kept} is missing:\n{all}");
         }
+    }
+
+    /// A `Reload` whose config cannot build an agent reports `ReloadFailed` to
+    /// the TUI, and the agent it already had keeps the conversation: the next
+    /// prompt is still answered under the old config.
+    #[tokio::test]
+    async fn failed_rebuild_reports_reload_failed_and_the_old_agent_still_answers() {
+        use crate::agent::door_test_support::DoorFixture;
+        let fixture = DoorFixture::start().await;
+        let agent = Agent::from_config(&fixture.config)
+            .await
+            .expect("the agent builds");
+
+        let mut broken = fixture.config.clone();
+        broken.default_provider = Some("nosuch-provider".to_string());
+
+        let (req_tx, req_rx) = mpsc::channel(16);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
+        req_tx
+            .send(TurnRequest::Reload(Box::new(broken)))
+            .await
+            .unwrap();
+
+        let mut reported = None;
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if let AgentEvent::ReloadFailed { error } = ev {
+                reported = Some(error);
+                break;
+            }
+        }
+        let error = reported.expect("the failed rebuild is reported, not only logged");
+        assert!(
+            error.contains("nosuch-provider"),
+            "the report names the provider that could not be built: {error}"
+        );
+
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "still there?".into(),
+                conversation_id: None,
+            })
+            .await
+            .unwrap();
+        let mut answered = false;
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if matches!(ev, AgentEvent::Done { .. }) {
+                answered = true;
+                break;
+            }
+        }
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+
+        assert!(
+            answered,
+            "the previous agent still answers after a failed rebuild"
+        );
+        fixture.llm.wait_for_requests(1).await;
     }
 
     /// Two exchanges, then `Reload` (what `/model` sends), then a message: the

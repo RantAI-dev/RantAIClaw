@@ -1224,6 +1224,12 @@ async fn agent_chat_stream(
                 crate::agent::AgentEvent::ReloadComplete { .. } => serde_json::json!({
                     "type": "reload_complete",
                 }),
+                // Reload failure is TUI-only too: per-request gateway agents
+                // never receive a `Reload`. Kept exhaustive for the compiler.
+                crate::agent::AgentEvent::ReloadFailed { error } => serde_json::json!({
+                    "type": "reload_failed",
+                    "error": error,
+                }),
                 // Compaction is TUI-only too — per-request gateway
                 // agents have a fresh history each call. Surface as
                 // a benign info line so the SSE stream is exhaustive.

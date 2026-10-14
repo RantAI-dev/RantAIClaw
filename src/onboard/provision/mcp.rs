@@ -99,6 +99,7 @@ impl TuiProvisioner for McpProvisioner {
                 label: "Select MCP servers to install (multi-select)".into(),
                 options: all_options,
                 multi: true,
+                filterable: false,
             },
         )
         .await?;
@@ -147,6 +148,7 @@ impl TuiProvisioner for McpProvisioner {
                     "Yes — install all zero-auth servers".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

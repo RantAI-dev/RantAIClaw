@@ -78,11 +78,14 @@ impl TuiProvisioner for LoginProvisioner {
                 label: "Enable console login (username + password)?".into(),
                 options: vec!["Enable".into(), "Skip / disable".into()],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
         let selection = recv_selection(&mut responses).await?;
-        if selection.first().copied().unwrap_or(0) == 1 {
+        // Only an explicit "Enable" (row 0) continues; an empty answer takes the
+        // disable branch, as the sibling surfaces route empty to their off arm.
+        if selection.first().copied() != Some(0) {
             // Disable: clear any stored credential so the gate turns off, and
             // drop the auto-lock window with it — it is meaningless with no
             // credential to unlock.
@@ -163,13 +166,17 @@ impl TuiProvisioner for LoginProvisioner {
                 label: "Lock automatically after a stretch of inactivity?".into(),
                 options: IDLE_PRESETS.iter().map(|(l, _)| (*l).to_string()).collect(),
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
         let choice = recv_selection(&mut responses).await?;
-        let idle_secs = IDLE_PRESETS
-            .get(choice.first().copied().unwrap_or(0))
-            .map_or(0, |(_, secs)| *secs);
+        let Some(&choice_idx) = choice.first() else {
+            return Ok(ProvisionOutcome::Aborted(
+                "no idle timeout was selected".to_string(),
+            ));
+        };
+        let idle_secs = IDLE_PRESETS.get(choice_idx).map_or(0, |(_, secs)| *secs);
 
         config.gateway.login.username = Some(username);
         config.gateway.login.password_hash =
@@ -231,6 +238,44 @@ async fn leave_disabled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty answer at "Enable console login?" must not enable the gate or
+    /// ask for credentials. A stored credential stays cleared.
+    #[tokio::test]
+    async fn empty_enable_answer_leaves_console_login_disabled() {
+        use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.gateway.login.username = Some("stale-op".into());
+        config.gateway.login.password_hash = Some("stale-hash".into());
+        config.gateway.login.idle_timeout_secs = 900;
+
+        let t = drive(
+            &LoginProvisioner,
+            &mut config,
+            &profile,
+            vec![Answer::Empty],
+        )
+        .await;
+
+        let asked_for_credentials = t.events.iter().any(|e| {
+            matches!(e, ProvisionEvent::Prompt { id, .. } if id == "username" || id == "password")
+        });
+        assert!(
+            !asked_for_credentials,
+            "an empty enable answer must not reach the credential prompts"
+        );
+        assert!(
+            t.configured(),
+            "the disable branch completes: {:?}",
+            t.outcome
+        );
+        assert_eq!(config.gateway.login.username, None, "gate stays off");
+        assert_eq!(config.gateway.login.password_hash, None, "gate stays off");
+        assert_eq!(config.gateway.login.idle_timeout_secs, 0);
+    }
 
     #[tokio::test]
     async fn leave_disabled_clears_the_login_gate() {

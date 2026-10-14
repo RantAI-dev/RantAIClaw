@@ -102,6 +102,7 @@ impl TuiProvisioner for MultimodalProvisioner {
                     "Yes — allow remote URLs".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

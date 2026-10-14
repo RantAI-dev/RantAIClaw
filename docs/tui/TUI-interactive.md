@@ -446,7 +446,9 @@ Delete the `CHANNEL_TYPES` const (not used after this).
 **Prompt schedule:**
 1. `Choose` — provider list. Single-select. Options pulled from `crate::providers::available_providers()` (use the same enum the legacy section reads).
 2. `Prompt` (secret) — API key. Default: `None`. Validation: pre-flight ping via `validate::http::probe_get` to the provider's `/v1/models` endpoint with the key as `Bearer`. On 200 OK → continue; on 401 → re-prompt with "invalid key" message; on network error → warn + continue (defer to runtime).
-3. `Choose` — model list. Single-select. Options fetched live from the provider's `/v1/models` endpoint after the key is validated. If list fetch fails, fall back to a hardcoded "Top 5" per provider (read from `crate::providers::default_models()`).
+3. `Choose` — model list. Single-select, and filterable by typing (`filterable: true`). The options are `crate::onboard::wizard::provider_model_list`: the provider's whole catalog (the workspace cache when it holds models, else the curated list) plus the active model when the catalog lacks it. This is the same list the `/model` picker offers, and it is not capped. The old 120-row cap existed because the setup `Choose` had no filter box, and it now filters by typing.
+
+**Custom endpoint:** a `custom:<base url>` provider reads its model list under the same `custom:<base url>` key `/model` uses. When the endpoint has cached models they are offered as a filterable `Choose` with a `type a model name` row last, and that row asks for the name with the `custom_model` `Prompt` below. With no cached models the `Prompt` is asked directly, as before.
 
 **Config writes:**
 - `config.providers.<provider>.api_key = Some(encrypt(key))` — use `crate::secrets::encrypt_for_profile(profile, key)` per existing pattern.

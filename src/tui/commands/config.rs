@@ -22,12 +22,8 @@ impl CommandHandler for StatusCommand {
 
         let panel = InfoPanel::new("Status")
             .with_subtitle("session snapshot")
-            .with_footer("Esc close · /config to edit · /usage for tokens")
-            .section(
-                InfoSection::new("Agent")
-                    .key_value("Model", &ctx.model)
-                    .key_value("Debug", if ctx.debug_mode { "on" } else { "off" }),
-            )
+            .with_footer("Esc close · /model for the model · /setup for config")
+            .section(InfoSection::new("Agent").key_value("Model", &ctx.model))
             .section(
                 InfoSection::new("Session")
                     .key_value("ID", session_short)
@@ -38,26 +34,8 @@ impl CommandHandler for StatusCommand {
     }
 }
 
-/// /debug command — toggle debug mode on or off
-pub struct DebugCommand;
-
-impl CommandHandler for DebugCommand {
-    fn name(&self) -> &str {
-        "debug"
-    }
-
-    fn description(&self) -> &str {
-        "Toggle debug mode"
-    }
-
-    fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        ctx.debug_mode = !ctx.debug_mode;
-        let state = if ctx.debug_mode { "on" } else { "off" };
-        Ok(CommandResult::Message(format!("Debug mode: {}", state)))
-    }
-}
-
-/// /config command — inspect or set runtime configuration keys
+/// /config command — inspect runtime configuration. It sets nothing: the model
+/// is changed with `/model`, and every other setting is changed with `/setup`.
 pub struct ConfigCommand;
 
 impl CommandHandler for ConfigCommand {
@@ -66,29 +44,24 @@ impl CommandHandler for ConfigCommand {
     }
 
     fn description(&self) -> &str {
-        "Inspect or set configuration values"
+        "Inspect configuration values"
     }
 
     fn usage(&self) -> &str {
-        "/config [model|debug] [value]"
+        "/config [key]"
     }
 
-    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+    fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
         let parts: Vec<&str> = args.split_whitespace().collect();
 
         match parts.len() {
             0 => {
-                // Open the config inspector panel. Editing config still
-                // happens via `/config <key> <value>` and `/setup`.
+                // Open the config inspector panel. Settings change through
+                // `/model` (the model) and `/setup` (everything else).
                 let panel = InfoPanel::new("Config")
-                    .with_subtitle("session-level keys")
+                    .with_subtitle("current values")
                     .with_footer(
-                        "Esc close · `/config <key> <value>` to set · `/setup` for full wizard",
-                    )
-                    .section(
-                        InfoSection::new("Runtime")
-                            .key_value("model", &ctx.model)
-                            .key_value("debug", if ctx.debug_mode { "true" } else { "false" }),
+                        "Esc close · `/model` to change the model · `/setup` for the wizard",
                     )
                     .section(InfoSection::new("Persisted").plain(
                         "On-disk config lives at \
@@ -99,54 +72,35 @@ impl CommandHandler for ConfigCommand {
                 Ok(CommandResult::OpenInfoPanel(panel))
             }
             1 => {
-                // Show a specific key
+                // `/config model` used to read the session label; the model
+                // now lives in `/model`, and no key here is readable any more.
                 let key = parts[0];
-                match key {
-                    "model" => Ok(CommandResult::Message(format!("model = {}", ctx.model))),
-                    "debug" => Ok(CommandResult::Message(format!(
-                        "debug = {}",
-                        ctx.debug_mode
-                    ))),
-                    _ => Ok(CommandResult::Message(format!(
-                        "Unknown config key: {key}. Supported: model, debug. Use /setup to edit persisted config."
-                    ))),
-                }
+                Ok(CommandResult::Message(config_key_message(key)))
             }
             _ => {
-                // Set key = value (everything after the key is the value).
-                // These are SESSION-ONLY toggles — they never touch config.toml.
+                // Setting a value here is refused, never applied: a session-only
+                // label that the agent does not follow is the bug this command
+                // used to ship. The model is changed with `/model`.
                 let key = parts[0];
-                let value = parts[1..].join(" ");
-                match key {
-                    "model" => {
-                        ctx.model = value.clone();
-                        Ok(CommandResult::Message(format!(
-                            "model set to: {value} (session only — use /setup to persist)"
-                        )))
-                    }
-                    "debug" => {
-                        let enabled = match value.trim().to_ascii_lowercase().as_str() {
-                            "true" | "1" | "on" => true,
-                            "false" | "0" | "off" => false,
-                            other => {
-                                // Reject rather than silently coercing to false.
-                                return Ok(CommandResult::Message(format!(
-                                    "debug expects a boolean (true/false), got `{other}`"
-                                )));
-                            }
-                        };
-                        ctx.debug_mode = enabled;
-                        Ok(CommandResult::Message(format!(
-                            "debug set to: {} (session only — use /setup to persist)",
-                            ctx.debug_mode
-                        )))
-                    }
-                    _ => Ok(CommandResult::Message(format!(
-                        "Unknown config key: {key}. Supported: model, debug. Use /setup to edit persisted config."
-                    ))),
-                }
+                Ok(CommandResult::Message(config_key_message(key)))
             }
         }
+    }
+}
+
+/// The answer to `/config <key>` and `/config <key> <value>`. Neither reads nor
+/// writes anything: a key `/config` used to set is now named as a `/model`
+/// change, and every other key is unknown here.
+fn config_key_message(key: &str) -> String {
+    if key == "model" {
+        "The model is changed with `/model <provider:model>`, which saves it and reloads the agent. \
+         `/config` does not set it."
+            .to_string()
+    } else {
+        format!(
+            "Unknown config key: {key}. `/config` only shows values. Use `/setup` to edit config, \
+             or `/model` to change the model."
+        )
     }
 }
 
@@ -655,58 +609,79 @@ mod tests {
         }
     }
 
+    /// `/config model` used to change `ctx.model` for the session while the
+    /// agent kept its model. It now changes nothing and names `/model`.
     #[test]
-    fn debug_command_toggles_mode() {
-        let cmd = DebugCommand;
-        let mut ctx = test_context();
-
-        assert!(!ctx.debug_mode);
-
-        cmd.execute("", &mut ctx).unwrap();
-        assert!(ctx.debug_mode);
-
-        cmd.execute("", &mut ctx).unwrap();
-        assert!(!ctx.debug_mode);
-    }
-
-    #[test]
-    fn config_command_sets_values() {
+    fn config_model_changes_nothing_and_names_model_command() {
         let cmd = ConfigCommand;
         let mut ctx = test_context();
+        let before = ctx.model.clone();
 
-        let result = cmd.execute("model new-model", &mut ctx).unwrap();
+        let result = cmd.execute("model openai:audit-alt", &mut ctx).unwrap();
 
-        assert_eq!(ctx.model, "new-model");
-        match result {
-            CommandResult::Message(m) => assert!(
-                m.contains("session only"),
-                "set message must be honest about session-only scope: {m}"
-            ),
-            _ => panic!("expected a Message"),
-        }
-    }
-
-    #[test]
-    fn config_debug_rejects_non_bool_instead_of_coercing() {
-        let cmd = ConfigCommand;
-        let mut ctx = test_context();
-        assert!(!ctx.debug_mode);
-
-        // A garbage value must NOT silently flip debug to false.
-        let result = cmd.execute("debug maybe", &mut ctx).unwrap();
-        assert!(!ctx.debug_mode);
+        assert_eq!(
+            ctx.model, before,
+            "/config must not change the status-bar model"
+        );
         match result {
             CommandResult::Message(m) => {
-                assert!(m.contains("boolean"), "expected a rejection message: {m}");
+                assert!(m.contains("/model"), "the answer must point to /model: {m}");
             }
             _ => panic!("expected a Message"),
         }
+    }
 
-        // A real bool still works.
-        cmd.execute("debug on", &mut ctx).unwrap();
-        assert!(ctx.debug_mode);
-        cmd.execute("debug off", &mut ctx).unwrap();
-        assert!(!ctx.debug_mode);
+    /// The `/config` inspector and its help list no longer offer `model` or
+    /// `debug`: the model is changed with `/model`, and the debug toggle is gone.
+    #[test]
+    fn config_panel_lists_neither_model_nor_debug_as_settable() {
+        let cmd = ConfigCommand;
+        let mut ctx = test_context();
+
+        let CommandResult::OpenInfoPanel(panel) = cmd.execute("", &mut ctx).unwrap() else {
+            panic!("bare /config opens the inspector");
+        };
+        let rows: Vec<String> = panel
+            .sections
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .filter_map(|row| match row {
+                InfoRow::KeyValue { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !rows.iter().any(|k| k == "model" || k == "debug"),
+            "{rows:?}"
+        );
+
+        let CommandResult::Message(unknown) = cmd.execute("debug on", &mut ctx).unwrap() else {
+            panic!("expected a Message");
+        };
+        assert!(
+            unknown.contains("Unknown config key") && !unknown.contains("debug,"),
+            "the help must not advertise debug: {unknown}"
+        );
+    }
+
+    /// `/status` no longer shows a Debug row: the toggle it reported is removed.
+    #[test]
+    fn status_panel_has_no_debug_row() {
+        let mut ctx = test_context();
+        let CommandResult::OpenInfoPanel(panel) = StatusCommand.execute("", &mut ctx).unwrap()
+        else {
+            panic!("/status opens a panel");
+        };
+        let keys: Vec<String> = panel
+            .sections
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .filter_map(|row| match row {
+                InfoRow::KeyValue { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!keys.iter().any(|k| k == "Debug"), "{keys:?}");
     }
 
     #[test]

@@ -83,12 +83,17 @@ impl TuiProvisioner for PersonaProvisioner {
                 label: "Pick a persona preset".into(),
                 options: preset_options.clone(),
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
 
         let selection = recv_selection(&mut responses).await?;
-        let preset_idx = selection.first().copied().unwrap_or(0);
+        let Some(&preset_idx) = selection.first() else {
+            return Ok(ProvisionOutcome::Aborted(
+                "no persona preset was selected".to_string(),
+            ));
+        };
         let preset = PresetId::ALL
             .get(preset_idx)
             .copied()
@@ -148,6 +153,7 @@ impl TuiProvisioner for PersonaProvisioner {
                 label: "Tone".into(),
                 options: tone_options,
                 multi: false,
+                filterable: false,
             },
         )
         .await?;

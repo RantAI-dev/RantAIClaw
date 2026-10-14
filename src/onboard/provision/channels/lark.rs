@@ -134,15 +134,23 @@ impl TuiProvisioner for LarkProvisioner {
                     "Lark (International)".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
-        let use_feishu = recv_selection(&mut responses)
-            .await?
-            .first()
-            .copied()
-            .unwrap_or(0)
-            == 0;
+        // An empty answer picks no host. Abort before any credential is sent to
+        // one, the same idiom the other single-select write sites use.
+        let Some(&region) = recv_selection(&mut responses).await?.first() else {
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "No region was selected.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted("No region was selected.".into()));
+        };
+        let use_feishu = region == 0;
 
         // Validate by getting tenant access token
         send(
@@ -222,6 +230,7 @@ impl TuiProvisioner for LarkProvisioner {
                     "Webhook (requires public HTTPS URL)".to_string(),
                 ],
                 multi: false,
+                filterable: false,
             },
         )
         .await?;
@@ -333,6 +342,56 @@ pub(crate) fn classify_tenant_token_body(body: &str) -> verdict::ProbeVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty answer at the Region choose must abort before any credential
+    /// is sent to a host: it picks no deployment, so it must not pick Feishu.
+    #[tokio::test]
+    async fn empty_region_answer_aborts_before_any_host_is_chosen() {
+        use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+
+        let t = drive(
+            &LarkProvisioner,
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("cli_test_app"),
+                Answer::Text("test-secret"),
+                Answer::Empty,
+            ],
+        )
+        .await;
+
+        assert!(
+            !t.configured(),
+            "an empty region must not complete: {:?}",
+            t.outcome
+        );
+        assert!(
+            matches!(t.outcome, Ok(ProvisionOutcome::Aborted(_))),
+            "the flow aborts: {:?}",
+            t.outcome
+        );
+        assert!(
+            t.events
+                .iter()
+                .any(|e| matches!(e, ProvisionEvent::Failed { .. })),
+            "the abort is reported as a failure"
+        );
+        // The flow stops at the region, before any credential is validated
+        // against a host. The validation step announces itself, so its absence
+        // shows no host was contacted.
+        assert!(
+            !t.messages()
+                .iter()
+                .any(|m| m.contains("Validating credentials")),
+            "no host is probed for an empty region: {:?}",
+            t.messages()
+        );
+    }
 
     /// The region selection used to be a branch that could not take its Feishu
     /// arm, so a Feishu tenant's credentials were always sent to the Lark
