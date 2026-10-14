@@ -383,9 +383,12 @@ Notable optional features: `channel-matrix`, `observability-otel`, `kb-office`,
 because both are already in the default build — `channel-lark` directly,
 `rag-pdf` indirectly through the default `kb` feature.
 
-The Landlock crate compiles in automatically on Linux with no feature flag, but see
-**What these controls do not cover** — the sandbox layer is not wired to command
-execution yet.
+The feature list above is the whole conditional surface. There is no sandbox crate in
+the build and no sandbox feature: nothing pulls in Landlock, firejail or bubblewrap
+on any platform. What confines commands is `[runtime].kind`, `native` or `docker`,
+and a command naming a credential directory is refused at every autonomy level with
+no approval that can lift it. See **What these controls do not cover** for what that
+leaves open.
 
 ## Supply chain
 
