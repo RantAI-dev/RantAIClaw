@@ -64,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `doctor` passed an MCP server that was on PATH but could not start. It now starts each configured server, completes the initialize handshake and lists tools under a 10-second per-server deadline, and names the failing server and the step that failed; `--offline` keeps the PATH-only scan.
 - The shell security note claimed an automatic Landlock sandbox with a Firejail fallback that the code does not have. The note is rewritten in English and states the controls that exist: the command allowlist, the credential-directory refusal, the central read-only gate, the per-hour action budget, the 600 s timeout, the 1 MiB output cap, and `[runtime].kind`.
 - In the console's approval modal, Always did nothing beyond the current reply: the next message asked again. Always on a command outside the allowlist now holds until the conversation ends. It does not carry into another conversation, and it is cleared when the conversation is deleted or the autonomy preset changes. Medium-risk prompts and tools forced to prompt still ask every time.
 - `memory clear` and `/clear` stopped at 1000 entries and reported the rest as gone: with 1001 notes one stayed, and the summary still said everything was cleared. A lookup by key prefix (`memory get`, `memory clear --key`) or by text (`memory_store` `replaces`) missed notes older than the newest 1000.
