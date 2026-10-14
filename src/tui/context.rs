@@ -108,6 +108,9 @@ pub struct TuiContext {
     /// Number of turn requests currently queued at the actor (submitted but
     /// not yet completed). Incremented on submit, decremented on `Done`.
     pub queued_turns: usize,
+    /// A history reseed the request channel was full for. Sent by
+    /// `flush_pending_reseed` before the next request.
+    pub pending_reseed: Option<Vec<(String, String)>>,
     /// Canonical names of providers detected as enabled (have an API key
     /// configured) when the TUI launched. Used by `/model` to populate
     /// the model picker. First entry is the primary/default provider.
@@ -266,6 +269,7 @@ impl TuiContext {
             req_tx,
             events_rx,
             queued_turns: 0,
+            pending_reseed: None,
             available_providers: Vec::new(),
             workspace_dir: None,
             available_skills: Vec::new(),
@@ -738,23 +742,23 @@ impl TuiContext {
         Ok(removed)
     }
 
-    /// Drop the last assistant reply and everything after it from the screen
-    /// and the stored session, keeping the user turn before it. The agent is
-    /// reseeded with the turns before that user turn, since the retry sends
-    /// it again. Returns `false` when there is no reply to drop.
+    /// Drop what followed the last user turn (its reply, or the note a failed
+    /// turn left) from the screen and the stored session. The user turn stays:
+    /// the retry is sent again without being appended. The agent is reseeded
+    /// with the turns before that user turn, since the retry sends it again.
+    /// Returns `false` when there is no user turn to retry.
     pub fn drop_last_reply(&mut self) -> Result<bool> {
-        let Some(reply) = self.messages.iter().rposition(|m| m.role == "assistant") else {
+        let Some(user) = self.messages.iter().rposition(|m| m.role == "user") else {
             return Ok(false);
         };
-        let reply_id = self.messages[reply].id;
+        let first_after = user + 1;
         if let Some(sid) = self.session_id.clone() {
-            self.session_store.delete_messages_from(&sid, reply_id)?;
+            if let Some(after) = self.messages.get(first_after) {
+                self.session_store.delete_messages_from(&sid, after.id)?;
+            }
         }
-        self.messages.truncate(reply);
-        let before_turn = match self.messages.iter().rposition(|m| m.role == "user") {
-            Some(user) => crate::sessions::turns_for_history(&self.messages[..user]),
-            None => Vec::new(),
-        };
+        self.messages.truncate(first_after);
+        let before_turn = crate::sessions::turns_for_history(&self.messages[..user]);
         self.reseed_agent(&before_turn);
         Ok(true)
     }
@@ -763,15 +767,45 @@ impl TuiContext {
     /// conversational turns of the session the screen now shows. Sent on the
     /// same channel as `Submit`, so the next prompt is sent with them.
     ///
-    /// Best effort: the screen has already changed, and a channel that is
-    /// closed means the actor has gone with the TUI, so nothing is lost by
-    /// logging it rather than failing the command.
-    pub fn reseed_agent(&self, turns: &[(String, String)]) {
-        if let Err(e) = self
+    /// This runs from sync command code, so it cannot await. A reseed the
+    /// channel cannot take now is held in `pending_reseed` and sent by
+    /// [`TuiContext::flush_pending_reseed`], which the async caller awaits
+    /// before any request goes out. A closed channel means the actor is gone,
+    /// so it is surfaced in `last_error` rather than dropped.
+    pub fn reseed_agent(&mut self, turns: &[(String, String)]) {
+        match self
             .req_tx
             .try_send(TurnRequest::SetHistory(turns.to_vec()))
         {
-            tracing::warn!("could not reseed the agent history: {e}");
+            Ok(()) => {
+                // This reseed supersedes any held earlier one: sending the
+                // held one afterwards would put the agent back on old history.
+                self.pending_reseed = None;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Newest wins: a later reseed replaces an unsent earlier one.
+                self.pending_reseed = Some(turns.to_vec());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.last_error = Some("agent bridge closed: history not reseeded".to_string());
+            }
+        }
+    }
+
+    /// Send a reseed that `reseed_agent` had to hold, awaiting room in the
+    /// channel. Call before dispatching any request, so the agent sees the
+    /// reseed first. A closed channel is surfaced in `last_error`.
+    pub async fn flush_pending_reseed(&mut self) {
+        let Some(turns) = self.pending_reseed.take() else {
+            return;
+        };
+        if self
+            .req_tx
+            .send(TurnRequest::SetHistory(turns))
+            .await
+            .is_err()
+        {
+            self.last_error = Some("agent bridge closed: history not reseeded".to_string());
         }
     }
 

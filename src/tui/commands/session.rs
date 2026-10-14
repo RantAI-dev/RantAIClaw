@@ -111,6 +111,15 @@ impl CommandHandler for ResumeCommand {
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let prefix = args.trim();
+        // An id that matches no session, or matches several, is refused with
+        // the same wording `session get` uses, and the current session stays.
+        if !prefix.is_empty() {
+            if let Err(e) =
+                crate::sessions::cli::resolve_session_for_resume(&ctx.session_store, prefix)
+            {
+                return Ok(CommandResult::Message(e.to_string()));
+            }
+        }
         let sessions = picker_sessions(ctx, args)?;
         let items = build_session_items(&sessions, ctx.session_id.as_deref());
         let preselect = if prefix.is_empty() {
@@ -266,6 +275,90 @@ mod tests {
         let mut ctx = test_context();
         let cmd = ResumeCommand;
         let result = cmd.execute("", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenListPicker(picker) => {
+                assert_eq!(picker.kind, ListPickerKind::Session);
+            }
+            other => panic!("expected OpenListPicker, got {other:?}"),
+        }
+    }
+
+    /// `/resume <id>` with no match answers with the `session get` wording and
+    /// keeps the current session, as the plan's TUI rule requires.
+    #[test]
+    fn resume_with_no_match_answers_and_keeps_the_current_session() {
+        let mut ctx = test_context();
+        ctx.append_user_message("the current conversation").unwrap();
+        let current = ctx.session_id.clone();
+
+        let result = ResumeCommand.execute("zzz-no-such", &mut ctx).unwrap();
+
+        match result {
+            CommandResult::Message(msg) => {
+                assert_eq!(msg, "no session matches prefix `zzz-no-such`");
+            }
+            other => panic!("expected the refusal Message, got {other:?}"),
+        }
+        assert_eq!(ctx.session_id, current, "the current session stays bound");
+    }
+
+    /// `/resume <prefix>` shared by several sessions answers with the
+    /// `session get` ambiguity wording and keeps the current session. Two
+    /// sessions are created and their ids share their first character, so the
+    /// one-character prefix is ambiguous whatever UUIDs the store drew.
+    #[test]
+    fn resume_with_an_ambiguous_prefix_answers_and_keeps_the_current_session() {
+        let mut ctx = test_context();
+        // Create sessions until two share a first hex digit. With 16 digits
+        // this takes a handful of draws; the bound makes a failure to find a
+        // pair an explicit test failure rather than a hang.
+        let mut ids: Vec<String> = Vec::new();
+        let mut shared: Option<char> = None;
+        for _ in 0..256 {
+            let id = ctx
+                .session_store
+                .new_session("test-model", "tui")
+                .unwrap()
+                .id;
+            let first = id.chars().next().expect("non-empty id");
+            if ids.iter().any(|other| other.starts_with(first)) {
+                shared = Some(first);
+                break;
+            }
+            ids.push(id);
+        }
+        let prefix = shared
+            .expect("two sessions share a first character")
+            .to_string();
+        ctx.append_user_message("the current conversation").unwrap();
+        let current = ctx.session_id.clone();
+
+        let result = ResumeCommand.execute(&prefix, &mut ctx).unwrap();
+
+        match result {
+            CommandResult::Message(msg) => assert!(
+                msg.starts_with(&format!("`{prefix}` is ambiguous (")),
+                "got {msg:?}"
+            ),
+            other => panic!("expected the ambiguity Message, got {other:?}"),
+        }
+        assert_eq!(ctx.session_id, current, "the current session stays bound");
+    }
+
+    /// A `/resume <id>` that resolves to one session still opens the picker,
+    /// so the refusal does not block a valid resume.
+    #[test]
+    fn resume_with_a_unique_match_opens_the_picker() {
+        let mut ctx = test_context();
+        let target = ctx
+            .session_store
+            .new_session("test-model", "tui")
+            .unwrap()
+            .id;
+        ctx.append_user_message("the current conversation").unwrap();
+
+        let result = ResumeCommand.execute(&target, &mut ctx).unwrap();
+
         match result {
             CommandResult::OpenListPicker(picker) => {
                 assert_eq!(picker.kind, ListPickerKind::Session);

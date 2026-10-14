@@ -3,8 +3,9 @@ use anyhow::Result;
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
 
-/// /retry command — drop the last assistant reply and re-dispatch
-/// the previous user message to the agent without making the user retype.
+/// /retry command — re-dispatch the last user message to the agent without
+/// making the user retype. The exchange is anchored on the last user row:
+/// whatever follows it (a reply, or a note from a failed turn) is dropped.
 pub struct RetryCommand;
 
 impl CommandHandler for RetryCommand {
@@ -17,17 +18,9 @@ impl CommandHandler for RetryCommand {
     }
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let Some(assistant_idx) = ctx.messages.iter().rposition(|m| m.role == "assistant") else {
+        let Some(user_idx) = ctx.messages.iter().rposition(|m| m.role == "user") else {
             return Ok(CommandResult::Message(
                 "No previous response to retry.".to_string(),
-            ));
-        };
-        let Some(user_idx) = ctx.messages[..assistant_idx]
-            .iter()
-            .rposition(|m| m.role == "user")
-        else {
-            return Ok(CommandResult::Message(
-                "No previous user message to retry.".to_string(),
             ));
         };
 
@@ -151,8 +144,10 @@ mod tests {
         }
     }
 
+    /// A first turn with no reply yet is still the exchange to retry: the
+    /// user row is the anchor, so the question is re-asked.
     #[test]
-    fn retry_with_no_assistant_reports_message() {
+    fn retry_with_only_a_user_turn_resubmits_it() {
         let cmd = RetryCommand;
         let mut ctx = test_context();
 
@@ -160,6 +155,22 @@ mod tests {
 
         let result = cmd.execute("", &mut ctx).unwrap();
         assert_eq!(ctx.messages.len(), 1);
+        match result {
+            CommandResult::RetryLast(text) => assert_eq!(text, "hello"),
+            other => panic!("expected RetryLast, got {other:?}"),
+        }
+    }
+
+    /// Notes are not turns: with only a note on screen there is no question to
+    /// re-ask, so the command refuses.
+    #[test]
+    fn retry_with_only_a_note_reports_message() {
+        let cmd = RetryCommand;
+        let mut ctx = test_context();
+
+        ctx.append_note_message("✗ provider timed out").unwrap();
+
+        let result = cmd.execute("", &mut ctx).unwrap();
         match result {
             CommandResult::Message(msg) => assert!(msg.contains("No previous response")),
             other => panic!("expected Message, got {other:?}"),

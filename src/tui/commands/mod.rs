@@ -89,6 +89,12 @@ pub enum CommandResult {
     /// Cancel the in-flight turn — the same TurnRequest::Cancel that Esc
     /// sends. The dispatcher owns the async send.
     CancelTurn,
+    /// Compact older turns into a summary — the `TurnRequest::Compact` that
+    /// `/compress` asks for. The dispatcher owns the async send, so a history
+    /// reseed still held for the agent goes first.
+    Compact {
+        keep_last: usize,
+    },
     /// Append `String` as a system message AND cancel the in-flight turn.
     /// Used by `/deny`: rejecting a pending shell approval should stop the
     /// turn (so the LLM doesn't retry alternative commands) — the same
