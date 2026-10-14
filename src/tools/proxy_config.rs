@@ -8,6 +8,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How long `set` and `apply_env` wait for a proxy URL to accept a TCP connection.
+const PROXY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct ProxyConfigTool {
     config: Arc<Config>,
@@ -247,6 +251,7 @@ impl ProxyConfigTool {
         proxy.no_proxy = proxy.normalized_no_proxy();
         proxy.services = proxy.normalized_services();
         proxy.validate()?;
+        ensure_proxy_reachable(&proxy).await?;
 
         cfg.proxy = proxy.clone();
         cfg.save().await?;
@@ -296,7 +301,7 @@ impl ProxyConfigTool {
         })
     }
 
-    fn handle_apply_env(&self) -> anyhow::Result<ToolResult> {
+    async fn handle_apply_env(&self) -> anyhow::Result<ToolResult> {
         let cfg = self.load_config_without_env()?;
         let proxy = cfg.proxy;
         proxy.validate()?;
@@ -312,6 +317,7 @@ impl ProxyConfigTool {
             );
         }
 
+        ensure_proxy_reachable(&proxy).await?;
         proxy.apply_to_process_env();
         set_runtime_proxy_config(proxy.clone());
 
@@ -351,6 +357,73 @@ fn redact_proxy_userinfo(url: &str) -> String {
         },
         None => url.to_string(),
     }
+}
+
+/// Refuse a proxy that would take effect but does not accept a TCP connection.
+///
+/// Only an enabled proxy with at least one URL is checked: a disabled proxy, or
+/// one whose URLs are all cleared, puts nothing into effect. The first URL that
+/// fails refuses the whole action, so nothing is written or applied.
+async fn ensure_proxy_reachable(proxy: &ProxyConfig) -> anyhow::Result<()> {
+    if !proxy.enabled {
+        return Ok(());
+    }
+    for url in [&proxy.http_proxy, &proxy.https_proxy, &proxy.all_proxy]
+        .into_iter()
+        .flatten()
+    {
+        let url = url.trim();
+        if !url.is_empty() {
+            probe_proxy_url(url).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn probe_proxy_url(url: &str) -> anyhow::Result<()> {
+    // The error text never carries the raw URL, so userinfo cannot leak through it.
+    let shown = redact_proxy_userinfo(url);
+    let (host, port) = proxy_probe_address(url).map_err(|_| {
+        anyhow::anyhow!("Proxy {shown} is not a valid proxy URL; nothing was changed.")
+    })?;
+    let connect = tokio::net::TcpStream::connect((host.as_str(), port));
+    match tokio::time::timeout(PROXY_PROBE_TIMEOUT, connect).await {
+        Ok(Ok(_stream)) => Ok(()),
+        Ok(Err(error)) => {
+            let reason = match error.kind() {
+                std::io::ErrorKind::ConnectionRefused => "connection refused",
+                _ => "could not connect; the host may not resolve or may be unreachable",
+            };
+            anyhow::bail!(
+                "Proxy {shown} did not accept a connection ({reason}); nothing was changed."
+            )
+        }
+        Err(_elapsed) => anyhow::bail!(
+            "Proxy {shown} did not accept a connection within {} seconds; nothing was changed.",
+            PROXY_PROBE_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// Host and port to probe for a proxy URL. A URL without an explicit port uses
+/// the scheme default: 80 for http, 443 for https, 1080 for socks5/socks5h.
+fn proxy_probe_address(url: &str) -> anyhow::Result<(String, u16)> {
+    let parsed = reqwest::Url::parse(url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("proxy URL has no host"))?;
+    // IPv6 literals come back bracketed; the connect call wants them bare.
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = match parsed.scheme() {
+        "socks5" | "socks5h" => parsed.port().unwrap_or(1080),
+        _ => parsed
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("proxy URL has no port"))?,
+    };
+    Ok((host, port))
 }
 
 #[async_trait]
@@ -443,7 +516,7 @@ impl Tool for ProxyConfigTool {
                 match action.as_str() {
                     "set" => self.handle_set(&args).await,
                     "disable" => self.handle_disable(&args).await,
-                    "apply_env" => self.handle_apply_env(),
+                    "apply_env" => self.handle_apply_env().await,
                     "clear_env" => self.handle_clear_env(),
                     _ => unreachable!("handled above"),
                 }
@@ -569,14 +642,16 @@ mod tests {
 
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let (_listener, url) = listening_proxy_url().await;
 
         let set_result = tool
             .execute(json!({
                 "action": "set",
                 "scope": "services",
-                "http_proxy": "http://127.0.0.1:7890",
+                "http_proxy": url,
                 "services": ["provider.openai", "tool.http_request"]
             }))
             .await
@@ -589,15 +664,213 @@ mod tests {
         assert!(get_result.output.contains("services"));
     }
 
+    const PROXY_ENV_KEYS: [&str; 8] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+
+    fn proxy_env_snapshot() -> Vec<Option<String>> {
+        PROXY_ENV_KEYS
+            .iter()
+            .map(|key| std::env::var(key).ok())
+            .collect()
+    }
+
+    fn restore_proxy_env(snapshot: &[Option<String>]) {
+        for (key, value) in PROXY_ENV_KEYS.iter().zip(snapshot) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    async fn listening_proxy_url() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        (listener, url)
+    }
+
     #[tokio::test]
-    async fn set_null_proxy_url_clears_existing_value() {
+    async fn set_to_listening_proxy_saves_and_applies() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tool = ProxyConfigTool::new(config.clone(), test_security());
+        let (_listener, url) = listening_proxy_url().await;
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "enabled": true,
+                "scope": "rantaiclaw",
+                "http_proxy": url,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let saved = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(saved.contains(&url), "saved config holds the URL: {saved}");
+        assert_eq!(
+            runtime_proxy_config().http_proxy.as_deref(),
+            Some(url.as_str())
+        );
+        set_runtime_proxy_config(ProxyConfig::default());
+    }
+
+    #[tokio::test]
+    async fn set_to_closed_port_is_refused_and_changes_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let env_before = proxy_env_snapshot();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tool = ProxyConfigTool::new(config.clone(), test_security());
+        let bytes_before = std::fs::read(&config.config_path).unwrap();
+        let runtime_before = runtime_proxy_config();
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "enabled": true,
+                "scope": "environment",
+                "http_proxy": "http://127.0.0.1:9",
+                "https_proxy": "http://127.0.0.1:9",
+            }))
+            .await
+            .unwrap();
+
+        let error = result.error.unwrap_or_default();
+        assert!(!result.success, "closed port must be refused");
+        assert!(
+            error.contains("http://127.0.0.1:9"),
+            "names the URL: {error}"
+        );
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(std::fs::read(&config.config_path).unwrap(), bytes_before);
+        assert_eq!(runtime_proxy_config().http_proxy, runtime_before.http_proxy);
+        assert_eq!(runtime_proxy_config().enabled, runtime_before.enabled);
+        assert_eq!(proxy_env_snapshot(), env_before);
+        restore_proxy_env(&env_before);
+    }
+
+    #[tokio::test]
+    async fn apply_env_refuses_saved_unreachable_proxy_and_leaves_env_alone() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let env_before = proxy_env_snapshot();
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.proxy.enabled = true;
+        config.proxy.scope = ProxyScope::Environment;
+        config.proxy.http_proxy = Some("http://127.0.0.1:9".into());
+        config.save().await.unwrap();
+        let tool = ProxyConfigTool::new(Arc::new(config), test_security());
+
+        let result = tool.execute(json!({"action": "apply_env"})).await.unwrap();
+
+        let error = result.error.unwrap_or_default();
+        assert!(!result.success, "unreachable saved proxy must be refused");
+        assert!(
+            error.contains("http://127.0.0.1:9"),
+            "names the URL: {error}"
+        );
+        assert_eq!(proxy_env_snapshot(), env_before);
+        restore_proxy_env(&env_before);
+    }
+
+    #[tokio::test]
+    async fn set_disabled_proxy_skips_reachability_check() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tool = ProxyConfigTool::new(config.clone(), test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "enabled": false,
+                "scope": "rantaiclaw",
+                "http_proxy": "http://127.0.0.1:9",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let saved = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(saved.contains("127.0.0.1:9"), "config saved: {saved}");
+        set_runtime_proxy_config(ProxyConfig::default());
+    }
+
+    #[tokio::test]
+    async fn refusal_redacts_proxy_userinfo() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "enabled": true,
+                "scope": "rantaiclaw",
+                "http_proxy": "http://user:secret@127.0.0.1:9",
+            }))
+            .await
+            .unwrap();
+
+        let error = result.error.unwrap_or_default();
+        assert!(!result.success);
+        assert!(error.contains("***@127.0.0.1:9"), "redacted URL: {error}");
+        assert!(!error.contains("secret"), "no credential in error: {error}");
+        assert!(!error.contains("user:"), "no credential in error: {error}");
+    }
+
+    #[test]
+    fn probe_address_uses_scheme_default_port_when_none_given() {
+        assert_eq!(
+            proxy_probe_address("http://proxy.internal").unwrap(),
+            ("proxy.internal".to_string(), 80)
+        );
+        assert_eq!(
+            proxy_probe_address("https://proxy.internal").unwrap(),
+            ("proxy.internal".to_string(), 443)
+        );
+        assert_eq!(
+            proxy_probe_address("socks5://proxy.internal").unwrap(),
+            ("proxy.internal".to_string(), 1080)
+        );
+        assert_eq!(
+            proxy_probe_address("socks5h://proxy.internal").unwrap(),
+            ("proxy.internal".to_string(), 1080)
+        );
+        assert_eq!(
+            proxy_probe_address("http://user:pw@127.0.0.1:3128").unwrap(),
+            ("127.0.0.1".to_string(), 3128)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_null_proxy_url_clears_existing_value() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let (_listener, url) = listening_proxy_url().await;
 
         let set_result = tool
             .execute(json!({
                 "action": "set",
-                "http_proxy": "http://127.0.0.1:7890"
+                "http_proxy": url
             }))
             .await
             .unwrap();
