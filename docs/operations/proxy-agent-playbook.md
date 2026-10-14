@@ -103,6 +103,8 @@ Expected behavior:
 
 - Runtime proxy is active for RantaiClaw HTTP clients.
 - `HTTP_PROXY` / `HTTPS_PROXY` process env exports are not required.
+- `set` probes each URL that would take effect (TCP connect, 3-second timeout). An unreachable URL is refused, the URL is named, and nothing is changed.
+- An accepted change applies at once to the running process, provider calls included.
 
 ---
 
@@ -128,6 +130,8 @@ Expected behavior:
 
 - Only matched services use proxy.
 - Unmatched services bypass proxy.
+- `set` probes each URL that would take effect (TCP connect, 3-second timeout). An unreachable URL is refused, the URL is named, and nothing is changed.
+- An accepted change applies at once to the running process, provider calls included.
 
 ---
 
@@ -147,6 +151,8 @@ Expected behavior:
 
 - Runtime proxy is active.
 - Environment variables are exported for the process.
+- `set` and `apply_env` probe each URL that would take effect (TCP connect, 3-second timeout). An unreachable URL is refused, the URL is named, and nothing is changed.
+- An accepted change applies at once to the running process, provider calls included.
 
 ---
 
@@ -207,6 +213,9 @@ Expected behavior:
 
 - Error: invalid proxy URL scheme
   - Allowed schemes: `http`, `https`, `socks5`, `socks5h`.
+
+- Error: `Proxy <url> did not accept a connection (...); nothing was changed.`
+  - Fix: confirm the host and port are reachable, the proxy process is up, and no firewall blocks it. Then retry `set` or `apply_env`. A URL without a port uses 80 (http), 443 (https) or 1080 (socks5/socks5h).
 
 - Proxy does not apply as expected
   - Run `{"action":"list_services"}` and verify service names/selectors.
