@@ -231,16 +231,7 @@ impl CommandHandler for UsageCommand {
                     .key_value("Completion", &counts[1])
                     .key_value("Total", &counts[2]),
             )
-            .section(
-                InfoSection::new("Model")
-                    .key_value("Active", &ctx.model)
-                    .key_value(
-                        "Context window",
-                        ctx.context_window
-                            .map(|w| format!("{w} tokens"))
-                            .unwrap_or_else(|| "unknown".to_string()),
-                    ),
-            );
+            .section(InfoSection::new("Model").key_value("Active", &ctx.model));
         Ok(CommandResult::OpenInfoPanel(panel))
     }
 }
@@ -305,6 +296,22 @@ mod tests {
         assert!(rows.contains(&"Prompt = 120".to_string()), "{rows:?}");
         assert!(rows.contains(&"Completion = 34".to_string()), "{rows:?}");
         assert!(rows.contains(&"Total = 154".to_string()), "{rows:?}");
+    }
+
+    /// The panel shows no context-window line: nothing in the code sets a
+    /// window size, so the line could only ever read `unknown`.
+    #[test]
+    fn usage_panel_has_no_context_window_line() {
+        let mut ctx = test_context();
+        let rows = panel_rows(&UsageCommand.execute("", &mut ctx).expect("panel"));
+        assert!(
+            rows.iter().all(|r| !r.contains("Context window")),
+            "no context-window row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.starts_with("Active = ")),
+            "the active model stays: {rows:?}"
+        );
     }
 
     #[test]

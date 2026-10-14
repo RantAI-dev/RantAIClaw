@@ -108,7 +108,7 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 | Command       | Aliases    | Description                                                | Output                         | Args |
 | ------------- | ---------- | ---------------------------------------------------------- | ------------------------------ | ---- |
 | `/model`      |            | Pick or change the active model. Builds the provider first, then saves `default_provider`/`default_model` and reloads the running agent. | **interactive picker** (no args) / scrollback msg (with args) | `[provider:model]` |
-| `/usage`      |            | Show token usage statistics.                               | scrollback                     | none |
+| `/usage`      |            | Show token usage for this session: prompt, completion and total tokens summed over every turn. `not reported` until a provider reports usage. Resets on `/new` and on resuming another session. | scrollback                     | none |
 
 `/model <provider:model>` is refused before anything is written. The TUI builds the provider through the
 same factory the agent uses, so a target that cannot run (`/model nosuch:xyz`) answers `Model not

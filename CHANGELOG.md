@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `/usage` showed only the last turn under "this session", and the status bar's token count
+  with it. It now sums every turn of the session; `/new` and switching sessions start the total
+  over, and a resumed session starts unreported because the store keeps no per-turn usage. The
+  `Context window` line always read `unknown` and is removed, with the window and percentage
+  in the status bar.
 - The terminal chat kept sending the model the conversation the screen had cleared, undone or
   switched away from, lost every earlier turn after a model switch, and replaced the real system
   prompt with a screen note on resume.
