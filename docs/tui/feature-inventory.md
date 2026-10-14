@@ -63,8 +63,8 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 
 | Command       | Aliases    | Description                                                | Output        | Args supported |
 | ------------- | ---------- | ---------------------------------------------------------- | ------------- | -------------- |
-| `/new`        | `/clear`   | Start a new session (fresh ID + history).                  | scrollback msg| none           |
-| `/sessions`   |            | List past sessions.                                        | scrollback    | none           |
+| `/new`        | `/clear`   | Start a new session; the next message carries the system prompt only. | scrollback msg| none           |
+| `/sessions`   |            | List past sessions; picking one resumes it and seeds its turns.        | scrollback    | none           |
 | `/resume`     |            | Resume a past session by ID prefix.                        | scrollback    | `<id-prefix>`  |
 | `/title`      |            | Set a title for the current session.                       | scrollback    | `<text>`       |
 | `/search`     |            | Search message history.                                    | scrollback    | `<query>`      |
@@ -73,8 +73,8 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 
 | Command       | Aliases    | Description                                                | Output        | Args |
 | ------------- | ---------- | ---------------------------------------------------------- | ------------- | ---- |
-| `/retry`      |            | Re-run the last user message.                              | resubmits     | none |
-| `/undo`       |            | Remove last assistant + user exchange.                     | scrollback    | none |
+| `/retry`      |            | Re-run the last user message; the old reply is removed from the screen, the stored session and the model's context. | resubmits     | none |
+| `/undo`       |            | Remove the last assistant + user exchange from the screen, the stored session and the model's context. | scrollback    | none |
 | `/stop`       |            | Stop ongoing agent generation.                             | -             | none |
 
 ### Configuration

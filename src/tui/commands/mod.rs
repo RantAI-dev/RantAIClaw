@@ -60,6 +60,10 @@ pub enum CommandResult {
     /// The message is not appended to history again — the caller
     /// expects it to already live there (e.g. `/retry`).
     Resubmit(String),
+    /// Re-run the last user message, dropping the reply it got. The app drops
+    /// that exchange's reply from the screen, the store and the agent only
+    /// once it can dispatch, so a retry refused mid-stream changes nothing.
+    RetryLast(String),
     /// Open an interactive list picker (Up/Down/Enter/Esc). The
     /// `ListPicker.kind` tag tells the app's key handler which side
     /// effect to run when the user presses Enter — switch model,

@@ -139,6 +139,14 @@ fn resolve_id(store: &SessionStore, id_prefix: &str) -> Result<String> {
     }
 }
 
+/// Resolve a `chat --resume` argument to the full id of an existing session.
+///
+/// Refuses, before anything is opened or written, with the same wording
+/// `session get` uses, so a typo never reaches the TUI as a bound id.
+pub fn resolve_session_for_resume(store: &SessionStore, id_or_prefix: &str) -> Result<String> {
+    resolve_id(store, id_or_prefix)
+}
+
 /// Cumulative session/message stats — the headless equivalent of TUI `/insights`.
 pub fn insights() -> Result<()> {
     let store = open_store()?;
@@ -166,4 +174,78 @@ pub fn insights() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file-backed store holding one `sessions` row per id. The rows are
+    /// written through a second connection, since the store's `conn` is private.
+    fn store_with(dir: &std::path::Path, ids: &[&str]) -> SessionStore {
+        let path = dir.join("sessions.db");
+        let store = SessionStore::open(&path).expect("open store");
+        let raw = rusqlite::Connection::open(&path).expect("raw connection");
+        for id in ids {
+            raw.execute(
+                "INSERT INTO sessions (id, model, started_at, source) \
+                 VALUES (?1, 'm', 0, 'tui')",
+                rusqlite::params![id],
+            )
+            .expect("insert session");
+        }
+        store
+    }
+
+    #[test]
+    fn resume_binds_the_full_id_of_a_unique_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let full = "12176d39-aaaa-4bbb-8ccc-0123456789ab";
+        let store = store_with(dir.path(), &[full, "99999999-aaaa-4bbb-8ccc-0123456789ab"]);
+        assert_eq!(
+            resolve_session_for_resume(&store, "12176d39").unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn resume_refuses_an_unknown_id_with_the_session_get_wording() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with(dir.path(), &["12176d39-aaaa-4bbb-8ccc-0123456789ab"]);
+        let err = resolve_session_for_resume(&store, "00000000-nope").unwrap_err();
+        assert_eq!(err.to_string(), "no session matches prefix `00000000-nope`");
+    }
+
+    #[test]
+    fn resume_refuses_an_ambiguous_prefix_with_the_session_get_wording() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with(
+            dir.path(),
+            &[
+                "12176d39-aaaa-4bbb-8ccc-0123456789ab",
+                "12176d39-bbbb-4bbb-8ccc-0123456789ab",
+            ],
+        );
+        let err = resolve_session_for_resume(&store, "12176d39").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`12176d39` is ambiguous (2 matches); use a longer prefix"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_multibyte_garbage_without_panicking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with(dir.path(), &["12176d39-aaaa-4bbb-8ccc-0123456789ab"]);
+        let err = resolve_session_for_resume(&store, "日本語日本語").unwrap_err();
+        assert_eq!(err.to_string(), "no session matches prefix `日本語日本語`");
+    }
+
+    #[test]
+    fn resume_refusal_writes_nothing_to_the_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with(dir.path(), &[]);
+        assert!(resolve_session_for_resume(&store, "00000000-nope").is_err());
+        assert_eq!(store.count_sessions().unwrap(), 0);
+    }
 }

@@ -17,6 +17,12 @@ pub enum TurnRequest {
         conversation_id: Option<String>,
     },
     Cancel,
+    /// Replace the agent's history with the given conversational turns, under
+    /// the system prompt the agent builds itself. The screen's session is the
+    /// one whose turns these are: `/new` sends none, a session pick or `/undo`
+    /// sends what the session still holds. Queued behind a running turn, like
+    /// `Reload`, so the next prompt is sent with the new history.
+    SetHistory(Vec<(String, String)>),
     /// Replace the actor's `Agent` with one built from the supplied
     /// config. Used after the first-run wizard or `/setup` saves new
     /// provider/api_key/model so the running session picks up the
@@ -48,6 +54,9 @@ pub struct TuiAgentActor {
     /// Reload deferred until the in-flight turn completes — replacing
     /// `self.agent` mid-turn would invalidate the borrow.
     pending_reload: Option<Box<crate::config::Config>>,
+    /// History replacements that arrived during the turn, applied in order
+    /// once it ends; the last one leaves the history.
+    pending_history: Vec<Vec<(String, String)>>,
 }
 
 /// Error event sent for a turn request that arrives while no working
@@ -69,6 +78,42 @@ impl TuiAgentActor {
             queue: VecDeque::new(),
             current: None,
             pending_reload: None,
+            pending_history: Vec::new(),
+        }
+    }
+
+    /// Move the conversation of the agent being replaced into `new_agent`, so a
+    /// reload (`/model`, `/setup`, a skills change, an outside config edit)
+    /// does not lose the turns the screen still shows. Only the system prompt
+    /// is rebuilt, from the new config. With no agent to replace, the new one
+    /// starts as it is. If the prompt cannot be rebuilt the turns are left on
+    /// the old agent, the failure is logged, and the new agent starts empty.
+    fn carry_history_into(&mut self, new_agent: &mut Agent) {
+        let Some(previous) = self.agent.as_mut() else {
+            return;
+        };
+        let carried = crate::memory::MEMORY_VIEW.sync_scope(crate::memory::MemoryView::All, || {
+            new_agent.adopt_history_from(previous)
+        });
+        if let Err(e) = carried {
+            tracing::warn!("failed to carry the conversation across a reload: {e}");
+        }
+    }
+
+    /// Replace the agent's history with `turns` under the system prompt the
+    /// agent builds. The prompt reads the memory view, so the rebuild runs
+    /// under `All`, as the other seeding callers do. A failed build is logged
+    /// and leaves the history as it was.
+    fn reseed(&mut self, turns: &[(String, String)]) {
+        let Some(agent) = self.agent.as_mut() else {
+            return;
+        };
+        let reseeded = crate::memory::MEMORY_VIEW
+            .sync_scope(crate::memory::MemoryView::All, || {
+                agent.reseed_history(turns)
+            });
+        if let Err(e) = reseeded {
+            tracing::warn!("failed to reseed agent history: {e}");
         }
     }
 
@@ -91,10 +136,14 @@ impl TuiAgentActor {
                         conversation_id,
                     }) => self.queue.push_back((text, conversation_id)),
                     Some(TurnRequest::Cancel) => { /* no-op while idle */ }
+                    Some(TurnRequest::SetHistory(turns)) => {
+                        self.reseed(&turns);
+                    }
                     Some(TurnRequest::Reload(config)) => {
                         match crate::agent::Agent::from_config(&config).await {
                             Ok(mut new_agent) => {
                                 new_agent.set_surface("tui");
+                                self.carry_history_into(&mut new_agent);
                                 let mcp_tools_by_server = new_agent.mcp_tools_by_server();
                                 let mcp_servers_configured: Vec<String> =
                                     config.mcp_servers.keys().cloned().collect();
@@ -198,6 +247,11 @@ impl TuiAgentActor {
                                             self.queue.push_back((more, conversation_id));
                                         }
                                         Some(TurnRequest::Cancel) => token.cancel(),
+                                        Some(TurnRequest::SetHistory(turns)) => {
+                                            // Defer, as Reload does: the active turn
+                                            // holds the agent's history.
+                                            self.pending_history.push(turns);
+                                        }
                                         Some(TurnRequest::Reload(config)) => {
                                             // Defer until the active turn
                                             // ends — replacing self.agent
@@ -234,11 +288,18 @@ impl TuiAgentActor {
                         }
                     } // turn_fut dropped here — self.agent no longer borrowed.
 
+                    // Apply history replacements that arrived during the turn,
+                    // in order, so the last one is what the next prompt sees.
+                    for turns in std::mem::take(&mut self.pending_history) {
+                        self.reseed(&turns);
+                    }
+
                     // Apply any reload that arrived during the turn.
                     if let Some(config) = self.pending_reload.take() {
                         match crate::agent::Agent::from_config(&config).await {
                             Ok(mut new_agent) => {
                                 new_agent.set_surface("tui");
+                                self.carry_history_into(&mut new_agent);
                                 let mcp_tools_by_server = new_agent.mcp_tools_by_server();
                                 let mcp_servers_configured: Vec<String> =
                                     config.mcp_servers.keys().cloned().collect();
@@ -837,5 +898,308 @@ mod tests {
         }
         assert!(system.contains("profile-canary-41c9"), "{system}");
         assert!(system.contains("notes-canary-52d0"), "{system}");
+    }
+    /// A resumed session seeds the real system prompt and its conversational
+    /// turns; the screen notes and error lines it holds never reach the model.
+    #[tokio::test]
+    async fn a_resumed_session_seeds_the_system_prompt_and_only_its_turns() {
+        use crate::sessions::{turns_for_history, Message};
+        let row = |role: &str, content: &str| Message {
+            id: 0,
+            session_id: "s1".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            timestamp: 0,
+        };
+        let stored = vec![
+            row("note", "Resumed session 12176d39 (4 messages)"),
+            row("user", "where is the lantern"),
+            row("assistant", "✗ provider timed out"),
+            row("system", "Removed 1 message(s)."),
+            row("assistant", "under the stairs"),
+            row(
+                "system",
+                "[Compacted summary of earlier conversation]\n\nwe talked about keys",
+            ),
+            row("user", "and the key"),
+        ];
+        let provider = ScriptedChat::new(vec![]);
+        let mut agent = build_test_agent_with_provider(Box::new(Arc::clone(&provider)));
+        agent
+            .restore_history(&turns_for_history(&stored))
+            .expect("restore history");
+
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "one more".into(),
+                conversation_id: None,
+            })
+            .await
+            .unwrap();
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if matches!(ev, AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+
+        let seen = provider.seen.lock().expect("seen mutex").clone();
+        let request = seen.first().expect("one request reached the provider");
+        assert_eq!(
+            request.first().map(|(role, _)| role.as_str()),
+            Some("system"),
+            "the request must open with the system prompt: {request:?}"
+        );
+        assert!(
+            request[0].1.len() > 100,
+            "the first system message must be the real prompt, not a note: {:?}",
+            request[0]
+        );
+        let all = request
+            .iter()
+            .map(|(_, c)| c.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for note in ["Resumed session", "Removed 1", "provider timed out"] {
+            assert!(!all.contains(note), "{note} reached the model:\n{all}");
+        }
+        for kept in [
+            "where is the lantern",
+            "under the stairs",
+            "and the key",
+            "we talked about keys",
+        ] {
+            assert!(all.contains(kept), "{kept} is missing:\n{all}");
+        }
+    }
+
+    /// Two exchanges, then `Reload` (what `/model` sends), then a message: the
+    /// new agent keeps both exchanges, and its system prompt is rebuilt from
+    /// the reloaded config.
+    #[tokio::test]
+    async fn reload_keeps_the_history_and_rebuilds_the_system_prompt() {
+        use crate::agent::door_test_support::DoorFixture;
+        let fixture = DoorFixture::start().await;
+        let agent = Agent::from_config(&fixture.config)
+            .await
+            .expect("the agent builds");
+        let mut agent = agent;
+        agent
+            .restore_history(&turns(&[
+                ("user", "first question"),
+                ("assistant", "first answer"),
+                ("user", "second question"),
+                ("assistant", "second answer"),
+            ]))
+            .expect("restore history");
+
+        let (req_tx, req_rx) = mpsc::channel(16);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
+        req_tx
+            .send(TurnRequest::Reload(Box::new(fixture.config.clone())))
+            .await
+            .unwrap();
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if matches!(ev, AgentEvent::ReloadComplete { .. }) {
+                break;
+            }
+        }
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "third question".into(),
+                conversation_id: None,
+            })
+            .await
+            .unwrap();
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if matches!(ev, AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+
+        fixture.llm.wait_for_requests(1).await;
+        let shape: Vec<(String, String)> = fixture.llm.messages_for_test().into_iter().collect();
+        let roles: Vec<&str> = shape.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "user", "assistant", "user"],
+            "{shape:?}"
+        );
+        let conversation: Vec<&str> = shape[1..].iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(
+            conversation,
+            [
+                "first question",
+                "first answer",
+                "second question",
+                "second answer",
+                "third question",
+            ],
+            "every exchange must survive the reload, in order"
+        );
+        assert!(
+            shape[0].1.len() > 100,
+            "the system prompt is rebuilt from the reloaded config: {:?}",
+            shape[0]
+        );
+    }
+
+    /// Runs `requests` through a fresh actor over `agent`, waits for every turn
+    /// to finish, and returns what the provider was sent for each request.
+    async fn run_requests(
+        agent: Agent,
+        provider: &Arc<ScriptedChat>,
+        requests: Vec<TurnRequest>,
+    ) -> Vec<Vec<(String, String)>> {
+        let (req_tx, req_rx) = mpsc::channel(16);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
+        let turns = requests
+            .iter()
+            .filter(|r| matches!(r, TurnRequest::Submit { .. }))
+            .count();
+        for request in requests {
+            req_tx.send(request).await.unwrap();
+        }
+        let mut done = 0;
+        while done < turns {
+            match timeout(Duration::from_secs(5), events_rx.recv()).await {
+                Ok(Some(AgentEvent::Done { .. })) => done += 1,
+                Ok(Some(_)) => {}
+                _ => panic!("a turn did not finish"),
+            }
+        }
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+        provider.seen.lock().expect("seen mutex").clone()
+    }
+
+    fn submit(text: &str) -> TurnRequest {
+        TurnRequest::Submit {
+            text: text.into(),
+            conversation_id: None,
+        }
+    }
+
+    fn turns(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect()
+    }
+
+    /// `SetHistory` replaces the history the next request carries: the old
+    /// turns are gone, the new ones are in order, and the real system prompt
+    /// leads the request.
+    #[tokio::test]
+    async fn set_history_replaces_the_history_before_the_next_prompt() {
+        let provider = ScriptedChat::new(vec![]);
+        let mut agent = build_test_agent_with_provider(Box::new(Arc::clone(&provider)));
+        agent
+            .restore_history(&turns(&[
+                ("user", "old question"),
+                ("assistant", "old answer"),
+            ]))
+            .expect("restore history");
+
+        let seen = run_requests(
+            agent,
+            &provider,
+            vec![
+                TurnRequest::SetHistory(turns(&[
+                    ("user", "new question"),
+                    ("assistant", "new answer"),
+                ])),
+                submit("next"),
+            ],
+        )
+        .await;
+
+        let request = seen.first().expect("one request reached the provider");
+        let shape: Vec<(&str, &str)> = request
+            .iter()
+            .map(|(r, c)| (r.as_str(), c.as_str()))
+            .collect();
+        assert_eq!(shape[0].0, "system");
+        assert!(shape[0].1.len() > 100, "the prompt must be real: {shape:?}");
+        assert_eq!(
+            shape[1..],
+            [
+                ("user", "new question"),
+                ("assistant", "new answer"),
+                ("user", "next"),
+            ],
+            "{shape:?}"
+        );
+    }
+
+    /// Two exchanges, then `/new` (an empty reseed), then a message: the request
+    /// is the system prompt and the new message, and none of the old exchanges.
+    #[tokio::test]
+    async fn after_new_the_request_is_the_system_prompt_and_the_new_message() {
+        let provider = ScriptedChat::new(vec![]);
+        let agent = build_test_agent_with_provider(Box::new(Arc::clone(&provider)));
+
+        let seen = run_requests(
+            agent,
+            &provider,
+            vec![
+                TurnRequest::SetHistory(turns(&[
+                    ("user", "first question"),
+                    ("assistant", "first answer"),
+                    ("user", "second question"),
+                    ("assistant", "second answer"),
+                ])),
+                // The same channel carries `/new`, so it is ordered behind
+                // the history it replaces.
+                TurnRequest::SetHistory(vec![]),
+                submit("a new message"),
+            ],
+        )
+        .await;
+
+        let request = seen.first().expect("one request reached the provider");
+        let shape: Vec<(&str, &str)> = request
+            .iter()
+            .map(|(r, c)| (r.as_str(), c.as_str()))
+            .collect();
+        assert_eq!(shape.len(), 2, "{shape:?}");
+        assert_eq!(shape[0].0, "system");
+        assert_eq!(shape[1], ("user", "a new message"));
+    }
+
+    /// Empty turns leave the fresh-session shape: the real system prompt and
+    /// then the new message, with nothing before it.
+    #[tokio::test]
+    async fn set_history_with_no_turns_leaves_only_the_system_prompt() {
+        let provider = ScriptedChat::new(vec![]);
+        let mut agent = build_test_agent_with_provider(Box::new(Arc::clone(&provider)));
+        agent
+            .restore_history(&turns(&[
+                ("user", "old question"),
+                ("assistant", "old answer"),
+            ]))
+            .expect("restore history");
+
+        let seen = run_requests(
+            agent,
+            &provider,
+            vec![TurnRequest::SetHistory(vec![]), submit("fresh")],
+        )
+        .await;
+
+        let request = seen.first().expect("one request reached the provider");
+        let shape: Vec<&str> = request.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(shape, ["system", "user"], "{request:?}");
+        assert!(request[0].1.len() > 100, "{request:?}");
+        assert_eq!(request[1].1, "fresh");
     }
 }

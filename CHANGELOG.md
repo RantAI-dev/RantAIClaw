@@ -64,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The terminal chat kept sending the model the conversation the screen had cleared, undone or
+  switched away from, lost every earlier turn after a model switch, and replaced the real system
+  prompt with a screen note on resume.
+- `/undo` and `/retry` now also fix the stored session, a model switch keeps the conversation, screen
+  notes and error lines are never sent, and `chat --resume` accepts a unique prefix or refuses unknown
+  and ambiguous ids before the chat opens.
 - In the console's approval modal, Always did nothing beyond the current reply: the next message asked again. Always on a command outside the allowlist now holds until the conversation ends. It does not carry into another conversation, and it is cleared when the conversation is deleted or the autonomy preset changes. Medium-risk prompts and tools forced to prompt still ask every time.
 - `memory clear` and `/clear` stopped at 1000 entries and reported the rest as gone: with 1001 notes one stayed, and the summary still said everything was cleared. A lookup by key prefix (`memory get`, `memory clear --key`) or by text (`memory_store` `replaces`) missed notes older than the newest 1000.
 - While a reply streamed, the model's reasoning showed in front of the answer. The saved reply was already clean; the streamed text was not. This applied to every surface that streams: the gateway chunk events, the TUI live preview and channel streaming. Only the reply is streamed now, and reasoning is sent once, at the end, when it is the whole reply.

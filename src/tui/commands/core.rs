@@ -108,6 +108,9 @@ impl CommandHandler for NewCommand {
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         ctx.clear_session()?;
+        // The agent keeps its own history, so the cleared screen must reach it
+        // too: an empty reseed leaves the fresh-session shape.
+        ctx.reseed_agent(&[]);
         Ok(CommandResult::ClearTerminal(
             "Started new session".to_string(),
         ))
@@ -120,6 +123,23 @@ mod tests {
     fn test_context() -> TuiContext {
         let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
         ctx
+    }
+
+    /// `/new` empties the agent's history too: the next request the actor sends
+    /// carries no turn of the session that was just ended.
+    #[test]
+    fn new_command_reseeds_the_agent_with_no_turns() {
+        use crate::tui::async_bridge::TurnRequest;
+        let (mut ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        ctx.append_user_message("old question").unwrap();
+        ctx.append_assistant_message("old answer").unwrap();
+
+        NewCommand.execute("", &mut ctx).unwrap();
+
+        match req_rx.try_recv() {
+            Ok(TurnRequest::SetHistory(turns)) => assert!(turns.is_empty(), "{turns:?}"),
+            other => panic!("expected SetHistory, got {other:?}"),
+        }
     }
 
     fn info(name: &str, description: &str, usage: &str) -> crate::tui::commands::CommandInfo {

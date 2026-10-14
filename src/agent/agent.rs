@@ -401,6 +401,51 @@ impl Agent {
                     system_prompt,
                 )));
         }
+        self.push_prior_turns(prior);
+        Ok(())
+    }
+
+    /// Replace the history with the real system prompt followed by `turns`, in
+    /// order. Unlike [`Agent::restore_history`], the prompt is built even when
+    /// `turns` is empty, so the result is always the fresh-session shape
+    /// `[system prompt, ...turns]`. A turn carrying role `system` is still
+    /// sent as given, but the prompt is still built first: a summary is
+    /// context, not a prompt.
+    pub fn reseed_history(&mut self, turns: &[(String, String)]) -> Result<()> {
+        let system_prompt = self.build_system_prompt()?;
+        self.history.clear();
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::system(
+                system_prompt,
+            )));
+        self.push_prior_turns(turns);
+        Ok(())
+    }
+
+    /// Carry the conversation of `previous` into this agent, which was just
+    /// built from a new config. The history moves as it is (tool calls and
+    /// results included), except the system prompt, which this agent's own
+    /// prompt replaces: the previous agent's leading system message is dropped
+    /// and everything after it, a compaction summary among it, is kept in order.
+    pub fn adopt_history_from(&mut self, previous: &mut Agent) -> Result<()> {
+        let system_prompt = self.build_system_prompt()?;
+        let mut carried = std::mem::take(&mut previous.history);
+        if matches!(
+            carried.first(),
+            Some(ConversationMessage::Chat(chat)) if chat.role == "system"
+        ) {
+            carried.remove(0);
+        }
+        self.history.clear();
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::system(
+                system_prompt,
+            )));
+        self.history.extend(carried);
+        Ok(())
+    }
+
+    fn push_prior_turns(&mut self, prior: &[(String, String)]) {
         for (role, content) in prior {
             let chat = match role.as_str() {
                 "system" => ChatMessage::system(content),
@@ -409,7 +454,6 @@ impl Agent {
             };
             self.history.push(ConversationMessage::Chat(chat));
         }
-        Ok(())
     }
 
     /// Build an agent from config with a fresh observer derived from

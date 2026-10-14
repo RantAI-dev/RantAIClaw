@@ -335,6 +335,25 @@ impl SessionStore {
         Ok(removed > 0)
     }
 
+    /// Delete the messages of `session_id` whose row id is at or after
+    /// `from_id`, and set `message_count` to the rows that remain. Used by
+    /// `/undo` and `/retry` to drop the last exchange from the stored session.
+    /// Returns how many rows were deleted.
+    pub fn delete_messages_from(&mut self, session_id: &str, from_id: i64) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND id >= ?2",
+            params![session_id, from_id],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET message_count = \
+             (SELECT COUNT(*) FROM messages WHERE session_id = ?1) WHERE id = ?1",
+            params![session_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Every session id for one conversation_key, ordered newest first.
     /// Caller still has to fetch each session's metadata if it needs it; this
     /// helper only returns ids so the DELETE handler can fan out grant

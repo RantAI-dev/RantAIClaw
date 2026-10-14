@@ -32,8 +32,7 @@ impl CommandHandler for RetryCommand {
         };
 
         let prompt = ctx.messages[user_idx].content.clone();
-        ctx.messages.remove(assistant_idx);
-        Ok(CommandResult::Resubmit(prompt))
+        Ok(CommandResult::RetryLast(prompt))
     }
 }
 
@@ -50,28 +49,19 @@ impl CommandHandler for UndoCommand {
     }
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let mut removed = 0;
-
-        // Remove last assistant message first
-        if let Some(idx) = ctx.messages.iter().rposition(|m| m.role == "assistant") {
-            ctx.messages.remove(idx);
-            removed += 1;
-        }
-
-        // Then remove last user message
-        if let Some(idx) = ctx.messages.iter().rposition(|m| m.role == "user") {
-            ctx.messages.remove(idx);
-            removed += 1;
-        }
-
+        // The undone exchange leaves the store as well as the screen, so the
+        // session that is resumed later does not bring it back.
+        let removed = ctx.drop_last_exchange()?;
         if removed == 0 {
-            Ok(CommandResult::Message("No messages to undo.".to_string()))
-        } else {
-            Ok(CommandResult::Message(format!(
-                "Removed {} message(s).",
-                removed
-            )))
+            return Ok(CommandResult::Message("No messages to undo.".to_string()));
         }
+        // The agent is reseeded from what the store still holds, so the
+        // undone turns are not sent with the next prompt.
+        let kept = crate::sessions::turns_for_history(&ctx.messages);
+        ctx.reseed_agent(&kept);
+        Ok(CommandResult::Message(format!(
+            "Removed {removed} message(s)."
+        )))
     }
 }
 
@@ -142,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_drops_last_assistant_and_returns_resubmit_with_last_user_text() {
+    fn retry_returns_the_last_user_text_and_leaves_the_exchange_to_the_app() {
         let cmd = RetryCommand;
         let mut ctx = test_context();
 
@@ -152,13 +142,12 @@ mod tests {
 
         let result = cmd.execute("", &mut ctx).unwrap();
 
-        // The user message is retained; the assistant reply is dropped.
-        assert_eq!(ctx.messages.len(), 1);
-        assert_eq!(ctx.messages[0].role, "user");
-        assert_eq!(ctx.messages[0].content, "hello");
+        // The command only names the prompt. The reply is dropped by the app,
+        // once it knows the retry can be dispatched.
+        assert_eq!(ctx.messages.len(), 2);
         match result {
-            CommandResult::Resubmit(text) => assert_eq!(text, "hello"),
-            other => panic!("expected Resubmit, got {other:?}"),
+            CommandResult::RetryLast(text) => assert_eq!(text, "hello"),
+            other => panic!("expected RetryLast, got {other:?}"),
         }
     }
 
@@ -199,12 +188,11 @@ mod tests {
 
         let result = cmd.execute("", &mut ctx).unwrap();
 
-        // "ans2" is removed, "second" stays as the next prompt to resubmit.
-        assert_eq!(ctx.messages.len(), 3);
-        assert_eq!(ctx.messages[2].content, "second");
+        // The screen is untouched; "second" is the prompt to resubmit.
+        assert_eq!(ctx.messages.len(), 4);
         match result {
-            CommandResult::Resubmit(text) => assert_eq!(text, "second"),
-            other => panic!("expected Resubmit, got {other:?}"),
+            CommandResult::RetryLast(text) => assert_eq!(text, "second"),
+            other => panic!("expected RetryLast, got {other:?}"),
         }
     }
 

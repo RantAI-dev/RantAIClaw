@@ -538,7 +538,7 @@ Starts the interactive TUI. **This is the default — `rantaiclaw` with no subco
 
 | Flag | Description |
 |---|---|
-| `--resume <ID>` | Resume a specific session by ID |
+| `--resume <ID>` | Resume a specific session by ID. A unique prefix of that ID is accepted and the full ID is what gets resumed; an unknown or ambiguous ID is refused with an error before the chat opens |
 | `-m`, `--message <TEXT>` | Single-message mode; prints the reply and exits, no TUI |
 | `--model <MODEL>` | Override the model for this run, e.g. `anthropic:claude-sonnet-4-20250514` |
 | `--profile <NAME>` | Run against a different profile without changing the active marker |
