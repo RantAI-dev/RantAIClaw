@@ -162,6 +162,37 @@ pub fn redact_historic_image_markers(messages: Vec<ChatMessage>) -> Vec<ChatMess
 /// answer confidently about something it never received.
 pub const IMAGE_OMITTED_NOTE: &str = "[image omitted: this model cannot receive images]";
 
+/// The image media types a rig-backed provider can send as an image part.
+///
+/// Keyed on the primary provider name, the same key the vision gate uses (a
+/// fallback is not consulted). `None` means no rig restriction: ollama and
+/// bedrock send their own image parts, and `custom:`/unknown names are not
+/// rig backends. Values are lower-case MIME types from
+/// [`ALLOWED_IMAGE_MIME_TYPES`]; a type outside this list is refused before the
+/// message enters the conversation.
+#[must_use]
+pub fn rig_backend_mime_allowlist(provider_name: &str) -> Option<&'static [&'static str]> {
+    match provider_name {
+        "anthropic" | "openai" => Some(&["image/png", "image/jpeg", "image/gif", "image/webp"]),
+        "gemini" => Some(&["image/png", "image/jpeg", "image/webp"]),
+        _ => None,
+    }
+}
+
+/// The MIME type of every `[IMAGE:data:…]` marker in `content`, in order.
+/// A marker that is not a data URI yields no entry; the readability step has
+/// already turned local paths and URLs into data URIs by the time it is used.
+pub fn image_data_uri_mimes(content: &str) -> Vec<String> {
+    let (_cleaned, refs) = parse_image_markers(content);
+    refs.iter()
+        .filter_map(|reference| {
+            let rest = reference.strip_prefix("data:")?;
+            let (header, _) = rest.split_once(',')?;
+            Some(header.strip_suffix(";base64")?.to_ascii_lowercase())
+        })
+        .collect()
+}
+
 pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }

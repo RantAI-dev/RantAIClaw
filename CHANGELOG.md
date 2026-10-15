@@ -67,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On the OpenAI, Anthropic and Gemini providers an image was sent as text, not as an image, and a
+  missing image file broke every later message in the conversation. The image now goes out as an
+  image part. On a vision provider, an image file that cannot be read is refused before the message
+  enters the conversation, so the next message goes through. On those three providers an image of a
+  type they cannot send is refused the same way: they take png, jpeg and webp, gif also on Anthropic
+  and OpenAI, and bmp is refused on all three.
 - `/usage` showed only the last turn under "this session", and the status bar's token count
   with it. It now sums every turn of the session; `/new` and switching sessions start the total
   over, and a resumed session starts unreported because the store keeps no per-turn usage. The

@@ -59,6 +59,10 @@ pub struct Agent {
     /// Surface this agent serves, written as the audit `channel` (`tui`,
     /// `console`). `None` means the CLI, which keeps the `cli` value.
     surface: Option<&'static str>,
+    /// The primary provider's name from config (`default_provider`). Keys the
+    /// rig image allowlist, the same primary the vision gate reads. `None` for
+    /// agents built from the bare builder (tests, embeds): no rig restriction.
+    primary_provider: Option<String>,
     /// MCP server health snapshot taken during `from_config`. Used
     /// by the TUI's `/mcp` slash command to show which servers
     /// connected vs. failed without re-probing.
@@ -297,6 +301,7 @@ impl AgentBuilder {
             // The builder carries no surface: the surfaces that name one call
             // [`Agent::set_surface`] after they build the agent.
             surface: None,
+            primary_provider: None,
             mcp_health: Vec::new(),
             mcp_tools_by_server: std::collections::HashMap::new(),
             identity_config: self.identity_config.unwrap_or_default(),
@@ -648,6 +653,7 @@ impl Agent {
             .build()
             .map(|mut agent| {
                 agent.security = Some(security);
+                agent.primary_provider = Some(provider_name.to_string());
                 agent.mcp_health = mcp_health;
                 agent.mcp_tools_by_server = mcp_tools_by_server;
                 // Every agent built from a real config is subject to the daily
@@ -1016,6 +1022,51 @@ impl Agent {
         result
     }
 
+    /// Check the images a user message names before it enters the history.
+    ///
+    /// Only a vision-capable provider reaches the loop's image step; any other
+    /// provider keeps the loop's own refusal, so this does nothing for it. The
+    /// readability check is the loop's own (`prepare_messages_for_provider`,
+    /// with the loop's `MultimodalConfig`): it reads each local path or URL and
+    /// refuses it when it cannot. The mime check is the rig allowlist for the
+    /// primary provider, and runs on the PREPARED content, where every marker
+    /// is already a data URI with its real MIME type. A raw path has no MIME
+    /// type until that read, so the check cannot run on the raw input.
+    async fn check_images_before_history(&self, content: &str) -> Result<()> {
+        if !self.provider.supports_vision() {
+            return Ok(());
+        }
+        let message = [ChatMessage::user(content)];
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &message,
+            &crate::config::MultimodalConfig::default(),
+        )
+        .await?;
+        let prepared_content = prepared
+            .messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+
+        let Some(allowed) = self
+            .primary_provider
+            .as_deref()
+            .and_then(crate::multimodal::rig_backend_mime_allowlist)
+        else {
+            return Ok(());
+        };
+        for mime in crate::multimodal::image_data_uri_mimes(prepared_content) {
+            if !allowed.contains(&mime.as_str()) {
+                return Err(crate::multimodal::MultimodalError::UnsupportedMime {
+                    input: format!("data:{mime};base64,…"),
+                    mime,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     async fn turn_inner(
         &mut self,
         user_message: &str,
@@ -1057,6 +1108,13 @@ impl Agent {
             }
             crate::memory::prepend_memory_block(&context.block, user_message)
         };
+
+        // Refuse an unreadable image before the message enters the history. The
+        // loop reads the same markers with the same config, so a message that
+        // passes here is the message the loop will send. A refusal leaves the
+        // history as it was; a message that reached the history would fail every
+        // later turn, because each one re-reads it.
+        self.check_images_before_history(&enriched).await?;
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
@@ -1913,5 +1971,282 @@ mod tests {
     #[tokio::test]
     async fn agent_without_a_surface_still_writes_cli() {
         assert_eq!(audit_channel_for_one_turn(None).await, "cli");
+    }
+
+    /// A provider that declares vision and records the message bodies it was
+    /// sent. Its replies are plain text, so a turn that reaches it completes.
+    struct VisionMock {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for VisionMock {
+        fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+            crate::providers::traits::ProviderCapabilities {
+                native_tool_calling: false,
+                vision: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            self.seen.lock().push(
+                request
+                    .messages
+                    .iter()
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            Ok(crate::providers::ChatResponse {
+                usage: None,
+                text: Some("seen".into()),
+                tool_calls: vec![],
+            })
+        }
+    }
+
+    /// An agent whose primary is `provider_name`, backed by [`VisionMock`].
+    fn vision_agent(provider_name: &str) -> (Agent, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::builder()
+            .provider(Box::new(VisionMock { seen: seen.clone() }))
+            .tools(vec![])
+            .memory(Arc::from(
+                crate::memory::create_memory(
+                    &crate::config::MemoryConfig {
+                        backend: "none".into(),
+                        ..crate::config::MemoryConfig::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("memory"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder");
+        agent.primary_provider = Some(provider_name.to_string());
+        (agent, seen)
+    }
+
+    #[tokio::test]
+    async fn gif_on_gemini_is_refused_before_the_history_and_the_next_message_succeeds() {
+        let (mut agent, _seen) = vision_agent("gemini");
+        // The system prompt is seeded on the first turn; the baseline is what
+        // a refusal must leave behind.
+        agent.turn("hello first").await.expect("first plain turn");
+        let before = agent.history.len();
+
+        let gif = "data:image/gif;base64,R0lGODlh";
+        let err = agent
+            .turn(&format!("look [IMAGE:{gif}]"))
+            .await
+            .expect_err("gemini does not take gif");
+        assert!(
+            err.to_string().contains("MIME type is not allowed"),
+            "same refusal text as an unreadable MIME: {err}"
+        );
+        assert_eq!(agent.history.len(), before, "refusal leaves history alone");
+
+        agent
+            .turn("plain text after the refusal")
+            .await
+            .expect("the next plain message succeeds");
+    }
+
+    #[tokio::test]
+    async fn gif_on_anthropic_is_sent_as_an_image_not_refused() {
+        let (mut agent, seen) = vision_agent("anthropic");
+        let gif = "data:image/gif;base64,R0lGODlh";
+        agent
+            .turn(&format!("look [IMAGE:{gif}]"))
+            .await
+            .expect("anthropic takes gif");
+        let sent = seen.lock().join("\n");
+        assert!(sent.contains(gif), "the gif reached the provider: {sent}");
+    }
+
+    #[tokio::test]
+    async fn bmp_on_openai_is_refused_before_the_history_and_the_next_message_succeeds() {
+        let (mut agent, _seen) = vision_agent("openai");
+        agent.turn("hello first").await.expect("first plain turn");
+        let before = agent.history.len();
+
+        let err = agent
+            .turn("look [IMAGE:data:image/bmp;base64,Qk0=]")
+            .await
+            .expect_err("openai does not take bmp through rig");
+        assert!(
+            err.to_string().contains("MIME type is not allowed"),
+            "{err}"
+        );
+        assert_eq!(agent.history.len(), before);
+
+        agent
+            .turn("plain")
+            .await
+            .expect("next plain message succeeds");
+    }
+
+    #[tokio::test]
+    async fn missing_image_file_is_refused_with_todays_error_and_history_is_unchanged() {
+        let (mut agent, _seen) = vision_agent("openai");
+        agent.turn("hello first").await.expect("first plain turn");
+        let before = agent.history.len();
+
+        let err = agent
+            .turn("[IMAGE:/tmp/tidakada-574-xyz.png] gambar hilang")
+            .await
+            .expect_err("a missing file is refused");
+        assert!(
+            err.to_string()
+                .contains("multimodal image source not found or unreadable"),
+            "the loop's own error text: {err}"
+        );
+        assert_eq!(agent.history.len(), before, "refusal leaves history alone");
+
+        agent
+            .turn("plain text after the refusal")
+            .await
+            .expect("the next plain message succeeds");
+    }
+
+    /// Write a real file with `bytes` under a temp dir and return its path.
+    fn temp_image(name: &str, bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("write image");
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn gif_file_on_gemini_is_refused_before_the_history_and_the_next_message_succeeds() {
+        // A path marker: the mime is only known after the read, so the check
+        // must run on the prepared content. The raw text has no data URI.
+        let (_dir, gif) = temp_image("anim.gif", b"GIF89a\x01\x00\x01\x00");
+        let (mut agent, _seen) = vision_agent("gemini");
+        agent.turn("hello first").await.expect("first plain turn");
+        let before = agent.history.len();
+
+        let err = agent
+            .turn(&format!("look [IMAGE:{}]", gif.display()))
+            .await
+            .expect_err("gemini does not take a gif file");
+        assert!(
+            err.to_string().contains("MIME type is not allowed")
+                && err.to_string().contains("image/gif"),
+            "the UnsupportedMime refusal names the gif: {err}"
+        );
+        assert_eq!(agent.history.len(), before, "no user message was pushed");
+
+        agent
+            .turn("plain text after the refusal")
+            .await
+            .expect("the next plain message succeeds");
+    }
+
+    #[tokio::test]
+    async fn bmp_file_on_openai_is_refused_before_the_history_and_the_next_message_succeeds() {
+        let (_dir, bmp) = temp_image("scan.bmp", b"BM\x1a\x00\x00\x00\x00\x00\x00\x00");
+        let (mut agent, _seen) = vision_agent("openai");
+        agent.turn("hello first").await.expect("first plain turn");
+        let before = agent.history.len();
+
+        let err = agent
+            .turn(&format!("look [IMAGE:{}]", bmp.display()))
+            .await
+            .expect_err("openai does not take a bmp file through rig");
+        assert!(
+            err.to_string().contains("MIME type is not allowed")
+                && err.to_string().contains("image/bmp"),
+            "the UnsupportedMime refusal names the bmp: {err}"
+        );
+        assert_eq!(agent.history.len(), before, "no user message was pushed");
+
+        agent
+            .turn("plain text after the refusal")
+            .await
+            .expect("the next plain message succeeds");
+    }
+
+    #[tokio::test]
+    async fn refused_image_surfaces_as_an_error_event_then_done() {
+        let (mut agent, _seen) = vision_agent("openai");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+
+        let result = agent
+            .turn_streaming(
+                "[IMAGE:/tmp/tidakada-574-xyz.png] gambar hilang",
+                Some(tx),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+
+        let mut saw_error = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Error(msg) = event {
+                assert!(
+                    msg.contains("multimodal image source not found or unreadable"),
+                    "{msg}"
+                );
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "the TUI gets an Error event");
+    }
+
+    #[tokio::test]
+    async fn vision_off_provider_keeps_the_loops_refusal() {
+        // A provider without vision never reaches the pre-push check: the
+        // loop refuses the marker with the capability error, as before.
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![])
+            .memory(Arc::from(
+                crate::memory::create_memory(
+                    &crate::config::MemoryConfig {
+                        backend: "none".into(),
+                        ..crate::config::MemoryConfig::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("memory"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder");
+        agent.primary_provider = Some("gemini".into());
+
+        let err = agent
+            .turn("[IMAGE:data:image/png;base64,iVBORw0KGgo=] look")
+            .await
+            .expect_err("a non-vision provider refuses the image");
+        assert!(
+            err.to_string().contains("does not support vision input"),
+            "the capability refusal is unchanged: {err}"
+        );
     }
 }
