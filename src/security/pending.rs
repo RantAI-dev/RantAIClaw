@@ -38,6 +38,17 @@ pub enum Decision {
     Deny,
 }
 
+/// A decision together with whether the registry deadline produced it.
+///
+/// `decision` is exactly what the matching `request_decision*` call returns.
+/// `timed_out` is true only when the deadline elapsed, so `decision` is the
+/// auto-deny and nobody answered. A person's Deny has `timed_out: false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingOutcome {
+    pub decision: Decision,
+    pub timed_out: bool,
+}
+
 /// A request awaiting decision. Cloneable snapshot — the live oneshot
 /// sender stays inside the registry.
 #[derive(Debug, Clone)]
@@ -268,6 +279,22 @@ impl PendingApprovals {
         channel: impl Into<String>,
         reply_target: impl Into<String>,
     ) -> Decision {
+        self.request_decision_in_outcome(id, basename, full_command, channel, reply_target)
+            .await
+            .decision
+    }
+
+    /// As [`request_decision_in`](Self::request_decision_in), but also reports
+    /// whether the deadline produced the decision. Callers that must tell "no
+    /// answer in time" from a person's Deny use this; the decision is the same.
+    pub async fn request_decision_in_outcome(
+        &self,
+        id: Uuid,
+        basename: impl Into<String>,
+        full_command: impl Into<String>,
+        channel: impl Into<String>,
+        reply_target: impl Into<String>,
+    ) -> PendingOutcome {
         self.request_decision_with(id, basename, full_command, channel, reply_target, false)
             .await
     }
@@ -286,6 +313,7 @@ impl PendingApprovals {
     ) -> Decision {
         self.request_decision_with(id, basename, full_command, channel, reply_target, true)
             .await
+            .decision
     }
 
     async fn request_decision_with(
@@ -296,7 +324,7 @@ impl PendingApprovals {
         channel: impl Into<String>,
         reply_target: impl Into<String>,
         always_available: bool,
-    ) -> Decision {
+    ) -> PendingOutcome {
         let mut request = PendingRequest::new_with_id(
             id,
             basename.into(),
@@ -327,9 +355,15 @@ impl PendingApprovals {
         // `_cleanup` drops after this value is produced, removing both entries.
         match self.inner.timeout {
             Some(d) => match tokio::time::timeout(d, rx).await {
-                Ok(Ok(decision)) => decision,
+                Ok(Ok(decision)) => PendingOutcome {
+                    decision,
+                    timed_out: false,
+                },
                 // Sender dropped (registry shut down) — deny, no broadcast.
-                Ok(Err(_)) => Decision::Deny,
+                Ok(Err(_)) => PendingOutcome {
+                    decision: Decision::Deny,
+                    timed_out: false,
+                },
                 // Deadline elapsed — auto-deny AND tell resolved-subscribers so a
                 // web modal can close instead of leaving dead buttons.
                 Err(_elapsed) => {
@@ -339,13 +373,22 @@ impl PendingApprovals {
                         reply_target: reply_target_for_resolve.clone(),
                         timed_out: true,
                     });
-                    Decision::Deny
+                    PendingOutcome {
+                        decision: Decision::Deny,
+                        timed_out: true,
+                    }
                 }
             },
             None => match rx.await {
-                Ok(decision) => decision,
+                Ok(decision) => PendingOutcome {
+                    decision,
+                    timed_out: false,
+                },
                 // Oneshot sender dropped (registry shut down) — deny.
-                Err(_) => Decision::Deny,
+                Err(_) => PendingOutcome {
+                    decision: Decision::Deny,
+                    timed_out: false,
+                },
             },
         }
     }
@@ -515,6 +558,42 @@ impl Default for PendingApprovals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deadline's auto-deny is reported as `timed_out`. A person's Deny is
+    /// the same `Decision::Deny` but is not reported as timed out.
+    #[tokio::test]
+    async fn outcome_marks_only_the_deadline_as_timed_out() {
+        let registry = PendingApprovals::new(Some(Duration::from_millis(30)));
+        let timed = registry
+            .request_decision_in_outcome(Uuid::new_v4(), "shell", "ls", "tui", "")
+            .await;
+        assert_eq!(timed.decision, Decision::Deny);
+        assert!(timed.timed_out, "the deadline must be observable");
+
+        let registry = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let registry2 = registry.clone();
+        let task = tokio::spawn(async move {
+            registry2
+                .request_decision_in_outcome(Uuid::new_v4(), "shell", "ls", "tui", "")
+                .await
+        });
+        await_registered(&registry).await;
+        let id = registry.list()[0].id;
+        assert!(registry.resolve(id, Decision::Deny));
+        let answered = task.await.unwrap();
+        assert_eq!(answered.decision, Decision::Deny);
+        assert!(!answered.timed_out, "a person's Deny is not a timeout");
+    }
+
+    async fn await_registered(registry: &PendingApprovals) {
+        for _ in 0..100 {
+            if !registry.list().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("request never registered");
+    }
 
     #[tokio::test]
     async fn resolve_returns_decision() {

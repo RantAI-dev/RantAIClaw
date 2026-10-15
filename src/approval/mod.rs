@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -38,6 +38,52 @@ pub enum ApprovalResponse {
     No,
     /// Execute and add tool to session-scoped allowlist.
     Always,
+}
+
+/// Why a backend returned `No`: a person said so, or nobody could be asked.
+///
+/// Carried next to [`ApprovalResponse`] so the agent loop can tell the model the
+/// truth. "Denied" wording is correct only after a person answered No. A call that
+/// no approver could see was refused for want of one, and the loop says so.
+/// This never reaches the audit log or the gateway: [`ApprovalLogEntry`] keeps
+/// the bare response it always wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionBasis {
+    /// A person answered, or the backend reports a No it cannot split further —
+    /// which is what a backend that only implements [`ApprovalBackend::decide`]
+    /// means by every No, since that is the trait default.
+    Answered,
+    /// No approver was reachable on this surface: stdin is not a terminal, the
+    /// read failed, or the surface has no inline approver at all.
+    NoApprover,
+    /// The prompt was shown (or posted) but no answer came before the deadline.
+    /// Nobody said No, so the wording says no answer came in time.
+    NoAnswer,
+}
+
+/// A backend's decision together with its basis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verdict {
+    pub response: ApprovalResponse,
+    pub basis: DecisionBasis,
+}
+
+impl Verdict {
+    /// An answer a person gave.
+    pub fn answered(response: ApprovalResponse) -> Self {
+        Self {
+            response,
+            basis: DecisionBasis::Answered,
+        }
+    }
+
+    /// No approver was available to answer.
+    pub fn no_approver() -> Self {
+        Self {
+            response: ApprovalResponse::No,
+            basis: DecisionBasis::NoApprover,
+        }
+    }
 }
 
 /// A single audit log entry for an approval decision.
@@ -243,6 +289,11 @@ impl ApprovalManager {
     /// For non-CLI channels, returns `Yes` automatically (interactive
     /// approval is only supported on CLI for now).
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
+        prompt_cli_interactive(request).response
+    }
+
+    /// As [`Self::prompt_cli`], with the basis of a No.
+    pub fn prompt_cli_verdict(&self, request: &ApprovalRequest) -> Verdict {
         prompt_cli_interactive(request)
     }
 }
@@ -351,6 +402,14 @@ pub fn is_named_owner_any<'a>(
 #[async_trait::async_trait]
 pub trait ApprovalBackend: Send + Sync {
     async fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse;
+
+    /// The decision with its basis. The default treats every No as an answer
+    /// a person gave, which is what a backend that only implements `decide`
+    /// has always meant. Backends that can tell "nobody was asked" from "asked
+    /// and refused" override this.
+    async fn decide_verdict(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> Verdict {
+        Verdict::answered(self.decide(mgr, request).await)
+    }
 }
 
 /// Interactive terminal prompt (TUI / CLI surface).
@@ -359,7 +418,11 @@ pub struct CliApprovalBackend;
 #[async_trait::async_trait]
 impl ApprovalBackend for CliApprovalBackend {
     async fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
-        mgr.prompt_cli(request)
+        self.decide_verdict(mgr, request).await.response
+    }
+
+    async fn decide_verdict(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> Verdict {
+        mgr.prompt_cli_verdict(request)
     }
 }
 
@@ -372,6 +435,10 @@ pub struct AutoDenyBackend;
 impl ApprovalBackend for AutoDenyBackend {
     async fn decide(&self, _mgr: &ApprovalManager, _request: &ApprovalRequest) -> ApprovalResponse {
         ApprovalResponse::No
+    }
+
+    async fn decide_verdict(&self, _mgr: &ApprovalManager, _request: &ApprovalRequest) -> Verdict {
+        Verdict::no_approver()
     }
 }
 
@@ -392,12 +459,12 @@ pub fn default_backend_for(channel_name: &str) -> Box<dyn ApprovalBackend> {
 // ── CLI prompt ───────────────────────────────────────────────────
 
 /// Display the approval prompt and read user input from stdin.
-fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
+fn prompt_cli_interactive(request: &ApprovalRequest) -> Verdict {
     // No interactive approver present (systemd stdin=null, piped input, or a
     // scheduled/headless run that reached this path by mistake): never block on
     // a read that cannot be answered — auto-deny, matching AutoDenyBackend.
     if !io::stdin().is_terminal() {
-        return ApprovalResponse::No;
+        return Verdict::no_approver();
     }
     let summary = summarize_args(&request.arguments);
     eprintln!();
@@ -409,13 +476,44 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     let stdin = io::stdin();
     let mut line = String::new();
     if stdin.lock().read_line(&mut line).is_err() {
-        return ApprovalResponse::No;
+        // The prompt was shown and the read failed: nobody answered.
+        return Verdict::no_approver();
     }
 
-    match line.trim().to_ascii_lowercase().as_str() {
+    Verdict::answered(match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => ApprovalResponse::Yes,
         "a" | "always" => ApprovalResponse::Always,
         _ => ApprovalResponse::No,
+    })
+}
+
+/// Operator-facing line for a call refused because no approver was reachable,
+/// keyed per tool. Logged once per tool per process.
+///
+/// Returns `true` the first time `tool` is seen (the caller logs then). The
+/// text never goes into a tool result: the model cannot edit config.
+pub fn note_no_approver_first_time(tool: &str) -> bool {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    SEEN.lock().insert(tool.to_string())
+}
+
+/// What the operator is told when `tool` was refused for want of an approver on
+/// `channel`. Names the tool and the settings that let it run on that surface.
+pub fn no_approver_operator_hint(tool: &str, channel: &str) -> String {
+    if channel == "cli" {
+        format!(
+            "tool `{tool}` was refused because no approver was available: stdin is not a \
+             terminal. Run the agent from a terminal to be asked, add \"{tool}\" to \
+             [autonomy].auto_approve to let it run without a prompt, or raise autonomy with \
+             `rantaiclaw autonomy <preset>`"
+        )
+    } else {
+        format!(
+            "tool `{tool}` was refused because no approver was available on this surface. \
+             Enable in-chat approval with [channels_config].approval_owners, set \
+             [channels_config].autonomous_tools = true, add \"{tool}\" to [autonomy].auto_approve, \
+             or raise autonomy with `rantaiclaw autonomy <preset>`"
+        )
     }
 }
 
@@ -1088,9 +1186,10 @@ mod tests {
 
     /// Defense-in-depth: even the interactive backend refuses to block on a read
     /// that cannot be answered when stdin is not a terminal (systemd, piped, or a
-    /// headless run routed here by mistake).
+    /// headless run routed here by mistake). Nobody was asked, so the refusal
+    /// carries `NoApprover`, not `Answered`.
     #[test]
-    fn cli_prompt_denies_when_stdin_not_a_terminal() {
+    fn cli_prompt_refuses_with_no_approver_when_stdin_not_a_terminal() {
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
             return; // interactive run: the guard only fires for non-TTY stdin
@@ -1099,6 +1198,73 @@ mod tests {
             tool_name: "shell".into(),
             arguments: serde_json::json!({ "command": "echo hi" }),
         };
-        assert_eq!(prompt_cli_interactive(&request), ApprovalResponse::No);
+        let verdict = prompt_cli_interactive(&request);
+        assert_eq!(verdict.response, ApprovalResponse::No);
+        assert_eq!(verdict.basis, DecisionBasis::NoApprover);
+    }
+
+    /// `AutoDenyBackend` is the inline decision for every surface with no
+    /// approver. It refuses, and says nobody was asked.
+    #[tokio::test]
+    async fn auto_deny_backend_refuses_with_no_approver() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let request = ApprovalRequest {
+            tool_name: "web_search_tool".into(),
+            arguments: serde_json::json!({ "query": "x" }),
+        };
+        let verdict = AutoDenyBackend.decide_verdict(&mgr, &request).await;
+        assert_eq!(verdict.response, ApprovalResponse::No);
+        assert_eq!(verdict.basis, DecisionBasis::NoApprover);
+    }
+
+    /// A backend that only implements `decide` (the gateway modal and the chat
+    /// relay do) reports its No as an answered one. Its wording is unchanged.
+    #[tokio::test]
+    async fn backend_that_answers_no_reports_answered() {
+        struct AnswersNo;
+        #[async_trait::async_trait]
+        impl ApprovalBackend for AnswersNo {
+            async fn decide(
+                &self,
+                _mgr: &ApprovalManager,
+                _request: &ApprovalRequest,
+            ) -> ApprovalResponse {
+                ApprovalResponse::No
+            }
+        }
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({}),
+        };
+        let verdict = AnswersNo.decide_verdict(&mgr, &request).await;
+        assert_eq!(verdict.response, ApprovalResponse::No);
+        assert_eq!(verdict.basis, DecisionBasis::Answered);
+    }
+
+    /// The operator log names the tool and the settings that let it run on
+    /// this surface, and says so once per tool, not once per process.
+    #[test]
+    fn no_approver_log_is_once_per_tool() {
+        assert!(note_no_approver_first_time("approval_once_probe_a"));
+        assert!(!note_no_approver_first_time("approval_once_probe_a"));
+        assert!(
+            note_no_approver_first_time("approval_once_probe_b"),
+            "a different tool still gets its own line"
+        );
+    }
+
+    #[test]
+    fn no_approver_hint_names_the_tool_and_how_to_allow_it() {
+        let cli = no_approver_operator_hint("mcp__audit__echo", "cli");
+        assert!(cli.contains("mcp__audit__echo"), "{cli}");
+        assert!(cli.contains("[autonomy].auto_approve"), "{cli}");
+        assert!(cli.contains("terminal"), "{cli}");
+
+        let channel = no_approver_operator_hint("web_search_tool", "telegram");
+        assert!(channel.contains("web_search_tool"), "{channel}");
+        assert!(channel.contains("[autonomy].auto_approve"), "{channel}");
+        assert!(channel.contains("approval_owners"), "{channel}");
+        assert!(channel.contains("autonomous_tools"), "{channel}");
     }
 }
