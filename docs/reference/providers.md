@@ -134,6 +134,17 @@ Image markers (``[IMAGE:<source>]``) reach the model as image parts on these pro
 - A provider that declares no vision input (for example `custom:<url>`) refuses the current turn's
   image with the capability error, and the conversation continues with the next message. Earlier
   images in the history are replaced with an omission note, not refused.
+- `max_images` counts the images of the whole session, not of one message: a session already holding
+  four images refuses the message that would add a fifth, whatever message carries it. The refusal
+  says how many images the session holds, what the limit is, and that `/new` starts over.
+- A refusal takes the message back in the terminal chat. The row leaves the screen and the session
+  store, so `/undo`, `/retry` and a later resume cannot bring it back, its text returns to the input
+  box, and the refusal is shown once, as one line. The console has no input box: it reports the
+  refusal on the same event a failed turn uses, and stores nothing for the turn.
+- The `[multimodal]` settings (`max_images`, `max_image_size_mb`, `allow_remote_fetch`) apply wherever
+  a turn is sent: the terminal chat, the CLI, the channels, the gateway's chat turns and the console
+  (`POST /api/v1/agent/chat`). Before, an agent turn prepared its images with the built-in defaults,
+  so the section reached the channels and the gateway's chat turns only.
 
 ### Ollama Vision Notes
 

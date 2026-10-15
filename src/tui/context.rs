@@ -109,6 +109,15 @@ pub struct TuiContext {
     /// A history reseed the request channel was full for. Sent by
     /// `flush_pending_reseed` before the next request.
     pub pending_reseed: Option<Vec<(String, String)>>,
+    /// Whether the bound session's title was set by hand through `/title`.
+    ///
+    /// A title is otherwise derived from the session's first user row, and a
+    /// derived title is cleared when that row goes. This flag is what keeps
+    /// the operator's own title out of both: no message re-derives over it,
+    /// and deleting rows never clears it. Reset by `/new`, which binds a
+    /// different session — the flag describes the session on screen, so it
+    /// must not outlive it.
+    pub title_set_by_hand: bool,
     /// Canonical names of providers detected as enabled (have an API key
     /// configured) when the TUI launched. Used by `/model` to populate
     /// the model picker. First entry is the primary/default provider.
@@ -266,6 +275,7 @@ impl TuiContext {
             events_rx,
             queued_turns: 0,
             pending_reseed: None,
+            title_set_by_hand: false,
             available_providers: Vec::new(),
             workspace_dir: None,
             available_skills: Vec::new(),
@@ -642,26 +652,34 @@ impl TuiContext {
         }
     }
 
-    /// Append a user message to the in-memory list and persist it.
+    /// Append a user message to the in-memory list and persist it, returning
+    /// the store id of the row it wrote.
     ///
-    /// If this is the first message in the session and the session has no
-    /// title yet, derive a title from the message preview and persist it.
-    /// Title-write errors are swallowed — never block the user turn on a
-    /// best-effort UI affordance.
-    pub fn append_user_message(&mut self, content: &str) -> Result<()> {
-        let is_first_message = self.messages.is_empty();
+    /// The caller keeps that id: a turn submitted for this row is what a later
+    /// refusal has to name, not "the last user row" (see
+    /// [`take_back_refused_row`]).
+    ///
+    /// If this is the session's first user row and no title was set by hand,
+    /// derive a title from the message preview and persist it. "First user
+    /// row", not "first row": a session opened with `/new` already holds a
+    /// "Started new session" note, and the picker would otherwise list every
+    /// such session as `(untitled)`. Title-write errors are swallowed — never
+    /// block the user turn on a best-effort UI affordance.
+    pub fn append_user_message(&mut self, content: &str) -> Result<i64> {
+        let is_first_user_row = !self.messages.iter().any(|m| m.role == "user");
         let sid = self.ensure_session_id()?;
         let mut msg = Message::user(&sid, content);
         msg.id = self.session_store.append_message(&msg)?;
+        let row_id = msg.id;
         self.messages.push(msg);
 
-        if is_first_message {
+        if is_first_user_row && !self.title_set_by_hand {
             let title = derive_session_title(content);
             if !title.is_empty() {
                 let _ = self.session_store.set_title(&sid, &title);
             }
         }
-        Ok(())
+        Ok(row_id)
     }
 
     /// Append a screen note (inline command output like `/usage`, `/sessions`,
@@ -733,9 +751,72 @@ impl TuiContext {
         let removed = self.messages.len() - cut;
         if let Some(sid) = self.session_id.clone() {
             self.session_store.delete_messages_from(&sid, from_id)?;
+            // A derived title is the first user row's preview. When that row
+            // is the one going, the title goes with it, so the next user row
+            // names the session. A title set by hand is the operator's and is
+            // kept whatever is deleted.
+            let leaves_no_user_row = !self.messages[..cut].iter().any(|m| m.role == "user");
+            if leaves_no_user_row && !self.title_set_by_hand {
+                self.session_store.clear_title(&sid)?;
+            }
         }
         self.messages.truncate(cut);
         Ok(removed)
+    }
+
+    /// Take back the user message the agent refused before it entered the
+    /// history: drop THAT row — the one with the store id `row_id` the turn
+    /// was submitted for — from the screen and from the store, and hand its
+    /// text to the caller for the input box. Returns the removed text, or
+    /// `None` when the row is not on screen (already undone, or a session
+    /// switch since).
+    ///
+    /// The row is named rather than searched for because the screen can hold
+    /// more than one user row: a message submitted while the refused turn was
+    /// still in flight is on screen by the time the refusal arrives, and that
+    /// one is still waiting its turn. Only the refused row goes.
+    ///
+    /// The refusal removed nothing from the agent's history either, because
+    /// the agent refused the message before pushing it. This is the other
+    /// half: the TUI had already written the row down when it submitted the
+    /// turn.
+    pub fn take_back_refused_row(&mut self, row_id: i64) -> Option<String> {
+        let at = self.messages.iter().position(|m| m.id == row_id)?;
+        let refused = self.messages[at].content.clone();
+        // The row a derived title came from is the session's first user row.
+        let was_first_user_row = !self.messages[..at].iter().any(|m| m.role == "user");
+        // Failing to take the row back is reported through `last_error` rather
+        // than swallowed: a row left behind comes back on every reseed. The
+        // store goes first, so a failure leaves the screen untouched.
+        if let Some(sid) = self.session_id.clone() {
+            if let Err(e) = self.session_store.delete_message(&sid, row_id) {
+                self.last_error = Some(format!("failed to remove the refused message: {e}"));
+                return None;
+            }
+        }
+        self.messages.remove(at);
+        if was_first_user_row && !self.title_set_by_hand {
+            if let Some(sid) = self.session_id.clone() {
+                // The title came from the row that just went. A user row that
+                // survived it — a message waiting behind the refused turn —
+                // names the session instead; with none left the session is
+                // untitled again, and the next user row names it.
+                let next = self
+                    .messages
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .map(|m| derive_session_title(&m.content))
+                    .filter(|title| !title.is_empty());
+                let written = match next {
+                    Some(title) => self.session_store.set_title(&sid, &title),
+                    None => self.session_store.clear_title(&sid),
+                };
+                if let Err(e) = written {
+                    self.last_error = Some(format!("failed to update the session title: {e}"));
+                }
+            }
+        }
+        Some(refused)
     }
 
     /// Drop what followed the last user turn (its reply, or the note a failed
@@ -820,6 +901,10 @@ impl TuiContext {
         self.scroll_offset = 0;
         self.token_usage = None;
         self.last_error = None;
+        // A different session is bound after `/new`, and a title set by hand
+        // belongs to the one that ended. The new session titles itself from
+        // its first user row.
+        self.title_set_by_hand = false;
         // `/new` empties the transcript — selection anchors are stale.
         self.selection = None;
         Ok(())

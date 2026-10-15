@@ -104,14 +104,13 @@ impl TuiAgentActor {
     /// agent builds. The prompt reads the memory view, so the rebuild runs
     /// under `All`, as the other seeding callers do. A failed build is logged
     /// and leaves the history as it was.
-    fn reseed(&mut self, turns: &[(String, String)]) {
+    async fn reseed(&mut self, turns: &[(String, String)]) {
         let Some(agent) = self.agent.as_mut() else {
             return;
         };
         let reseeded = crate::memory::MEMORY_VIEW
-            .sync_scope(crate::memory::MemoryView::All, || {
-                agent.reseed_history(turns)
-            });
+            .scope(crate::memory::MemoryView::All, agent.reseed_history(turns))
+            .await;
         if let Err(e) = reseeded {
             tracing::warn!("failed to reseed agent history: {e}");
         }
@@ -137,7 +136,7 @@ impl TuiAgentActor {
                     }) => self.queue.push_back((text, conversation_id)),
                     Some(TurnRequest::Cancel) => { /* no-op while idle */ }
                     Some(TurnRequest::SetHistory(turns)) => {
-                        self.reseed(&turns);
+                        self.reseed(&turns).await;
                     }
                     Some(TurnRequest::Reload(config)) => {
                         match crate::agent::Agent::from_config(&config).await {
@@ -297,7 +296,7 @@ impl TuiAgentActor {
                     // Apply history replacements that arrived during the turn,
                     // in order, so the last one is what the next prompt sees.
                     for turns in std::mem::take(&mut self.pending_history) {
-                        self.reseed(&turns);
+                        self.reseed(&turns).await;
                     }
 
                     // Apply any reload that arrived during the turn.
@@ -589,6 +588,16 @@ mod tests {
             }
             other => panic!("expected Error event, got {other:?}"),
         }
+        // No `Done` follows: there was no turn to end, so the surface that
+        // queued this submit retires it on the error itself (see
+        // `TuiApp::finalize_error`). A `Done` added here would need the
+        // surface to stop doing that, or the turn is popped twice.
+        assert!(
+            timeout(Duration::from_millis(200), events_rx.recv())
+                .await
+                .is_err(),
+            "the no-agent error is the whole answer to a submit"
+        );
         drop(req_tx);
         let _ = timeout(Duration::from_secs(1), handle).await;
     }
@@ -940,6 +949,7 @@ mod tests {
         let mut agent = build_test_agent_with_provider(Box::new(Arc::clone(&provider)));
         agent
             .restore_history(&turns_for_history(&stored))
+            .await
             .expect("restore history");
 
         let (req_tx, req_rx) = mpsc::channel(4);
@@ -1067,6 +1077,7 @@ mod tests {
                 ("user", "second question"),
                 ("assistant", "second answer"),
             ]))
+            .await
             .expect("restore history");
 
         let (req_tx, req_rx) = mpsc::channel(16);
@@ -1179,6 +1190,7 @@ mod tests {
                 ("user", "old question"),
                 ("assistant", "old answer"),
             ]))
+            .await
             .expect("restore history");
 
         let seen = run_requests(
@@ -1258,6 +1270,7 @@ mod tests {
                 ("user", "old question"),
                 ("assistant", "old answer"),
             ]))
+            .await
             .expect("restore history");
 
         let seen = run_requests(

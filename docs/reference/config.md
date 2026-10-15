@@ -309,7 +309,7 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_images` | `4` | Maximum image markers accepted per request |
+| `max_images` | `4` | Maximum image markers accepted across the whole session history |
 | `max_image_size_mb` | `5` | Per-image size limit before base64 encoding |
 | `allow_remote_fetch` | `false` | Allow fetching `http(s)` image URLs from markers |
 

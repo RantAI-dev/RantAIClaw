@@ -224,6 +224,10 @@ impl CommandHandler for TitleCommand {
             ));
         };
         ctx.session_store.set_title(&sid, title)?;
+        // The operator named this session, so nothing derives over it later
+        // and no deleted row clears it. Reset by `/new`, which binds another
+        // session.
+        ctx.title_set_by_hand = true;
 
         // Echo what was actually stored, not what was typed — `set_title`
         // normalises (control characters dropped, whitespace collapsed, length

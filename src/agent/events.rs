@@ -79,6 +79,22 @@ pub enum AgentEvent {
     /// Non-recoverable error. Followed by `Done { cancelled: false, final_text: "" }`.
     Error(String),
 
+    /// The turn was refused before the message entered the history — one of
+    /// its images could not be sent (see `agent::ImageRefused`). Nothing was
+    /// recorded, so a surface can take the message back: off the screen, out
+    /// of the session store, and its text back into the input box where it
+    /// can be edited and sent again. Followed by `Done { cancelled: false,
+    /// final_text: "" }` like any other error, so every consumer's turn
+    /// bookkeeping stays the same.
+    ///
+    /// Typed rather than folded into [`AgentEvent::Error`] so a surface tells
+    /// a refusal from a turn that failed after it was sent, without reading
+    /// the error text.
+    ImageRefused {
+        /// Why the message was not sent, as the user reads it.
+        message: String,
+    },
+
     /// The actor could not rebuild the agent for a `TurnRequest::Reload`. The
     /// previous agent is still in place and keeps answering; the TUI shows the
     /// error and drops any model switch that was waiting on this reload.
@@ -238,5 +254,8 @@ mod tests {
             cancelled: false,
         };
         let _ = AgentEvent::Error("boom".into());
+        let _ = AgentEvent::ImageRefused {
+            message: "This message was not sent".into(),
+        };
     }
 }

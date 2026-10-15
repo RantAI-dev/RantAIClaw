@@ -14,6 +14,7 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -96,7 +97,28 @@ pub struct Agent {
     /// `None` on bare-builder agents (tests, custom embeds); `from_config` sets
     /// it whenever `[cost] enabled` is on.
     ledger: Option<Arc<crate::cost::CostTracker>>,
+    /// The `[multimodal]` config the image preparation runs with: the same
+    /// config the loop gets, so a turn is judged here as the loop will judge it.
+    /// Bare-builder agents keep the defaults; `from_config` sets the user's.
+    multimodal: crate::config::MultimodalConfig,
 }
+
+/// A message refused before it entered the history, because one of its images
+/// cannot be sent. Carried as the error of [`Agent::turn`], so a surface can tell
+/// a refusal (nothing was recorded, the text can be edited and sent again) from
+/// a turn that failed after it was pushed. `message` is the text the user sees.
+#[derive(Debug)]
+pub struct ImageRefused {
+    pub message: String,
+}
+
+impl std::fmt::Display for ImageRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ImageRefused {}
 
 pub struct AgentBuilder {
     provider: Option<Box<dyn Provider>>,
@@ -314,6 +336,7 @@ impl AgentBuilder {
             approval_manager: self.approval_manager,
             approval_backend: self.approval_backend,
             ledger: self.ledger,
+            multimodal: crate::config::MultimodalConfig::default(),
         })
     }
 }
@@ -393,7 +416,7 @@ impl Agent {
     /// already carry one, so the next `turn()` doesn't append a system
     /// prompt out of order. Takes primitives (not `ConversationMessage`) so
     /// callers across the lib/bin boundary stay type-compatible.
-    pub fn restore_history(&mut self, prior: &[(String, String)]) -> Result<()> {
+    pub async fn restore_history(&mut self, prior: &[(String, String)]) -> Result<()> {
         self.history.clear();
         if prior.is_empty() {
             return Ok(());
@@ -406,7 +429,7 @@ impl Agent {
                     system_prompt,
                 )));
         }
-        self.push_prior_turns(prior);
+        self.push_prior_turns(prior).await;
         Ok(())
     }
 
@@ -416,14 +439,14 @@ impl Agent {
     /// `[system prompt, ...turns]`. A turn carrying role `system` is still
     /// sent as given, but the prompt is still built first: a summary is
     /// context, not a prompt.
-    pub fn reseed_history(&mut self, turns: &[(String, String)]) -> Result<()> {
+    pub async fn reseed_history(&mut self, turns: &[(String, String)]) -> Result<()> {
         let system_prompt = self.build_system_prompt()?;
         self.history.clear();
         self.history
             .push(ConversationMessage::Chat(ChatMessage::system(
                 system_prompt,
             )));
-        self.push_prior_turns(turns);
+        self.push_prior_turns(turns).await;
         Ok(())
     }
 
@@ -450,14 +473,41 @@ impl Agent {
         Ok(())
     }
 
-    fn push_prior_turns(&mut self, prior: &[(String, String)]) {
+    /// Put the prior turns into the history. Each user turn goes through the
+    /// same image preparation a new turn does, judged against the turns before
+    /// it. A turn whose image can no longer be prepared keeps its text, and its
+    /// marker becomes a placeholder naming the file; the reseed never fails.
+    async fn push_prior_turns(&mut self, prior: &[(String, String)]) {
         for (role, content) in prior {
             let chat = match role.as_str() {
                 "system" => ChatMessage::system(content),
                 "assistant" => ChatMessage::assistant(content),
-                _ => ChatMessage::user(content),
+                _ => {
+                    let prepared = self.prepare_prior_user_turn(content).await;
+                    ChatMessage::user(prepared)
+                }
             };
             self.history.push(ConversationMessage::Chat(chat));
+        }
+    }
+
+    /// The content a stored user turn is put back with. Prepared exactly as a
+    /// new turn would be, so the images are data URIs; a turn whose images
+    /// cannot be prepared keeps its text with a placeholder per failed marker.
+    async fn prepare_prior_user_turn(&self, content: &str) -> String {
+        match self.prepare_new_turn(content).await {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
+                let mut text = cleaned;
+                for reference in refs {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    let _ = write!(text, "[image not sent: {reference}]");
+                }
+                text
+            }
         }
     }
 
@@ -660,6 +710,7 @@ impl Agent {
                 // token ceiling. Bare-builder agents (tests, embeds) are not —
                 // they have no workspace to keep a ledger in.
                 agent.ledger = crate::cost::ledger_for(config);
+                agent.multimodal = config.multimodal.clone();
                 agent
             })
     }
@@ -972,6 +1023,9 @@ impl Agent {
     ///   * `Chunk` events (if any) precede `Usage`.
     ///   * On success: `Usage` immediately precedes `Done { cancelled: false }`.
     ///   * On error: `Error(msg)` precedes `Done { cancelled: false, final_text: "" }`.
+    ///   * On a refusal ([`ImageRefused`]): `ImageRefused { message }` takes the
+    ///     `Error` slot, and the same `Done` follows — nothing ran, but the
+    ///     turn still ended.
     ///   * On cancellation: `Done { cancelled: true }` fires with whatever
     ///     partial text has been produced.
     ///   * `Done` fires exactly once per call.
@@ -1008,7 +1062,21 @@ impl Agent {
             }
             Err(err) => {
                 if let Some(tx) = events.as_ref() {
-                    let _ = tx.send(AgentEvent::Error(err.to_string())).await;
+                    // A refusal is not a failure: nothing ran and nothing was
+                    // recorded, so the surface is told which one this is by the
+                    // event it gets, not by reading the text of an `Error`.
+                    match err.downcast_ref::<ImageRefused>() {
+                        Some(refused) => {
+                            let _ = tx
+                                .send(AgentEvent::ImageRefused {
+                                    message: refused.message.clone(),
+                                })
+                                .await;
+                        }
+                        None => {
+                            let _ = tx.send(AgentEvent::Error(err.to_string())).await;
+                        }
+                    }
                     let _ = tx
                         .send(AgentEvent::Done {
                             final_text: String::new(),
@@ -1022,49 +1090,77 @@ impl Agent {
         result
     }
 
-    /// Check the images a user message names before it enters the history.
+    /// Prepare the images of a user message the loop is about to send, and
+    /// return the message with them in the prepared form.
+    ///
+    /// The image preparation runs over the same set the loop prepares: the
+    /// history as the provider will see it, plus this message. So the image
+    /// count, the size limit and readability are judged as the loop will judge
+    /// them, with the user's `[multimodal]` config. A refusal is an
+    /// [`ImageRefused`]: the message is not pushed.
     ///
     /// Only a vision-capable provider reaches the loop's image step; any other
-    /// provider keeps the loop's own refusal, so this does nothing for it. The
-    /// readability check is the loop's own (`prepare_messages_for_provider`,
-    /// with the loop's `MultimodalConfig`): it reads each local path or URL and
-    /// refuses it when it cannot. The mime check is the rig allowlist for the
-    /// primary provider, and runs on the PREPARED content, where every marker
-    /// is already a data URI with its real MIME type. A raw path has no MIME
-    /// type until that read, so the check cannot run on the raw input.
-    async fn check_images_before_history(&self, content: &str) -> Result<()> {
+    /// provider keeps the loop's own refusal, so the message is returned as it
+    /// is. The mime check is the rig allowlist for the primary provider, and
+    /// runs on the PREPARED content, where every marker is already a data URI
+    /// with its real MIME type.
+    async fn prepare_new_turn(&self, content: &str) -> Result<String> {
         if !self.provider.supports_vision() {
-            return Ok(());
+            return Ok(content.to_string());
         }
-        let message = [ChatMessage::user(content)];
-        let prepared = crate::multimodal::prepare_messages_for_provider(
-            &message,
-            &crate::config::MultimodalConfig::default(),
-        )
-        .await?;
+        let mut messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        messages.push(ChatMessage::user(content));
+        let prepared =
+            match crate::multimodal::prepare_messages_for_provider(&messages, &self.multimodal)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(err) => return Err(self.refusal_for(err, &messages).into()),
+            };
         let prepared_content = prepared
             .messages
-            .first()
-            .map(|m| m.content.as_str())
+            .last()
+            .map(|m| m.content.clone())
             .unwrap_or_default();
 
-        let Some(allowed) = self
+        if let Some(allowed) = self
             .primary_provider
             .as_deref()
             .and_then(crate::multimodal::rig_backend_mime_allowlist)
-        else {
-            return Ok(());
-        };
-        for mime in crate::multimodal::image_data_uri_mimes(prepared_content) {
-            if !allowed.contains(&mime.as_str()) {
-                return Err(crate::multimodal::MultimodalError::UnsupportedMime {
-                    input: format!("data:{mime};base64,…"),
-                    mime,
+        {
+            for mime in crate::multimodal::image_data_uri_mimes(&prepared_content) {
+                if !allowed.contains(&mime.as_str()) {
+                    let err = crate::multimodal::MultimodalError::UnsupportedMime {
+                        input: format!("data:{mime};base64,…"),
+                        mime,
+                    };
+                    return Err(self.refusal_for(err.into(), &messages).into());
                 }
-                .into());
             }
         }
-        Ok(())
+        Ok(prepared_content)
+    }
+
+    /// The text a refused turn carries. A full session says how many images it
+    /// holds, the limit, and that `/new` starts over; any other refusal keeps
+    /// the loop's own error text.
+    fn refusal_for(&self, err: anyhow::Error, messages: &[ChatMessage]) -> ImageRefused {
+        let limit_hit = err
+            .downcast_ref::<crate::multimodal::MultimodalError>()
+            .is_some_and(|e| matches!(e, crate::multimodal::MultimodalError::TooManyImages { .. }));
+        let message = if limit_hit {
+            let (max_images, _) = self.multimodal.effective_limits();
+            // The session's count, this message included: what the loop counts.
+            let held = crate::multimodal::count_image_markers(messages);
+            format!(
+                "This message was not sent: the session holds {held} images and the limit \
+                 of {max_images} is reached. Start over with /new to send more images; \
+                 your text is back in the input box."
+            )
+        } else {
+            format!("This message was not sent: {err}. Your text is back in the input box.")
+        };
+        ImageRefused { message }
     }
 
     async fn turn_inner(
@@ -1109,15 +1205,14 @@ impl Agent {
             crate::memory::prepend_memory_block(&context.block, user_message)
         };
 
-        // Refuse an unreadable image before the message enters the history. The
-        // loop reads the same markers with the same config, so a message that
-        // passes here is the message the loop will send. A refusal leaves the
-        // history as it was; a message that reached the history would fail every
-        // later turn, because each one re-reads it.
-        self.check_images_before_history(&enriched).await?;
+        // Prepare the message's images before it enters the history. A refusal
+        // leaves the history as it was. The pushed message carries the prepared
+        // content (images as data URIs), so a later turn never reads the file
+        // again: a file removed after this turn cannot break the next one.
+        let prepared = self.prepare_new_turn(&enriched).await?;
 
         self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+            .push(ConversationMessage::Chat(ChatMessage::user(prepared)));
 
         let effective_model = self.classify_model(user_message);
 
@@ -1151,7 +1246,7 @@ impl Agent {
             // No guest gate on the interactive/console agent — the local or
             // authenticated user is the owner.
             None,
-            &crate::config::MultimodalConfig::default(),
+            &self.multimodal,
             self.config.max_tool_iterations,
             cancel.cloned(),
             None,
@@ -2112,7 +2207,7 @@ mod tests {
         let before = agent.history.len();
 
         let err = agent
-            .turn("[IMAGE:/tmp/tidakada-574-xyz.png] gambar hilang")
+            .turn("[IMAGE:/tmp/missing-picture.png] missing picture")
             .await
             .expect_err("a missing file is refused");
         assert!(
@@ -2187,30 +2282,209 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refused_image_surfaces_as_an_error_event_then_done() {
+    async fn refused_image_surfaces_as_a_typed_refusal_then_done() {
         let (mut agent, _seen) = vision_agent("openai");
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
         let result = agent
             .turn_streaming(
-                "[IMAGE:/tmp/tidakada-574-xyz.png] gambar hilang",
+                "[IMAGE:/tmp/missing-picture.png] missing picture",
                 Some(tx),
                 None,
             )
             .await;
         assert!(result.is_err());
 
-        let mut saw_error = false;
+        let mut saw_refusal = false;
+        let mut saw_done = false;
         while let Ok(event) = rx.try_recv() {
-            if let AgentEvent::Error(msg) = event {
-                assert!(
-                    msg.contains("multimodal image source not found or unreadable"),
-                    "{msg}"
-                );
-                saw_error = true;
+            match event {
+                AgentEvent::ImageRefused { message } => {
+                    assert!(
+                        message.contains("multimodal image source not found or unreadable"),
+                        "{message}"
+                    );
+                    saw_refusal = true;
+                }
+                AgentEvent::Error(msg) => panic!("a refusal is not a plain error: {msg}"),
+                AgentEvent::Done { .. } => saw_done = true,
+                _ => {}
             }
         }
-        assert!(saw_error, "the TUI gets an Error event");
+        assert!(saw_refusal, "the TUI gets a typed refusal");
+        assert!(
+            saw_done,
+            "the turn still ends, so turn bookkeeping is unchanged"
+        );
+    }
+
+    /// A vision agent whose `[multimodal]` config is `multimodal`, the way
+    /// `from_config` gives it the user's section.
+    fn vision_agent_with_multimodal(
+        provider_name: &str,
+        multimodal: crate::config::MultimodalConfig,
+    ) -> (Agent, Arc<Mutex<Vec<String>>>) {
+        let (mut agent, seen) = vision_agent(provider_name);
+        agent.multimodal = multimodal;
+        (agent, seen)
+    }
+
+    /// A 1×1 PNG's bytes: enough for MIME detection, small enough to allow.
+    const PNG_BYTES: &[u8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
+    #[tokio::test]
+    async fn the_session_image_count_is_judged_across_the_history() {
+        // Five turns of one image each, under the default limit of four. The
+        // fifth image is the one that would take the session past the limit;
+        // the loop counts every marker in the history, so the check must too.
+        let (_dir, png) = temp_image("count.png", PNG_BYTES);
+        let (mut agent, _seen) = vision_agent_with_multimodal(
+            "openai",
+            crate::config::MultimodalConfig {
+                max_images: 4,
+                ..crate::config::MultimodalConfig::default()
+            },
+        );
+        for n in 1..=4 {
+            agent
+                .turn(&format!("picture {n} [IMAGE:{}]", png.display()))
+                .await
+                .unwrap_or_else(|e| panic!("image {n} of four is accepted: {e}"));
+        }
+        let before = agent.history.len();
+
+        let err = agent
+            .turn(&format!("picture 5 [IMAGE:{}]", png.display()))
+            .await
+            .expect_err("the fifth image of the session is refused");
+        assert!(
+            err.downcast_ref::<ImageRefused>().is_some(),
+            "a refusal is typed, so the screen can tell it from a failure: {err}"
+        );
+        assert!(
+            err.to_string().contains("holds 5 images")
+                && err.to_string().contains("limit of 4")
+                && err.to_string().contains("/new"),
+            "the refusal says the count (this message included), the limit and /new: {err}"
+        );
+        assert_eq!(agent.history.len(), before, "refusal leaves history alone");
+
+        agent
+            .turn("plain text after the refusal")
+            .await
+            .expect("a plain turn after the refusal succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_prepared_image_is_not_read_again_on_a_later_turn() {
+        // A good image turn, then the file is removed, then a plain turn. The
+        // history carries the prepared data URI, so the plain turn does not
+        // re-read the file and succeeds.
+        let (dir, png) = temp_image("gone.png", PNG_BYTES);
+        let (mut agent, seen) = vision_agent("openai");
+        agent
+            .turn(&format!("look [IMAGE:{}]", png.display()))
+            .await
+            .expect("the image turn is accepted");
+        drop(dir);
+        assert!(!png.exists(), "the file is gone before the next turn");
+
+        agent
+            .turn("plain text after the image")
+            .await
+            .expect("the plain turn succeeds with the image file gone");
+        let sent = seen.lock().join("\n");
+        assert!(
+            sent.contains("data:image/png;base64,"),
+            "the image went out as a data URI: {sent}"
+        );
+        assert!(
+            !sent.contains(&png.display().to_string()),
+            "the path marker did not go out again: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_users_size_limit_reaches_the_pre_push_check() {
+        // A 2 MB image under the user's `max_image_size_mb = 1`: refused before
+        // the push. Under the default of 5 MB it would be accepted.
+        let big = vec![0u8; 2 * 1024 * 1024];
+        let mut bytes = PNG_BYTES.to_vec();
+        bytes.extend_from_slice(&big);
+        let (_dir, png) = temp_image("big.png", &bytes);
+        let (mut agent, _seen) = vision_agent_with_multimodal(
+            "openai",
+            crate::config::MultimodalConfig {
+                max_image_size_mb: 1,
+                ..crate::config::MultimodalConfig::default()
+            },
+        );
+        agent.turn("hello first").await.expect("first plain turn");
+        let before = agent.history.len();
+
+        let err = agent
+            .turn(&format!("look [IMAGE:{}]", png.display()))
+            .await
+            .expect_err("a 2 MB image is over the user's 1 MB limit");
+        assert!(
+            err.to_string()
+                .contains("multimodal image size limit exceeded"),
+            "{err}"
+        );
+        assert_eq!(agent.history.len(), before, "refusal leaves history alone");
+    }
+
+    #[tokio::test]
+    async fn a_reseed_of_a_turn_whose_file_is_gone_keeps_the_text_and_never_fails() {
+        // A turn restored from the store names an image whose file was removed
+        // since. The reseed keeps the turn's text, puts a placeholder in place
+        // of the marker, and does not fail: the session stays usable.
+        let (dir, png) = temp_image("moved.png", PNG_BYTES);
+        drop(dir);
+        let (mut agent, seen) = vision_agent("openai");
+        let turns = vec![
+            (
+                "user".to_string(),
+                format!("look at this [IMAGE:{}]", png.display()),
+            ),
+            ("assistant".to_string(), "I see it".to_string()),
+        ];
+
+        agent
+            .reseed_history(&turns)
+            .await
+            .expect("a reseed never fails on a missing image");
+
+        let held: Vec<String> = agent
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                ConversationMessage::Chat(c) if c.role == "user" => Some(c.content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held.len(), 1, "one user turn is held: {held:?}");
+        assert!(
+            held[0].contains("look at this"),
+            "the turn's text is kept: {held:?}"
+        );
+        assert!(
+            !held[0].contains("[IMAGE:"),
+            "no image marker is held: {held:?}"
+        );
+        assert!(
+            held[0].contains("moved.png"),
+            "the placeholder names the file: {held:?}"
+        );
+
+        agent
+            .turn("plain text after the reseed")
+            .await
+            .expect("the next turn succeeds after the reseed");
+        assert!(seen
+            .lock()
+            .join("\n")
+            .contains("plain text after the reseed"));
     }
 
     #[tokio::test]
