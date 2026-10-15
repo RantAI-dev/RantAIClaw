@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- On the prompt (XML) tool protocol, a tool's output could close its `<tool_result>` frame and inject text the model read as a separate result; the output and the frame's attribute values are now escaped so each result stays one frame. MCP tool output had no size limit; it is now capped at 1 MiB with a marker saying how many bytes were dropped.
 - The shell, `pty`, `ssh exec`, skill tools and cron jobs refuse a command that names a credential
   directory (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.kube`, `~/.netrc`,
   `~/.azure`, `~/.config/gcloud`, or a profile `secrets` directory), at every autonomy

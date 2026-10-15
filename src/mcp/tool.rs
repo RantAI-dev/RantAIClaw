@@ -8,6 +8,7 @@
 //! double-underscore convention matches Claude Code's MCP tool
 //! naming so users coming from there have one less surprise.
 
+use std::fmt::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,6 +34,23 @@ pub fn qualified_name(server: &str, tool: &str) -> String {
             .collect()
     };
     format!("mcp__{}__{}", sanitize(server), sanitize(tool))
+}
+
+/// Largest MCP tool output that reaches the agent, in bytes. Same value as
+/// `MAX_OUTPUT_BYTES` in `src/tools/shell.rs` (private to that module, so it
+/// is repeated here); keep the two in step.
+pub(crate) const MAX_MCP_OUTPUT_BYTES: usize = 1_048_576;
+
+/// Keep at most `MAX_MCP_OUTPUT_BYTES` of a successful tool's text, cut on a
+/// char boundary, and say how much was dropped.
+fn cap_output(mut text: String) -> String {
+    if text.len() > MAX_MCP_OUTPUT_BYTES {
+        let keep = text.floor_char_boundary(MAX_MCP_OUTPUT_BYTES);
+        let dropped = text.len() - keep;
+        text.truncate(keep);
+        let _ = write!(text, "\n[mcp output truncated: {dropped} bytes dropped]");
+    }
+    text
 }
 
 pub struct McpTool {
@@ -97,7 +115,7 @@ impl Tool for McpTool {
         match self.client.call(&self.upstream_name, normalised).await {
             Ok(text) => Ok(ToolResult {
                 success: true,
-                output: text,
+                output: cap_output(text),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
@@ -127,5 +145,72 @@ mod tests {
             qualified_name("my-server", "do.thing"),
             "mcp__my_server__do_thing"
         );
+    }
+
+    /// Fake stdio server (POSIX sh, as in `tests/mcp_client_transport.rs`):
+    /// answers `initialize`/`tools/list` like a normal server, and every
+    /// `tools/call` with one text block of `$TEXT_BYTES` bytes of `a`.
+    fn text_server(text_bytes: usize) -> String {
+        format!(
+            r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *initialize*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"capabilities":{{}}}}}}\n' "$id" ;;
+    *tools/list*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[]}}}}\n' "$id" ;;
+    *) big=$(head -c {text_bytes} /dev/zero | tr '\0' a)
+       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"%s"}}]}}}}\n' "$id" "$big" ;;
+  esac
+done
+"#
+        )
+    }
+
+    async fn tool_over(script: &str) -> McpTool {
+        let client = crate::mcp::client::McpClient::connect(
+            "fixture",
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("fixture server connects");
+        McpTool::new(
+            Arc::new(client),
+            McpToolInfo {
+                name: "echo".into(),
+                description: String::new(),
+                input_schema: Value::Null,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn output_over_one_mib_is_cut_with_a_marker() {
+        let tool = tool_over(&text_server(2 * 1024 * 1024)).await;
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let marker = "[mcp output truncated: ";
+        let at = result.output.find(marker).expect("cut marker present");
+        assert!(
+            result.output.len() <= MAX_MCP_OUTPUT_BYTES + 200,
+            "kept {} bytes",
+            result.output.len()
+        );
+        assert!(
+            result.output[at..].contains("bytes dropped"),
+            "{}",
+            &result.output[at..]
+        );
+        assert!(result.output.starts_with("aaaa"));
+    }
+
+    #[tokio::test]
+    async fn output_under_the_cap_is_unchanged() {
+        let tool = tool_over(&text_server(10)).await;
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert_eq!(result.output, "a".repeat(10));
+        assert!(result.success);
     }
 }

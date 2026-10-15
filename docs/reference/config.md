@@ -486,6 +486,9 @@ Notes:
 - The subprocess environment is stripped and rebuilt from a non-secret allowlist
   plus the declared `env`, so an MCP server does not inherit the daemon's provider
   keys.
+- **A tool's output is capped at 1 MiB** (1,048,576 bytes) before it reaches the agent.
+  Output past the cap is cut on a character boundary, and a final line says how many
+  bytes were dropped. Error text is not capped.
 
 ## `[tunnel]`
 
