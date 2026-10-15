@@ -328,9 +328,16 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `true` | Enable `browser_open` tool (opens URLs without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
+| `allowed_domains` | `["*"]` | Allowed hosts for the `browser` and `browser_open` tools (exact, subdomain or `"*"` for any public host) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"computer_use"`, or `"auto"`. `"rust_native"` and `"native"` fail with an error, because the native backend was removed |
+
+Notes:
+
+- Usable-by-default: the wildcard `["*"]` allows any public host. Both tools read the same list.
+- An entry is an exact host (`"docs.example.com"`), a domain (`"example.com"`, which admits `docs.example.com` too) or a `"*.domain"` wildcard.
+- Private and local hosts (loopback, RFC 1918, link-local and the IPv6 equivalents) are refused before the list is read, `"*"` included.
+- A config that already holds `allowed_domains = []` is kept as written. Both tools then refuse every URL until domains are configured.
 
 ### `[browser.computer_use]`
 

@@ -1041,8 +1041,13 @@ pub struct BrowserConfig {
     /// the intended contract declared by the v8→v9 migration.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Allowed domains for `browser_open` (exact or subdomain match)
-    #[serde(default)]
+    /// Allowed domains for the `browser` and `browser_open` tools. Accepts an
+    /// exact host, a subdomain (`example.com` admits `docs.example.com`), a
+    /// `*.domain` wildcard, or `"*"` for any public host. Private and local
+    /// hosts are refused before this list is consulted. Default `["*"]`, so the
+    /// tools work on a fresh install; an explicit `[]` is kept and refuses every
+    /// URL.
+    #[serde(default = "default_wildcard_domains")]
     pub allowed_domains: Vec<String>,
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
@@ -1063,7 +1068,7 @@ impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            allowed_domains: Vec::new(),
+            allowed_domains: default_wildcard_domains(),
             session_name: None,
             backend: default_browser_backend(),
             computer_use: BrowserComputerUseConfig::default(),
@@ -7673,14 +7678,14 @@ default_temperature = 0.7
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
         assert!(c.browser.enabled);
-        assert!(c.browser.allowed_domains.is_empty());
+        assert_eq!(c.browser.allowed_domains, vec!["*".to_string()]);
     }
 
     #[test]
     async fn browser_config_default_enabled() {
         let b = BrowserConfig::default();
         assert!(b.enabled);
-        assert!(b.allowed_domains.is_empty());
+        assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
         assert_eq!(b.computer_use.endpoint, "http://127.0.0.1:8787/v1/actions");
         assert_eq!(b.computer_use.timeout_ms, 15_000);
@@ -7734,7 +7739,32 @@ default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(parsed.browser.enabled);
-        assert!(parsed.browser.allowed_domains.is_empty());
+        assert_eq!(parsed.browser.allowed_domains, vec!["*".to_string()]);
+    }
+
+    #[test]
+    async fn browser_allowed_domains_missing_key_loads_wildcard() {
+        let toml_str = r#"
+default_temperature = 0.7
+[browser]
+enabled = true
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.browser.allowed_domains, vec!["*".to_string()]);
+    }
+
+    #[test]
+    async fn browser_allowed_domains_explicit_empty_list_loads_empty() {
+        let toml_str = r#"
+default_temperature = 0.7
+[browser]
+allowed_domains = []
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(
+            parsed.browser.allowed_domains.is_empty(),
+            "an explicit [] is a user choice and must be kept"
+        );
     }
 
     #[test]

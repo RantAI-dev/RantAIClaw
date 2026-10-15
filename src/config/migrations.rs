@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 38;
+pub const CURRENT_VERSION: u32 = 39;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -496,7 +496,19 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v38(raw);
     }
 
-    // Future migrations (v39, …) inserted here in order.
+    // v38 → v39: `[browser].allowed_domains` defaults to `["*"]` (was `[]`), so
+    // the `browser` and `browser_open` tools work on a fresh install. Private
+    // and local hosts stay refused before the list is consulted. A fresh config
+    // gets `["*"]` from the new default. An existing config that already holds
+    // `allowed_domains = []` keeps it, because the file says so and the refusal
+    // names the key. No transformation; this arm burns a version slot so the
+    // schema_drift fingerprint (which embeds default values) is accepted with
+    // intent (mirrors v8 → v9).
+    if from < 39 {
+        // (no transformation; default-value change only)
+    }
+
+    // Future migrations (v40, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -2554,7 +2566,35 @@ allowed_users = ["*"]
         );
     }
 
+    #[test]
+    fn v39_keeps_an_explicit_empty_allowlist() {
+        let mut v = parse("schema_version = 38\n[browser]\nallowed_domains = []\n");
+        assert!(migrate(&mut v).expect("migration runs"));
+        let cfg: crate::config::Config = v.try_into().expect("the migrated config loads");
+        assert!(
+            cfg.browser.allowed_domains.is_empty(),
+            "an explicit [] is a user choice and must survive the migration"
+        );
+        assert_eq!(cfg.schema_version, 39);
+    }
+
+    #[test]
+    fn v39_leaves_an_absent_allowlist_absent_and_loads_the_wildcard() {
+        let mut v = parse("schema_version = 38\n[browser]\nenabled = true\n");
+        assert!(migrate(&mut v).expect("migration runs"));
+        let cfg: crate::config::Config = v.try_into().expect("the migrated config loads");
+        assert_eq!(cfg.browser.allowed_domains, vec!["*".to_string()]);
+    }
+
     /// The default a fresh install gets is the value the step migrates to.
+    #[test]
+    fn v39_target_is_the_default_a_fresh_install_gets() {
+        assert_eq!(
+            crate::config::Config::default().browser.allowed_domains,
+            vec!["*".to_string()]
+        );
+    }
+
     #[test]
     fn v37_target_is_the_default_a_fresh_install_gets() {
         assert_eq!(
