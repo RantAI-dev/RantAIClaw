@@ -117,6 +117,24 @@ a provider that does not report them adds nothing to the day's total.
 - API key requests use `generativelanguage.googleapis.com/v1beta`
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
 
+### Image Input By Provider
+
+Image markers (``[IMAGE:<source>]``) reach the model as image parts on these providers:
+
+- `ollama` and `bedrock` send their own image parts.
+- `anthropic`, `openai` and `gemini` (the rig path) send png, jpeg and webp; `anthropic` and `openai`
+  also send gif. bmp is refused on all three.
+- On a vision provider, a message whose image file cannot be read is refused before it enters the
+  conversation, so the next message goes through.
+- On the rig providers (`anthropic`, `openai`, `gemini`), a message naming an image type the
+  provider's rig path cannot send (bmp on all three; gif on `gemini`) is refused before it enters the
+  conversation, with the `MIME type is not allowed` error. The list is keyed on the primary
+  provider. A fallback or model route that serves a turn is not checked against its own list, the
+  same as the existing vision check.
+- A provider that declares no vision input (for example `custom:<url>`) refuses the current turn's
+  image with the capability error, and the conversation continues with the next message. Earlier
+  images in the history are replaced with an omission note, not refused.
+
 ### Ollama Vision Notes
 
 - Provider ID: `ollama`

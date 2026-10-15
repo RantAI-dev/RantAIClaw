@@ -54,7 +54,10 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use rig_core::client::CompletionClient;
-use rig_core::completion::message::{AssistantContent, ToolFunction};
+use rig_core::completion::message::{
+    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, ToolFunction,
+    UserContent,
+};
 use rig_core::completion::{
     CompletionModel, CompletionRequest, GetTokenUsage, Message as RigMessage, ToolDefinition,
 };
@@ -66,6 +69,7 @@ use tokio::sync::mpsc;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities, ToolCall, ToolsPayload,
 };
+use crate::multimodal;
 use crate::tools::ToolSpec;
 
 /// Inner client dispatch — one concrete `rig_core` client per supported
@@ -303,6 +307,48 @@ fn anthropic_max_tokens(model: &str) -> u64 {
     4_096
 }
 
+/// A user message as rig sends it: its text parts in order, each
+/// `[IMAGE:data:…]` marker as an image part, never as marker text.
+///
+/// The multimodal step has already rewritten local paths to data URIs, so a
+/// marker here is a data URI. A marker whose data URI does not parse as a
+/// base64 image is left in the text, as before this change.
+fn user_message_from(content: &str) -> RigMessage {
+    let (cleaned, refs) = multimodal::parse_image_markers(content);
+    let mut parts: Vec<UserContent> = Vec::new();
+    if !cleaned.is_empty() || refs.is_empty() {
+        parts.push(UserContent::text(cleaned));
+    }
+    for reference in refs {
+        match split_data_uri(&reference) {
+            Some((media_type, data)) => parts.push(UserContent::Image(Image {
+                data: DocumentSourceKind::Base64(data.to_string()),
+                media_type: Some(media_type),
+                detail: Some(ImageDetail::Auto),
+                additional_params: None,
+            })),
+            None => parts.push(UserContent::text(format!("[IMAGE:{reference}]"))),
+        }
+    }
+    let content = OneOrMany::many(parts).expect("a user message always has at least one part");
+    RigMessage::User { content }
+}
+
+/// `data:image/png;base64,XYZ` → (`PNG`, `XYZ`). `None` for anything else.
+fn split_data_uri(reference: &str) -> Option<(ImageMediaType, &str)> {
+    let rest = reference.strip_prefix("data:")?;
+    let (header, data) = rest.split_once(',')?;
+    let mime = header.strip_suffix(";base64")?;
+    let media_type = match mime {
+        "image/png" => ImageMediaType::PNG,
+        "image/jpeg" => ImageMediaType::JPEG,
+        "image/gif" => ImageMediaType::GIF,
+        "image/webp" => ImageMediaType::WEBP,
+        _ => return None,
+    };
+    Some((media_type, data))
+}
+
 fn build_rig_request(
     request: ChatRequest<'_>,
     model: &str,
@@ -320,12 +366,12 @@ fn build_rig_request(
                     None => m.content.clone(),
                 });
             }
-            "user" => history.push(RigMessage::user(m.content.clone())),
+            "user" => history.push(user_message_from(&m.content)),
             "assistant" => history.push(assistant_message_from(&m.content)),
             "tool" => history.push(tool_result_message_from(&m.content)),
             other => {
                 tracing::warn!(target: "rig_native", role = %other, "unknown role; treating as user");
-                history.push(RigMessage::user(m.content.clone()));
+                history.push(user_message_from(&m.content));
             }
         }
     }
@@ -1897,5 +1943,133 @@ mod tests {
         // not a fallback, and rig does not default it.
         assert_eq!(anthropic_max_tokens("claude-3-5-sonnet-20241022"), 4_096);
         assert_eq!(anthropic_max_tokens("claude-3-opus-20240229"), 4_096);
+    }
+
+    /// A 1×1 PNG, base64, as `normalize_data_uri` leaves it after the
+    /// multimodal step: the marker carries a data URI, never a path.
+    const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    fn marked_user_message() -> ChatMessage {
+        ChatMessage::user(format!(
+            "lihat gambar ini\n\n[IMAGE:data:image/png;base64,{PNG_B64}]"
+        ))
+    }
+
+    #[tokio::test]
+    async fn anthropic_wire_sends_the_image_as_an_image_part() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "type": "message", "id": "msg_img", "model": "claude-3-haiku-20240307",
+                    "role": "assistant", "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider =
+            RigProvider::for_provider_with_url("anthropic", Some("k"), Some(&server.uri()))
+                .expect("construct");
+        let messages = vec![marked_user_message()];
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "claude-3-haiku-20240307",
+                0.2,
+            )
+            .await
+            .expect("chat against the mock");
+
+        let body = first_request_body(&server).await;
+        let content = body["messages"][0]["content"].to_string();
+        assert!(
+            content.contains(r#""type":"image""#) && content.contains(PNG_B64),
+            "anthropic must receive an image part with the data: {content}"
+        );
+        assert!(
+            content.contains("lihat gambar ini"),
+            "text part kept: {content}"
+        );
+        assert!(
+            !content.contains("[IMAGE:"),
+            "no marker text may reach the wire: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_wire_sends_the_image_as_an_image_url_part() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "c", "object": "chat.completion", "created": 1_700_000_000_u64,
+                    "model": "gpt-4o-mini",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = RigProvider::for_provider_with_url("openai", Some("k"), Some(&server.uri()))
+            .expect("construct");
+        let messages = vec![marked_user_message()];
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "gpt-4o-mini",
+                0.2,
+            )
+            .await
+            .expect("chat against the mock");
+
+        let body = first_request_body(&server).await;
+        let content = body["messages"][0]["content"].to_string();
+        assert!(
+            content.contains(r#""type":"image_url""#)
+                && content.contains(&format!("data:image/png;base64,{PNG_B64}")),
+            "openai must receive an image_url part with the data URI: {content}"
+        );
+        assert!(content.contains("lihat gambar ini"), "text kept: {content}");
+        assert!(!content.contains("[IMAGE:"), "no marker text: {content}");
+    }
+
+    #[test]
+    fn gemini_native_content_carries_the_image_as_inline_data() {
+        // gemini has no base-URL hook (for_provider_with_url ignores it), so
+        // the wire is checked at the rig conversion the gemini client runs.
+        let req = build_rig_request(
+            ChatRequest {
+                messages: &[marked_user_message()],
+                tools: None,
+            },
+            "gemini-2.0-flash",
+            0.0,
+        )
+        .unwrap();
+        let contents: Vec<rig_core::providers::gemini::completion::gemini_api_types::Content> = req
+            .chat_history
+            .clone()
+            .into_iter()
+            .map(|m| m.try_into().expect("gemini converts the user message"))
+            .collect();
+        let wire = serde_json::to_string(&contents).unwrap();
+        assert!(
+            wire.contains("inlineData") && wire.contains(PNG_B64),
+            "gemini must receive the image as inline data: {wire}"
+        );
+        assert!(wire.contains("lihat gambar ini"), "text kept: {wire}");
+        assert!(!wire.contains("[IMAGE:"), "no marker text: {wire}");
     }
 }
