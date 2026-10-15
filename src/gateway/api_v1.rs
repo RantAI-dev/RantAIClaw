@@ -711,9 +711,11 @@ async fn agent_chat_sync(
         // Rebuilding the system prompt reads the view, so it runs under the same
         // `All` view as the turn below.
         crate::memory::MEMORY_VIEW
-            .sync_scope(crate::memory::MemoryView::All, || {
-                agent.restore_history(&prior)
-            })
+            .scope(
+                crate::memory::MemoryView::All,
+                agent.restore_history(&prior),
+            )
+            .await
             .map_err(err_500)?;
     }
     // Feed the agent the message plus any framed reference material; only
@@ -1029,9 +1031,11 @@ async fn agent_chat_stream(
                     // Rebuilding the system prompt reads the view, so it runs
                     // under the same `All` view as the turn below.
                     let _ = crate::memory::MEMORY_VIEW
-                        .sync_scope(crate::memory::MemoryView::All, || {
-                            agent.restore_history(&prior)
-                        });
+                        .scope(
+                            crate::memory::MemoryView::All,
+                            agent.restore_history(&prior),
+                        )
+                        .await;
                 }
                 // Carry this turn's scope into tool execution so the shell tool
                 // and the Layer-A modal register their approvals against it. The
@@ -1124,7 +1128,14 @@ async fn agent_chat_stream(
                     "total": usage.total_tokens,
                     "cost_usd": usage.cost_usd,
                 }),
-                crate::agent::AgentEvent::Error(message) => {
+                // A refusal (`ImageRefused`) is the message the agent would not send, before
+                // anything ran: `errored` keeps the `Done` below from
+                // persisting it. The console has no input box to hand the text
+                // back to, so it is reported on the same wire event a failure
+                // uses and the contract is unchanged — one arm, because the
+                // two carry the same payload.
+                crate::agent::AgentEvent::Error(message)
+                | crate::agent::AgentEvent::ImageRefused { message } => {
                     errored = true;
                     serde_json::json!({"type": "error", "message": message})
                 }

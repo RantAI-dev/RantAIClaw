@@ -163,6 +163,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the document to it once stored. Before, the name was recorded in the document's metadata only, so the group
   never listed the document.
 - `browser_open` ignored the `"*"` wildcard in `[browser].allowed_domains`, and the two browser tools refused the same state in different words. Both now share one verdict and one message.
+- A message refused for its image came back after `/undo`, `/retry` or resuming the session, and every later
+  turn failed with the same error. The refused message is taken back instead: the row leaves the screen and
+  the session store, so no reseed brings it back, its text returns to the input box, and the refusal is shown
+  once, as one line.
+- The fifth image of a session passed the check and broke every message after it, and an image file deleted
+  or moved after a good turn did the same. The image count is now judged across the whole session, and a
+  refusal for a full session says how many images the session holds, what the limit is and that `/new` starts
+  over. A pushed turn keeps its image as prepared data, so a file deleted later no longer breaks later turns,
+  and a reseed that meets an image file it can no longer read keeps the text and leaves an
+  `[image not sent: <ref>]` placeholder in place of the marker.
+- `[multimodal]` (`max_images`, `max_image_size_mb`, `allow_remote_fetch`) had no effect in the terminal chat
+  and the console, where an agent turn prepared its images with the built-in defaults. Both read the
+  operator's section now. The channels and the gateway's chat turns already read it and are unchanged.
+- A session started with `/new` had no title and was listed as `(untitled)`. It now takes the title of its
+  first user message, whatever notes come before it, and a title set with `/title` is kept.
 
 ## [0.33.0-alpha] — 2026-10-08
 

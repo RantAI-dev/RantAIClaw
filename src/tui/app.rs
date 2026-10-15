@@ -204,6 +204,21 @@ fn clawhub_candidate_items(
         .collect()
 }
 
+/// A turn the TUI submitted to the agent actor and is still waiting on.
+#[derive(Debug, Clone, Copy)]
+pub struct SubmittedTurn {
+    /// Store id of the user row this turn answers, when it has one. `None`
+    /// for a resubmit that appended no row (`/continue`). This is how a
+    /// refusal finds the row to take back: the turn names it, not "the last
+    /// user row on screen", which a message submitted in the meantime has
+    /// already replaced.
+    pub row_id: Option<i64>,
+    /// The agent refused this turn's message. The `Done` that ends it belongs
+    /// to a turn that never ran, so it ends the turn without committing a
+    /// reply — and it says so about THIS turn, whatever was submitted after it.
+    pub refused: bool,
+}
+
 /// Top-level TUI application.
 // Many independent UI mode flags; grouping them into a sub-struct would not
 // improve clarity and would churn every call site.
@@ -410,6 +425,22 @@ pub struct TuiApp {
     /// Whether the autonomy-hint toast has already fired this turn so
     /// we don't spam the user with the same suggestion on every block.
     pub autonomy_hint_shown_this_turn: bool,
+    /// Turns submitted to the actor and not yet ended, oldest first, each
+    /// with the user row it answers. The actor answers turns in submission
+    /// order, so the front is the turn in flight: a refusal takes back its own
+    /// row, and the `Done` that follows is matched to the turn it ends even
+    /// when another message was submitted while it ran.
+    pub pending_turns: std::collections::VecDeque<SubmittedTurn>,
+    /// Whether the bridge's actor holds an `Agent`. `false` only when the
+    /// boot-time `Agent::from_config` failed and no `Reload` has healed the
+    /// session since.
+    ///
+    /// The actor owns the agent; this records that one fact because the TUI
+    /// cannot otherwise tell an error that ends a turn for good — there was
+    /// no agent to run it, so no `Done` will ever follow — from the error a
+    /// running turn sends before its own `Done`. `run_tui` clears it when the
+    /// boot failed; a reload that rebuilds the agent sets it again.
+    pub actor_has_agent: bool,
     /// Most-recent unresolved pending approval. When `Some`, the input
     /// box surfaces a single-key Y/N/A prompt and absorbs Y/N/A/Esc so
     /// the user doesn't have to type `/allow X`. Resolves via
@@ -583,6 +614,8 @@ impl TuiApp {
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
+            pending_turns: std::collections::VecDeque::new(),
+            actor_has_agent: true,
             pending_approval: None,
             pending_model: None,
         })
@@ -2056,7 +2089,15 @@ impl TuiApp {
         }
 
         let text = trimmed.to_string();
-        self.context.append_user_message(&text)?;
+        let row_id = self.context.append_user_message(&text)?;
+        // This turn answers this row. The queue is what ties a refusal, and
+        // the `Done` that follows it, to the message they are about — a turn
+        // submitted while another one is still in flight must not be mistaken
+        // for either.
+        self.pending_turns.push_back(SubmittedTurn {
+            row_id: Some(row_id),
+            refused: false,
+        });
         // Commit user message to scrollback so it appears inline like
         // Hermes/Claude-Code chat output.
         self.scrollback_queue
@@ -2077,6 +2118,9 @@ impl TuiApp {
             })
             .await
         {
+            // Nothing will ever answer this turn, so it must not sit in the
+            // queue and be mistaken for a later one.
+            self.pending_turns.pop_back();
             self.context.last_error = Some(format!("agent bridge closed: {e}"));
             self.context.scroll_offset = 0;
             return Ok(());
@@ -2766,6 +2810,9 @@ impl TuiApp {
             AgentEvent::Error(msg) => {
                 self.finalize_error(msg);
             }
+            AgentEvent::ImageRefused { message } => {
+                self.finalize_refusal(message);
+            }
             AgentEvent::ReloadFailed { error } => {
                 // The previous agent is still running and answers the next
                 // prompt. A model switch waiting on this reload is dropped, so
@@ -2781,6 +2828,10 @@ impl TuiApp {
                 mcp_tools_by_server,
                 security,
             } => {
+                // The reload rebuilt the agent, so the actor can run a turn
+                // again: from here on a turn it answers with an error is
+                // followed by that turn's own `Done` (`finalize_error`).
+                self.actor_has_agent = true;
                 // Refresh the TUI's cached MCP snapshot so `/mcp`
                 // reflects the post-reload state. The agent already
                 // has the new tools and can use them on the next
@@ -2942,6 +2993,23 @@ impl TuiApp {
         // the next turn starts with a clean slate.
         self.shell_blocks_this_turn = 0;
         self.autonomy_hint_shown_this_turn = false;
+
+        // This `Done` ends the turn at the front of the queue. A refused turn
+        // already showed its one line (see `finalize_refusal`) and its text
+        // is back in the input box; nothing ran, so it carries no reply, and
+        // committing an empty assistant row plus a "[no response …]" line
+        // would be a reply the user never asked for. Whether this turn was
+        // refused is its own fact — a message submitted since says nothing
+        // about it.
+        let refused = self
+            .pending_turns
+            .pop_front()
+            .is_some_and(|turn| turn.refused);
+        if refused {
+            self.end_turn_or_run_the_next();
+            return;
+        }
+
         let mut body = if cancelled && final_text.is_empty() {
             if let AppState::Streaming { partial, .. } = &self.state {
                 partial.clone()
@@ -3032,19 +3100,7 @@ impl TuiApp {
                 .push(("assistant".to_string(), body.clone()));
         }
 
-        if self.context.queued_turns > 0 {
-            self.context.queued_turns -= 1;
-            self.state = AppState::Streaming {
-                partial: String::new(),
-                tool_blocks: Vec::new(),
-                cancelling: false,
-                turn_started_at: std::time::Instant::now(),
-            };
-            self.stream_committed_chars = 0;
-            self.stream_header_committed = false;
-        } else {
-            self.state = AppState::Ready;
-        }
+        self.end_turn_or_run_the_next();
 
         // A clean turn means the underlying system path that produced
         // the previous `last_error` is verifiably healthy now (the
@@ -3059,9 +3115,70 @@ impl TuiApp {
         }
     }
 
+    /// End the turn that just finished: the next queued turn starts streaming,
+    /// or the app goes back to `Ready` when none is waiting.
+    fn end_turn_or_run_the_next(&mut self) {
+        if self.context.queued_turns > 0 {
+            self.context.queued_turns -= 1;
+            self.state = AppState::Streaming {
+                partial: String::new(),
+                tool_blocks: Vec::new(),
+                cancelling: false,
+                turn_started_at: std::time::Instant::now(),
+            };
+            self.stream_committed_chars = 0;
+            self.stream_header_committed = false;
+        } else {
+            self.state = AppState::Ready;
+        }
+    }
+
+    /// Finalize a turn on [`AgentEvent::ImageRefused`] — the agent would not
+    /// send the message, because one of its images could not be prepared, and
+    /// nothing entered its history.
+    ///
+    /// So the TUI takes the message back rather than showing a failed turn:
+    /// the row leaves the screen and the store (so `/undo`, `/retry` and a
+    /// later resume cannot bring it back), its text returns to the input box
+    /// to be edited and sent again, and the refusal is shown once, as one
+    /// line. A turn that fails after the message was sent keeps today's
+    /// behavior and does not come here.
+    fn finalize_refusal(&mut self, message: String) {
+        self.shell_blocks_this_turn = 0;
+        self.autonomy_hint_shown_this_turn = false;
+        // The refusal belongs to the turn in flight — the front of the queue.
+        // Marking it here and taking back the row IT was submitted for is
+        // what keeps a message submitted in the meantime from being taken
+        // back in its place, or from forgetting that this turn never ran.
+        let refused_row = self.pending_turns.front_mut().map(|turn| {
+            turn.refused = true;
+            turn.row_id
+        });
+        if let Some(text) = refused_row
+            .flatten()
+            .and_then(|row_id| self.context.take_back_refused_row(row_id))
+        {
+            self.context.input_buffer = text;
+            self.context.cursor_to_end();
+        }
+        // Stored as a note, like a failed turn's error line: the text is back
+        // in the input box, and a note is never replayed to the model.
+        if let Err(e) = self.context.append_note_message(&message) {
+            self.context.last_error = Some(format!("failed to persist refusal: {e}"));
+        }
+        self.scrollback_queue.push(("system".to_string(), message));
+        // Nothing ran, so the previous turn's `last_error` is neither
+        // confirmed nor cleared here — the same as a cancelled turn.
+    }
+
     /// Finalize a turn on `AgentEvent::Error`. Surfaces the error as a
     /// visible assistant message (so it shows up in chat history) AND sets
     /// `last_error` so the status bar reflects it until cleared.
+    ///
+    /// The turn itself ends with the `Done` that follows the error — except
+    /// when the actor holds no agent, which answers a `Submit` with this
+    /// error alone. Then this call retires the queued turn, so every submit
+    /// still has exactly one pop.
     ///
     /// Recognizes a small list of common error shapes (API key not set,
     /// rate-limited, model not available) and rewrites them into a
@@ -3086,6 +3203,16 @@ impl TuiApp {
         // Commit error message to scrollback so the user sees it inline.
         self.scrollback_queue
             .push(("system".to_string(), chat_body));
+        // With no agent, this error is the whole answer to the turn that was
+        // queued for it: the actor could not run it and sends no `Done`, so
+        // the queue entry is retired here — one `Submit`, one pop. Left at the
+        // front it would be the row the next refusal takes back, the same way
+        // an unanswered turn would swallow the `Done` of the turn after it.
+        // A running agent's error is always followed by that turn's own
+        // `Done`, which pops it; popping here as well would pop twice.
+        if !self.actor_has_agent {
+            self.pending_turns.pop_front();
+        }
         self.state = AppState::Ready;
     }
 
@@ -3141,7 +3268,7 @@ impl TuiApp {
                 self.context.last_error = None;
             }
             CmdResult::Resubmit(text) => {
-                self.dispatch_resubmit(text).await;
+                self.dispatch_resubmit(text, None).await;
             }
             CmdResult::RetryLast(text) => {
                 // A retry refused mid-stream must change nothing, so the old
@@ -3152,7 +3279,15 @@ impl TuiApp {
                         return Ok(());
                     }
                 }
-                self.dispatch_resubmit(text).await;
+                // The retried message keeps its row on the screen; that row is
+                // the one a refusal of this turn takes back.
+                let row_id = self
+                    .context
+                    .messages
+                    .iter()
+                    .rposition(|m| m.role == "user")
+                    .map(|at| self.context.messages[at].id);
+                self.dispatch_resubmit(text, row_id).await;
             }
             CmdResult::SetModel(target) => {
                 self.apply_model_selection(&target);
@@ -3339,6 +3474,10 @@ impl TuiApp {
                 // Another session's total is not this session's: the store
                 // keeps no per-turn usage, so the picked one starts unreported.
                 self.context.token_usage = None;
+                // A title set by hand belongs to the session it was set on,
+                // like `/new`: the picked session titles itself from its own
+                // first user row.
+                self.context.title_set_by_hand = false;
                 // History replaced (resume) — selection anchors are stale.
                 self.context.selection = None;
                 self.selection_drag_anchor = None;
@@ -4460,9 +4599,12 @@ impl TuiApp {
     }
 
     /// Dispatch a `/retry`-style resubmit: re-runs an existing user message
-    /// without appending it to history. Refuses while a turn is already
-    /// streaming — the user should cancel first.
-    async fn dispatch_resubmit(&mut self, text: String) {
+    /// without appending it to history. `row_id` is the store id of the user
+    /// row this turn answers, or `None` for a resubmit that wrote no row
+    /// (`/continue`) — there is nothing for a refusal to take back then.
+    /// Refuses while a turn is already streaming — the user should cancel
+    /// first.
+    async fn dispatch_resubmit(&mut self, text: String, row_id: Option<i64>) {
         match self.state {
             AppState::Streaming { .. } => {
                 self.context.last_error = Some(
@@ -4472,6 +4614,10 @@ impl TuiApp {
             }
             AppState::Ready => {
                 self.context.flush_pending_reseed().await;
+                self.pending_turns.push_back(SubmittedTurn {
+                    row_id,
+                    refused: false,
+                });
                 if let Err(e) = self
                     .context
                     .req_tx
@@ -4481,6 +4627,9 @@ impl TuiApp {
                     })
                     .await
                 {
+                    // Nothing will ever answer this turn, so it must not sit
+                    // in the queue and be mistaken for a later one.
+                    self.pending_turns.pop_back();
                     self.context.last_error = Some(format!("agent bridge closed: {e}"));
                     return;
                 }
@@ -6041,6 +6190,8 @@ pub(super) mod test_support {
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
+            pending_turns: std::collections::VecDeque::new(),
+            actor_has_agent: true,
             pending_approval: None,
             pending_model: None,
         }
@@ -8287,7 +8438,7 @@ pub(crate) fn provider_key_status(c: &crate::config::Config) -> Option<bool> {
 
 /// Re-feeds the stored turns of session `resume_id` to `agent`, so the model
 /// remembers the earlier conversation.
-fn restore_resumed_session(agent: &mut Agent, resume_id: &str) {
+async fn restore_resumed_session(agent: &mut Agent, resume_id: &str) {
     match crate::sessions::cli::open_store().and_then(|s| s.get_messages(resume_id)) {
         Ok(msgs) => {
             let prior = crate::sessions::turns_for_history(&msgs);
@@ -8296,9 +8447,11 @@ fn restore_resumed_session(agent: &mut Agent, resume_id: &str) {
                 // sets it only around each turn. The TUI is the operator's own
                 // surface, so the rebuild runs under the `All` view too.
                 let restored = crate::memory::MEMORY_VIEW
-                    .sync_scope(crate::memory::MemoryView::All, || {
-                        agent.restore_history(&prior)
-                    });
+                    .scope(
+                        crate::memory::MemoryView::All,
+                        agent.restore_history(&prior),
+                    )
+                    .await;
                 if let Err(e) = restored {
                     tracing::warn!("failed to restore resumed history: {e}");
                 }
@@ -8359,7 +8512,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // actually remembers the earlier conversation (not just the scrollback).
     if let Some(resume_id) = tui_config.resume_session.as_deref() {
         if let Some(agent) = agent.as_mut() {
-            restore_resumed_session(agent, resume_id);
+            restore_resumed_session(agent, resume_id).await;
         }
     }
 
@@ -8405,6 +8558,10 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         events_rx,
     )?;
     app.context.available_providers = available_providers;
+    // The actor answers a `Submit` it cannot run with the no-agent error and
+    // no `Done`, so the TUI has to know when that is the case: the boot
+    // result is that fact, and a reload heals it in place.
+    app.actor_has_agent = agent_boot_error.is_none();
     app.context.workspace_dir = Some(app_config.workspace_dir.clone());
     // Subscribe to the pending-approvals broadcast before stashing the
     // security handle on the context, so that the moment the shell tool
@@ -9287,6 +9444,8 @@ mod tests {
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
+            pending_turns: std::collections::VecDeque::new(),
+            actor_has_agent: true,
             pending_approval: None,
             pending_model: None,
         };
@@ -10783,8 +10942,9 @@ mod session_history_tests {
     use crate::tui::async_bridge::TurnRequest;
     use crate::tui::context::TuiContext;
     use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+    use std::sync::{Arc, Mutex};
 
-    use super::test_support::app_with_context as make_app_with_context;
+    use super::test_support::{app_with_context as make_app_with_context, app_with_profile_root};
 
     /// Stores `pairs` as one session in `store`, returning its id.
     fn store_session(store: &SessionStore, pairs: &[(&str, &str)]) -> String {
@@ -11475,6 +11635,824 @@ mod session_history_tests {
             "a picked session starts unreported, not with the previous total"
         );
     }
+
+    // ── a message refused for its image ─────────────────────────────────
+    //
+    // The agent refuses such a message before it enters the history and says
+    // so with a typed event. These drive a real `TuiAgentActor` over a real
+    // channel, so what the TUI acts on is what a refused turn really sends.
+
+    /// A vision-capable provider that records every request, so a test can
+    /// read what the model was actually sent.
+    struct VisionEcho {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for VisionEcho {
+        fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+            crate::providers::traits::ProviderCapabilities {
+                native_tool_calling: false,
+                vision: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("an answer".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            self.seen.lock().unwrap().push(
+                request
+                    .messages
+                    .iter()
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            Ok(crate::providers::ChatResponse {
+                usage: None,
+                text: Some("an answer".to_string()),
+                tool_calls: vec![],
+            })
+        }
+    }
+
+    /// An app over an in-memory store whose agent is a vision agent behind a
+    /// live actor: `(app, what the provider was sent, profile root)`. The
+    /// root is held so nothing in the test can reach the developer's own
+    /// `~/.rantaiclaw`.
+    fn app_with_vision_agent() -> (TuiApp, Arc<Mutex<Vec<String>>>, tempfile::TempDir) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agent = crate::agent::Agent::builder()
+            .provider(Box::new(VisionEcho { seen: seen.clone() }))
+            .tools(vec![])
+            .memory(Arc::from(
+                crate::memory::create_memory(
+                    &crate::config::MemoryConfig {
+                        backend: "none".into(),
+                        ..crate::config::MemoryConfig::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("memory"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder");
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(8);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(
+            crate::tui::async_bridge::TuiAgentActor::new(Some(agent), req_rx, events_tx).run(),
+        );
+        let store = SessionStore::in_memory().expect("in-memory store");
+        let ctx = TuiContext::new(store, "mock-model", None, req_tx, events_rx).expect("context");
+        let root = tempfile::TempDir::new().expect("temp profile root");
+        let app = app_with_profile_root(ctx, root.path().to_path_buf());
+        (app, seen, root)
+    }
+
+    /// Drain the bridge into the app until `done` holds. The TUI drains once
+    /// per frame; a test drains in a loop, and says what it was waiting for.
+    async fn pump_until(app: &mut TuiApp, what: &str, done: impl Fn(&TuiApp) -> bool) {
+        for _ in 0..400 {
+            app.drain_events();
+            if done(app) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the app never reached {what}");
+    }
+
+    /// Every row the store holds for the app's session, as `(role, content)`.
+    fn stored_rows(app: &TuiApp) -> Vec<(String, String)> {
+        let sid = app.context.session_id.clone().expect("a bound session");
+        app.context
+            .session_store
+            .get_messages(&sid)
+            .expect("stored messages")
+            .into_iter()
+            .map(|m| (m.role, m.content))
+            .collect()
+    }
+
+    /// The turns a reseed from the store would send to the agent.
+    fn turns_in_the_store(app: &TuiApp) -> Vec<(String, String)> {
+        let sid = app.context.session_id.clone().expect("a bound session");
+        let stored = app
+            .context
+            .session_store
+            .get_messages(&sid)
+            .expect("stored messages");
+        crate::sessions::turns_for_history(&stored)
+    }
+
+    /// The title the store holds for a session — what the picker lists it
+    /// under, or `None` for `(untitled)`.
+    fn title_of(app: &TuiApp, sid: &str) -> Option<String> {
+        app.context
+            .session_store
+            .get_session(sid)
+            .expect("the session opens")
+            .expect("the session is stored")
+            .title
+    }
+
+    /// A message whose image cannot be read: the file is not there, so the
+    /// agent refuses it before the turn runs.
+    const UNREADABLE_IMAGE_MESSAGE: &str = "look at this [IMAGE:/tmp/missing-picture.png]";
+
+    #[tokio::test]
+    async fn a_refused_image_is_taken_back_and_the_next_turns_are_answered() {
+        let (mut app, seen, _root) = app_with_vision_agent();
+
+        app.context.input_buffer = UNREADABLE_IMAGE_MESSAGE.to_string();
+        app.submit_input().await.expect("the message is submitted");
+        assert!(
+            stored_rows(&app).iter().any(|(_, c)| c.contains("[IMAGE:")),
+            "the row is on the screen before the turn runs"
+        );
+
+        pump_until(&mut app, "the refusal", |app| {
+            matches!(app.state, AppState::Ready)
+                && !app
+                    .context
+                    .messages
+                    .iter()
+                    .any(|m| m.content.contains("[IMAGE:"))
+        })
+        .await;
+
+        // (a) The refused row is gone from the screen and from the store, so
+        // no reseed, `/undo`, `/retry` or resume can bring it back.
+        let rows = stored_rows(&app);
+        assert!(
+            !app.context
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[IMAGE:")),
+            "the screen keeps no refused image"
+        );
+        assert!(
+            !rows.iter().any(|(_, c)| c.contains("[IMAGE:")),
+            "the store keeps no refused image: {rows:?}"
+        );
+        assert!(
+            turns_in_the_store(&app)
+                .iter()
+                .all(|(_, c)| !c.contains("[IMAGE:")),
+            "a reseed from the store carries no image marker"
+        );
+
+        // (b) Its text is back in the input box, ready to edit and send again.
+        assert_eq!(
+            app.context.input_buffer, UNREADABLE_IMAGE_MESSAGE,
+            "the refused text is back in the input box"
+        );
+        assert_eq!(
+            app.context.cursor_pos,
+            UNREADABLE_IMAGE_MESSAGE.chars().count(),
+            "the cursor sits at the end of the restored text"
+        );
+
+        // (c) The refusal is one line, and no "[no response …]" follows it.
+        assert_eq!(
+            rows.len(),
+            1,
+            "the refusal is the one row the turn added: {rows:?}"
+        );
+        assert_eq!(rows[0].0, "note", "{rows:?}");
+        assert!(
+            rows[0].1.starts_with("This message was not sent:"),
+            "{:?}",
+            rows[0].1
+        );
+        assert!(
+            !app.context
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with("[no response from model")),
+            "an empty reply line must not follow a refusal: {:?}",
+            app.context.messages
+        );
+
+        // The turns after it are answered, before and after `/undo`.
+        app.context.input_buffer = "what did I just ask?".to_string();
+        app.submit_input()
+            .await
+            .expect("the plain turn is submitted");
+        pump_until(&mut app, "the plain reply", |app| {
+            app.context.messages.iter().any(|m| m.role == "assistant")
+        })
+        .await;
+
+        app.handle_command("undo").await.expect("/undo runs");
+        assert!(
+            !app.context.messages.iter().any(|m| m.role == "assistant"),
+            "/undo took the exchange back"
+        );
+        assert!(
+            turns_in_the_store(&app)
+                .iter()
+                .all(|(_, c)| !c.contains("[IMAGE:")),
+            "the reseed /undo sends holds no image marker"
+        );
+
+        app.context.input_buffer = "and again?".to_string();
+        app.submit_input().await.expect("the turn after /undo");
+        pump_until(&mut app, "the reply after /undo", |app| {
+            matches!(app.state, AppState::Ready)
+                && app.context.messages.iter().any(|m| m.role == "assistant")
+        })
+        .await;
+
+        let sent = seen.lock().unwrap().join("\n");
+        assert!(
+            !sent.contains("[IMAGE:"),
+            "no image marker ever reached the model: {sent}"
+        );
+        assert!(sent.contains("what did I just ask?"), "{sent}");
+    }
+
+    /// A session that still holds a refused image row — left by an older
+    /// build, or written by another surface — must not break the turns after
+    /// it is resumed through the picker: the row's image cannot be prepared,
+    /// so its text is kept and the next turn is answered.
+    #[tokio::test]
+    async fn a_resumed_session_that_still_holds_an_image_row_still_answers() {
+        let (mut app, seen, _root) = app_with_vision_agent();
+        let session = store_session(
+            &app.context.session_store,
+            &[
+                ("user", UNREADABLE_IMAGE_MESSAGE),
+                ("assistant", "I could not read that picture"),
+            ],
+        );
+        app.state = AppState::Ready;
+
+        pick_session(&mut app, &session).await;
+
+        app.context.input_buffer = "what did I ask?".to_string();
+        app.submit_input().await.expect("the turn after the resume");
+        pump_until(&mut app, "the reply after the resume", |app| {
+            app.context
+                .messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content == "an answer")
+        })
+        .await;
+
+        let sent = seen.lock().unwrap().join("\n");
+        assert!(
+            !sent.contains("[IMAGE:"),
+            "the stale marker never reached the model: {sent}"
+        );
+        assert!(
+            sent.contains("look at this"),
+            "the stored turn kept its text: {sent}"
+        );
+    }
+
+    /// `/new` opens a session with a "Started new session" note, so the title
+    /// cannot come from "the first row": it comes from the first user row, and
+    /// the picker lists the session under it.
+    #[tokio::test]
+    async fn a_session_started_with_new_takes_the_title_of_its_first_user_message() {
+        let (mut app, _seen, _root) = app_with_vision_agent();
+
+        app.handle_command("new").await.expect("/new runs");
+        let sid = app
+            .context
+            .session_id
+            .clone()
+            .expect("the note binds a session");
+        assert!(
+            title_of(&app, &sid).is_none(),
+            "a session that holds only a note is untitled"
+        );
+
+        app.context.input_buffer = "design a cache eviction policy".to_string();
+        app.submit_input()
+            .await
+            .expect("the first message is submitted");
+
+        assert_eq!(
+            title_of(&app, &sid).as_deref(),
+            Some("design a cache eviction policy"),
+            "the session is listed under its first user message"
+        );
+    }
+
+    /// A refused first message titles nothing — the row it would have named is
+    /// gone — and the next user message names the session. The refused turn
+    /// adds exactly one line.
+    #[tokio::test]
+    async fn a_refused_first_message_leaves_the_session_untitled_and_the_next_one_names_it() {
+        let (mut app, _seen, _root) = app_with_vision_agent();
+        app.handle_command("new").await.expect("/new runs");
+        let sid = app
+            .context
+            .session_id
+            .clone()
+            .expect("the note binds a session");
+        let before = stored_rows(&app).len();
+
+        app.context.input_buffer = UNREADABLE_IMAGE_MESSAGE.to_string();
+        app.submit_input()
+            .await
+            .expect("the refused message is submitted");
+        pump_until(&mut app, "the refusal", |app| {
+            matches!(app.state, AppState::Ready)
+                && !app
+                    .context
+                    .messages
+                    .iter()
+                    .any(|m| m.content.contains("[IMAGE:"))
+        })
+        .await;
+
+        let rows = stored_rows(&app);
+        assert_eq!(
+            rows.len(),
+            before + 1,
+            "the refusal is the only line the refused turn added: {rows:?}"
+        );
+        assert_eq!(rows[before].0, "note", "{rows:?}");
+        assert!(
+            title_of(&app, &sid).is_none(),
+            "a session whose only user row was refused is untitled"
+        );
+
+        app.context.input_buffer = "design a cache eviction policy".to_string();
+        app.submit_input()
+            .await
+            .expect("the next message is submitted");
+
+        assert_eq!(
+            title_of(&app, &sid).as_deref(),
+            Some("design a cache eviction policy"),
+            "the next user message names the session"
+        );
+    }
+
+    /// A title set by hand with `/title` is the operator's: a refused message
+    /// does not clear it, and no later message derives over it. `/new` starts
+    /// a different session, which titles itself again.
+    #[tokio::test]
+    async fn a_title_set_by_hand_survives_a_refusal_and_does_not_outlive_new() {
+        let (mut app, _seen, _root) = app_with_vision_agent();
+        app.handle_command("new").await.expect("/new runs");
+        let titled = app
+            .context
+            .session_id
+            .clone()
+            .expect("the note binds a session");
+        app.handle_command("title my-session")
+            .await
+            .expect("/title runs");
+
+        // The refused message is the session's first user row — the row a
+        // derived title would have come from.
+        app.context.input_buffer = UNREADABLE_IMAGE_MESSAGE.to_string();
+        app.submit_input()
+            .await
+            .expect("the refused message is submitted");
+        pump_until(&mut app, "the refusal", |app| {
+            matches!(app.state, AppState::Ready)
+                && !app
+                    .context
+                    .messages
+                    .iter()
+                    .any(|m| m.content.contains("[IMAGE:"))
+        })
+        .await;
+
+        assert_eq!(
+            title_of(&app, &titled).as_deref(),
+            Some("my-session"),
+            "a hand-set title is kept"
+        );
+
+        app.context.input_buffer = "a plain question".to_string();
+        app.submit_input()
+            .await
+            .expect("the next message is submitted");
+        assert_eq!(
+            title_of(&app, &titled).as_deref(),
+            Some("my-session"),
+            "no later message derives over a hand-set title"
+        );
+
+        app.handle_command("new").await.expect("/new runs");
+        let fresh = app
+            .context
+            .session_id
+            .clone()
+            .expect("the note binds a session");
+        app.context.input_buffer = "a fresh question".to_string();
+        app.submit_input()
+            .await
+            .expect("the first message is submitted");
+        assert_eq!(
+            title_of(&app, &fresh).as_deref(),
+            Some("a fresh question"),
+            "the new session titles itself; the old session's title does not follow"
+        );
+    }
+
+    /// A message submitted while another turn is still in flight waits its
+    /// turn, so a refusal can arrive when the screen holds more than one user
+    /// row. The refusal takes back ITS OWN row: the refused message goes from
+    /// the screen and from the store and its text returns to the input box,
+    /// while the message queued behind it keeps its row and its answer.
+    #[tokio::test]
+    async fn a_refused_message_is_taken_back_while_another_one_waits_behind_it() {
+        let (mut app, seen, _root) = app_with_vision_agent();
+
+        app.context.input_buffer = UNREADABLE_IMAGE_MESSAGE.to_string();
+        app.submit_input()
+            .await
+            .expect("the refused message is submitted");
+        // Submitted while the refused turn is still in flight, so BOTH rows
+        // are on screen before the refusal is handled.
+        app.context.input_buffer = "what did I just ask?".to_string();
+        app.submit_input()
+            .await
+            .expect("the second message is submitted");
+        assert_eq!(app.context.queued_turns, 1, "the second turn waits");
+
+        pump_until(&mut app, "the reply to the queued message", |app| {
+            matches!(app.state, AppState::Ready)
+                && app.context.messages.iter().any(|m| m.role == "assistant")
+        })
+        .await;
+
+        let rows = stored_rows(&app);
+        // (a) The refused message is the one that went — from the screen and
+        // from the store — so no reseed, `/undo` or resume brings it back.
+        assert!(
+            !app.context
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[IMAGE:")),
+            "the screen keeps no refused image"
+        );
+        assert!(
+            !rows.iter().any(|(_, c)| c.contains("[IMAGE:")),
+            "the store keeps no refused image: {rows:?}"
+        );
+        // (b) The message queued behind it is untouched: same row, same text.
+        assert_eq!(
+            rows.iter()
+                .filter(|(role, _)| role == "user")
+                .map(|(_, content)| content.as_str())
+                .collect::<Vec<_>>(),
+            ["what did I just ask?"],
+            "the queued message keeps its own row: {rows:?}"
+        );
+        // (c) The refused text is back in the input box, ready to edit.
+        assert_eq!(
+            app.context.input_buffer, UNREADABLE_IMAGE_MESSAGE,
+            "the refused text is back in the input box"
+        );
+        // (d) The queued message is answered, with no empty reply line and no
+        // empty assistant row left over from the turn that never ran.
+        assert!(
+            app.context
+                .messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content == "an answer"),
+            "the queued message is answered: {:?}",
+            rows
+        );
+        assert!(
+            !app.context
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with("[no response from model")),
+            "no empty reply line follows the refusal"
+        );
+
+        let sent = seen.lock().unwrap().join("\n");
+        assert!(
+            !sent.contains("[IMAGE:"),
+            "no image marker ever reached the model: {sent}"
+        );
+        assert!(sent.contains("what did I just ask?"), "{sent}");
+    }
+
+    /// A `/retry` submits a turn for a row that is already on the screen, so
+    /// a refusal of it takes back THAT row — the retried one — even though the
+    /// resubmit appended nothing.
+    #[tokio::test]
+    async fn a_refused_retry_takes_back_the_retried_row() {
+        let (mut app, seen, _root) = app_with_vision_agent();
+        let session = store_session(
+            &app.context.session_store,
+            &[
+                ("user", UNREADABLE_IMAGE_MESSAGE),
+                ("assistant", "I could not read that picture"),
+            ],
+        );
+        app.state = AppState::Ready;
+        pick_session(&mut app, &session).await;
+
+        app.handle_command("retry").await.expect("/retry runs");
+        pump_until(&mut app, "the refusal", |app| {
+            matches!(app.state, AppState::Ready)
+                && !app
+                    .context
+                    .messages
+                    .iter()
+                    .any(|m| m.content.contains("[IMAGE:"))
+        })
+        .await;
+
+        let rows = stored_rows(&app);
+        assert!(
+            !rows.iter().any(|(_, c)| c.contains("[IMAGE:")),
+            "the store keeps no refused image: {rows:?}"
+        );
+        assert_eq!(
+            app.context.input_buffer, UNREADABLE_IMAGE_MESSAGE,
+            "the retried text is back in the input box"
+        );
+        assert!(
+            !seen.lock().unwrap().join("\n").contains("[IMAGE:"),
+            "no image marker ever reached the model"
+        );
+    }
+
+    /// Take one event off the bridge and hand it to the app, as a frame does.
+    /// `drain_events` takes everything the channel holds in a single pass, so
+    /// this is how a test places an action between two events the agent sent
+    /// back to back.
+    async fn next_event(app: &mut TuiApp) -> AgentEvent {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.context.events_rx.recv(),
+        )
+        .await
+        .expect("the agent sends an event")
+        .expect("the bridge stays open")
+    }
+
+    /// A refused turn never ran, so the `Done` that ends it must add no
+    /// reply — not even when the operator submits the next message in the
+    /// window between the refusal and that `Done`. A turn-end marker the
+    /// submit clears is a turn-end marker the wrong turn can swallow.
+    #[tokio::test]
+    async fn a_done_after_a_refusal_adds_no_reply_even_when_a_message_was_submitted_in_between() {
+        let (mut app, _seen, _root) = app_with_vision_agent();
+
+        app.context.input_buffer = UNREADABLE_IMAGE_MESSAGE.to_string();
+        app.submit_input()
+            .await
+            .expect("the refused message is submitted");
+
+        let refusal = next_event(&mut app).await;
+        assert!(
+            matches!(refusal, AgentEvent::ImageRefused { .. }),
+            "the turn was refused, not failed: {refusal:?}"
+        );
+        app.handle_agent_event(refusal);
+
+        // Inside the window: the next message is submitted before the `Done`
+        // that ends the refused turn has been handled.
+        app.context.input_buffer = "what did I just ask?".to_string();
+        app.submit_input()
+            .await
+            .expect("the next message is submitted inside the window");
+
+        let done = next_event(&mut app).await;
+        assert!(
+            matches!(done, AgentEvent::Done { .. }),
+            "the refused turn ends with its own Done: {done:?}"
+        );
+        app.handle_agent_event(done);
+
+        assert!(
+            !app.context
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with("[no response from model")),
+            "the Done that ends a refused turn prints no empty-reply line: {:?}",
+            stored_rows(&app)
+        );
+        assert_eq!(
+            app.context
+                .messages
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .count(),
+            0,
+            "and commits no empty assistant row: {:?}",
+            stored_rows(&app)
+        );
+        assert_eq!(
+            app.context.queued_turns, 0,
+            "the turn that never ran is over; the queued one is now in flight"
+        );
+
+        // The queued message is answered as usual.
+        pump_until(&mut app, "the reply to the queued message", |app| {
+            app.context.messages.iter().any(|m| m.role == "assistant")
+        })
+        .await;
+    }
+
+    /// A turn the actor could not run ends when its error is surfaced. With no
+    /// agent there was no turn to run, so the actor answers the `Submit` with
+    /// the no-agent error and sends no `Done` — the TUI retires the queued turn
+    /// itself. Left in the queue, that dead entry sits at the front: the first
+    /// refusal after the session heals takes back ITS row, deleting a message
+    /// typed before the reload from the screen and the store and putting THAT
+    /// text in the input box, while the message that was actually refused
+    /// survives — the defect this whole path exists to stop.
+    ///
+    /// The events are placed by hand because staging "no agent, then a reload
+    /// that heals it" against a live actor needs a config that builds a
+    /// vision-capable agent: a provider without vision refuses an unreadable
+    /// image with a plain `Error` (the loop's capability gate), never
+    /// `ImageRefused`, and no provider factory that builds offline is
+    /// vision-capable. The TUI acts on the event stream alone, so the test
+    /// hands it the stream that sequence really produces.
+    #[tokio::test]
+    async fn a_refusal_after_a_turn_the_actor_never_ran_takes_back_its_own_row() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        // What `run_tui` records when the boot-time `Agent::from_config`
+        // failed: the actor runs with no agent until a reload heals it.
+        app.actor_has_agent = false;
+
+        // (1) A message the actor cannot run. The row is written and the turn
+        // queued, exactly as it is for any other message.
+        app.context.input_buffer = "hello".to_string();
+        app.submit_input().await.expect("the message is submitted");
+        assert!(
+            matches!(req_rx.try_recv(), Ok(TurnRequest::Submit { .. })),
+            "the turn reached the actor"
+        );
+        assert_eq!(
+            app.pending_turns.len(),
+            1,
+            "the turn is queued while it is unanswered"
+        );
+        // The only event back. The TUI does not read this text — an error it
+        // cannot pair with a `Done` is a fact about the actor, not the words.
+        app.handle_agent_event(AgentEvent::Error(
+            "No working provider — fix it via /setup provider.".to_string(),
+        ));
+        assert!(
+            app.pending_turns.is_empty(),
+            "an error the actor sends no Done for must not leave its turn queued: {:?}",
+            app.pending_turns
+        );
+        assert!(
+            app.context
+                .messages
+                .iter()
+                .any(|m| m.role == "user" && m.content == "hello"),
+            "the message stays on the screen, as it does today"
+        );
+
+        // (2) `/model` heals the session: the actor holds an agent again.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+
+        // (3) A message whose image cannot be read is refused, and takes back
+        // its own row.
+        app.context.input_buffer = UNREADABLE_IMAGE_MESSAGE.to_string();
+        app.submit_input()
+            .await
+            .expect("the refused message is submitted");
+        app.handle_agent_event(AgentEvent::ImageRefused {
+            message: "This message was not sent: the picture could not be read.".to_string(),
+        });
+        app.handle_agent_event(AgentEvent::Done {
+            final_text: String::new(),
+            cancelled: false,
+        });
+
+        let rows = stored_rows(&app);
+        assert!(
+            !app.context
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[IMAGE:")),
+            "the refused row leaves the screen: {:?}",
+            app.context.messages
+        );
+        assert!(
+            !rows.iter().any(|(_, c)| c.contains("[IMAGE:")),
+            "the refused row leaves the store: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(role, c)| role == "user" && c == "hello"),
+            "the message from before the reload survives: {rows:?}"
+        );
+        assert!(
+            app.context
+                .messages
+                .iter()
+                .any(|m| m.role == "user" && m.content == "hello"),
+            "the message from before the reload is still on the screen"
+        );
+        assert_eq!(
+            app.context.input_buffer, UNREADABLE_IMAGE_MESSAGE,
+            "the refused text is the text that comes back"
+        );
+        assert!(
+            app.pending_turns.is_empty(),
+            "the refusal and its Done closed one turn each: {:?}",
+            app.pending_turns
+        );
+
+        // (4) The next turn is answered by its own `Done` — the queue is not
+        // off by one, which is how a dead entry would show up here.
+        app.context.input_buffer = "are you there?".to_string();
+        app.submit_input()
+            .await
+            .expect("the turn after the refusal is submitted");
+        assert_eq!(app.pending_turns.len(), 1, "one queued turn");
+        app.handle_agent_event(AgentEvent::Done {
+            final_text: "an answer".to_string(),
+            cancelled: false,
+        });
+        assert!(
+            app.context
+                .messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content == "an answer"),
+            "the turn after the refusal is answered: {:?}",
+            stored_rows(&app)
+        );
+        assert!(app.pending_turns.is_empty(), "{:?}", app.pending_turns);
+    }
+
+    /// `/title` belongs to the session it was set on. The picker binds another
+    /// one, whose first user row has to be able to name it — otherwise the
+    /// picked session stays `(untitled)` for the rest of its life.
+    #[tokio::test]
+    async fn picking_a_session_lets_its_own_first_user_message_name_it() {
+        let (mut app, _seen, _root) = app_with_vision_agent();
+
+        app.handle_command("new").await.expect("/new runs");
+        let named = app
+            .context
+            .session_id
+            .clone()
+            .expect("the note binds a session");
+        app.handle_command("title my-session")
+            .await
+            .expect("/title runs");
+        assert!(
+            app.context.title_set_by_hand,
+            "the session on screen was named by hand"
+        );
+
+        // Another session, with no title of its own.
+        let picked = store_session(
+            &app.context.session_store,
+            &[("note", "Started new session")],
+        );
+        app.state = AppState::Ready;
+        pick_session(&mut app, &picked).await;
+
+        app.context.input_buffer = "design a cache eviction policy".to_string();
+        app.submit_input()
+            .await
+            .expect("the first message of the picked session is submitted");
+
+        assert_eq!(
+            title_of(&app, &picked).as_deref(),
+            Some("design a cache eviction policy"),
+            "the picked session is listed under its first user message"
+        );
+        assert_eq!(
+            title_of(&app, &named).as_deref(),
+            Some("my-session"),
+            "the session that was named by hand keeps its title"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -11709,7 +12687,7 @@ mod resume_view_tests {
         let mut agent = Agent::from_config(&fixture.config)
             .await
             .expect("the agent builds");
-        restore_resumed_session(&mut agent, &session_id);
+        restore_resumed_session(&mut agent, &session_id).await;
         crate::memory::MEMORY_VIEW
             .scope(
                 crate::memory::MemoryView::All,

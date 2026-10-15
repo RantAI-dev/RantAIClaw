@@ -320,6 +320,22 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Remove a session's title, leaving it untitled (the picker reads that
+    /// as `(untitled)`).
+    ///
+    /// `set_title` cannot do this: it refuses a title that normalises to
+    /// nothing, so a caller that means "no title" — the row an auto-derived
+    /// title came from was deleted — needs its own way to say it. Only the
+    /// auto-derived path uses it; a title the operator set by hand is never
+    /// cleared.
+    pub fn clear_title(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET title = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// Delete a session and all of its messages. Returns `true` if a session
     /// row was removed, `false` if no session matched `id`.
     ///
@@ -352,6 +368,25 @@ impl SessionStore {
         )?;
         tx.commit()?;
         Ok(deleted)
+    }
+
+    /// Delete one message of `session_id` by row id, and set `message_count`
+    /// to the rows that remain. Used when a single row has to go out of the
+    /// middle of a session — the refused message of a turn that other rows
+    /// were already written behind. Returns whether a row was removed.
+    pub fn delete_message(&mut self, session_id: &str, id: i64) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND id = ?2",
+            params![session_id, id],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET message_count = \
+             (SELECT COUNT(*) FROM messages WHERE session_id = ?1) WHERE id = ?1",
+            params![session_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted > 0)
     }
 
     /// Every session id for one conversation_key, ordered newest first.

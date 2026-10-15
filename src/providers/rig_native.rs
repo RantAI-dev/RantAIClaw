@@ -1951,7 +1951,7 @@ mod tests {
 
     fn marked_user_message() -> ChatMessage {
         ChatMessage::user(format!(
-            "lihat gambar ini\n\n[IMAGE:data:image/png;base64,{PNG_B64}]"
+            "look at this picture\n\n[IMAGE:data:image/png;base64,{PNG_B64}]"
         ))
     }
 
@@ -1993,7 +1993,7 @@ mod tests {
             "anthropic must receive an image part with the data: {content}"
         );
         assert!(
-            content.contains("lihat gambar ini"),
+            content.contains("look at this picture"),
             "text part kept: {content}"
         );
         assert!(
@@ -2041,7 +2041,10 @@ mod tests {
                 && content.contains(&format!("data:image/png;base64,{PNG_B64}")),
             "openai must receive an image_url part with the data URI: {content}"
         );
-        assert!(content.contains("lihat gambar ini"), "text kept: {content}");
+        assert!(
+            content.contains("look at this picture"),
+            "text kept: {content}"
+        );
         assert!(!content.contains("[IMAGE:"), "no marker text: {content}");
     }
 
@@ -2069,7 +2072,7 @@ mod tests {
             wire.contains("inlineData") && wire.contains(PNG_B64),
             "gemini must receive the image as inline data: {wire}"
         );
-        assert!(wire.contains("lihat gambar ini"), "text kept: {wire}");
+        assert!(wire.contains("look at this picture"), "text kept: {wire}");
         assert!(!wire.contains("[IMAGE:"), "no marker text: {wire}");
     }
 }
