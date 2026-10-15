@@ -64,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/config` sets nothing. The `model` and `debug` keys are gone: `/config model` changes no setting and
   answers that the model is changed with `/model`, and the debug toggle is removed with the `/config debug`
   key, the `/debug` command and the `/status` Debug row. `/model <provider:model>` changes the model.
+- `[browser] allowed_domains` now defaults to `["*"]` (config schema 38 → 39), so `browser` and `browser_open` take a public host on a fresh install. An existing config is left as written.
 
 ### Fixed
 
@@ -159,6 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `kb ingest --group <name>` checks that the group exists before the file is read or embedded, and attaches
   the document to it once stored. Before, the name was recorded in the document's metadata only, so the group
   never listed the document.
+- `browser_open` ignored the `"*"` wildcard in `[browser].allowed_domains`, and the two browser tools refused the same state in different words. Both now share one verdict and one message.
 
 ## [0.33.0-alpha] — 2026-10-08
 

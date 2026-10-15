@@ -213,7 +213,7 @@ impl BrowserTool {
     ) -> Self {
         Self {
             security,
-            allowed_domains: normalize_domains(allowed_domains),
+            allowed_domains: normalize_allowed_domains(allowed_domains),
             session_name,
             backend,
             computer_use,
@@ -334,7 +334,7 @@ impl BrowserTool {
     }
 
     /// Validate URL against allowlist
-    fn validate_url(&self, url: &str) -> anyhow::Result<()> {
+    pub(crate) fn validate_url(&self, url: &str) -> anyhow::Result<()> {
         let url = url.trim();
 
         if url.is_empty() {
@@ -351,24 +351,7 @@ impl BrowserTool {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "Browser tool enabled but no allowed_domains configured. \
-                Add [browser].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' not in browser.allowed_domains");
-        }
-
-        Ok(())
+        check_url_host(url, &self.allowed_domains)
     }
 
     /// Execute an agent-browser command
@@ -1183,12 +1166,71 @@ fn unavailable_action_for_backend_error(action: &str, backend: ResolvedBackend) 
     )
 }
 
-fn normalize_domains(domains: Vec<String>) -> Vec<String> {
-    domains
+/// Normalize `[browser].allowed_domains` entries. Shared by `browser` and
+/// `browser_open` so one config list gives both tools the same matcher input.
+pub(crate) fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+    let mut normalized = domains
         .into_iter()
-        .map(|d| d.trim().to_lowercase())
-        .filter(|d| !d.is_empty())
-        .collect()
+        .filter_map(|d| normalize_domain(&d))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
+}
+
+fn normalize_domain(raw: &str) -> Option<String> {
+    let mut d = raw.trim().to_lowercase();
+    if d.is_empty() {
+        return None;
+    }
+
+    if let Some(stripped) = d.strip_prefix("https://") {
+        d = stripped.to_string();
+    } else if let Some(stripped) = d.strip_prefix("http://") {
+        d = stripped.to_string();
+    }
+
+    if let Some((host, _)) = d.split_once('/') {
+        d = host.to_string();
+    }
+
+    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
+
+    if let Some((host, _)) = d.split_once(':') {
+        d = host.to_string();
+    }
+
+    if d.is_empty() || d.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    Some(d)
+}
+
+/// Message for an empty `[browser].allowed_domains`. Both tools return it verbatim.
+const EMPTY_ALLOWLIST_MESSAGE: &str =
+    "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml";
+
+/// The host verdict both browser tools apply to a URL that already passed their
+/// own scheme check. Order: empty list, host extraction, private or local host,
+/// allowlist. The private-host refusal runs before the allowlist, so `"*"` never
+/// admits loopback, link-local or RFC 1918 addresses.
+pub(crate) fn check_url_host(url: &str, allowed: &[String]) -> anyhow::Result<()> {
+    if allowed.is_empty() {
+        anyhow::bail!(EMPTY_ALLOWLIST_MESSAGE);
+    }
+
+    let host = extract_host(url)?;
+
+    if is_private_host(&host) {
+        anyhow::bail!("Blocked local/private host: {host}");
+    }
+
+    if !host_matches_allowlist(&host, allowed) {
+        anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
+    }
+
+    Ok(())
 }
 
 fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
@@ -1224,9 +1266,17 @@ fn extract_host(url_str: &str) -> anyhow::Result<String> {
         .or_else(|| url.strip_prefix("file://"))
         .unwrap_or(url);
 
-    // Extract host — handle bracketed IPv6 addresses like [::1]:8080
-    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    // The authority ends at the first path, query or fragment delimiter.
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
 
+    if authority.contains('@') {
+        anyhow::bail!("URL userinfo is not allowed");
+    }
+
+    // Extract host — handle bracketed IPv6 addresses like [::1]:8080
     let host = if authority.starts_with('[') {
         // IPv6: take everything up to and including the closing ']'
         authority.find(']').map_or(authority, |i| &authority[..=i])
@@ -1235,6 +1285,7 @@ fn extract_host(url_str: &str) -> anyhow::Result<String> {
         authority.split(':').next().unwrap_or(authority)
     };
 
+    let host = host.trim_end_matches('.');
     if host.is_empty() {
         anyhow::bail!("Invalid URL: no host");
     }
@@ -1373,14 +1424,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_domains_works() {
+    fn normalize_allowed_domains_strips_scheme_path_port_and_case() {
+        let got = normalize_allowed_domains(vec!["  HTTPS://Docs.Example.com/path ".into()]);
+        assert_eq!(got, vec!["docs.example.com".to_string()]);
+    }
+
+    #[test]
+    fn normalize_allowed_domains_deduplicates() {
+        let got = normalize_allowed_domains(vec![
+            "example.com".into(),
+            "EXAMPLE.COM".into(),
+            "https://example.com/".into(),
+        ]);
+        assert_eq!(got, vec!["example.com".to_string()]);
+    }
+
+    #[test]
+    fn normalize_allowed_domains_works() {
         let domains = vec![
             "  Example.COM  ".into(),
             "docs.example.com".into(),
             String::new(),
         ];
-        let normalized = normalize_domains(domains);
-        assert_eq!(normalized, vec!["example.com", "docs.example.com"]);
+        let normalized = normalize_allowed_domains(domains);
+        assert_eq!(normalized, vec!["docs.example.com", "example.com"]);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use super::browser::{check_url_host, normalize_allowed_domains};
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -33,21 +34,7 @@ impl BrowserOpenTool {
             anyhow::bail!("Only https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
-        }
+        check_url_host(url, &self.allowed_domains)?;
 
         Ok(url.to_string())
     }
@@ -184,131 +171,11 @@ async fn open_in_brave(url: &str) -> anyhow::Result<()> {
     }
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| normalize_domain(&d))
-        .collect::<Vec<_>>();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(d)
-}
-
-fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("Only https:// URLs are allowed"))?;
-
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
-    }
-
-    if authority.contains('@') {
-        anyhow::bail!("URL userinfo is not allowed");
-    }
-
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in browser_open");
-    }
-
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-
-    if host.is_empty() {
-        anyhow::bail!("URL must include a valid host");
-    }
-
-    Ok(host)
-}
-
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
-}
-
-fn is_private_or_local_host(host: &str) -> bool {
-    let has_local_tld = host
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if host == "localhost" || host.ends_with(".localhost") || has_local_tld || host == "::1" {
-        return true;
-    }
-
-    if let Some([a, b, _, _]) = parse_ipv4(host) {
-        return a == 0
-            || a == 10
-            || a == 127
-            || (a == 169 && b == 254)
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 100 && (64..=127).contains(&b));
-    }
-
-    false
-}
-
-fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-
-    let mut octets = [0_u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        octets[i] = part.parse::<u8>().ok()?;
-    }
-    Some(octets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::browser::BrowserTool;
 
     fn test_tool(allowed_domains: Vec<&str>) -> BrowserOpenTool {
         let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::Supervised));
@@ -316,22 +183,6 @@ mod tests {
             security,
             allowed_domains.into_iter().map(String::from).collect(),
         )
-    }
-
-    #[test]
-    fn normalize_domain_strips_scheme_path_and_case() {
-        let got = normalize_domain("  HTTPS://Docs.Example.com/path ").unwrap();
-        assert_eq!(got, "docs.example.com");
-    }
-
-    #[test]
-    fn normalize_allowed_domains_deduplicates() {
-        let got = normalize_allowed_domains(vec![
-            "example.com".into(),
-            "EXAMPLE.COM".into(),
-            "https://example.com/".into(),
-        ]);
-        assert_eq!(got, vec!["example.com".to_string()]);
     }
 
     #[test]
@@ -418,16 +269,74 @@ mod tests {
         assert!(err.contains("allowed_domains"));
     }
 
+    /// Run the same URL through both browser tools and return each verdict as
+    /// `Ok(())` or the refusal text. The two tools share `[browser].allowed_domains`.
+    fn verdicts(allowed: Vec<String>, url: &str) -> (Result<(), String>, Result<(), String>) {
+        let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::Supervised));
+        let open = BrowserOpenTool::new(security.clone(), allowed.clone());
+        let browser = BrowserTool::new(security, allowed, None);
+        (
+            open.validate_url(url)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            browser.validate_url(url).map_err(|e| e.to_string()),
+        )
+    }
+
+    const PRIVATE_OR_LOCAL_URLS: [&str; 5] = [
+        "https://127.0.0.1",
+        "https://10.0.0.1",
+        "https://[::1]",
+        "https://foo.local",
+        "https://localhost",
+    ];
+
     #[test]
-    fn parse_ipv4_valid() {
-        assert_eq!(parse_ipv4("1.2.3.4"), Some([1, 2, 3, 4]));
+    fn fresh_default_accepts_a_public_host_in_both_tools() {
+        let (open, browser) = verdicts(
+            crate::config::BrowserConfig::default().allowed_domains,
+            "https://example.com",
+        );
+        assert!(open.is_ok(), "browser_open refused: {open:?}");
+        assert!(browser.is_ok(), "browser refused: {browser:?}");
     }
 
     #[test]
-    fn parse_ipv4_invalid() {
-        assert_eq!(parse_ipv4("1.2.3"), None);
-        assert_eq!(parse_ipv4("1.2.3.999"), None);
-        assert_eq!(parse_ipv4("not-an-ip"), None);
+    fn fresh_default_refuses_private_and_local_hosts_with_one_message() {
+        for url in PRIVATE_OR_LOCAL_URLS {
+            let (open, browser) =
+                verdicts(crate::config::BrowserConfig::default().allowed_domains, url);
+            assert!(open.is_err(), "browser_open accepted {url}");
+            assert_eq!(open, browser, "tools disagree on {url}");
+            assert!(
+                open.unwrap_err().starts_with("Blocked local/private host"),
+                "{url} must be refused as local/private"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_allowlist_gets_one_message_from_both_tools() {
+        let (open, browser) = verdicts(vec![], "https://example.com");
+        assert!(open.is_err() && browser.is_err());
+        assert_eq!(open, browser);
+        assert!(open.unwrap_err().contains("allowed_domains"));
+    }
+
+    #[test]
+    fn wildcard_subdomain_allowlist_gives_one_verdict_in_both_tools() {
+        let allowed = vec!["*.example.com".to_string()];
+
+        let (open, browser) = verdicts(allowed.clone(), "https://a.example.com/x");
+        assert!(open.is_ok(), "browser_open refused a.example.com: {open:?}");
+        assert!(
+            browser.is_ok(),
+            "browser refused a.example.com: {browser:?}"
+        );
+
+        let (open, browser) = verdicts(allowed, "https://example.org");
+        assert!(open.is_err() && browser.is_err());
+        assert_eq!(open, browser);
     }
 
     #[tokio::test]
