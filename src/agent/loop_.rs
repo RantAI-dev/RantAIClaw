@@ -147,6 +147,22 @@ fn denied_tool_message(tool_name: &str) -> String {
     format!("The `{tool_name}` tool did NOT run and nothing was changed: the operator did not approve it.")
 }
 
+/// What the model is told when a call was refused because no approver could be
+/// reached. Nobody was asked, so this must not say the operator refused.
+fn no_approver_tool_message(tool_name: &str) -> String {
+    format!(
+        "The `{tool_name}` tool did NOT run and nothing was changed: no approver was available on this surface, so nobody could approve it."
+    )
+}
+
+/// What the model is told when a prompt was shown but no answer came before the
+/// deadline. Nobody said No, so this must not say the operator refused.
+fn no_answer_tool_message(tool_name: &str) -> String {
+    format!(
+        "The `{tool_name}` tool did NOT run and nothing was changed: no answer came in time, so it was not approved."
+    )
+}
+
 /// Tell the operator how to enable in-chat approval — once per process, on the
 /// log, never inside a tool result.
 ///
@@ -1620,14 +1636,15 @@ pub(crate) async fn execute_tool_calls_collecting(
                 // change behaviour; CLI/webhook pass None and are unaffected.
                 // Dropping the decide() future is cancel-safe — PendingApprovals'
                 // RAII cleanup removes the pending entry.
-                let decision = if let Some(token) = cancellation_token {
+                let verdict = if let Some(token) = cancellation_token {
                     tokio::select! {
                         () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                        d = backend.decide(mgr, &request) => d,
+                        v = backend.decide_verdict(mgr, &request) => v,
                     }
                 } else {
-                    backend.decide(mgr, &request).await
+                    backend.decide_verdict(mgr, &request).await
                 };
+                let decision = verdict.response;
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
                 if decision == ApprovalResponse::No {
                     if let Some(tx) = events {
@@ -1647,7 +1664,23 @@ pub(crate) async fn execute_tool_calls_collecting(
                             })
                             .await;
                     }
-                    let msg = if channel_name == "cli" {
+                    let msg = if verdict.basis == crate::approval::DecisionBasis::NoApprover {
+                        // Nobody was asked. The model gets the reason; the
+                        // operator gets the settings that would let the tool run,
+                        // once per tool, on the log only.
+                        if crate::approval::note_no_approver_first_time(&call.name) {
+                            tracing::warn!(
+                                target: "approval",
+                                "{}",
+                                crate::approval::no_approver_operator_hint(&call.name, channel_name)
+                            );
+                        }
+                        no_approver_tool_message(&call.name)
+                    } else if verdict.basis == crate::approval::DecisionBasis::NoAnswer {
+                        // The prompt went out and the deadline passed. Nobody was
+                        // refused, so there is no approver hint to log.
+                        no_answer_tool_message(&call.name)
+                    } else if channel_name == "cli" {
                         "Denied by user.".to_string()
                     } else {
                         // Read by the MODEL. It used to open with three
@@ -5158,6 +5191,254 @@ done
             !ran.load(Ordering::SeqCst),
             "cancelled approval must not run the tool"
         );
+    }
+
+    /// Run one gated `do_thing` call through the executor and report the
+    /// model-facing output plus whether the tool body ran.
+    async fn run_gated_call(
+        channel: &str,
+        mgr: &ApprovalManager,
+        backend: Option<&dyn crate::approval::ApprovalBackend>,
+    ) -> (String, bool) {
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(mgr),
+            channel,
+            None, // test: no origin chat
+            backend,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            None,
+        )
+        .await
+        .unwrap();
+        (results[0].output.clone(), ran.load(Ordering::SeqCst))
+    }
+
+    /// A backend that answers No, as a person at the keyboard would.
+    struct AnswersNoBackend;
+
+    #[async_trait::async_trait]
+    impl crate::approval::ApprovalBackend for AnswersNoBackend {
+        async fn decide(
+            &self,
+            _mgr: &ApprovalManager,
+            _request: &ApprovalRequest,
+        ) -> ApprovalResponse {
+            ApprovalResponse::No
+        }
+    }
+
+    /// CLI surface with stdin not a terminal (the `cargo test` run): nobody
+    /// was asked, so the model must not be told a person said no.
+    #[tokio::test]
+    async fn cli_with_no_terminal_says_no_approver_not_denied_by_user() {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return; // interactive run: the no-terminal branch cannot be reached
+        }
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mgr = supervised_manager();
+        let (output, ran) = run_gated_call("cli", &mgr, None).await;
+        assert!(!ran, "a refused call must not run");
+        assert!(
+            !output.contains("Denied by user"),
+            "nobody was asked: {output}"
+        );
+        assert!(output.contains("did NOT run"), "{output}");
+        assert!(
+            output.contains("no approver"),
+            "the model must be told no approver was available: {output}"
+        );
+    }
+
+    /// Non-CLI surface with no injected backend: the name-derived default is
+    /// `AutoDenyBackend`, which asked nobody.
+    #[tokio::test]
+    async fn auto_deny_surface_says_no_approver() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mgr = supervised_manager();
+        let (output, ran) = run_gated_call("scheduler", &mgr, None).await;
+        assert!(!ran, "auto-deny must not run the tool");
+        assert!(output.contains("did NOT run"), "{output}");
+        assert!(
+            output.contains("no approver"),
+            "the model must be told no approver was available: {output}"
+        );
+        assert!(!output.contains("did not approve"), "{output}");
+    }
+
+    /// A person (here, a backend standing in for one) answered No: the
+    /// "operator did not approve it" wording is correct and must not change.
+    #[tokio::test]
+    async fn answered_no_keeps_the_denied_wording() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mgr = supervised_manager();
+        let (output, ran) = run_gated_call("telegram", &mgr, Some(&AnswersNoBackend)).await;
+        assert!(!ran, "an answered No must not run the tool");
+        assert_eq!(output, denied_tool_message("do_thing"));
+        assert!(
+            output.contains("the operator did not approve it"),
+            "{output}"
+        );
+    }
+
+    /// Every path that ends without an approval must still refuse: the tool
+    /// body never runs. Covers the CLI with no terminal, an auto-deny surface,
+    /// and a backend that answers No.
+    #[tokio::test]
+    async fn every_no_approver_path_still_refuses_and_never_reaches_execute() {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return; // interactive run: the cli no-terminal case would block on a read
+        }
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mgr = supervised_manager();
+        for (channel, backend) in [
+            ("scheduler", None),
+            ("telegram", None),
+            ("cli", None),
+            (
+                "telegram",
+                Some(&AnswersNoBackend as &dyn crate::approval::ApprovalBackend),
+            ),
+        ] {
+            let (output, ran) = run_gated_call(channel, &mgr, backend).await;
+            assert!(!ran, "{channel}: refused call reached execute: {output}");
+            assert!(output.contains("did NOT run"), "{channel}: {output}");
+        }
+    }
+
+    /// A prompt was shown and nobody answered before the deadline: the model is
+    /// told no answer came in time, not that anyone refused, and the tool does
+    /// not run.
+    #[tokio::test]
+    async fn no_answer_says_no_answer_in_time_and_never_runs() {
+        struct TimesOutBackend;
+        #[async_trait::async_trait]
+        impl crate::approval::ApprovalBackend for TimesOutBackend {
+            async fn decide(
+                &self,
+                _mgr: &ApprovalManager,
+                _request: &ApprovalRequest,
+            ) -> ApprovalResponse {
+                ApprovalResponse::No
+            }
+            async fn decide_verdict(
+                &self,
+                _mgr: &ApprovalManager,
+                _request: &ApprovalRequest,
+            ) -> crate::approval::Verdict {
+                crate::approval::Verdict {
+                    response: ApprovalResponse::No,
+                    basis: crate::approval::DecisionBasis::NoAnswer,
+                }
+            }
+        }
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mgr = supervised_manager();
+        let (output, ran) = run_gated_call("telegram", &mgr, Some(&TimesOutBackend)).await;
+        assert!(!ran, "a timed-out call must not run");
+        assert!(output.contains("did NOT run"), "{output}");
+        assert!(output.contains("no answer came in time"), "{output}");
+        assert!(!output.contains("did not approve"), "{output}");
+        assert!(!output.contains("no approver"), "{output}");
+    }
+
+    /// `auto_approve` takes an exact tool name, so one MCP tool can run
+    /// headless under supervised autonomy without a prompt.
+    #[tokio::test]
+    async fn auto_approved_mcp_tool_runs_headless() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            auto_approve: vec!["mcp__audit__echo".into()],
+            always_ask: vec![],
+            ..crate::config::AutonomyConfig::default()
+        });
+        let call = ParsedToolCall {
+            name: "mcp__audit__echo".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RenamedRanFlagTool {
+            name: "mcp__audit__echo",
+            ran: Arc::clone(&ran),
+        })];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "cli",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(ran.load(Ordering::SeqCst), "auto_approve must let it run");
+        assert!(results[0].success, "{}", results[0].output);
+    }
+
+    /// `RanFlagTool` under a caller-chosen name.
+    struct RenamedRanFlagTool {
+        name: &'static str,
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for RenamedRanFlagTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "echoed".into(),
+                error: None,
+            })
+        }
     }
 
     #[tokio::test]

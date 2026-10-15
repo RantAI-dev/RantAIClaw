@@ -24,6 +24,7 @@ use std::sync::Arc;
 use crate::agent::{AgentEvent, AgentEventSender};
 use crate::approval::{
     summarize_args, ApprovalBackend, ApprovalManager, ApprovalRequest, ApprovalResponse,
+    DecisionBasis, Verdict,
 };
 use crate::security::{Decision, PendingApprovals};
 use tokio_util::sync::CancellationToken;
@@ -59,9 +60,14 @@ impl WebModalApprovalBackend {
 #[async_trait::async_trait]
 impl ApprovalBackend for WebModalApprovalBackend {
     async fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
+        self.decide_verdict(mgr, request).await.response
+    }
+
+    async fn decide_verdict(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> Verdict {
         let id = Uuid::new_v4();
         // Tell the browser to show the modal. If the SSE receiver is gone the
-        // client can't answer → fail closed (deny), never run the tool.
+        // client can't answer → fail closed (deny), never run the tool. The
+        // modal was never shown, so nobody could have answered.
         if self
             .events
             .send(AgentEvent::ApprovalRequest {
@@ -73,7 +79,7 @@ impl ApprovalBackend for WebModalApprovalBackend {
             .await
             .is_err()
         {
-            return ApprovalResponse::No;
+            return Verdict::no_approver();
         }
 
         // Register under the same UUID the browser holds, scoped to this turn so
@@ -82,28 +88,38 @@ impl ApprovalBackend for WebModalApprovalBackend {
         let (channel, reply_target) = crate::security::current_turn_scope();
         // Block this tool call until the client resolves `id` (via `resolve`)
         // or the registry deadline auto-denies.
-        match self
+        let outcome = self
             .relay
-            .request_decision_in(
+            .request_decision_in_outcome(
                 id,
                 id.to_string(),
                 summarize_args(&request.arguments),
                 channel,
                 reply_target,
             )
-            .await
-        {
-            Decision::Once => ApprovalResponse::Yes,
+            .await;
+        match outcome.decision {
+            Decision::Once => Verdict::answered(ApprovalResponse::Yes),
             // "Always" from the modal → allowlist this tool for the session so
             // it stops prompting (the loop's `record_decision` folds an
             // `Always` response into `ApprovalManager`'s session allowlist).
-            Decision::Session | Decision::Persist => ApprovalResponse::Always,
+            Decision::Session | Decision::Persist => Verdict::answered(ApprovalResponse::Always),
+            Decision::Deny if outcome.timed_out => {
+                // The deadline auto-denied. Nobody clicked anything, so this is
+                // not a person's No. Cancel the turn as a deny does, so the
+                // loop does not retry the same modal on the next iteration.
+                self.cancel.cancel();
+                Verdict {
+                    response: ApprovalResponse::No,
+                    basis: DecisionBasis::NoAnswer,
+                }
+            }
             Decision::Deny => {
                 // Stop the whole turn on deny (TUI parity) — fire the shared
                 // token so the loop unwinds cleanly at its next checkpoint
                 // instead of returning the denial to the model to retry.
                 self.cancel.cancel();
-                ApprovalResponse::No
+                Verdict::answered(ApprovalResponse::No)
             }
         }
     }
@@ -292,6 +308,66 @@ mod tests {
             arguments: serde_json::json!({}),
         };
         assert_eq!(backend.decide(&mgr, &request).await, ApprovalResponse::No);
+    }
+
+    /// The SSE receiver is gone, so the modal was never shown and nobody could
+    /// answer. That is a no-approver refusal, not an answered No.
+    #[tokio::test]
+    async fn dropped_sse_receiver_reports_no_approver() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
+        let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        drop(rx);
+        let backend = WebModalApprovalBackend::new(relay, tx, CancellationToken::new());
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({}),
+        };
+        let verdict = backend.decide_verdict(&manager(), &request).await;
+        assert_eq!(verdict.response, ApprovalResponse::No);
+        assert_eq!(verdict.basis, DecisionBasis::NoApprover);
+    }
+
+    /// The modal was shown and the registry deadline passed with no answer.
+    /// Nobody said No, so the basis is `NoAnswer`, not `Answered`.
+    #[tokio::test]
+    async fn elapsed_deadline_reports_no_answer() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_millis(30))));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let backend = WebModalApprovalBackend::new(relay, tx, CancellationToken::new());
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({}),
+        };
+        // The modal is shown; nobody clicks it.
+        let verdict = backend.decide_verdict(&manager(), &request).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::ApprovalRequest { .. })),
+            "the modal must have been shown before the deadline"
+        );
+        assert_eq!(verdict.response, ApprovalResponse::No);
+        assert_eq!(verdict.basis, DecisionBasis::NoAnswer);
+    }
+
+    /// A person clicking Deny is an answered No, and it still cancels the turn.
+    #[tokio::test]
+    async fn modal_deny_reports_answered() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let backend = WebModalApprovalBackend::new(relay.clone(), tx, CancellationToken::new());
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({}),
+        };
+        let decide =
+            tokio::spawn(async move { backend.decide_verdict(&manager(), &request).await });
+        let id = match rx.recv().await.expect("event") {
+            AgentEvent::ApprovalRequest { id, .. } => id,
+            other => panic!("expected ApprovalRequest, got {other:?}"),
+        };
+        assert!(resolve(&relay, &id, false, false));
+        let verdict = decide.await.unwrap();
+        assert_eq!(verdict.response, ApprovalResponse::No);
+        assert_eq!(verdict.basis, DecisionBasis::Answered);
     }
 
     #[tokio::test]

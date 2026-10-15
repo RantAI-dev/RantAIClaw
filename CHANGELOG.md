@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A tool refused because no approver was available (a terminal run without a terminal on stdin, or a surface with no approver) said "Denied by user" though nobody was asked. The model is now told no approver was available, and the operator log names the tool and the `[autonomy].auto_approve` setting that lets it run. Every such call is still refused.
 - On the OpenAI, Anthropic and Gemini providers an image was sent as text, not as an image, and a
   missing image file broke every later message in the conversation. The image now goes out as an
   image part. On a vision provider, an image file that cannot be read is refused before the message

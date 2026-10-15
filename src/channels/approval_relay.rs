@@ -53,7 +53,7 @@ use std::sync::Arc;
 
 use crate::approval::{
     can_approve, summarize_args, ApprovalBackend, ApprovalManager, ApprovalRequest,
-    ApprovalResponse,
+    ApprovalResponse, DecisionBasis, Verdict,
 };
 use crate::channels::traits::Channel;
 #[cfg(test)]
@@ -391,7 +391,11 @@ impl ChatRelayApprovalBackend {
 
 #[async_trait::async_trait]
 impl ApprovalBackend for ChatRelayApprovalBackend {
-    async fn decide(&self, _mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
+    async fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
+        self.decide_verdict(mgr, request).await.response
+    }
+
+    async fn decide_verdict(&self, _mgr: &ApprovalManager, request: &ApprovalRequest) -> Verdict {
         let summary = summarize_args(&request.arguments);
         // The id is minted here, not inside the registry, because the prompt is
         // posted BEFORE the request is registered and it has to name the request
@@ -415,14 +419,14 @@ impl ApprovalBackend for ChatRelayApprovalBackend {
                 error = %e,
                 "failed to post tool-approval prompt; denying"
             );
-            return ApprovalResponse::No;
+            return Verdict::no_approver();
         }
 
         // Block this tool call until an owner resolves it (via
         // `try_handle_tool_reply`) or the registry's deadline auto-denies.
-        match self
+        let outcome = self
             .relay
-            .request_decision_in(
+            .request_decision_in_outcome(
                 request_id,
                 request.tool_name.clone(),
                 summary,
@@ -432,13 +436,21 @@ impl ApprovalBackend for ChatRelayApprovalBackend {
                 // triggering chat, which a guest chooses.
                 self.origin.reply_target.clone(),
             )
-            .await
-        {
+            .await;
+        match outcome.decision {
             // A single approval grants this one call; we deliberately do NOT
             // map Session/Persist to a session allowlist here — channel
             // approvals stay per-call so a stranger can't ride a prior grant.
-            Decision::Once | Decision::Session | Decision::Persist => ApprovalResponse::Yes,
-            Decision::Deny => ApprovalResponse::No,
+            Decision::Once | Decision::Session | Decision::Persist => {
+                Verdict::answered(ApprovalResponse::Yes)
+            }
+            // The deadline passed with the prompt posted: nobody answered.
+            Decision::Deny if outcome.timed_out => Verdict {
+                response: ApprovalResponse::No,
+                basis: DecisionBasis::NoAnswer,
+            },
+            // An owner (or anyone, for a Deny) said No in the chat.
+            Decision::Deny => Verdict::answered(ApprovalResponse::No),
         }
     }
 }
@@ -1803,8 +1815,109 @@ mod tests {
         }
     }
 
+    /// A channel whose `send` always fails: the prompt never reaches anyone.
+    struct FailingChannel;
+
+    #[async_trait::async_trait]
+    impl Channel for FailingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            anyhow::bail!("network down")
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start_typing(
+            &self,
+            _recipient: &str,
+            _thread_ts: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     fn test_manager() -> ApprovalManager {
         ApprovalManager::from_config(&crate::config::AutonomyConfig::default())
+    }
+
+    fn relay_origin() -> crate::channels::traits::ChannelMessage {
+        crate::channels::traits::ChannelMessage {
+            reply_target: "chat-1".into(),
+            channel: "telegram".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The prompt never reached the chat, so nobody could answer it. The
+    /// refusal is `NoApprover`, and the tool is not run.
+    #[tokio::test]
+    async fn chat_relay_send_failure_reports_no_approver() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let channel: Arc<dyn Channel> = Arc::new(FailingChannel);
+        let backend = ChatRelayApprovalBackend::new(relay.clone(), channel, &relay_origin());
+        let request = ApprovalRequest {
+            tool_name: "web_search".into(),
+            arguments: serde_json::json!({ "query": "rust" }),
+        };
+        let verdict = backend.decide_verdict(&test_manager(), &request).await;
+        assert_eq!(verdict.response, ApprovalResponse::No, "still refuses");
+        assert_eq!(verdict.basis, DecisionBasis::NoApprover);
+        assert!(
+            relay.list().is_empty(),
+            "a prompt that was never sent must not leave a pending request"
+        );
+    }
+
+    /// The prompt was posted and the deadline passed with no reply: `NoAnswer`.
+    #[tokio::test]
+    async fn chat_relay_deadline_reports_no_answer() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_millis(30))));
+        let channel: Arc<dyn Channel> = Arc::new(CapturingChannel::default());
+        let backend = ChatRelayApprovalBackend::new(relay, channel, &relay_origin());
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({ "command": "ls" }),
+        };
+        let verdict = backend.decide_verdict(&test_manager(), &request).await;
+        assert_eq!(verdict.response, ApprovalResponse::No);
+        assert_eq!(verdict.basis, DecisionBasis::NoAnswer);
+    }
+
+    /// An owner's Deny from the registry is a person's No: `Answered`.
+    #[tokio::test]
+    async fn chat_relay_owner_deny_reports_answered() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let channel: Arc<dyn Channel> = Arc::new(CapturingChannel::default());
+        let backend = ChatRelayApprovalBackend::new(relay.clone(), channel, &relay_origin());
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({ "command": "ls" }),
+        };
+        let decide =
+            tokio::spawn(async move { backend.decide_verdict(&test_manager(), &request).await });
+        await_pending(&relay, 1).await;
+        let owners = vec!["owner1".to_string()];
+        try_handle_tool_reply(
+            "/deny shell",
+            &relay,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        let verdict = decide.await.unwrap();
+        assert_eq!(verdict.response, ApprovalResponse::No);
+        assert_eq!(verdict.basis, DecisionBasis::Answered);
     }
 
     #[tokio::test]

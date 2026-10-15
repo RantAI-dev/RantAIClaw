@@ -446,6 +446,7 @@ a token to the browser.
 
 Notes:
 
+- A tool that an MCP server provides needs approval under `supervised` like any other tool. To let one run without a prompt, list its name in `[autonomy].auto_approve` as `mcp__<server>__<tool>`; the refusal on a surface with no approver, and how to allow it, is described in the `auto_approve` note under [`[autonomy]`](#autonomy).
 - **MCP tools reach the TUI/CLI agent, the gateway's `/api/v1` chat, chat channels
   and cron.** The last two were added by closing issue #283: the channel runtime
   and the cron/one-shot agent path assemble their own registries and used to do it
@@ -529,6 +530,7 @@ Web console (`rantaiclaw ui start`) settings.
 Notes:
 
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
+- `auto_approve` takes exact tool names, not patterns. An MCP tool is listed by its full name, `mcp__<server>__<tool>`, so `auto_approve = ["mcp__audit__echo"]` lets that one tool run without a prompt under `supervised`. On a surface with no approver (a terminal run whose stdin is not a terminal, a scheduled job, or a chat with no owner), a tool that needs approval is refused, the model is told no approver was available, and the operator log names the tool and how to allow it.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
 - The credential-directory refusal is best effort for commands. A command reaches a credential directory without naming it through `cd`, a variable other than `HOME`, a glob, command substitution or an interpreter. Operating-system containment is `[runtime].kind`.

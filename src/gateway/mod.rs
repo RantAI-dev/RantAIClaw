@@ -1728,9 +1728,11 @@ async fn run_gateway_chat_with_multimodal(
     };
 
     // Create approval manager from config so autonomy levels are enforced.
-    // In gateway mode, tools that need approval are auto-denied (no interactive
-    // prompt available). The agent sees "Denied by user." and can explain to
-    // the user that the action requires a higher autonomy level.
+    // In gateway mode, tools that need approval are auto-denied when no
+    // interactive approver is attached (the gate reports `NoApprover`, and the
+    // model is told no approver was available, not that the operator refused).
+    // The agent can then explain that the action needs an approval path — the
+    // web modal, or a higher autonomy level.
     //
     // When `[channels_config] autonomous_tools` is enabled, skip the per-tool
     // approval gate entirely so channel messages (Telegram/WhatsApp/…) can run
