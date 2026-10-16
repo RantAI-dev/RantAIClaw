@@ -195,9 +195,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   split, so both are read correctly. The typed `/model custom:<url>:<model>` is still split as text, so a
   base URL with no path, or a model id holding `/`, is still misread there.
 - A reload with nothing to do with a `/model` switch could take the switch's label, and a failed reload of
-  any kind answered `Model not changed` although it had changed no model. Each reload now carries an id
-  and its outcome is matched to the reload that asked for it: only a `/model` outcome moves or drops that
-  switch, and a failed config reload says the reload failed and why.
+  any kind answered `Model not changed` although it had changed no model. Each reload now carries an id,
+  and an outcome for the reload a switch asked for, or for any reload sent after it (which carries that
+  switch's model), is that switch's verdict; an outcome with an older id moves nothing. A failed config
+  reload says the reload failed and why, and when a switch is pending that failure is its verdict.
 - A `/model` switch saved `config.toml`, and the config watcher read that save back as an outside change
   and rebuilt the same config a second time. The bytes the TUI just wrote are now recorded, and a
   watcher tick carrying them is skipped; an edit that really changes the file still reloads. A reload
