@@ -225,7 +225,7 @@ pub struct SubmittedTurn {
 ///
 /// The status bar and the saved config both name a model only once an agent is
 /// running it, so neither moves before the matching `ReloadComplete` — and a
-/// `ReloadFailed` (or an outcome belonging to some other reload) changes
+/// `ReloadFailed` (or an outcome belonging to an older reload) changes
 /// neither. Reloads that change no model at all (a skill toggle, an autonomy
 /// preset) are not held here: their outcome does nothing but the MCP/security
 /// snapshots every `ReloadComplete` already carries.
@@ -234,8 +234,9 @@ pub struct SubmittedTurn {
 /// supersedes the earlier one, and the superseded one is reported by nobody.
 #[derive(Debug)]
 pub struct PendingReload {
-    /// Correlation id stamped on the `TurnRequest::Reload`; only an outcome
-    /// carrying this id is that reload's verdict.
+    /// Correlation id stamped on the `TurnRequest::Reload`. Reload ids are
+    /// monotonic and every reload sent after this one carries this one's model,
+    /// so an outcome whose id is at or past this one is this reload's verdict.
     pub id: u64,
     /// `provider:model`, the label the rebuilt agent runs. `None` for a reload
     /// whose config names no model, where the status bar stays as it is.
@@ -494,8 +495,8 @@ pub struct TuiApp {
     /// `security.pending().resolve_by_basename(...)` and clears here.
     pub pending_approval: Option<crate::security::PendingRequest>,
     /// The reload this app is waiting on, and what its outcome may change.
-    /// Only an outcome carrying the same [`PendingReload::id`] adopts the
-    /// model label or writes the unsaved config.
+    /// An outcome whose id is at or past the pending id adopts the model label
+    /// and writes the unsaved config; an older outcome moves nothing.
     pub pending_reload: Option<PendingReload>,
     /// Correlation id for the next `TurnRequest::Reload` this app sends.
     /// Monotonic and never reused, so an outcome can only ever match one
@@ -2998,15 +2999,16 @@ impl TuiApp {
             AgentEvent::ReloadFailed { id, error } => {
                 // The previous agent is still running and answers the next
                 // prompt, so a rebuild that failed changes nothing: the label,
-                // `self.config` and the file keep what they had. Only the
-                // outcome of the reload this switch asked for is that switch's
-                // verdict — an unrelated reload failing (a skill toggle, a
-                // config reload) neither drops a pending switch nor claims the
-                // model was not changed, because it never touched one.
+                // `self.config` and the file keep what they had. A failure is
+                // the pending switch's verdict when it comes from the switch
+                // itself or from any reload sent after it — those carry the
+                // switch's model, so the switch did not land. A failure from an
+                // older reload (`pending.id > id`) is not its verdict and
+                // leaves the switch waiting.
                 let was_a_model_switch = self
                     .pending_reload
                     .as_ref()
-                    .is_some_and(|pending| pending.id == id && pending.unsaved_config.is_some());
+                    .is_some_and(|pending| pending.id <= id && pending.unsaved_config.is_some());
                 if was_a_model_switch {
                     self.pending_reload = None;
                 }
@@ -3037,12 +3039,14 @@ impl TuiApp {
                 self.context.mcp_tools_by_server = mcp_tools_by_server;
                 // An agent is now running the config THIS reload carried, so
                 // the status bar may name its model and a `/model` switch may
-                // write its config. An outcome for another reload (a skill
-                // toggle, a config reload finishing first) moves nothing.
+                // write its config. Reload ids are monotonic and every reload
+                // sent after a pending switch carries its model, so an outcome
+                // whose id is at or past the pending one IS that switch's
+                // verdict; an older outcome (`pending.id > id`) moves nothing.
                 if self
                     .pending_reload
                     .as_ref()
-                    .is_some_and(|pending| pending.id == id)
+                    .is_some_and(|pending| pending.id <= id)
                 {
                     // Read the switch's model off the slot BEFORE taking it:
                     // what is written below is the config this app holds now
@@ -9968,106 +9972,6 @@ mod tests {
         );
     }
 
-    /// A skill toggle sends its own reload, and the actor answers reloads in
-    /// the order they arrive. When that reload completes while a `/model`
-    /// switch is still in flight, the switch's outcome is the only one that
-    /// moves the label — the skill rebuild changed no model.
-    #[tokio::test]
-    async fn an_unrelated_reload_completing_mid_switch_leaves_the_label_to_the_switch() {
-        let tmp = tempfile::TempDir::new().expect("tmp");
-        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
-            SessionStore::in_memory().expect("store"),
-            "openai:old-model",
-        );
-        app.config.config_path = tmp.path().join("config.toml");
-        app.config.workspace_dir = tmp.path().to_path_buf();
-        app.config.default_provider = Some("openai".to_string());
-        app.config.api_key = Some("sk-test-placeholder".to_string());
-
-        app.apply_model_selection(Some("openai"), "new-model");
-        let (switch_id, _config) = expect_reload(&mut req_rx).await;
-        // The next id the app stamps is the skill toggle's reload.
-        let skill_reload_id = switch_id + 1;
-
-        app.handle_agent_event(AgentEvent::ReloadComplete {
-            id: skill_reload_id,
-            mcp_servers_configured: vec![],
-            mcp_tools_by_server: std::collections::HashMap::new(),
-            security: None,
-        });
-        assert_eq!(
-            app.context.model, "openai:old-model",
-            "a skill rebuild does not name a model the agent does not run yet"
-        );
-        assert!(
-            app.pending_reload.is_some(),
-            "the switch is still waiting for its own outcome"
-        );
-
-        app.handle_agent_event(AgentEvent::ReloadComplete {
-            id: switch_id,
-            mcp_servers_configured: vec![],
-            mcp_tools_by_server: std::collections::HashMap::new(),
-            security: None,
-        });
-        assert_eq!(app.context.model, "openai:new-model");
-        let said: Vec<&str> = app
-            .scrollback_queue
-            .iter()
-            .map(|(_, m)| m.as_str())
-            .collect();
-        assert_eq!(said.len(), 1, "the switch is announced once: {said:?}");
-    }
-
-    /// A reload from another path that FAILS — a skill toggle whose rebuild    /// cannot run, an `/autonomy` preset that cannot apply — is not a `/model`
-    /// switch: it must not claim the model was not changed, and it must not
-    /// drop the switch that is still waiting on its own outcome.
-    #[tokio::test]
-    async fn a_failed_unrelated_reload_does_not_drop_the_pending_switch() {
-        let tmp = tempfile::TempDir::new().expect("tmp");
-        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
-            SessionStore::in_memory().expect("store"),
-            "openai:old-model",
-        );
-        app.config.config_path = tmp.path().join("config.toml");
-        app.config.workspace_dir = tmp.path().to_path_buf();
-        app.config.default_provider = Some("openai".to_string());
-        app.config.api_key = Some("sk-test-placeholder".to_string());
-
-        app.apply_model_selection(Some("openai"), "new-model");
-        let (id, _config) = expect_reload(&mut req_rx).await;
-
-        // Some other reload, sent after the switch, fails first.
-        app.handle_agent_event(AgentEvent::ReloadFailed {
-            id: id + 1,
-            error: "the skill list could not be rebuilt".to_string(),
-        });
-
-        let said = app
-            .scrollback_queue
-            .last()
-            .map(|(_, m)| m.as_str())
-            .unwrap_or_default();
-        assert!(
-            !said.contains("Model not changed"),
-            "a reload that changed no model must not claim it did: {said}"
-        );
-        assert!(said.contains("skill list could not be rebuilt"), "{said}");
-        assert!(
-            app.pending_reload.is_some(),
-            "the switch is still waiting on its own rebuild"
-        );
-
-        // The switch's own outcome still lands.
-        app.handle_agent_event(AgentEvent::ReloadComplete {
-            id,
-            mcp_servers_configured: vec![],
-            mcp_tools_by_server: std::collections::HashMap::new(),
-            security: None,
-        });
-        assert_eq!(app.context.model, "openai:new-model");
-    }
-
     /// An unrelated reload sent AFTER a `/model` switch and completed after it
     /// carries the switch's model. The actor is FIFO and builds its agent from
     /// the config a `Reload` hands it, so the reload that lands last is the one
@@ -10578,6 +10482,413 @@ mod tests {
         let (_id, config) = expect_reload(&mut req_rx).await;
         assert_eq!(config.default_provider.as_deref(), Some(portless));
         assert_eq!(config.default_model.as_deref(), Some("llama3"));
+    }
+
+    /// A `/model` switch pending with id N, when the actor instead reports an
+    /// outcome for the next reload it ran (id N+1 — what an `/autonomy`
+    /// triggered after the switch would overwrite the actor slot to), still
+    /// adopts the switch: the latest reload sent after a pending switch carries
+    /// the switch's model, so its verdict is the switch's. The status bar,
+    /// `self.config`, the file and the message all move together, and the
+    /// pending slot clears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_switch_landing_through_a_later_reloads_outcome_adopts_the_switch() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let path = root.join("config.toml");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = path.clone();
+        app.config.workspace_dir = root.clone();
+        app.profile.root = root.clone();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+        app.config.save().await.expect("baseline config written");
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (switch_id, _switch_config) = expect_reload(&mut req_rx).await;
+
+        // Simulate the actor overwriting the switch's Reload in its single
+        // deferred slot: it now holds a Reload stamped N+1 (the later reload
+        // the operator triggered). The TUI's `pending_reload` is still the
+        // switch's slot, with id N.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: switch_id + 1,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+
+        assert_eq!(
+            app.context.model, "openai:new-model",
+            "the latest reload carried the switch's model, so its verdict is the switch's"
+        );
+        assert_eq!(
+            app.config.default_provider.as_deref(),
+            Some("openai"),
+            "self.config follows the switch"
+        );
+        assert_eq!(
+            app.config.default_model.as_deref(),
+            Some("new-model"),
+            "self.config follows the switch"
+        );
+
+        // The "Model set to" line is said exactly once.
+        let said: Vec<&str> = app
+            .scrollback_queue
+            .iter()
+            .map(|(_, m)| m.as_str())
+            .filter(|m| m.contains("Model set to"))
+            .collect();
+        assert_eq!(said.len(), 1, "the switch is announced once: {said:?}");
+        assert!(
+            said[0].contains("openai:new-model"),
+            "the line names the new model: {said:?}"
+        );
+
+        // The pending slot cleared so the session is not wedged by a stuck switch.
+        assert!(
+            app.pending_reload.is_none(),
+            "the verdict clears the pending slot — nothing left behind for next /model"
+        );
+        assert!(
+            !app.model_switch_in_flight(),
+            "no switch is in flight, so a later reload_config takes the slot"
+        );
+
+        // The save lands on disk in the background; wait for it.
+        let mut on_disk = String::new();
+        for _ in 0..150 {
+            on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+            if on_disk.contains("new-model") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            on_disk.contains("new-model"),
+            "the file names the new model"
+        );
+    }
+
+    /// A `/model` switch pending with id N, when the actor reports a failure
+    /// from the same later reload (id N+1), drops the switch: it never landed
+    /// on `self.config` or the file, the label stays as it was, and the
+    /// operator reads exactly one "Model not changed" line.
+    #[tokio::test]
+    async fn a_switch_failed_through_a_later_reloads_outcome_drops_the_switch() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let path = root.join("config.toml");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = path.clone();
+        app.config.workspace_dir = root.clone();
+        app.profile.root = root.clone();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+        app.config.save().await.expect("baseline config written");
+        let before = std::fs::read(&path).expect("baseline bytes");
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (switch_id, _switch_config) = expect_reload(&mut req_rx).await;
+
+        // Actor reports failure for the later reload it actually ran (id N+1).
+        app.handle_agent_event(AgentEvent::ReloadFailed {
+            id: switch_id + 1,
+            error: "the new provider refused to build".to_string(),
+        });
+
+        assert_eq!(
+            app.context.model, "openai:old-model",
+            "the label keeps the model the agent still runs"
+        );
+        assert_eq!(
+            app.config.default_provider.as_deref(),
+            Some("openai"),
+            "self.config keeps what it had"
+        );
+        assert_eq!(
+            app.config.default_model.as_deref(),
+            Some("old-model"),
+            "self.config keeps what it had"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("config still there"),
+            before,
+            "no save happens for a failed switch"
+        );
+        let said: Vec<&str> = app
+            .scrollback_queue
+            .iter()
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert_eq!(said.len(), 1, "the refusal is said once: {said:?}");
+        assert!(
+            said[0].contains("Model not changed"),
+            "the line names what was not changed: {said:?}"
+        );
+        assert!(
+            app.pending_reload.is_none(),
+            "the verdict clears the pending slot"
+        );
+        assert!(
+            !app.model_switch_in_flight(),
+            "no switch is in flight anymore"
+        );
+    }
+
+    /// An outcome whose id is smaller than the pending id moves nothing: the
+    /// verdict is for a reload the actor ran BEFORE the switch, so the switch
+    /// stays pending and the label, `self.config` and the file are untouched.
+    #[tokio::test]
+    async fn an_outcome_with_a_smaller_id_moves_nothing() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = root.join("config.toml");
+        app.config.workspace_dir = root.clone();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (switch_id, _switch_config) = expect_reload(&mut req_rx).await;
+
+        // An outcome for a reload that ran BEFORE the switch.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: switch_id - 1,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+
+        assert_eq!(
+            app.context.model, "openai:old-model",
+            "an older verdict does not move the label"
+        );
+        assert_eq!(
+            app.config.default_model.as_deref(),
+            Some("old-model"),
+            "an older verdict does not adopt its model"
+        );
+        assert!(
+            app.pending_reload.is_some(),
+            "the switch keeps waiting on its own verdict"
+        );
+        assert!(app.model_switch_in_flight(), "a switch is still in flight");
+
+        // The switch's own outcome (with the exact pending id) still lands.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: switch_id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(app.context.model, "openai:new-model");
+        assert!(app.pending_reload.is_none());
+    }
+
+    /// After a switch's verdict (even the one that landed through a later
+    /// reload's outcome), a fresh `reload_config` from a file naming another
+    /// provider takes its own slot and its own outcome moves the label —
+    /// the previously stuck switch no longer wedges the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_a_verdict_a_later_config_reload_takes_its_own_slot_and_moves_the_label() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let path = root.join("config.toml");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = path.clone();
+        app.config.workspace_dir = root.clone();
+        app.profile.root = root.clone();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+        app.config.save().await.expect("baseline config written");
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (switch_id, _switch_config) = expect_reload(&mut req_rx).await;
+
+        // The later reload the operator triggered lands the switch's model
+        // (`with_pending_model`), so its outcome is the switch's verdict. Send
+        // it for real — not a fabricated id — so the app's reload counter
+        // advances exactly as the live path does.
+        app.apply_preset_to_config_and_reload(crate::approval::policy_writer::PolicyPreset::Manual)
+            .expect("preset applied and saved");
+        let (later_id, later_config) = expect_reload(&mut req_rx).await;
+        assert_eq!(later_id, switch_id + 1);
+        assert_eq!(
+            later_config.default_model.as_deref(),
+            Some("new-model"),
+            "the later reload carries the switch's model"
+        );
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: later_id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(app.context.model, "openai:new-model");
+        assert!(app.pending_reload.is_none());
+
+        // Wait for the switch's save to land on disk before the operator
+        // edits the file again.
+        let mut saved_baseline = String::new();
+        for _ in 0..150 {
+            saved_baseline = std::fs::read_to_string(&path).unwrap_or_default();
+            if saved_baseline.contains("new-model") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            saved_baseline.contains("new-model"),
+            "the switch's save has landed"
+        );
+
+        // Operator hands edits the file to a different provider/model.
+        let mut edited = app.config.clone();
+        edited.default_provider = Some("other-provider".to_string());
+        edited.default_model = Some("other-model".to_string());
+        edited.save().await.expect("hand edit written");
+
+        // TUI reloads from the file. Anything from here on belongs to this
+        // plain reload; the switch's own "Model set to" line is already in the
+        // scrollback and must not be re-counted.
+        let before_reload = app.scrollback_queue.len();
+        app.reload_config().expect("the hand edit reloads");
+        let (reload_id, reload_config) = expect_reload(&mut req_rx).await;
+
+        // The reload took its own slot — its own id, no unsaved_config.
+        let pending = app
+            .pending_reload
+            .as_ref()
+            .expect("the reload takes its own slot now");
+        assert_eq!(
+            pending.id, reload_id,
+            "the pending slot matches the reload the app sent"
+        );
+        assert_eq!(
+            reload_id,
+            switch_id + 2,
+            "this reload is its own event, not the old switch's"
+        );
+        assert_eq!(
+            reload_config.default_provider.as_deref(),
+            Some("other-provider"),
+            "the hand edit reaches the agent"
+        );
+        assert_eq!(
+            reload_config.default_model.as_deref(),
+            Some("other-model"),
+            "the hand edit reaches the agent"
+        );
+        assert!(
+            pending.unsaved_config.is_none(),
+            "a plain config reload has nothing unsaved to persist"
+        );
+
+        // The reload's own outcome moves the label.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: reload_id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(
+            app.context.model, "other-provider:other-model",
+            "the new file's model lands on the label"
+        );
+        assert!(
+            app.pending_reload.is_none(),
+            "the reload's own verdict clears the slot"
+        );
+
+        // A plain config reload whose file matches what the agent already
+        // runs must not claim the model was set — there is nothing unsaved
+        // to announce. Scoped to this reload's own messages: the switch's
+        // verdict above legitimately said "Model set to".
+        let said: Vec<&str> = app
+            .scrollback_queue
+            .iter()
+            .skip(before_reload)
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert!(
+            !said.iter().any(|m| m.contains("Model set to")),
+            "a plain config reload does not say \"Model set to\": {said:?}"
+        );
+    }
+
+    /// A plain config reload (`unsaved_config: None`) pending with id N, when
+    /// the actor reports `ReloadComplete { id: N+1 }` for the later reload it
+    /// actually ran, still moves the label — the latest reload carries the
+    /// same model either way, and no "Model set to" line is announced because
+    /// there is nothing unsaved to persist.
+    #[tokio::test]
+    async fn a_plain_config_reload_moves_the_label_through_a_later_outcome() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, _req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:edited-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("edited-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+
+        // Place a plain config reload in the pending slot directly, bypassing
+        // `reload_config` (which would also kick the actor). The semantics of
+        // a plain reload are what `reload_config` builds when no switch is in
+        // flight: `model_label` from the file, `unsaved_config: None`.
+        let id = app.next_reload_id();
+        let model_label = model_label_of(&app.config);
+        app.pending_reload = Some(PendingReload {
+            id,
+            model_label: Some(model_label),
+            unsaved_config: None,
+        });
+
+        // Later outcome that arrived after the actor overwrote.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: id + 1,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+
+        assert_eq!(
+            app.context.model, "openai:edited-model",
+            "a plain config reload moves the label through a later outcome"
+        );
+        assert!(
+            app.pending_reload.is_none(),
+            "the verdict clears the pending slot"
+        );
+        let said: Vec<&str> = app
+            .scrollback_queue
+            .iter()
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert!(
+            said.is_empty(),
+            "no \"Model set to\" line for a reload that persists nothing: {said:?}"
+        );
     }
 
     #[test]

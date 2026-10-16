@@ -1154,6 +1154,98 @@ mod tests {
         );
     }
 
+    /// Two `Reload`s that arrive during one in-flight turn land in the actor's
+    /// single deferred slot: the later one replaces the earlier, so only the
+    /// later one is applied and only it reports. The earlier reload gets no
+    /// outcome at all — which is why the TUI must treat an outcome for any
+    /// reload sent after a pending one as that pending reload's verdict.
+    #[tokio::test]
+    async fn two_reloads_during_one_turn_report_only_the_later_id() {
+        use crate::agent::door_test_support::DoorFixture;
+
+        struct SlowProvider;
+
+        #[async_trait]
+        impl Provider for SlowProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<String> {
+                Ok("x".into())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<ChatResponse> {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(ChatResponse {
+                    usage: None,
+                    text: Some("late".into()),
+                    tool_calls: vec![],
+                })
+            }
+        }
+
+        let fixture = DoorFixture::start().await;
+        let agent = build_test_agent_with_provider(Box::new(SlowProvider));
+
+        let (req_tx, req_rx) = mpsc::channel(16);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
+
+        // Start a turn and keep it in flight while both reloads arrive.
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "start".into(),
+                conversation_id: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        req_tx
+            .send(TurnRequest::Reload {
+                id: 11,
+                config: Box::new(fixture.config.clone()),
+            })
+            .await
+            .unwrap();
+        req_tx
+            .send(TurnRequest::Reload {
+                id: 12,
+                config: Box::new(fixture.config.clone()),
+            })
+            .await
+            .unwrap();
+
+        let mut completes = Vec::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if let AgentEvent::ReloadComplete { id, .. } = ev {
+                completes.push(id);
+                break;
+            }
+        }
+        assert_eq!(
+            completes,
+            vec![12],
+            "only the later reload that survives the actor's single slot reports"
+        );
+        assert!(
+            timeout(Duration::from_millis(250), events_rx.recv())
+                .await
+                .is_err(),
+            "the earlier reload is superseded: it gets no outcome"
+        );
+
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+    }
+
     /// Runs `requests` through a fresh actor over `agent`, waits for every turn
     /// to finish, and returns what the provider was sent for each request.
     async fn run_requests(
