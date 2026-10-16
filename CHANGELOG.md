@@ -182,6 +182,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `0177.0.0.1`, `127.1`) or reached through a DNS name that resolves to a private address, now
   that `[browser].allowed_domains` defaults to `["*"]`; both browser tools now refuse those in
   any spelling and by resolved address.
+- After a `/model` switch whose rebuild failed, the status bar and `config.toml` both named the new model
+  the chat had just said was not changed, and the reason was printed twice. Nothing is written now until
+  an agent has been rebuilt from the new config: the label, the running config and the file all keep what
+  they had, and one line gives the reason.
+- Picking a session changed the model in the status bar without changing the model the agent ran, so the
+  label could name a model nothing was running. The pick leaves the label alone, and a session created
+  with another model is named once, after its history is replayed, with a pointer at `/model`.
+- A custom model whose id holds `/` (`Qwen/Qwen2.5-7B`), and a `custom:` endpoint whose base URL has no
+  path, could not be picked from the list: the picker joined the provider and the model into one string
+  and the switch split it back apart. A picked row now carries the two values separately and is never
+  split, so both are read correctly. The typed `/model custom:<url>:<model>` is still split as text, so a
+  base URL with no path, or a model id holding `/`, is still misread there.
+- A reload with nothing to do with a `/model` switch could take the switch's label, and a failed reload of
+  any kind answered `Model not changed` although it had changed no model. Each reload now carries an id
+  and its outcome is matched to the reload that asked for it: only a `/model` outcome moves or drops that
+  switch, and a failed config reload says the reload failed and why.
+- A `/model` switch saved `config.toml`, and the config watcher read that save back as an outside change
+  and rebuilt the same config a second time. The bytes the TUI just wrote are now recorded, and a
+  watcher tick carrying them is skipped; an edit that really changes the file still reloads. A reload
+  sent while a switch is still rebuilding (`/autonomy`, a skill toggle, the skills watcher, the config
+  watcher) now carries that switch's model too, so the agent cannot go back to a model the status bar
+  no longer names, and a switch a watcher tick would once have overwritten still lands.
+- A `/model` switch whose `config.toml` write failed told the operator only `Model set to <model>`:
+  the agent really was on the new model, the file was not, and nothing said so. The failure is now
+  reported once, saying the switch stands for the session and naming the error.
+- An unanswered console-login question in `rantaiclaw setup login` took the disable branch: the stored
+  console username, password hash and idle-lock window were cleared as if the operator had said no, and
+  that was written to `config.toml`. An empty answer decides nothing now. The step aborts with `Console
+  login was not answered, so nothing was changed.`, writes nothing and leaves the stored login as it
+  was, and the setup overlay stays open on that line instead of closing. An explicit `Skip / disable`
+  still turns the gate off.
 
 ## [0.33.0-alpha] — 2026-10-08
 

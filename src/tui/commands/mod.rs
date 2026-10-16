@@ -22,6 +22,9 @@ use std::collections::HashMap;
 use super::context::TuiContext;
 
 pub(crate) use model::split_model_target;
+/// Key prefix of a `/model` picker row, so the app can find the chosen row's
+/// `(provider, model)` in the entries the picker was opened with.
+pub(crate) use model::ROW_KEY_PREFIX;
 
 /// Canonical skill-name key for command matching: lowercase, and treat `-`
 /// and `_` as equivalent. Used by `/skill <name>`, `/skills <name>`
@@ -141,6 +144,14 @@ pub enum CommandResult {
     /// `/<skill-name>` direct-invoke fallback to pre-fill a "Use the
     /// <skill> skill: " prompt.
     SetInput(String),
+    /// Open the model picker, with the `(provider, model)` each row stands
+    /// for. The row keys are opaque, so the pair travels beside the picker
+    /// rather than inside a joined string that would have to be split again
+    /// (a model id may hold `/`, a custom endpoint's name its own `:`).
+    OpenModelPicker {
+        picker: crate::tui::widgets::ListPicker,
+        entries: Vec<crate::tui::widgets::ModelEntry>,
+    },
     /// Switch the active model: update the label, persist
     /// `default_provider`/`default_model`, and rebuild the agent via
     /// `TurnRequest::Reload`. Carried as a result rather than done in the

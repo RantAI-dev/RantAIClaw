@@ -4,6 +4,11 @@ use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
 use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind, ModelEntry};
 
+/// Prefix of a `/model` picker row key. The rest is the row's index into the
+/// entries the picker was opened with: a name, not data. Nothing reads a model
+/// or a provider back out of it.
+pub(crate) const ROW_KEY_PREFIX: &str = "model-row:";
+
 /// Rows for one provider's model picker.
 ///
 /// Resolves the same catalog the CLI (`models list`) and the web console
@@ -156,10 +161,16 @@ impl CommandHandler for ModelCommand {
             ));
         }
 
+        // The row key is opaque and carries no data: a joined `provider:model`
+        // cannot be split back apart without guessing (a custom endpoint's
+        // name holds its own `:`, a model id may hold `/`), so the pair
+        // travels beside the picker in `OpenModelPicker::entries` and the key
+        // is only a stable name for the row.
         let items: Vec<ListPickerItem> = entries
             .iter()
-            .map(|e| ListPickerItem {
-                key: e.target(),
+            .enumerate()
+            .map(|(index, e)| ListPickerItem {
+                key: format!("{ROW_KEY_PREFIX}{index}"),
                 primary: e.target(),
                 secondary: e.description.clone(),
                 disabled: false,
@@ -177,14 +188,18 @@ impl CommandHandler for ModelCommand {
             None => "No providers with credentials detected. Run `rantaiclaw setup provider`."
                 .to_string(),
         };
+        let active_row = entries
+            .iter()
+            .position(|e| e.target() == ctx.model)
+            .map(|index| format!("{ROW_KEY_PREFIX}{index}"));
         let picker = ListPicker::new(
             ListPickerKind::Model,
             "Select Model",
             items,
-            Some(&ctx.model),
+            active_row.as_deref(),
             empty_hint,
         );
-        Ok(CommandResult::OpenListPicker(picker))
+        Ok(CommandResult::OpenModelPicker { picker, entries })
     }
 }
 
@@ -393,14 +408,20 @@ mod tests {
 
         let result = cmd.execute("", &mut ctx).unwrap();
         match result {
-            CommandResult::OpenListPicker(picker) => {
+            CommandResult::OpenModelPicker { picker, entries } => {
                 assert_eq!(picker.kind, ListPickerKind::Model);
                 assert!(!picker.entries().is_empty());
+                // Rows are named by index, not by data: what each row stands
+                // for travels in `entries`, beside the picker.
                 assert!(picker.entries().iter().all(
-                    |e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.key.starts_with("openai:"))
+                    |e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.key.starts_with(ROW_KEY_PREFIX))
                 ));
+                assert!(picker.entries().iter().all(
+                    |e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.primary.starts_with("openai:"))
+                ));
+                assert!(entries.iter().all(|e| e.provider == "openai"));
             }
-            other => panic!("expected OpenListPicker, got {other:?}"),
+            other => panic!("expected OpenModelPicker, got {other:?}"),
         }
     }
 
@@ -482,23 +503,26 @@ mod tests {
         ctx.model = format!("{url}:my-own-model");
         ctx.workspace_dir = Some(workspace.path().to_path_buf());
 
-        let CommandResult::OpenListPicker(picker) = ModelCommand.execute("", &mut ctx).unwrap()
+        let CommandResult::OpenModelPicker { picker, entries } =
+            ModelCommand.execute("", &mut ctx).unwrap()
         else {
-            panic!("expected OpenListPicker");
+            panic!("expected OpenModelPicker");
         };
-        let keys: Vec<String> = picker
-            .entries()
-            .iter()
-            .filter_map(|e| e.as_item().map(|i| i.key.clone()))
-            .collect();
+        let targets: Vec<String> = entries.iter().map(ModelEntry::target).collect();
 
-        assert_eq!(keys.len(), 4, "3 cached + the active model: {keys:?}");
+        assert_eq!(targets.len(), 4, "3 cached + the active model: {targets:?}");
         for id in ["llama-a", "llama-b", "llama-c", "my-own-model"] {
             assert!(
-                keys.contains(&format!("{url}:{id}")),
-                "{id} is offered: {keys:?}"
+                targets.contains(&format!("{url}:{id}")),
+                "{id} is offered: {targets:?}"
             );
         }
+        assert!(
+            picker.entries().iter().all(
+                |e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.key.starts_with(ROW_KEY_PREFIX))
+            ),
+            "a row key never carries the endpoint: joining and splitting it back is what breaks on one"
+        );
     }
 
     /// Boot path: `rantaiclaw chat` starts with `ctx.model` = `provider:model`
@@ -514,18 +538,15 @@ mod tests {
         ctx.model = "openai:openai/active-model".to_string();
         ctx.workspace_dir = Some(workspace.path().to_path_buf());
 
-        let CommandResult::OpenListPicker(picker) = ModelCommand.execute("", &mut ctx).unwrap()
+        let CommandResult::OpenModelPicker { entries, .. } =
+            ModelCommand.execute("", &mut ctx).unwrap()
         else {
-            panic!("expected OpenListPicker");
+            panic!("expected OpenModelPicker");
         };
-        let keys: Vec<String> = picker
-            .entries()
-            .iter()
-            .filter_map(|e| e.as_item().map(|i| i.key.clone()))
-            .collect();
+        let models: Vec<&str> = entries.iter().map(|e| e.model_id.as_str()).collect();
 
-        assert_eq!(keys.len(), 151, "150 cached + the active model");
-        assert!(keys.contains(&"openai:openai/active-model".to_string()));
+        assert_eq!(models.len(), 151, "150 cached + the active model");
+        assert!(models.contains(&"openai/active-model"));
     }
 
     /// The picker offers a 150-model catalog and the active model: 151 rows,
@@ -574,9 +595,10 @@ mod tests {
         ctx.available_providers = vec!["some-unlisted-provider".to_string()];
         ctx.workspace_dir = Some(tempfile::TempDir::new().unwrap().keep());
 
-        let CommandResult::OpenListPicker(picker) = ModelCommand.execute("", &mut ctx).unwrap()
+        let CommandResult::OpenModelPicker { picker, .. } =
+            ModelCommand.execute("", &mut ctx).unwrap()
         else {
-            panic!("expected OpenListPicker");
+            panic!("expected OpenModelPicker");
         };
 
         assert!(
@@ -596,9 +618,10 @@ mod tests {
         ctx.available_providers = Vec::new();
         ctx.model = String::new();
 
-        let CommandResult::OpenListPicker(picker) = ModelCommand.execute("", &mut ctx).unwrap()
+        let CommandResult::OpenModelPicker { picker, .. } =
+            ModelCommand.execute("", &mut ctx).unwrap()
         else {
-            panic!("expected OpenListPicker");
+            panic!("expected OpenModelPicker");
         };
 
         assert!(

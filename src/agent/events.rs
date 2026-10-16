@@ -97,8 +97,12 @@ pub enum AgentEvent {
 
     /// The actor could not rebuild the agent for a `TurnRequest::Reload`. The
     /// previous agent is still in place and keeps answering; the TUI shows the
-    /// error and drops any model switch that was waiting on this reload.
+    /// error and drops the model switch that was waiting on this reload.
     ReloadFailed {
+        /// The `TurnRequest::Reload`'s own id, echoed unchanged: a surface with
+        /// more than one reload in flight needs to know which request this
+        /// outcome answers.
+        id: u64,
         /// Why the agent could not be built, as the factory reported it.
         error: String,
     },
@@ -108,6 +112,10 @@ pub enum AgentEvent {
     /// `/mcp` reflect the new state without re-probing). Emitted at
     /// reload-complete time, not per turn.
     ReloadComplete {
+        /// The `TurnRequest::Reload`'s own id, echoed unchanged: the new agent
+        /// is in place for THAT config, which is what the status bar and the
+        /// saved config may now name.
+        id: u64,
         /// Names of MCP servers configured after the reload.
         mcp_servers_configured: Vec<String>,
         /// Per-server qualified tool names actually discovered.

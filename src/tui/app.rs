@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal, Stdout, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -219,6 +220,33 @@ pub struct SubmittedTurn {
     pub refused: bool,
 }
 
+/// A reload the TUI sent to the agent actor and is still waiting on: what its
+/// outcome is allowed to change, and nothing else.
+///
+/// The status bar and the saved config both name a model only once an agent is
+/// running it, so neither moves before the matching `ReloadComplete` — and a
+/// `ReloadFailed` (or an outcome belonging to some other reload) changes
+/// neither. Reloads that change no model at all (a skill toggle, an autonomy
+/// preset) are not held here: their outcome does nothing but the MCP/security
+/// snapshots every `ReloadComplete` already carries.
+///
+/// One slot, not a queue: a reload asked for while another is in flight
+/// supersedes the earlier one, and the superseded one is reported by nobody.
+#[derive(Debug)]
+pub struct PendingReload {
+    /// Correlation id stamped on the `TurnRequest::Reload`; only an outcome
+    /// carrying this id is that reload's verdict.
+    pub id: u64,
+    /// `provider:model`, the label the rebuilt agent runs. `None` for a reload
+    /// whose config names no model, where the status bar stays as it is.
+    pub model_label: Option<String>,
+    /// Set by `/model` alone: the config the switch produced, which the agent
+    /// has now been built from but which is on neither `self.config` nor disk.
+    /// Its presence is also what makes a failure read "Model not changed" — a
+    /// plain config reload changed no model and must not claim it did.
+    pub unsaved_config: Option<Box<crate::config::Config>>,
+}
+
 /// Top-level TUI application.
 // Many independent UI mode flags; grouping them into a sub-struct would not
 // improve clarity and would churn every call site.
@@ -360,6 +388,25 @@ pub struct TuiApp {
     /// pipeline that wizard close uses, so the agent picks up the
     /// change on the next turn without a restart.
     pub config_watcher: Option<crate::config::watcher::ConfigWatcher>,
+    /// Fingerprint of the `config.toml` bytes this app already accounts for.
+    /// A watcher tick whose file content matches it is not an external edit —
+    /// it is the write `/model`'s save just made, or a touch that changed
+    /// nothing — so the reload it would trigger is skipped. Shared with that
+    /// save task, which stamps it once the bytes are there; the gateway gates
+    /// its own reloader on the same value. Behind a mutex because that task is
+    /// not on this thread.
+    ///
+    /// Only `/model`'s save stamps it. A save this app makes for another reason
+    /// (`/autonomy`'s preset) does not, so its tick still reloads the agent, as
+    /// it did before this gate existed — suppressing that rebuild is a separate
+    /// change with its own evidence, not a side effect of this one.
+    pub config_fingerprint: Arc<std::sync::Mutex<String>>,
+    /// Failure line for the `config.toml` save a `/model` switch triggers once
+    /// the agent it waits for is running. The save runs off-thread, so the
+    /// "Model set to" line is said before the write is known to have landed;
+    /// this carries the other outcome back to `drain_events`, which says it.
+    /// `None` when no switch save is outstanding.
+    pub model_switch_save_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     /// Handle to the background channel runtime (Telegram/Discord/Slack/…
     /// listeners) spawned alongside the TUI. Held so a mid-session channel
     /// or skill change can cancel and respawn the runtime in place via
@@ -446,11 +493,18 @@ pub struct TuiApp {
     /// the user doesn't have to type `/allow X`. Resolves via
     /// `security.pending().resolve_by_basename(...)` and clears here.
     pub pending_approval: Option<crate::security::PendingRequest>,
-    /// The `provider:model` a `/model` switch asked for, held until the reload
-    /// it triggered completes. Only that reload adopts it into `context.model`;
-    /// reloads from other paths (wizard save, external edit, skill toggle) leave
-    /// it alone, so an unrelated `ReloadComplete` never moves the status bar.
-    pub pending_model: Option<String>,
+    /// The reload this app is waiting on, and what its outcome may change.
+    /// Only an outcome carrying the same [`PendingReload::id`] adopts the
+    /// model label or writes the unsaved config.
+    pub pending_reload: Option<PendingReload>,
+    /// Correlation id for the next `TurnRequest::Reload` this app sends.
+    /// Monotonic and never reused, so an outcome can only ever match one
+    /// request.
+    pub reload_seq: u64,
+    /// The `(provider, model)` each row of the open model picker stands for,
+    /// in the picker's own row order. A row key is opaque (`model-row:{n}`),
+    /// so this is where a chosen row's pair is read from.
+    pub model_picker_entries: Option<Vec<super::widgets::ModelEntry>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -601,6 +655,8 @@ impl TuiApp {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            config_fingerprint: Arc::new(std::sync::Mutex::new(String::new())),
+            model_switch_save_rx: None,
             channel_supervisor: None,
             info_panel: None,
             stream_committed_chars: 0,
@@ -617,7 +673,9 @@ impl TuiApp {
             pending_turns: std::collections::VecDeque::new(),
             actor_has_agent: true,
             pending_approval: None,
-            pending_model: None,
+            pending_reload: None,
+            reload_seq: 0,
+            model_picker_entries: None,
         })
     }
 
@@ -746,11 +804,20 @@ impl TuiApp {
         // Hand the new config to the agent actor — mirrors what
         // `reload_config` does after a wizard run, but without the
         // wholesale re-read since we already have the live struct.
+        //
+        // The preset change travels with the model a `/model` switch is still
+        // waiting to land, exactly as it travels from every other sender
+        // (`with_pending_model`). This reload is the last one the actor sees,
+        // so it decides what the next message is answered with.
+        let id = self.next_reload_id();
         let req_tx = self.context.req_tx.clone();
-        let config = self.config.clone();
+        let config = self.with_pending_model(self.config.clone());
         tokio::spawn(async move {
             let _ = req_tx
-                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .send(crate::tui::TurnRequest::Reload {
+                    id,
+                    config: Box::new(config),
+                })
                 .await;
         });
         Ok(())
@@ -2159,6 +2226,33 @@ impl TuiApp {
             self.handle_agent_event(ev);
         }
 
+        // A `/model` switch's config.toml save runs off-thread, so a write that
+        // fails arrives here after the "Model set to" line was already said.
+        // Said once, as an error: the agent really is on the new model, but the
+        // file on disk is not, and only saying so keeps the two readable.
+        let mut save_failures: Vec<String> = Vec::new();
+        let mut save_task_gone = false;
+        if let Some(rx) = self.model_switch_save_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(line) => save_failures.push(line),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        save_task_gone = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if save_task_gone {
+            self.model_switch_save_rx = None;
+        }
+        for line in save_failures {
+            self.context.last_error = Some(line.clone());
+            let _ = self.context.append_system_message(&line);
+            self.scrollback_queue.push(("system".to_string(), line));
+        }
+
         // Pending-approval requests from the shell tool. Each new
         // request surfaces as a system message with the exact slash
         // commands the user can type to resolve it.
@@ -2468,21 +2562,17 @@ impl TuiApp {
         self.channel_supervisor = Some(ChannelSupervisor { shutdown, handle });
     }
 
-    /// Apply a user-driven model switch from `/model` (arg or picker).
+    /// Apply a user-driven model switch from `/model`. `provider` and `model`
+    /// arrive as two values: a picker row carries them apart (a model id may
+    /// hold `/` and a base URL its own `:`, so joining them into one string and
+    /// splitting it again loses either), and a typed `/model <provider:model>`
+    /// is split once here by `split_model_target`.
     ///
-    /// Until v0.22.1-alpha this was label-only: `context.model` changed,
-    /// the agent kept its launch-time model (`Agent::from_config`), and
-    /// the config on disk never learned about the switch. Persist first,
-    /// then reload — the same ordering the wizard save path uses, so a
-    /// crash between the two leaves disk authoritative.
-    ///
-    /// Known double-fire, accepted: the save trips the config watcher, whose
-    /// debounced tick runs `reload_config` and pushes a second `Reload` with
-    /// the same config. One redundant agent rebuild per manual switch — a
-    /// human-frequency event, not worth another memo flag to suppress.
-    fn apply_model_selection(&mut self, target: &str) {
-        let (provider, model) = super::commands::split_model_target(target);
-
+    /// Nothing is written until the agent has been rebuilt from this config.
+    /// The switch asks the actor for a rebuild and waits: `self.config`, the
+    /// file and the status bar all move only on the `ReloadComplete` that
+    /// answers THIS reload, and a `ReloadFailed` leaves all three as they were.
+    fn apply_model_selection(&mut self, provider: Option<&str>, model: &str) {
         // The config this switch would produce. Nothing is written until the
         // build check below has passed on it.
         let mut next = self.config.clone();
@@ -2503,29 +2593,101 @@ impl TuiApp {
             return;
         }
 
-        // The status bar moves only when the actor reports the new agent is in
-        // place (`ReloadComplete`). Until then the agent runs the old model, so
-        // the pending target is held here and adopted only by that reload.
-        self.config = next;
-        self.pending_model = Some(target.to_string());
-
-        // `self.config` is the decrypted in-memory config (the same one the
-        // provisioner save path clones), so the `Reload` hands the agent
+        let id = self.next_reload_id();
+        let model_label = model_label_of(&next);
+        // The config the agent is being built from is decrypted in memory (the
+        // same one the provisioner save path clones), so the `Reload` hands it
         // usable credentials — the invariant `reload_config`'s decrypt pass
-        // exists to protect. `save()` takes `&self` and encrypts into a
-        // clone, so it does not disturb that.
-        let config = self.config.clone();
+        // exists to protect.
+        let config = Box::new(next);
+        self.pending_reload = Some(PendingReload {
+            id,
+            model_label: Some(model_label),
+            unsaved_config: Some(config.clone()),
+        });
         let req_tx = self.context.req_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = config.save().await {
-                // The in-session switch below still applies; only the
-                // on-disk copy is stale. Next successful save (wizard,
-                // /setup) heals it.
-                tracing::warn!("failed to persist model change: {e:#}");
-            }
             let _ = req_tx
-                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .send(crate::tui::TurnRequest::Reload {
+                    id,
+                    config: config.clone(),
+                })
                 .await;
+        });
+    }
+
+    /// Correlation id for the next `TurnRequest::Reload`. Monotonic and never
+    /// reused, so an outcome can only ever be matched to one request.
+    fn next_reload_id(&mut self) -> u64 {
+        self.reload_seq += 1;
+        self.reload_seq
+    }
+
+    /// `base` with the model a `/model` switch is still waiting to land, when
+    /// one is in flight.
+    ///
+    /// While that switch waits for its own `ReloadComplete`, its model is on
+    /// neither `self.config` nor the file — it exists only in
+    /// `pending_reload.unsaved_config`. The actor is FIFO and builds its agent
+    /// from the config each `Reload` carries, so a reload sent in that window by
+    /// any other path (`/autonomy`, a skill toggle, the skills watcher, the
+    /// config watcher) that carried the config as it stands would put the agent
+    /// back on the PRE-switch model — after the switch's own outcome already
+    /// moved the label and wrote the file. `base` is the sender's own config,
+    /// so its own changes stay; only the model comes from the switch.
+    fn with_pending_model(&self, base: crate::config::Config) -> crate::config::Config {
+        let Some(switch) = self
+            .pending_reload
+            .as_ref()
+            .and_then(|pending| pending.unsaved_config.as_ref())
+        else {
+            return base;
+        };
+        let mut base = base;
+        if let Some(provider) = switch.default_provider.as_deref() {
+            base.default_provider = Some(provider.to_string());
+        }
+        if let Some(model) = switch.default_model.as_deref() {
+            base.default_model = Some(model.to_string());
+        }
+        base
+    }
+
+    /// Whether a `/model` switch is still waiting on the rebuild it asked for.
+    fn model_switch_in_flight(&self) -> bool {
+        self.pending_reload
+            .as_ref()
+            .is_some_and(|pending| pending.unsaved_config.is_some())
+    }
+
+    /// Save a `/model` switch's config, now that an agent has been built from
+    /// it, and record the bytes written so the config watcher's tick for this
+    /// own write is recognised and skipped (`drain_config_reload_events`).
+    ///
+    /// The save runs off-thread, so the "Model set to" line is said before the
+    /// write is known to have landed. A failure is not swallowed into the log:
+    /// the task hands the line to `model_switch_save_rx` and `drain_events`
+    /// says it. The in-session switch stands — an agent is running that model —
+    /// so the line says exactly that, and names the file that is stale.
+    ///
+    /// `save()` takes `&self` and encrypts into a clone, so `self.config` keeps
+    /// the decrypted credentials the provisioner paths read.
+    fn persist_model_switch(&mut self, config: crate::config::Config, label: String) {
+        let fingerprint = Arc::clone(&self.config_fingerprint);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.model_switch_save_rx = Some(rx);
+        tokio::spawn(async move {
+            if let Err(e) = config.save().await {
+                let _ = tx.send(format!(
+                    "⚠ Model set to {label} for this session, but saving config.toml \
+                     failed: {e:#}. It keeps the model it had; the next save \
+                     (/setup, the wizard) writes this one."
+                ));
+                tracing::warn!("failed to persist model change: {e:#}");
+                return;
+            }
+            let written = crate::config::fingerprint::fingerprint_file(&config.config_path);
+            *fingerprint.lock().unwrap_or_else(|e| e.into_inner()) = written;
         });
     }
 
@@ -2566,22 +2728,34 @@ impl TuiApp {
         let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
         crate::config::schema::decrypt_config_secrets(&store, &mut config)?;
         config.apply_env_overrides();
-        // Refresh the status-bar model label so the running TUI shows
-        // the freshly-saved provider/model. Without this, a wizard run
-        // that switches provider (e.g. openrouter → minimax) would
-        // leave the status bar showing the old provider until the
-        // next launch.
-        let provider = config.default_provider.clone().unwrap_or_default();
-        let model = config.default_model.clone().unwrap_or_default();
-        let model_label = if !provider.is_empty() && !model.is_empty() {
-            format!("{provider}:{model}")
-        } else if !model.is_empty() {
-            model
-        } else {
-            self.context.model.clone()
-        };
-        if !model_label.is_empty() {
-            self.context.model = model_label;
+        // A `/model` switch in flight outranks what the file says: its model is
+        // on neither `self.config` nor the file until its own rebuild lands, so
+        // rebuilding the agent from the bytes just read would take the agent
+        // back to the pre-switch model under a status bar the switch has not
+        // moved yet. Everything else the file changed is kept — a hand edit
+        // during the switch window still reaches the agent this way.
+        let reload_config = self.with_pending_model(config.clone());
+        // The status-bar model label follows this reload, not the file read
+        // above: an operator (or a wizard run that switches provider, e.g.
+        // openrouter → minimax) must not see the new model named until an
+        // agent is actually running it, and a rebuild that fails must leave
+        // the label on the model the agent still answers with.
+        let model_label = model_label_of(&reload_config);
+        let id = self.next_reload_id();
+        // One pending slot, and a switch in flight holds it: taking it here
+        // would discard the operator's `/model` with its `unsaved_config`, and
+        // the switch's `ReloadComplete` would then match nothing — the file
+        // read below would silently win over what the operator just typed. The
+        // switch keeps the slot, so its own outcome still adopts it and writes
+        // the file; this reload's outcome only moves the label when no switch
+        // is waiting, as before.
+        if !self.model_switch_in_flight() {
+            self.pending_reload = Some(PendingReload {
+                id,
+                model_label: (!model_label.is_empty()).then_some(model_label),
+                // The file already holds this config; `/model` alone writes.
+                unsaved_config: None,
+            });
         }
         // Recompute the /model picker's available-providers list from
         // the new config. Same logic as the startup-time computation
@@ -2656,7 +2830,12 @@ impl TuiApp {
             let _ = self.context.append_system_message(&msg);
             self.scrollback_queue.push(("system".to_string(), msg));
         }
-        self.config = config.clone();
+        // `self.config` keeps the model the agent runs: a switch still waiting
+        // for its own outcome has not been adopted here, so neither the
+        // in-memory config nor the file names its model yet. Everything else
+        // the file changed is adopted, and reaches the agent through the
+        // reload below.
+        self.config = config;
         // Config reload can flip `skills.entries.<name>.enabled` (CLI
         // `skills enable/disable`, an external edit, or the in-picker
         // toggle). Refresh the cached skill lists so `/skills`,
@@ -2675,7 +2854,10 @@ impl TuiApp {
         let req_tx = self.context.req_tx.clone();
         tokio::spawn(async move {
             let _ = req_tx
-                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .send(crate::tui::TurnRequest::Reload {
+                    id,
+                    config: Box::new(reload_config),
+                })
                 .await;
         });
         // Config reload means the on-disk state changed (wizard saved,
@@ -2813,17 +2995,32 @@ impl TuiApp {
             AgentEvent::ImageRefused { message } => {
                 self.finalize_refusal(message);
             }
-            AgentEvent::ReloadFailed { error } => {
+            AgentEvent::ReloadFailed { id, error } => {
                 // The previous agent is still running and answers the next
-                // prompt. A model switch waiting on this reload is dropped, so
-                // the status bar keeps naming the model the agent runs.
-                self.pending_model = None;
-                let msg = format!("Model not changed: the agent could not be rebuilt: {error}");
+                // prompt, so a rebuild that failed changes nothing: the label,
+                // `self.config` and the file keep what they had. Only the
+                // outcome of the reload this switch asked for is that switch's
+                // verdict — an unrelated reload failing (a skill toggle, a
+                // config reload) neither drops a pending switch nor claims the
+                // model was not changed, because it never touched one.
+                let was_a_model_switch = self
+                    .pending_reload
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == id && pending.unsaved_config.is_some());
+                if was_a_model_switch {
+                    self.pending_reload = None;
+                }
+                let msg = if was_a_model_switch {
+                    format!("Model not changed: the agent could not be rebuilt: {error}")
+                } else {
+                    format!("Config reload failed, keeping the running config: {error}")
+                };
                 self.context.last_error = Some(msg.clone());
                 let _ = self.context.append_system_message(&msg);
                 self.scrollback_queue.push(("system".to_string(), msg));
             }
             AgentEvent::ReloadComplete {
+                id,
                 mcp_servers_configured,
                 mcp_tools_by_server,
                 security,
@@ -2838,15 +3035,44 @@ impl TuiApp {
                 // turn — this just keeps the UI's view in sync.
                 self.context.mcp_servers_configured = mcp_servers_configured.into_iter().collect();
                 self.context.mcp_tools_by_server = mcp_tools_by_server;
-                // A `/model` switch is in place now: the status bar names it and
-                // the note says so. Reloads from other paths carry no pending
-                // model and leave the status bar as it was.
-                if let Some(target) = self.pending_model.take() {
-                    self.context.model = target.clone();
-                    self.context.last_error = None;
-                    let msg = format!("Model set to: {target}");
-                    let _ = self.context.append_system_message(&msg);
-                    self.scrollback_queue.push(("system".to_string(), msg));
+                // An agent is now running the config THIS reload carried, so
+                // the status bar may name its model and a `/model` switch may
+                // write its config. An outcome for another reload (a skill
+                // toggle, a config reload finishing first) moves nothing.
+                if self
+                    .pending_reload
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == id)
+                {
+                    // Read the switch's model off the slot BEFORE taking it:
+                    // what is written below is the config this app holds now
+                    // with that model on it, not the snapshot the switch sent.
+                    let adopted = self.with_pending_model(self.config.clone());
+                    let pending = self
+                        .pending_reload
+                        .take()
+                        .expect("the pending reload was just matched");
+                    if let Some(label) = pending.model_label {
+                        self.context.model = label;
+                    }
+                    if pending.unsaved_config.is_some() {
+                        // An agent is running that model now, so `self.config`
+                        // may name it and the file follows on the next task.
+                        //
+                        // The snapshot the switch sent is read for its model
+                        // only. Swapping it back in would revert everything
+                        // that landed while the switch was in flight — a skill
+                        // toggle, an `/autonomy` preset, a file edit the
+                        // watcher picked up — in memory and on disk, because
+                        // this save is the last writer.
+                        self.config = adopted.clone();
+                        let label = self.context.model.clone();
+                        self.persist_model_switch(adopted, label);
+                        let msg = format!("Model set to: {}", self.context.model);
+                        self.context.last_error = None;
+                        let _ = self.context.append_system_message(&msg);
+                        self.scrollback_queue.push(("system".to_string(), msg));
+                    }
                 }
                 // Re-subscribe to the new SecurityPolicy's pending-
                 // approval broadcast. The old subscriber was bound to
@@ -3290,9 +3516,20 @@ impl TuiApp {
                 self.dispatch_resubmit(text, row_id).await;
             }
             CmdResult::SetModel(target) => {
-                self.apply_model_selection(&target);
+                // The typed `/model <provider:model>` form: split once here,
+                // then hand the switch two values.
+                let (provider, model) = super::commands::split_model_target(&target);
+                self.apply_model_selection(provider, model);
             }
             CmdResult::OpenListPicker(picker) => {
+                // Any other picker replaces the model picker's side table.
+                self.model_picker_entries = None;
+                self.list_picker = Some(picker);
+            }
+            CmdResult::OpenModelPicker { picker, entries } => {
+                // The rows' keys are opaque (`model-row:{n}`); the provider and
+                // model each row stands for travel beside the picker.
+                self.model_picker_entries = Some(entries);
                 self.list_picker = Some(picker);
             }
             CmdResult::OpenInfoPanel(panel) => {
@@ -3452,7 +3689,25 @@ impl TuiApp {
 
         match kind {
             ListPickerKind::Model => {
-                self.apply_model_selection(&key);
+                // The chosen row names its row, not a model: the pair comes
+                // from the entries the picker was opened with, never from
+                // splitting a joined string back apart. One picker is open at a
+                // time, so the table is spent here.
+                let entries = self.model_picker_entries.take();
+                let entry = key
+                    .strip_prefix(super::commands::ROW_KEY_PREFIX)
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| entries.as_ref()?.get(index));
+                match entry.map(|e| (e.provider.clone(), e.model_id.clone())) {
+                    Some((provider, model)) => self.apply_model_selection(Some(&provider), &model),
+                    None => {
+                        let msg = "That model row is no longer available — reopen /model.";
+                        self.context.last_error = Some(msg.to_string());
+                        let _ = self.context.append_system_message(msg);
+                        self.scrollback_queue
+                            .push(("system".to_string(), msg.to_string()));
+                    }
+                }
             }
             ListPickerKind::Session => {
                 let session = match self.context.session_store.get_session(&key) {
@@ -3469,7 +3724,11 @@ impl TuiApp {
                     }
                 };
                 self.context.session_id = Some(session.id.clone());
-                self.context.model = session.model.clone();
+                // The label is not written here: the agent is not rebuilt on a
+                // pick, so the model that answers the next message is the one
+                // already running. The picked session's own model is named in
+                // one note after the replay instead.
+
                 self.context.messages.clear();
                 // Another session's total is not this session's: the store
                 // keeps no per-turn usage, so the picked one starts unreported.
@@ -3505,6 +3764,18 @@ impl TuiApp {
                 for m in &self.context.messages {
                     self.scrollback_queue
                         .push((m.role.clone(), m.content.clone()));
+                }
+                // A session opened under another model says so, once, after the
+                // replay — before it the note would be replayed a second time.
+                if session_model_differs(&session.model, &self.context.model) {
+                    let msg = format!(
+                        "This session was created with {model}; the agent still runs {running}. \
+                         Use /model to switch.",
+                        model = session.model.trim(),
+                        running = self.context.model,
+                    );
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".to_string(), msg));
                 }
             }
             ListPickerKind::Personality => {
@@ -3883,11 +4154,15 @@ impl TuiApp {
         let msg = format!("✓ {canonical} {new_state}. Reloading agent…");
         let _ = self.context.append_system_message(&msg);
         self.scrollback_queue.push(("system".to_string(), msg));
+        let id = self.next_reload_id();
         let req_tx = self.context.req_tx.clone();
-        let config = self.config.clone();
+        let config = self.with_pending_model(self.config.clone());
         tokio::spawn(async move {
             let _ = req_tx
-                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .send(crate::tui::TurnRequest::Reload {
+                    id,
+                    config: Box::new(config),
+                })
                 .await;
         });
     }
@@ -4024,6 +4299,26 @@ impl TuiApp {
         if !should_reload {
             return;
         }
+        // A watcher event fires on ANY write to the file, this app's own
+        // included: a `/model` switch writes `config.toml` once the rebuild it
+        // asked for has succeeded, and a rewrite that changes no content fires
+        // the same way. Comparing the bytes is what stops that tick from
+        // pushing a second `Reload` of the config the switch just rebuilt from
+        // — the same fingerprint gate the gateway's reloader uses.
+        let on_disk = crate::config::fingerprint::fingerprint_file(&self.profile.config_toml());
+        if *self
+            .config_fingerprint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            == on_disk
+        {
+            tracing::info!("config.toml tick carries bytes this app already has — not reloading");
+            return;
+        }
+        *self
+            .config_fingerprint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = on_disk;
         match self.reload_config() {
             Ok(()) => {
                 tracing::info!(
@@ -4074,11 +4369,15 @@ impl TuiApp {
             // existing `TurnRequest::Reload` path (same as wizard
             // close) — costs ~one Agent rebuild including MCP
             // re-discovery, but only on real skill add/remove.
-            let config = self.config.clone();
+            let id = self.next_reload_id();
+            let config = self.with_pending_model(self.config.clone());
             let req_tx = self.context.req_tx.clone();
             tokio::spawn(async move {
                 let _ = req_tx
-                    .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                    .send(crate::tui::TurnRequest::Reload {
+                        id,
+                        config: Box::new(config),
+                    })
                     .await;
             });
             tracing::info!(
@@ -6133,6 +6432,7 @@ pub(super) mod test_support {
     use super::{AppState, CommandRegistry, TuiApp, INLINE_VIEWPORT_LINES};
     use crate::tui::context::TuiContext;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     /// A `TuiApp` in `Ready` state whose profile lives under `profile_root`.
     pub(crate) fn app_with_profile_root(ctx: TuiContext, profile_root: PathBuf) -> TuiApp {
@@ -6177,6 +6477,8 @@ pub(super) mod test_support {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            config_fingerprint: Arc::new(std::sync::Mutex::new(String::new())),
+            model_switch_save_rx: None,
             channel_supervisor: None,
             info_panel: None,
             stream_committed_chars: 0,
@@ -6193,7 +6495,9 @@ pub(super) mod test_support {
             pending_turns: std::collections::VecDeque::new(),
             actor_has_agent: true,
             pending_approval: None,
-            pending_model: None,
+            pending_reload: None,
+            reload_seq: 0,
+            model_picker_entries: None,
         }
     }
 
@@ -8392,6 +8696,41 @@ pub(crate) fn channels_differ(before: Option<&String>, after: Option<&String>) -
     }
 }
 
+/// The status-bar label for a config: `provider:model`, the spelling the boot
+/// path (`boot_model_label`) and the wizard save store build. A config that
+/// names no provider labels its model alone; a config that names no model at
+/// all has no label, and the caller leaves the status bar as it is.
+fn model_label_of(config: &crate::config::Config) -> String {
+    let provider = config.default_provider.as_deref().unwrap_or_default();
+    let model = config.default_model.as_deref().unwrap_or_default();
+    match (provider.is_empty(), model.is_empty()) {
+        (false, false) => format!("{provider}:{model}"),
+        (true, false) => model.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Whether a session's recorded model names something other than the model the
+/// running agent is on.
+///
+/// A session records the label as it stood when it opened, so what it holds is
+/// usually the `provider:model` the status bar shows. The CLI (`agent -m`) and
+/// the API (`record_api_turn`) record a bare model id instead, which that label
+/// spells with its provider in front — both spellings name the same model then,
+/// and only a real difference is worth telling the operator about. A row with
+/// no model recorded names nothing, so it is not a difference either; neither is
+/// one recorded against a running label that names no model, which would put an
+/// empty label in the middle of the note.
+fn session_model_differs(recorded: &str, running: &str) -> bool {
+    let recorded = recorded.trim();
+    if recorded.is_empty() || running.trim().is_empty() || recorded == running {
+        return false;
+    }
+    !running
+        .strip_suffix(recorded)
+        .is_some_and(|provider| provider.ends_with(':'))
+}
+
 /// Whether the agent can be built from `config`, judged by the same provider
 /// factory and argument order `Agent::from_config_with_observer` uses
 /// (`src/agent/agent.rs`). Construction only: no request is sent to the
@@ -9431,6 +9770,8 @@ mod tests {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            config_fingerprint: Arc::new(std::sync::Mutex::new(String::new())),
+            model_switch_save_rx: None,
             channel_supervisor: None,
             info_panel: None,
             stream_committed_chars: 0,
@@ -9447,7 +9788,9 @@ mod tests {
             pending_turns: std::collections::VecDeque::new(),
             actor_has_agent: true,
             pending_approval: None,
-            pending_model: None,
+            pending_reload: None,
+            reload_seq: 0,
+            model_picker_entries: None,
         };
         (app, req_rx)
     }
@@ -9465,6 +9808,28 @@ mod tests {
     // thing that changed: the agent kept its launch-time provider/model and
     // every subsequent turn silently ran on the old one.
 
+    /// The reload the app sent to the agent bridge, as `(correlation id, config)`.
+    async fn expect_reload(
+        req_rx: &mut tokio::sync::mpsc::Receiver<TurnRequest>,
+    ) -> (u64, Box<crate::config::Config>) {
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), req_rx.recv())
+            .await
+            .expect("reload sent within 5s")
+            .expect("bridge channel open");
+        match req {
+            TurnRequest::Reload { id, config } => (id, config),
+            other => panic!("expected TurnRequest::Reload, got {other:?}"),
+        }
+    }
+
+    /// Whether a second reload is queued: the watcher must not push one for the
+    /// bytes a `/model` switch just wrote.
+    async fn no_second_reload(req_rx: &mut tokio::sync::mpsc::Receiver<TurnRequest>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(200), req_rx.recv())
+            .await
+            .is_err()
+    }
+
     #[tokio::test]
     async fn model_selection_persists_config_and_reloads_the_agent() {
         let tmp = tempfile::TempDir::new().expect("tmp");
@@ -9472,33 +9837,51 @@ mod tests {
             SessionStore::in_memory().expect("store"),
             "anthropic:old-model",
         );
-        app.config.config_path = tmp.path().join("config.toml");
+        let path = tmp.path().join("config.toml");
+        app.config.config_path = path.clone();
         app.config.workspace_dir = tmp.path().to_path_buf();
 
-        app.apply_model_selection("openrouter:meta/llama-4-scout");
+        app.apply_model_selection(Some("openrouter"), "meta/llama-4-scout");
 
         // The status bar does not change until the actor reports the new agent
         // is in place (`ReloadComplete`): until then the agent still runs the
         // old model, and the label must keep saying so.
         assert_eq!(app.context.model, "anthropic:old-model");
 
-        // The reload carries the new pair. Save happens before the send in
-        // the same task, so once this arrives the file must exist too.
-        let req = tokio::time::timeout(std::time::Duration::from_secs(5), req_rx.recv())
-            .await
-            .expect("reload sent within 5s")
-            .expect("bridge channel open");
-        let TurnRequest::Reload(config) = req else {
-            panic!("expected TurnRequest::Reload");
-        };
+        // The reload carries the new pair. Nothing is on disk yet: a switch that
+        // could not be built must not be left behind for the next launch.
+        let (id, config) = expect_reload(&mut req_rx).await;
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
         assert_eq!(config.default_model.as_deref(), Some("meta/llama-4-scout"));
+        assert!(!path.exists(), "the file waits for the rebuild");
 
-        let raw = std::fs::read_to_string(tmp.path().join("config.toml"))
-            .expect("config persisted to disk");
+        // The agent is in place: the label names the switch and the config that
+        // was built from it is now what `self.config` and the file hold.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(app.context.model, "openrouter:meta/llama-4-scout");
+        assert_eq!(
+            app.config.default_model.as_deref(),
+            Some("meta/llama-4-scout")
+        );
+
+        let mut saved = String::new();
+        for _ in 0..100 {
+            if path.exists() {
+                saved = std::fs::read_to_string(&path).expect("config persisted to disk");
+                if saved.contains("meta/llama-4-scout") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(
-            raw.contains("meta/llama-4-scout"),
-            "saved config names the new model"
+            saved.contains("meta/llama-4-scout"),
+            "the config an agent was built from is the one on disk"
         );
     }
 
@@ -9518,7 +9901,7 @@ mod tests {
         app.config.default_provider = Some("openai".to_string());
         app.config.default_model = Some("old-model".to_string());
 
-        app.apply_model_selection("nosuch:xyz");
+        app.apply_model_selection(Some("nosuch"), "xyz");
 
         assert_eq!(
             app.context.model, "openai:old-model",
@@ -9551,11 +9934,12 @@ mod tests {
     }
 
     /// The status bar follows the agent: it moves only when the reload that a
-    /// `/model` switch triggered reports the new agent in place.
+    /// `/model` switch triggered reports the new agent in place, and then it
+    /// reads `provider:model` — the boot label — even for a bare `/model name`.
     #[tokio::test]
     async fn status_bar_adopts_the_model_only_when_the_reload_completes() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        let (mut app, _req_rx) = make_app_with_bridge_from_store(
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
             SessionStore::in_memory().expect("store"),
             "openai:old-model",
         );
@@ -9564,46 +9948,84 @@ mod tests {
         app.config.default_provider = Some("openai".to_string());
         app.config.api_key = Some("sk-test-placeholder".to_string());
 
-        app.apply_model_selection("openai:new-model");
+        app.apply_model_selection(None, "new-model");
+        let (id, _config) = expect_reload(&mut req_rx).await;
         assert_eq!(app.context.model, "openai:old-model", "not yet in place");
 
         app.handle_agent_event(AgentEvent::ReloadComplete {
+            id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(
+            app.context.model, "openai:new-model",
+            "a bare /model name is labelled like the boot label"
+        );
+        assert!(
+            app.pending_reload.is_none(),
+            "the pending switch is consumed"
+        );
+    }
+
+    /// A skill toggle sends its own reload, and the actor answers reloads in
+    /// the order they arrive. When that reload completes while a `/model`
+    /// switch is still in flight, the switch's outcome is the only one that
+    /// moves the label — the skill rebuild changed no model.
+    #[tokio::test]
+    async fn an_unrelated_reload_completing_mid_switch_leaves_the_label_to_the_switch() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (switch_id, _config) = expect_reload(&mut req_rx).await;
+        // The next id the app stamps is the skill toggle's reload.
+        let skill_reload_id = switch_id + 1;
+
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: skill_reload_id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(
+            app.context.model, "openai:old-model",
+            "a skill rebuild does not name a model the agent does not run yet"
+        );
+        assert!(
+            app.pending_reload.is_some(),
+            "the switch is still waiting for its own outcome"
+        );
+
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: switch_id,
             mcp_servers_configured: vec![],
             mcp_tools_by_server: std::collections::HashMap::new(),
             security: None,
         });
         assert_eq!(app.context.model, "openai:new-model");
-        assert!(
-            app.pending_model.is_none(),
-            "the pending switch is consumed"
-        );
+        let said: Vec<&str> = app
+            .scrollback_queue
+            .iter()
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert_eq!(said.len(), 1, "the switch is announced once: {said:?}");
     }
 
-    /// A reload from another path (wizard save, external edit, skill toggle)
-    /// completes with no `/model` switch pending: the status bar must not move.
+    /// A reload from another path that FAILS — a skill toggle whose rebuild    /// cannot run, an `/autonomy` preset that cannot apply — is not a `/model`
+    /// switch: it must not claim the model was not changed, and it must not
+    /// drop the switch that is still waiting on its own outcome.
     #[tokio::test]
-    async fn unrelated_reload_leaves_the_status_bar_alone() {
-        let (mut app, _req_rx) = make_app_with_bridge_from_store(
-            SessionStore::in_memory().expect("store"),
-            "openai:current",
-        );
-        assert!(app.pending_model.is_none());
-
-        app.handle_agent_event(AgentEvent::ReloadComplete {
-            mcp_servers_configured: vec![],
-            mcp_tools_by_server: std::collections::HashMap::new(),
-            security: None,
-        });
-
-        assert_eq!(app.context.model, "openai:current");
-    }
-
-    /// A rebuild that fails leaves the previous agent running, so the status bar
-    /// keeps its model, and the error reaches the chat.
-    #[tokio::test]
-    async fn failed_rebuild_keeps_the_status_bar_and_says_why() {
+    async fn a_failed_unrelated_reload_does_not_drop_the_pending_switch() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        let (mut app, _req_rx) = make_app_with_bridge_from_store(
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
             SessionStore::in_memory().expect("store"),
             "openai:old-model",
         );
@@ -9612,17 +10034,438 @@ mod tests {
         app.config.default_provider = Some("openai".to_string());
         app.config.api_key = Some("sk-test-placeholder".to_string());
 
-        app.apply_model_selection("openai:new-model");
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (id, _config) = expect_reload(&mut req_rx).await;
+
+        // Some other reload, sent after the switch, fails first.
         app.handle_agent_event(AgentEvent::ReloadFailed {
-            error: "boom".to_string(),
+            id: id + 1,
+            error: "the skill list could not be rebuilt".to_string(),
         });
 
-        assert_eq!(app.context.model, "openai:old-model");
-        assert!(app.pending_model.is_none());
-        let err = app.context.last_error.as_deref().unwrap_or_default();
+        let said = app
+            .scrollback_queue
+            .last()
+            .map(|(_, m)| m.as_str())
+            .unwrap_or_default();
         assert!(
-            err.contains("boom"),
-            "the chat error names the cause: {err}"
+            !said.contains("Model not changed"),
+            "a reload that changed no model must not claim it did: {said}"
+        );
+        assert!(said.contains("skill list could not be rebuilt"), "{said}");
+        assert!(
+            app.pending_reload.is_some(),
+            "the switch is still waiting on its own rebuild"
+        );
+
+        // The switch's own outcome still lands.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(app.context.model, "openai:new-model");
+    }
+
+    /// An unrelated reload sent AFTER a `/model` switch and completed after it
+    /// carries the switch's model. The actor is FIFO and builds its agent from
+    /// the config a `Reload` hands it, so the reload that lands last is the one
+    /// the next message is answered on: carrying `self.config` as it stands
+    /// would put the agent back on the pre-switch model while the status bar
+    /// and config.toml both named the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrelated_reload_sent_during_a_switch_carries_the_switches_model() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        let path = tmp.path().join("config.toml");
+        app.config.config_path = path;
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (switch_id, _switch_config) = expect_reload(&mut req_rx).await;
+        assert_eq!(
+            app.context.model, "openai:old-model",
+            "the switch has not been rebuilt yet"
+        );
+
+        // `/autonomy` saves and hands its own config to the actor — a reload
+        // the switch did not ask for, sent after it.
+        app.apply_preset_to_config_and_reload(crate::approval::policy_writer::PolicyPreset::Manual)
+            .expect("preset applied and saved");
+        let (other_id, other_config) = expect_reload(&mut req_rx).await;
+        assert_eq!(
+            other_id,
+            switch_id + 1,
+            "sent after the switch, so it is the reload that lands last"
+        );
+        assert_eq!(
+            other_config.default_model.as_deref(),
+            Some("new-model"),
+            "the last reload to land decides what the agent answers with, so it carries the \
+             model the switch is waiting to put in place"
+        );
+
+        // Both rebuilds land, the switch's first — the actor is FIFO, so the
+        // agent at rest is built from the unrelated reload's config.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: switch_id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: other_id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+
+        assert_eq!(app.context.model, "openai:new-model");
+        assert_eq!(
+            (
+                app.config.default_provider.as_deref(),
+                app.config.default_model.as_deref(),
+            ),
+            (Some("openai"), Some("new-model")),
+            "the config the agent answers with at rest names the model the label does"
+        );
+        assert_eq!(
+            app.config.autonomy.always_ask,
+            vec!["*".to_string()],
+            "the unrelated reload's own change survives the switch adopting its model"
+        );
+    }
+
+    /// A config-watcher reload that lands while a `/model` switch is in flight
+    /// — what an operator's hand edit of config.toml becomes — keeps the switch
+    /// instead of superseding it. The edit reaches the agent, the switch's model
+    /// rides on the edit's own rebuild, and the switch's own outcome still
+    /// adopts it, so label, agent and file agree once everything settles.
+    #[tokio::test]
+    async fn a_hand_edit_during_a_switch_keeps_the_switch_and_its_model() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let path = root.join("config.toml");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        // `reload_config` reads the profile's config.toml, so the hand edit, the
+        // switch's save and the reload must all be looking at this one file.
+        app.config.config_path = path.clone();
+        app.config.workspace_dir = root.clone();
+        app.profile.root = root.clone();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+        app.config.save().await.expect("baseline config written");
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (switch_id, _switch_config) = expect_reload(&mut req_rx).await;
+
+        // The operator edits the file while that rebuild is still in flight.
+        // The edit touches something other than the model, so it competes with
+        // the switch for nothing except the reload slot.
+        let mut edited = app.config.clone();
+        edited.default_temperature = 0.25;
+        edited.save().await.expect("hand edit written");
+        app.reload_config().expect("the edit reloads");
+        let (edit_id, edit_config) = expect_reload(&mut req_rx).await;
+
+        assert_eq!(edit_id, switch_id + 1, "sent after the switch");
+        assert_eq!(
+            edit_config.default_temperature, 0.25,
+            "the edit reaches the agent"
+        );
+        assert_eq!(
+            edit_config.default_model.as_deref(),
+            Some("new-model"),
+            "the file still names the pre-switch model, so this rebuild must carry the \
+             switch's — otherwise the agent goes back to a model the label has not named"
+        );
+        assert_eq!(
+            app.pending_reload.as_ref().map(|p| p.id),
+            Some(switch_id),
+            "the switch keeps the pending slot instead of being dropped by the watcher tick"
+        );
+        assert!(
+            app.pending_reload
+                .as_ref()
+                .is_some_and(|p| p.unsaved_config.is_some()),
+            "the dropped part of a switch is the config it has not written yet"
+        );
+        assert_eq!(
+            app.context.model, "openai:old-model",
+            "the label has not moved: no agent has reported the new one yet"
+        );
+
+        // Both rebuilds land, the switch's first.
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: switch_id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: edit_id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+
+        assert_eq!(app.context.model, "openai:new-model");
+        assert_eq!(
+            (
+                app.config.default_model.as_deref(),
+                app.config.default_temperature,
+            ),
+            (Some("new-model"), 0.25),
+            "the config the agent answers with at rest carries both the switch's model and the edit"
+        );
+
+        // The file lands on the same pair: the switch's save is the last writer.
+        let mut on_disk = String::new();
+        for _ in 0..150 {
+            on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+            if on_disk.contains("new-model") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            on_disk.contains("new-model"),
+            "the file names the new model"
+        );
+        assert!(on_disk.contains("0.25"), "the edit survived the save");
+    }
+
+    /// A `/model` switch whose rebuild fails changes nothing. The status bar
+    /// keeps naming the model the agent still runs, `self.config` and the file
+    /// on disk keep the pair they had, and the operator reads one line.
+    #[tokio::test]
+    async fn failed_model_switch_leaves_the_label_the_config_and_the_file_alone() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        let path = tmp.path().join("config.toml");
+        app.config.config_path = path.clone();
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+        app.config.save().await.expect("baseline config written");
+        let before = std::fs::read(&path).expect("baseline bytes");
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (id, config) = expect_reload(&mut req_rx).await;
+        assert_eq!(config.default_model.as_deref(), Some("new-model"));
+        app.handle_agent_event(AgentEvent::ReloadFailed {
+            id,
+            error: "the new provider refused to build".to_string(),
+        });
+
+        assert_eq!(
+            app.context.model, "openai:old-model",
+            "the label keeps naming the model the agent runs"
+        );
+        assert_eq!(
+            app.config.default_model.as_deref(),
+            Some("old-model"),
+            "the in-memory config keeps the pair it had"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("config still there"),
+            before,
+            "a switch that could not be built is never written to disk"
+        );
+        let said: Vec<&str> = app
+            .scrollback_queue
+            .iter()
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert_eq!(said.len(), 1, "the refusal is said once: {said:?}");
+        assert!(
+            said[0].contains("Model not changed") && said[0].contains("refused to build"),
+            "the line says the model was not changed and why: {said:?}"
+        );
+    }
+
+    /// The switch's save runs off-thread, so "Model set to" is said before the
+    /// write is known to have landed. A write that fails is said too: the agent
+    /// really is on the new model, but config.toml is stale, and an operator told
+    /// only the first thing will read a file that disagrees with the status bar.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_whose_save_fails_says_so_and_keeps_the_session_switch() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        // A directory where the file goes: `atomic_write_config` writes its temp
+        // file and then cannot replace a directory with it, so the save fails the
+        // way an unwritable path would.
+        let path = tmp.path().join("config.toml");
+        std::fs::create_dir(&path).expect("the config path is a directory");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = path;
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (id, _config) = expect_reload(&mut req_rx).await;
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(app.context.model, "openai:new-model");
+
+        // The save task reports through the app's drain, as the render loop runs it.
+        let mut failures: Vec<String> = Vec::new();
+        for _ in 0..150 {
+            app.drain_events();
+            failures = app
+                .scrollback_queue
+                .iter()
+                .map(|(_, m)| m.clone())
+                .filter(|m| m.contains("config.toml"))
+                .collect();
+            if !failures.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            failures.len(),
+            1,
+            "one line says the save did not land: {failures:?}"
+        );
+        assert!(
+            failures[0].contains("openai:new-model") && failures[0].contains("this session"),
+            "the line says the switch stands for this session: {:?}",
+            failures[0]
+        );
+        assert!(
+            app.context
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("config.toml")),
+            "the failure is on the error surface too: {:?}",
+            app.context.last_error
+        );
+        assert_eq!(
+            app.context.model, "openai:new-model",
+            "an agent really is running that model, so the label keeps it"
+        );
+    }
+
+    /// The switch's own save trips the config watcher. With a REAL watcher
+    /// running, that tick must not push a second rebuild of the config the
+    /// switch just rebuilt from: one rebuild, one line, and a label that does
+    /// not move. A later edit that really changes the file must still reload —
+    /// otherwise "no second reload" would only mean the watcher was dead.
+    #[tokio::test]
+    async fn the_models_own_save_does_not_start_a_second_rebuild() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let path = root.join("config.toml");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = path.clone();
+        app.config.workspace_dir = root.clone();
+        // `reload_config` reads the profile's config.toml, so the watcher, the
+        // save and the reload must all be looking at this one file.
+        app.profile.root = root.clone();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+        app.config.save().await.expect("baseline config written");
+        app.config_watcher = Some(
+            crate::config::watcher::ConfigWatcher::watch(&path).expect("watcher on the tempdir"),
+        );
+
+        app.apply_model_selection(Some("openai"), "new-model");
+        let (id, _config) = expect_reload(&mut req_rx).await;
+        app.handle_agent_event(AgentEvent::ReloadComplete {
+            id,
+            mcp_servers_configured: vec![],
+            mcp_tools_by_server: std::collections::HashMap::new(),
+            security: None,
+        });
+        assert_eq!(app.context.model, "openai:new-model");
+
+        // Let the save land and its debounced tick arrive (the watcher debounces
+        // for 500 ms of real time), draining the tick as the frame loop does.
+        let mut on_disk = String::new();
+        for _ in 0..150 {
+            on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+            app.drain_config_reload_events();
+            if on_disk.contains("new-model") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            on_disk.contains("new-model"),
+            "the switch is saved once the agent runs it"
+        );
+        for _ in 0..150 {
+            app.drain_config_reload_events();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            no_second_reload(&mut req_rx).await,
+            "the switch's own save must not push a second rebuild"
+        );
+        assert_eq!(
+            app.context.model, "openai:new-model",
+            "the watcher tick does not move the label"
+        );
+        let said: Vec<&str> = app
+            .scrollback_queue
+            .iter()
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert_eq!(said.len(), 1, "the switch is announced once: {said:?}");
+
+        // The watcher is live: an edit that really changes the file reloads.
+        let mut edited = app.config.clone();
+        edited.default_model = Some("edited-model".to_string());
+        edited.save().await.expect("external edit written");
+        let mut reloaded: Option<Box<crate::config::Config>> = None;
+        for _ in 0..150 {
+            app.drain_config_reload_events();
+            match tokio::time::timeout(std::time::Duration::from_millis(5), req_rx.recv()).await {
+                Ok(Some(TurnRequest::Reload { id, config })) => {
+                    assert_ne!(id, 1, "this is the edit's own reload");
+                    reloaded = Some(config);
+                    break;
+                }
+                // No rebuild yet, or nothing on the channel this tick.
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => panic!("bridge channel closed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let reloaded = reloaded.expect("a real edit still reloads the agent");
+        assert_eq!(reloaded.default_model.as_deref(), Some("edited-model"));
+        assert_eq!(
+            app.context.model, "openai:new-model",
+            "an edit that triggered a rebuild does not name the model before the agent runs it"
         );
     }
 
@@ -9640,20 +10483,14 @@ mod tests {
         app.config.default_provider = Some(url.to_string());
         app.config.default_model = Some("llama-a".to_string());
 
-        app.apply_model_selection(&format!("{url}:llama-b"));
+        app.apply_model_selection(Some(url), "llama-b");
 
         assert!(
             app.context.last_error.is_none(),
             "the build check accepts the endpoint: {:?}",
             app.context.last_error
         );
-        let req = tokio::time::timeout(std::time::Duration::from_secs(5), req_rx.recv())
-            .await
-            .expect("reload sent within 5s")
-            .expect("bridge channel open");
-        let TurnRequest::Reload(config) = req else {
-            panic!("expected TurnRequest::Reload");
-        };
+        let (_id, config) = expect_reload(&mut req_rx).await;
         assert_eq!(config.default_provider.as_deref(), Some(url));
         assert_eq!(config.default_model.as_deref(), Some("llama-b"));
     }
@@ -9671,17 +10508,76 @@ mod tests {
         // A build needs a credential: an operator switching to anthropic has one.
         app.config.api_key = Some("sk-ant-test-placeholder".to_string());
 
-        app.apply_model_selection("claude-opus-5");
+        app.apply_model_selection(None, "claude-opus-5");
 
-        let req = tokio::time::timeout(std::time::Duration::from_secs(5), req_rx.recv())
-            .await
-            .expect("reload sent within 5s")
-            .expect("bridge channel open");
-        let TurnRequest::Reload(config) = req else {
-            panic!("expected TurnRequest::Reload");
-        };
+        let (_id, config) = expect_reload(&mut req_rx).await;
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
         assert_eq!(config.default_model.as_deref(), Some("claude-opus-5"));
+    }
+
+    /// A picker row reaches the switch as two values, so an endpoint whose name
+    /// holds a colon and a model id that holds a slash both survive. Joined
+    /// into one string they came back mangled: the `Qwen/` id split inside
+    /// itself, and the portless endpoint split at its own last colon.
+    #[tokio::test]
+    async fn a_picker_row_keeps_the_whole_endpoint_and_a_model_id_with_a_slash() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("state")).expect("workspace state dir");
+        let endpoint = "custom:http://h:8000/v1";
+        let portless = "custom:http://localhost:11434";
+        std::fs::write(
+            workspace.join("state").join("models_cache.json"),
+            serde_json::json!({
+                "entries": [
+                    { "provider": endpoint, "fetched_at_unix": 4_102_444_800_u64,
+                      "models": ["Qwen/Qwen2.5-7B"] },
+                    { "provider": portless, "fetched_at_unix": 4_102_444_800_u64,
+                      "models": ["llama3"] },
+                ]
+            })
+            .to_string(),
+        )
+        .expect("models cache");
+
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.api_key = Some("sk-test-placeholder".to_string());
+        app.context.available_providers = vec![endpoint.to_string(), portless.to_string()];
+        app.context.workspace_dir = Some(workspace);
+
+        // Row 0: the endpoint with a path, whose model id holds a `/`.
+        app.handle_command("model")
+            .await
+            .expect("/model opens the picker");
+        app.list_picker.as_mut().expect("picker open").selected = 0;
+        app.dispatch_list_picker_selection().await;
+        let (_id, config) = expect_reload(&mut req_rx).await;
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some(endpoint),
+            "the whole endpoint is the provider"
+        );
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("Qwen/Qwen2.5-7B"),
+            "a model id that holds a slash is not split inside itself"
+        );
+
+        // Row 1: an endpoint with no path at all.
+        app.handle_command("model")
+            .await
+            .expect("/model opens the picker");
+        app.list_picker.as_mut().expect("picker open").selected = 1;
+        app.dispatch_list_picker_selection().await;
+        let (_id, config) = expect_reload(&mut req_rx).await;
+        assert_eq!(config.default_provider.as_deref(), Some(portless));
+        assert_eq!(config.default_model.as_deref(), Some("llama3"));
     }
 
     #[test]
@@ -10305,7 +11201,7 @@ mod submit_tests {
                 assert_eq!(conversation_id, Some(format!("tui:{sid}")));
             }
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
-            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
+            TurnRequest::Reload { .. } => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
             TurnRequest::SetHistory(_) => panic!("expected Submit, got SetHistory"),
         }
@@ -10363,7 +11259,7 @@ mod submit_tests {
         match req {
             TurnRequest::Submit { text, .. } => assert_eq!(text, "queued"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
-            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
+            TurnRequest::Reload { .. } => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
             TurnRequest::SetHistory(_) => panic!("expected Submit, got SetHistory"),
         }
@@ -10871,7 +11767,7 @@ mod retry_tests {
         match req {
             TurnRequest::Submit { text, .. } => assert_eq!(text, "previous prompt"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
-            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
+            TurnRequest::Reload { .. } => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
             TurnRequest::SetHistory(_) => panic!("expected Submit, got SetHistory"),
         }
@@ -10948,7 +11844,17 @@ mod session_history_tests {
 
     /// Stores `pairs` as one session in `store`, returning its id.
     fn store_session(store: &SessionStore, pairs: &[(&str, &str)]) -> String {
-        let session = store.new_session("mock-model", "tui").expect("session");
+        store_session_with_model(store, "mock-model", pairs)
+    }
+
+    /// As [`store_session`], under a recorded `model`: the label the status bar
+    /// held when that session opened.
+    fn store_session_with_model(
+        store: &SessionStore,
+        model: &str,
+        pairs: &[(&str, &str)],
+    ) -> String {
+        let session = store.new_session(model, "tui").expect("session");
         for (role, content) in pairs {
             store
                 .append_message(&Message {
@@ -11633,6 +12539,99 @@ mod session_history_tests {
         assert!(
             app.context.token_usage.is_none(),
             "a picked session starts unreported, not with the previous total"
+        );
+    }
+
+    /// Picking a session changes the history, not the agent, so the status bar
+    /// keeps naming the model that answers the next message. A session opened
+    /// under another model says so once, and says where to change it.
+    #[tokio::test]
+    async fn picking_a_session_from_another_model_notes_it_and_leaves_the_label_alone() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        let session = store_session_with_model(
+            &app.context.session_store,
+            "openrouter:other-model",
+            &[("user", "a question"), ("assistant", "an answer")],
+        );
+        app.state = AppState::Ready;
+
+        pick_session(&mut app, &session).await;
+
+        assert_eq!(
+            app.context.model, "mock-model",
+            "the label still names the model the running agent answers with"
+        );
+        let notes: Vec<&str> = app
+            .context
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("openrouter:other-model"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(notes.len(), 1, "one note, once: {notes:?}");
+        assert!(
+            notes[0].contains("/model"),
+            "the note points at the command that changes it: {:?}",
+            notes[0]
+        );
+    }
+
+    /// A session that names no other model says nothing about one: neither a
+    /// row that recorded none, nor one recorded against a status bar that names
+    /// no model. The note the second shape would draw reads "the agent still
+    /// runs ." — an empty label in the middle of a sentence.
+    #[tokio::test]
+    async fn picking_a_session_with_no_model_recorded_says_nothing_about_the_model() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        let session =
+            store_session_with_model(&app.context.session_store, "", &[("user", "a question")]);
+        app.state = AppState::Ready;
+
+        pick_session(&mut app, &session).await;
+
+        assert_eq!(
+            app.context.model, "mock-model",
+            "the label still names the model the running agent answers with"
+        );
+        let about_models: Vec<&str> = app
+            .context
+            .messages
+            .iter()
+            .filter(|m| m.content.to_lowercase().contains("model"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            about_models.is_empty(),
+            "there is no other model to name: {about_models:?}"
+        );
+
+        // The mirror: a row that DID record a model, picked while the status
+        // bar names none. There is still no running model to contrast it with.
+        let recorded = store_session_with_model(
+            &app.context.session_store,
+            "openai:other-model",
+            &[("user", "another question")],
+        );
+        app.context.model = String::new();
+
+        pick_session(&mut app, &recorded).await;
+
+        assert!(
+            app.context.model.is_empty(),
+            "the label is left alone whatever the row recorded"
+        );
+        let about_models: Vec<&str> = app
+            .context
+            .messages
+            .iter()
+            .filter(|m| m.content.to_lowercase().contains("model"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            about_models.is_empty(),
+            "an empty running label is not a model to name: {about_models:?}"
         );
     }
 
@@ -12333,6 +13332,7 @@ mod session_history_tests {
 
         // (2) `/model` heals the session: the actor holds an agent again.
         app.handle_agent_event(AgentEvent::ReloadComplete {
+            id: 0,
             mcp_servers_configured: vec![],
             mcp_tools_by_server: std::collections::HashMap::new(),
             security: None,

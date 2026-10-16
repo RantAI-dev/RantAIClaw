@@ -83,9 +83,27 @@ impl TuiProvisioner for LoginProvisioner {
         )
         .await?;
         let selection = recv_selection(&mut responses).await?;
-        // Only an explicit "Enable" (row 0) continues; an empty answer takes the
-        // disable branch, as the sibling surfaces route empty to their off arm.
-        if selection.first().copied() != Some(0) {
+        // An empty answer picks no row, so it decides nothing. Console login is
+        // the exposure boundary in front of the console and this TUI, and the
+        // operator never answered about it: clearing a stored credential on an
+        // unanswered prompt is not this step's call. Abort as the sibling
+        // single-select write sites do, which also leaves the config
+        // unwritten (an `Aborted` outcome is not persisted).
+        let Some(&answer) = selection.first() else {
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "Console login was not answered, so nothing was changed.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "console login was not answered, so nothing was changed".to_string(),
+            ));
+        };
+        // Only an explicit "Enable" (row 0) continues; the explicit
+        // "Skip / disable" row turns the gate off.
+        if answer != 0 {
             // Disable: clear any stored credential so the gate turns off, and
             // drop the auto-lock window with it — it is meaningless with no
             // credential to unlock.
@@ -239,10 +257,13 @@ async fn leave_disabled(
 mod tests {
     use super::*;
 
-    /// An empty answer at "Enable console login?" must not enable the gate or
-    /// ask for credentials. A stored credential stays cleared.
+    /// An empty answer at "Enable console login?" answers nothing, so this
+    /// step must not decide: the console login is an exposure boundary, and an
+    /// operator who never picked a row has not asked for it to be turned off.
+    /// The provisioner aborts without asking for credentials, and the stored
+    /// credential is exactly as it was.
     #[tokio::test]
-    async fn empty_enable_answer_leaves_console_login_disabled() {
+    async fn empty_enable_answer_aborts_and_leaves_console_login_as_it_was() {
         use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
         let tmp = tempfile::tempdir().expect("temp dir");
         let profile = scratch_profile(tmp.path());
@@ -267,6 +288,44 @@ mod tests {
             !asked_for_credentials,
             "an empty enable answer must not reach the credential prompts"
         );
+        assert!(
+            t.aborted(),
+            "an unanswered gate is an abort, not a decision: {:?}",
+            t.outcome
+        );
+        assert_eq!(
+            config.gateway.login.username.as_deref(),
+            Some("stale-op"),
+            "the stored operator is not cleared"
+        );
+        assert_eq!(
+            config.gateway.login.password_hash.as_deref(),
+            Some("stale-hash"),
+            "the stored password hash is not cleared"
+        );
+        assert_eq!(config.gateway.login.idle_timeout_secs, 900);
+    }
+
+    /// An explicit "Skip / disable" still turns the gate off: it is an answer.
+    #[tokio::test]
+    async fn an_explicit_skip_answer_leaves_console_login_disabled() {
+        use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.gateway.login.username = Some("stale-op".into());
+        config.gateway.login.password_hash = Some("stale-hash".into());
+        config.gateway.login.idle_timeout_secs = 900;
+
+        let t = drive(
+            &LoginProvisioner,
+            &mut config,
+            &profile,
+            vec![Answer::Pick(1)],
+        )
+        .await;
+
         assert!(
             t.configured(),
             "the disable branch completes: {:?}",
