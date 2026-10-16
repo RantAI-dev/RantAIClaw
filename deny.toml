@@ -32,6 +32,24 @@ ignore = [
     # replacement. REMOVE once a rand 0.10.x release depends on a non-yanked
     # chacha20 and the lockfile picks it up (or 0.10.0 is un-yanked).
     "chacha20@0.10.0",
+    # zip 8.6.0 was YANKED upstream together with EVERY 7.x/8.x release
+    # (checked 2026-10-16; only 9.0.3 remains, and that is a major bump).
+    # Reached via calamine 0.36.1 and docx-rs 0.4.22 (opt-in `kb-office`),
+    # which pin zip ^8.6, so no in-range non-yanked release exists.
+    # crates.io bytes are immutable, so the yanked version is byte-identical to
+    # when it was published.
+    #
+    # A crate spec here suppresses ONLY the yanked status. Verified on
+    # cargo-deny 0.20.2 with a synthetic zip 8.6.0 advisory injected into the
+    # local advisory db: with this entry present that advisory still errors,
+    # so advisories are NOT suppressed (they are matched by RUSTSEC id, which
+    # this entry does not list). The one real advisory naming zip,
+    # RUSTSEC-2025-0168 / CVE-2025-29787, is patched in >= 2.3.0 and so does
+    # not affect 8.6.0.
+    #
+    # REMOVE once calamine and docx-rs both accept zip 9 and the lockfile picks
+    # it up (or 8.6.0 is un-yanked).
+    { crate = "zip@8.6.0", reason = "no in-range non-yanked zip exists: yanked with every 7.x/8.x release (checked 2026-10-16, only 9.0.3 remains); calamine 0.36.1 and docx-rs 0.4.22 pin ^8.6; no advisory affects this version; remove once both accept zip 9" },
     # bitmaps v3.2.1 — unsound `Bitmap::try_from(&[u8])`, no patched version.
     # Reached only through the opt-in `channel-matrix` feature via matrix-sdk 0.18
     # → imbl 6.1.0 → bitmaps (verified: `cargo tree -i bitmaps` with default
