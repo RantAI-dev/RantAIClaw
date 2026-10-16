@@ -1313,7 +1313,11 @@ fn is_private_host(host: &str) -> bool {
         return true;
     }
 
-    // Parse as IP address to catch all representations (decimal, hex, octal, mapped)
+    // Parse as IP — `str::parse::<IpAddr>` only accepts the canonical forms
+    // (dotted-quad IPv4, IPv6, and IPv4-mapped IPv6). Numeric spellings that
+    // the WHATWG URL parser reads as an IPv4 address (`2130706433`,
+    // `0x7f000001`, `127.1`, `0177.0.0.1`) are handled by `parse_numeric_ipv4`
+    // below.
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
@@ -1321,7 +1325,67 @@ fn is_private_host(host: &str) -> bool {
         };
     }
 
+    // Numeric IPv4 spellings (`127.1`, `2130706433`, `0x7f000001`, `0177.0.0.1`)
+    // that browsers and the OS resolver read as an IPv4 address.
+    if let Some(v4) = parse_numeric_ipv4(bare) {
+        return is_non_global_v4(v4);
+    }
+
     false
+}
+
+/// Parse a host written as an IPv4 address in any form the WHATWG URL parser
+/// accepts: one to four dot-separated parts, each decimal, hex (`0x`) or octal
+/// (leading `0`). Returns `None` for anything else, including hostnames such as
+/// `08` or `example.com`, so only real numeric addresses are classified as IPs.
+fn parse_numeric_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let numbers = parts
+        .iter()
+        .map(|p| parse_ipv4_number(p))
+        .collect::<Option<Vec<u32>>>()?;
+    let (last, head) = numbers.split_last()?;
+
+    // All but the last part are single bytes; the last fills the remaining bytes.
+    if head.iter().any(|&n| n > 255) {
+        return None;
+    }
+    let tail_limit = 1u64 << (8 * (5 - numbers.len()));
+    if u64::from(*last) >= tail_limit {
+        return None;
+    }
+
+    let mut value = u64::from(*last);
+    for (i, &n) in head.iter().enumerate() {
+        value += u64::from(n) << (8 * (3 - i));
+    }
+    u32::try_from(value).ok().map(std::net::Ipv4Addr::from)
+}
+
+/// One dot-separated part of a WHATWG IPv4 host: `0x` hex, leading-`0` octal, or decimal.
+fn parse_ipv4_number(part: &str) -> Option<u32> {
+    if part.is_empty() {
+        return None;
+    }
+    let (digits, radix) =
+        if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            (hex, 16)
+        } else if part.len() > 1 && part.starts_with('0') {
+            (&part[1..], 8)
+        } else {
+            (part, 10)
+        };
+    if digits.is_empty() {
+        // A bare `0x` is zero in the WHATWG parser.
+        return Some(0);
+    }
+    if !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    u32::from_str_radix(digits, radix).ok()
 }
 
 /// Returns `true` for any IPv4 address that is not globally routable.
@@ -1378,7 +1442,7 @@ fn first_non_global_addr(addrs: &[std::net::SocketAddr]) -> Option<std::net::IpA
 /// is non-global. Literal-IP hosts short-circuit (already classified by
 /// `is_private_host`). A fast rebind race between this lookup and the browser's
 /// own connect remains a residual limitation short of pinning the resolved IP.
-async fn assert_host_resolves_to_public(url: &str) -> anyhow::Result<()> {
+pub(crate) async fn assert_host_resolves_to_public(url: &str) -> anyhow::Result<()> {
     let host = extract_host(url)?;
     let bare = host
         .strip_prefix('[')
@@ -1396,7 +1460,27 @@ async fn assert_host_resolves_to_public(url: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Cannot resolve host '{bare}': {e}"))?
         .collect();
 
-    if let Some(ip) = first_non_global_addr(&addrs) {
+    assert_resolved_addrs_public(url, &addrs)
+}
+
+/// The decision half of the resolution guard: refuse when any address the host
+/// resolved to is non-global. Split out from the lookup so a test can supply the
+/// addresses without DNS.
+pub(crate) fn assert_resolved_addrs_public(
+    url: &str,
+    addrs: &[std::net::SocketAddr],
+) -> anyhow::Result<()> {
+    let host = extract_host(url)?;
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host);
+
+    if addrs.is_empty() {
+        anyhow::bail!("Cannot resolve host '{bare}'");
+    }
+
+    if let Some(ip) = first_non_global_addr(addrs) {
         anyhow::bail!("Blocked: host '{bare}' resolves to a private/local address ({ip})");
     }
 
@@ -1500,6 +1584,56 @@ mod tests {
     }
 
     #[test]
+    fn is_private_host_catches_every_numeric_ipv4_spelling() {
+        // Browsers and getaddrinfo read each of these as 127.0.0.1 / 10.0.0.1.
+        for host in [
+            "127.0.0.1",
+            "127.1",
+            "127.0.1",
+            "2130706433",
+            "0x7f000001",
+            "0x7f.1",
+            "0177.0.0.1",
+            "0177.1",
+            "0x7f.0.0.1",
+            "0xa.0.0.1",
+            "167772161",
+        ] {
+            assert!(is_private_host(host), "{host} must be private");
+        }
+        assert!(!is_private_host("8.8.8.8"));
+        assert!(!is_private_host("134744072")); // 8.8.8.8 in decimal
+    }
+
+    #[test]
+    fn numeric_ipv4_parser_follows_whatwg_and_rejects_hostnames() {
+        assert_eq!(
+            parse_numeric_ipv4("127.1"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            parse_numeric_ipv4("2130706433"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            parse_numeric_ipv4("0x7f000001"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            parse_numeric_ipv4("0177.0.0.1"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        // Leading-zero decimal that is not octal is a hostname label, not an IP.
+        assert_eq!(parse_numeric_ipv4("08"), None);
+        assert_eq!(parse_numeric_ipv4("example.com"), None);
+        assert_eq!(parse_numeric_ipv4("1.2.3.4.5"), None);
+        assert_eq!(parse_numeric_ipv4("256.0.0.1"), None);
+        assert_eq!(parse_numeric_ipv4("4294967296"), None);
+        assert_eq!(parse_numeric_ipv4("1..2"), None);
+        assert_eq!(parse_numeric_ipv4(""), None);
+    }
+
+    #[test]
     fn is_private_host_catches_ipv6() {
         assert!(is_private_host("::1"));
         assert!(is_private_host("[::1]"));
@@ -1548,6 +1682,37 @@ mod tests {
         );
         let public: Vec<std::net::SocketAddr> = vec!["1.1.1.1:443".parse().unwrap()];
         assert!(first_non_global_addr(&public).is_none());
+    }
+
+    #[test]
+    fn resolved_addrs_decision_refuses_any_non_global_address() {
+        let private: Vec<std::net::SocketAddr> = ["93.184.215.14:443", "127.0.0.1:443"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let err = assert_resolved_addrs_public("https://rebind.example/x", &private)
+            .expect_err("a host with one private address must be refused");
+        assert!(
+            err.to_string().contains("private/local") && err.to_string().contains("127.0.0.1"),
+            "unexpected error: {err}"
+        );
+
+        let public: Vec<std::net::SocketAddr> = vec!["93.184.215.14:443".parse().unwrap()];
+        assert_resolved_addrs_public("https://example.com/x", &public)
+            .expect("an all-public resolution must pass");
+    }
+
+    #[test]
+    fn resolved_addrs_decision_refuses_empty_slice() {
+        // Fail closed: an empty resolved-address list means the host did not
+        // resolve to anything, which is the same "Cannot resolve host" outcome
+        // the real lookup path produces.
+        let err = assert_resolved_addrs_public("https://example.com/", &[])
+            .expect_err("an empty resolved-address list must be refused");
+        assert!(
+            err.to_string().contains("Cannot resolve host"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
