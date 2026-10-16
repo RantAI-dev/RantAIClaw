@@ -239,6 +239,10 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/model`
 - `/model <model-id>`
 
+Those four are the channel server's own commands. The interactive chat's `/model` — the picker,
+the saved config and the status-bar label — is a different command, documented under
+[`chat`](#the-model-the-chat-runs-model).
+
 Channel runtime also watches `config.toml` and hot-applies updates to:
 - `default_provider`
 - `default_model`
@@ -545,6 +549,46 @@ Starts the interactive TUI. **This is the default — `rantaiclaw` with no subco
 
 `agent run -m` and `chat -m` both answer one message. `agent` is the headless entry point;
 `chat` is the TUI's, and its `-m` exists so a script can use the same command a human types.
+
+#### The model the chat runs (`/model`)
+
+- `/model` — open the model picker
+- `/model <provider:model>` — switch to a named target
+- `/model <model>` — switch within the provider already in use
+
+The picker offers what `rantaiclaw models list` prints — each enabled provider's whole
+catalog, the cached one when `models refresh` or `doctor models` has written it, the curated
+list otherwise — plus the model in use when its own provider's catalog does not already hold
+it. That is the one list the setup model step reads too, and a `custom:<base-url>` provider
+lists the models cached for that endpoint. `Up`/`Down` navigate, typing narrows the rows,
+`Enter` selects, `Esc` cancels.
+
+**`config.toml` is written only once an agent has actually been rebuilt with the new model.**
+The TUI builds the provider through the same factory the agent uses, and a target that cannot
+run is refused there, before anything is written: `Model not changed: <provider> cannot run
+this model: <reason>`. A target that survives the check is put to the agent as a reload, and
+the status bar, the running config and `default_provider`/`default_model` move together, and
+only when that reload reports the new agent in place. The status bar reads `provider:model`,
+the label the chat boots with. A rebuild that fails leaves all three exactly as they were and
+prints the reason once: `Model not changed: the agent could not be rebuilt: <reason>`. The
+model in `config.toml` is therefore always one an agent was built with, never one merely asked
+for. The write the TUI makes itself is recognised by the config watcher, so a switch does not
+rebuild the same config a second time. If that write then fails, the switch still stands for the
+session — an agent really is running the new model — and the chat says so once, naming the error:
+`⚠ Model set to <provider:model> for this session, but saving config.toml failed: <reason>`.
+
+Picking a session (`/sessions`, `/resume`) changes neither the model in use nor the status
+bar: the agent is not rebuilt, so what answers the next message is still the model the label
+names. A session recorded under another model says so once, after its history is replayed,
+naming that model and pointing at `/model`.
+
+**One limit, and it is the typed form.** A row picked from the list carries its provider and
+its model as two values and is never split back apart, so `Qwen/Qwen2.5-7B` and a base URL
+that is only a host and a port (`custom:http://localhost:11434`) are both read correctly when
+they are picked. A target typed as `/model custom:<url>:<model>` is split as text: the base
+URL has to end in a path (`http://localhost:11434/v1`), and the model id has to hold no `/`.
+Without a path the split lands inside the URL, and a `/` in the model id cuts it. Pick those
+from the list.
 
 ### `auth`
 

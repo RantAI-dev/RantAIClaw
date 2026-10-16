@@ -2042,6 +2042,27 @@ fn build_model_options(model_ids: Vec<String>, source: &str) -> Vec<(String, Str
         .collect()
 }
 
+/// The rows the wizard's model step offers, drawn from the shared list
+/// ([`provider_model_list`]) `/model` and the setup overlay read: the
+/// provider's whole catalog — the cache when it holds models, else the curated
+/// list — in catalog order. The wizard runs before a model is configured, so
+/// there is no active model to append, and a row the curated catalog does not
+/// describe carries no description.
+fn wizard_model_options(workspace_dir: &Path, provider_name: &str) -> Vec<(String, String)> {
+    let curated = curated_models_for_provider(provider_name);
+    provider_model_list(workspace_dir, provider_name, "")
+        .into_iter()
+        .map(|model_id| {
+            let description = curated
+                .iter()
+                .find(|(curated_id, _)| *curated_id == model_id)
+                .map(|(_, description)| description.clone())
+                .unwrap_or_default();
+            (model_id, description)
+        })
+        .collect()
+}
+
 fn print_model_preview(models: &[String]) {
     for model in models.iter().take(MODEL_PREVIEW_LIMIT) {
         println!("  {} {model}", style("-"));
@@ -2928,7 +2949,10 @@ pub(crate) fn setup_provider(
 
     // ── Model selection ──
     let canonical_provider = canonical_provider_name(provider_name);
-    let mut model_options: Vec<(String, String)> = curated_models_for_provider(canonical_provider);
+    // The same rows `/model` and the setup overlay offer. A fetch below may
+    // still replace them with a fresher list.
+    let mut model_options: Vec<(String, String)> =
+        wizard_model_options(workspace_dir, provider_name);
 
     let mut live_options: Option<Vec<(String, String)>> = None;
 
@@ -3026,9 +3050,17 @@ pub(crate) fn setup_provider(
     }
 
     if let Some(live_model_options) = live_options {
+        // The other row is the provider's whole catalog, which the wizard reads
+        // through the shared list: the cached catalog when the cache holds
+        // models, the curated one otherwise. Name that source — calling every
+        // row "curated" read "Curated starter list (400)" over a cache dump.
+        let catalog_label = match provider_model_catalog(workspace_dir, provider_name).source {
+            "cache" => "Cached model list",
+            _ => "Curated model list",
+        };
         let source_options = vec![
             format!("Provider model list ({})", live_model_options.len()),
-            format!("Curated starter list ({})", model_options.len()),
+            format!("{catalog_label} ({})", model_options.len()),
         ];
 
         let source_idx = Select::new()
@@ -3056,7 +3088,12 @@ pub(crate) fn setup_provider(
 
     let model_labels: Vec<String> = model_options
         .iter()
-        .map(|(model_id, label)| format!("{label} — {}", style(model_id).dim()))
+        // A catalog row the curated list does not describe has no description
+        // to lead with; it is offered by its id alone.
+        .map(|(model_id, label)| match label.as_str() {
+            "" => style(model_id).dim().to_string(),
+            label => format!("{label} — {}", style(model_id).dim()),
+        })
         .collect();
 
     let model_idx = Select::new()
@@ -6640,6 +6677,47 @@ mod tests {
         let list = provider_model_list(dir.path(), "openai", "gpt-b");
 
         assert_eq!(list, vec!["gpt-a", "gpt-b"]);
+    }
+
+    /// The legacy wizard's model step reads the shared list too: with a
+    /// populated cache it offers the provider's whole catalog, the same rows
+    /// `/model` and the setup overlay offer — not its own curated list.
+    #[test]
+    fn wizard_model_options_read_the_shared_model_list() {
+        let dir = workspace_with_cached_models("openai", &["gpt-a", "gpt-b"]);
+
+        let rows = wizard_model_options(dir.path(), "openai");
+
+        assert_eq!(
+            rows.into_iter()
+                .map(|(model_id, _)| model_id)
+                .collect::<Vec<_>>(),
+            provider_model_list(dir.path(), "openai", ""),
+            "the wizard offers the same rows as every other surface"
+        );
+    }
+
+    /// With no cache the shared list is the curated catalog, so the wizard
+    /// keeps offering the curated rows, still described as it described them.
+    #[test]
+    fn wizard_model_options_fall_back_to_the_curated_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let rows = wizard_model_options(dir.path(), "openai");
+
+        let curated = curated_models_for_provider("openai");
+        assert_eq!(
+            rows.iter()
+                .map(|(model_id, _)| model_id)
+                .collect::<Vec<_>>(),
+            curated.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            "no cache means the curated catalog, as before"
+        );
+        assert_eq!(
+            rows.first().map(|(_, description)| description.clone()),
+            curated.first().map(|(_, description)| description.clone()),
+            "a curated row keeps its description"
+        );
     }
 
     /// The gateway's catalog is not changed by the shared list: it still

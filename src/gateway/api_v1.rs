@@ -1237,7 +1237,7 @@ async fn agent_chat_stream(
                 }),
                 // Reload failure is TUI-only too: per-request gateway agents
                 // never receive a `Reload`. Kept exhaustive for the compiler.
-                crate::agent::AgentEvent::ReloadFailed { error } => serde_json::json!({
+                crate::agent::AgentEvent::ReloadFailed { error, .. } => serde_json::json!({
                     "type": "reload_failed",
                     "error": error,
                 }),

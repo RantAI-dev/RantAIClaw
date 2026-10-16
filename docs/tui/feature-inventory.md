@@ -107,7 +107,7 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 
 | Command       | Aliases    | Description                                                | Output                         | Args |
 | ------------- | ---------- | ---------------------------------------------------------- | ------------------------------ | ---- |
-| `/model`      |            | Pick or change the active model. Builds the provider first, then saves `default_provider`/`default_model` and reloads the running agent. | **interactive picker** (no args) / scrollback msg (with args) | `[provider:model]` |
+| `/model`      |            | Pick or change the active model. Builds the provider first, then reloads the running agent and saves `default_provider`/`default_model` only once that reload reports the new agent in place. | **interactive picker** (no args) / scrollback msg (with args) | `[provider:model]` |
 | `/usage`      |            | Show token usage for this session: prompt, completion and total tokens summed over every turn. `not reported` until a provider reports usage. Resets on `/new` and on resuming another session. | scrollback                     | none |
 
 `/model <provider:model>` is refused before anything is written. The TUI builds the provider through the
@@ -118,7 +118,17 @@ status bar keeps naming the model the agent runs.
 The status bar moves only when the reload reports the new agent in place. Until then the agent is still
 on the old model, so a `/model` switch that is still loading does not change the label. If the rebuild
 fails, the chat says `Model not changed: the agent could not be rebuilt: <reason>` and the status bar
-keeps the old model.
+keeps the old model — and so does `config.toml`: nothing is written until an agent has actually been
+rebuilt with the new model. The label reads `provider:model`, the spelling the boot label uses, also
+after a bare `/model <name>`.
+
+Picking a session does not move the label: the agent is not rebuilt, so the model in use is unchanged.
+A session recorded under another model says so once, after the replay, naming that model and pointing
+at `/model`.
+
+A row picked from the list is never split back apart, so a model id holding `/` and a `custom:` base
+URL that is only a host and a port are both read correctly. The typed `/model custom:<url>:<model>` is
+split as text: the base URL has to end in a path and the model id has to hold no `/`.
 
 ### Other
 
@@ -152,7 +162,7 @@ keeps the old model.
 | ------------------------- | -------- |
 | Profile selection         | `--profile <name>` CLI flag or `RANTAICLAW_PROFILE` env. The TUI reads the active profile's `config.toml` at launch. |
 | Available providers list  | `default_provider` + any unique providers in `model_routes`, exposed via `ctx.available_providers` and consumed by the model picker. |
-| Status-bar model display  | Reflects `default_provider:default_model` from config (overridden by `--model` flag if given, or by `/model` selection at runtime). A `/model` selection moves it only once the reload reports the new agent in place, so the label always names the model the agent is actually running. |
+| Status-bar model display  | Reflects `default_provider:default_model` from config (overridden by `--model` flag if given, or by `/model` selection at runtime). A `/model` selection moves it only once the reload reports the new agent in place, so the label always names the model the agent is actually running. Picking a session leaves it alone; a session made under another model is named in one note. |
 | Tracing                   | TUI tick logs go to `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log` (avoids alt-screen corruption). |
 
 ---

@@ -27,7 +27,15 @@ pub enum TurnRequest {
     /// config. Used after the first-run wizard or `/setup` saves new
     /// provider/api_key/model so the running session picks up the
     /// new credentials without a `/quit` + relaunch.
-    Reload(Box<crate::config::Config>),
+    ///
+    /// `id` is the sender's correlation id. It is echoed on the
+    /// `ReloadComplete` / `ReloadFailed` this request reports, so a surface
+    /// with several reloads in flight can tell this outcome from the one that
+    /// merely finished first.
+    Reload {
+        id: u64,
+        config: Box<crate::config::Config>,
+    },
     /// Compact older messages into a summary. Streams the summary
     /// through the normal event channel (Chunk / Done), then emits
     /// `AgentEvent::CompactionComplete` so the TUI can replace its
@@ -52,8 +60,9 @@ pub struct TuiAgentActor {
     queue: VecDeque<(String, Option<String>)>,
     current: Option<CancellationToken>,
     /// Reload deferred until the in-flight turn completes — replacing
-    /// `self.agent` mid-turn would invalidate the borrow.
-    pending_reload: Option<Box<crate::config::Config>>,
+    /// `self.agent` mid-turn would invalidate the borrow. The id travels with
+    /// the config so the deferred outcome is reported as this request's.
+    pending_reload: Option<(u64, Box<crate::config::Config>)>,
     /// History replacements that arrived during the turn, applied in order
     /// once it ends; the last one leaves the history.
     pending_history: Vec<Vec<(String, String)>>,
@@ -138,7 +147,7 @@ impl TuiAgentActor {
                     Some(TurnRequest::SetHistory(turns)) => {
                         self.reseed(&turns).await;
                     }
-                    Some(TurnRequest::Reload(config)) => {
+                    Some(TurnRequest::Reload { id, config }) => {
                         match crate::agent::Agent::from_config(&config).await {
                             Ok(mut new_agent) => {
                                 new_agent.set_surface("tui");
@@ -152,6 +161,7 @@ impl TuiAgentActor {
                                 let _ = self
                                     .events_tx
                                     .send(crate::agent::events::AgentEvent::ReloadComplete {
+                                        id,
                                         mcp_servers_configured,
                                         mcp_tools_by_server,
                                         security,
@@ -163,6 +173,7 @@ impl TuiAgentActor {
                                 let _ = self
                                     .events_tx
                                     .send(crate::agent::events::AgentEvent::ReloadFailed {
+                                        id,
                                         error: format!("{e:#}"),
                                     })
                                     .await;
@@ -257,12 +268,12 @@ impl TuiAgentActor {
                                             // holds the agent's history.
                                             self.pending_history.push(turns);
                                         }
-                                        Some(TurnRequest::Reload(config)) => {
+                                        Some(TurnRequest::Reload { id, config }) => {
                                             // Defer until the active turn
                                             // ends — replacing self.agent
                                             // mid-turn would invalidate
                                             // turn_fut's &mut self.agent borrow.
-                                            self.pending_reload = Some(config);
+                                            self.pending_reload = Some((id, config));
                                         }
                                         Some(TurnRequest::Compact { .. }) => {
                                             // Compaction mutates self.agent.history,
@@ -300,7 +311,7 @@ impl TuiAgentActor {
                     }
 
                     // Apply any reload that arrived during the turn.
-                    if let Some(config) = self.pending_reload.take() {
+                    if let Some((id, config)) = self.pending_reload.take() {
                         match crate::agent::Agent::from_config(&config).await {
                             Ok(mut new_agent) => {
                                 new_agent.set_surface("tui");
@@ -317,6 +328,7 @@ impl TuiAgentActor {
                                 let _ = self
                                     .events_tx
                                     .send(crate::agent::events::AgentEvent::ReloadComplete {
+                                        id,
                                         mcp_servers_configured,
                                         mcp_tools_by_server,
                                         security,
@@ -328,6 +340,7 @@ impl TuiAgentActor {
                                 let _ = self
                                     .events_tx
                                     .send(crate::agent::events::AgentEvent::ReloadFailed {
+                                        id,
                                         error: format!("{e:#}"),
                                     })
                                     .await;
@@ -1018,18 +1031,22 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
         req_tx
-            .send(TurnRequest::Reload(Box::new(broken)))
+            .send(TurnRequest::Reload {
+                id: 7,
+                config: Box::new(broken),
+            })
             .await
             .unwrap();
 
         let mut reported = None;
         while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
-            if let AgentEvent::ReloadFailed { error } = ev {
-                reported = Some(error);
+            if let AgentEvent::ReloadFailed { id, error } = ev {
+                reported = Some((id, error));
                 break;
             }
         }
-        let error = reported.expect("the failed rebuild is reported, not only logged");
+        let (id, error) = reported.expect("the failed rebuild is reported, not only logged");
+        assert_eq!(id, 7, "the failure answers the reload that asked for it");
         assert!(
             error.contains("nosuch-provider"),
             "the report names the provider that could not be built: {error}"
@@ -1084,7 +1101,10 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
         req_tx
-            .send(TurnRequest::Reload(Box::new(fixture.config.clone())))
+            .send(TurnRequest::Reload {
+                id: 3,
+                config: Box::new(fixture.config.clone()),
+            })
             .await
             .unwrap();
         while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {

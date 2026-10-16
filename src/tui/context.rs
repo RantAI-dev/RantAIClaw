@@ -1278,7 +1278,7 @@ mod tests {
         match req_rx.try_recv().expect("req received") {
             TurnRequest::Submit { text: s, .. } => assert_eq!(s, "ping"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
-            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
+            TurnRequest::Reload { .. } => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
             TurnRequest::SetHistory(_) => panic!("expected Submit, got SetHistory"),
         }
