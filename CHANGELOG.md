@@ -178,6 +178,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator's section now. The channels and the gateway's chat turns already read it and are unchanged.
 - A session started with `/new` had no title and was listed as `(untitled)`. It now takes the title of its
   first user message, whatever notes come before it, and a title set with `/title` is kept.
+- `browser_open` opened a private or local host written as a numeric IPv4 form (`2130706433`,
+  `0177.0.0.1`, `127.1`) or reached through a DNS name that resolves to a private address, now
+  that `[browser].allowed_domains` defaults to `["*"]`; both browser tools now refuse those in
+  any spelling and by resolved address.
 
 ## [0.33.0-alpha] — 2026-10-08
 

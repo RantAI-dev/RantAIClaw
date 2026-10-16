@@ -1,4 +1,7 @@
-use super::browser::{check_url_host, normalize_allowed_domains};
+use super::browser::{
+    assert_host_resolves_to_public, assert_resolved_addrs_public, check_url_host,
+    normalize_allowed_domains,
+};
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -37,6 +40,28 @@ impl BrowserOpenTool {
         check_url_host(url, &self.allowed_domains)?;
 
         Ok(url.to_string())
+    }
+
+    /// Everything that must hold before Brave is launched: the literal host check,
+    /// then the resolved-address check. Resolution runs through the same helper
+    /// `browser` uses, so a public name that points at a private address is refused.
+    async fn assert_open_allowed(&self, raw_url: &str) -> anyhow::Result<String> {
+        self.assert_open_allowed_with(raw_url, None).await
+    }
+
+    /// `addrs` is the test seam: `Some` supplies the resolved addresses so the
+    /// decision is testable without DNS; `None` performs the real lookup.
+    async fn assert_open_allowed_with(
+        &self,
+        raw_url: &str,
+        addrs: Option<&[std::net::SocketAddr]>,
+    ) -> anyhow::Result<String> {
+        let url = self.validate_url(raw_url)?;
+        match addrs {
+            Some(addrs) => assert_resolved_addrs_public(&url, addrs)?,
+            None => assert_host_resolves_to_public(&url).await?,
+        }
+        Ok(url)
     }
 }
 
@@ -85,7 +110,7 @@ impl Tool for BrowserOpenTool {
             });
         }
 
-        let url = match self.validate_url(url) {
+        let url = match self.assert_open_allowed(url).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
@@ -339,6 +364,56 @@ mod tests {
         assert_eq!(open, browser);
     }
 
+    #[test]
+    fn fresh_default_refuses_every_numeric_ipv4_spelling_in_both_tools() {
+        for url in [
+            "https://127.0.0.1",
+            "https://127.1",
+            "https://2130706433",
+            "https://0x7f000001",
+            "https://0177.0.0.1",
+        ] {
+            let (open, browser) =
+                verdicts(crate::config::BrowserConfig::default().allowed_domains, url);
+            assert!(open.is_err(), "browser_open accepted {url}");
+            assert_eq!(open, browser, "tools disagree on {url}");
+            assert!(
+                open.unwrap_err().starts_with("Blocked local/private host"),
+                "{url} must be refused as local/private"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_check_still_passes_public_hosts() {
+        let tool = test_tool(vec!["*"]);
+        assert!(tool.validate_url("https://example.com").is_ok());
+        assert!(tool.validate_url("https://93.184.215.14").is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_guard_refuses_when_resolved_address_is_private() {
+        let tool = test_tool(vec!["*"]);
+        let private: Vec<std::net::SocketAddr> = vec!["127.0.0.1:443".parse().unwrap()];
+        let err = tool
+            .assert_open_allowed_with("https://rebind.example/x", Some(&private))
+            .await
+            .expect_err("a public name resolving to loopback must be refused")
+            .to_string();
+        assert!(err.contains("private/local"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn open_guard_allows_when_all_resolved_addresses_are_public() {
+        let tool = test_tool(vec!["*"]);
+        let public: Vec<std::net::SocketAddr> = vec!["93.184.215.14:443".parse().unwrap()];
+        let url = tool
+            .assert_open_allowed_with("https://example.com/x", Some(&public))
+            .await
+            .expect("an all-public resolution must pass the guard");
+        assert_eq!(url, "https://example.com/x");
+    }
+
     #[tokio::test]
     async fn execute_blocks_readonly_mode() {
         let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
@@ -361,5 +436,41 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
+    }
+
+    #[tokio::test]
+    async fn open_guard_refuses_a_host_that_cannot_resolve() {
+        // `.invalid` is reserved by RFC 6761 and never resolves, so this
+        // exercises the production `None` arm (real DNS lookup) without
+        // depending on a particular network failure path: with or without
+        // DNS available, the lookup cannot return a public address.
+        let tool = test_tool(vec!["*"]);
+        let err = tool
+            .assert_open_allowed("https://rantaiclaw.invalid/")
+            .await
+            .expect_err(".invalid host must be refused by the resolve guard")
+            .to_string();
+        assert!(
+            err.contains("Cannot resolve host"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_refuses_a_numeric_private_host() {
+        // `2130706433` is `127.0.0.1` in decimal. The literal check must
+        // refuse it BEFORE the resolve guard runs (and well before any
+        // browser is launched), so this test must NOT reach `open_in_brave`.
+        let tool = test_tool(vec!["*"]);
+        let result = tool
+            .execute(json!({"url": "https://2130706433"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "numeric private host must be refused");
+        let err = result.error.expect("refusal must carry an error message");
+        assert!(
+            err.contains("Blocked local/private host"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -336,7 +336,7 @@ Notes:
 
 - Usable-by-default: the wildcard `["*"]` allows any public host. Both tools read the same list.
 - An entry is an exact host (`"docs.example.com"`), a domain (`"example.com"`, which admits `docs.example.com` too) or a `"*.domain"` wildcard.
-- Private and local hosts (loopback, RFC 1918, link-local and the IPv6 equivalents) are refused before the list is read, `"*"` included.
+- Private and local hosts (loopback, RFC 1918, link-local and the IPv6 equivalents) are refused before the list is read, `"*"` included. Both `browser` and `browser_open` refuse them in every numeric IPv4 spelling — decimal, hex `0x`, octal with a leading `0`, and the one-to-four-part forms such as `127.1` — and by the address the host resolves to.
 - A config that already holds `allowed_domains = []` is kept as written. Both tools then refuse every URL until domains are configured.
 
 ### `[browser.computer_use]`
