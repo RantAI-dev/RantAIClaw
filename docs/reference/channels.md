@@ -327,8 +327,12 @@ Telegram, Discord, Lark, WhatsApp Cloud API and WhatsApp Web answer three more k
   comes up in every group rather than only where mentions are required.
 
 Approval replies (`/approve`, `/deny`) and pairing (`/bind`, `/claim`) are handled before any of
-these and behave as before. Slack has no reset command: a new top-level message already starts a new
-conversation.
+these and behave as before. An approval reply that names nothing pending is answered by the
+relay itself when it starts with `/` (any of `/approve`, `/deny`, `/allow`,
+or a slash-prefixed bare verb) or names a request handle, and the reply lists what is still
+answerable in this chat. A reply that is none of those — a slash-less non-handle-shaped token
+(`approve helm`), a bare verb (`ok`, `yes`), or plain chat — stays chat. Slack has no reset
+command: a new top-level message already starts a new conversation.
 
 ## Channel Session Recording
 

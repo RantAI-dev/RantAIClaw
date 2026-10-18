@@ -1986,24 +1986,15 @@ pub(crate) async fn run_message_dispatch_loop(
         // The chat this reply arrived in. Resolution used to consult neither the
         // request id nor the origin the request already carried, so an approval
         // posted into one chat could be answered from another.
-        let approval_reply = approval_relay::try_handle_tool_reply(
+        let approval_reply = approval_relay::try_approval_reply(
             &msg.content,
             ctx.tool_approvals.as_ref(),
+            ctx.security.as_ref(),
             approver,
             &live_owners,
             &msg.channel,
             &msg.reply_target,
-        )
-        .or_else(|| {
-            approval_relay::try_handle_reply(
-                &msg.content,
-                ctx.security.as_ref(),
-                approver,
-                &live_owners,
-                &msg.channel,
-                &msg.reply_target,
-            )
-        });
+        );
         if let Some(reply) = approval_reply {
             if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
                 let ack = msg.reply(reply);

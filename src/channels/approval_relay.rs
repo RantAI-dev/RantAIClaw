@@ -29,8 +29,21 @@
 //!    - **no `--persist`**: a tool approval answers one request, and a trailing
 //!      token makes the whole reply fall through to the agent as ordinary chat
 //!
+//! The loose-name branch (one request answerable here, the token doesn't match
+//! its basename) only fires when the token names the request's *command* —
+//! `kubectl` against `shell` running `kubectl get pods`, never a stray handle
+//! typed for an answered request.
+//!
 //! The prompt omits the leading `/` on channels whose platform intercepts it
 //! (see [`command_prefix`](super::commands::command_prefix)).
+//!
+//! After both layers return `None`, [`try_unmatched_approval_reply`] answers
+//! the reply itself when it is in command form: a leading `/` plus any of the
+//! three approval parsers, or a slash-less reply whose target is handle-shaped
+//! (Slack owners type `approve a5ed3d`). A handle-shaped token that matches no
+//! pending request is therefore answered by the relay — the message names the
+//! token, says nothing pending matches it, and lists what is still answerable
+//! in this chat — instead of being forwarded to the model.
 //!
 //! **Layer B — [`try_handle_reply`]** is a stateless parser called by the
 //! channel dispatch loop before each inbound message is forwarded to the
@@ -58,6 +71,7 @@ use crate::approval::{
 use crate::channels::traits::Channel;
 #[cfg(test)]
 use crate::channels::traits::SendMessage;
+use crate::security::pending::REQUEST_HANDLE_LEN;
 use crate::security::{Decision, PendingApprovals, PendingRequest, SecurityPolicy};
 
 /// Try to interpret `text` as an approval reply. On success returns a
@@ -145,7 +159,7 @@ pub fn try_handle_reply(
             }
             handle_parsed(&parsed, security, &pending)
         }
-        _ => Some(ambiguous_pending_message(&snapshot, "allow")),
+        _ => Some(ambiguous_pending_message(&snapshot, "allow", false)),
     }
 }
 
@@ -549,9 +563,15 @@ fn parse_tool_reply(text: &str) -> Option<ParsedToolReply> {
 /// the shell `/allow` path) fall through to other handlers. The owner-authority
 /// gate mirrors the shell relay: an `approve` is honored only from an authorized
 /// owner; `deny` is honored from anyone (stopping an action is always safe).
+///
+/// `shell_pending` is the Layer B (shell allowlist) registry. Branch 3 reads it
+/// so a token meant for a pending Layer B basename can no longer be claimed by
+/// an unrelated Layer A request. `None` keeps the old behaviour, used by every
+/// test that has nothing Layer B to consider.
 pub fn try_handle_tool_reply(
     text: &str,
     relay: &PendingApprovals,
+    shell_pending: Option<&PendingApprovals>,
     sender: &str,
     owners: &[String],
     channel: &str,
@@ -595,27 +615,48 @@ pub fn try_handle_tool_reply(
                 reply_target,
             ));
         }
-        // Loose name: the token isn't an exact tool basename, but if there's
-        // exactly one request pending IN THIS CHAT, treat it as that one (e.g.
-        // `/approve kubectl` → the single pending `shell` request).
+        // Loose name, narrowed: the token isn't an exact tool basename, but if
+        // exactly one request is answerable IN THIS CHAT and its command's
+        // basename matches the token, treat it as that one (e.g. `/approve
+        // kubectl` → the single pending `shell` request whose `full_command`
+        // starts with `kubectl`). Two reasons it had to narrow:
+        //
+        //  - The token must equal the COMMAND name, not any token: when exactly
+        //    one request was pending, an `approve a5ed3d` typed for an answered
+        //    handle resolved the dead handle's unrelated sibling.
+        //  - No Layer B entry may claim the same basename: with a pending shell
+        //    `brew` allowlist request and an unrelated Layer A request in the
+        //    chat, `approve brew` resolved the wrong layer.
         let here: Vec<&PendingRequest> = pending
             .iter()
             .filter(|r| request_is_answerable_here(r, channel, reply_target))
             .collect();
         if here.len() == 1 {
-            let basename = here[0].basename.clone();
-            return Some(resolve_tool(
-                relay,
-                &basename,
-                parsed.verb,
-                sender,
-                owners,
-                channel,
-                reply_target,
-            ));
+            let command_name = first_command_token(&here[0].full_command);
+            let token_matches = command_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(parsed.tool.as_str()));
+            let layer_b_owns_it = shell_pending.is_some_and(|sp| {
+                sp.list()
+                    .iter()
+                    .any(|r| r.basename.eq_ignore_ascii_case(&parsed.tool))
+            });
+            if token_matches && !layer_b_owns_it {
+                let basename = here[0].basename.clone();
+                return Some(resolve_tool(
+                    relay,
+                    &basename,
+                    parsed.verb,
+                    sender,
+                    owners,
+                    channel,
+                    reply_target,
+                ));
+            }
         }
-        // Token names something not pending and the queue is empty or
-        // ambiguous → not ours (could be a shell reply or plain chat).
+        // Token names something not pending and the queue is empty, ambiguous,
+        // or its command name does not match → not ours (could be a shell reply
+        // or plain chat).
         return None;
     }
 
@@ -643,7 +684,7 @@ pub fn try_handle_tool_reply(
             channel,
             reply_target,
         )),
-        _ => Some(ambiguous_pending_message(&pending, "approve")),
+        _ => Some(ambiguous_pending_message(&pending, "approve", true)),
     }
 }
 
@@ -715,17 +756,199 @@ fn resolve_tool(
     }
 }
 
-/// Build a "which one?" message listing the pending basenames so the owner can
+/// Build a "which one?" message listing the pending requests so the owner can
 /// name a specific target rather than us guessing.
-fn ambiguous_pending_message(pending: &[PendingRequest], verb: &str) -> String {
+///
+/// `named_by_handle` selects the form the owner can actually use to answer:
+/// - `true` (Layer A, the tool-approval relay) — basenames AND short request
+///   handles, so the reply advertises both forms. The relay resolves both.
+/// - `false` (Layer B, the shell allowlist) — basenames only. The Layer B
+///   registry resolves by basename only, so naming a handle would lead the
+///   owner to "Nothing pending matches `<handle>`" and contradict the list.
+fn ambiguous_pending_message(
+    pending: &[PendingRequest],
+    verb: &str,
+    named_by_handle: bool,
+) -> String {
     let names: Vec<String> = pending
         .iter()
-        .map(|r| format!("`{}`", r.basename))
+        .map(|r| {
+            if named_by_handle {
+                format!(
+                    "`{}` (`{}`)",
+                    r.basename,
+                    PendingApprovals::handle_for(r.id)
+                )
+            } else {
+                format!("`{}`", r.basename)
+            }
+        })
         .collect();
-    format!(
-        "Multiple approvals are pending: {}. Reply `/{verb} <name>` to pick one.",
-        names.join(", ")
+    let advice = if named_by_handle {
+        format!("Reply `/{verb} <name or handle>` to pick one.")
+    } else {
+        format!("Reply `/{verb} <name>` to pick one.")
+    };
+    format!("Still pending here: {}. {advice}", names.join(", "))
+}
+
+/// Strip the directory part from a path-like command token and return its
+/// basename. Returns `None` for empty input or a token with no usable
+/// basename — used by the narrowed loose-name branch so `/approve kubectl`
+/// matches a pending `shell` whose `full_command` starts with `/usr/bin/kubectl`.
+fn first_command_token(full_command: &str) -> Option<String> {
+    let first = full_command.split_whitespace().next()?;
+    if first.is_empty() {
+        return None;
+    }
+    let basename = std::path::Path::new(first).file_name()?.to_str()?;
+    if basename.is_empty() {
+        None
+    } else {
+        Some(basename.to_string())
+    }
+}
+
+/// Final-stage relay answer for an approval reply that named no pending
+/// request. Returns `Some(ack)` only when the reply is in command form — a
+/// leading `/` plus any of the three approval parsers accepting it, or a
+/// slash-less reply whose target token is handle-shaped (`/approve a5ed3d`
+/// reaches this function for a Slack owner whose platform swallows the slash).
+/// Bare verbs without a slash (`approve helm`, `ok`) and slash-less non-handle
+/// tokens stay ordinary chat so they reach the model as before.
+///
+/// The message names the token, says nothing pending matches it (no longer
+/// pending or never known), and lists the requests still answerable in this
+/// chat from either layer. The text is the same for any sender: this function
+/// grants nothing, the listed requests were already announced in this chat,
+/// and answering here leaks no information a non-owner could not already see.
+pub fn try_unmatched_approval_reply(
+    text: &str,
+    relay: &PendingApprovals,
+    security: &SecurityPolicy,
+    channel: &str,
+    reply_target: &str,
+) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Branch (b): handle-shaped target, slash optional. Without a slash, only
+    // this form is claimed — Slack intercepts `/` and an owner there types
+    // `approve a5ed3d`.
+    let tool_parsed = parse_tool_reply(text);
+    if let Some(parsed) = tool_parsed.as_ref().filter(|p| is_handle_shaped(&p.tool)) {
+        return Some(build_unmatched_ack(
+            &parsed.tool,
+            relay,
+            security,
+            channel,
+            reply_target,
+        ));
+    }
+    // Branch (a): the reply starts with `/` and any approval parser accepts
+    // it. `/approve` alone (parse_bare_verb) and `/allow helm` (parse_reply)
+    // both land here.
+    if trimmed.starts_with('/') {
+        let reply_parsed = parse_reply(text);
+        let bare_parsed = parse_bare_verb(text);
+        if tool_parsed.is_some() || reply_parsed.is_some() || bare_parsed.is_some() {
+            let token = if let Some(p) = tool_parsed {
+                p.tool
+            } else if let Some(p) = reply_parsed {
+                p.basename
+            } else {
+                trimmed
+                    .strip_prefix('/')
+                    .unwrap_or(trimmed)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            };
+            return Some(build_unmatched_ack(
+                &token,
+                relay,
+                security,
+                channel,
+                reply_target,
+            ));
+        }
+    }
+    None
+}
+
+fn build_unmatched_ack(
+    token: &str,
+    relay: &PendingApprovals,
+    security: &SecurityPolicy,
+    channel: &str,
+    reply_target: &str,
+) -> String {
+    let mut ack =
+        format!("Nothing pending matches `{token}` — no longer pending, or never issued.");
+    let layer_a: Vec<PendingRequest> = relay
+        .list()
+        .into_iter()
+        .filter(|r| request_is_answerable_here(r, channel, reply_target))
+        .collect();
+    let layer_b: Vec<PendingRequest> = security
+        .pending()
+        .map(|p| {
+            p.list()
+                .into_iter()
+                .filter(|r| request_is_answerable_here(r, channel, reply_target))
+                .collect()
+        })
+        .unwrap_or_default();
+    if layer_a.is_empty() && layer_b.is_empty() {
+        ack.push('\n');
+        ack.push_str("Nothing here is waiting on an approval.");
+    } else {
+        ack.push_str(" Still answerable in this chat:");
+        if !layer_a.is_empty() {
+            ack.push('\n');
+            ack.push_str(&ambiguous_pending_message(&layer_a, "approve", true));
+        }
+        if !layer_b.is_empty() {
+            ack.push('\n');
+            ack.push_str(&ambiguous_pending_message(&layer_b, "allow", false));
+        }
+    }
+    ack
+}
+
+/// `token` is a request handle: exactly `REQUEST_HANDLE_LEN` ASCII hex digits.
+/// Accepts upper or lower case; the registry stores handles in lowercase but
+/// the prompt a Slack owner retyped might still be capitalised.
+fn is_handle_shaped(token: &str) -> bool {
+    token.len() == REQUEST_HANDLE_LEN && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The approval-reply chain the dispatch loop runs, in order: Layer A
+/// (tool approvals), Layer B (shell allowlist), then the unmatched-command
+/// stage. One function so the order lives in one place and no caller can
+/// reorder it or drop a stage silently.
+pub fn try_approval_reply(
+    text: &str,
+    tool_approvals: &PendingApprovals,
+    security: &SecurityPolicy,
+    sender: &str,
+    owners: &[String],
+    channel: &str,
+    reply_target: &str,
+) -> Option<String> {
+    try_handle_tool_reply(
+        text,
+        tool_approvals,
+        security.pending().as_deref(),
+        sender,
+        owners,
+        channel,
+        reply_target,
     )
+    .or_else(|| try_handle_reply(text, security, sender, owners, channel, reply_target))
+    .or_else(|| try_unmatched_approval_reply(text, tool_approvals, security, channel, reply_target))
 }
 
 #[cfg(test)]
@@ -960,26 +1183,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_reply_returns_none_when_no_pending_match() {
-        // Recognised verb, but nothing pending for that tool → fall through
-        // (could be a shell reply or plain chat).
+    async fn unmatched_tool_reply_is_answered_by_the_relay() {
+        // A `/approve <tool>` that names no pending request used to fall through
+        // and reach the model. The relay now answers itself: command form plus
+        // no match means the owner typed the wrong name, and the relay says so
+        // and lists what IS still answerable. Plain chat (no verb, no parser
+        // accept) stays chat.
         let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
-        assert!(try_handle_tool_reply(
+        let security = supervised_only_echo();
+        let owners = vec!["owner1".to_string()];
+        // Layer A returns None when nothing pending matches — the empty
+        // registry means branch 1 (handle), branch 2 (exact basename), and
+        // branch 3 (loose-name, exactly one here) all skip. The chain's
+        // third stage is what answers this reply.
+        assert!(
+            try_handle_tool_reply(
+                "/approve web_search",
+                &relay,
+                None,
+                "owner1",
+                &owners,
+                "telegram",
+                "chat-1",
+            )
+            .is_none(),
+            "Layer A returns None on the empty registry so the third stage runs"
+        );
+        let ack = try_unmatched_approval_reply(
             "/approve web_search",
             &relay,
-            "owner1",
-            &["owner1".into()],
+            &security,
             "telegram",
-            "chat-1"
+            "chat-1",
         )
-        .is_none());
-        assert!(try_handle_tool_reply(
+        .expect("relay answers command-form no-match");
+        assert!(ack.contains("web_search"), "ack names the token: {ack}");
+        assert!(
+            ack.contains("Nothing here is waiting"),
+            "ack says nothing is pending: {ack}"
+        );
+
+        // Plain chat has no leading `/` and no handle-shaped token → stays chat.
+        assert!(try_unmatched_approval_reply(
             "hello there",
             &relay,
-            "owner1",
-            &["owner1".into()],
+            &security,
             "telegram",
-            "chat-1"
+            "chat-1",
         )
         .is_none());
     }
@@ -1004,6 +1254,7 @@ mod tests {
         let ack = try_handle_tool_reply(
             "/approve web_search",
             &relay,
+            None,
             "owner1",
             &owners,
             "telegram",
@@ -1036,6 +1287,7 @@ mod tests {
         let ack = try_handle_tool_reply(
             "/approve web_search",
             &relay,
+            None,
             "stranger",
             &owners,
             "telegram",
@@ -1049,6 +1301,7 @@ mod tests {
         let ack = try_handle_tool_reply(
             "/approve web_search",
             &relay,
+            None,
             "owner1",
             &owners,
             "telegram",
@@ -1083,14 +1336,16 @@ mod tests {
 
         let owners = vec!["owner1".to_string()];
         assert!(
-            try_handle_tool_reply("ok", &relay, "owner1", &owners, "discord", "chat-b").is_none(),
+            try_handle_tool_reply("ok", &relay, None, "owner1", &owners, "discord", "chat-b")
+                .is_none(),
             "a bare verb in another chat must not answer this request"
         );
         assert_eq!(relay.list().len(), 1, "the request is still pending");
 
         // The owner CAN still answer it from the chat it was posted to.
-        let ack = try_handle_tool_reply("ok", &relay, "owner1", &owners, "telegram", "chat-a")
-            .expect("answerable from its own chat");
+        let ack =
+            try_handle_tool_reply("ok", &relay, None, "owner1", &owners, "telegram", "chat-a")
+                .expect("answerable from its own chat");
         assert!(ack.contains("Approved"), "{ack}");
         assert_eq!(task.await.unwrap(), Decision::Once);
     }
@@ -1114,7 +1369,8 @@ mod tests {
 
         let owners = vec!["owner1".to_string()];
         assert!(
-            try_handle_tool_reply("ok", &relay, "owner1", &owners, "telegram", "chat-b").is_none()
+            try_handle_tool_reply("ok", &relay, None, "owner1", &owners, "telegram", "chat-b")
+                .is_none()
         );
         assert_eq!(relay.list().len(), 1);
         relay.resolve_by_basename("web_search", Decision::Deny);
@@ -1224,6 +1480,7 @@ mod tests {
         let by_name = try_handle_tool_reply(
             "approve shell",
             &relay,
+            None,
             "owner1",
             &owners,
             "slack",
@@ -1240,6 +1497,7 @@ mod tests {
         let ack = try_handle_tool_reply(
             &format!("approve {handle}"),
             &relay,
+            None,
             "owner1",
             &owners,
             "slack",
@@ -1275,6 +1533,7 @@ mod tests {
         let ack = try_handle_tool_reply(
             &format!("/approve {handle}"),
             &relay,
+            None,
             "owner1",
             &owners,
             "telegram",
@@ -1447,8 +1706,9 @@ mod tests {
             await_pending(&relay, 1).await;
 
             let owners = vec!["owner1".to_string()];
-            let ack = try_handle_tool_reply(verb, &relay, "owner1", &owners, "telegram", "chat-1")
-                .unwrap_or_else(|| panic!("recognised: {verb}"));
+            let ack =
+                try_handle_tool_reply(verb, &relay, None, "owner1", &owners, "telegram", "chat-1")
+                    .unwrap_or_else(|| panic!("recognised: {verb}"));
             assert!(ack.contains("Approved"), "verb={verb} ack={ack}");
             assert_eq!(task.await.unwrap(), Decision::Once, "verb={verb}");
         }
@@ -1456,19 +1716,36 @@ mod tests {
 
     #[tokio::test]
     async fn bare_verb_returns_none_when_no_tool_pending() {
-        // Nothing pending → must fall through (normal chat like "yes please").
+        // Nothing pending → bare verbs without a slash stay chat. The slash
+        // form `/approve` is command form, so the new stage answers it
+        // itself (the relay tells the owner nothing is waiting). Slash-less
+        // `yes` / `ok` without a target token are bare verbs, not command
+        // form, so they fall through to the model as ordinary chat.
         let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let security = supervised_only_echo();
         let owners = vec!["owner1".to_string()];
+        assert!(try_handle_tool_reply(
+            "yes", &relay, None, "owner1", &owners, "telegram", "chat-1"
+        )
+        .is_none());
         assert!(
-            try_handle_tool_reply("yes", &relay, "owner1", &owners, "telegram", "chat-1").is_none()
-        );
-        assert!(
-            try_handle_tool_reply("ok", &relay, "owner1", &owners, "telegram", "chat-1").is_none()
-        );
-        assert!(
-            try_handle_tool_reply("/approve", &relay, "owner1", &owners, "telegram", "chat-1")
+            try_handle_tool_reply("ok", &relay, None, "owner1", &owners, "telegram", "chat-1")
                 .is_none()
         );
+        // Layer A returns None for `/approve` on the empty registry — there is
+        // no target token to match a basename or handle, and no pending request
+        // for the loose-name branch to claim. The chain's third stage is what
+        // answers this reply, not Layer A.
+        assert!(
+            try_handle_tool_reply(
+                "/approve", &relay, None, "owner1", &owners, "telegram", "chat-1",
+            )
+            .is_none(),
+            "Layer A returns None so the third stage runs"
+        );
+        let ack = try_unmatched_approval_reply("/approve", &relay, &security, "telegram", "chat-1")
+            .expect("relay answers a slash-prefixed bare verb");
+        assert!(ack.contains("Nothing pending matches `approve`"), "{ack}");
     }
 
     #[tokio::test]
@@ -1493,8 +1770,10 @@ mod tests {
         await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
-        let ack = try_handle_tool_reply("approve", &relay, "owner1", &owners, "telegram", "chat-1")
-            .expect("consumed: ambiguous");
+        let ack = try_handle_tool_reply(
+            "approve", &relay, None, "owner1", &owners, "telegram", "chat-1",
+        )
+        .expect("consumed: ambiguous");
         assert!(ack.contains("web_search"), "{ack}");
         assert!(ack.contains("shell"), "{ack}");
         // Nothing resolved — both still pending.
@@ -1529,6 +1808,7 @@ mod tests {
         let ack = try_handle_tool_reply(
             "/approve kubectl",
             &relay,
+            None,
             "owner1",
             &owners,
             "telegram",
@@ -1556,14 +1836,15 @@ mod tests {
         await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
-        let ack =
-            try_handle_tool_reply("approve", &relay, "stranger", &owners, "telegram", "chat-1")
-                .expect("consumed");
+        let ack = try_handle_tool_reply(
+            "approve", &relay, None, "stranger", &owners, "telegram", "chat-1",
+        )
+        .expect("consumed");
         assert!(ack.contains("not authorized"), "{ack}");
         assert_eq!(relay.list().len(), 1, "pending stays open");
 
         // A real owner can still resolve.
-        try_handle_tool_reply("yes", &relay, "owner1", &owners, "telegram", "chat-1")
+        try_handle_tool_reply("yes", &relay, None, "owner1", &owners, "telegram", "chat-1")
             .expect("recognised");
         assert_eq!(task.await.unwrap(), Decision::Once);
     }
@@ -1775,8 +2056,16 @@ mod tests {
         await_pending(&relay, 1).await;
 
         // Deny needs no owner authority — stopping an action is always safe.
-        let ack = try_handle_tool_reply("/deny shell", &relay, "anyone", &[], "telegram", "chat-1")
-            .expect("recognised");
+        let ack = try_handle_tool_reply(
+            "/deny shell",
+            &relay,
+            None,
+            "anyone",
+            &[],
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
         assert!(ack.contains("Denied"), "{ack}");
         assert_eq!(task.await.unwrap(), Decision::Deny);
     }
@@ -1909,6 +2198,7 @@ mod tests {
         try_handle_tool_reply(
             "/deny shell",
             &relay,
+            None,
             "owner1",
             &owners,
             "telegram",
@@ -1944,6 +2234,7 @@ mod tests {
         try_handle_tool_reply(
             "/approve web_search",
             &relay,
+            None,
             "owner1",
             &owners,
             "telegram",
@@ -2006,5 +2297,457 @@ mod tests {
         assert_eq!(posted[0].recipient, "chat-1");
         assert_eq!(posted[0].thread_ts.as_deref(), Some("thread-1"));
         assert_eq!(posted[0].reply_anchor.as_deref(), Some("383"));
+    }
+
+    // ── Approval reply names its request ─────────────────────────────
+
+    /// A `file_write` request is auto-denied after five minutes, then the agent
+    /// asks for `shell` in the same chat. The owner replies `approve a5ed3d`
+    /// (no slash) — Slack intercepts `/` and types the bare handle form. The
+    /// loose-name branch used to claim the only pending request as a side
+    /// effect; the relay now answers "nothing pending matches" and the `shell`
+    /// request stays open. Driven through `try_approval_reply` so the chain's
+    /// ordering — Layer A first, then Layer B, then the unmatched stage — is
+    /// what the test pins, not a hand-rolled version of it.
+    #[tokio::test]
+    async fn dead_handle_does_not_resolve_the_only_other_pending_request() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let id_first = uuid::Uuid::new_v4();
+        let id_second = uuid::Uuid::new_v4();
+        let (r1, r2) = (relay.clone(), relay.clone());
+        let first = tokio::spawn(async move {
+            r1.request_decision_in(id_first, "file_write", "out a.txt", "slack", "chat-1")
+                .await
+        });
+        let second = tokio::spawn(async move {
+            r2.request_decision_in(id_second, "shell", "rm b.txt", "slack", "chat-1")
+                .await
+        });
+        await_pending(&relay, 2).await;
+
+        // The first request auto-denies (deadline-style: resolve_by_handle with
+        // a different handle removes nothing — we resolve it manually here for
+        // the test, simulating the five-minute auto-deny that left the handle
+        // typed in chat).
+        let _ = relay.resolve_by_handle(&PendingApprovals::handle_for(id_first), Decision::Deny);
+        let _ = first.await;
+
+        // Owner types the dead handle — without the slash Slack stripped it.
+        // The relay must answer and the `shell` request must still be pending.
+        let security = supervised_only_echo();
+        let owners = vec!["owner1".to_string()];
+        let handle_text = format!("approve {}", PendingApprovals::handle_for(id_first));
+
+        // The full chain (Layer A → Layer B → unmatched stage), one entry
+        // point — the dispatch loop calls exactly this function.
+        let ack = try_approval_reply(
+            &handle_text,
+            &relay,
+            &security,
+            "owner1",
+            &owners,
+            "slack",
+            "chat-1",
+        )
+        .expect("relay answers a handle-shaped token that matches no pending request");
+        assert!(
+            ack.contains("Nothing pending matches"),
+            "ack names the no-match: {ack}"
+        );
+        assert!(
+            ack.contains("shell"),
+            "ack lists what is still pending: {ack}"
+        );
+
+        // The shell task must still be waiting. A short timeout proves no
+        // spurious resolution came through.
+        if let Ok(resolved) = tokio::time::timeout(Duration::from_millis(150), second).await {
+            panic!("shell resolved unexpectedly: {resolved:?}");
+        }
+    }
+
+    /// Ordering: Layer B runs before the unmatched stage, so `/allow brew`
+    /// resolves through the shell allowlist when `brew` is pending there.
+    /// The chain's three stages each get their chance — Layer A first, then
+    /// Layer B, then the unmatched stage. If the order is wrong, the chain
+    /// here would either claim `brew` for nothing (no Layer A shell pending)
+    /// or refuse to answer (no third-stage fallback for a `/allow` that names
+    /// a pending Layer B basename).
+    #[tokio::test]
+    async fn chain_layer_b_brew_runs_before_new_stage() {
+        let layer_a = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let layer_b = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let security = supervised_only_echo();
+        security.set_pending(layer_b.clone());
+
+        let pb = layer_b.clone();
+        let task_b = tokio::spawn(async move {
+            pb.request_decision("brew", "brew --version", "telegram")
+                .await
+        });
+        await_pending(&layer_b, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_approval_reply(
+            "/allow brew",
+            &layer_a,
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("Layer B resolves its own basename before the new stage");
+        assert!(ack.contains("session"), "{ack}");
+        assert_eq!(task_b.await.unwrap(), Decision::Session);
+    }
+
+    /// Ordering: when nothing pending matches anywhere along the chain, the
+    /// unmatched stage answers the reply itself. Without this stage, the
+    /// chain would return `None` and the message would reach the model as
+    /// ordinary chat — proving that deleting the third stage is what loses
+    /// this acknowledgement.
+    #[tokio::test]
+    async fn chain_new_stage_answers_when_no_match_anywhere() {
+        let layer_a = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let security = supervised_only_echo();
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_approval_reply(
+            "/approve helm",
+            &layer_a,
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("unmatched stage answers a slash-form no-match");
+        assert!(ack.contains("helm"), "{ack}");
+        assert!(
+            ack.contains("Nothing pending matches"),
+            "third stage names the no-match: {ack}"
+        );
+    }
+
+    /// An answered handle and nothing else answerable in this chat: the new
+    /// stage answers and the message never reaches the model.
+    #[tokio::test]
+    async fn answered_handle_with_no_other_pending_is_answered_by_relay() {
+        let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let security = supervised_only_echo();
+        let ack =
+            try_unmatched_approval_reply("approve deadbe", &relay, &security, "telegram", "chat-1")
+                .expect("relay answers handle-shaped token, no pending");
+        assert!(
+            ack.contains("Nothing pending matches `deadbe`"),
+            "ack names the token: {ack}"
+        );
+        assert!(
+            ack.contains("Nothing here is waiting"),
+            "ack says nothing is pending: {ack}"
+        );
+    }
+
+    /// A handle-shaped token that never existed behaves the same way.
+    #[tokio::test]
+    async fn never_existed_handle_shaped_token_is_answered_by_relay() {
+        let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let security = supervised_only_echo();
+        let ack =
+            try_unmatched_approval_reply("approve abcdef", &relay, &security, "telegram", "chat-1")
+                .expect("relay answers handle-shaped no-match");
+        assert!(ack.contains("abcdef"), "{ack}");
+    }
+
+    /// Same single-pending state, but the token doesn't match the command:
+    /// `/approve helm` is answered by the new stage (it starts with `/` and
+    /// `parse_tool_reply` accepts it); `approve helm` (no slash) is plain
+    /// chat that falls through to the model.
+    #[tokio::test]
+    async fn unmatched_token_against_single_pending_is_answered_or_chat() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let r2 = relay.clone();
+        let task = tokio::spawn(async move {
+            r2.request_decision_in(
+                uuid::Uuid::new_v4(),
+                "shell",
+                "kubectl get pods",
+                "telegram",
+                "chat-1",
+            )
+            .await
+        });
+        await_pending(&relay, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let security = supervised_only_echo();
+
+        // With the slash: command form, parse_tool_reply accepts `helm`, but
+        // neither `helm` nor any pending basename matches → new stage answers.
+        let ack =
+            try_unmatched_approval_reply("/approve helm", &relay, &security, "telegram", "chat-1")
+                .expect("relay answers a slash-form no-match");
+        assert!(ack.contains("helm"), "{ack}");
+        // The shell task must still be waiting. A short timeout proves no
+        // spurious resolution came through.
+        if let Ok(resolved) = tokio::time::timeout(Duration::from_millis(150), task).await {
+            panic!("shell resolved unexpectedly: {resolved:?}");
+        }
+
+        // Without the slash: `helm` is not handle-shaped (5 chars) and the
+        // text does not start with `/` → new stage returns None. The bare
+        // verb path in `try_handle_tool_reply` also returns None (only one
+        // token, not a verb). The reply falls through to the model.
+        assert!(
+            try_unmatched_approval_reply("approve helm", &relay, &security, "telegram", "chat-1")
+                .is_none(),
+            "slash-less non-handle-shaped non-verb stays chat"
+        );
+        assert!(
+            try_handle_tool_reply(
+                "approve helm",
+                &relay,
+                None,
+                "owner1",
+                &owners,
+                "telegram",
+                "chat-1"
+            )
+            .is_none(),
+            "Layer A does not claim a token that is not the command's name"
+        );
+
+        // Cleanup.
+        relay.resolve_by_basename("shell", Decision::Deny);
+    }
+
+    /// `approve brew` with a pending Layer B `brew` and a Layer A `shell`
+    /// request whose `full_command` starts with `brew` (so the loose-name
+    /// branch would otherwise fire on Layer A): the Layer B basename must
+    /// block that, the Layer B path resolves `brew`, and the Layer A request
+    /// stays pending.
+    #[tokio::test]
+    async fn layer_b_basename_blocks_layer_a_loose_name() {
+        let layer_a = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let layer_b = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let security = supervised_only_echo();
+        security.set_pending(layer_b.clone());
+
+        let (ra, rb) = (layer_a.clone(), layer_b.clone());
+        let ta = tokio::spawn(async move {
+            ra.request_decision_in(
+                uuid::Uuid::new_v4(),
+                "shell",
+                "brew install foo",
+                "telegram",
+                "chat-1",
+            )
+            .await
+        });
+        let tb = tokio::spawn(async move {
+            rb.request_decision_in(
+                uuid::Uuid::new_v4(),
+                "brew",
+                "brew --version",
+                "telegram",
+                "chat-1",
+            )
+            .await
+        });
+        await_pending(&layer_a, 1).await;
+        await_pending(&layer_b, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+
+        // Layer A: the loose-name branch must NOT claim `brew` when Layer B
+        // has it pending (Layer A's full_command starts with `brew`, so the
+        // loose-name branch would otherwise fire).
+        let out_a = try_handle_tool_reply(
+            "approve brew",
+            &layer_a,
+            Some(&layer_b),
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        );
+        assert!(
+            out_a.is_none(),
+            "Layer A must not resolve the basename Layer B owns: {out_a:?}"
+        );
+        assert_eq!(
+            layer_a.list().len(),
+            1,
+            "Layer A's shell request stays pending"
+        );
+
+        // Case-insensitive: `BREW` (capitalised) must also be blocked on Layer
+        // A and resolved by Layer B. The Layer B registry stores the basename
+        // in lowercase but a phone keyboard capitalises the first word, and
+        // Layer A's command-name match is already case-insensitive.
+        let out_a_caps = try_handle_tool_reply(
+            "approve BREW",
+            &layer_a,
+            Some(&layer_b),
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        );
+        assert!(
+            out_a_caps.is_none(),
+            "Layer A must not resolve BREW when Layer B owns brew (case-insensitive): {out_a_caps:?}"
+        );
+        assert_eq!(layer_a.list().len(), 1);
+
+        // Layer B: `approve brew` resolves the shell allowlist entry.
+        let out_b = try_handle_reply(
+            "approve brew",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("Layer B resolves its own basename");
+        assert!(out_b.contains("session"), "{out_b}");
+        assert_eq!(tb.await.unwrap(), Decision::Session);
+
+        // The Layer A request is still pending.
+        assert_eq!(layer_a.list().len(), 1);
+
+        // Cleanup.
+        layer_a.resolve_by_basename("shell", Decision::Deny);
+        let _ = tokio::time::timeout(Duration::from_millis(50), ta).await;
+    }
+
+    /// A tool whose basename happens to be six hex characters still resolves
+    /// by name — branch 2 above the new stage, so a basename that looks like
+    /// a handle cannot trick the new stage into answering it.
+    #[tokio::test]
+    async fn basename_of_six_hex_characters_resolves_by_name() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let r2 = relay.clone();
+        let task = tokio::spawn(async move {
+            r2.request_decision_in(
+                uuid::Uuid::new_v4(),
+                "abc123",
+                "echo named-after-hex",
+                "telegram",
+                "chat-1",
+            )
+            .await
+        });
+        await_pending(&relay, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        // `/approve abc123` resolves by exact basename — branch 2 fires before
+        // the new stage gets a chance.
+        let ack = try_handle_tool_reply(
+            "/approve abc123",
+            &relay,
+            None,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("branch 2: exact basename");
+        assert!(ack.contains("Approved"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    /// A handle typed in a different chat than the request's still resolves,
+    /// because branch 1 is unscoped on purpose.
+    #[tokio::test]
+    async fn handle_resolves_across_chats() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let id = uuid::Uuid::new_v4();
+        let r2 = relay.clone();
+        let task = tokio::spawn(async move {
+            r2.request_decision_in(id, "shell", "rm x", "telegram", "chat-a")
+                .await
+        });
+        await_pending(&relay, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let handle = PendingApprovals::handle_for(id);
+        let ack = try_handle_tool_reply(
+            &format!("/approve {handle}"),
+            &relay,
+            None,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-b",
+        )
+        .expect("branch 1 is unscoped, resolves in any chat");
+        assert!(ack.contains("Approved"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    /// Bare `ok` with nothing pending still returns `None` (chat stays chat).
+    /// The new stage never claims a slash-less bare verb.
+    #[tokio::test]
+    async fn bare_ok_with_nothing_pending_stays_chat() {
+        let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let security = supervised_only_echo();
+        assert!(
+            try_unmatched_approval_reply("ok", &relay, &security, "telegram", "chat-1").is_none(),
+            "a slash-less bare verb is not command form"
+        );
+        assert!(
+            try_unmatched_approval_reply("yes", &relay, &security, "telegram", "chat-1").is_none(),
+            "neither is a slash-less yes"
+        );
+    }
+
+    /// The command-form predicate (a): `/approve` alone (parse_bare_verb
+    /// accepts) → the new stage answers, naming the verb. This is the
+    /// slash-only case.
+    #[tokio::test]
+    async fn slash_only_bare_verb_is_answered_by_relay() {
+        let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let security = supervised_only_echo();
+        let ack = try_unmatched_approval_reply("/deny", &relay, &security, "telegram", "chat-1")
+            .expect("slash-prefixed bare deny is command form");
+        assert!(ack.contains("Nothing pending matches `deny`"), "{ack}");
+    }
+
+    /// The ambiguous list now names the handles alongside the basenames, so
+    /// an owner can disambiguate by id.
+    #[tokio::test]
+    async fn ambiguous_list_names_handles() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let id_a = uuid::Uuid::new_v4();
+        let id_b = uuid::Uuid::new_v4();
+        let (r1, r2) = (relay.clone(), relay.clone());
+        let first = tokio::spawn(async move {
+            r1.request_decision_in(id_a, "web_search", "q", "telegram", "chat-1")
+                .await
+        });
+        let second = tokio::spawn(async move {
+            r2.request_decision_in(id_b, "shell", "ls", "telegram", "chat-1")
+                .await
+        });
+        await_pending(&relay, 2).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_tool_reply(
+            "approve", &relay, None, "owner1", &owners, "telegram", "chat-1",
+        )
+        .expect("ambiguous: answered");
+        let handle_a = PendingApprovals::handle_for(id_a);
+        let handle_b = PendingApprovals::handle_for(id_b);
+        assert!(ack.contains(&handle_a), "names handle a: {ack}");
+        assert!(ack.contains(&handle_b), "names handle b: {ack}");
+        assert!(ack.contains("Reply `/approve <name or handle>`"), "{ack}");
+
+        // Cleanup: deny both handles so the spawned waiters finish, then join them.
+        relay.resolve_by_handle(&handle_a, Decision::Deny);
+        relay.resolve_by_handle(&handle_b, Decision::Deny);
+        let _ = first.await;
+        let _ = second.await;
     }
 }
