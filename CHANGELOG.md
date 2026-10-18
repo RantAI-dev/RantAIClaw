@@ -215,6 +215,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   login was not answered, so nothing was changed.`, writes nothing and leaves the stored login as it
   was, and the setup overlay stays open on that line instead of closing. An explicit `Skip / disable`
   still turns the gate off.
+- The `cli`, `dingtalk`, `qq`, `imessage` and `irc` listeners ignored their `CancellationToken`, so a
+  cancelled channel waited out the supervisor's whole `LISTENER_SHUTDOWN_GRACE` and was then dropped
+  with no teardown of its own: no WebSocket close frame from DingTalk or QQ, no `QUIT` from IRC, an
+  iMessage poll that slept on, and a CLI session stuck at its stdin wait. Each listen path now returns
+  inside the grace after that teardown: DingTalk and QQ send `Close(None)` first, IRC sends `QUIT`, the
+  iMessage poll gate ends the loop, and the CLI loop returns at its stdin wait.
 
 ## [0.33.0-alpha] — 2026-10-08
 

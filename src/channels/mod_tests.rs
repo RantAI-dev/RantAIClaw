@@ -164,9 +164,12 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
         (
             "dingtalk",
             include_str!("dingtalk.rs"),
-            "fn listen(",
+            // The frame loop is a named future since the wait point gained a
+            // cancellation test, so `listen` delegates to it; the gate runs
+            // per frame inside that loop.
+            "fn run_frame_loop<",
             "self.is_user_allowed(",
-            &[],
+            &["self.run_frame_loop("],
         ),
         (
             "discord",
@@ -221,18 +224,17 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
             "self.is_user_allowed(",
             &[],
         ),
-        // QQ gates twice — once per message shape — so both are named.
-        // One entry, not two: the C2C and group events used to be separate
-        // `listen` arms with a gate each, and this table pinned both by their
-        // argument name. They now share one path through `classify_inbound`,
-        // so there is one gate to pin. That both event types still reach it is
-        // covered by the `classify_inbound_*` unit tests in `qq.rs`.
+        // QQ gates once, inside the gateway session `listen` hands everything
+        // to: both event shapes reach it through `Self::classify_inbound` in
+        // that one body, pinned by its argument name. That both event types
+        // reach `classify_inbound` is covered by the `classify_inbound_*`
+        // unit tests in `qq.rs`.
         (
             "qq",
             include_str!("qq.rs"),
-            "fn listen(",
+            "fn run_ws_session<",
             "self.is_user_allowed(&routed.sender)",
-            &["Self::classify_inbound("],
+            &["self.run_ws_session("],
         ),
         (
             "signal",
@@ -308,6 +310,278 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
     }
 }
 
+/// Every production `listen` path reads the `CancellationToken` it is handed.
+///
+/// Shutdown is cooperative: the supervisor cancels the token and gives the
+/// listener `LISTENER_SHUTDOWN_GRACE` to finish its own teardown before the
+/// future is dropped. A path that never reads the token cannot use that
+/// grace — it dies by the drop, with no WebSocket close frame and no IRC
+/// `QUIT`, and a channel serving HTTP keeps serving until its socket closes
+/// on its own. The path is walked hop by hop the way
+/// [`every_channel_listen_path_calls_its_allowlist_gate`] walks it, because
+/// the read usually lives below `listen` itself: `cli` reads it in the stdin
+/// loop, `irc` three hops down in `wait_for_server_line`.
+///
+/// Comments and string literals are masked before the search, so a read that
+/// only exists in a comment cannot satisfy it. One row's verdict is the
+/// opposite: `whatsapp_web`'s feature-off stub takes the token as `_cancel`,
+/// never waits on it, and bails at once, so a build without the feature
+/// fails loudly instead of hanging a listener that cannot run.
+/// One row of [`every_production_listen_path_reads_its_cancellation_token`]:
+/// (channel, source, entry signature, which occurrence of that signature,
+/// whether the path must read the token, call sites from the entry down).
+type ListenPathRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    usize,
+    bool,
+    &'static [&'static str],
+);
+
+#[test]
+fn every_production_listen_path_reads_its_cancellation_token() {
+    // (channel, source, entry signature, which occurrence of that signature —
+    //  `whatsapp_web.rs` declares `listen` twice —, whether the path must read
+    //  the token, call sites from the entry down, one per hop)
+    let paths: &[ListenPathRow] = &[
+        (
+            "cli",
+            include_str!("cli.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["run_stdin_loop("],
+        ),
+        (
+            "dingtalk",
+            include_str!("dingtalk.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.run_frame_loop("],
+        ),
+        (
+            "qq",
+            include_str!("qq.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.run_ws_session("],
+        ),
+        (
+            "imessage",
+            include_str!("imessage.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["Self::wait_for_next_poll("],
+        ),
+        (
+            "irc",
+            include_str!("irc.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.run_session(", ".wait_for_server_line("],
+        ),
+        (
+            "telegram",
+            include_str!("telegram.rs"),
+            "fn listen(",
+            1,
+            true,
+            &[],
+        ),
+        (
+            "mattermost",
+            include_str!("mattermost.rs"),
+            "fn listen(",
+            1,
+            true,
+            &[],
+        ),
+        (
+            "matrix",
+            include_str!("matrix.rs"),
+            "fn listen(",
+            1,
+            true,
+            &[],
+        ),
+        (
+            "signal",
+            include_str!("signal.rs"),
+            "fn listen(",
+            1,
+            true,
+            &[],
+        ),
+        (
+            "discord",
+            include_str!("discord.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.listen_inner("],
+        ),
+        (
+            "slack (socket mode)",
+            include_str!("slack.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.listen_inner(", "self.listen_socket_mode("],
+        ),
+        (
+            "slack (polling)",
+            include_str!("slack.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.listen_inner(", "self.listen_polling("],
+        ),
+        (
+            "lark (websocket)",
+            include_str!("lark.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.listen_ws("],
+        ),
+        (
+            "lark (webhook)",
+            include_str!("lark.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.listen_http("],
+        ),
+        (
+            "whatsapp",
+            include_str!("whatsapp.rs"),
+            "fn listen(",
+            1,
+            true,
+            &[],
+        ),
+        (
+            "whatsapp_web (websocket)",
+            include_str!("whatsapp_web.rs"),
+            "fn listen(",
+            1,
+            true,
+            &[],
+        ),
+        (
+            "whatsapp_web (feature-off stub)",
+            include_str!("whatsapp_web.rs"),
+            "fn listen(",
+            2,
+            false,
+            &[],
+        ),
+        (
+            "email",
+            include_str!("email_channel.rs"),
+            "fn listen(",
+            1,
+            true,
+            &["self.listen_with_idle("],
+        ),
+        ("linq", include_str!("linq.rs"), "fn listen(", 1, true, &[]),
+        (
+            "nextcloud talk",
+            include_str!("nextcloud_talk.rs"),
+            "fn listen(",
+            1,
+            true,
+            &[],
+        ),
+    ];
+
+    // The three spellings a token read takes in this tree: a `select!` arm,
+    // an `await` on the future, and the synchronous check.
+    const TOKEN_READS: [&str; 3] = [
+        "cancel.cancelled()",
+        ".cancelled().await",
+        "cancel.is_cancelled()",
+    ];
+    // A leading underscore is the listener being handed the token and
+    // ignoring it — what a path must never do when it claims to read.
+    const DISCARDED: &str = "_cancel: tokio_util::sync::CancellationToken";
+
+    for (channel, src, entry, occurrence, must_read, hops) in paths {
+        let (masked, _) = mask_comments_and_literals(production_half(src));
+        let production =
+            String::from_utf8(masked).expect("masking only replaces bytes with spaces");
+
+        let mut body = fn_body_nth(&production, entry, *occurrence).unwrap_or_else(|| {
+            panic!("{channel}: `{entry}` (occurrence {occurrence}) not found in production code")
+        });
+        let mut path = vec![body];
+        for hop in *hops {
+            assert!(
+                body.contains(hop),
+                "{channel}: the listen path no longer reaches `{hop}`, so a token \
+                 read behind that call would not be on the path any more"
+            );
+            let callee = callee_name(hop);
+            // Generic callees declare `async fn run_stdin_loop<R>(…)`, whose
+            // header the `fn {callee}(` form cannot match; the paren-less one can.
+            body = fn_body_nth(&production, &format!("fn {callee}("), 1)
+                .or_else(|| fn_body_nth(&production, &format!("fn {callee}"), 1))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{channel}: `{callee}` is called by the listen path but \
+                         has no definition in production code"
+                    )
+                });
+            path.push(body);
+        }
+
+        let path_source: String = path.concat();
+        let reads_token = TOKEN_READS
+            .iter()
+            .any(|needle| path_source.contains(needle));
+        let discards_token = path_source.contains(DISCARDED);
+
+        if *must_read {
+            assert!(
+                reads_token,
+                "{channel}: nothing on the listen path reads the cancellation \
+                 token, so shutdown waits out `LISTENER_SHUTDOWN_GRACE` and \
+                 then drops the listener with no teardown of its own"
+            );
+            assert!(
+                !discards_token,
+                "{channel}: a function on the listen path takes the token as \
+                 `_cancel`, so the read asserted above can only be another \
+                 token's while this one is ignored"
+            );
+        } else {
+            // The feature-off stub's verdict: take the token, never wait on
+            // it, refuse to start. Bailing keeps a build without the feature
+            // failing loudly instead of hanging.
+            assert!(
+                discards_token,
+                "{channel}: the feature-off stub must take the token as `_cancel` \
+                 and refuse to start, so a build without the feature fails loudly"
+            );
+            assert!(
+                !reads_token,
+                "{channel}: the feature-off stub must not wait on the token; it \
+                 has no listener to cancel"
+            );
+            assert!(
+                path_source.contains("bail"),
+                "{channel}: the feature-off stub must refuse to start rather \
+                 than return success"
+            );
+        }
+    }
+}
+
 /// F-15. Pairing replies (`/bind`, `/claim`) used to be sent to the raw
 /// event chat Jid, which is a `@lid` on LID-addressed DMs and lands in a
 /// thread the operator never sees. The helper `pick_reply_target` swaps it
@@ -362,7 +636,15 @@ fn production_half(src: &str) -> &str {
 /// Body of the first function whose signature starts with `header`, ending
 /// at the next method declared at the same indentation.
 fn fn_body<'a>(production: &'a str, header: &str) -> Option<&'a str> {
-    let after = production.split(header).nth(1)?;
+    fn_body_nth(production, header, 1)
+}
+
+/// [`fn_body`] for the `occurrence`-th function with that signature, counted
+/// from 1: `whatsapp_web.rs` declares `listen` twice, the second one being
+/// the feature-off stub that must refuse to start.
+fn fn_body_nth<'a>(production: &'a str, header: &str, occurrence: usize) -> Option<&'a str> {
+    let after = production.split(header).nth(occurrence)?;
+    // The end markers only match 4-space-indented signatures, so a free (column-0) fn body extends to the end of the production half.
     let end = [
         "\n    fn ",
         "\n    async fn ",
