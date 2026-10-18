@@ -114,20 +114,90 @@ pub(crate) fn pairing_profile_root() -> Result<PathBuf> {
     Ok(crate::profile::ProfileManager::active()?.root)
 }
 
+/// The surfaces a pairing code can actually be claimed on: the channel (or
+/// gateway) modules that consume codes from the shared pairing store. Listed
+/// from the consume sites, so adding a listener updates this list in the same
+/// change; `webhook` and `email` are catalog keys with no consume site, so a
+/// code minted for either could never be claimed.
+const CONSUMABLE_PAIRING_SURFACES: [&str; 16] = [
+    "telegram",       // channels/telegram.rs
+    "discord",        // channels/discord.rs
+    "slack",          // channels/slack.rs
+    "mattermost",     // channels/mattermost.rs
+    "imessage",       // channels/imessage.rs
+    "matrix",         // channels/matrix.rs
+    "signal",         // channels/signal.rs
+    "whatsapp",       // channels/whatsapp.rs (Cloud API)
+    "whatsapp_web",   // channels/whatsapp_web.rs
+    "linq",           // gateway/mod.rs dispatches the Linq listener
+    "nextcloud_talk", // channels/nextcloud_talk.rs
+    "dingtalk",       // channels/dingtalk.rs
+    "qq",             // channels/qq.rs
+    "irc",            // channels/irc.rs
+    "lark",           // channels/lark.rs
+    "gateway",        // gateway/mod.rs
+];
+
+/// Why a pairing code for `channel` must not be minted on this `config`, or
+/// `None` when minting is allowed.
+///
+/// The one refusal shared by both mint paths — the `channels pair` CLI and the
+/// `issue_pairing_code` tool — so an assistant conversation cannot mint a code
+/// the CLI would reject. Both name the config actually in use rather than a
+/// fixed path. Checked in order: the running WhatsApp transport, a locked
+/// (under development) channel, a surface no listener consumes, and finally a
+/// catalog channel this config does not configure.
+pub(crate) fn pairing_surface_refusal(channel: &str, config: &Config) -> Option<String> {
+    if let Some(refusal) = crate::security::pairing_store::whatsapp_surface_refusal(
+        channel,
+        config.channels_config.running_whatsapp_surface(),
+    ) {
+        return Some(refusal);
+    }
+    if let Some(key) = crate::channels::locked_channel_key_for_provisioner(channel) {
+        return Some(format!(
+            "\"{key}\" is {} and cannot be paired yet.",
+            ChannelSupport::UnderDevelopment.label()
+        ));
+    }
+    if !CONSUMABLE_PAIRING_SURFACES.contains(&channel) {
+        let valid = CONSUMABLE_PAIRING_SURFACES.join(", ");
+        return Some(format!(
+            "`{channel}` is not a surface a pairing code can be claimed on. Valid surfaces: {valid}."
+        ));
+    }
+    if CHANNEL_CATALOG.iter().any(|(key, _, _, _)| *key == channel)
+        && !channel_is_configured(channel, config)
+    {
+        // Mirrors `bind_telegram_identity`'s not-configured refusal, which is
+        // the message an operator already recognizes from that path.
+        return Some(format!(
+            "`{channel}` channel is not configured. Run `rantaiclaw onboard --channels-only` first"
+        ));
+    }
+    None
+}
+
 /// Mint an on-demand pairing code for `channel` into the shared store and print
 /// the code plus `/bind`/`/claim` instructions. Works whether or not the daemon
 /// is running — a running daemon validates the code on the next pairing message
 /// without a restart.
 ///
-/// `ttl_minutes` is the validity window; `max_uses` bounds claims (`None` =
-/// unlimited within the window); `grant_owner` permits `/claim` (owner). Returns
-/// the minted plaintext code (also used by tests to assert it is non-empty).
+/// Refuses surfaces [`pairing_surface_refusal`] rejects, so no code is minted
+/// for a channel nothing will ever answer. `ttl_minutes` is the validity
+/// window; `max_uses` bounds claims (`None` = unlimited within the window);
+/// `grant_owner` permits `/claim` (owner). Returns the minted plaintext code
+/// (also used by tests to assert it is non-empty).
 pub(crate) fn pair_channel(
     channel: &str,
+    config: &Config,
     ttl_minutes: i64,
     max_uses: Option<u32>,
     grant_owner: bool,
 ) -> Result<String> {
+    if let Some(refusal) = pairing_surface_refusal(channel, config) {
+        anyhow::bail!(refusal);
+    }
     let root = pairing_profile_root()?;
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -564,8 +634,26 @@ pub(crate) fn channel_add_guidance(channel_type: &str) -> String {
 }
 
 /// Guidance for `channel remove`. See [`channel_add_guidance`].
-pub(crate) fn channel_remove_guidance(name: &str) -> String {
-    format!("Remove channel '{name}' — edit ~/.rantaiclaw/config.toml directly")
+///
+/// Names the config actually in use — the loaded config's path, else the
+/// active profile's `config.toml` — because with profiles the file the daemon
+/// reads is not necessarily `~/.rantaiclaw/config.toml`, and guidance naming
+/// the wrong file sends the operator there. When neither resolves, the text
+/// omits the path rather than guessing one.
+pub(crate) fn channel_remove_guidance(name: &str, config: &Config) -> String {
+    let path = (!config.config_path.as_os_str().is_empty())
+        .then(|| config.config_path.display().to_string())
+        .or_else(|| {
+            crate::profile::ProfileManager::active()
+                .ok()
+                .map(|profile| profile.config_toml().display().to_string())
+        });
+    match path {
+        Some(path) => format!("Remove channel '{name}' — edit {path} directly"),
+        None => {
+            format!("Remove channel '{name}' — edit the active profile's `config.toml` directly")
+        }
+    }
 }
 
 pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
@@ -623,7 +711,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             Ok(())
         }
         crate::ChannelCommands::Remove { name } => {
-            println!("{}", channel_remove_guidance(&name));
+            println!("{}", channel_remove_guidance(&name, config));
             Ok(())
         }
         crate::ChannelCommands::BindTelegram { identity } => {
@@ -638,19 +726,10 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             max_uses,
             no_owner,
         } => {
-            if let Some(refusal) = crate::security::pairing_store::whatsapp_surface_refusal(
-                &channel,
-                config.channels_config.running_whatsapp_surface(),
-            ) {
-                anyhow::bail!(refusal);
-            }
-            if let Some(key) = crate::channels::locked_channel_key_for_provisioner(&channel) {
-                anyhow::bail!(
-                    "\"{key}\" is {} and cannot be paired yet.",
-                    crate::channels::ChannelSupport::UnderDevelopment.label()
-                );
-            }
-            pair_channel(&channel, ttl, max_uses, !no_owner)?;
+            // The surface refusal lives in `pair_channel` (shared with the
+            // `issue_pairing_code` tool), so the CLI no longer keeps its own
+            // copy of the checks.
+            pair_channel(&channel, config, ttl, max_uses, !no_owner)?;
             Ok(())
         }
     }

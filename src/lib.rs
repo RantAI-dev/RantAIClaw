@@ -122,7 +122,7 @@ Add a channel configuration.
 NOTE: CLI `channel add` is not yet implemented. It prints the requested type \
 and directs you to the interactive setup. Configure channels with:
   rantaiclaw onboard          # guided channel setup (recommended)
-or edit ~/.rantaiclaw/config.toml directly.
+or edit the active profile's `config.toml` directly.
 
 Supported channel types: telegram, discord, slack, mattermost, webhook, \
 imessage, matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark, \
@@ -138,7 +138,7 @@ dingtalk, qq.")]
 Remove a channel configuration.
 
 NOTE: CLI `channel remove` is not yet implemented. It directs you to edit \
-~/.rantaiclaw/config.toml directly (delete the channel's \
+the active profile's `config.toml` directly (delete the channel's \
 [channels_config.<name>] section) or re-run `rantaiclaw onboard`.")]
     Remove {
         /// Channel name to remove

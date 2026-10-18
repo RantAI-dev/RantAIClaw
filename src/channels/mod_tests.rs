@@ -4585,9 +4585,100 @@ async fn channel_remove_reports_guidance_without_failing() {
     .await;
 
     assert!(result.is_ok(), "guidance must not be reported as a failure");
-    let text = admin::channel_remove_guidance("telegram");
+    let text = admin::channel_remove_guidance("telegram", &config);
     assert!(text.contains("telegram"));
     assert!(text.contains("config.toml"), "says where to make the edit");
+}
+
+/// `channel remove` must name the config in use — the loaded config's path,
+/// here a temp file — not a fixed `~/.rantaiclaw/config.toml` that may not be
+/// the file the daemon reads.
+#[test]
+fn channel_remove_guidance_names_the_resolved_config_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let mut config = Config::default();
+    config.config_path = config_path.clone();
+
+    let text = admin::channel_remove_guidance("telegram", &config);
+    assert!(text.contains("telegram"), "names the channel: {text}");
+    assert!(
+        text.contains(&config_path.display().to_string()),
+        "names the config in use: {text}"
+    );
+    assert!(
+        !text.contains("~/.rantaiclaw"),
+        "must not print a fixed path the operator may not use: {text}"
+    );
+}
+
+/// The two CLI declarations of `channel add`/`channel remove` (the library
+/// enum in `lib.rs` and the binary's own enum in `main.rs`) must stay
+/// word-for-word identical, and neither may name `~/.rantaiclaw/config.toml`:
+/// with profiles the active config can live anywhere, so guidance pointing at
+/// a fixed path sends the operator to a file the daemon does not read.
+#[test]
+fn channel_add_and_remove_long_help_match_across_the_two_cli_declarations() {
+    /// Slice the `ChannelCommands` enum body out of a CLI source file. The
+    /// body ends at the first column-0 `}`, which is where both enums close.
+    fn enum_body(src: &str) -> &str {
+        let start = src
+            .find("enum ChannelCommands")
+            .expect("the enum is declared in both files");
+        let end = src[start..]
+            .find("\n}\n")
+            .expect("the enum body closes at a column-0 brace")
+            + start
+            + "\n}\n".len();
+        &src[start..end]
+    }
+    /// Slice one variant's `long_about` text, from its first line to the end
+    /// of the string literal (the `")` that closes it).
+    fn long_about<'a>(body: &'a str, header: &str) -> &'a str {
+        let start = body.find(header).expect("the variant header is present");
+        let end = body[start..]
+            .find("\")")
+            .expect("the long_about literal is closed")
+            + start
+            + "\")".len();
+        &body[start..end]
+    }
+
+    let lib = enum_body(include_str!("../lib.rs"));
+    let main = enum_body(include_str!("../main.rs"));
+
+    assert!(
+        !lib.contains("~/.rantaiclaw/config.toml"),
+        "the library CLI must not name a fixed config path: {lib}"
+    );
+    assert!(
+        !main.contains("~/.rantaiclaw/config.toml"),
+        "the binary CLI must not name a fixed config path: {main}"
+    );
+
+    const ADD: &str = "Add a channel configuration.";
+    const REMOVE: &str = "Remove a channel configuration.";
+    assert_eq!(
+        long_about(lib, ADD),
+        long_about(main, ADD),
+        "`channel add` long help must be identical in both CLI declarations"
+    );
+    assert_eq!(
+        long_about(lib, REMOVE),
+        long_about(main, REMOVE),
+        "`channel remove` long help must be identical in both CLI declarations"
+    );
+
+    assert!(
+        long_about(lib, ADD).contains("the active profile's `config.toml`"),
+        "`channel add` help must point at the profile in use: {}",
+        long_about(lib, ADD)
+    );
+    assert!(
+        long_about(lib, REMOVE).contains("the active profile's `config.toml`"),
+        "`channel remove` help must point at the profile in use: {}",
+        long_about(lib, REMOVE)
+    );
 }
 
 /// Populate every channel section, so the factory has to build all of them.
@@ -5254,7 +5345,9 @@ async fn channel_pair_refuses_a_locked_channel_but_not_gateway() {
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", tmp.path());
 
-    let config = Config::default();
+    // A supported channel mints only when it is configured; without a Telegram
+    // section the not-configured refusal would trip on the `usable` case.
+    let (config, _cfg_path) = telegram_config_in(&tmp, &[]);
     let locked = crate::ChannelCommands::Pair {
         channel: "irc".to_string(),
         ttl: 15,
@@ -5290,6 +5383,159 @@ async fn channel_pair_refuses_a_locked_channel_but_not_gateway() {
     );
     assert!(usable_result.is_ok(), "{usable_result:?}");
     assert!(gateway_result.is_ok(), "{gateway_result:?}");
+}
+
+/// `channels pair --channel nope`: not a catalog key at all, so no channel
+/// will ever answer a code minted for it. It must refuse before minting, and
+/// nothing may reach the pairing store.
+#[tokio::test]
+async fn channel_pair_refuses_an_unknown_surface_and_leaves_the_store_empty() {
+    let _guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let config = Config::default();
+    let result = admin::handle_command(
+        crate::ChannelCommands::Pair {
+            channel: "nope".to_string(),
+            ttl: 15,
+            max_uses: None,
+            no_owner: true,
+        },
+        &config,
+    )
+    .await;
+    let store = admin::pairing_profile_root().map(|root| root.join("pairing_codes.json"));
+    let stored = store.as_ref().is_ok_and(|path| path.exists());
+
+    match prev_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let err = result.expect_err("an unknown surface must be refused, not minted");
+    assert!(
+        err.to_string().contains("telegram"),
+        "the refusal must list the surfaces that actually work: {err}"
+    );
+    assert!(store.is_ok(), "the profile root must resolve");
+    assert!(!stored, "nothing may reach the pairing store");
+}
+
+/// `channels pair --channel telegram` on a config with no Telegram section:
+/// the code would be minted for a channel nothing listens on. It must refuse
+/// the same way `channel bind-telegram` already does, and mint nothing.
+#[tokio::test]
+async fn channel_pair_refuses_a_catalog_channel_that_is_not_configured() {
+    let _guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let config = Config::default();
+    let result = admin::handle_command(
+        crate::ChannelCommands::Pair {
+            channel: "telegram".to_string(),
+            ttl: 15,
+            max_uses: None,
+            no_owner: true,
+        },
+        &config,
+    )
+    .await;
+    let store = admin::pairing_profile_root().map(|root| root.join("pairing_codes.json"));
+    let stored = store.as_ref().is_ok_and(|path| path.exists());
+
+    match prev_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let err = result
+        .expect_err("an unconfigured channel must be refused, not minted")
+        .to_string();
+    assert!(err.contains("telegram"), "must name the channel: {err}");
+    assert!(
+        err.contains("onboard"),
+        "must point at the command that works: {err}"
+    );
+    assert!(!stored, "nothing may reach the pairing store");
+}
+
+/// Assistant parity: the `issue_pairing_code` tool must refuse exactly the
+/// surfaces the CLI refuses, so an assistant conversation cannot mint a code
+/// the CLI would reject.
+#[tokio::test]
+async fn the_issue_pairing_code_tool_refuses_unknown_and_unconfigured_surfaces() {
+    let _guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let tool = crate::tools::issue_pairing_code::IssuePairingCodeTool::new(
+        Arc::new(crate::security::SecurityPolicy::default()),
+        Arc::new(Config::default()),
+    );
+    let unknown = tool
+        .execute(serde_json::json!({"channel": "nope"}))
+        .await
+        .unwrap();
+    let unconfigured = tool
+        .execute(serde_json::json!({"channel": "telegram"}))
+        .await
+        .unwrap();
+
+    match prev_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    assert!(
+        !unknown.success,
+        "an unknown surface must not mint: {:?}",
+        unknown.error
+    );
+    assert!(
+        unknown.error.unwrap_or_default().contains("telegram"),
+        "the refusal must list the surfaces that actually work"
+    );
+    assert!(
+        !unconfigured.success,
+        "an unconfigured channel must not mint: {:?}",
+        unconfigured.error
+    );
+    let unconfigured_err = unconfigured.error.unwrap_or_default();
+    assert!(
+        unconfigured_err.contains("telegram"),
+        "must name the channel: {unconfigured_err}"
+    );
+    assert!(
+        unconfigured_err.contains("onboard"),
+        "must point at the command that works: {unconfigured_err}"
+    );
+}
+
+/// The refusal must not overreach: a configured, consumable channel still
+/// mints. Driven through `pair_channel` directly so the returned code is
+/// observable.
+#[tokio::test]
+async fn channel_pair_mints_for_a_configured_channel() {
+    let _guard = crate::test_env::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let (config, _cfg_path) = telegram_config_in(&tmp, &[]);
+    let code = admin::pair_channel("telegram", &config, 15, None, true);
+
+    match prev_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let code = code.expect("a configured channel must mint");
+    assert!(!code.is_empty(), "the minted code must be non-empty");
 }
 
 /// The roster is what `channel list` and `status` report. It used to be a
