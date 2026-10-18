@@ -138,17 +138,12 @@ impl Tool for IssuePairingCodeTool {
                 "missing `channel` (the surface to mint a code for, e.g. telegram, whatsapp_web, gateway)",
             ));
         }
-        if let Some(refusal) = pairing_store::whatsapp_surface_refusal(
-            &channel,
-            self.config.channels_config.running_whatsapp_surface(),
-        ) {
+        // The same surface refusal the `channels pair` CLI runs, so the
+        // assistant cannot mint a code the CLI would reject.
+        if let Some(refusal) =
+            crate::channels::admin::pairing_surface_refusal(&channel, &self.config)
+        {
             return Ok(err(refusal));
-        }
-        if let Some(key) = crate::channels::locked_channel_key_for_provisioner(&channel) {
-            return Ok(err(format!(
-                "\"{key}\" is {} and cannot be paired yet.",
-                crate::channels::ChannelSupport::UnderDevelopment.label()
-            )));
         }
 
         let ttl_minutes = args
@@ -253,10 +248,13 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
-        let tool = IssuePairingCodeTool::new(
-            Arc::new(SecurityPolicy::default()),
-            Arc::new(Config::default()),
-        );
+        // A code is only minted for a channel this config actually runs.
+        let mut config = Config::default();
+        config.channels_config.telegram = serde_json::from_value(json!({
+            "bot_token": "111:aaaaaaaaaaaaaaaaaaaaaaaaa", "allowed_users": []
+        }))
+        .expect("telegram");
+        let tool = IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
         let res = tool
             .execute(json!({"channel": "telegram", "ttl_minutes": 5}))
             .await
@@ -283,10 +281,14 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
-        let tool = IssuePairingCodeTool::new(
-            Arc::new(SecurityPolicy::default()),
-            Arc::new(Config::default()),
-        );
+        // A code is only minted for a channel this config actually runs.
+        let mut config = Config::default();
+        config.channels_config.whatsapp = serde_json::from_value(json!({
+            "phone_number_id": "1", "access_token": "t", "verify_token": "v",
+            "allowed_numbers": []
+        }))
+        .expect("whatsapp");
+        let tool = IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
         let res = tool
             .execute(json!({"channel": "whatsapp", "owner": false}))
             .await

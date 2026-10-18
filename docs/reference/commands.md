@@ -231,6 +231,9 @@ CLI/tool enforce, applied up-front for the HTTP surface's blast radius.
 - `rantaiclaw channel bind-telegram <IDENTITY>`
 - `rantaiclaw channel add <type> <json>`
 - `rantaiclaw channel remove <name>`
+- `rantaiclaw channel pair [--channel <surface>]`
+
+`pair` mints a one-time pairing code that a user claims in chat with `/claim <code>`. It refuses with a non-zero exit when the surface is one no channel or gateway listener consumes (the message lists the valid surfaces), or when the surface is a catalog channel this config does not configure (the message points at `rantaiclaw onboard --channels-only`).
 
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
