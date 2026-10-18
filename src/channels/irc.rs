@@ -707,7 +707,7 @@ impl IrcChannel {
     async fn run_session(
         &self,
         tx: mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         if let Some(refusal) = self.insecure_credential_refusal() {
             anyhow::bail!(refusal);
@@ -759,12 +759,16 @@ impl IrcChannel {
         let mut nick_retries = 0_u8;
 
         loop {
-            line.clear();
-            let n = tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut line))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("IRC read timed out (no data for {READ_TIMEOUT:?})")
-                })??;
+            let Some(n) = self
+                .wait_for_server_line(&mut buf_reader, &mut line, &cancel)
+                .await?
+            else {
+                // The token fired: `wait_for_server_line` sent `QUIT` before
+                // returning, and `listen` clears the write half as it always
+                // did. A shutdown is not a fault, so it must not surface as
+                // `Err` and escalate the supervisor's backoff.
+                return Ok(());
+            };
             if n == 0 {
                 anyhow::bail!("IRC connection closed by server");
             }
@@ -1005,6 +1009,62 @@ impl IrcChannel {
 
                 _ => {}
             }
+        }
+    }
+
+    /// Wait for the next server read while the session is alive: the loop's
+    /// wait point, with the cancellation token on the same `select!`.
+    ///
+    /// Why this exists: `read_line` can sit for `READ_TIMEOUT` between server
+    /// pings, and the loop used to have no arm for the token — so shutdown
+    /// waited out the listener grace, the connection was dropped mid-read, and
+    /// the server saw a registration time out rather than a `QUIT`. The token
+    /// arm is first (`biased`), so cancellation wins a tie against a line that
+    /// happens to be ready, and it performs the teardown (`QUIT`) before the
+    /// `Ok(None)` that stops the loop.
+    ///
+    /// `Ok(Some(n))` is a completed read (`n` bytes, `0` meaning the server
+    /// closed the connection — `run_session` decides what that means),
+    /// `Ok(None)` is cancellation. Cancellation is deliberately not an error:
+    /// `Channel::listen` returning `Err` would escalate the supervisor's
+    /// reconnect backoff for a shutdown we asked for.
+    ///
+    /// # Errors
+    /// The read failed, or no data arrived for `READ_TIMEOUT` — both unchanged
+    /// from the inline read this replaced.
+    async fn wait_for_server_line<R>(
+        &self,
+        buf_reader: &mut BufReader<R>,
+        line: &mut String,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<Option<usize>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        line.clear();
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                self.send_quit().await;
+                Ok(None)
+            }
+            read = tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(line)) => {
+                let n = read
+                    .map_err(|_| anyhow::anyhow!("IRC read timed out (no data for {READ_TIMEOUT:?})"))??;
+                Ok(Some(n))
+            }
+        }
+    }
+
+    /// Tell the server the session is leaving — IRC's teardown, sent before
+    /// `run_session` returns so `listen`'s writer clearing still sees a live
+    /// socket. Best effort by design: this runs on the shutdown path, where a
+    /// dead or already-closed connection must not turn a deliberate `Ok(())`
+    /// into an error.
+    async fn send_quit(&self) {
+        let mut guard = self.writer.lock().await;
+        if let Some(ref mut w) = *guard {
+            let _ = Self::send_raw(w, "QUIT :RantaiClaw shutting down").await;
         }
     }
 }
@@ -1739,6 +1799,76 @@ nickname = "bot"
             .expect_err("send must report the dead session, not swallow it");
         assert!(err.to_string().contains("not connected"), "got: {err}");
         assert!(!ch.health_check().await);
+    }
+
+    /// The session used to sit in its read with the token bound as `_cancel`,
+    /// so a shutdown cost the full listener grace and the server saw a dead
+    /// registration instead of a `QUIT`.
+    ///
+    /// Route (2) of the plan: `listen` reaches the read only through
+    /// `connect`, which starts a TLS handshake that a plain `TcpListener`
+    /// cannot complete, so the test drives the extracted wait itself. The
+    /// reader is a loopback TCP connection that accepts and then sends
+    /// nothing — a server silent between pings — which is exactly the wait
+    /// point; nothing outside `127.0.0.1` is contacted.
+    #[tokio::test]
+    async fn cancelling_stops_the_irc_read_wait_at_its_wait_point() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed");
+        let addr = listener.local_addr().expect("bound address");
+        // Held for the whole test: dropping it would end the read with EOF,
+        // and the "still waiting" proof below would pass for the wrong reason.
+        let _peer_socket = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("loopback connect must succeed");
+        let (server_socket, _) = listener.accept().await.expect("accept must succeed");
+
+        let ch = channel_with_owners(&[]);
+        // Seed the writer so the `QUIT` the cancel arm sends is observable.
+        let (quit_sink, mut quit_peer) = tokio::io::duplex(1024);
+        *ch.writer.lock().await = Some(Box::new(quit_sink));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut buf_reader = BufReader::new(server_socket);
+        let mut line = String::new();
+        let wait = ch.wait_for_server_line(&mut buf_reader, &mut line, &cancel);
+        tokio::pin!(wait);
+
+        // The session must still be sitting at the read: a wait that returned
+        // at once would make the assertions below pass vacuously.
+        tokio::select! {
+            biased;
+            outcome = &mut wait => {
+                panic!("the IRC read wait returned before cancellation: {outcome:?}")
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
+            .await
+            .expect("the wait must stop well inside LISTENER_SHUTDOWN_GRACE");
+        assert!(
+            matches!(&outcome, Ok(None)),
+            "cancellation must be Ok(None), never an error — an Err would \
+             escalate the supervisor's backoff on a shutdown we asked for: \
+             {outcome:?}"
+        );
+
+        // Teardown before the return: `QUIT` reached the write half. Taking
+        // the sink out of the channel slot drops it, so the peer read below
+        // ends at EOF instead of waiting.
+        ch.writer.lock().await.take();
+        let mut written = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut quit_peer, &mut written)
+            .await
+            .expect("read the QUIT the cancel arm sent");
+        let written = String::from_utf8(written).expect("the QUIT line is ASCII");
+        assert!(
+            written.starts_with("QUIT ") && written.ends_with("\r\n"),
+            "the session must leave with a well-formed QUIT, got {written:?}"
+        );
     }
 
     /// Chunks went out back-to-back, which most networks disconnect as excess
