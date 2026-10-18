@@ -280,88 +280,56 @@ impl DingTalkChannel {
         let gw: GatewayResponse = resp.json().await?;
         Ok(gw)
     }
-}
 
-#[async_trait]
-impl Channel for DingTalkChannel {
-    fn name(&self) -> &str {
-        "dingtalk"
-    }
-
-    fn render_target(&self) -> crate::channels::format::RenderTarget {
-        // DingTalk's `markdown` message type renders a CommonMark-ish subset but
-        // no tables, so `tables_native: false` sends tables as an ASCII grid.
-        crate::channels::format::RenderTarget::StdMarkdown {
-            tables_native: false,
-        }
-    }
-
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        // Clone out and drop the guard before the POST: the URL used to borrow
-        // from the map, so the read lock was held for the whole request.
-        let webhook_url = {
-            let webhooks = self.session_webhooks.read().await;
-            let entry = webhooks.get(&message.recipient).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No session webhook found for chat {}. \
-                     The user must send a message first to establish a session.",
-                    message.recipient
-                )
-            })?;
-            if Self::is_expired(entry, Self::now_ms()) {
-                anyhow::bail!(
-                    "The session webhook for chat {} has expired. \
-                     DingTalk issues a fresh one with the user's next message.",
-                    message.recipient
-                );
-            }
-            entry.url.clone()
-        };
-
-        let title = message.subject.as_deref().unwrap_or("RantaiClaw");
-        let rendered =
-            crate::channels::format::render_to_string(&message.content, &self.render_target());
-        let body = serde_json::json!({
-            "msgtype": "markdown",
-            "markdown": {
-                "title": title,
-                "text": rendered,
-            }
-        });
-
-        let resp = self
-            .http_client()
-            .post(&webhook_url)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DingTalk webhook reply failed ({status}): {err}");
-        }
-
-        Ok(())
-    }
-
-    async fn listen(
+    /// Read frames from `read` and forward inbound messages to `tx`, honouring
+    /// cancellation at the wait point. The WebSocket endpoint DingTalk hands
+    /// out is a fixed host, so a test drives this directly with a stream that
+    /// never yields rather than standing up a fake gateway. On cancellation the
+    /// close frame the platform expects is sent before the socket is dropped,
+    /// and `Ok(())` is returned: cancellation is not a fault, and an `Err`
+    /// would escalate the supervisor's reconnect backoff.
+    async fn run_frame_loop<W, S>(
         &self,
+        mut write: W,
+        mut read: S,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<()> {
-        tracing::info!("DingTalk: registering gateway connection...");
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()>
+    where
+        W: futures_util::Sink<Message> + Unpin,
+        // The pong arm below formats the sink's own error into its warning;
+        // the concrete WebSocket type always satisfied this, and the generic
+        // extraction has to say so.
+        W::Error: std::fmt::Display,
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                // `biased` puts cancellation first: a frame already buffered
+                // and a cancellation landing on the same poll resolves toward
+                // shutdown, so the close frame below still goes out inside the
+                // supervisor's grace period.
+                () = cancel.cancelled() => {
+                    // DingTalk tears down its stream connection with a WebSocket
+                    // close frame; dropping the socket without one leaves the
+                    // subscription open on the platform's side until its own
+                    // timeout fires. The send is best effort: a dead or
+                    // already-closed socket must not turn the deliberate
+                    // `Ok(())` into an error.
+                    let _ = write.send(Message::Close(None)).await;
+                    return Ok(());
+                }
+                msg = read.next() => match msg {
+                    Some(msg) => msg,
+                    // The stream ended without a close frame: report as a
+                    // transport fault so the supervisor reconnects with backoff
+                    // rather than treating this as a clean shutdown.
+                    None => anyhow::bail!("DingTalk WebSocket stream ended"),
+                },
+            };
 
-        let gw = self.register_connection().await?;
-        let ws_url = format!("{}?ticket={}", gw.endpoint, gw.ticket);
-
-        tracing::info!("DingTalk: connecting to stream WebSocket...");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
-        let (mut write, mut read) = ws_stream.split();
-
-        tracing::info!("DingTalk: connected and listening for messages...");
-
-        while let Some(msg) = read.next().await {
             let msg = match Self::classify_frame(msg) {
                 FrameOutcome::Text(t) => t,
                 FrameOutcome::CleanClose => break,
@@ -520,6 +488,89 @@ impl Channel for DingTalkChannel {
 
         anyhow::bail!("DingTalk WebSocket stream ended")
     }
+}
+
+#[async_trait]
+impl Channel for DingTalkChannel {
+    fn name(&self) -> &str {
+        "dingtalk"
+    }
+
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        // DingTalk's `markdown` message type renders a CommonMark-ish subset but
+        // no tables, so `tables_native: false` sends tables as an ASCII grid.
+        crate::channels::format::RenderTarget::StdMarkdown {
+            tables_native: false,
+        }
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Clone out and drop the guard before the POST: the URL used to borrow
+        // from the map, so the read lock was held for the whole request.
+        let webhook_url = {
+            let webhooks = self.session_webhooks.read().await;
+            let entry = webhooks.get(&message.recipient).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No session webhook found for chat {}. \
+                     The user must send a message first to establish a session.",
+                    message.recipient
+                )
+            })?;
+            if Self::is_expired(entry, Self::now_ms()) {
+                anyhow::bail!(
+                    "The session webhook for chat {} has expired. \
+                     DingTalk issues a fresh one with the user's next message.",
+                    message.recipient
+                );
+            }
+            entry.url.clone()
+        };
+
+        let title = message.subject.as_deref().unwrap_or("RantaiClaw");
+        let rendered =
+            crate::channels::format::render_to_string(&message.content, &self.render_target());
+        let body = serde_json::json!({
+            "msgtype": "markdown",
+            "markdown": {
+                "title": title,
+                "text": rendered,
+            }
+        });
+
+        let resp = self
+            .http_client()
+            .post(&webhook_url)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("DingTalk webhook reply failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        tracing::info!("DingTalk: registering gateway connection...");
+
+        let gw = self.register_connection().await?;
+        let ws_url = format!("{}?ticket={}", gw.endpoint, gw.ticket);
+
+        tracing::info!("DingTalk: connecting to stream WebSocket...");
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+        let (write, read) = ws_stream.split();
+
+        tracing::info!("DingTalk: connected and listening for messages...");
+
+        self.run_frame_loop(write, read, tx, cancel).await
+    }
 
     fn apply_allowed_senders(&self, allowed: &[String]) {
         if let Ok(mut users) = self.allowed_users.write() {
@@ -535,6 +586,46 @@ impl Channel for DingTalkChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The WebSocket read loop honours cancellation while blocked on a frame
+    /// that never arrives. The endpoint DingTalk hands out is a fixed host, so
+    /// the extracted loop is driven directly against a stream that never
+    /// yields (standing in for a silent connection) and a sink that swallows
+    /// the close frame without a real socket behind it.
+    #[tokio::test]
+    async fn cancelling_stops_the_dingtalk_frame_loop_at_its_wait_point() {
+        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec!["*".into()]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let sink = futures_util::sink::drain::<Message>();
+        let stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+
+        let loop_fut = ch.run_frame_loop(sink, stream, tx, cancel.clone());
+        tokio::pin!(loop_fut);
+
+        // The loop must still be waiting on the stream: a regression that
+        // dropped the cancel arm would either return Ok(()) at once (if the
+        // stream ended) or block forever here — both visible below.
+        tokio::select! {
+            biased;
+            res = &mut loop_fut => {
+                panic!("the frame loop returned before cancellation: {res:?}")
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut loop_fut)
+            .await
+            .expect("frame loop must return well inside the shutdown grace")
+            .expect("cancellation must not end the frame loop in an error");
+        assert!(
+            rx.try_recv().is_err(),
+            "the frame loop must not emit a message when no frame arrives"
+        );
+    }
 
     /// THE plan's primary test. A socket error surfacing as `Ok(())` made the
     /// supervisor mark a health error *and* reset the backoff — so a reconnect
@@ -631,19 +722,19 @@ mod tests {
         let src = include_str!("dingtalk.rs");
         // Stop at the test module, so this test's own mentions do not count.
         let production = src.split("#[cfg(test)]").next().expect("source");
-        let listen_body = production
-            .split("async fn listen(")
+        let frame_loop_body = production
+            .split("async fn run_frame_loop<")
             .nth(1)
-            .expect("listen exists");
-        let ack_at = listen_body
+            .expect("run_frame_loop exists");
+        let ack_at = frame_loop_body
             .find("let _ = write.send(Message::Text(ack.to_string().into())).await;")
-            .expect("the ACK send is in listen");
-        let unauthorized_at = listen_body
+            .expect("the ACK send is in the frame loop");
+        let unauthorized_at = frame_loop_body
             .find("ignoring message from unauthorized user")
-            .expect("the allowlist filter is in listen");
-        let empty_at = listen_body
+            .expect("the allowlist filter is in the frame loop");
+        let empty_at = frame_loop_body
             .find("if content.is_empty()")
-            .expect("the empty-content filter is in listen");
+            .expect("the empty-content filter is in the frame loop");
         assert!(
             ack_at < unauthorized_at && ack_at < empty_at,
             "the ACK must be sent before any filter that can `continue`"

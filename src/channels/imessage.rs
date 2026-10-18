@@ -87,6 +87,22 @@ impl IMessageChannel {
         }
         true
     }
+
+    /// Wait for the next poll cycle, or end the listen loop if cancellation
+    /// fires first. `true` means a poll should run; `false` means the caller
+    /// must stop. `biased` makes cancellation win a tie against a sleep that
+    /// expires on the same poll, so shutdown completes inside the supervisor's
+    /// grace instead of paying for one more poll cycle.
+    async fn wait_for_next_poll(
+        cancel: &tokio_util::sync::CancellationToken,
+        poll_interval_secs: u64,
+    ) -> bool {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => false,
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(poll_interval_secs)) => true,
+        }
+    }
 }
 
 /// Escape a string for safe interpolation into `AppleScript`.
@@ -198,7 +214,7 @@ end tell"#
     async fn listen(
         &self,
         tx: mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         tracing::info!("iMessage channel listening (AppleScript bridge)...");
 
@@ -241,7 +257,16 @@ end tell"#
         let mut last_rowid = initial_rowid;
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(self.poll_interval_secs)).await;
+            // Wait for the next poll cycle or cancellation, whichever comes
+            // first. A cancellation that lands while the blocking SQLite poll
+            // below is running cannot interrupt it — that poll runs on a
+            // blocking thread and is bounded by its `LIMIT 20`, so shutdown
+            // waits at most one in-flight poll cycle, which is why the gate
+            // between cycles is enough.
+            if !Self::wait_for_next_poll(&cancel, self.poll_interval_secs).await {
+                tracing::info!("iMessage channel shutting down");
+                return Ok(());
+            }
 
             let since = last_rowid;
             let (returned_conn, poll_result) = tokio::task::spawn_blocking(
@@ -402,6 +427,41 @@ mod tests {
         let ch = IMessageChannel::new(vec!["+1234567890".into()]);
         assert_eq!(ch.allowed_contacts.read().len(), 1);
         assert_eq!(ch.poll_interval_secs, 3);
+    }
+
+    /// The poll gate honours cancellation instead of sleeping out a whole
+    /// interval. The database path is hard-coded to the macOS Messages
+    /// location, so `listen` cannot be driven directly here; the extracted
+    /// wait — the loop's only wait point — is driven against a poll interval
+    /// that would never fire during the test, standing in for the sleep
+    /// between two polls of a quiet database.
+    #[tokio::test]
+    async fn cancelling_stops_the_imessage_poll_wait_at_its_wait_point() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        // An hour-long interval: without the cancel arm this future could not
+        // finish inside the timeout below, so the last assertion is what
+        // proves the cancel arm is what fires.
+        let wait = IMessageChannel::wait_for_next_poll(&cancel, 3600);
+        tokio::pin!(wait);
+
+        // The gate must still be waiting before cancellation fires.
+        tokio::select! {
+            biased;
+            outcome = &mut wait => {
+                panic!("the poll wait finished before cancellation fired: {outcome}");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+
+        cancel.cancel();
+        let should_poll = tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
+            .await
+            .expect("poll wait must end well inside the shutdown grace");
+        assert!(
+            !should_poll,
+            "cancellation must end the wait and tell the loop to stop, not to poll again"
+        );
     }
 
     #[test]
