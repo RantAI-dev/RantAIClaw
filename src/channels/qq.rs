@@ -288,109 +288,45 @@ impl QQChannel {
             content: content.to_string(),
         })
     }
-}
 
-/// What [`QQChannel::classify_inbound`] decided about one dispatch event.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum QqInbound {
-    /// Not a message this channel routes: an event type we do not handle, or a
-    /// message with nothing in it.
-    Ignore,
-    Route(QqRouted),
-}
-
-/// A routable QQ message, before dedup, pairing, and the allowlist gate.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct QqRouted {
-    /// How to name this event in an operator-facing log line.
-    pub kind: &'static str,
-    /// The openid the allowlist and the agent both key on.
-    pub sender: String,
-    /// The reply anchor: `user:<openid>` for C2C, `group:<openid>` for a group.
-    pub chat_id: String,
-    pub content: String,
-}
-
-#[async_trait]
-impl Channel for QQChannel {
-    fn name(&self) -> &str {
-        "qq"
-    }
-
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let token = self.get_token().await?;
-
-        // QQ text bubbles render no markup — strip to readable text. Both the
-        // group and user bind points use the same rendered string.
-        let rendered = crate::channels::format::render_to_string(
-            &message.content,
-            &crate::channels::format::RenderTarget::Plain,
-        );
-
-        // Determine if this is a group or private message based on recipient format
-        // Format: "user:{openid}" or "group:{group_openid}"
-        let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
-            (
-                format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
-                json!({
-                    "content": &rendered,
-                    "msg_type": 0,
-                }),
-            )
-        } else {
-            let user_id = message
-                .recipient
-                .strip_prefix("user:")
-                .unwrap_or(&message.recipient);
-            (
-                format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
-                json!({
-                    "content": &rendered,
-                    "msg_type": 0,
-                }),
-            )
-        };
-
-        ensure_https(&url)?;
-
-        let resp = self
-            .http_client()
-            .post(&url)
-            .header("Authorization", format!("QQBot {token}"))
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send message failed ({status}): {err}");
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn listen(
+    /// Run the QQ gateway WebSocket session: the hello read, the identify,
+    /// and the main read loop, honouring cancellation at both wait points. The
+    /// gateway endpoint is a fixed host, so a test drives this directly with a
+    /// stream that never yields rather than standing up a fake gateway. On
+    /// cancellation the close frame the platform expects is sent before the
+    /// socket is dropped, and `Ok(())` is returned: cancellation is not a fault,
+    /// and an `Err` would escalate the supervisor's reconnect backoff.
+    async fn run_ws_session<W, S>(
         &self,
+        mut write: W,
+        mut read: S,
+        token: &str,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<()> {
-        tracing::info!("QQ: authenticating...");
-        let token = self.get_token().await?;
-
-        tracing::info!("QQ: fetching gateway URL...");
-        let gw_url = self.get_gateway_url(&token).await?;
-
-        tracing::info!("QQ: connecting to gateway WebSocket...");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&gw_url).await?;
-        let (mut write, mut read) = ws_stream.split();
-
-        // Read Hello (opcode 10)
-        let hello = read
-            .next()
-            .await
-            .ok_or(anyhow::anyhow!("QQ: no hello frame"))??;
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()>
+    where
+        W: futures_util::Sink<Message> + Unpin,
+        // The identify send propagates its error with `?` into `anyhow`, which
+        // only converts a real `std::error::Error`; the concrete WebSocket
+        // type always was one, and the generic extraction has to say so.
+        W::Error: std::error::Error + Send + Sync + 'static,
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        // Read Hello (opcode 10) — first wait point.
+        let hello = tokio::select! {
+            biased;
+            // `biased` puts cancellation first: a hello already buffered and a
+            // cancellation landing on the same poll resolves toward shutdown,
+            // so the close frame below still goes out inside the supervisor's
+            // grace period.
+            () = cancel.cancelled() => {
+                // Best effort: a dead or already-closed socket must not turn the deliberate `Ok(())` into an error.
+                let _ = write.send(Message::Close(None)).await;
+                return Ok(());
+            }
+            hello = read.next() => hello.ok_or(anyhow::anyhow!("QQ: no hello frame"))??,
+        };
         let hello_data: serde_json::Value = serde_json::from_str(&hello.to_string())?;
         let heartbeat_interval = hello_data
             .get("d")
@@ -436,6 +372,16 @@ impl Channel for QQChannel {
 
         loop {
             tokio::select! {
+                biased;
+                // `biased` puts cancellation first: a frame or heartbeat already
+                // buffered and a cancellation landing on the same poll resolves
+                // toward shutdown, so the close frame below still goes out inside
+                // the supervisor's grace period.
+                () = cancel.cancelled() => {
+                    // Best effort: a dead or already-closed socket must not turn the deliberate `Ok(())` into an error.
+                    let _ = write.send(Message::Close(None)).await;
+                    return Ok(());
+                }
                 _ = hb_rx.recv() => {
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
@@ -560,6 +506,105 @@ impl Channel for QQChannel {
 
         anyhow::bail!("QQ WebSocket connection closed")
     }
+}
+
+/// What [`QQChannel::classify_inbound`] decided about one dispatch event.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum QqInbound {
+    /// Not a message this channel routes: an event type we do not handle, or a
+    /// message with nothing in it.
+    Ignore,
+    Route(QqRouted),
+}
+
+/// A routable QQ message, before dedup, pairing, and the allowlist gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct QqRouted {
+    /// How to name this event in an operator-facing log line.
+    pub kind: &'static str,
+    /// The openid the allowlist and the agent both key on.
+    pub sender: String,
+    /// The reply anchor: `user:<openid>` for C2C, `group:<openid>` for a group.
+    pub chat_id: String,
+    pub content: String,
+}
+
+#[async_trait]
+impl Channel for QQChannel {
+    fn name(&self) -> &str {
+        "qq"
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let token = self.get_token().await?;
+
+        // QQ text bubbles render no markup — strip to readable text. Both the
+        // group and user bind points use the same rendered string.
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+
+        // Determine if this is a group or private message based on recipient format
+        // Format: "user:{openid}" or "group:{group_openid}"
+        let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
+            (
+                format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
+                json!({
+                    "content": &rendered,
+                    "msg_type": 0,
+                }),
+            )
+        } else {
+            let user_id = message
+                .recipient
+                .strip_prefix("user:")
+                .unwrap_or(&message.recipient);
+            (
+                format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
+                json!({
+                    "content": &rendered,
+                    "msg_type": 0,
+                }),
+            )
+        };
+
+        ensure_https(&url)?;
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("QQ send message failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        tracing::info!("QQ: authenticating...");
+        let token = self.get_token().await?;
+
+        tracing::info!("QQ: fetching gateway URL...");
+        let gw_url = self.get_gateway_url(&token).await?;
+
+        tracing::info!("QQ: connecting to gateway WebSocket...");
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&gw_url).await?;
+        let (write, read) = ws_stream.split();
+
+        self.run_ws_session(write, read, &token, tx, cancel).await
+    }
 
     fn apply_allowed_senders(&self, allowed: &[String]) {
         if let Ok(mut users) = self.allowed_users.write() {
@@ -580,6 +625,108 @@ mod tests {
     fn test_name() {
         let ch = QQChannel::new("id".into(), "secret".into(), vec![]);
         assert_eq!(ch.name(), "qq");
+    }
+
+    /// The gateway session honours cancellation while blocked on the initial
+    /// hello frame that never arrives. The gateway endpoint is a fixed host, so
+    /// the extracted session is driven directly against a stream that never
+    /// yields (standing in for a silent gateway) and a sink that swallows the
+    /// close frame without a real socket behind it. The hello read is the first
+    /// wait point and where the cancel arm fires here.
+    #[tokio::test]
+    async fn cancelling_stops_the_qq_gateway_session_at_its_hello_wait_point() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec!["*".into()]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let sink = futures_util::sink::drain::<Message>();
+        let stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+
+        let session = ch.run_ws_session(sink, stream, "fake-token", tx, cancel.clone());
+        tokio::pin!(session);
+
+        // The session must still be waiting on the hello: a regression that
+        // dropped the cancel arm would either return Ok(()) at once or block
+        // forever here — both visible below.
+        tokio::select! {
+            biased;
+            outcome = &mut session => {
+                panic!("the session finished before cancellation fired: {outcome:?}");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut session)
+            .await
+            .expect("session must return well inside the shutdown grace");
+        assert!(
+            result.is_ok(),
+            "cancellation must end the gateway session with Ok(()), not an error"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the session must not emit a message when no frame arrives"
+        );
+    }
+
+    /// Once the gateway is up, cancellation lands on the main loop's select —
+    /// over the heartbeat and the read — not on the hello read. This drives
+    /// that state with a stream that yields exactly one hello frame and then
+    /// never another: the session consumes the hello, identifies, and parks in
+    /// the main loop, so the cancel arm of the loop's select is the one that
+    /// must fire. Without that arm the session would hang until the supervisor
+    /// drops the future, past `LISTENER_SHUTDOWN_GRACE` — and the close frame
+    /// the platform expects would never go out. The hello arm cannot stand in
+    /// for it: it already fired (or did not) before the loop is reached.
+    #[tokio::test]
+    async fn cancelling_stops_the_qq_gateway_session_in_its_main_loop() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec!["*".into()]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let sink = futures_util::sink::drain::<Message>();
+        // The session parses the hello with `serde_json::from_str(&hello)`,
+        // which is the text payload itself, and reads `d.heartbeat_interval`
+        // off it (defaulting when absent) — one frame, then silence, so the
+        // read in the main loop can only ever pend.
+        let hello = Message::Text(
+            serde_json::json!({"op": 10, "d": {"heartbeat_interval": 41250}})
+                .to_string()
+                .into(),
+        );
+        let stream = futures_util::stream::iter(vec![Ok(hello)])
+            .chain(futures_util::stream::pending::<
+                Result<Message, tokio_tungstenite::tungstenite::Error>,
+            >());
+
+        let session = ch.run_ws_session(sink, stream, "fake-token", tx, cancel.clone());
+        tokio::pin!(session);
+
+        // The session must sit in the main loop with the hello already
+        // consumed: if it returned here it never reached the loop's select, so
+        // cancelling below would prove nothing about that arm.
+        tokio::select! {
+            biased;
+            outcome = &mut session => {
+                panic!("the session finished before entering the main loop: {outcome:?}");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
+
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut session)
+            .await
+            .expect("the main loop must end the session well inside the shutdown grace");
+        assert!(
+            result.is_ok(),
+            "cancellation in the main loop must end the session with Ok(()), not an \
+             error: an Err would escalate the supervisor's reconnect backoff"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the session must not emit a message when no dispatch frame arrives"
+        );
     }
 
     /// A direct message is keyed on `user_openid`, not on `author.id`. Getting
