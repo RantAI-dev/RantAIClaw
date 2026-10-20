@@ -1868,7 +1868,17 @@ async fn main() -> Result<()> {
             });
             // Standalone `gateway` command: no daemon supervisor to signal, so
             // no readiness Notify.
-            gateway::run_gateway(&host, port, config, shutdown, None, None, None).await
+            match gateway::run_gateway(&host, port, config, shutdown, None, None, None).await {
+                // A configuration-driven startup error (public-bind refusal,
+                // unparseable bind) exits EX_CONFIG so a systemd unit with
+                // RestartPreventExitStatus=78 does not restart it.
+                Err(e) if gateway::startup_exit_code(&e) == gateway::EX_CONFIG_EXIT_CODE => {
+                    eprintln!("Error: {e:#}");
+                    std::process::exit(gateway::EX_CONFIG_EXIT_CODE);
+                }
+                // Everything else keeps today's propagation: exit 1.
+                other => other,
+            }
         }
 
         Some(Commands::Daemon { port, host }) => {
@@ -1879,7 +1889,20 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting RantaiClaw Daemon on {host}:{port}");
             }
-            daemon::run(config, host, port).await
+            match daemon::run(config, host, port).await {
+                // A gateway startup error that follows from the config alone
+                // (bad tunnel/provider/memory/runtime settings) surfaced by the
+                // daemon supervisor exits EX_CONFIG so a systemd unit with
+                // RestartPreventExitStatus=78 leaves it stopped. AddrInUse
+                // after the retry budget stays exit 1, so systemd keeps
+                // retrying a port conflict.
+                Err(e) if gateway::startup_exit_code(&e) == gateway::EX_CONFIG_EXIT_CODE => {
+                    eprintln!("Error: {e:#}");
+                    std::process::exit(gateway::EX_CONFIG_EXIT_CODE);
+                }
+                // Everything else keeps today's propagation: exit 1.
+                other => other,
+            }
         }
 
         Some(Commands::Status) => {

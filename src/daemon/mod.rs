@@ -45,6 +45,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .channel_max_backoff_secs
         .max(initial_backoff);
 
+    // The state file the background writer flushes and the cleanup removes.
+    // Derived once here and passed into `drain_and_cleanup`, so teardown never
+    // re-derives it from the config (plan 591).
+    let state_file = state_file_path(&config);
+
     crate::health::mark_component_ok("daemon");
 
     // Auto-managed external services (e.g. SearXNG) — opt-in via
@@ -239,6 +244,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 handles,
                 &services,
                 &active_profile,
+                &state_file,
             )
             .await;
             return Err(e);
@@ -251,6 +257,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 handles,
                 &services,
                 &active_profile,
+                &state_file,
             )
             .await;
             return Ok(());
@@ -284,6 +291,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         handles,
         &services,
         &active_profile,
+        &state_file,
     )
     .await;
 
@@ -301,12 +309,17 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 /// state — HTTP requests, replies, long-poll offsets); the rest are aborted
 /// directly. Shared by the fatal-exit, early-shutdown, and normal-stop paths so
 /// teardown stays identical.
+///
+/// `state_file_path` is the `daemon_state.json` this daemon flushes (plan 591):
+/// once the state writer has been aborted AND awaited below, the file is
+/// removed — a reader must never describe a daemon that has stopped.
 async fn drain_and_cleanup(
     mut gateway_handle: JoinHandle<()>,
     channels_handle: Option<JoinHandle<()>>,
     handles: Vec<JoinHandle<()>>,
     services: &[Box<dyn crate::services::Service>],
     active_profile: &str,
+    state_file_path: &Path,
 ) {
     // One deadline for both drains, so the time the gateway does not use is
     // left to channels instead of lost.
@@ -342,6 +355,25 @@ async fn drain_and_cleanup(
         let _ = handle.await;
     }
 
+    // Plan 591: the state file must not outlive this daemon. The writer has
+    // been aborted AND awaited above, so no last flush can recreate the file
+    // after this point. Remove it plus any own-pid temp an interrupted atomic
+    // write (`write_state_file_atomic`) may have left; another pid's temp is
+    // not this daemon's to touch. A missing file is already the goal; any
+    // other failure is logged and left to the reader-side age rule
+    // (`read_live_state`) to cover.
+    let own_pid_tmp = state_file_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    for path in [state_file_path, own_pid_tmp.as_path()] {
+        if let Err(e) = tokio::fs::remove_file(path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %path.display(),
+                    "failed to remove daemon state file: {e}"
+                );
+            }
+        }
+    }
+
     // Stop auto-managed services after the supervised components are down, so
     // in-flight tool calls don't get a torn-down container mid-request.
     if !services.is_empty() {
@@ -356,8 +388,11 @@ async fn drain_and_cleanup(
 }
 
 /// How a failed gateway run should be treated by its supervisor.
+///
+/// `pub(crate)` so the gateway tests can classify a `run_gateway` error at
+/// this seam and pin the fatal/retry split end to end.
 #[derive(Debug, PartialEq, Eq)]
-enum GatewayFailure {
+pub(crate) enum GatewayFailure {
     /// Never retry — propagate so the process exits non-zero.
     Fatal,
     /// The port is occupied; retry a bounded number of times (a restart may just
@@ -370,7 +405,7 @@ enum GatewayFailure {
 /// Classify a gateway run error. A [`crate::gateway::GatewayStartupFatal`] in the
 /// chain is unrecoverable; an `EADDRINUSE` io-error is fatal-after-N; anything
 /// else is transient.
-fn classify_gateway_failure(e: &anyhow::Error) -> GatewayFailure {
+pub(crate) fn classify_gateway_failure(e: &anyhow::Error) -> GatewayFailure {
     if e.chain().any(|c| {
         c.downcast_ref::<crate::gateway::GatewayStartupFatal>()
             .is_some()
@@ -519,6 +554,24 @@ pub fn state_file_path_for(config_path: &Path) -> PathBuf {
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
         .join("daemon_state.json")
+}
+
+/// Read the daemon state file, but only while it can still be describing a
+/// live daemon. The state writer stamps `written_at` on every flush every
+/// `STATUS_FLUSH_SECONDS`, so a stamp older than three intervals belongs to a
+/// daemon that has since exited or crashed (cleanup removes the file on every
+/// exit path that runs, but a crash — SIGKILL, OOM — cannot). Returns the
+/// parsed state, or `None` for anything a reader must treat as "daemon not
+/// running": absent, unreadable, unparseable, or stale. The age rule lives
+/// only here — readers stay free of it.
+pub fn read_live_state(path: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let state: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let written_at = state.get("written_at")?.as_str()?;
+    let written_at = chrono::DateTime::parse_from_rfc3339(written_at).ok()?;
+    let max_age = chrono::Duration::seconds((STATUS_FLUSH_SECONDS * 3) as i64);
+    let age = chrono::Utc::now().signed_duration_since(written_at);
+    (age <= max_age).then_some(state)
 }
 
 /// Write the daemon state file atomically: serialize to a per-pid temp file in
@@ -751,7 +804,15 @@ mod tests {
             }
         });
 
-        drain_and_cleanup(gateway, Some(channels), Vec::new(), &[], "drain-test").await;
+        drain_and_cleanup(
+            gateway,
+            Some(channels),
+            Vec::new(),
+            &[],
+            "drain-test",
+            &home.path().join("daemon_state.json"),
+        )
+        .await;
 
         assert!(
             finished.load(std::sync::atomic::Ordering::SeqCst),
@@ -772,9 +833,76 @@ mod tests {
         let channels = tokio::spawn(tokio::time::sleep(Duration::from_mins(1)));
 
         let started = tokio::time::Instant::now();
-        drain_and_cleanup(gateway, Some(channels), Vec::new(), &[], "drain-test").await;
+        drain_and_cleanup(
+            gateway,
+            Some(channels),
+            Vec::new(),
+            &[],
+            "drain-test",
+            &home.path().join("daemon_state.json"),
+        )
+        .await;
 
         assert_eq!(started.elapsed(), Duration::from_secs(16));
+    }
+
+    /// Plan 591: nothing a reader can see may outlive this daemon. A real
+    /// state-writer handle (`handles[0]`, as `run` pushes it) has flushed at
+    /// least once — its first interval tick is immediate — before the drain
+    /// begins; after the writer is aborted AND awaited, the file and any
+    /// own-pid temp left by an interrupted atomic write must be gone (other
+    /// pids' temp files are not this daemon's to touch).
+    #[tokio::test]
+    async fn drain_and_cleanup_removes_the_state_file_after_the_writer_is_done() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+
+        let state_path = tmp.path().join("daemon_state.json");
+        let config = test_config(&tmp);
+        let writer = spawn_state_writer(config);
+        let flushed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::fs::try_exists(&state_path).await.unwrap_or(false) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            flushed.is_ok(),
+            "the state writer must flush to the state path before the drain"
+        );
+
+        let own_pid_tmp = state_path.with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&own_pid_tmp, br#"{"partial":true}"#).unwrap();
+        let other_pid_tmp =
+            state_path.with_extension(format!("json.tmp.{}", std::process::id() + 7));
+        std::fs::write(&other_pid_tmp, br#"{"other":true}"#).unwrap();
+
+        drain_and_cleanup(
+            tokio::spawn(async {}),
+            None,
+            vec![writer],
+            &[],
+            "drain-test",
+            &state_path,
+        )
+        .await;
+
+        assert!(
+            !state_path.exists(),
+            "drain_and_cleanup must remove daemon_state.json once the state writer is down"
+        );
+        assert!(
+            !own_pid_tmp.exists(),
+            "drain_and_cleanup must remove daemon_state.json.tmp.<own pid>"
+        );
+        assert!(
+            other_pid_tmp.exists(),
+            "another pid's temp file is not ours to remove"
+        );
     }
 
     /// One registry per process is a wiring fact with no behavioural test that
@@ -923,6 +1051,63 @@ mod tests {
             stopped.is_ok(),
             "supervisor did not stop promptly during backoff"
         );
+    }
+
+    /// The gateway supervisor, not the generic component one: a `[tunnel]
+    /// provider` value the factory cannot build follows from the config alone,
+    /// so the supervisor must send the error on `fatal_tx` once — `daemon::run`
+    /// exits non-zero — and then stop, instead of retrying the same `Config`
+    /// forever behind the "daemon started" banner. It is the `fatal_tx`
+    /// counterpart of `supervisor_marks_error_and_restart_on_failure`.
+    #[tokio::test]
+    async fn gateway_supervisor_sends_fatal_config_error_once_and_does_not_retry() {
+        let mut config = Config::default();
+        config.tunnel.provider = "cloudflared".into();
+
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, fatal_rx) = tokio::sync::oneshot::channel();
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
+
+        let handle = spawn_gateway_supervisor(
+            "127.0.0.1".to_string(),
+            0,
+            config,
+            shutdown.clone(),
+            std::sync::Arc::clone(&ready),
+            fatal_tx,
+            // Large backoff: the ONLY acceptable outcome is the fatal send; a
+            // retry loop would wait it out and the first expect below would not.
+            60,
+            60,
+            observer,
+            std::sync::Arc::new(crate::channels::ChannelBus::default()),
+        );
+
+        let e = tokio::time::timeout(Duration::from_secs(10), fatal_rx)
+            .await
+            .expect("the supervisor must send the fatal error promptly instead of retrying")
+            .expect("the sender must still be alive when the failure is fatal");
+
+        assert_eq!(
+            classify_gateway_failure(&e),
+            GatewayFailure::Fatal,
+            "the error must be classified fatal: {e:#}"
+        );
+        assert!(
+            e.to_string()
+                .contains(r#"[tunnel] provider = "cloudflared""#),
+            "the message must name the config key: {e:#}"
+        );
+
+        // No retry: after the fatal send the supervisor task must be DONE, not
+        // parked in a 60s backoff for the next attempt.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the supervisor must stop after a fatal error instead of retrying")
+            .expect("the supervisor task must not panic");
+        shutdown.cancel();
     }
 
     #[test]

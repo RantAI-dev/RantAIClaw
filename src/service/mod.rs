@@ -743,9 +743,16 @@ fn systemd_user_unit(
         systemd_escape_value(profile)
     );
     let _ = writeln!(service, "Environment=RANTAICLAW_UNIT=rantaiclaw.service");
+    // RestartPreventExitStatus=78 (EX_CONFIG): a daemon that exited because of a
+    // gateway/tunnel/other configuration error must NOT be started again every
+    // RestartSec=3 forever — systemd's default start limit (5 in 10s) is never
+    // reached at that rate. Port conflicts still exit 1 and keep restarting.
+    // (`systemd_user_unit` is the only systemd renderer in the codebase;
+    // launchd has no per-exit-code exclusion, so the plist keeps KeepAlive.)
     format!(
         "[Unit]\nDescription=RantaiClaw daemon\nAfter=network.target\n\n\
          [Service]\n{service}ExecStart={} daemon\nRestart=always\nRestartSec=3\n\
+         RestartPreventExitStatus=78\n\
          KillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=30\n\n\
          [Install]\nWantedBy=default.target\n",
         systemd_escape_value(&exe.display().to_string())
@@ -1860,6 +1867,10 @@ mod tests {
         let unit = systemd_user_unit(Path::new("/x/rantaiclaw"), None, None, "default");
         for needle in [
             "Restart=always\n",
+            "RestartSec=3\n",
+            // A configuration-error exit must NOT be restarted back to life:
+            // 78 = EX_CONFIG, what a GatewayStartupFatal exits with.
+            "RestartPreventExitStatus=78\n",
             "KillSignal=SIGTERM\n",
             "KillMode=mixed\n",
             "TimeoutStopSec=30\n",
