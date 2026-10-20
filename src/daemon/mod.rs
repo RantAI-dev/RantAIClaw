@@ -356,8 +356,11 @@ async fn drain_and_cleanup(
 }
 
 /// How a failed gateway run should be treated by its supervisor.
+///
+/// `pub(crate)` so the gateway tests can classify a `run_gateway` error at
+/// this seam and pin the fatal/retry split end to end.
 #[derive(Debug, PartialEq, Eq)]
-enum GatewayFailure {
+pub(crate) enum GatewayFailure {
     /// Never retry — propagate so the process exits non-zero.
     Fatal,
     /// The port is occupied; retry a bounded number of times (a restart may just
@@ -370,7 +373,7 @@ enum GatewayFailure {
 /// Classify a gateway run error. A [`crate::gateway::GatewayStartupFatal`] in the
 /// chain is unrecoverable; an `EADDRINUSE` io-error is fatal-after-N; anything
 /// else is transient.
-fn classify_gateway_failure(e: &anyhow::Error) -> GatewayFailure {
+pub(crate) fn classify_gateway_failure(e: &anyhow::Error) -> GatewayFailure {
     if e.chain().any(|c| {
         c.downcast_ref::<crate::gateway::GatewayStartupFatal>()
             .is_some()
@@ -923,6 +926,63 @@ mod tests {
             stopped.is_ok(),
             "supervisor did not stop promptly during backoff"
         );
+    }
+
+    /// The gateway supervisor, not the generic component one: a `[tunnel]
+    /// provider` value the factory cannot build follows from the config alone,
+    /// so the supervisor must send the error on `fatal_tx` once — `daemon::run`
+    /// exits non-zero — and then stop, instead of retrying the same `Config`
+    /// forever behind the "daemon started" banner. It is the `fatal_tx`
+    /// counterpart of `supervisor_marks_error_and_restart_on_failure`.
+    #[tokio::test]
+    async fn gateway_supervisor_sends_fatal_config_error_once_and_does_not_retry() {
+        let mut config = Config::default();
+        config.tunnel.provider = "cloudflared".into();
+
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, fatal_rx) = tokio::sync::oneshot::channel();
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
+
+        let handle = spawn_gateway_supervisor(
+            "127.0.0.1".to_string(),
+            0,
+            config,
+            shutdown.clone(),
+            std::sync::Arc::clone(&ready),
+            fatal_tx,
+            // Large backoff: the ONLY acceptable outcome is the fatal send; a
+            // retry loop would wait it out and the first expect below would not.
+            60,
+            60,
+            observer,
+            std::sync::Arc::new(crate::channels::ChannelBus::default()),
+        );
+
+        let e = tokio::time::timeout(Duration::from_secs(10), fatal_rx)
+            .await
+            .expect("the supervisor must send the fatal error promptly instead of retrying")
+            .expect("the sender must still be alive when the failure is fatal");
+
+        assert_eq!(
+            classify_gateway_failure(&e),
+            GatewayFailure::Fatal,
+            "the error must be classified fatal: {e:#}"
+        );
+        assert!(
+            e.to_string()
+                .contains(r#"[tunnel] provider = "cloudflared""#),
+            "the message must name the config key: {e:#}"
+        );
+
+        // No retry: after the fatal send the supervisor task must be DONE, not
+        // parked in a 60s backoff for the next attempt.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the supervisor must stop after a fatal error instead of retrying")
+            .expect("the supervisor task must not panic");
+        shutdown.cancel();
     }
 
     #[test]
