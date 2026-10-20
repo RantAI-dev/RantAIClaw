@@ -158,7 +158,7 @@ hostname = "0.4.2"
 rustls = "0.23"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.10"
 
 # TUI framework
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
