@@ -498,6 +498,9 @@ Notes:
 
 Each provider gets its own subsection (`[tunnel.cloudflare]`,
 `[tunnel.ngrok]`, `[tunnel.custom]`), required when that provider is selected.
+An unknown `provider` name, or a missing required provider section, is a startup
+error: the daemon stops at start with a message naming the key and does not
+retry.
 
 **A tunnel does not authorise a public bind.** Every provider proxies
 `localhost:<port>`, so the gateway stays on `127.0.0.1` and the tunnel reaches

@@ -66,7 +66,7 @@ rantaiclaw usage
 | Config validity | `rantaiclaw doctor` | no critical errors |
 | Channel connectivity | `rantaiclaw channel doctor` | configured channels healthy |
 | Runtime summary | `rantaiclaw status` | expected provider/model/channels |
-| Daemon heartbeat/state | `~/.rantaiclaw/daemon_state.json` | file updates periodically |
+| Daemon heartbeat/state | `~/.rantaiclaw/daemon_state.json` | file updates periodically; it is removed when the daemon stops, and a file older than ~15 seconds is treated as "daemon not running" (relevant after a crash) |
 | Session persistence | `rantaiclaw session list` or `GET /api/v1/sessions` | recent CLI/TUI/API turns are listed |
 
 ## Session Persistence Checks
@@ -111,6 +111,15 @@ covers every `Client/*` target.
 ```bash
 journalctl --user -u rantaiclaw.service -f
 ```
+
+## Daemon Stops With Exit Code 78
+
+A daemon that exits with code 78 (`EX_CONFIG`) stopped for a configuration error in the gateway
+or tunnel settings; the stop message names the setting. systemd units rendered by current versions
+carry `RestartPreventExitStatus=78`, so systemd does not restart the daemon — fix the config and
+start the service again. On launchd (macOS) the job is restarted anyway: launchd cannot exclude a
+single exit code, so it applies its own throttling and the reason is in
+`~/.rantaiclaw/logs/daemon.stderr.log`.
 
 ## Stopping and Restarting
 
