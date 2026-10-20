@@ -58,6 +58,13 @@ pub struct SelectorPrefs {
     /// Recognised: `npm` | `pnpm` | `yarn`. Unknown values fall through
     /// to `npm`.
     pub node_manager: String,
+    /// Whether the recipe runner may write progress lines to stdout.
+    /// `false` for the TUI and the agent tool, which own the terminal or
+    /// the tool result respectively; only the CLI (which owns stdout for
+    /// the command) sets it. Failures are always reported through the
+    /// returned error, never through stdout, so a silent caller still
+    /// learns why a recipe failed.
+    pub progress: bool,
 }
 
 impl Default for SelectorPrefs {
@@ -65,12 +72,14 @@ impl Default for SelectorPrefs {
         Self {
             prefer_brew: true,
             node_manager: "npm".to_string(),
+            progress: false,
         }
     }
 }
 
 impl SelectorPrefs {
-    /// Build from a `[skills.install]` config block.
+    /// Build from a `[skills.install]` config block. Progress output stays
+    /// off; a caller that owns the terminal opts in explicitly.
     pub fn from_config(cfg: &crate::config::SkillsInstallConfig) -> Self {
         Self {
             prefer_brew: cfg.prefer_brew,
@@ -79,6 +88,7 @@ impl SelectorPrefs {
             } else {
                 cfg.node_manager.clone()
             },
+            progress: false,
         }
     }
 }
@@ -146,14 +156,16 @@ pub fn install_deps_for_with_prefs(
     }
 
     let recipe = preferred[0];
-    println!(
-        "→ {}: running `{}` recipe ({})",
-        skill.name,
-        recipe.kind,
-        recipe.label.as_str()
-    );
+    if prefs.progress {
+        println!(
+            "→ {}: running `{}` recipe ({})",
+            skill.name,
+            recipe.kind,
+            recipe.label.as_str()
+        );
+    }
 
-    run_recipe(recipe, &skill.name)
+    run_recipe(recipe, &skill.name, prefs.progress)
         .with_context(|| format!("recipe `{}` failed for {}", recipe.kind, skill.name))?;
 
     // Re-validate.
@@ -246,65 +258,68 @@ fn pick_preferred_with_prefs<'a>(
     ranked
 }
 
-fn run_recipe(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
+fn run_recipe(recipe: &SkillInstallRecipe, slug: &str, progress: bool) -> Result<()> {
     match recipe.kind.as_str() {
-        "brew" => run_brew(recipe),
-        "uv" => run_uv(recipe),
-        "npm" | "node" => run_npm(recipe),
-        "pnpm" => run_pnpm(recipe),
-        "yarn" => run_yarn(recipe),
-        "go" => run_go(recipe),
-        "download" => run_download(recipe, slug),
+        "brew" => run_brew(recipe, progress),
+        "uv" => run_uv(recipe, progress),
+        "npm" | "node" => run_npm(recipe, progress),
+        "pnpm" => run_pnpm(recipe, progress),
+        "yarn" => run_yarn(recipe, progress),
+        "go" => run_go(recipe, progress),
+        "download" => run_download(recipe, slug, progress),
         other => bail!("unsupported install kind `{other}`"),
     }
 }
 
-fn run_brew(recipe: &SkillInstallRecipe) -> Result<()> {
+fn run_brew(recipe: &SkillInstallRecipe, progress: bool) -> Result<()> {
     let formula = recipe
         .formula
         .as_ref()
         .ok_or_else(|| anyhow!("brew recipe missing `formula`"))?;
-    run_subprocess("brew", &["install", formula])
+    run_subprocess("brew", &["install", formula], progress)
 }
 
-fn run_uv(recipe: &SkillInstallRecipe) -> Result<()> {
+fn run_uv(recipe: &SkillInstallRecipe, progress: bool) -> Result<()> {
     let pkg = recipe
         .pkg
         .as_ref()
         .ok_or_else(|| anyhow!("uv recipe missing `pkg`"))?;
-    run_subprocess("uv", &["tool", "install", pkg])
+    run_subprocess("uv", &["tool", "install", pkg], progress)
 }
 
-fn run_npm(recipe: &SkillInstallRecipe) -> Result<()> {
+fn run_npm(recipe: &SkillInstallRecipe, progress: bool) -> Result<()> {
     let pkg = recipe
         .pkg
         .as_ref()
         .ok_or_else(|| anyhow!("npm recipe missing `pkg`"))?;
-    run_subprocess("npm", &["install", "-g", pkg])
+    run_subprocess("npm", &["install", "-g", pkg], progress)
 }
 
-fn run_pnpm(recipe: &SkillInstallRecipe) -> Result<()> {
+fn run_pnpm(recipe: &SkillInstallRecipe, progress: bool) -> Result<()> {
     let pkg = recipe
         .pkg
         .as_ref()
         .ok_or_else(|| anyhow!("pnpm recipe missing `pkg`"))?;
-    run_subprocess("pnpm", &["add", "-g", pkg])
+    run_subprocess("pnpm", &["add", "-g", pkg], progress)
 }
 
-fn run_yarn(recipe: &SkillInstallRecipe) -> Result<()> {
+fn run_yarn(recipe: &SkillInstallRecipe, progress: bool) -> Result<()> {
     let pkg = recipe
         .pkg
         .as_ref()
         .ok_or_else(|| anyhow!("yarn recipe missing `pkg`"))?;
-    run_subprocess("yarn", &["global", "add", pkg])
+    run_subprocess("yarn", &["global", "add", pkg], progress)
 }
 
-fn run_go(recipe: &SkillInstallRecipe) -> Result<()> {
+fn run_go(recipe: &SkillInstallRecipe, progress: bool) -> Result<()> {
     // OpenClaw bootstraps Go via brew when go is missing; mirror that.
     if which::which("go").is_err() {
         if which::which("brew").is_ok() {
-            println!("  · `go` not found, bootstrapping via brew first");
-            run_subprocess("brew", &["install", "go"]).context("bootstrap go via brew")?;
+            if progress {
+                println!("  · `go` not found, bootstrapping via brew first");
+            }
+            run_subprocess("brew", &["install", "go"], progress)
+                .context("bootstrap go via brew")?;
         } else {
             bail!("go recipe needs `go` on PATH (or brew to bootstrap it)");
         }
@@ -313,7 +328,7 @@ fn run_go(recipe: &SkillInstallRecipe) -> Result<()> {
         .module
         .as_ref()
         .ok_or_else(|| anyhow!("go recipe missing `module`"))?;
-    run_subprocess("go", &["install", module])
+    run_subprocess("go", &["install", module], progress)
 }
 
 /// Resolve the directory a `download` recipe may write into.
@@ -356,7 +371,7 @@ fn verify_sha256(body: &[u8], expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
+fn run_download(recipe: &SkillInstallRecipe, slug: &str, progress: bool) -> Result<()> {
     let url = recipe
         .url
         .as_ref()
@@ -365,18 +380,20 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
     std::fs::create_dir_all(&target_dir)
         .with_context(|| format!("create target dir {}", target_dir.display()))?;
 
-    println!("  · downloading {url}");
+    if progress {
+        println!("  · downloading {url}");
+    }
     let bytes = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_mins(2))
         .build()
         .context("build reqwest client")?
         .get(url)
         .send()
-        .context("download GET")?
+        .with_context(|| format!("download GET {url}"))?
         .error_for_status()
-        .context("download HTTP status")?
+        .with_context(|| format!("download HTTP status for {url}"))?
         .bytes()
-        .context("download body")?;
+        .with_context(|| format!("download body from {url}"))?;
 
     if let Some(expected) = recipe.sha256.as_deref() {
         if !expected.is_empty() {
@@ -387,9 +404,21 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
 
     match recipe.archive.as_deref() {
         Some("tar.gz" | "tgz") => {
-            extract_targz(&bytes, &target_dir, recipe.strip_components.unwrap_or(0))?;
+            extract_targz(
+                &bytes,
+                &target_dir,
+                recipe.strip_components.unwrap_or(0),
+                progress,
+            )?;
         }
-        Some("zip") => extract_zip(&bytes, &target_dir, recipe.strip_components.unwrap_or(0))?,
+        Some("zip") => {
+            extract_zip(
+                &bytes,
+                &target_dir,
+                recipe.strip_components.unwrap_or(0),
+                progress,
+            )?;
+        }
         Some("tar.bz2") => {
             bail!("tar.bz2 archives not yet supported")
         }
@@ -410,15 +439,17 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
         Some(other) => bail!("unsupported archive type `{other}`"),
     }
 
-    println!("  · placed in {}", target_dir.display());
-    println!(
-        "  · ⚠ make sure `{}` is on your $PATH",
-        target_dir.display()
-    );
+    if progress {
+        println!("  · placed in {}", target_dir.display());
+        println!(
+            "  · ⚠ make sure `{}` is on your $PATH",
+            target_dir.display()
+        );
+    }
     Ok(())
 }
 
-fn extract_targz(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
+fn extract_targz(bytes: &[u8], dest: &Path, strip: usize, progress: bool) -> Result<()> {
     let archive = write_archive_bytes(bytes, dest, "download.tar.gz")?;
     let list = archive_entries("tar", &["-tzf", archive.to_string_lossy().as_ref()])?;
     validate_archive_entries(&list)?;
@@ -433,13 +464,14 @@ fn extract_targz(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
             dest.to_string_lossy().as_ref(),
             strip_arg.as_str(),
         ],
+        progress,
     )
     .context("extract tar.gz download")?;
     let _ = std::fs::remove_file(archive);
     Ok(())
 }
 
-fn extract_zip(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
+fn extract_zip(bytes: &[u8], dest: &Path, strip: usize, progress: bool) -> Result<()> {
     let archive = write_archive_bytes(bytes, dest, "download.zip")?;
     let list = archive_entries("unzip", &["-Z1", archive.to_string_lossy().as_ref()])
         .context("list zip entries (is `unzip` on PATH?)")?;
@@ -454,6 +486,7 @@ fn extract_zip(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
                 "-d",
                 dest.to_string_lossy().as_ref(),
             ],
+            progress,
         )
         .context("extract zip download")?;
     } else {
@@ -472,6 +505,7 @@ fn extract_zip(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
                 "-d",
                 staging.to_string_lossy().as_ref(),
             ],
+            progress,
         )
         .context("extract zip download to staging")?;
         move_stripped_entries(&staging, dest, strip)?;
@@ -558,14 +592,45 @@ fn move_stripped_entry(path: &Path, root: &Path, dest: &Path, strip: usize) -> R
     Ok(())
 }
 
-fn run_subprocess(cmd: &str, args: &[&str]) -> Result<()> {
-    println!("  $ {cmd} {}", args.join(" "));
-    let status = Command::new(cmd)
+/// Spawn `cmd` and report its failure through the returned error.
+///
+/// Output is captured rather than inherited so the error can carry the
+/// tool's own diagnosis: the exit status plus the last 20 lines of stderr
+/// (or of stdout when stderr is empty — some tools report there). A caller
+/// that does not own the terminal (`progress = false`, i.e. the TUI and the
+/// agent tool) never sees the child's output streamed onto its screen.
+///
+/// The captured output is deliberately discarded on success, for the CLI
+/// too: the caller already prints the `$ <cmd> <args>` line before the child
+/// runs and the per-skill outcome line after it, so a long `brew install`
+/// still shows which command is running instead of reading like a hang.
+/// Package managers can emit hundreds of lines, and echoing them on success
+/// would bury that outcome line and double the noise for `--all`. On failure
+/// the cause matters, so it travels in the error instead.
+fn run_subprocess(cmd: &str, args: &[&str], progress: bool) -> Result<()> {
+    if progress {
+        println!("  $ {cmd} {}", args.join(" "));
+    }
+    let output = Command::new(cmd)
         .args(args)
-        .status()
+        .output()
         .with_context(|| format!("spawn {cmd}"))?;
-    if !status.success() {
-        bail!("`{cmd} {}` exited with {}", args.join(" "), status);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.as_ref()
+        } else {
+            stderr.as_ref()
+        };
+        let lines: Vec<&str> = detail.lines().collect();
+        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+        let mut message = format!("`{cmd} {}` exited with {}", args.join(" "), output.status);
+        if !tail.is_empty() {
+            message.push('\n');
+            message.push_str(&tail);
+        }
+        bail!(message);
     }
     Ok(())
 }
@@ -790,11 +855,52 @@ mod tests {
         let dest = temp.path().join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         let bytes = std::fs::read(&archive).unwrap();
-        extract_targz(&bytes, &dest, 1).unwrap();
+        extract_targz(&bytes, &dest, 1, false).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dest.join("bin/tool")).unwrap(),
             "ok"
+        );
+    }
+
+    /// A failing driver must hand back its own diagnosis: the exit status
+    /// and the last lines of stderr. With the inherited-output call
+    /// (`Command::status`) the error only said "exited with …" and the
+    /// `EACCES` that explains the failure was lost.
+    #[cfg(unix)]
+    #[test]
+    fn install_deps_failing_recipe_error_carries_exit_status_and_stderr() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake_npm = bin_dir.path().join("npm");
+        std::fs::write(
+            &fake_npm,
+            "#!/bin/sh\necho 'EACCES: permission denied' >&2\nexit 243\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let previous_path = std::env::var("PATH").unwrap_or_default();
+        let _path = crate::test_env::EnvGuard::set(
+            "PATH",
+            format!("{}:{previous_path}", bin_dir.path().display()),
+        );
+
+        let mut recipe = r("npm");
+        recipe.pkg = Some("rantaiclaw-probe-pkg".into());
+
+        let err = run_recipe(&recipe, "probe", false)
+            .expect_err("a driver that exits 243 must fail the recipe");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("243"),
+            "error must carry the exit status: {text}"
+        );
+        assert!(
+            text.contains("EACCES"),
+            "error must carry the driver's last stderr lines: {text}"
         );
     }
 }

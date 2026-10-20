@@ -2175,88 +2175,139 @@ pub(crate) fn handle_command(
             .map_err(|_| anyhow::anyhow!("inspect thread panicked"))?
         }
         crate::SkillCommands::InstallDeps { slug, all } => {
-            let with_status = load_skills_with_status(workspace_dir, config);
-
-            // Build the list of (skill, missing-bins) targets.
-            let targets: Vec<&Skill> = if all {
-                with_status
-                    .iter()
-                    .filter(|(s, _)| !s.requires.bins.is_empty())
-                    .map(|(s, _)| s)
-                    .collect()
-            } else if let Some(s) = slug.as_ref() {
-                let found = with_status
-                    .iter()
-                    .find(|(skill, _)| skill.name.eq_ignore_ascii_case(s))
-                    .map(|(skill, _)| skill);
-                match found {
-                    Some(s) => vec![s],
-                    None => anyhow::bail!("skill `{s}` not found"),
-                }
-            } else {
-                anyhow::bail!("`skills install-deps` needs either a slug or --all");
-            };
-
-            if targets.is_empty() {
-                println!("Nothing to do — no skills declare binary requirements.");
-                return Ok(());
-            }
-
-            let mut had_failure = false;
-            for skill in &targets {
-                if skill.install_recipes.is_empty() {
-                    if !skill.requires.bins.is_empty() {
-                        let missing: Vec<&str> = skill
-                            .requires
-                            .bins
-                            .iter()
-                            .filter(|b| which::which(b).is_err())
-                            .map(|b| b.as_str())
-                            .collect();
-                        if !missing.is_empty() {
-                            println!(
-                                "⊘ {}: missing {} but no install recipes declared — install manually",
-                                skill.name,
-                                missing.join(", ")
-                            );
-                        }
-                    }
-                    continue;
-                }
-                let prefs = install_deps::SelectorPrefs::from_config(&config.skills.install);
-                match install_deps::install_deps_for_with_prefs(skill, &prefs) {
-                    Ok(outcome) if outcome.success() => {
-                        println!(
-                            "  {} {}: installed {}",
-                            console::style("✓").green().bold(),
-                            outcome.skill,
-                            outcome.bins_installed.join(", ")
-                        );
-                    }
-                    Ok(outcome) if outcome.recipe_used.is_none() => {
-                        println!("  · {}: deps already satisfied", outcome.skill);
-                    }
-                    Ok(outcome) => {
-                        had_failure = true;
-                        println!(
-                            "  ✗ {}: recipe ran but {} still missing",
-                            outcome.skill,
-                            outcome.bins_still_missing.join(", ")
-                        );
-                    }
-                    Err(e) => {
-                        had_failure = true;
-                        println!("  ✗ {}: {e}", skill.name);
-                    }
-                }
-            }
-
-            if had_failure {
-                anyhow::bail!("one or more install-deps runs failed");
-            }
-            Ok(())
+            run_install_deps_command(workspace_dir, config, slug, all)
         }
     }
+}
+
+/// Run `skills install-deps` for one skill or for every skill that declares
+/// binary requirements.
+///
+/// Extracted from [`handle_command`] so the CLI arm and its tests share one
+/// entry point. The recipe runners block (`reqwest::blocking` for `download`,
+/// `Command` for the package managers), and `handle_command` is called from
+/// the thread `#[tokio::main]` started; building a blocking `reqwest` client
+/// there panics with "Cannot drop a runtime in a context where blocking is
+/// not allowed". The per-skill work therefore runs on a fresh OS thread —
+/// the same pattern the `Update` and `Inspect` arms use. One thread for the
+/// whole command, rather than one per skill, keeps the printed lines in the
+/// order the targets are processed.
+///
+/// Exit status: `Ok(())` only when every targeted skill has every required
+/// binary on `$PATH` afterwards. A skill with a missing binary and no recipe,
+/// and a recipe that failed or left a binary missing, all return `Err` after
+/// the remaining targets have been attempted.
+pub(crate) fn run_install_deps_command(
+    workspace_dir: &Path,
+    config: &crate::config::Config,
+    slug: Option<String>,
+    all: bool,
+) -> Result<()> {
+    let with_status = load_skills_with_status(workspace_dir, config);
+
+    // Build the list of target skills. `--all` covers every skill that
+    // declares binaries, gated or not: the point is to make them installable.
+    let targets: Vec<Skill> = if all {
+        with_status
+            .iter()
+            .filter(|(s, _)| !s.requires.bins.is_empty())
+            .map(|(s, _)| s)
+            .cloned()
+            .collect()
+    } else if let Some(s) = slug.as_ref() {
+        let found = with_status
+            .iter()
+            .find(|(skill, _)| skill.name.eq_ignore_ascii_case(s))
+            .map(|(skill, _)| skill.clone());
+        match found {
+            Some(s) => vec![s],
+            None => anyhow::bail!("skill `{s}` not found"),
+        }
+    } else {
+        anyhow::bail!("`skills install-deps` needs either a slug or --all");
+    };
+
+    if targets.is_empty() {
+        println!("Nothing to do — no skills declare binary requirements.");
+        return Ok(());
+    }
+
+    let install_config = config.skills.install.clone();
+    std::thread::spawn(move || run_install_deps_targets(&targets, &install_config))
+        .join()
+        .map_err(|_| anyhow::anyhow!("install-deps thread panicked"))?
+}
+
+/// Run the recipes for `targets`. Reached only through
+/// [`run_install_deps_command`]'s dedicated OS thread, never directly from
+/// the async runtime.
+fn run_install_deps_targets(
+    targets: &[Skill],
+    install_config: &crate::config::SkillsInstallConfig,
+) -> Result<()> {
+    let mut prefs = install_deps::SelectorPrefs::from_config(install_config);
+    // The CLI owns the terminal for this command, so it keeps the progress
+    // lines. The TUI and the agent tool build their prefs from config and
+    // stay silent.
+    prefs.progress = true;
+
+    let mut had_failure = false;
+    for skill in targets {
+        if skill.install_recipes.is_empty() {
+            if !skill.requires.bins.is_empty() {
+                let missing: Vec<&str> = skill
+                    .requires
+                    .bins
+                    .iter()
+                    .filter(|b| which::which(b).is_err())
+                    .map(|b| b.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    // Exiting 0 here would tell a script the dependency is
+                    // installed when it is not.
+                    had_failure = true;
+                    println!(
+                        "⊘ {}: missing {} but no install recipes declared — install manually",
+                        skill.name,
+                        missing.join(", ")
+                    );
+                }
+            }
+            continue;
+        }
+        match install_deps::install_deps_for_with_prefs(skill, &prefs) {
+            Ok(outcome) if outcome.success() => {
+                println!(
+                    "  {} {}: installed {}",
+                    console::style("✓").green().bold(),
+                    outcome.skill,
+                    outcome.bins_installed.join(", ")
+                );
+            }
+            Ok(outcome) if outcome.recipe_used.is_none() => {
+                println!("  · {}: deps already satisfied", outcome.skill);
+            }
+            Ok(outcome) => {
+                had_failure = true;
+                println!(
+                    "  ✗ {}: recipe ran but {} still missing",
+                    outcome.skill,
+                    outcome.bins_still_missing.join(", ")
+                );
+            }
+            Err(e) => {
+                had_failure = true;
+                // `{e:#}` keeps the context chain, which now carries the
+                // recipe's exit status and last error lines.
+                println!("  ✗ {}: {e:#}", skill.name);
+            }
+        }
+    }
+
+    if had_failure {
+        anyhow::bail!("one or more install-deps runs failed");
+    }
+    Ok(())
 }
 
 /// Resolves `name`, flips its `enabled` flag via [`set_skill_enabled`], and
@@ -4024,6 +4075,266 @@ description = "Bare minimum"
         assert_eq!(
             decrypted, "plaintext-test-secret",
             "secret must decrypt back to its original plaintext"
+        );
+    }
+
+    // --- `skills install-deps` CLI entry point (plan 596) ----------------
+
+    /// Serve `body` for every GET on a loopback listener. Same shape as
+    /// [`spawn_mock_clawhub`]: a blocking `std::net::TcpListener` on its own
+    /// OS thread, so no caller needs a runtime. Returns the base URL.
+    fn spawn_mock_file(body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { break };
+                let mut buf = [0u8; 4096];
+                if sock.read(&mut buf).is_err() {
+                    continue;
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(&body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Write `<root>/<slug>/SKILL.md` whose frontmatter carries `metadata`,
+    /// the single-line JSON blob the loader parses for `requires` and
+    /// `install[]`.
+    fn write_probe_skill(root: &Path, slug: &str, metadata: &str) {
+        let skill_dir = root.join(slug);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {slug}\ndescription: install-deps probe\nmetadata: {metadata}\n---\n# {slug}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Where a `download` recipe for `slug` places its files, resolved the
+    /// same way the runner does (`install_deps::resolve_target_dir` is
+    /// private). Call only while the data-dir env guard is in scope.
+    fn download_target_dir(slug: &str) -> PathBuf {
+        directories::ProjectDirs::from("", "", "rantaiclaw")
+            .expect("project dirs")
+            .data_dir()
+            .join("tools")
+            .join(slug)
+    }
+
+    /// The CLI writes recipes' progress lines to stdout because it owns the
+    /// terminal. On the async thread `handle_command` runs on, the blocking
+    /// HTTP client inside a `download` recipe panics; the entry point must
+    /// move the recipe work to an OS thread.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_deps_download_recipe_from_cli_entry_point_does_not_panic_and_installs_bin() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+
+        let target_dir = download_target_dir("download-probe");
+        let previous_path = std::env::var("PATH").unwrap_or_default();
+        let _path = crate::test_env::EnvGuard::set(
+            "PATH",
+            format!("{}:{previous_path}", target_dir.display()),
+        );
+
+        let body = b"#!/bin/sh\necho download-probe\n".to_vec();
+        let base = spawn_mock_file(body.clone());
+        let metadata = format!(
+            r#"{{"clawdbot":{{"requires":{{"bins":["rantaiclaw-download-probe"]}},"install":[{{"kind":"download","url":"{base}/rantaiclaw-download-probe","sha256":"{}"}}]}}}}"#,
+            sha256_hex(&body)
+        );
+        write_probe_skill(
+            &workspace.path().join("skills"),
+            "download-probe",
+            &metadata,
+        );
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.skills.open_skills_enabled = false;
+
+        let result = run_install_deps_command(
+            workspace.path(),
+            &config,
+            Some("download-probe".to_string()),
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "download recipe through the CLI entry point failed: {result:?}"
+        );
+
+        let installed = target_dir.join("rantaiclaw-download-probe");
+        assert!(
+            installed.is_file(),
+            "downloaded bin missing at {}",
+            installed.display()
+        );
+    }
+
+    /// The failure must name the check that failed, and nothing may be
+    /// written before the hash is verified.
+    #[cfg(unix)]
+    #[test]
+    fn install_deps_download_with_wrong_sha256_errors_and_leaves_no_executable() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let data = tempfile::tempdir().unwrap();
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data.path().to_string_lossy());
+
+        let body = b"#!/bin/sh\necho wrong-hash-probe\n".to_vec();
+        let base = spawn_mock_file(body);
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let metadata = format!(
+            r#"{{"clawdbot":{{"requires":{{"bins":["rantaiclaw-wrong-hash-probe"]}},"install":[{{"kind":"download","url":"{base}/rantaiclaw-wrong-hash-probe","sha256":"{wrong}"}}]}}}}"#
+        );
+        write_probe_skill(&workspace_dir.join("skills"), "wrong-hash-probe", &metadata);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let with_status = load_skills_with_status(&workspace_dir, &config);
+        let (skill, _) = with_status
+            .iter()
+            .find(|(s, _)| s.name == "wrong-hash-probe")
+            .expect("probe skill present");
+
+        let err = install_deps::install_deps_for_with_prefs(
+            skill,
+            &install_deps::SelectorPrefs::default(),
+        )
+        .expect_err("a wrong sha256 must fail the recipe");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("integrity check failed"),
+            "error must name the integrity check: {text}"
+        );
+
+        let installed = download_target_dir("wrong-hash-probe").join("rantaiclaw-wrong-hash-probe");
+        assert!(
+            !installed.exists(),
+            "nothing may be written before the hash matches: {}",
+            installed.display()
+        );
+    }
+
+    /// A missing binary with no recipe is a failure, not a no-op: a script
+    /// that runs this must see a non-zero exit.
+    #[test]
+    fn install_deps_command_missing_bin_without_recipe_returns_error() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        write_probe_skill(
+            &workspace_dir.join("skills"),
+            "needs-manual",
+            r#"{"clawdbot":{"requires":{"bins":["rantaiclaw-manual-probe"]}}}"#,
+        );
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let result = run_install_deps_command(
+            &workspace_dir,
+            &config,
+            Some("needs-manual".to_string()),
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "a missing bin with no recipe must return Err (non-zero exit), got {result:?}"
+        );
+    }
+
+    /// A skill whose declared binaries are all present is still a success.
+    #[cfg(unix)]
+    #[test]
+    fn install_deps_command_all_bins_present_returns_ok() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        write_probe_skill(
+            &workspace_dir.join("skills"),
+            "deps-present",
+            r#"{"clawdbot":{"requires":{"bins":["sh"]}}}"#,
+        );
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let result = run_install_deps_command(
+            &workspace_dir,
+            &config,
+            Some("deps-present".to_string()),
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "all bins present must return Ok (exit 0), got {result:?}"
+        );
+    }
+
+    /// `--all` attempts every target, then fails once: the unsatisfiable
+    /// skill sets the failure, and the satisfiable one still runs its recipe.
+    #[cfg(unix)]
+    #[test]
+    fn install_deps_all_reports_failure_and_processes_every_skill() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let npm = bin_dir.path().join("npm");
+        fs::write(
+            &npm,
+            "#!/bin/sh\nDIR=\"$(dirname \"$0\")\"\nprintf '#!/bin/sh\\nexit 0\\n' > \"$DIR/rantaiclaw-fake-npm-bin\"\nchmod +x \"$DIR/rantaiclaw-fake-npm-bin\"\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let previous_path = std::env::var("PATH").unwrap_or_default();
+        let _path = EnvVarGuard::set(
+            "PATH",
+            &format!("{}:{previous_path}", bin_dir.path().display()),
+        );
+
+        let skills_root = workspace_dir.join("skills");
+        write_probe_skill(
+            &skills_root,
+            "needs-manual",
+            r#"{"clawdbot":{"requires":{"bins":["rantaiclaw-manual-probe"]}}}"#,
+        );
+        write_probe_skill(
+            &skills_root,
+            "needs-npm",
+            r#"{"clawdbot":{"requires":{"bins":["rantaiclaw-fake-npm-bin"]},"install":[{"kind":"npm","pkg":"rantaiclaw-probe-pkg"}]}}"#,
+        );
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let result = run_install_deps_command(&workspace_dir, &config, None, true);
+        assert!(
+            result.is_err(),
+            "one unsatisfiable skill must make --all fail, got {result:?}"
+        );
+        assert!(
+            bin_dir.path().join("rantaiclaw-fake-npm-bin").exists(),
+            "the satisfiable skill must still have been processed"
         );
     }
 }
