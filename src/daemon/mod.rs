@@ -45,6 +45,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .channel_max_backoff_secs
         .max(initial_backoff);
 
+    // The state file the background writer flushes and the cleanup removes.
+    // Derived once here and passed into `drain_and_cleanup`, so teardown never
+    // re-derives it from the config (plan 591).
+    let state_file = state_file_path(&config);
+
     crate::health::mark_component_ok("daemon");
 
     // Auto-managed external services (e.g. SearXNG) — opt-in via
@@ -239,6 +244,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 handles,
                 &services,
                 &active_profile,
+                &state_file,
             )
             .await;
             return Err(e);
@@ -251,6 +257,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 handles,
                 &services,
                 &active_profile,
+                &state_file,
             )
             .await;
             return Ok(());
@@ -284,6 +291,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         handles,
         &services,
         &active_profile,
+        &state_file,
     )
     .await;
 
@@ -301,12 +309,17 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 /// state — HTTP requests, replies, long-poll offsets); the rest are aborted
 /// directly. Shared by the fatal-exit, early-shutdown, and normal-stop paths so
 /// teardown stays identical.
+///
+/// `state_file_path` is the `daemon_state.json` this daemon flushes (plan 591):
+/// once the state writer has been aborted AND awaited below, the file is
+/// removed — a reader must never describe a daemon that has stopped.
 async fn drain_and_cleanup(
     mut gateway_handle: JoinHandle<()>,
     channels_handle: Option<JoinHandle<()>>,
     handles: Vec<JoinHandle<()>>,
     services: &[Box<dyn crate::services::Service>],
     active_profile: &str,
+    state_file_path: &Path,
 ) {
     // One deadline for both drains, so the time the gateway does not use is
     // left to channels instead of lost.
@@ -340,6 +353,25 @@ async fn drain_and_cleanup(
     }
     for handle in handles {
         let _ = handle.await;
+    }
+
+    // Plan 591: the state file must not outlive this daemon. The writer has
+    // been aborted AND awaited above, so no last flush can recreate the file
+    // after this point. Remove it plus any own-pid temp an interrupted atomic
+    // write (`write_state_file_atomic`) may have left; another pid's temp is
+    // not this daemon's to touch. A missing file is already the goal; any
+    // other failure is logged and left to the reader-side age rule
+    // (`read_live_state`) to cover.
+    let own_pid_tmp = state_file_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    for path in [state_file_path, own_pid_tmp.as_path()] {
+        if let Err(e) = tokio::fs::remove_file(path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %path.display(),
+                    "failed to remove daemon state file: {e}"
+                );
+            }
+        }
     }
 
     // Stop auto-managed services after the supervised components are down, so
@@ -522,6 +554,24 @@ pub fn state_file_path_for(config_path: &Path) -> PathBuf {
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
         .join("daemon_state.json")
+}
+
+/// Read the daemon state file, but only while it can still be describing a
+/// live daemon. The state writer stamps `written_at` on every flush every
+/// `STATUS_FLUSH_SECONDS`, so a stamp older than three intervals belongs to a
+/// daemon that has since exited or crashed (cleanup removes the file on every
+/// exit path that runs, but a crash — SIGKILL, OOM — cannot). Returns the
+/// parsed state, or `None` for anything a reader must treat as "daemon not
+/// running": absent, unreadable, unparseable, or stale. The age rule lives
+/// only here — readers stay free of it.
+pub fn read_live_state(path: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let state: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let written_at = state.get("written_at")?.as_str()?;
+    let written_at = chrono::DateTime::parse_from_rfc3339(written_at).ok()?;
+    let max_age = chrono::Duration::seconds((STATUS_FLUSH_SECONDS * 3) as i64);
+    let age = chrono::Utc::now().signed_duration_since(written_at);
+    (age <= max_age).then_some(state)
 }
 
 /// Write the daemon state file atomically: serialize to a per-pid temp file in
@@ -754,7 +804,15 @@ mod tests {
             }
         });
 
-        drain_and_cleanup(gateway, Some(channels), Vec::new(), &[], "drain-test").await;
+        drain_and_cleanup(
+            gateway,
+            Some(channels),
+            Vec::new(),
+            &[],
+            "drain-test",
+            &home.path().join("daemon_state.json"),
+        )
+        .await;
 
         assert!(
             finished.load(std::sync::atomic::Ordering::SeqCst),
@@ -775,9 +833,76 @@ mod tests {
         let channels = tokio::spawn(tokio::time::sleep(Duration::from_mins(1)));
 
         let started = tokio::time::Instant::now();
-        drain_and_cleanup(gateway, Some(channels), Vec::new(), &[], "drain-test").await;
+        drain_and_cleanup(
+            gateway,
+            Some(channels),
+            Vec::new(),
+            &[],
+            "drain-test",
+            &home.path().join("daemon_state.json"),
+        )
+        .await;
 
         assert_eq!(started.elapsed(), Duration::from_secs(16));
+    }
+
+    /// Plan 591: nothing a reader can see may outlive this daemon. A real
+    /// state-writer handle (`handles[0]`, as `run` pushes it) has flushed at
+    /// least once — its first interval tick is immediate — before the drain
+    /// begins; after the writer is aborted AND awaited, the file and any
+    /// own-pid temp left by an interrupted atomic write must be gone (other
+    /// pids' temp files are not this daemon's to touch).
+    #[tokio::test]
+    async fn drain_and_cleanup_removes_the_state_file_after_the_writer_is_done() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+
+        let state_path = tmp.path().join("daemon_state.json");
+        let config = test_config(&tmp);
+        let writer = spawn_state_writer(config);
+        let flushed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::fs::try_exists(&state_path).await.unwrap_or(false) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            flushed.is_ok(),
+            "the state writer must flush to the state path before the drain"
+        );
+
+        let own_pid_tmp = state_path.with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&own_pid_tmp, br#"{"partial":true}"#).unwrap();
+        let other_pid_tmp =
+            state_path.with_extension(format!("json.tmp.{}", std::process::id() + 7));
+        std::fs::write(&other_pid_tmp, br#"{"other":true}"#).unwrap();
+
+        drain_and_cleanup(
+            tokio::spawn(async {}),
+            None,
+            vec![writer],
+            &[],
+            "drain-test",
+            &state_path,
+        )
+        .await;
+
+        assert!(
+            !state_path.exists(),
+            "drain_and_cleanup must remove daemon_state.json once the state writer is down"
+        );
+        assert!(
+            !own_pid_tmp.exists(),
+            "drain_and_cleanup must remove daemon_state.json.tmp.<own pid>"
+        );
+        assert!(
+            other_pid_tmp.exists(),
+            "another pid's temp file is not ours to remove"
+        );
     }
 
     /// One registry per process is a wiring fact with no behavioural test that
