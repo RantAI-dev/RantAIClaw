@@ -175,6 +175,19 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # webpki-roots v0.26.11 — RUSTSEC-2026-0381, emSign root removed from the
+    # bundled root list. The advisory matches 0.26.11 by version number only:
+    # 0.26.x is a wrapper that depends on `webpki-roots` 1.x, the crate that
+    # actually ships the root list, and that dependency is held at >= 1.0.10 by
+    # the Cargo.toml floor and locked at 1.0.10 in Cargo.lock — so the root list
+    # every build actually embeds is the patched one with no emSign root. There
+    # is no patched 0.26.x release; the wrapper stays because tokio-tungstenite
+    # still requests ^0.26.
+    #
+    # REVIEW BY: drop this waiver when tokio-tungstenite or axum moves to
+    # webpki-roots 1.x (checked 2026-10-20: tokio-tungstenite 0.30.0 still
+    # requests ^0.26), and remove the 0.26.11 entry from Cargo.lock with it.
+    "RUSTSEC-2026-0381",
 ]
 
 [licenses]
