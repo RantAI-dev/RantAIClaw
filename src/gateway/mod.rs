@@ -1127,6 +1127,7 @@ pub async fn run_gateway(
         )))
     })?;
     let mut tunnel_url: Option<String> = None;
+    let mut tunnel_started = false;
 
     // Not wrapped unless the bind was refused outright: `AddrInUse` and every
     // other io error stay raw here so the supervisor can classify them
@@ -1221,6 +1222,7 @@ pub async fn run_gateway(
             Ok(url) => {
                 println!("🌐 Tunnel active: {url}");
                 tunnel_url = Some(url);
+                tunnel_started = true;
             }
             Err(e) => {
                 // Not a fallback: the listener is already bound and serving.
@@ -1290,6 +1292,23 @@ pub async fn run_gateway(
     // serving ended cleanly or with an error, so a supervised restart never
     // stacks another live watcher on top.
     reloader_shutdown.cancel();
+
+    // The tunnel stops with the gateway on every path that reaches here, Ok or
+    // Err, in this one place instead of one call per return. `tunnel_started`
+    // keeps a failed start from resetting anything it never set up. A failing
+    // stop is logged and never hides the serve error.
+    //
+    // `kill_on_drop(true)` on every provider stays the backstop for the ABORT
+    // path only: `drain_and_cleanup` aborts this task after `DRAIN_TIMEOUT` and
+    // an aborted future cannot run async cleanup.
+    if tunnel_started {
+        if let Some(ref tun) = tunnel {
+            if let Err(e) = tun.stop().await {
+                tracing::warn!(provider = tun.name(), error = %e, "tunnel stop failed");
+            }
+        }
+    }
+
     serve_result?;
 
     Ok(())
@@ -3069,6 +3088,88 @@ mod tests {
             message.contains("[tunnel.cloudflare] section is missing"),
             "the message must say which section to add: {message}"
         );
+    }
+
+    /// The tunnel process must be stopped through `Tunnel::stop()` when
+    /// `run_gateway` returns, not left to `kill_on_drop`'s SIGKILL: the fake
+    /// custom provider traps TERM and writes a marker, so the marker exists
+    /// only if stop() ran and sent SIGTERM. Its pid must be gone afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_gateway_stops_the_tunnel_when_the_gateway_returns() {
+        use crate::config::schema::CustomTunnelConfig;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("sigterm");
+        let pid_file = dir.path().join("pid");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "rantaiclaw-tunnel",
+            &format!(
+                "#!/bin/sh\ntrap 'echo sigterm > {}; exit 0' TERM\necho $$ > {}\necho 'url=https://rantaiclaw_tunnel.test'\nwhile :; do sleep 0.2; done\n",
+                marker.display(),
+                pid_file.display()
+            ),
+        );
+
+        let mut config = crate::config::Config::default();
+        config.tunnel.provider = "custom".into();
+        config.tunnel.custom = Some(CustomTunnelConfig {
+            start_command: format!("{} {{port}}", fake.display()),
+            health_url: None,
+            url_pattern: Some("rantaiclaw_tunnel.test".into()),
+        });
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let gateway = tokio::spawn(super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            shutdown.clone(),
+            None,
+            None,
+            None,
+        ));
+
+        // The fake writes its pid after installing the TERM trap, so once the
+        // file appears a SIGTERM cannot slip in before the trap is armed.
+        let pid = wait_for_pid_file(&pid_file).await;
+
+        shutdown.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), gateway)
+            .await
+            .expect("run_gateway must return after the shutdown token is cancelled")
+            .expect("the gateway task must not panic");
+        result.expect("a shutdown on request is a clean exit");
+
+        assert!(
+            marker.exists(),
+            "the tunnel must receive SIGTERM through stop(), not SIGKILL on drop"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "the tunnel child must be gone after the gateway returns: pid {pid}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        // Signal 0 only probes for existence; the child was reaped by stop().
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the fake tunnel never wrote its pid to {}", path.display());
     }
 
     /// An unknown `default_provider` follows from the config alone — the

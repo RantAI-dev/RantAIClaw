@@ -68,11 +68,53 @@ pub(crate) fn new_shared_process() -> SharedProcess {
     Arc::new(Mutex::new(None))
 }
 
-/// Kill a shared tunnel process if running.
+/// How long a tunnel child gets to exit after SIGTERM before it is killed.
+/// Fits well inside the daemon's `DRAIN_TIMEOUT` (16 s).
+#[cfg(unix)]
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Stop a shared tunnel process if running.
+///
+/// On Unix the child gets SIGTERM first so it can clean up (tailscale's own
+/// serve/funnel reset already ran before this), then SIGKILL once
+/// [`STOP_GRACE`] passes, then it is reaped. A child that exits on SIGTERM
+/// never waits for the bound.
 pub(crate) async fn kill_shared(proc: &SharedProcess) -> Result<()> {
     let mut guard = proc.lock().await;
     if let Some(ref mut tp) = *guard {
+        #[cfg(unix)]
+        {
+            let mut exited = false;
+            if let Some(pid) = tp.child.id() {
+                // Safety: `pid` is a live child of this process; SIGTERM to it
+                // is the intended stop signal and carries no memory safety
+                // requirement.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+
+                let deadline = tokio::time::Instant::now() + STOP_GRACE;
+                loop {
+                    // `Ok(None)` means still running; any other result means
+                    // it is gone (or can no longer be polled).
+                    if !matches!(tp.child.try_wait(), Ok(None)) {
+                        exited = true;
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+
+            if !exited {
+                tp.child.start_kill().ok();
+            }
+        }
+        #[cfg(not(unix))]
         tp.child.kill().await.ok();
+
         tp.child.wait().await.ok();
     }
     *guard = None;
@@ -391,10 +433,89 @@ mod tests {
             });
         }
 
+        let started = tokio::time::Instant::now();
         kill_shared(&proc).await.unwrap();
+        let elapsed = started.elapsed();
 
         let guard = proc.lock().await;
         assert!(guard.is_none());
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a child that exits on SIGTERM must not wait out the grace bound: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        // Signal 0 only probes for existence. The child was reaped by
+        // `kill_shared`, so a live pid here would mean it survived.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("fake program never wrote its pid to {}", path.display());
+    }
+
+    /// A child that ignores SIGTERM must still be dead once the grace bound
+    /// passes: SIGTERM first (the trap records it), then SIGKILL, then reap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_shared_sigkills_a_child_that_ignores_sigterm_within_the_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let term_file = dir.path().join("term");
+        let fake = write_fake_program(
+            dir.path(),
+            "stubborn",
+            &format!(
+                "#!/bin/sh\ntrap 'echo term > {}' TERM\necho $$ > {}\nwhile :; do sleep 0.2; done\n",
+                term_file.display(),
+                pid_file.display()
+            ),
+        );
+
+        let child = Command::new(&fake)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the stubborn fake should spawn");
+        let pid = wait_for_pid_file(&pid_file).await;
+
+        let proc = new_shared_process();
+        {
+            let mut guard = proc.lock().await;
+            *guard = Some(TunnelProcess {
+                child,
+                public_url: "https://example.test".into(),
+            });
+        }
+
+        let started = tokio::time::Instant::now();
+        kill_shared(&proc).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            term_file.exists(),
+            "SIGTERM must be tried before SIGKILL: the child never saw it"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "SIGKILL must land within the 2 s bound plus margin: {elapsed:?}"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "the child must be dead after kill_shared: pid {pid}"
+        );
     }
 
     #[tokio::test]
