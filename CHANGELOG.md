@@ -222,6 +222,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   iMessage poll that slept on, and a CLI session stuck at its stdin wait. Each listen path now returns
   inside the grace after that teardown: DingTalk and QQ send `Close(None)` first, IRC sends `QUIT`, the
   iMessage poll gate ends the loop, and the CLI loop returns at its stdin wait.
+- `skills install-deps` no longer panics on a `download` recipe run from the CLI. The
+  recipe driver called `reqwest::blocking` on the async CLI thread, where blocking is
+  refused; the recipe work now runs off that thread. A failing recipe's message carries
+  the command, its exit status and the last 20 lines of the tool's stderr (or of stdout
+  when stderr is empty), so an `EACCES` from `npm` reaches the operator instead of a bare
+  `exited with 243`. The command exits non-zero when a targeted skill's required binaries
+  are still missing at the end, including when the skill declares no recipe — that case
+  previously printed only `install manually` and exited 0. Recipe progress output is now
+  gated to the CLI, so the TUI and the agent tool no longer print a running recipe onto
+  the TUI screen or into the tool result.
 - A configuration error in the gateway or tunnel settings made the supervisor retry the gateway forever
   behind a "started" banner: an unknown tunnel `provider` name, for example, failed identically on every
   retry. The daemon now stops with a message naming the setting and exits with code 78 (`EX_CONFIG`), and
