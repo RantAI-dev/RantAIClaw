@@ -89,6 +89,8 @@ rantaiclaw setup skills                # multi-select picker
 rantaiclaw setup mcp                   # 9-server curated picker
 ```
 
+ClawHub installs require a `sha256` for every file in the version manifest. A version that lists a file without a valid 64-hex hash is refused before anything is fetched, and the refusal names the file; `skills update` keeps the installed version instead. Skills already on disk are not re-verified or changed by this check.
+
 ```toml
 [skills.entries.web-search]
 enabled = true
