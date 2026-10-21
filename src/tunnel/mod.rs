@@ -113,8 +113,7 @@ const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Stop a shared tunnel process if running.
 ///
-/// On Unix the child gets SIGTERM first so it can clean up (tailscale's own
-/// serve/funnel reset already ran before this), then SIGKILL once
+/// On Unix the child gets SIGTERM first so it can clean up, then SIGKILL once
 /// [`STOP_GRACE`] passes, then it is reaped. A child that exits on SIGTERM
 /// never waits for the bound.
 pub(crate) async fn kill_shared(proc: &SharedProcess) -> Result<()> {
@@ -133,11 +132,17 @@ pub(crate) async fn kill_shared(proc: &SharedProcess) -> Result<()> {
 
                 let deadline = tokio::time::Instant::now() + STOP_GRACE;
                 loop {
-                    // `Ok(None)` means still running; any other result means
-                    // it is gone (or can no longer be polled).
-                    if !matches!(tp.child.try_wait(), Ok(None)) {
-                        exited = true;
-                        break;
+                    // `Ok(None)` means still running, `Ok(Some(_))` means it is
+                    // gone. An error means it can no longer be polled, so the
+                    // kill below settles it instead of waiting for a process
+                    // that may never exit.
+                    match tp.child.try_wait() {
+                        Ok(Some(_)) => {
+                            exited = true;
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
                     }
                     if tokio::time::Instant::now() >= deadline {
                         break;

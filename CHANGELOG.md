@@ -247,8 +247,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child was killed when the value was dropped, never sent `SIGTERM` and never waited for, and
   `tailscale serve reset` never ran. The gateway now calls `stop()` after serving ends, on the clean and
   error paths alike; it sends `SIGTERM`, waits up to two seconds, then sends `SIGKILL` and reaps the child.
-  Tailscale's `serve` or `funnel` configuration is reset before the kill, so a funnel does not stay
-  published after the gateway is gone.
+  Stopping the gateway stops the tailscale process, and tailscale drops the foreground serve config itself;
+  the serve and funnel config the operator set up for other services on that node is left alone.
+- The gateway no longer reports a cloudflared help link or a Tailscale admin link as its public URL. The
+  QUIC library cloudflared uses prints a GitHub wiki link before it registers, and `tailscale serve` prints
+  its admin enable link when Serve or Funnel is not enabled on the tailnet. The wiki link was taken for
+  the tunnel's address and the tunnel was called ready; the admin link was reported as the address. A
+  cloudflared tunnel now reports no URL at all, and a tailscale tunnel reports the line whose host is this
+  node's `Self.DNSName`.
 - A tunnel that failed to start reported `No such file or directory (os error 2)` without saying which
   program was missing. Every spawn and output error now names the program, and its subcommand when there is
   one, and never an auth token. A non-zero `ngrok config add-authtoken` now fails the start, instead of

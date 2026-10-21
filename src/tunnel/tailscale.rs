@@ -9,13 +9,16 @@ use tokio::process::Command;
 /// How long `tailscale serve|funnel` gets to print the URL it publishes.
 const URL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The host part of a URL, for the confirmation below.
-fn url_host(url: &str) -> &str {
+/// The host part of a URL, lowercased and without the root dot, so it can be
+/// compared with `Self.DNSName`.
+fn url_host(url: &str) -> String {
     url.strip_prefix("https://")
         .unwrap_or(url)
         .split(['/', ':'])
         .next()
         .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 /// Tailscale Tunnel — uses `tailscale serve` (tailnet-only) or
@@ -50,12 +53,13 @@ impl TailscaleTunnel {
 
     /// `Self.DNSName` from `status --json`, read before serving.
     ///
-    /// It only ever CONFIRMS the URL that `serve`/`funnel` prints: the
-    /// reported value is the provider's own output, never this. Reading it
-    /// first makes a machine with no tailnet DNS name fail here, with an
-    /// error naming the program, instead of publishing a URL the gateway
-    /// cannot check. A missing or empty field, or JSON that does not parse, is
-    /// an error — never `localhost`.
+    /// It is the only host whose URL this tunnel may report: the name is
+    /// tailscale's own name for this node, so the address that serves this
+    /// gateway is the one whose host is that name. Reading it first makes a
+    /// machine with no tailnet DNS name fail here, with an error naming the
+    /// program, instead of publishing a URL the gateway cannot check. A
+    /// missing or empty field, or JSON that does not parse, is an error —
+    /// never `localhost`.
     async fn status_dns_name(&self) -> Result<String> {
         let output = Command::new(&self.program)
             .args(["status", "--json"])
@@ -96,13 +100,12 @@ impl Tunnel for TailscaleTunnel {
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<Option<String>> {
         let subcommand = if self.funnel { "funnel" } else { "serve" };
 
-        // The URL the gateway reports is the one serve|funnel prints. A
-        // configured hostname, or `Self.DNSName` when there is none, is only
-        // used below to confirm it.
-        let expected_host = match self.hostname.as_deref() {
-            Some(host) => host.trim_end_matches('.').to_string(),
-            None => self.status_dns_name().await?,
-        };
+        // This node's own DNS name, read on every start. It is the only host
+        // whose URL this tunnel may report: any other link on the output —
+        // the admin enable link tailscale prints when Serve or Funnel is not
+        // enabled on the tailnet — is not this tunnel's address.
+        let dns_name = self.status_dns_name().await?;
+        let expected_host = dns_name.to_ascii_lowercase();
 
         // tailscale serve|funnel <port>. It prints the URL on stdout and then
         // stays in the foreground, so it is never waited for.
@@ -131,6 +134,10 @@ impl Tunnel for TailscaleTunnel {
         // with the port trimmed because it serves on 443. The local port is
         // never appended.
         let mut public_url = None;
+        // The first other link tailscale printed, kept for the error message.
+        // It is tailscale's own link, never a secret.
+        let mut other_url = None;
+        let mut closed = false;
         let deadline = tokio::time::Instant::now() + URL_TIMEOUT;
         while tokio::time::Instant::now() < deadline {
             let line =
@@ -140,12 +147,24 @@ impl Tunnel for TailscaleTunnel {
                 Ok(Ok(Some(l))) => {
                     tracing::debug!("{}: {l}", self.program);
                     if let Some(url) = url_in(&l, "https://") {
-                        public_url = Some(url);
-                        break;
+                        if url_host(&url) == expected_host {
+                            public_url = Some(url);
+                            break;
+                        }
+                        // Some other link: the admin enable link tailscale
+                        // prints when Serve or Funnel is not enabled yet. It
+                        // waits for an admin, so keep reading for this node's
+                        // own URL.
+                        if other_url.is_none() {
+                            other_url = Some(url);
+                        }
                     }
                 }
                 // The command closed stdout or exited before printing a URL.
-                Ok(Ok(None)) => break,
+                Ok(Ok(None)) => {
+                    closed = true;
+                    break;
+                }
                 Ok(Err(e)) => bail!("Error reading {} output: {e}", self.program),
                 Err(_) => {} // timeout on this line, keep trying
             }
@@ -158,24 +177,42 @@ impl Tunnel for TailscaleTunnel {
                 child.wait().await.ok();
                 // Never a local or constructed address: the gateway reports
                 // only what the provider printed.
-                bail!(
-                    "{} ({subcommand_port}) did not print its public URL within {} s — \
-                     is Tailscale running and signed in?",
-                    self.program,
-                    URL_TIMEOUT.as_secs()
-                );
+                let base = if closed {
+                    format!(
+                        "{} ({subcommand_port}) exited before printing its public URL",
+                        self.program
+                    )
+                } else {
+                    format!(
+                        "{} ({subcommand_port}) did not print its public URL within {} s",
+                        self.program,
+                        URL_TIMEOUT.as_secs()
+                    )
+                };
+                let message = match other_url {
+                    Some(other) => format!(
+                        "{base} — it printed {other} instead, which is tailscale's own link: \
+                         Serve or Funnel may need enabling in the Tailscale admin console"
+                    ),
+                    None => format!("{base} — is Tailscale running and signed in?"),
+                };
+                bail!("{message}");
             }
         };
 
         // Confirmation only: a warning, never a correction, because the
-        // printed URL is the provider's own answer.
-        let reported_host = url_host(&public_url);
-        if !reported_host.eq_ignore_ascii_case(&expected_host) {
-            tracing::warn!(
-                expected = %expected_host,
-                reported = %public_url,
-                "tailscale's published URL does not match the configured or reported hostname"
-            );
+        // reported URL is the provider's own answer. The configured hostname
+        // never selects or replaces it.
+        if let Some(configured) = self.hostname.as_deref() {
+            let configured = configured.trim_end_matches('.');
+            if !configured.eq_ignore_ascii_case(&dns_name) {
+                tracing::warn!(
+                    configured = %configured,
+                    dns_name = %dns_name,
+                    reported = %public_url,
+                    "the configured tailscale hostname differs from the DNS name of this node"
+                );
+            }
         }
 
         {
@@ -197,30 +234,11 @@ impl Tunnel for TailscaleTunnel {
     }
 
     async fn stop(&self) -> Result<()> {
-        // Also reset the tailscale serve/funnel published config. A failed
-        // reset must not keep the process alive — the kill below still runs —
-        // but it is worth a warning that names the program it ran.
-        let subcommand = if self.funnel { "funnel" } else { "serve" };
-        match Command::new(&self.program)
-            .args([subcommand, "reset"])
-            .output()
-            .await
-        {
-            Ok(output) if !output.status.success() => tracing::warn!(
-                program = %self.program,
-                subcommand,
-                status = %output.status,
-                "tailscale reset failed; stopping the tunnel process anyway"
-            ),
-            Err(error) => tracing::warn!(
-                program = %self.program,
-                subcommand,
-                error = %error,
-                "tailscale reset failed; stopping the tunnel process anyway"
-            ),
-            Ok(_) => {}
-        }
-
+        // Nothing else to undo. `tailscale serve|funnel` runs in the
+        // foreground, and tailscale drops that config when the process ends.
+        // A reset writes an empty ServeConfig and removes every serve and
+        // funnel handler on the node, including the ones the operator set up
+        // for other services, so it is not run here.
         kill_shared(&self.proc).await
     }
 
@@ -246,6 +264,35 @@ impl Tunnel for TailscaleTunnel {
 mod tests {
     use super::*;
 
+    /// Captures everything logged while the returned guard is alive.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogBuffer {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("buffer lock").clone()).expect("utf-8 log")
+        }
+    }
+
     #[test]
     fn constructor_stores_hostname_and_mode() {
         let tunnel = TailscaleTunnel::new(true, Some("myhost.tailnet.ts.net".into()));
@@ -267,8 +314,8 @@ mod tests {
 
     #[tokio::test]
     async fn stop_without_started_process_is_ok() {
-        // Never the real `tailscale`: stop() runs `serve reset`, and this
-        // machine's tailscale is a live daemon.
+        // Never the real `tailscale`: this machine's tailscale is a live
+        // daemon, and a stop must never reach outside the gateway.
         let dir = tempfile::tempdir().expect("tempdir");
         let fake =
             crate::tunnel::write_fake_program(dir.path(), "tailscale", "#!/bin/sh\nexit 0\n");
@@ -279,14 +326,19 @@ mod tests {
     }
 
     /// A missing binary must be diagnosable: the serve spawn error names the
-    /// program and the subcommand.
+    /// program and the subcommand. The fake answers `status --json` and then
+    /// removes itself, so the `serve` spawn that follows finds no program to
+    /// run.
     #[tokio::test]
     async fn missing_program_serve_error_names_the_program() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("tailscale");
-        // A hostname skips `status --json`, so this is the serve spawn.
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "tailscale",
+            "#!/bin/sh\nif [ \"$1\" = \"status\" ]; then echo '{\"Self\":{\"DNSName\":\"node.tailnet.ts.net.\"}}'; rm -f \"$0\"; exit 0; fi\nexit 0\n",
+        );
         let tunnel = TailscaleTunnel::new(false, Some("rantaiclaw_node".into()))
-            .with_program(missing.to_str().expect("utf-8 temp path"));
+            .with_program(fake.to_str().expect("utf-8 temp path"));
 
         let err = tunnel
             .start("127.0.0.1", 8080)
@@ -295,7 +347,7 @@ mod tests {
 
         let message = format!("{err:#}");
         assert!(
-            message.contains(missing.to_str().expect("utf-8 temp path")),
+            message.contains(fake.to_str().expect("utf-8 temp path")),
             "the error must name the program it tried to run: {message}"
         );
         assert!(
@@ -329,65 +381,204 @@ mod tests {
         );
     }
 
-    /// stop() must reset the published serve config through the configured
-    /// program, before it stops the child — never through a `PATH` lookup.
+    /// stop() ends the process the gateway started and nothing else. The
+    /// serve and funnel config of the node belongs to the operator: a reset
+    /// writes an empty ServeConfig and removes every handler on the node,
+    /// including the ones the operator set up for other services. The fake
+    /// logs every invocation, so a reset would show up in the log.
     #[cfg(unix)]
     #[tokio::test]
-    async fn stop_resets_serve_through_the_configured_program() {
+    async fn stop_runs_no_command_beyond_the_serve_it_started() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("argv.log");
         let fake = crate::tunnel::write_fake_program(
             dir.path(),
             "tailscale",
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n[ \"$2\" = \"reset\" ] && exit 0\necho 'Available within your tailnet:'\necho 'https://rantaiclaw_node.tailnet.ts.net'\nwhile :; do sleep 0.2; done\n",
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> {}\n\
+                 if [ \"$1\" = \"status\" ]; then echo '{{\"Self\":{{\"DNSName\":\"node.tailnet.ts.net.\"}}}}'; exit 0; fi\n\
+                 # a reset invocation exits at once, so a reintroduced reset fails the test\n\
+                 if [ \"$2\" = \"reset\" ]; then exit 0; fi\n\
+                 echo 'Available within your tailnet:'\n\
+                 echo 'https://node.tailnet.ts.net'\n\
+                 while :; do sleep 0.2; done\n",
                 log.display()
             ),
         );
-        let tunnel = TailscaleTunnel::new(false, Some("rantaiclaw_node".into()))
-            .with_program(fake.to_str().expect("utf-8 temp path"));
+        let tunnel =
+            TailscaleTunnel::new(false, None).with_program(fake.to_str().expect("utf-8 temp path"));
 
         tunnel
             .start("127.0.0.1", 8080)
             .await
-            .expect("the fake starts");
+            .expect("the fake serves");
         tunnel.stop().await.expect("stop is ok");
 
         let recorded = std::fs::read_to_string(&log).expect("argv log");
-        assert!(
-            recorded.lines().any(|line| line.trim() == "serve reset"),
-            "the reset must run through the configured program: {recorded}"
+        let invocations: Vec<&str> = recorded.lines().map(str::trim).collect();
+        assert_eq!(
+            invocations,
+            vec!["status --json", "serve 8080"],
+            "stop must run no command of its own: {recorded}"
         );
     }
 
-    /// Funnel mode resets funnel, not serve.
+    /// When Serve or Funnel is not enabled on the tailnet, tailscale prints
+    /// its admin enable link and waits for an admin. That link is not this
+    /// tunnel's address: the URL is the line whose host is this node's DNS
+    /// name.
     #[cfg(unix)]
     #[tokio::test]
-    async fn stop_resets_funnel_through_the_configured_program() {
+    async fn the_admin_enable_link_is_never_the_public_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "tailscale",
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"status\" ]; then echo '{\"Self\":{\"DNSName\":\"node.tailnet.ts.net.\"}}'; exit 0; fi\n\
+             # a reset invocation exits at once, so a reintroduced reset fails the test\n\
+             if [ \"$2\" = \"reset\" ]; then exit 0; fi\n\
+             echo 'https://login.tailscale.com/f/serve?node=abc'\n\
+             echo 'https://node.tailnet.ts.net'\n\
+             while :; do sleep 0.2; done\n",
+        );
+        let tunnel =
+            TailscaleTunnel::new(false, None).with_program(fake.to_str().expect("utf-8 temp path"));
+
+        let url = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect("the fake publishes a URL");
+
+        assert_eq!(
+            url.as_deref(),
+            Some("https://node.tailnet.ts.net"),
+            "the admin enable link is not this tunnel's address"
+        );
+        assert_eq!(
+            tunnel.public_url().as_deref(),
+            Some("https://node.tailnet.ts.net")
+        );
+
+        tunnel.stop().await.expect("stop is ok");
+    }
+
+    /// The admin enable link with no URL of this node's own: the error names
+    /// the program and says that Serve or Funnel may need enabling. It comes
+    /// from the closed output, not from waiting out the 30 s deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_admin_enable_link_without_a_node_url_names_the_program_and_the_fix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "tailscale",
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"status\" ]; then echo '{\"Self\":{\"DNSName\":\"node.tailnet.ts.net.\"}}'; exit 0; fi\n\
+             echo 'https://login.tailscale.com/f/serve?node=abc'\n\
+             exit 1\n",
+        );
+        let tunnel =
+            TailscaleTunnel::new(false, None).with_program(fake.to_str().expect("utf-8 temp path"));
+
+        let started = tokio::time::Instant::now();
+        let err = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect_err("no URL of this node was printed");
+        let elapsed = started.elapsed();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(fake.to_str().expect("utf-8 temp path")),
+            "the error must name the program it ran: {message}"
+        );
+        assert!(
+            message.contains("Serve"),
+            "the error must say Serve may need enabling: {message}"
+        );
+        assert!(
+            message.contains("Funnel"),
+            "the error must say Funnel may need enabling: {message}"
+        );
+        assert!(
+            message.contains("admin console"),
+            "the error must say where to enable it: {message}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the failure must come from the closed output, not from the 30 s deadline: {elapsed:?}"
+        );
+    }
+
+    /// A configured hostname confirms the URL, it never selects or replaces
+    /// it: the URL stays the one whose host is this node's DNS name, and the
+    /// difference is logged. The DNS name is read on every start, even with a
+    /// hostname configured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_configured_hostname_only_confirms_the_dns_name_url() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("argv.log");
         let fake = crate::tunnel::write_fake_program(
             dir.path(),
             "tailscale",
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n[ \"$2\" = \"reset\" ] && exit 0\necho 'Available on the internet:'\necho 'https://rantaiclaw_node.tailnet.ts.net'\nwhile :; do sleep 0.2; done\n",
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> {}\n\
+                 if [ \"$1\" = \"status\" ]; then echo '{{\"Self\":{{\"DNSName\":\"node.tailnet.ts.net.\"}}}}'; exit 0; fi\n\
+                 # a reset invocation exits at once, so a reintroduced reset fails the test\n\
+                 if [ \"$2\" = \"reset\" ]; then exit 0; fi\n\
+                 echo 'Available within your tailnet:'\n\
+                 echo 'https://node.tailnet.ts.net'\n\
+                 while :; do sleep 0.2; done\n",
                 log.display()
             ),
         );
-        let tunnel = TailscaleTunnel::new(true, Some("rantaiclaw_node".into()))
+        let tunnel = TailscaleTunnel::new(false, Some("other.tailnet.ts.net".into()))
             .with_program(fake.to_str().expect("utf-8 temp path"));
 
-        tunnel
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let url = tunnel
             .start("127.0.0.1", 8080)
             .await
-            .expect("the fake starts");
-        tunnel.stop().await.expect("stop is ok");
+            .expect("the fake publishes a URL");
 
+        drop(guard);
+        let captured = buffer.contents();
+
+        assert_eq!(
+            url.as_deref(),
+            Some("https://node.tailnet.ts.net"),
+            "the configured hostname never replaces the URL of this node"
+        );
         let recorded = std::fs::read_to_string(&log).expect("argv log");
         assert!(
-            recorded.lines().any(|line| line.trim() == "funnel reset"),
-            "funnel mode must reset funnel: {recorded}"
+            recorded.lines().any(|line| line.trim() == "status --json"),
+            "the DNS name is read on every start: {recorded}"
         );
+        assert!(
+            captured.to_lowercase().contains("warn"),
+            "the difference must be logged as a warning: {captured}"
+        );
+        assert!(
+            captured.contains("other.tailnet.ts.net"),
+            "the warning must name the configured hostname: {captured}"
+        );
+        assert!(
+            captured.contains("node.tailnet.ts.net"),
+            "the warning must name the DNS name of this node: {captured}"
+        );
+
+        tunnel.stop().await.expect("stop is ok");
     }
 
     /// The URL is the one the serve command prints, with the port trimmed
@@ -402,6 +593,7 @@ mod tests {
             "tailscale",
             "#!/bin/sh\n\
              if [ \"$1\" = \"status\" ]; then echo '{\"Self\":{\"DNSName\":\"rantaiclaw_node.tailnet.ts.net.\"}}'; exit 0; fi\n\
+             # a reset invocation exits at once, so a reintroduced reset fails the test\n\
              if [ \"$2\" = \"reset\" ]; then exit 0; fi\n\
              echo 'Available within your tailnet:'\n\
              echo 'https://rantaiclaw_node.tailnet.ts.net'\n\
