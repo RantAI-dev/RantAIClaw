@@ -23,6 +23,7 @@
 pub mod anthropic;
 pub mod bedrock;
 pub mod compatible;
+pub mod config_error;
 pub mod copilot;
 pub mod gemini;
 pub mod gemini_cli;
@@ -35,6 +36,8 @@ pub mod reliable;
 pub mod rig_native;
 pub mod router;
 pub mod traits;
+
+pub use config_error::ProviderConfigError;
 
 #[allow(unused_imports)]
 pub use traits::{
@@ -1119,6 +1122,12 @@ fn resolve_provider_credential_with_kind(
     None
 }
 
+/// Parse the base URL of a `custom:` / `anthropic-custom:` provider.
+///
+/// Every failure here is a [`ProviderConfigError`]: the URL comes from the
+/// config file alone, so no credential, login or DNS lookup can repair it —
+/// a caller may treat it as fatal. The `Display` text is unchanged from the
+/// plain `anyhow` errors this replaced.
 fn parse_custom_provider_url(
     raw_url: &str,
     provider_label: &str,
@@ -1127,18 +1136,26 @@ fn parse_custom_provider_url(
     let base_url = raw_url.trim();
 
     if base_url.is_empty() {
-        anyhow::bail!("{provider_label} requires a URL. Format: {format_hint}");
+        return Err(ProviderConfigError::CustomUrlMissing {
+            provider_label: provider_label.to_string(),
+            format_hint: format_hint.to_string(),
+        }
+        .into());
     }
 
-    let parsed = reqwest::Url::parse(base_url).map_err(|_| {
-        anyhow::anyhow!("{provider_label} requires a valid URL. Format: {format_hint}")
-    })?;
+    let parsed =
+        reqwest::Url::parse(base_url).map_err(|_| ProviderConfigError::CustomUrlInvalid {
+            provider_label: provider_label.to_string(),
+            format_hint: format_hint.to_string(),
+        })?;
 
     match parsed.scheme() {
         "http" | "https" => Ok(base_url.to_string()),
-        _ => anyhow::bail!(
-            "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
-        ),
+        _ => Err(ProviderConfigError::CustomUrlScheme {
+            provider_label: provider_label.to_string(),
+            format_hint: format_hint.to_string(),
+        }
+        .into()),
     }
 }
 
@@ -1502,11 +1519,16 @@ fn create_provider_with_url_and_options(
             ))
         }
 
-        _ => anyhow::bail!(
-            "Unknown provider: {name}. Check README for supported providers or run `rantaiclaw onboard --interactive` to reconfigure.\n\
+        // A name no factory knows follows from the config file alone, so it is
+        // a `ProviderConfigError`: a caller may treat it as fatal.
+        _ => Err(ProviderConfigError::UnknownProvider {
+            name: name.to_string(),
+            guidance: "Check README for supported providers or run `rantaiclaw onboard --interactive` to reconfigure.\n\
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
              Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
-        ),
+                .to_string(),
+        }
+        .into()),
     }
 }
 
