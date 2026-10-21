@@ -29,8 +29,12 @@ pub trait Tunnel: Send + Sync {
     fn name(&self) -> &str;
 
     /// Start the tunnel, exposing `local_host:local_port` externally.
-    /// Returns the public URL on success.
-    async fn start(&self, local_host: &str, local_port: u16) -> Result<String>;
+    ///
+    /// Returns the public URL **the provider itself printed**, or `None` when
+    /// the provider reported none — `None` is a started tunnel with an unknown
+    /// URL, never a failure. The gateway must never report a local or guessed
+    /// address as public.
+    async fn start(&self, local_host: &str, local_port: u16) -> Result<Option<String>>;
 
     /// Stop the tunnel process gracefully.
     async fn stop(&self) -> Result<()>;
@@ -42,12 +46,58 @@ pub trait Tunnel: Send + Sync {
     fn public_url(&self) -> Option<String>;
 }
 
+/// Context for a spawn or output failure: the program plus the subcommand
+/// words it ran, never the argument values — cloudflared and ngrok receive
+/// their auth tokens as arguments, so echoing argv would leak them.
+pub(crate) fn program_context(action: &str, program: &str, subcommand: &str) -> String {
+    let words = if subcommand.is_empty() {
+        String::new()
+    } else {
+        format!(" ({subcommand})")
+    };
+    format!("{action} {program}{words} — is {program} installed and on PATH?")
+}
+
+/// The first `<scheme>://…` token on one output line: from the scheme to the
+/// next whitespace. Providers print their URL inside prose (`Registered…`,
+/// `Available within your tailnet:`, `url=https://…`), so this is the one
+/// place that turns a line into the URL the provider printed.
+pub(crate) fn url_in(line: &str, scheme: &str) -> Option<String> {
+    let start = line.find(scheme)?;
+    let rest = &line[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Drain one piped stream of a tunnel child, logging every line at `debug`,
+/// until the stream closes.
+///
+/// Every piped stream must stay drained for the child's whole life: a Go
+/// tunnel binary exits with SIGPIPE on its next write to fd 1 or 2 once the
+/// reader is gone (pkg.go.dev/os/signal), and a pipe nobody reads fills up and
+/// blocks a child that never writes to fd 1 or 2. The task is detached, so it
+/// keeps reading until the stream ends, whatever the caller does with its
+/// (unused) handle.
+pub(crate) fn spawn_drain<R>(label: &'static str, mut lines: tokio::io::Lines<R>)
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::debug!(stream = label, "{line}");
+        }
+    });
+}
+
 // ── Shared child-process handle ──────────────────────────────────
 
 /// Wraps a spawned tunnel child process so implementations can share it.
 pub(crate) struct TunnelProcess {
     pub child: tokio::process::Child,
-    pub public_url: String,
+    /// What the provider printed, if anything. `None` means the provider does
+    /// not report its public URL (cloudflared in token mode, a custom command
+    /// without a matching `url_pattern`).
+    pub public_url: Option<String>,
 }
 
 pub(crate) type SharedProcess = Arc<Mutex<Option<TunnelProcess>>>;
@@ -56,11 +106,53 @@ pub(crate) fn new_shared_process() -> SharedProcess {
     Arc::new(Mutex::new(None))
 }
 
-/// Kill a shared tunnel process if running.
+/// How long a tunnel child gets to exit after SIGTERM before it is killed.
+/// Fits well inside the daemon's `DRAIN_TIMEOUT` (16 s).
+#[cfg(unix)]
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Stop a shared tunnel process if running.
+///
+/// On Unix the child gets SIGTERM first so it can clean up (tailscale's own
+/// serve/funnel reset already ran before this), then SIGKILL once
+/// [`STOP_GRACE`] passes, then it is reaped. A child that exits on SIGTERM
+/// never waits for the bound.
 pub(crate) async fn kill_shared(proc: &SharedProcess) -> Result<()> {
     let mut guard = proc.lock().await;
     if let Some(ref mut tp) = *guard {
+        #[cfg(unix)]
+        {
+            let mut exited = false;
+            if let Some(pid) = tp.child.id() {
+                // Safety: `pid` is a live child of this process; SIGTERM to it
+                // is the intended stop signal and carries no memory safety
+                // requirement.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+
+                let deadline = tokio::time::Instant::now() + STOP_GRACE;
+                loop {
+                    // `Ok(None)` means still running; any other result means
+                    // it is gone (or can no longer be polled).
+                    if !matches!(tp.child.try_wait(), Ok(None)) {
+                        exited = true;
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+
+            if !exited {
+                tp.child.start_kill().ok();
+            }
+        }
+        #[cfg(not(unix))]
         tp.child.kill().await.ok();
+
         tp.child.wait().await.ok();
     }
     *guard = None;
@@ -121,6 +213,78 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+/// Write an executable fake program for tests. Unix-only: the fakes are shell
+/// scripts and the signal behaviour under test is POSIX.
+///
+/// The body is written by a helper process, not by this one: tests run in
+/// parallel threads, and a `fork` in another thread while this thread holds the
+/// file open for writing makes the child inherit that handle, after which the
+/// kernel refuses to `exec` the script with `ETXTBSY` ("Text file busy").
+#[cfg(all(test, unix))]
+pub(crate) fn write_fake_program(
+    dir: &std::path::Path,
+    name: &str,
+    body: &str,
+) -> std::path::PathBuf {
+    use std::io::Write as _;
+
+    let path = dir.join(name);
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the helper that writes the fake program");
+    child
+        .stdin
+        .as_mut()
+        .expect("helper stdin is piped")
+        .write_all(body.as_bytes())
+        .expect("write the fake program");
+    let status = child.wait().expect("wait for the fake program write");
+    assert!(
+        status.success(),
+        "writing the fake program failed: {status}"
+    );
+    path
+}
+
+/// Whether a pid is still running.
+///
+/// `kill(pid, 0)` alone is not enough: a child that exited but was never
+/// reaped is a zombie that still owns its pid, so the signal probe succeeds
+/// for a dead child. Read the state field when `/proc` is there and treat a
+/// zombie as dead; fall back to the signal probe where it is not.
+#[cfg(all(test, unix))]
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .is_some_and(|state| state != 'Z'),
+        // Safety: signal 0 carries no memory safety requirement and sends
+        // nothing; it only reports whether the pid exists.
+        Err(_) => unsafe { libc::kill(pid as libc::pid_t, 0) == 0 },
+    }
+}
+
+/// Wait until a fake program has written its pid (a shell expands `$$` only
+/// once it runs, so the file appearing means the trap is armed and the child
+/// is committed to its loop).
+#[cfg(all(test, unix))]
+pub(crate) async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse() {
+                return pid;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("fake program never wrote its pid to {}", path.display());
+}
 
 #[cfg(test)]
 mod tests {
@@ -272,7 +436,7 @@ mod tests {
     async fn none_tunnel_start_returns_local() {
         let t = NoneTunnel;
         let url = t.start("127.0.0.1", 8080).await.unwrap();
-        assert_eq!(url, "http://127.0.0.1:8080");
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1:8080"));
     }
 
     #[test]
@@ -339,14 +503,72 @@ mod tests {
             let mut guard = proc.lock().await;
             *guard = Some(TunnelProcess {
                 child,
-                public_url: "https://example.test".into(),
+                public_url: Some("https://example.test".into()),
             });
         }
 
+        let started = tokio::time::Instant::now();
         kill_shared(&proc).await.unwrap();
+        let elapsed = started.elapsed();
 
         let guard = proc.lock().await;
         assert!(guard.is_none());
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a child that exits on SIGTERM must not wait out the grace bound: {elapsed:?}"
+        );
+    }
+
+    /// A child that ignores SIGTERM must still be dead once the grace bound
+    /// passes: SIGTERM first (the trap records it), then SIGKILL, then reap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_shared_sigkills_a_child_that_ignores_sigterm_within_the_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let term_file = dir.path().join("term");
+        let fake = write_fake_program(
+            dir.path(),
+            "stubborn",
+            &format!(
+                "#!/bin/sh\ntrap 'echo term > {}' TERM\necho $$ > {}\nwhile :; do sleep 0.2; done\n",
+                term_file.display(),
+                pid_file.display()
+            ),
+        );
+
+        let child = Command::new(&fake)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the stubborn fake should spawn");
+        let pid = wait_for_pid_file(&pid_file).await;
+
+        let proc = new_shared_process();
+        {
+            let mut guard = proc.lock().await;
+            *guard = Some(TunnelProcess {
+                child,
+                public_url: Some("https://example.test".into()),
+            });
+        }
+
+        let started = tokio::time::Instant::now();
+        kill_shared(&proc).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            term_file.exists(),
+            "SIGTERM must be tried before SIGKILL: the child never saw it"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "SIGKILL must land within the 2 s bound plus margin: {elapsed:?}"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "the child must be dead after kill_shared: pid {pid}"
+        );
     }
 
     #[tokio::test]

@@ -10,8 +10,10 @@ impl Tunnel for NoneTunnel {
         "none"
     }
 
-    async fn start(&self, local_host: &str, local_port: u16) -> Result<String> {
-        Ok(format!("http://{local_host}:{local_port}"))
+    async fn start(&self, local_host: &str, local_port: u16) -> Result<Option<String>> {
+        // No tunnel, so the endpoint really is the local address: nothing is
+        // proxied and nothing is guessed.
+        Ok(Some(format!("http://{local_host}:{local_port}")))
     }
 
     async fn stop(&self) -> Result<()> {
@@ -41,7 +43,7 @@ mod tests {
     async fn start_returns_local_url() {
         let tunnel = NoneTunnel;
         let url = tunnel.start("127.0.0.1", 7788).await.unwrap();
-        assert_eq!(url, "http://127.0.0.1:7788");
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1:7788"));
     }
 
     #[tokio::test]
