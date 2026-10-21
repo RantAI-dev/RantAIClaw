@@ -706,8 +706,8 @@ mod tests {
         assert!(matches!(scheduler_diag(&path).0, StatusKind::Fail));
     }
 
-    /// Plan 591: a file whose `written_at` is older than three flush intervals
-    /// was written by a daemon that has since exited or crashed. It must read
+    /// A file whose `written_at` is older than three flush intervals was
+    /// written by a daemon that has since exited or crashed. It must read
     /// EXACTLY like an absent file — the "daemon not running" Warn — never a
     /// green row.
     #[test]

@@ -47,7 +47,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     // The state file the background writer flushes and the cleanup removes.
     // Derived once here and passed into `drain_and_cleanup`, so teardown never
-    // re-derives it from the config (plan 591).
+    // re-derives it from the config.
     let state_file = state_file_path(&config);
 
     crate::health::mark_component_ok("daemon");
@@ -310,9 +310,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 /// directly. Shared by the fatal-exit, early-shutdown, and normal-stop paths so
 /// teardown stays identical.
 ///
-/// `state_file_path` is the `daemon_state.json` this daemon flushes (plan 591):
-/// once the state writer has been aborted AND awaited below, the file is
-/// removed — a reader must never describe a daemon that has stopped.
+/// `state_file_path` is the `daemon_state.json` this daemon flushes: once the
+/// state writer has been aborted AND awaited below, the file is removed — a
+/// reader must never describe a daemon that has stopped.
 async fn drain_and_cleanup(
     mut gateway_handle: JoinHandle<()>,
     channels_handle: Option<JoinHandle<()>>,
@@ -355,13 +355,14 @@ async fn drain_and_cleanup(
         let _ = handle.await;
     }
 
-    // Plan 591: the state file must not outlive this daemon. The writer has
-    // been aborted AND awaited above, so no last flush can recreate the file
-    // after this point. Remove it plus any own-pid temp an interrupted atomic
-    // write (`write_state_file_atomic`) may have left; another pid's temp is
-    // not this daemon's to touch. A missing file is already the goal; any
-    // other failure is logged and left to the reader-side age rule
-    // (`read_live_state`) to cover.
+    // The state file must not outlive this daemon. The writer has been
+    // aborted AND awaited above, and its write + rename are one synchronous
+    // section, so a flush that was in flight runs to its end before this
+    // point and the removal below always comes last. Remove it plus any
+    // own-pid temp an interrupted atomic write (`write_state_file_atomic`) may
+    // have left; another pid's temp is not this daemon's to touch. A missing
+    // file is already the goal; any other failure is logged and left to the
+    // reader-side age rule (`read_live_state`) to cover.
     let own_pid_tmp = state_file_path.with_extension(format!("json.tmp.{}", std::process::id()));
     for path in [state_file_path, own_pid_tmp.as_path()] {
         if let Err(e) = tokio::fs::remove_file(path).await {
@@ -580,10 +581,19 @@ pub fn read_live_state(path: &Path) -> Option<serde_json::Value> {
 /// the old file or the new one in full — never a half-written flush, which used
 /// to surface as an intermittent false "daemon state corrupt". Best-effort: a
 /// failed temp write leaves the previous good file untouched.
-async fn write_state_file_atomic(path: &Path, data: &[u8]) {
+///
+/// `std::fs`, not `tokio::fs`, and with NO await between the write and the
+/// rename. The file is a few KB, so the blocking call is short; keeping the
+/// two steps in one synchronous section means a flush that is in flight when
+/// the daemon is aborted runs to its end, and the cleanup removal — which runs
+/// after the writer is aborted AND awaited — always happens last. With
+/// `tokio::fs` the write and the rename ran on the blocking pool, where
+/// `abort()` cancels nothing: a flush in flight could rename the file back
+/// over the one the cleanup had just removed.
+fn write_state_file_atomic(path: &Path, data: &[u8]) {
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    if tokio::fs::write(&tmp, data).await.is_ok() {
-        let _ = tokio::fs::rename(&tmp, path).await;
+    if std::fs::write(&tmp, data).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -605,7 +615,7 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
                 );
             }
             let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
-            write_state_file_atomic(&path, &data).await;
+            write_state_file_atomic(&path, &data);
         }
     })
 }
@@ -846,12 +856,12 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(16));
     }
 
-    /// Plan 591: nothing a reader can see may outlive this daemon. A real
-    /// state-writer handle (`handles[0]`, as `run` pushes it) has flushed at
-    /// least once — its first interval tick is immediate — before the drain
-    /// begins; after the writer is aborted AND awaited, the file and any
-    /// own-pid temp left by an interrupted atomic write must be gone (other
-    /// pids' temp files are not this daemon's to touch).
+    /// Nothing a reader can see may outlive this daemon. A real state-writer
+    /// handle (`handles[0]`, as `run` pushes it) has flushed at least once —
+    /// its first interval tick is immediate — before the drain begins; after
+    /// the writer is aborted AND awaited, the file and any own-pid temp left
+    /// by an interrupted atomic write must be gone (other pids' temp files
+    /// are not this daemon's to touch).
     #[tokio::test]
     async fn drain_and_cleanup_removes_the_state_file_after_the_writer_is_done() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
@@ -962,7 +972,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("daemon_state.json");
 
-        write_state_file_atomic(&path, br#"{"ok":true}"#).await;
+        write_state_file_atomic(&path, br#"{"ok":true}"#);
 
         // Target parses as JSON…
         let body = tokio::fs::read_to_string(&path).await.unwrap();

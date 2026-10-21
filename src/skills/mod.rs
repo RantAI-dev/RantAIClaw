@@ -3621,7 +3621,7 @@ description = "Bare minimum"
         hex::encode(hasher.finalize())
     }
 
-    // --- ClawHub manifest hash coverage (plan 597) ------------------------
+    // --- ClawHub manifest hash coverage --------------------------------------
 
     /// One entry of a multi-file mock ClawHub version manifest. `sha256`
     /// carries the manifest's raw value: `None` omits the key entirely
@@ -3746,7 +3746,7 @@ description = "Bare minimum"
     /// The refusals and installs below all take the CLI path
     /// (`handle_command` → `install_one`), which surfaces the inner error
     /// text via `with_context` — so asserting on `{err:#}` verifies both the
-    /// behavior and that the reason reaches the user (plan 597 step 4).
+    /// behavior and that the reason reaches the user.
     fn run_clawhub_install(
         workspace_dir: &std::path::Path,
         slug: &str,
@@ -4477,7 +4477,7 @@ description = "Bare minimum"
         );
     }
 
-    // --- `skills install-deps` CLI entry point (plan 596) ----------------
+    // --- `skills install-deps` CLI entry point -------------------------------
 
     /// Serve `body` for every GET on a loopback listener. Same shape as
     /// [`spawn_mock_clawhub`]: a blocking `std::net::TcpListener` on its own
