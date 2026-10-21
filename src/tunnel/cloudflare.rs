@@ -1,5 +1,5 @@
 use super::{
-    kill_shared, new_shared_process, program_context, spawn_drain, url_in, SharedProcess, Tunnel,
+    kill_shared, new_shared_process, program_context, spawn_drain, SharedProcess, Tunnel,
     TunnelProcess,
 };
 use anyhow::{bail, Context, Result};
@@ -80,9 +80,9 @@ impl Tunnel for CloudflareTunnel {
         // provisioned in the dashboard and cloudflared never learns it. The
         // readiness signal is "Registered tunnel connection" (Info level, one
         // per connection); waiting for an `https://` line would wait for
-        // something that never comes. If a URL line does appear first, it is
-        // the provider's own and is returned.
-        let mut public_url = None;
+        // something that never comes. No other line is a URL either: the QUIC
+        // library prints a help link to a GitHub wiki page before it
+        // registers, and that link is not this tunnel's address.
         let mut ready = false;
         let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
         while tokio::time::Instant::now() < deadline {
@@ -93,11 +93,6 @@ impl Tunnel for CloudflareTunnel {
                 Ok(Ok(Some(l))) => {
                     tracing::debug!("{}: {l}", self.program);
                     if l.contains("Registered tunnel connection") {
-                        ready = true;
-                        break;
-                    }
-                    if let Some(url) = url_in(&l, "https://") {
-                        public_url = Some(url);
                         ready = true;
                         break;
                     }
@@ -124,7 +119,9 @@ impl Tunnel for CloudflareTunnel {
             let mut guard = self.proc.lock().await;
             *guard = Some(TunnelProcess {
                 child,
-                public_url: public_url.clone(),
+                // The token mode never publishes the hostname, so there is no
+                // URL to report.
+                public_url: None,
             });
         }
         // Keep both streams drained for the child's whole life: dropping a
@@ -135,7 +132,7 @@ impl Tunnel for CloudflareTunnel {
         );
         spawn_drain("cloudflared stderr", lines);
 
-        Ok(public_url)
+        Ok(None)
     }
 
     async fn stop(&self) -> Result<()> {
@@ -277,6 +274,85 @@ mod tests {
         assert!(tunnel.health_check().await);
 
         tunnel.stop().await.ok();
+    }
+
+    /// cloudflared's QUIC library prints a help link to a GitHub wiki page
+    /// before it registers, on a stock Linux host. That link is not this
+    /// tunnel's address: the tunnel reports no URL, and it is ready only
+    /// after the registration line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quic_go_help_link_is_never_the_public_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "cloudflared",
+            &format!(
+                "#!/bin/sh\n\
+                 echo 'failed to sufficiently increase receive buffer size: want 16777216 bytes, have 425984. See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.' >&2\n\
+                 echo 'Registered tunnel connection (connIndex=0)' >&2\n\
+                 echo $$ > {}\n\
+                 while :; do sleep 0.2; done\n",
+                pid_file.display()
+            ),
+        );
+        let tunnel = CloudflareTunnel::new("rantaiclaw_cf_token".into())
+            .with_program(fake.to_str().expect("utf-8 temp path"));
+
+        let url = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect("a registered connection is a started tunnel");
+
+        assert_eq!(
+            url, None,
+            "the quic-go wiki link is not the tunnel's address"
+        );
+        assert_eq!(tunnel.public_url(), None);
+
+        let pid = crate::tunnel::wait_for_pid_file(&pid_file).await;
+        assert!(
+            crate::tunnel::process_is_alive(pid),
+            "the tunnel child must still run: pid {pid}"
+        );
+
+        tunnel.stop().await.ok();
+    }
+
+    /// A cloudflared that prints the QUIC help link and then exits never
+    /// registers. The failure comes from the closed output, not from waiting
+    /// out the 30 s deadline, and it names the program.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quic_go_line_without_a_registration_names_the_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "cloudflared",
+            "#!/bin/sh\n\
+             echo 'failed to sufficiently increase receive buffer size: want 16777216 bytes, have 425984. See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.' >&2\n\
+             exit 1\n",
+        );
+        let tunnel = CloudflareTunnel::new("rantaiclaw_cf_token".into())
+            .with_program(fake.to_str().expect("utf-8 temp path"));
+
+        let started = tokio::time::Instant::now();
+        let err = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect_err("a cloudflared that exits without registering is not a tunnel");
+        let elapsed = started.elapsed();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(fake.to_str().expect("utf-8 temp path")),
+            "the error must name the program it ran: {message}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the failure must come from the closed output, not from the 30 s deadline: {elapsed:?}"
+        );
     }
 
     /// A child that exits on its own must not be reported as alive: `id()`
