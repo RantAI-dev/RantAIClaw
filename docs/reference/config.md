@@ -511,6 +511,54 @@ control plane serving on a public interface. If the tunnel fails now, the
 gateway keeps serving on whatever it was already allowed to bind and says so;
 it does not acquire a public listener along the way.
 
+### The tunnel stops with the gateway
+
+The gateway starts the tunnel once it has bound its local port, and stops it
+however serving ends, cleanly or with an error. On Unix, `stop()` sends
+`SIGTERM`, waits up to two seconds for the process to exit, then sends `SIGKILL`
+and reaps it. Tailscale's published configuration is removed first, with
+`tailscale serve reset` or `tailscale funnel reset` run through the configured
+program; a reset that fails is logged and the process is stopped anyway.
+
+A tunnel that fails to start names the program it ran, and the subcommand when
+there is one, never an auth token, so a missing `cloudflared` says so instead
+of only `No such file or directory`. For `custom`, only the first word of
+`start_command` is named, because the rest of it is operator argv that may
+carry credentials.
+
+If the gateway task is aborted rather than stopped — when the daemon's drain
+window runs out — the child is killed when the tunnel value is dropped: an
+aborted task cannot run asynchronous cleanup.
+
+### What each provider reports as its URL
+
+The gateway reports a URL only when the provider itself printed one. It never
+builds a URL from a configured hostname, and never reports a local address as
+public. When a provider reports none, the startup banner reads
+`🌐 Tunnel active (<provider> did not report a public URL)` and there is no
+`Public URL` line. A running tunnel still counts as exposure: the warning about
+a console with no login fires for any running tunnel, whether or not it
+reported a URL.
+
+- `cloudflare` — none in token mode. A tunnel run with `--token` is provisioned
+  from the Cloudflare dashboard and never prints the public hostname, so
+  readiness is the `Registered tunnel connection` line on stderr, within 30 s.
+  A run that reports neither that line nor an `https://` line in 30 s fails
+  with an error naming the program; a URL line that does appear is reported.
+- `tailscale` — the `https://` line that `tailscale serve` or `tailscale funnel`
+  prints, within 30 s. A bare port is served on 443, so the URL carries no
+  local port. `Self.DNSName` from `status --json`, or a configured `hostname`,
+  only confirms it: a missing or unparsable DNS name is a start error, never
+  `localhost`, and so is no URL within the deadline. A printed host that does
+  not match the confirmed one is logged as a warning.
+- `ngrok` — the `url=` field in the agent's logfmt log output (`--log stdout
+  --log-format logfmt`), within 15 s. A run that prints no such line fails with
+  an error naming the program; a rejected auth token fails at
+  `ngrok config add-authtoken` instead.
+- `custom` — only a URL on a line that contains `url_pattern`, which is a
+  substring match, not a regular expression. Without `url_pattern`, or with no
+  match within 15 s, the tunnel starts and reports no URL.
+
 ## `[ui]`
 
 Web console (`rantaiclaw ui start`) settings.

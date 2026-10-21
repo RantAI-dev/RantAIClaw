@@ -232,6 +232,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped or crashed daemon's scheduler as healthy: a state file older than three flush intervals reads
   as "daemon not running". A SIGKILL or OOM crash still leaves the file on disk, so the reader-side age
   rule covers that case.
+- The tunnel process is now stopped when the gateway stops. `Tunnel::stop()` had no production caller: the
+  child was killed when the value was dropped, never sent `SIGTERM` and never waited for, and
+  `tailscale serve reset` never ran. The gateway now calls `stop()` after serving ends, on the clean and
+  error paths alike; it sends `SIGTERM`, waits up to two seconds, then sends `SIGKILL` and reaps the child.
+  Tailscale's `serve` or `funnel` configuration is reset before the kill, so a funnel does not stay
+  published after the gateway is gone.
+- A tunnel that failed to start reported `No such file or directory (os error 2)` without saying which
+  program was missing. Every spawn and output error now names the program, and its subcommand when there is
+  one, and never an auth token. A non-zero `ngrok config add-authtoken` now fails the start, instead of
+  letting the next command fail unauthenticated 15 s later.
+- The gateway no longer reports a guessed public URL. Tailscale built
+  `https://<hostname>:<local port>` and fell back to `localhost`; it now reports the line
+  `tailscale serve` or `tailscale funnel` printed, with no local port. A custom tunnel without a matching
+  `url_pattern` reported its local address; it now reports no URL. `cloudflared` in token mode reports no URL,
+  because it never learns the public hostname. When the provider gives none, the banner reads
+  `Tunnel active (<provider> did not report a public URL)`, and the warning about a console with no login
+  now fires for any running tunnel, whatever URL it reported.
+- `cloudflared` and `ngrok` dropped their output reader once the URL was found. Both are Go binaries, and a
+  write to a closed stdout or stderr makes them exit with `SIGPIPE`, so the tunnel could stop shortly after
+  it started. Every piped stream is now drained for the child's whole life, and `health_check` reports a
+  child that has exited as not alive.
 
 ## [0.33.0-alpha] — 2026-10-08
 
