@@ -3716,6 +3716,36 @@ mod tests {
         fixture.assert_every_note_was_sent();
     }
 
+    /// A skill that declares a `[[tools]]` block offers its tool to the model
+    /// at the console chat door, like any other tool in the registry.
+    #[tokio::test]
+    async fn the_console_chat_door_sends_the_skill_tool_to_the_model() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        crate::agent::door_test_support::write_skill(
+            &fixture.workspace,
+            "greeter",
+            &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+        );
+        let state = test_state();
+        *state.config.lock() = fixture.config.clone();
+
+        let response = agent_chat_dispatch(
+            State(state),
+            HeaderMap::new(),
+            Query(ChatQuery::default()),
+            lantern_chat(),
+        )
+        .await
+        .expect("sync response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = fixture.llm.native_tool_names();
+        assert!(
+            sent.iter().any(|name| name == "skill_greeter_greet"),
+            "the console chat door did not offer the skill's tool: {sent:?}"
+        );
+    }
+
     /// The same, through the streaming route: its turn runs in a spawned task,
     /// and a task-local does not cross a spawn, so the view is set inside it.
     #[tokio::test]

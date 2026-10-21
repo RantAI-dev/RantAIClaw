@@ -31,30 +31,35 @@ pub struct SkillToolAdapter {
     security: Arc<SecurityPolicy>,
 }
 
+/// The name a skill tool's adapter gets: `skill_<skill>_<tool>`, with every
+/// character that is neither alphanumeric nor `_` replaced by `_`. The
+/// `skill_` prefix is what keeps a skill adapter from shadowing a built-in
+/// tool of the same name.
+pub(crate) fn skill_tool_name(skill_name: &str, tool_name: &str) -> String {
+    format!(
+        "skill_{}_{}",
+        sanitize_name_part(skill_name),
+        sanitize_name_part(tool_name)
+    )
+}
+
+/// One part of an adapter name, with every character that is neither
+/// alphanumeric nor `_` replaced by `_`.
+fn sanitize_name_part(part: &str) -> String {
+    part.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 impl SkillToolAdapter {
     pub fn new(skill_name: &str, tool: SkillTool, security: Arc<SecurityPolicy>) -> Self {
-        let safe_skill = skill_name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        let safe_tool = tool
-            .name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        let prefixed_name = format!("skill_{safe_skill}_{safe_tool}");
+        let prefixed_name = skill_tool_name(skill_name, &tool.name);
         Self {
             prefixed_name,
             tool,
@@ -281,13 +286,31 @@ impl SkillToolAdapter {
 /// Create callable tool adapters from all loaded skills.
 ///
 /// Returns a `Vec<Box<dyn Tool>>` that can be appended to the main tool registry.
+///
+/// Two skills can sanitise to the same adapter name (`my-skill` and `my.skill`
+/// both give `skill_my_skill_greet`). The first one wins: a later skill never
+/// replaces a tool the model already knows, and the warning names both skills
+/// so the operator can see the collision.
 pub fn skill_tools_from_skills(
     skills: &[crate::skills::Skill],
     security: &Arc<SecurityPolicy>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    // The skill that owns each adapter name, so a collision can name both.
+    let mut owners: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for skill in skills {
         for tool in &skill.tools {
+            let name = skill_tool_name(&skill.name, &tool.name);
+            if let Some(first_skill) = owners.get(&name) {
+                tracing::warn!(
+                    skill = %skill.name,
+                    first_skill = %first_skill,
+                    tool = %name,
+                    "skipped: another skill already provides this tool name"
+                );
+                continue;
+            }
+            owners.insert(name, skill.name.clone());
             tools.push(Box::new(SkillToolAdapter::new(
                 &skill.name,
                 tool.clone(),
@@ -411,5 +434,130 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name(), "skill_weather_forecast");
         assert_eq!(tools[1].name(), "skill_weather_current");
+    }
+
+    /// A skill with one `[[tools]]` entry.
+    fn skill(name: &str, tool_name: &str) -> crate::skills::Skill {
+        crate::skills::Skill {
+            name: name.to_string(),
+            description: "A skill".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![SkillTool {
+                name: tool_name.to_string(),
+                description: "Run something".to_string(),
+                kind: "shell".to_string(),
+                command: "echo hello".to_string(),
+                args: HashMap::new(),
+            }],
+            prompts: vec![],
+            location: None,
+            requires: crate::skills::SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: false,
+            origin: None,
+        }
+    }
+
+    /// The WARN lines emitted while `run` executes. A scoped subscriber, so
+    /// parallel tests cannot see each other's events.
+    fn warnings_from(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("lock the log buffer")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Buffer {
+            type Writer = Self;
+
+            fn make_writer(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().expect("lock the log buffer").clone();
+        String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
+    /// Two skills can sanitise to the same adapter name. The first one wins:
+    /// a later skill never replaces a tool the model already knows, and the
+    /// warning names both skills so the operator can see the collision.
+    #[test]
+    fn two_skills_with_the_same_adapter_name_yield_one_tool_and_a_warning() {
+        let skills = vec![skill("my-skill", "greet"), skill("my.skill", "greet")];
+        let mut names = Vec::new();
+        let logged = warnings_from(|| {
+            let tools = skill_tools_from_skills(&skills, &test_security());
+            names = tools.iter().map(|t| t.name().to_string()).collect();
+        });
+
+        assert_eq!(
+            names,
+            vec!["skill_my_skill_greet".to_string()],
+            "the two skills did not collapse into one adapter"
+        );
+        assert!(
+            logged.contains("my-skill") && logged.contains("my.skill"),
+            "the warning must name both skills: {logged}"
+        );
+    }
+
+    /// A supervised owner's first call to a shell-kind skill tool asks for
+    /// approval. The skill tool's name is not on the auto-approve list, and
+    /// that list matches names exactly.
+    #[test]
+    fn a_supervised_owner_approves_a_skill_tool_before_it_runs() {
+        let manager = crate::approval::ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        );
+        assert!(
+            manager.needs_approval("skill_greeter_greet"),
+            "a skill tool ran without an approval prompt under the default config"
+        );
+        assert!(
+            !manager.needs_approval("file_read"),
+            "control: the auto-approved read tool still skips the prompt"
+        );
+    }
+
+    /// A skill tool is not known to be read-only, so the read-only gate
+    /// refuses it before its body runs.
+    #[test]
+    fn a_skill_tool_is_not_declared_read_only() {
+        let adapter = SkillToolAdapter::new(
+            "greeter",
+            SkillTool {
+                name: "greet".to_string(),
+                description: "Greet".to_string(),
+                kind: "shell".to_string(),
+                command: "echo hello".to_string(),
+                args: HashMap::new(),
+            },
+            test_security(),
+        );
+        assert!(
+            !adapter.is_read_only_call(&json!({})),
+            "a skill tool declared a read-only call, so read-only mode would run it"
+        );
     }
 }

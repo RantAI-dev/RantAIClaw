@@ -3034,6 +3034,43 @@ fn failover_notice(asked: &str, answered: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A cron agent job and the daemon heartbeat both run through
+    /// `run_with_scope`, the function the CLI door uses too, so a skill's
+    /// tool reaches the model there as well. The scheduler's shape is the
+    /// one under test: an unattended run, scoped to one conversation.
+    #[tokio::test]
+    async fn the_run_with_scope_door_sends_the_skill_tool_to_the_model() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        crate::agent::door_test_support::write_skill(
+            &fixture.workspace,
+            "greeter",
+            &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+        );
+
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        Box::pin(run_with_scope(
+            fixture.config.clone(),
+            Some("hello".to_string()),
+            None,
+            None,
+            0.0,
+            "scheduler",
+            Some(memory::MemoryView::Only("cron:door-job".to_string())),
+            None,
+            None,
+            true,
+            &mut stdin,
+        ))
+        .await
+        .expect("the unattended run reaches the local server");
+
+        let sent = fixture.llm.native_tool_names();
+        assert!(
+            sent.iter().any(|name| name == "skill_greeter_greet"),
+            "the run_with_scope door did not offer the skill's tool: {sent:?}"
+        );
+    }
+
     /// The stdout line names the provider the operator asked for and the one
     /// that answered, so a reply from a fallback is never silently attributed to
     /// the primary.

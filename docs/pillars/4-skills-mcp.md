@@ -11,6 +11,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 - 8 MCP servers curated picker — 2 zero-auth + 6 authenticated, with inline auth (filesystem dropped in v0.6.51 — see below)
 - Spawn-and-validate at setup time (zero-auth servers)
 - `author_skill` — writes a skill bundle from chat
+- Skill `[[tools]]` adapters offered to the model at every door (see below)
 
 ## Vs OpenClaw / Hermes-agent
 
@@ -36,8 +37,23 @@ a claim, not a status; where a row could not be settled by reading, it says so._
 | MCP zero-auth setup-time validation | Stable (added v0.5.2) |
 | Auth flow per MCP server | Stable |
 | MCP tool **reach** | Partial — TUI/CLI agent and the gateway's `/api/v1` chat only. Chat channels, cron and gateway webhooks get no MCP tools. **No longer silent**: `rantaiclaw doctor` says so next to `mcp.startup` and `docs/reference/config.md` documents it (Wave 2). Issue #283 — making the reach universal — stays open |
+| Skill tool **reach** | Stable — the `[[tools]]` adapters of every loaded, enabled skill are in the tool list of every turn: CLI, TUI, console chat, chat channels, cron, heartbeat and the gateway webhook. A disabled skill contributes nothing |
 | MCP crash supervision | **None.** A crashed server is not respawned. The gateway keeps one connected pool and reconnects on config change; the respawn-with-backoff stack that used to be in `src/mcp` had no caller and was deleted (plan 312, issue #282) |
 | `author_skill` authoring tool | Stable |
+
+## Skill tools at every door
+
+A skill's `[[tools]]` blocks become real callable tools, named `skill_<skill>_<tool>`. They sit in the shared tool
+registry, so the model is offered them in every turn: CLI, TUI, console chat, chat channels, cron, heartbeat and the
+gateway webhook alike. A skill that is disabled in the config contributes no tool. Two skills whose names sanitise to
+the same adapter name yield one adapter; the later one is refused, and the collision is logged with both skill names.
+
+Skill tools are gated like any other tool:
+
+- `readonly` (the Strict preset) refuses them — a declared command is not known to be read-only.
+- An owner under `supervised` gets an approval prompt naming the tool; skill tools are in no auto-approve list.
+- A guest needs an explicit grant for the tool name (`rantaiclaw permissions add tool skill_<skill>_<tool>`).
+- A delegate sub-agent receives a skill tool only when its `allowed_tools` names it.
 
 ## Architecture
 

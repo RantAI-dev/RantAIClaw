@@ -215,6 +215,31 @@ impl MockLlm {
     pub(crate) fn sent_text(&self) -> String {
         format!("{}\n{}", self.system_text(), self.conversation_text())
     }
+
+    /// The names of the tools the model was sent, across every recorded
+    /// request. A provider with native tool calling receives one spec per
+    /// tool under `tools[].function.name`; a request without that array
+    /// contributes nothing.
+    pub(crate) fn native_tool_names(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|request| {
+                request
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
 }
 
 impl Drop for MockLlm {
@@ -371,6 +396,26 @@ impl DoorFixture {
             "control: the prompt reads the workspace files:\n{system}"
         );
     }
+}
+
+/// Writes a skill into the workspace's `skills/` directory. The loader reads
+/// that directory (`src/skills/mod.rs`), so the skill is loaded for the next
+/// turn. `manifest` is the skill's `SKILL.toml`.
+pub(crate) fn write_skill(workspace: &std::path::Path, dir_name: &str, manifest: &str) {
+    let dir = workspace.join("skills").join(dir_name);
+    std::fs::create_dir_all(&dir).expect("the skill directory is created");
+    std::fs::write(dir.join("SKILL.toml"), manifest).expect("the skill manifest is written");
+}
+
+/// A `SKILL.toml` for a skill with one `[[tools]]` entry. The adapter name
+/// the model sees is `skill_<skill>_<tool>`, with every character that is
+/// neither alphanumeric nor `_` replaced by `_`.
+pub(crate) fn skill_with_one_tool(skill_name: &str, tool_name: &str, command: &str) -> String {
+    format!(
+        "[skill]\nname = \"{skill_name}\"\ndescription = \"A skill for the door tests\"\n\n\
+         [[tools]]\nname = \"{tool_name}\"\ndescription = \"Run the test skill\"\n\
+         kind = \"shell\"\ncommand = \"{command}\"\n"
+    )
 }
 
 /// The registry a door builds from `config`: `all_tools_with_runtime` over the

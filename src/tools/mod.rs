@@ -679,6 +679,19 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(TaskReadCommentsTool::new(config.clone())));
     }
 
+    // Skills declare `[[tools]]` blocks in SKILL.toml that become real
+    // callable shell/http tools. Every door builds its registry through this
+    // function, so the model can call a skill's tool wherever it talks. The
+    // FILTERED loader is used, so a skill disabled in the config (or gated by
+    // an unmet `requires`) contributes nothing.
+    //
+    // The adapters go in BEFORE the delegate snapshot below, so a delegate
+    // sub-agent inherits them under its own `allowed_tools` filter.
+    let skills = crate::skills::load_skills_with_config(workspace_dir, config.as_ref());
+    for skill_tool in skill_tools_from_skills(&skills, security) {
+        tool_arcs.push(Arc::from(skill_tool));
+    }
+
     // Add delegation tool when agents are configured
     if !agents.is_empty() {
         let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
@@ -928,6 +941,10 @@ mod tests {
     /// both directions. A tool added to `all_tools_with_runtime` without a
     /// list entry fails the first check; a list entry for a tool that was
     /// removed fails the second.
+    ///
+    /// The fixture's workspace holds no skill with a `[[tools]]` block, and
+    /// that is what keeps the two sides equal: such a skill would register a
+    /// `skill_<skill>_<tool>` name that `BUILTIN_TOOL_NAMES` does not list.
     #[test]
     fn builtin_tool_names_match_the_full_registry() {
         let tmp = TempDir::new().unwrap();
@@ -1416,6 +1433,199 @@ mod tests {
         assert_eq!(
             declaring, pinned,
             "a built-in tool declares read-only calls: update READ_ONLY_DECLARING_TOOLS on purpose"
+        );
+    }
+
+    /// The registry a door builds, over the same arguments the CLI door
+    /// passes.
+    fn registry_for(config: &Config, security: &Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, &config.workspace_dir, None).unwrap());
+        all_tools(
+            Arc::new(config.clone()),
+            security,
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.workspace_dir,
+            &config.agents,
+            config.api_key.as_deref(),
+            config,
+        )
+    }
+
+    /// A skill the operator disabled in the config contributes no tool: the
+    /// loader filters it out, so the registry never holds its adapter.
+    #[test]
+    fn a_skill_disabled_in_the_config_contributes_no_tool() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        std::fs::create_dir_all(config.workspace_dir.join("skills")).unwrap();
+        crate::agent::door_test_support::write_skill(
+            &config.workspace_dir,
+            "greeter",
+            &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+        );
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry.enabled = false;
+        config.skills.entries.insert("greeter".into(), entry);
+
+        let security = Arc::new(SecurityPolicy::default());
+        let tools = registry_for(&config, &security);
+        assert!(
+            !tools.iter().any(|t| t.name() == "skill_greeter_greet"),
+            "a skill disabled in the config still contributed its tool"
+        );
+
+        // Control: the same skill, enabled, does contribute its tool.
+        let mut enabled = config.clone();
+        enabled
+            .skills
+            .entries
+            .insert("greeter".into(), crate::config::SkillEntryConfig::default());
+        let tools = registry_for(&enabled, &security);
+        assert!(
+            tools.iter().any(|t| t.name() == "skill_greeter_greet"),
+            "an enabled skill contributed no tool"
+        );
+    }
+
+    /// A skill adapter can never shadow a built-in: the `skill_` prefix keeps
+    /// it apart, so the built-in `shell` is still there, exactly once, and the
+    /// skill's own tool is `skill_<skill>_shell`.
+    #[test]
+    fn a_skill_tool_cannot_shadow_a_builtin() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(config.workspace_dir.join("skills")).unwrap();
+        crate::agent::door_test_support::write_skill(
+            &config.workspace_dir,
+            "greeter",
+            &crate::agent::door_test_support::skill_with_one_tool("greeter", "shell", "echo hello"),
+        );
+
+        let security = Arc::new(SecurityPolicy::default());
+        let tools = registry_for(&config, &security);
+        assert_eq!(
+            tools.iter().filter(|t| t.name() == "shell").count(),
+            1,
+            "the built-in shell tool is not in the registry exactly once"
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|t| t.name() == "skill_greeter_shell")
+                .count(),
+            1,
+            "the skill's tool is not in the registry exactly once"
+        );
+    }
+
+    /// A delegate sub-agent whose `allowed_tools` names a skill's tool gets
+    /// it. The skill adapters are in the registry before the delegate
+    /// snapshots the parent's tools, so the sub-agent's own filter sees them.
+    #[tokio::test]
+    async fn a_delegate_sub_agent_gets_the_skill_tool_when_its_allowlist_names_it() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        crate::agent::door_test_support::write_skill(
+            &fixture.workspace,
+            "greeter",
+            &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+        );
+        let mut config = fixture.config.clone();
+        config.agents.insert(
+            "helper".to_string(),
+            crate::config::DelegateAgentConfig {
+                provider: fixture.llm.provider(),
+                model: "mock-model".to_string(),
+                system_prompt: None,
+                api_key: Some("mock-key".to_string()),
+                temperature: Some(0.0),
+                max_depth: 3,
+                agentic: true,
+                allowed_tools: vec!["skill_greeter_greet".to_string()],
+                max_iterations: 2,
+            },
+        );
+
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let registry = registry_for(&config, &security);
+        let delegate = registry
+            .iter()
+            .find(|tool| tool.name() == "delegate")
+            .expect("the registry holds the delegate tool");
+        let result = delegate
+            .execute(serde_json::json!({"agent": "helper", "prompt": "hello"}))
+            .await
+            .expect("the delegate runs");
+        assert!(result.success, "the delegate failed: {:?}", result.error);
+
+        let sent = fixture.llm.native_tool_names();
+        assert!(
+            sent.iter().any(|name| name == "skill_greeter_greet"),
+            "the sub-agent was not offered the skill's tool: {sent:?}"
+        );
+    }
+
+    /// A delegate sub-agent whose `allowed_tools` does not name a skill's
+    /// tool does not get it. The sub-agent's filter is an exact-name match
+    /// against the parent's tools, and a skill tool is a tool like any other.
+    #[tokio::test]
+    async fn a_delegate_sub_agent_does_not_get_the_skill_tool_when_the_allowlist_omits_it() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        crate::agent::door_test_support::write_skill(
+            &fixture.workspace,
+            "greeter",
+            &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+        );
+        let mut config = fixture.config.clone();
+        config.agents.insert(
+            "helper".to_string(),
+            crate::config::DelegateAgentConfig {
+                provider: fixture.llm.provider(),
+                model: "mock-model".to_string(),
+                system_prompt: None,
+                api_key: Some("mock-key".to_string()),
+                temperature: Some(0.0),
+                max_depth: 3,
+                agentic: true,
+                allowed_tools: vec!["file_read".to_string()],
+                max_iterations: 2,
+            },
+        );
+
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let registry = registry_for(&config, &security);
+        let delegate = registry
+            .iter()
+            .find(|tool| tool.name() == "delegate")
+            .expect("the registry holds the delegate tool");
+        let result = delegate
+            .execute(serde_json::json!({"agent": "helper", "prompt": "hello"}))
+            .await
+            .expect("the delegate runs");
+        assert!(result.success, "the delegate failed: {:?}", result.error);
+
+        let sent = fixture.llm.native_tool_names();
+        assert!(
+            sent.iter().any(|name| name == "file_read"),
+            "the sub-agent was not offered the tool its allowlist names: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|name| name == "skill_greeter_greet"),
+            "the sub-agent was offered a tool its allowlist does not name: {sent:?}"
         );
     }
 }
