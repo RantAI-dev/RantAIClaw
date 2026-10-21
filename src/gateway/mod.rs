@@ -1070,6 +1070,36 @@ fn startup_pairing_banner(code: &str, stdout_is_terminal: bool) -> String {
     }
 }
 
+/// What the tunnel start left behind for the startup banner.
+///
+/// `started` and `url` are deliberately separate: `start` succeeds with no URL
+/// whenever the provider does not print one (cloudflared in token mode, a
+/// custom command without a pattern), and the console warning keys on a
+/// running tunnel, never on a URL the provider may not have given.
+#[derive(Default)]
+struct TunnelStartup {
+    started: bool,
+    url: Option<String>,
+}
+
+/// The line that reports a tunnel that started. `None` means the provider did
+/// not report a public URL, and the line says so — it never fills in a local
+/// or constructed address.
+fn tunnel_active_line(provider: &str, url: Option<&str>) -> String {
+    match url {
+        Some(url) => format!("🌐 Tunnel active: {url}"),
+        None => format!("🌐 Tunnel active ({provider} did not report a public URL)"),
+    }
+}
+
+/// Whether the startup banner must warn that the console has no login while it
+/// is reachable from beyond localhost: a public bind, or a tunnel that is
+/// running — whatever URL it did or did not report.
+fn console_warns_no_login(host: &str, tunnel: &TunnelStartup, login_off: bool) -> bool {
+    let reachable = is_public_bind(host) || tunnel.started;
+    reachable && login_off
+}
+
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -1126,8 +1156,7 @@ pub async fn run_gateway(
             config.tunnel.provider
         )))
     })?;
-    let mut tunnel_url: Option<String> = None;
-    let mut tunnel_started = false;
+    let mut tunnel_startup = TunnelStartup::default();
 
     // Not wrapped unless the bind was refused outright: `AddrInUse` and every
     // other io error stay raw here so the supervisor can classify them
@@ -1220,9 +1249,9 @@ pub async fn run_gateway(
         println!("🔗 Starting {} tunnel...", tun.name());
         match tun.start(host, actual_port).await {
             Ok(url) => {
-                println!("🌐 Tunnel active: {url}");
-                tunnel_url = Some(url);
-                tunnel_started = true;
+                println!("{}", tunnel_active_line(tun.name(), url.as_deref()));
+                tunnel_startup.url = url;
+                tunnel_startup.started = true;
             }
             Err(e) => {
                 // Not a fallback: the listener is already bound and serving.
@@ -1236,15 +1265,16 @@ pub async fn run_gateway(
     }
 
     println!("🦀 RantaiClaw Gateway listening on http://{display_addr}");
-    if let Some(ref url) = tunnel_url {
+    if let Some(ref url) = tunnel_startup.url {
         println!("  🌐 Public URL: {url}");
     }
     // Warn when the gateway is reachable beyond localhost but the web console
     // has no login configured — anyone who can reach the port can drive the
-    // agent. Advisory only; the operator opted into the exposure.
-    let exposed = is_public_bind(host) || tunnel_url.is_some();
+    // agent. Advisory only; the operator opted into the exposure. A running
+    // tunnel always counts, even when its provider reported no URL: the tunnel
+    // is up, so the console is reachable.
     let login_off = config.gateway.login.password_hash.is_none();
-    if exposed && login_off {
+    if console_warns_no_login(host, &tunnel_startup, login_off) {
         println!(
             "  ⚠️  Reachable beyond localhost with no web-console login configured — \
              anyone who can reach {display_addr} can drive the agent."
@@ -1294,14 +1324,14 @@ pub async fn run_gateway(
     reloader_shutdown.cancel();
 
     // The tunnel stops with the gateway on every path that reaches here, Ok or
-    // Err, in this one place instead of one call per return. `tunnel_started`
-    // keeps a failed start from resetting anything it never set up. A failing
-    // stop is logged and never hides the serve error.
+    // Err, in this one place instead of one call per return. `started` keeps a
+    // failed start from resetting anything it never set up. A failing stop is
+    // logged and never hides the serve error.
     //
     // `kill_on_drop(true)` on every provider stays the backstop for the ABORT
     // path only: `drain_and_cleanup` aborts this task after `DRAIN_TIMEOUT` and
     // an aborted future cannot run async cleanup.
-    if tunnel_started {
+    if tunnel_startup.started {
         if let Some(ref tun) = tunnel {
             if let Err(e) = tun.stop().await {
                 tracing::warn!(provider = tun.name(), error = %e, "tunnel stop failed");
@@ -3088,6 +3118,68 @@ mod tests {
             message.contains("[tunnel.cloudflare] section is missing"),
             "the message must say which section to add: {message}"
         );
+    }
+
+    /// The banner reports the provider's own URL when it gave one.
+    #[test]
+    fn tunnel_active_line_prints_the_url_the_provider_reported() {
+        assert_eq!(
+            super::tunnel_active_line("custom", Some("https://rantaiclaw_tunnel.test")),
+            "🌐 Tunnel active: https://rantaiclaw_tunnel.test"
+        );
+    }
+
+    /// With no URL from the provider, the banner says the URL is unknown and
+    /// never fills in a local or constructed address.
+    #[test]
+    fn tunnel_active_line_says_the_provider_reported_no_url() {
+        // `custom` without a `url_pattern` is the case that used to print the
+        // local address as public.
+        let line = super::tunnel_active_line("custom", None);
+
+        assert!(
+            line.contains("custom"),
+            "the line must name the provider: {line}"
+        );
+        assert!(
+            line.contains("did not report a public URL"),
+            "the line must say the URL is unknown: {line}"
+        );
+        assert!(
+            !line.contains("http://") && !line.contains("https://"),
+            "a missing URL must not be filled in with one: {line}"
+        );
+        assert!(
+            !line.contains("localhost") && !line.contains("127.0.0.1"),
+            "a missing URL must not become a local address: {line}"
+        );
+    }
+
+    /// A tunnel that started without a URL still exposes the console, so the
+    /// no-login warning must fire.
+    #[test]
+    fn a_running_tunnel_without_a_url_still_warns_about_the_missing_login() {
+        let tunnel = super::TunnelStartup {
+            started: true,
+            url: None,
+        };
+
+        assert!(
+            super::console_warns_no_login("127.0.0.1", &tunnel, true),
+            "a running tunnel is reachable whether or not it reported a URL"
+        );
+        assert!(
+            !super::console_warns_no_login("127.0.0.1", &tunnel, false),
+            "a configured login needs no warning"
+        );
+    }
+
+    /// Loopback with no tunnel never triggers the warning.
+    #[test]
+    fn a_local_only_gateway_does_not_warn_about_the_missing_login() {
+        let tunnel = super::TunnelStartup::default();
+
+        assert!(!super::console_warns_no_login("127.0.0.1", &tunnel, true));
     }
 
     /// The tunnel process must be stopped through `Tunnel::stop()` when

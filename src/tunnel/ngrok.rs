@@ -1,5 +1,6 @@
 use super::{
-    kill_shared, new_shared_process, program_context, SharedProcess, Tunnel, TunnelProcess,
+    kill_shared, new_shared_process, program_context, spawn_drain, SharedProcess, Tunnel,
+    TunnelProcess,
 };
 use anyhow::{bail, Context, Result};
 use tokio::io::AsyncBufReadExt;
@@ -42,7 +43,7 @@ impl Tunnel for NgrokTunnel {
         "ngrok"
     }
 
-    async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
+    async fn start(&self, _local_host: &str, local_port: u16) -> Result<Option<String>> {
         // Set auth token
         let output = Command::new(&self.program)
             .args(["config", "add-authtoken", &self.auth_token])
@@ -85,12 +86,19 @@ impl Tunnel for NgrokTunnel {
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture ngrok stdout"))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture {} stdout", self.program))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture {} stderr", self.program))?;
 
         let mut reader = tokio::io::BufReader::new(stdout).lines();
         let mut public_url = String::new();
 
-        // Wait up to 15s for the tunnel URL
+        // Wait up to 15s for the tunnel URL. The `url=` logfmt field is the
+        // only random-URL mechanism the agent offers; it is UNCONFIRMED from
+        // ngrok's own sources (the v3 agent is closed source), so a timeout
+        // stays an error that names the program rather than a silent `None`.
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
         while tokio::time::Instant::now() < deadline {
             let line =
@@ -118,16 +126,27 @@ impl Tunnel for NgrokTunnel {
 
         if public_url.is_empty() {
             child.kill().await.ok();
-            bail!("ngrok did not produce a public URL within 15s. Is the auth token valid?");
+            child.wait().await.ok();
+            bail!(
+                "{} (http) did not produce a public URL within 15s. Is the auth token valid?",
+                self.program
+            );
         }
 
-        let mut guard = self.proc.lock().await;
-        *guard = Some(TunnelProcess {
-            child,
-            public_url: public_url.clone(),
-        });
+        {
+            let mut guard = self.proc.lock().await;
+            *guard = Some(TunnelProcess {
+                child,
+                public_url: Some(public_url.clone()),
+            });
+        }
+        // Keep both streams drained for the child's whole life: ngrok is a Go
+        // binary and exits with SIGPIPE on the next log write once its reader
+        // is gone.
+        spawn_drain("ngrok stdout", reader);
+        spawn_drain("ngrok stderr", tokio::io::BufReader::new(stderr).lines());
 
-        Ok(public_url)
+        Ok(Some(public_url))
     }
 
     async fn stop(&self) -> Result<()> {
@@ -135,15 +154,20 @@ impl Tunnel for NgrokTunnel {
     }
 
     async fn health_check(&self) -> bool {
-        let guard = self.proc.lock().await;
-        guard.as_ref().is_some_and(|tp| tp.child.id().is_some())
+        // `try_wait` reports a child that exited and was polled as gone; `id()`
+        // kept reporting a dead child as alive until it was reaped.
+        let mut guard = self.proc.lock().await;
+        match guard.as_mut() {
+            Some(tp) => matches!(tp.child.try_wait(), Ok(None)),
+            None => false,
+        }
     }
 
     fn public_url(&self) -> Option<String> {
         self.proc
             .try_lock()
             .ok()
-            .and_then(|g| g.as_ref().map(|tp| tp.public_url.clone()))
+            .and_then(|g| g.as_ref().and_then(|tp| tp.public_url.clone()))
     }
 }
 

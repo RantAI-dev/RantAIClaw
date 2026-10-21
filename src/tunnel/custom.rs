@@ -1,5 +1,6 @@
 use super::{
-    kill_shared, new_shared_process, program_context, SharedProcess, Tunnel, TunnelProcess,
+    kill_shared, new_shared_process, program_context, spawn_drain, url_in, SharedProcess, Tunnel,
+    TunnelProcess,
 };
 use anyhow::{bail, Context, Result};
 use tokio::io::AsyncBufReadExt;
@@ -8,8 +9,10 @@ use tokio::process::Command;
 /// Custom Tunnel — bring your own tunnel binary.
 ///
 /// Provide a `start_command` with `{port}` and `{host}` placeholders.
-/// Optionally provide a `url_pattern` regex to extract the public URL
-/// from stdout, and a `health_url` to poll for liveness.
+/// Optionally provide a `url_pattern` substring that the output line carrying
+/// the public URL must contain — without one the tunnel reports no URL, and a
+/// match found before the deadline is the only URL ever reported. Also
+/// optionally provide a `health_url` to poll for liveness.
 ///
 /// Examples:
 /// - `bore local {port} --to bore.pub`
@@ -43,7 +46,7 @@ impl Tunnel for CustomTunnel {
         "custom"
     }
 
-    async fn start(&self, local_host: &str, local_port: u16) -> Result<String> {
+    async fn start(&self, local_host: &str, local_port: u16) -> Result<Option<String>> {
         let cmd = self
             .start_command
             .replace("{port}", &local_port.to_string())
@@ -65,59 +68,61 @@ impl Tunnel for CustomTunnel {
             .spawn()
             .with_context(|| program_context("start", program, ""))?;
 
-        let mut public_url = format!("http://{local_host}:{local_port}");
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture custom tunnel stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture custom tunnel stderr"))?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
 
-        // If a URL pattern is provided, try to extract the public URL from stdout
+        // The public URL is whatever the operator's command printed and the
+        // pattern matched. Without a pattern there is nothing to match, so no
+        // wait and no URL: the local address is never reported as public.
+        let mut public_url = None;
         if let Some(ref pattern) = self.url_pattern {
-            if let Some(stdout) = child.stdout.take() {
-                let mut reader = tokio::io::BufReader::new(stdout).lines();
-                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
+            while tokio::time::Instant::now() < deadline {
+                let line =
+                    tokio::time::timeout(tokio::time::Duration::from_secs(3), lines.next_line())
+                        .await;
 
-                while tokio::time::Instant::now() < deadline {
-                    let line = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(3),
-                        reader.next_line(),
-                    )
-                    .await;
-
-                    match line {
-                        Ok(Ok(Some(l))) => {
-                            tracing::debug!("custom-tunnel: {l}");
-                            // Simple substring match on the pattern
-                            if l.contains(pattern)
-                                || l.contains("https://")
-                                || l.contains("http://")
-                            {
-                                // Extract URL from the line
-                                if let Some(idx) = l.find("https://") {
-                                    let url_part = &l[idx..];
-                                    let end = url_part
-                                        .find(|c: char| c.is_whitespace())
-                                        .unwrap_or(url_part.len());
-                                    public_url = url_part[..end].to_string();
-                                    break;
-                                } else if let Some(idx) = l.find("http://") {
-                                    let url_part = &l[idx..];
-                                    let end = url_part
-                                        .find(|c: char| c.is_whitespace())
-                                        .unwrap_or(url_part.len());
-                                    public_url = url_part[..end].to_string();
-                                    break;
-                                }
+                match line {
+                    Ok(Ok(Some(l))) => {
+                        tracing::debug!("custom-tunnel: {l}");
+                        // `url_pattern` is the substring the operator chose to
+                        // pick the line that carries the public URL (a command
+                        // may print a local health URL first). The URL itself
+                        // is still read off that line; it is never built here.
+                        if let Some(url) = url_in(&l, "https://").or_else(|| url_in(&l, "http://"))
+                        {
+                            if l.contains(pattern) {
+                                public_url = Some(url);
+                                break;
                             }
                         }
-                        Ok(Ok(None) | Err(_)) => break,
-                        Err(_) => {}
                     }
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => bail!("Error reading custom tunnel output: {e}"),
+                    Err(_) => {}
                 }
             }
         }
 
-        let mut guard = self.proc.lock().await;
-        *guard = Some(TunnelProcess {
-            child,
-            public_url: public_url.clone(),
-        });
+        {
+            let mut guard = self.proc.lock().await;
+            *guard = Some(TunnelProcess {
+                child,
+                public_url: public_url.clone(),
+            });
+        }
+        // Both streams stay drained for the child's whole life: the URL wait
+        // above only read part of stdout, and a dropped reader would stop the
+        // child (SIGPIPE) or block it on a full pipe.
+        spawn_drain("custom stdout", lines);
+        spawn_drain("custom stderr", tokio::io::BufReader::new(stderr).lines());
 
         Ok(public_url)
     }
@@ -137,16 +142,20 @@ impl Tunnel for CustomTunnel {
                 .is_ok();
         }
 
-        // Otherwise check if the process is still alive
-        let guard = self.proc.lock().await;
-        guard.as_ref().is_some_and(|tp| tp.child.id().is_some())
+        // Otherwise check if the process is still alive. `try_wait` reports a
+        // child that exited and was polled as gone; `id()` never does.
+        let mut guard = self.proc.lock().await;
+        match guard.as_mut() {
+            Some(tp) => matches!(tp.child.try_wait(), Ok(None)),
+            None => false,
+        }
     }
 
     fn public_url(&self) -> Option<String> {
         self.proc
             .try_lock()
             .ok()
-            .and_then(|g| g.as_ref().map(|tp| tp.public_url.clone()))
+            .and_then(|g| g.as_ref().and_then(|tp| tp.public_url.clone()))
     }
 }
 
@@ -187,16 +196,49 @@ mod tests {
         );
     }
 
+    /// Without a `url_pattern` there is nothing to match, so the tunnel is
+    /// started but reports no URL: the local address is never shown as public.
     #[tokio::test]
-    async fn start_without_pattern_returns_local_url() {
-        let tunnel = CustomTunnel::new("sleep 1".into(), None, None);
+    async fn start_without_pattern_reports_no_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "rantaiclaw_tunnel",
+            "#!/bin/sh\nsleep 30\n",
+        );
+        let tunnel = CustomTunnel::new(format!("{} {{port}}", fake.display()), None, None);
 
         let url = tunnel.start("127.0.0.1", 4455).await.unwrap();
-        assert_eq!(url, "http://127.0.0.1:4455");
-        assert_eq!(
-            tunnel.public_url().as_deref(),
-            Some("http://127.0.0.1:4455")
+        assert_eq!(url, None, "no pattern means no URL to report");
+        assert_eq!(tunnel.public_url(), None);
+
+        tunnel.stop().await.unwrap();
+    }
+
+    /// With a pattern but no matching URL line, the tunnel reports no URL: it
+    /// never falls back to the local address, whatever the local bind was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_with_pattern_and_no_match_reports_no_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "rantaiclaw_tunnel",
+            "#!/bin/sh\necho 'rantaiclaw_tunnel listening on a local port'\nexit 0\n",
         );
+        let tunnel = CustomTunnel::new(
+            format!("{} {{port}}", fake.display()),
+            None,
+            Some("https://".into()),
+        );
+
+        let url = tunnel
+            .start("127.0.0.1", 4455)
+            .await
+            .expect("the fake starts");
+
+        assert_eq!(url, None, "a missing match is no URL, not a local one");
+        assert_eq!(tunnel.public_url(), None);
 
         tunnel.stop().await.unwrap();
     }
@@ -211,7 +253,7 @@ mod tests {
 
         let url = tunnel.start("localhost", 9999).await.unwrap();
 
-        assert_eq!(url, "https://public.example");
+        assert_eq!(url.as_deref(), Some("https://public.example"));
         assert_eq!(
             tunnel.public_url().as_deref(),
             Some("https://public.example")
@@ -230,7 +272,7 @@ mod tests {
 
         let url = tunnel.start("10.1.2.3", 4321).await.unwrap();
 
-        assert_eq!(url, "http://10.1.2.3:4321");
+        assert_eq!(url.as_deref(), Some("http://10.1.2.3:4321"));
         tunnel.stop().await.unwrap();
     }
 
