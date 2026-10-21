@@ -1531,7 +1531,11 @@ autonomous_tools = false                # true = skip the approval gate entirely
   behalf — the owner's `autonomy.auto_approve` list is intentionally **not**
   inherited. Empty (the default) means the agent calls no tool for a guest;
   `guest_allowed_commands` is a hard ceiling on shell — a command outside it
-  is denied outright, never escalated to an owner.
+  is denied outright, never escalated to an owner. It is a ceiling on the
+  `shell` tool (and its `bash` and `run_command` names) and does not bind a
+  granted `skill_*` tool, whose declared program then runs with the model
+  choosing the extra argument, once the channel's approval gate lets the call
+  through ([Skills pillar](../pillars/4-skills-mcp.md#which-limits-bind-a-skill-tool)).
 - **If privileged tools are being denied, add an owner.** Do **not** reach for
   `autonomous_tools = true`: that skips the approval gate for everyone on the
   channel, which is a different and much larger decision.
