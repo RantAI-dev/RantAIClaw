@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before this change sends the literal `enc2:…` string as the route's key, so the route fails to
   authenticate. Rolling back means reverting, then re-entering any route key saved in between.
   Channel and tunnel tokens are still plaintext and are not part of this change.
+- A ClawHub skill file listed in the version manifest without a `sha256` (for example a script or `SKILL.toml`) was installed unverified: only the literal `SKILL.md` had to carry a hash, and every other entry was verified only when one happened to be present. Installs and updates now validate the whole manifest before fetching anything and refuse a version that lists any file without a valid 64-hex hash, naming the file; `skills update` keeps the installed version. Skills already installed are not re-verified, changed or removed.
 
 ### Added
 

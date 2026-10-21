@@ -644,6 +644,11 @@ not — `validate_slug` runs first there.
   will later read and act on, so choosing by popularity or list order would
   hand a slug squatter a path onto the machine. `matches` is omitted from
   every other error response.
+- **Unhashed manifest**: a version whose manifest lists any file without a valid
+  64-hex `sha256` is refused before anything is fetched or written. That
+  failure arrives as the `500` below, with `detail` naming the file and saying
+  it would be unverified — it is not a `4xx`. An already-installed skill is
+  never re-verified or removed by this check.
 - **Status codes**: `200`, `400` (invalid reference), `401`, `409` (ambiguous
   slug), `500` (ClawHub fetch/hash/install failure).
 

@@ -375,8 +375,12 @@ struct VersionFile {
 /// 3. For each file: `GET /skills/:slug/file?version=:v&path=<path>` → write to disk,
 ///    verify SHA-256 against the manifest.
 ///
-/// On any failure (network, hash mismatch, path traversal in the manifest)
-/// the partially-written directory is removed so the install is all-or-nothing.
+/// The whole manifest is validated before step 3 starts: a version that lists
+/// any file without a 64-hex `sha256` is refused, and the error names the file.
+///
+/// On any failure (network, a missing or malformed manifest hash, hash
+/// mismatch, path traversal in the manifest) the partially-written directory
+/// is removed so the install is all-or-nothing.
 pub async fn install_one(profile: &Profile, reference: &str) -> Result<()> {
     let skill_ref = parse_skill_ref(reference)?;
     ensure_base_url_safe()?;
@@ -473,6 +477,13 @@ async fn install_one_inner(
         anyhow::bail!("clawhub: version {version} of {slug} has no files");
     }
 
+    // Every entry must pin its own bytes before anything is fetched or
+    // created: the manifest and the files arrive from the same server, so a
+    // file the manifest does not hash cannot be proven to be the one the
+    // manifest describes. Doing this first also means a refused version
+    // fetches nothing and leaves no directory behind.
+    ensure_manifest_files_hashed(slug, &version, &files)?;
+
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
 
     // Step 3 — fetch + verify each file. We ban any path that escapes the
@@ -516,7 +527,6 @@ async fn install_one_inner(
         // succeeds. This was the v0.6.1-alpha "Clawhub Error Install" bug
         // — a stale README.md reference broke the entire install.
         let is_required = file.path.eq_ignore_ascii_case("SKILL.md");
-        ensure_required_hash(is_required, &file.sha256)?;
         let resp = match fetch_with_retry(client, &file_url, slug).await {
             Ok(r) => r,
             Err(e) if !is_required => {
@@ -536,10 +546,11 @@ async fn install_one_inner(
             .await
             .with_context(|| format!("download {}", file.path))?;
 
-        if !file.sha256.is_empty() {
-            verify_sha256(&bytes, &file.sha256)
-                .with_context(|| format!("hash check failed for {}", file.path))?;
-        }
+        // Unconditional: `ensure_manifest_files_hashed` above rejects the
+        // whole version unless every entry carries a well-formed sha256, so
+        // there is no unhashed file left to skip verification for.
+        verify_sha256(&bytes, &file.sha256)
+            .with_context(|| format!("hash check failed for {}", file.path))?;
 
         std::fs::write(&target, &bytes).with_context(|| format!("write {}", target.display()))?;
     }
@@ -929,15 +940,41 @@ fn ensure_scan_allows(slug: &str, version: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Required files (SKILL.md) must ship a verifiable hash. Optional files may
-/// omit it (best-effort, unchanged).
-fn ensure_required_hash(is_required: bool, sha256: &str) -> Result<()> {
-    if is_required && sha256.is_empty() {
+/// Validate the whole manifest before the first byte is fetched: every entry
+/// must carry a 64-hex `sha256`. A missing key, an empty string, a truncated
+/// value and a non-hex value all count as "no hash" — none of them can prove
+/// the bytes are the ones the manifest describes, and the manifest and the
+/// bytes come from the same server.
+///
+/// The check is manifest-wide, not per file as it is written, so a refused
+/// version fetches nothing and creates no directory: the failure lands before
+/// [`std::fs::create_dir_all`] and propagates out of [`install_one`], where
+/// the caller's cleanup and `skills update`'s restore arm handle it.
+fn ensure_manifest_files_hashed(slug: &str, version: &str, files: &[VersionFile]) -> Result<()> {
+    for file in files {
+        if is_sha256_hex(&file.sha256) {
+            continue;
+        }
+        let detail = if file.sha256.is_empty() {
+            "without a sha256".to_string()
+        } else {
+            format!(
+                "with a malformed sha256 `{}` (expected 64 hex characters)",
+                file.sha256
+            )
+        };
         anyhow::bail!(
-            "clawhub: required file has no sha256 in the manifest — refusing to write it unverified"
+            "clawhub: {slug}@{version} lists {} {detail} — refusing to install unverified files",
+            file.path
         );
     }
     Ok(())
+}
+
+/// Exactly 64 ASCII hex characters, either case — the shape of a SHA-256
+/// digest as ClawHub's manifests spell it.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Reject a `RANTAICLAW_CLAWHUB_BASE_URL` override that is not https, unless it
@@ -1538,10 +1575,53 @@ mod tests {
     }
 
     #[test]
-    fn required_file_without_hash_is_rejected() {
-        assert!(ensure_required_hash(true, "").is_err()); // SKILL.md, empty hash
-        assert!(ensure_required_hash(true, "abc123").is_ok());
-        assert!(ensure_required_hash(false, "").is_ok()); // optional file, ok
+    fn is_sha256_hex_accepts_only_64_hex_characters() {
+        assert!(is_sha256_hex(&"a".repeat(64)));
+        assert!(is_sha256_hex(&"A".repeat(64))); // case-insensitive, like verify_sha256
+        assert!(!is_sha256_hex("")); // missing key or empty string
+        assert!(!is_sha256_hex("abc123")); // truncated
+        assert!(!is_sha256_hex(&"a".repeat(63)));
+        assert!(!is_sha256_hex(&"a".repeat(65)));
+        assert!(!is_sha256_hex(&"g".repeat(64))); // non-hex
+    }
+
+    fn version_file(path: &str, sha256: &str) -> VersionFile {
+        VersionFile {
+            path: path.to_string(),
+            size: 0,
+            sha256: sha256.to_string(),
+            content_type: String::new(),
+        }
+    }
+
+    #[test]
+    fn manifest_with_an_unhashed_entry_is_refused_naming_the_file() {
+        let files = vec![
+            version_file("SKILL.md", &"a".repeat(64)),
+            version_file("run.sh", ""),
+        ];
+        let err = ensure_manifest_files_hashed("demo", "1.0.0", &files).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("run.sh"), "{text}");
+        assert!(text.contains("without a sha256"), "{text}");
+    }
+
+    #[test]
+    fn manifest_with_a_malformed_hash_is_refused_naming_the_file() {
+        let files = vec![version_file("SKILL.toml", "abc123")];
+        let err = ensure_manifest_files_hashed("demo", "1.0.0", &files).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("SKILL.toml"), "{text}");
+        assert!(text.contains("malformed sha256"), "{text}");
+    }
+
+    #[test]
+    fn manifest_with_every_entry_hashed_passes() {
+        let files = vec![
+            version_file("SKILL.md", &"a".repeat(64)),
+            version_file("run.sh", &"B".repeat(64)),
+        ];
+        ensure_manifest_files_hashed("demo", "1.0.0", &files).unwrap();
     }
 
     #[test]

@@ -3621,6 +3621,405 @@ description = "Bare minimum"
         hex::encode(hasher.finalize())
     }
 
+    // --- ClawHub manifest hash coverage (plan 597) ------------------------
+
+    /// One entry of a multi-file mock ClawHub version manifest. `sha256`
+    /// carries the manifest's raw value: `None` omits the key entirely
+    /// (the field the installer reads via `#[serde(default)]`), `Some(s)`
+    /// sends `s` verbatim — valid hex, empty, short, or wrong.
+    struct MockClawhubFile {
+        path: &'static str,
+        body: Vec<u8>,
+        sha256: Option<String>,
+    }
+
+    impl MockClawhubFile {
+        /// A file listed with the correct hash of its own body.
+        fn hashed(path: &'static str, body: &[u8]) -> Self {
+            Self {
+                path,
+                body: body.to_vec(),
+                sha256: Some(sha256_hex(body)),
+            }
+        }
+
+        /// A file listed with a manifest-supplied raw hash value.
+        fn raw_sha(path: &'static str, body: &[u8], sha256: &str) -> Self {
+            Self {
+                path,
+                body: body.to_vec(),
+                sha256: Some(sha256.to_string()),
+            }
+        }
+    }
+
+    type MockRequestLog = std::sync::Arc<Mutex<Vec<String>>>;
+
+    /// Multi-file mock ClawHub: like [`spawn_mock_clawhub`], but the version
+    /// manifest lists every file in `files` (each with its own hash entry and
+    /// body) and every request path is recorded in the returned log so tests
+    /// can assert what the client actually asked for. Serves the same three
+    /// endpoints `install_one` walks on a loopback-only listener; paths are
+    /// matched verbatim, so use separator-free names (`run.sh`, `SKILL.toml`).
+    fn spawn_mock_clawhub_multi(files: Vec<MockClawhubFile>) -> (String, MockRequestLog) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let files = std::sync::Arc::new(files);
+        let requests: MockRequestLog = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = requests.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = match sock.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                requests_clone.lock().unwrap().push(path.clone());
+
+                let files = files.clone();
+                let (status, ctype, resp_body): (&str, &str, Vec<u8>) = if path.contains("/file?") {
+                    let served = files
+                        .iter()
+                        .find(|f| path.contains(&format!("path={}", f.path)));
+                    match served {
+                        Some(f) => ("200 OK", "text/plain", f.body.clone()),
+                        None => ("404 Not Found", "text/plain", b"no such file".to_vec()),
+                    }
+                } else if path.contains("/versions/") {
+                    let entries: Vec<serde_json::Value> = files
+                        .iter()
+                        .map(|f| {
+                            let mut entry = serde_json::json!({
+                                "path": f.path,
+                                "size": f.body.len(),
+                                "contentType": "text/plain",
+                            });
+                            if let Some(sha) = &f.sha256 {
+                                entry["sha256"] = serde_json::Value::String(sha.clone());
+                            }
+                            entry
+                        })
+                        .collect();
+                    let manifest = serde_json::json!({
+                        "version": {
+                            "version": "1.0.0",
+                            "files": entries,
+                        }
+                    });
+                    (
+                        "200 OK",
+                        "application/json",
+                        manifest.to_string().into_bytes(),
+                    )
+                } else {
+                    let detail = serde_json::json!({
+                        "skill": {"slug": "demo"},
+                        "latestVersion": {"version": "1.0.0"}
+                    });
+                    (
+                        "200 OK",
+                        "application/json",
+                        detail.to_string().into_bytes(),
+                    )
+                };
+
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp_body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(&resp_body);
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    /// The refusals and installs below all take the CLI path
+    /// (`handle_command` → `install_one`), which surfaces the inner error
+    /// text via `with_context` — so asserting on `{err:#}` verifies both the
+    /// behavior and that the reason reaches the user (plan 597 step 4).
+    fn run_clawhub_install(
+        workspace_dir: &std::path::Path,
+        slug: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.to_path_buf();
+        config.skills.open_skills_enabled = false;
+        handle_command(
+            crate::SkillCommands::Install {
+                source: slug.to_string(),
+            },
+            &config,
+        )
+    }
+
+    #[test]
+    fn clawhub_install_writes_every_file_when_the_manifest_hashes_them_all() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let skill_md = b"# demo skill\n\nHashed multi-file manifest.\n".to_vec();
+        let run_sh = b"#!/bin/sh\necho rantaiclaw-demo\n".to_vec();
+        let (base, requests) = spawn_mock_clawhub_multi(vec![
+            MockClawhubFile::hashed("SKILL.md", &skill_md),
+            MockClawhubFile::hashed("run.sh", &run_sh),
+        ]);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        run_clawhub_install(&workspace_dir, "demo").expect("a fully hashed manifest must install");
+
+        assert_eq!(
+            fs::read(profile.skills_dir().join("demo").join("SKILL.md")).unwrap(),
+            skill_md,
+        );
+        assert_eq!(
+            fs::read(profile.skills_dir().join("demo").join("run.sh")).unwrap(),
+            run_sh,
+        );
+        let fetched = requests.lock().unwrap();
+        assert_eq!(
+            fetched.iter().filter(|p| p.contains("/file?")).count(),
+            2,
+            "both manifest files must be fetched once each; saw {fetched:?}"
+        );
+    }
+
+    #[test]
+    fn clawhub_install_refuses_a_file_with_an_empty_sha256_before_fetching() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let skill_md = b"# demo skill\n".to_vec();
+        let (base, requests) = spawn_mock_clawhub_multi(vec![
+            MockClawhubFile::hashed("SKILL.md", &skill_md),
+            MockClawhubFile::raw_sha("run.sh", b"#!/bin/sh\n", ""),
+        ]);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let err = run_clawhub_install(&workspace_dir, "demo")
+            .expect_err("a file listed with an empty sha256 must refuse the install");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("run.sh"),
+            "the error must name the offending file: {text}"
+        );
+        assert!(
+            text.contains("sha256"),
+            "the error must say which field is missing: {text}"
+        );
+        assert!(
+            !profile.skills_dir().join("demo").exists(),
+            "nothing may be installed for an unverified version"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("/file?")),
+            "the whole manifest must be validated before any file is fetched; saw {:?}",
+            requests.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn clawhub_install_refuses_a_file_with_no_sha256_key_before_fetching() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let skill_md = b"# demo skill\n".to_vec();
+        let run_sh = b"#!/bin/sh\necho rantaiclaw-missing\n".to_vec();
+        let (base, requests) = spawn_mock_clawhub_multi(vec![
+            MockClawhubFile::hashed("SKILL.md", &skill_md),
+            // No `sha256` key in the manifest entry at all — after serde's
+            // default this looks like an empty hash, but the omission must
+            // refuse all the same.
+            MockClawhubFile {
+                path: "run.sh",
+                body: run_sh,
+                sha256: None,
+            },
+        ]);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let err = run_clawhub_install(&workspace_dir, "demo")
+            .expect_err("a file listed without a sha256 key must refuse the install");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("run.sh"),
+            "the error must name the offending file: {text}"
+        );
+        assert!(
+            !profile.skills_dir().join("demo").exists(),
+            "nothing may be installed for an unverified version"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("/file?")),
+            "the whole manifest must be validated before any file is fetched; saw {:?}",
+            requests.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn clawhub_install_refuses_a_skill_toml_without_a_hash_before_fetching() {
+        // The dangerous shape: the loader prefers `SKILL.toml` over
+        // `SKILL.md` and reads `[[tools]]` from it, so an unverified
+        // SKILL.toml is executable configuration, not an inert asset.
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let skill_md = b"# demo skill\n".to_vec();
+        let skill_toml = b"schema_version = 1\n[[tools]]\nname = \"probe\"\n".to_vec();
+        let (base, requests) = spawn_mock_clawhub_multi(vec![
+            MockClawhubFile::hashed("SKILL.md", &skill_md),
+            MockClawhubFile::raw_sha("SKILL.toml", &skill_toml, ""),
+        ]);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let err = run_clawhub_install(&workspace_dir, "demo")
+            .expect_err("an unhashed SKILL.toml must refuse the install");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("SKILL.toml"),
+            "the error must name SKILL.toml: {text}"
+        );
+        assert!(
+            !profile.skills_dir().join("demo").exists(),
+            "nothing may be installed for an unverified version"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("/file?")),
+            "no file may be fetched before the manifest is validated; saw {:?}",
+            requests.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn clawhub_install_refuses_a_sha256_shorter_than_64_hex_before_fetching() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let skill_md = b"# demo skill\n".to_vec();
+        let (base, requests) = spawn_mock_clawhub_multi(vec![
+            MockClawhubFile::hashed("SKILL.md", &skill_md),
+            MockClawhubFile::raw_sha("run.sh", b"#!/bin/sh\n", "abc123"),
+        ]);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let err = run_clawhub_install(&workspace_dir, "demo")
+            .expect_err("a truncated sha256 must refuse the install");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("run.sh"),
+            "the error must name the offending file: {text}"
+        );
+        assert!(
+            !profile.skills_dir().join("demo").exists(),
+            "nothing may be installed for an unverified version"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("/file?")),
+            "no file may be fetched before the manifest is validated; saw {:?}",
+            requests.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn clawhub_install_refuses_a_wrong_sha256_and_writes_no_file() {
+        // Pins v0.33 behaviour: a present-but-wrong hash still fails, and
+        // the mismatching file must not land on disk.
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let skill_md = b"# demo skill\n".to_vec();
+        let run_sh = b"#!/bin/sh\necho rantaiclaw-badhash\n".to_vec();
+        let zeros = "0".repeat(64);
+        let (base, _requests) = spawn_mock_clawhub_multi(vec![
+            MockClawhubFile::hashed("SKILL.md", &skill_md),
+            MockClawhubFile::raw_sha("run.sh", &run_sh, &zeros),
+        ]);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let err = run_clawhub_install(&workspace_dir, "demo")
+            .expect_err("a wrong sha256 must fail the install");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("run.sh"),
+            "the error must name the mismatching file: {text}"
+        );
+        assert!(
+            !profile.skills_dir().join("demo").exists(),
+            "the partial install must be cleaned up — no file may survive a hash mismatch"
+        );
+    }
+
+    #[test]
+    fn clawhub_update_refuses_an_unhashed_version_and_keeps_the_old_one() {
+        // The dangerous shape for `skills update`: the old directory is
+        // renamed aside before the fetch, so a refused install must be
+        // restored byte-for-byte rather than leaving the user with nothing.
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let profile_skills = profile.skills_dir();
+        write_fake_skill(&profile_skills, "demo", None);
+        let original_content = fs::read(profile_skills.join("demo").join("SKILL.md")).unwrap();
+
+        let new_skill_md = b"# demo skill\n\nUpdated content from ClawHub.\n".to_vec();
+        let (base, _requests) = spawn_mock_clawhub_multi(vec![
+            MockClawhubFile::hashed("SKILL.md", &new_skill_md),
+            MockClawhubFile::raw_sha("run.sh", b"#!/bin/sh\n", ""),
+        ]);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+        let result = handle_command(
+            crate::SkillCommands::Update {
+                slug: Some("demo".to_string()),
+                all: false,
+            },
+            &config,
+        );
+        assert!(
+            result.is_err(),
+            "an update to an unhashed version must be reported as a failure, got {result:?}"
+        );
+
+        let restored = fs::read(profile_skills.join("demo").join("SKILL.md")).unwrap();
+        assert_eq!(
+            restored, original_content,
+            "the refused update must keep the old version's files unchanged"
+        );
+        assert!(
+            !profile_skills.join("demo").join("run.sh").exists(),
+            "the new version's unverified file must not appear after a refused update"
+        );
+        assert!(
+            !profile
+                .root
+                .join(".skills-update-tmp")
+                .join("demo")
+                .exists(),
+            "the backup must be restored, not left behind, after a refused update"
+        );
+    }
+
     #[test]
     fn update_success_swaps_new_version() {
         let (_env, workspace_dir) = FakeProfileEnv::new();
