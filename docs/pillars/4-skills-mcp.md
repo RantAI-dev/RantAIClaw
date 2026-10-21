@@ -55,6 +55,39 @@ Skill tools are gated like any other tool:
 - A guest needs an explicit grant for the tool name (`rantaiclaw permissions add tool skill_<skill>_<tool>`).
 - A delegate sub-agent receives a skill tool only when its `allowed_tools` names it.
 
+### Which limits bind a skill tool
+
+For the `shell` kind, the program a skill tool runs is the one the skill declares. Its `SKILL.toml` `[[tools]]` block
+names the command: the stored command is split on whitespace, the first word is the program and the rest are its
+arguments. The model may add one extra argument, appended as a single argument.
+
+No shell sits in that path. The command never passes through a shell, so there is no expansion, no chaining, no pipe and
+no redirect, and the model's extra argument is one argument rather than a command line. A skill tool cannot run a
+pipeline.
+
+The `shell` tool's command limits do not bind a skill tool. `allowed_commands` and the high- and medium-risk levels bind
+the `shell` tool and a cron job's command, and bind no skill tool: a skill tool is not classified by the risk
+classifier, so `block_high_risk_commands` and `require_approval_for_medium_risk` do not apply to it. The path limits
+`forbidden_paths` and `workspace_only` are not the `shell` tool's limits either: they bind the file tools, the `ssh`
+tool's local path and a path-shaped argument of a cron job's command, and bind no skill tool.
+
+What does apply:
+
+- the `readonly` refusal, since a skill tool never declares a read-only call;
+- the approval prompt an owner gets under `supervised`;
+- a 120 s timeout;
+- for the `shell` kind, a refusal when the command string names a credential directory. The string is the declared
+  command plus the model's extra argument, so a benign declared command still fails when the model's argument names a
+  credential directory. The `http` kind has no such check.
+
+The `http` kind runs `curl` directly, with explicit arguments and no shell, against the URL the skill declares.
+`http_request.allowed_domains` does not apply to it, and neither do the built-in tool's private-host and DNS-rebinding
+guards. The URL comes from the skill declaration, not from the model; the model picks the method and the body. The
+method is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD` or `OPTIONS`, and anything else falls back to `GET`.
+
+Installing or enabling a skill is the trust decision. The `[[tools]]` block in its `SKILL.toml` says which program runs,
+or which URL the `http` kind calls, so read it before you enable the skill.
+
 ## Architecture
 
 ```
@@ -79,7 +112,7 @@ For programmatic tool surfaces, see Pillar 3 — `Tool` trait.
 
 ## Why no `filesystem` MCP server in the curated list
 
-Removed in v0.6.51. RantaiClaw ships built-in `shell`, `file_read`, and `file_write` tools gated by `SecurityPolicy.workspace_only` + `forbidden_paths`. The MCP `@modelcontextprotocol/server-filesystem` package duplicated those capabilities at the cost of:
+Removed in v0.6.51. RantaiClaw ships built-in `file_read` and `file_write` tools gated by `SecurityPolicy.workspace_only` + `forbidden_paths`, and a `shell` tool, which those path limits do not bind. The MCP `@modelcontextprotocol/server-filesystem` package duplicated those capabilities at the cost of:
 
 - ~80MB of node + npx fetch on first agent boot
 - 2 wasted tool iterations per filesystem op (the model probes both layers)

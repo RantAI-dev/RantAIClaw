@@ -24,7 +24,11 @@ run arbitrary privileged tools." This is the feature.
     the permissions summary shows it as refused,
   - if `shell` is permitted, commands must match `guest_allowed_commands`
     (globs, same matcher as the existing command allowlist) — **out-of-list =
-    hard deny**, never escalated to the owner.
+    hard deny**, never escalated to the owner. `guest_allowed_commands` binds
+    the `shell` tool (and its `bash` and `run_command` names) and does not bind
+    a granted `skill_*` tool, so such a grant lets the guest's turn run the
+    skill's declared program, with the model choosing the extra argument, once
+    the channel's approval gate lets the call through ([Skills pillar](../pillars/4-skills-mcp.md#which-limits-bind-a-skill-tool)).
   - A guest's system prompt describes the guest's turn, not the host. It leaves
     out:
     - the owner's profile (`USER.md`), notes (`MEMORY.md`), `BOOTSTRAP.md` and
