@@ -14870,3 +14870,110 @@ async fn guest_strict_line_does_not_deny_a_read_tool_it_does_not_know() {
     let none = guest_prompt_when_gates_differ(false, &[], &[], Strict).await;
     assert!(none.contains("None of your tools run"), "{none}");
 }
+
+/// The channel path builds its registry the way every other door does, so a
+/// skill's tool is in it. The owner's turn runs on that registry and gets the
+/// tool; a guest's turn runs on the entries the guest gate permits, and the
+/// default guest allowlist is empty, so the guest does not get it.
+#[tokio::test]
+async fn the_channel_door_offers_the_skill_tool_to_the_owner_and_not_to_a_guest() {
+    let workspace = TempDir::new().expect("temp workspace");
+    crate::agent::door_test_support::write_skill(
+        workspace.path(),
+        "greeter",
+        &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+    );
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+
+    // The registry the channel runtime builds (`src/channels/mod.rs`).
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let runtime: Arc<dyn crate::runtime::RuntimeAdapter> = Arc::from(
+        crate::runtime::create_runtime(&config.runtime).expect("the native runtime builds"),
+    );
+    let mem: Arc<dyn Memory> =
+        Arc::new(SqliteMemory::new(&config.workspace_dir).expect("the notes database opens"));
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(crate::tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem,
+        None,
+        None,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    ));
+
+    assert!(
+        registry
+            .iter()
+            .any(|tool| tool.name() == "skill_greeter_greet"),
+        "the channel registry does not hold the skill's tool"
+    );
+
+    // The guest's per-turn registry is the entries the gate permits. The
+    // default guest allowlist is empty, so the skill's tool is not among them.
+    let gate = crate::channels::guest_gate_from_config(&config);
+    let guest_tools = crate::tools::guest_registry::permitted_tools(&registry, &gate);
+    assert!(
+        !guest_tools
+            .iter()
+            .any(|tool| tool.name() == "skill_greeter_greet"),
+        "a guest without a grant reached the skill's tool"
+    );
+}
+
+/// A guest the operator granted the skill's tool by name reaches it. The
+/// grant is the guest's whole ceiling, so naming the tool is enough.
+#[tokio::test]
+async fn the_channel_door_offers_the_skill_tool_to_a_guest_with_a_grant() {
+    let workspace = TempDir::new().expect("temp workspace");
+    crate::agent::door_test_support::write_skill(
+        workspace.path(),
+        "greeter",
+        &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+    );
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    config.channels_config.guest_allowed_tools = vec!["skill_greeter_greet".to_string()];
+
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let runtime: Arc<dyn crate::runtime::RuntimeAdapter> = Arc::from(
+        crate::runtime::create_runtime(&config.runtime).expect("the native runtime builds"),
+    );
+    let mem: Arc<dyn Memory> =
+        Arc::new(SqliteMemory::new(&config.workspace_dir).expect("the notes database opens"));
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(crate::tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem,
+        None,
+        None,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    ));
+
+    let gate = crate::channels::guest_gate_from_config(&config);
+    let guest_tools = crate::tools::guest_registry::permitted_tools(&registry, &gate);
+    assert!(
+        guest_tools
+            .iter()
+            .any(|tool| tool.name() == "skill_greeter_greet"),
+        "a guest granted the skill's tool by name did not reach it"
+    );
+}

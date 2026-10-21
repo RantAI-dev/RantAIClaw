@@ -587,7 +587,10 @@ fn build_tools_factory(
         } else {
             (None, None)
         };
-        let mut tools = tools::all_tools_with_runtime(
+        // The skill tools are part of the shared registry builder
+        // (`tools::all_tools_with_runtime`), like every other tool, so the
+        // webhook door lists each of them exactly once.
+        tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             Arc::clone(&runtime),
@@ -600,13 +603,7 @@ fn build_tools_factory(
             &config.agents,
             config.api_key.as_deref(),
             config,
-        );
-
-        // Skills define [[tools]] blocks in SKILL.toml that become real
-        // callable shell/http tools.
-        let skills = skills::load_skills_with_config(&config.workspace_dir, config);
-        tools.extend(tools::skill_tools_from_skills(&skills, &security));
-        tools
+        )
     })
 }
 
@@ -7247,6 +7244,38 @@ mod tests {
             "webhook",
             &prompt,
             &crate::agent::door_test_support::held_by(&registry),
+        );
+    }
+
+    /// The webhook door lists a skill's tool exactly once. The webhook factory
+    /// used to add the skill tools on top of the shared registry, so the model
+    /// was offered every skill tool twice.
+    #[tokio::test]
+    async fn the_webhook_door_lists_the_skill_tool_exactly_once() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        crate::agent::door_test_support::write_skill(
+            workspace.path(),
+            "greeter",
+            &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+        );
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+
+        let runtime: Arc<dyn runtime::RuntimeAdapter> =
+            Arc::from(runtime::create_runtime(&config.runtime).expect("the native runtime builds"));
+        let factory = build_tools_factory(
+            runtime,
+            Arc::new(MockMemory),
+            Arc::new(crate::security::SecurityPolicy::default()),
+        );
+        let registry = factory(&config);
+        let occurrences = registry
+            .iter()
+            .filter(|tool| tool.name() == "skill_greeter_greet")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "the webhook registry lists the skill's tool {occurrences} times"
         );
     }
 

@@ -264,6 +264,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write to a closed stdout or stderr makes them exit with `SIGPIPE`, so the tunnel could stop shortly after
   it started. Every piped stream is now drained for the child's whole life, and `health_check` reports a
   child that has exited as not alive.
+- The tools a skill declares in its `[[tools]]` blocks reached the model only through the gateway webhook. The
+  CLI, the TUI, the console chat, chat channels, cron and the heartbeat offered no skill tool at all. Every turn
+  registry now carries the adapters of the skills that are loaded and enabled for that turn's config, so the model
+  is offered them at every door, and the webhook lists each of them once instead of twice. This widens what the
+  model can call by default: skill tools are refused under `readonly`, prompt an owner under `supervised` like any
+  other tool, and need an explicit guest grant. Two skills that sanitise to the same tool name yield one adapter,
+  and the collision is logged with both skill names.
 
 ## [0.33.0-alpha] — 2026-10-08
 

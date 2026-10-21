@@ -933,6 +933,46 @@ mod tests {
         assert!(system.contains("profile-canary-41c9"), "{system}");
         assert!(system.contains("notes-canary-52d0"), "{system}");
     }
+
+    /// The TUI boots its agent from the config, and that agent's registry
+    /// holds the tools a skill declares. The turn the TUI runs therefore
+    /// offers the skill's tool to the model, like any other tool.
+    #[tokio::test]
+    async fn the_tui_turn_door_sends_the_skill_tool_to_the_model() {
+        let fixture = crate::agent::door_test_support::DoorFixture::start().await;
+        crate::agent::door_test_support::write_skill(
+            &fixture.workspace,
+            "greeter",
+            &crate::agent::door_test_support::skill_with_one_tool("greeter", "greet", "echo hello"),
+        );
+        let agent = Agent::from_config(&fixture.config)
+            .await
+            .expect("the TUI agent boots from the config");
+
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let handle = tokio::spawn(TuiAgentActor::new(Some(agent), req_rx, events_tx).run());
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "hello".into(),
+                conversation_id: Some("tui:s1".into()),
+            })
+            .await
+            .unwrap();
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), events_rx.recv()).await {
+            if matches!(ev, AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+
+        let sent = fixture.llm.native_tool_names();
+        assert!(
+            sent.iter().any(|name| name == "skill_greeter_greet"),
+            "the TUI turn door did not offer the skill's tool: {sent:?}"
+        );
+    }
     /// A resumed session seeds the real system prompt and its conversational
     /// turns; the screen notes and error lines it holds never reach the model.
     #[tokio::test]
