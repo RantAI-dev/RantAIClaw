@@ -637,30 +637,62 @@ pub fn build_gateway_router(
 
     let gateway_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let gateway_provider_credential = config.resolve_key_for_provider(gateway_provider_name);
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
-        gateway_provider_name,
-        gateway_provider_credential.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &|name| config.resolve_key_for_provider(name),
-        &providers::ProviderRuntimeOptions {
-            auth_profile_override: None,
-            rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-            secrets_encrypt: config.secrets.encrypt,
-            reasoning_enabled: config.runtime.reasoning_enabled,
-            failover_announce: providers::FailoverAnnounce::default(),
-        },
-    )?);
+    let provider: Arc<dyn Provider> = Arc::from(
+        providers::create_resilient_provider_with_options(
+            gateway_provider_name,
+            gateway_provider_credential.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &|name| config.resolve_key_for_provider(name),
+            &providers::ProviderRuntimeOptions {
+                auth_profile_override: None,
+                rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+                secrets_encrypt: config.secrets.encrypt,
+                reasoning_enabled: config.runtime.reasoning_enabled,
+                failover_announce: providers::FailoverAnnounce::default(),
+            },
+        )
+        // Fatal: provider construction errors are all configuration or
+        // validation errors (unknown name, missing key, unparseable custom
+        // URL) — construction does no network I/O, so the same config fails
+        // again on every retry. Invalid fallback providers are already
+        // swallowed with a warning inside the factory.
+        .map_err(|e| {
+            anyhow::Error::new(GatewayStartupFatal(format!(
+                "[providers] default_provider = {gateway_provider_name:?}: {e:#}"
+            )))
+        })?,
+    );
     // Empty when unconfigured (no baked-in model): the gateway still starts and
     // serves the console so the operator can configure a model; a chat request
     // then fails fast in the agent loop with a clear hint.
     let model = config.default_model.clone().unwrap_or_default();
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    // Split by error kind: an unrecognised `backend` NAME is a configuration
+    // error (unknown memory backend) that would fail again on every retry —
+    // fatal. Opening or locking `brain.db` is a local disk condition
+    // (`SqliteMemory::with_embedder`, SQLite open/timeout) that can heal —
+    // retried as today. The unknown-backend text comes verbatim from
+    // `memory::create_memory_with_builders`; the split is decided at this call
+    // site in the gateway, not by teaching the supervisor about memory errors.
+    let mem: Arc<dyn Memory> = match memory::create_memory_with_storage(
         &config.memory,
         &config.workspace_dir,
         config.api_key.as_deref(),
-    )?);
+    ) {
+        Ok(mem) => Arc::from(mem),
+        Err(e) => {
+            let text = format!("{e:#}");
+            if text.starts_with("unknown memory backend") {
+                return Err(anyhow::Error::new(GatewayStartupFatal(format!(
+                    "[memory] backend = {:?}: {text}",
+                    config.memory.backend
+                ))));
+            }
+            // Local disk open/lock failure: can heal on a retry.
+            return Err(e);
+        }
+    };
     let memory_search_mode = Arc::new(memory::search_mode_label(
         &memory::resolve_embedding_config(
             &config.memory,
@@ -669,8 +701,16 @@ pub fn build_gateway_router(
         )
         .provider,
     ));
+    // Fatal: `runtime::create_runtime` does pure validation (`bail!` on an
+    // unknown or unimplemented kind); the same config fails again on every
+    // retry.
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
+        Arc::from(runtime::create_runtime(&config.runtime).map_err(|e| {
+            anyhow::Error::new(GatewayStartupFatal(format!(
+                "[runtime] kind = {:?}: {e:#}",
+                config.runtime.kind
+            )))
+        })?);
     // Built from the real config, so `workspace_dir` is the gateway's write root.
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
@@ -939,13 +979,35 @@ fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
         .with_context(|| format!("gateway host {host:?} resolved to no address"))
 }
 
+/// Map a failed `TcpListener::bind` to the error the daemon supervisor sees.
+///
+/// `PermissionDenied` follows from the Config alone — binding the same
+/// privileged port fails identically on every retry — so it becomes
+/// [`GatewayStartupFatal`] now. `AddrInUse` (the old process may still be
+/// releasing the port) and every other io error — `AddrNotAvailable` for an
+/// interface that can come up later, I/O hiccups — stay a raw `io::Error` in
+/// the chain so `classify_gateway_failure` keeps its retry budget or transient
+/// backoff for them.
+fn classify_bind_error(addr: &SocketAddr, e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow::Error::new(GatewayStartupFatal(format!(
+            "could not bind the gateway to {addr}: {e}. Fix: use an unprivileged port \
+             ([gateway] port in config.toml); a privileged port below 1024 would fail \
+             identically on every retry, or grant the binary CAP_NET_BIND_SERVICE."
+        )))
+    } else {
+        anyhow::Error::from(e)
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
-/// A gateway startup failure the daemon supervisor must NOT retry: an
-/// unrecoverable bind refusal (public-bind guard) or an unparseable bind
-/// address. It is wrapped in the returned `anyhow::Error` so the supervisor can
-/// `downcast_ref` and propagate a non-zero exit instead of looping forever
-/// behind a false "daemon started" banner. `EADDRINUSE` is intentionally NOT
+/// A gateway startup failure the daemon supervisor must NOT retry: an error
+/// that follows from the configuration alone, so the same `Config` value would
+/// fail again on every attempt. It is wrapped in the returned `anyhow::Error`
+/// so the supervisor can `downcast_ref` and propagate a non-zero exit instead
+/// of looping forever behind a false "daemon started" banner. Each message
+/// names the config key it comes from. `AddrInUse` is intentionally NOT
 /// wrapped — the supervisor treats it as fatal-after-N-retries, since during a
 /// restart the old process may still be releasing the port.
 #[derive(Debug)]
@@ -958,6 +1020,34 @@ impl std::fmt::Display for GatewayStartupFatal {
 }
 
 impl std::error::Error for GatewayStartupFatal {}
+
+/// Exit code for a configuration-driven gateway startup failure: 78
+/// (`EX_CONFIG` from `sysexits.h` — the process was given bad configuration).
+/// Service units rendered from now on carry
+/// `RestartPreventExitStatus=78`, so systemd does not restart a daemon that
+/// stopped for configuration. `EX_CONFIG_EXIT_CODE == 1` is NOT true: any other
+/// error — including `AddrInUse` after the supervisor's retry budget — keeps
+/// exit 1, so systemd keeps retrying a port conflict it can release later.
+pub const EX_CONFIG_EXIT_CODE: i32 = 78;
+
+/// Exit code for everything that is not a configuration error: the status the
+/// process exits with today (`async fn main() -> Result<()>` propagation).
+pub const GENERIC_ERROR_EXIT_CODE: i32 = 1;
+
+/// Map an error returned by `daemon::run` or `run_gateway` to the process exit
+/// code: [`EX_CONFIG_EXIT_CODE`] when the error chain holds a
+/// [`GatewayStartupFatal`], else [`GENERIC_ERROR_EXIT_CODE`]. The chain must
+/// survive `daemon::run`'s drain/return untouched (no `to_string()`
+/// re-wrapping) for the fatal kind to stay visible here.
+pub fn startup_exit_code(e: &anyhow::Error) -> i32 {
+    if e.chain()
+        .any(|c| c.downcast_ref::<GatewayStartupFatal>().is_some())
+    {
+        EX_CONFIG_EXIT_CODE
+    } else {
+        GENERIC_ERROR_EXIT_CODE
+    }
+}
 
 /// The banner `run_gateway` prints for its startup pairing code. On an
 /// interactive stdout the full multi-line banner with the code is returned;
@@ -1020,9 +1110,33 @@ pub async fn run_gateway(
             "invalid bind address {host}:{port}: {e}"
         )))
     })?;
-    // NOT wrapped: a bind failure here (e.g. EADDRINUSE) stays a raw io::Error so
-    // the supervisor can classify it as fatal-after-N rather than fatal-now.
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    // The tunnel is CREATED before the listener is bound: a tunnel
+    // configuration error (unknown provider, missing `[tunnel.<provider>]`
+    // section) follows from the Config alone, so it would fail again on every
+    // retry — it must stop the daemon without ever binding the listener,
+    // firing `ready`, or letting the daemon print its "started" banner.
+    //
+    // Starting the tunnel stays after the bind below, because it needs the
+    // port; a tunnel that fails to START (binary missing, no URL) stays
+    // non-fatal, as before.
+    let tunnel = crate::tunnel::create_tunnel(&config.tunnel).map_err(|e| {
+        anyhow::Error::new(GatewayStartupFatal(format!(
+            "[tunnel] provider = {:?}: {e:#}",
+            config.tunnel.provider
+        )))
+    })?;
+    let mut tunnel_url: Option<String> = None;
+
+    // Not wrapped unless the bind was refused outright: `AddrInUse` and every
+    // other io error stay raw here so the supervisor can classify them
+    // (`AddrInUse` as fatal-after-N, `AddrNotAvailable` as transient) instead
+    // of treating them as fatal-now. Only `PermissionDenied` — a privileged
+    // port, which would fail identically on every retry with the same port —
+    // becomes fatal (see [`classify_bind_error`]).
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| classify_bind_error(&addr, e))?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
@@ -1094,10 +1208,13 @@ pub async fn run_gateway(
         }
     }
 
-    // ── Tunnel ────────────────────────────────────────────────
-    let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
-    let mut tunnel_url: Option<String> = None;
-
+    // The tunnel is CREATED before the listener is bound (see the call above):
+    // a tunnel configuration error (unknown provider, missing
+    // `[tunnel.<provider>]` section) never binds, never fires `ready`, and
+    // never lets the daemon print its "started" banner. Only STARTING the
+    // tunnel happens here, after the bind, because it needs the port. A
+    // tunnel start failure is diagnosable, not fatal: the listener is
+    // already bound and serving.
     if let Some(ref tun) = tunnel {
         println!("🔗 Starting {} tunnel...", tun.name());
         match tun.start(host, actual_port).await {
@@ -2856,6 +2973,374 @@ mod tests {
         assert!(
             !err.to_string().contains("Refusing to bind"),
             "the guard must not fire once allow_public_bind is set: {err:#}"
+        );
+        // The bind failed on a machine condition, not config: the same config
+        // would succeed once the address exists, so it must stay retryable.
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+        assert_eq!(
+            classify_gateway_failure(&err),
+            GatewayFailure::Transient,
+            "AddrNotAvailable must keep today's retry behaviour: {err:#}"
+        );
+    }
+
+    /// A `[tunnel] provider` name the factory does not know follows from the
+    /// config alone — the same `Config` value would fail again on every retry
+    /// — so `run_gateway` must mark it fatal for the supervisor, name the
+    /// config key in the message, AND never bind the listener (nor fire
+    /// `ready`, so the daemon never prints its "started" banner).
+    #[tokio::test]
+    async fn run_gateway_with_unknown_tunnel_provider_is_fatal_and_never_binds() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let mut config = crate::config::Config::default();
+        config.tunnel.provider = "cloudflared".into();
+
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut notified = std::pin::pin!(ready.notified());
+        let err = super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            Some(std::sync::Arc::clone(&ready)),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unknown tunnel provider is a config error, the config can never start");
+
+        assert_eq!(
+            classify_gateway_failure(&err),
+            GatewayFailure::Fatal,
+            "the supervisor must stop instead of retrying forever: {err:#}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(r#"[tunnel] provider = "cloudflared""#),
+            "the message must name the config key: {message}"
+        );
+        assert!(
+            message.contains("Valid: none, cloudflare, tailscale, ngrok, custom"),
+            "the message must say which providers are valid: {message}"
+        );
+
+        // The listener was never bound: `run_gateway` notifies `ready` only
+        // after a successful bind. If the bind happened, a permit exists and
+        // `notified` (potentially unpolled until now) completes at once.
+        let fired = tokio::time::timeout(std::time::Duration::ZERO, &mut notified)
+            .await
+            .is_ok();
+        assert!(
+            !fired,
+            "a tunnel config error must not bind the listener or fire ready"
+        );
+    }
+
+    /// Each named tunnel provider has its own config section; the section
+    /// errors follow from the config alone, so they are fatal too.
+    #[tokio::test]
+    async fn run_gateway_with_missing_tunnel_section_is_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let mut config = crate::config::Config::default();
+        // cloudflare is known, but no [tunnel.cloudflare] section exists.
+        config.tunnel.provider = "cloudflare".into();
+
+        let err = super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a missing tunnel section is a config error");
+
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Fatal);
+        let message = err.to_string();
+        assert!(
+            message.contains(r#"[tunnel] provider = "cloudflare""#),
+            "the message must name the config key: {message}"
+        );
+        assert!(
+            message.contains("[tunnel.cloudflare] section is missing"),
+            "the message must say which section to add: {message}"
+        );
+    }
+
+    /// An unknown `default_provider` follows from the config alone — the
+    /// factory does no network I/O at construction, so the same config fails
+    /// again on every retry — and the message names the key.
+    #[tokio::test]
+    async fn run_gateway_with_unknown_default_provider_is_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.default_provider = Some("example_unknown_provider".into());
+
+        let err = super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unknown provider is a config error");
+
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Fatal);
+        let message = err.to_string();
+        assert!(
+            message.contains(r#"default_provider = "example_unknown_provider""#),
+            "the message must name the config key: {message}"
+        );
+        assert!(
+            message.contains("Unknown provider"),
+            "the underlying factory error must stay in the chain: {message}"
+        );
+    }
+
+    /// An unrecognised `memory.backend` NAME is fatal (config alone), while an
+    /// unopenable `brain.db` stays retryable — the disk can come back; see
+    /// `run_gateway_with_unopenable_memory_store_stays_retryable`.
+    #[tokio::test]
+    async fn run_gateway_with_unknown_memory_backend_is_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.memory.backend = "example_unknown_backend".into();
+
+        let err = super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unknown memory backend is a config error");
+
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Fatal);
+        let message = err.to_string();
+        assert!(
+            message.contains(r#"[memory] backend = "example_unknown_backend""#),
+            "the message must name the config key: {message}"
+        );
+        assert!(
+            message.contains("expected one of: sqlite, none"),
+            "the message must say which backends exist: {message}"
+        );
+    }
+
+    /// Unknown `runtime.kind` is pure validation (`bail!` inside the factory),
+    /// so it is fatal.
+    #[tokio::test]
+    async fn run_gateway_with_unknown_runtime_kind_is_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.runtime.kind = "example_unknown_kind".into();
+
+        let err = super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unknown runtime kind is a config error");
+
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Fatal);
+        let message = err.to_string();
+        assert!(
+            message.contains(r#"[runtime] kind = "example_unknown_kind""#),
+            "the message must name the config key: {message}"
+        );
+        assert!(
+            message.contains("Unknown runtime kind"),
+            "the underlying factory error must stay in the chain: {message}"
+        );
+    }
+
+    /// An unopenable memory STORE is a disk condition (`brain.db` cannot be
+    /// created or locked), NOT a config error — it must keep today's retry
+    /// behaviour instead of killing the daemon over a hiccup that can heal.
+    ///
+    /// Workspace trick: `workspace_dir` holds a regular file named `memory`,
+    /// so `fs::create_dir_all(workspace_dir/memory)` fails — deterministic and
+    /// portable, no filesystem races.
+    #[tokio::test]
+    async fn run_gateway_with_unopenable_memory_store_stays_retryable() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        std::fs::write(
+            workspace.path().join("memory"),
+            b"a file, not a directory\n",
+        )
+        .expect("blocker file");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        // Backend stays at its default: "sqlite".
+
+        let err = super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the memory store genuinely cannot open here");
+
+        assert_eq!(
+            classify_gateway_failure(&err),
+            GatewayFailure::Transient,
+            "a disk condition must keep the retry behaviour: {err:#}"
+        );
+        assert!(
+            !err.chain()
+                .any(|c| c.downcast_ref::<super::GatewayStartupFatal>().is_some()),
+            "no fatal marker may sit in the chain: {err:#}"
+        );
+        assert!(
+            !err.to_string().contains("unknown memory backend"),
+            "the backend NAME is fine, only the store is unopenable: {err:#}"
+        );
+    }
+
+    /// A host `resolve_bind_addr` can never resolve follows from the config
+    /// alone, so it stays fatal (pre-existing behaviour, pinned end-to-end).
+    #[tokio::test]
+    async fn run_gateway_with_unresolvable_bind_host_is_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let mut config = crate::config::Config::default();
+        // The dotted-quad-looking host passes the public-bind guard only with
+        // an opt-in; the resolver itself rejects the out-of-range octets
+        // without a network query (libc treats digit-only dotted syntax as
+        // numeric and answers EAI_NONAME).
+        config.gateway.allow_public_bind = true;
+
+        let err = super::run_gateway(
+            "999.999.999.999",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unresolvable bind host is a config error");
+
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Fatal);
+        assert!(
+            err.to_string().contains("invalid bind address"),
+            "the existing fatal text stays verbatim: {err:#}"
+        );
+    }
+
+    /// `PermissionDenied` on the bind follows from the config alone — the same
+    /// port fails identically on every retry — so `classify_bind_error` marks
+    /// it fatal.
+    #[test]
+    fn bind_error_permission_denied_is_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().expect("parse");
+        let err = super::classify_bind_error(
+            &addr,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Fatal);
+        assert!(
+            err.to_string().contains("[gateway] port"),
+            "the message must point at the port setting: {err:#}"
+        );
+    }
+
+    /// `AddrNotAvailable` (address not on this host) is a machine condition —
+    /// an interface can come up later — so the raw io error stays retryable,
+    /// exactly as before.
+    #[test]
+    fn bind_error_addr_not_available_stays_retryable() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse");
+        let err = super::classify_bind_error(
+            &addr,
+            std::io::Error::from(std::io::ErrorKind::AddrNotAvailable),
+        );
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Transient);
+        assert!(!err
+            .chain()
+            .any(|c| c.downcast_ref::<super::GatewayStartupFatal>().is_some()));
+    }
+
+    /// `AddrInUse` keeps its dedicated classification (fatal only after the
+    /// supervisor's retry budget, because the old process may still be
+    /// releasing the port) — the raw io error must survive unwrapped.
+    #[test]
+    fn bind_error_addr_in_use_keeps_the_retry_budget() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse");
+        let err =
+            super::classify_bind_error(&addr, std::io::Error::from(std::io::ErrorKind::AddrInUse));
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::AddrInUse);
+        assert!(!err
+            .chain()
+            .any(|c| c.downcast_ref::<super::GatewayStartupFatal>().is_some()));
+    }
+
+    /// The exit-code mapping: a `GatewayStartupFatal` chain — even wrapped in
+    /// further context, as `daemon::run` propagates it — maps to 78.
+    #[test]
+    fn startup_exit_code_maps_gateway_startup_fatal_to_ex_config() {
+        let fatal = anyhow::Error::new(super::GatewayStartupFatal("bad [tunnel]".into()));
+        assert_eq!(super::startup_exit_code(&fatal), super::EX_CONFIG_EXIT_CODE);
+        let wrapped = fatal.context("while starting the gateway");
+        assert_eq!(
+            super::startup_exit_code(&wrapped),
+            super::EX_CONFIG_EXIT_CODE
+        );
+    }
+
+    /// Everything else keeps exit 1: generic errors AND `AddrInUse` (so
+    /// systemd keeps retrying a port conflict). No binary is spawned; this is
+    /// a unit test on the mapping function.
+    #[test]
+    fn startup_exit_code_keeps_other_errors_at_exit_1() {
+        assert_eq!(
+            super::startup_exit_code(&anyhow::anyhow!("transient hiccup")),
+            super::GENERIC_ERROR_EXIT_CODE
+        );
+        let addr_in_use = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "port busy",
+        ));
+        assert_eq!(
+            super::startup_exit_code(&addr_in_use),
+            super::GENERIC_ERROR_EXIT_CODE
         );
     }
 

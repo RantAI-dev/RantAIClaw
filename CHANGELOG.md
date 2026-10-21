@@ -232,6 +232,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously printed only `install manually` and exited 0. Recipe progress output is now
   gated to the CLI, so the TUI and the agent tool no longer print a running recipe onto
   the TUI screen or into the tool result.
+- A configuration error in the gateway or tunnel settings made the supervisor retry the gateway forever
+  behind a "started" banner: an unknown tunnel `provider` name, for example, failed identically on every
+  retry. The daemon now stops with a message naming the setting and exits with code 78 (`EX_CONFIG`), and
+  systemd units rendered from now on carry `RestartPreventExitStatus=78`, so systemd does not restart the
+  stopped daemon. Existing installed units need `rantaiclaw service install` run again to pick the line
+  up; `rantaiclaw update` only restarts the unit and does not re-render it.
+- `daemon_state.json` is now removed when the daemon stops, and the TUI doctor no longer reports a
+  stopped or crashed daemon's scheduler as healthy: a state file older than three flush intervals reads
+  as "daemon not running". A SIGKILL or OOM crash still leaves the file on disk, so the reader-side age
+  rule covers that case.
 
 ## [0.33.0-alpha] — 2026-10-08
 

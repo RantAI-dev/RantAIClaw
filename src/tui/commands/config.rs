@@ -521,24 +521,22 @@ impl CommandHandler for ChannelsCommand {
 }
 
 /// Read the daemon's scheduler-component health from its cross-process state
-/// file. Absent file → the daemon isn't running (Warn, not Fail — matches the
-/// keyless-provider convention).
+/// file. Anything `read_live_state` refuses — absent file, unparseable body,
+/// or a `written_at` whose daemon has stopped flushing — is exactly the same
+/// "daemon not running" Warn (the file can only appear once a daemon flushes).
 fn scheduler_diag(state_file: &std::path::Path) -> (StatusKind, String) {
-    let Ok(raw) = std::fs::read_to_string(state_file) else {
+    let Some(state) = crate::daemon::read_live_state(state_file) else {
         return (
             StatusKind::Warn,
             "daemon not running (start `rantaiclaw daemon` for scheduled jobs)".to_string(),
         );
     };
-    let status = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|v| {
-            v.get("components")?
-                .get("scheduler")?
-                .get("status")?
-                .as_str()
-                .map(str::to_string)
-        });
+    let status = state
+        .get("components")
+        .and_then(|c| c.get("scheduler"))
+        .and_then(|s| s.get("status"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     match status.as_deref() {
         Some("ok") => (StatusKind::Ok, "healthy".to_string()),
         Some("error") => (StatusKind::Fail, "unhealthy — see daemon logs".to_string()),
@@ -684,24 +682,49 @@ mod tests {
         assert!(!keys.iter().any(|k| k == "Debug"), "{keys:?}");
     }
 
+    /// A `daemon_state.json` body stamped the way the daemon's state writer
+    /// stamps it: `written_at` from some seconds ago.
+    fn state_body(status: &str, written_age_seconds: i64) -> String {
+        serde_json::json!({
+            "components": {"scheduler": {"status": status}},
+            "written_at": (chrono::Utc::now()
+                - chrono::Duration::seconds(written_age_seconds))
+                .to_rfc3339(),
+        })
+        .to_string()
+    }
+
     #[test]
     fn scheduler_diag_reads_state_file() {
-        use super::scheduler_diag;
         use crate::tui::widgets::StatusKind;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("daemon_state.json");
         assert!(matches!(scheduler_diag(&path).0, StatusKind::Warn)); // absent → daemon down
-        std::fs::write(
-            &path,
-            serde_json::json!({"components":{"scheduler":{"status":"ok"}}}).to_string(),
-        )
-        .unwrap();
+        std::fs::write(&path, state_body("ok", 0)).unwrap();
         assert!(matches!(scheduler_diag(&path).0, StatusKind::Ok));
-        std::fs::write(
-            &path,
-            serde_json::json!({"components":{"scheduler":{"status":"error"}}}).to_string(),
-        )
-        .unwrap();
+        std::fs::write(&path, state_body("error", 0)).unwrap();
         assert!(matches!(scheduler_diag(&path).0, StatusKind::Fail));
+    }
+
+    /// Plan 591: a file whose `written_at` is older than three flush intervals
+    /// was written by a daemon that has since exited or crashed. It must read
+    /// EXACTLY like an absent file — the "daemon not running" Warn — never a
+    /// green row.
+    #[test]
+    fn scheduler_diag_reads_a_stale_state_file_as_daemon_not_running() {
+        use crate::tui::widgets::StatusKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        std::fs::write(&path, state_body("ok", 60)).unwrap();
+
+        let (kind, message) = scheduler_diag(&path);
+        assert!(
+            matches!(kind, StatusKind::Warn),
+            "stale ok must not be Ok: {kind:?}"
+        );
+        assert!(
+            message.contains("daemon not running"),
+            "stale ok must carry the same message as an absent file: {message}"
+        );
     }
 }
