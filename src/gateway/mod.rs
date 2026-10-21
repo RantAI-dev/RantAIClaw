@@ -649,15 +649,30 @@ pub fn build_gateway_router(
                 failover_announce: providers::FailoverAnnounce::default(),
             },
         )
-        // Fatal: provider construction errors are all configuration or
-        // validation errors (unknown name, missing key, unparseable custom
-        // URL) — construction does no network I/O, so the same config fails
-        // again on every retry. Invalid fallback providers are already
-        // swallowed with a warning inside the factory.
+        // Fatal ONLY for a provider CONFIGURATION error: an unknown provider
+        // name, or a custom endpoint URL that is missing, unparseable, or not
+        // http(s). The same config file fails the same way on every retry, and
+        // nothing outside it can change that.
+        //
+        // A missing credential is NOT fatal: `rantaiclaw auth login`, an
+        // environment variable, or a key stored in the config later can supply
+        // it without the config file changing, so the supervisor must retry
+        // until one of them does.
+        //
+        // The split is decided HERE, at the call site, and not in the
+        // supervisor: the supervisor must not learn about provider errors.
+        // The memory-backend split below does the same for the same reason.
+        // The marker is a TYPE, never a message text.
         .map_err(|e| {
-            anyhow::Error::new(GatewayStartupFatal(format!(
-                "[providers] default_provider = {gateway_provider_name:?}: {e:#}"
-            )))
+            if e.chain()
+                .any(|c| c.downcast_ref::<providers::ProviderConfigError>().is_some())
+            {
+                anyhow::Error::new(GatewayStartupFatal(format!(
+                    "[providers] default_provider = {gateway_provider_name:?}: {e:#}"
+                )))
+            } else {
+                e
+            }
         })?,
     );
     // Empty when unconfigured (no baked-in model): the gateway still starts and
@@ -953,14 +968,49 @@ pub fn build_gateway_router(
     Ok((state, app))
 }
 
+/// Why a bind host could not be turned into a socket address.
+///
+/// The split is the fatal/transient one: a host that can never resolve
+/// follows from the config file alone, while a lookup that failed depends on
+/// DNS, the network, the resolver and the hosts file — all outside the
+/// config file. A malformed numeric address is the one failed lookup that
+/// still follows from the config file alone, so it is fatal.
+#[derive(Debug)]
+enum BindHostError {
+    /// The host is neither a socket address nor a name any resolver could
+    /// answer, or it is a malformed numeric address: the same config fails
+    /// the same way on every retry, so it is fatal.
+    Unparseable(String),
+    /// The host is a name the resolver could answer, but the lookup failed or
+    /// returned no address. The `anyhow::Error` keeps the resolver's own error
+    /// in its chain.
+    LookupFailed(anyhow::Error),
+}
+
+impl std::fmt::Display for BindHostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unparseable(reason) => write!(f, "{reason}"),
+            Self::LookupFailed(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
 /// Resolve a gateway host + port into a bind address. `SocketAddr::parse` accepts
 /// only a numeric IPv4 or a bracketed IPv6, but `is_public_bind` blesses the
 /// spellings `localhost`, `::1`, and `0:0:0:0:0:0:0:1` — so `--host localhost`
 /// (the natural "loopback only") used to crash the gateway at startup. Normalize
 /// the known loopback aliases (no DNS), then fall back to a resolver for a
 /// hostname or an unbracketed IPv6.
-fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
-    use std::net::ToSocketAddrs;
+///
+/// The two failure kinds are kept apart, because they are not the same
+/// failure: a host that is not a name any resolver could answer can never
+/// resolve (fatal), while a name the resolver could not answer RIGHT NOW
+/// depends on DNS, the network, the resolver and the hosts file — all outside
+/// the config file — and a later retry can succeed (transient). The one
+/// exception is a digit-only dotted name: a failed lookup there is a malformed
+/// numeric address, which follows from the config file alone (fatal).
+fn resolve_bind_addr(host: &str, port: u16) -> std::result::Result<SocketAddr, BindHostError> {
     let normalized = match host {
         "localhost" => "127.0.0.1".to_string(),
         "::1" | "[::1]" | "0:0:0:0:0:0:0:1" => "[::1]".to_string(),
@@ -969,11 +1019,134 @@ fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
     if let Ok(addr) = format!("{normalized}:{port}").parse::<SocketAddr>() {
         return Ok(addr);
     }
-    (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("could not resolve gateway host {host:?}"))?
-        .next()
-        .with_context(|| format!("gateway host {host:?} resolved to no address"))
+    if host.contains(':') {
+        // A colon can only be an IPv6 literal: no DNS name carries one. The
+        // std parser needs the brackets, so a bare literal is retried in that
+        // form.
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(addr) = format!("[{bare}]:{port}").parse::<SocketAddr>() {
+            return Ok(addr);
+        }
+        // A scope id (`fe80::1%lo`) is a socket-address form the std parser
+        // rejects; only the resolver understands it. A failure there is
+        // transient: the interface the scope names may not exist yet, and it
+        // can come up later.
+        if is_scoped_ipv6_literal(bare) {
+            return resolve_via_resolver(bare, port);
+        }
+        // A colon-carrying host that is not an IPv6 literal can never be
+        // answered by any resolver.
+        return Err(BindHostError::Unparseable(format!(
+            "{host:?} is neither a socket address nor a valid hostname"
+        )));
+    }
+    // A host that is neither a socket address nor a name any resolver could
+    // answer is not something a resolver can answer: the same config fails
+    // the same way on every retry. The lookup is not even attempted.
+    if !is_valid_hostname(host) {
+        return Err(BindHostError::Unparseable(format!(
+            "{host:?} is neither a socket address nor a valid hostname"
+        )));
+    }
+    resolve_via_resolver(host, port)
+}
+
+/// Ask the resolver for a host + port.
+///
+/// A failure is transient: the resolver, the network, the DNS cache and the
+/// hosts file are all outside the config file, and a later retry can
+/// succeed. The one exception is a malformed NUMERIC address, which the
+/// resolver refuses without a DNS query: it can never resolve.
+fn resolve_via_resolver(host: &str, port: u16) -> std::result::Result<SocketAddr, BindHostError> {
+    use std::net::ToSocketAddrs;
+    match (host, port).to_socket_addrs() {
+        Ok(mut resolved) => match resolved.next() {
+            Some(addr) => Ok(addr),
+            None => Err(BindHostError::LookupFailed(anyhow::anyhow!(
+                "gateway host {host:?} resolved to no address"
+            ))),
+        },
+        Err(e) => {
+            // A digit-only dotted name is a numeric address, not a hostname:
+            // the resolver reads it as an IP address and refuses a malformed
+            // one outright, without a DNS query, so it can never resolve.
+            if looks_like_numeric_address(host) {
+                return Err(BindHostError::Unparseable(format!(
+                    "{host:?} is a malformed numeric address"
+                )));
+            }
+            // The resolver's own error stays in the chain: it is the reason
+            // the lookup failed, and it is not a configuration error.
+            Err(BindHostError::LookupFailed(anyhow::Error::new(e).context(
+                format!("could not resolve gateway host {host:?}"),
+            )))
+        }
+    }
+}
+
+/// Whether `host` is an IPv6 literal with a scope id (`fe80::1%lo`).
+///
+/// The std socket-address parser rejects a scope id, so this form is only
+/// ever handled by the resolver.
+fn is_scoped_ipv6_literal(host: &str) -> bool {
+    match host.split_once('%') {
+        Some((addr, zone)) => !zone.is_empty() && addr.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => false,
+    }
+}
+
+/// Whether `host` is a name a resolver could answer: a series of `.`-separated
+/// labels (a single trailing dot is the root label and is allowed), each label
+/// holding ASCII letters, digits, `-` or `_` and neither starting nor ending
+/// with `-`.
+///
+/// The set is deliberately WIDER than the DNS rules. The resolver does not
+/// only speak DNS: a `/etc/hosts` entry may carry an underscore
+/// (`127.0.0.1 my_gateway`) and glibc answers such a name, and a hosts-file
+/// name is not bound by the DNS length limits either. A name the resolver
+/// cannot answer however long it waits must not stop the daemon, so neither
+/// the underscore nor the length limits are applied here. What stays rejected
+/// is a name that carries a character no name can hold — a space, a `!`.
+///
+/// A name inside the set may still fail to resolve. That is a DNS or
+/// hosts-file condition, both outside the config file, and it is transient —
+/// the one exception is a digit-only dotted name, whose failed lookup is a
+/// malformed address and is fatal.
+fn is_valid_hostname(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    // A single trailing dot is the root label and is allowed.
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.is_empty() {
+        return false;
+    }
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
+/// Whether `host` is a digit-only dotted name, such as `0` or `1.2.3.4`.
+///
+/// A digit-only name is also a name `is_valid_hostname` accepts, so this
+/// predicate does not decide whether the host is a name. The resolver reads
+/// such a name as an IP address, so the digits alone decide the outcome. This
+/// predicate is consulted ONLY after a lookup has already failed: a digit-only
+/// name that resolves is a working address, and a failed lookup there is a
+/// malformed address, never a DNS outage.
+fn looks_like_numeric_address(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Map a failed `TcpListener::bind` to the error the daemon supervisor sees.
@@ -1022,9 +1195,10 @@ impl std::error::Error for GatewayStartupFatal {}
 /// (`EX_CONFIG` from `sysexits.h` — the process was given bad configuration).
 /// Service units rendered from now on carry
 /// `RestartPreventExitStatus=78`, so systemd does not restart a daemon that
-/// stopped for configuration. `EX_CONFIG_EXIT_CODE == 1` is NOT true: any other
-/// error — including `AddrInUse` after the supervisor's retry budget — keeps
-/// exit 1, so systemd keeps retrying a port conflict it can release later.
+/// stopped for configuration. Every other error keeps exit 1
+/// ([`GENERIC_ERROR_EXIT_CODE`]) — including `AddrInUse` after the
+/// supervisor's retry budget — so systemd keeps retrying a port conflict it
+/// can release later.
 pub const EX_CONFIG_EXIT_CODE: i32 = 78;
 
 /// Exit code for everything that is not a configuration error: the status the
@@ -1131,12 +1305,19 @@ pub async fn run_gateway(
         ))));
     }
 
-    // Fatal: an unparseable host/port can never succeed on retry.
-    let addr = resolve_bind_addr(host, port).map_err(|e| {
-        anyhow::Error::new(GatewayStartupFatal(format!(
-            "invalid bind address {host}:{port}: {e}"
-        )))
-    })?;
+    // Fatal: a host that can never resolve — neither a socket address nor a
+    // valid hostname — fails the same way on every retry. Transient: a valid
+    // hostname whose lookup failed, because DNS, the network and the resolver
+    // are all outside the config file and a later retry can succeed.
+    let addr = match resolve_bind_addr(host, port) {
+        Ok(addr) => addr,
+        Err(BindHostError::Unparseable(reason)) => {
+            return Err(anyhow::Error::new(GatewayStartupFatal(format!(
+                "invalid bind address {host}:{port}: {reason}"
+            ))));
+        }
+        Err(BindHostError::LookupFailed(reason)) => return Err(reason),
+    };
 
     // The tunnel is CREATED before the listener is bound: a tunnel
     // configuration error (unknown provider, missing `[tunnel.<provider>]`
@@ -2818,6 +2999,12 @@ async fn handle_trigger_webhook(
 
 #[cfg(test)]
 mod tests {
+    // The zombie-aware `process_is_alive` and its `wait_for_pid_file` sibling
+    // live in `crate::tunnel`; a copy here would count a reaped-but-unwaited
+    // child as alive.
+    #[cfg(unix)]
+    use crate::tunnel::{process_is_alive, wait_for_pid_file};
+
     #[test]
     fn every_loopback_spelling_resolves() {
         // Each spelling is_public_bind blesses as loopback must produce a valid
@@ -2832,6 +3019,142 @@ mod tests {
             assert_eq!(addr.port(), 8080);
         }
     }
+
+    /// The `resolve_bind_addr` split, on the function itself: a host that is
+    /// not a hostname at all can never resolve (the fatal kind), while a valid
+    /// hostname whose lookup failed is a DNS condition (the transient kind).
+    #[test]
+    fn resolve_bind_addr_splits_an_unparseable_host_from_a_failed_lookup() {
+        // A garbage host: a space and a `!` are not hostname characters.
+        let err = super::resolve_bind_addr("not a host!", 8080)
+            .expect_err("a host that is not a hostname cannot resolve");
+        assert!(
+            matches!(err, super::BindHostError::Unparseable(_)),
+            "a garbage host must be the fatal kind: {err:?}"
+        );
+
+        // A well-formed hostname whose lookup fails: `.invalid` is reserved
+        // (RFC 2606) and never resolves, so the failure is local and needs no
+        // network.
+        let err = super::resolve_bind_addr("gateway.invalid", 8080)
+            .expect_err("the reserved .invalid TLD never resolves");
+        assert!(
+            matches!(err, super::BindHostError::LookupFailed(_)),
+            "a failed lookup must be the transient kind: {err:?}"
+        );
+    }
+
+    /// A bare IPv6 literal is a socket-address form, not a hostname: the
+    /// gateway must bind it, exactly as it did before the fatal/transient
+    /// split. The parse is local — no DNS query and no network.
+    #[test]
+    fn resolve_bind_addr_resolves_a_bare_ipv6_literal() {
+        let addr = super::resolve_bind_addr("2001:db8::1", 8080)
+            .unwrap_or_else(|e| panic!("an IPv6 literal must resolve, got {e}"));
+        assert_eq!(addr.port(), 8080);
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+            "the literal must be bound as written: {addr}"
+        );
+    }
+
+    /// A scoped IPv6 literal (`fe80::1%lo`) names a local interface. The std
+    /// socket-address parser rejects a scope id, so only the resolver
+    /// understands this form — and whether the resolver CAN answer it depends
+    /// on the machine, because the scope names an interface that has to
+    /// exist.
+    ///
+    /// The invariant under test is the failure KIND, not the bind: a scoped
+    /// literal must never be the fatal kind, because an interface that is not
+    /// up yet can come up later — that is "another process or time".
+    #[test]
+    fn resolve_bind_addr_treats_a_scoped_ipv6_literal_as_transient() {
+        match super::resolve_bind_addr("fe80::1%lo", 8080) {
+            Ok(addr) => assert!(addr.is_ipv6(), "a scoped literal binds an IPv6: {addr}"),
+            Err(err) => assert!(
+                matches!(err, super::BindHostError::LookupFailed(_)),
+                "a scoped IPv6 literal must be the transient kind: {err:?}"
+            ),
+        }
+    }
+
+    /// A colon can only be an IPv6 literal: no DNS name carries one. A
+    /// colon-carrying host that is not an IPv6 literal can never be answered
+    /// by any resolver, so it stays fatal.
+    #[test]
+    fn resolve_bind_addr_rejects_a_colon_host_that_is_not_an_ipv6_literal() {
+        let err = super::resolve_bind_addr("not::a::host", 8080)
+            .expect_err("a colon host that is not an IPv6 literal cannot resolve");
+        assert!(
+            matches!(err, super::BindHostError::Unparseable(_)),
+            "a colon host that is not an IPv6 literal must be the fatal kind: {err:?}"
+        );
+    }
+
+    /// A name a `/etc/hosts` entry can carry (`127.0.0.1 my_gateway`) is
+    /// answered by the resolver from the hosts file. The hosts file is
+    /// outside the config file, so such a name must never stop the daemon:
+    /// when the lookup fails it is transient, not fatal.
+    ///
+    /// Whether THIS machine carries such an entry is not the point — the
+    /// failure KIND is.
+    #[test]
+    fn resolve_bind_addr_treats_an_underscore_name_as_transient() {
+        if let Err(err) = super::resolve_bind_addr("my_gateway", 8080) {
+            assert!(
+                matches!(err, super::BindHostError::LookupFailed(_)),
+                "a hosts-file-style name must be the transient kind: {err:?}"
+            );
+        }
+    }
+
+    /// The hostname check the split rests on: a label may hold ASCII letters,
+    /// digits, `-` and `_`, may not start or end with `-`, and a name may not
+    /// carry an empty label.
+    ///
+    /// The set is WIDER than the DNS rules on purpose. The resolver does not
+    /// only speak DNS: a `/etc/hosts` entry may carry an underscore
+    /// (`127.0.0.1 my_gateway`) and glibc answers such a name, and a
+    /// hosts-file name is not bound by the DNS length limits either. A name
+    /// the resolver cannot answer however long it waits must not stop the
+    /// daemon, so neither the underscore nor the length limits are applied
+    /// here. What stays rejected is a name that carries a character no name
+    /// can hold — a space, a `!`.
+    #[test]
+    fn is_valid_hostname_accepts_hostnames_and_rejects_the_rest() {
+        for host in [
+            "gateway.invalid",
+            "localhost",
+            "a",
+            "example-1.test",
+            "host.",
+            "0",
+            // A hosts-file name: an underscore is not a DNS character, but
+            // `/etc/hosts` may carry one and the resolver answers it.
+            "under_score.test",
+            "my_gateway",
+        ] {
+            assert!(super::is_valid_hostname(host), "{host} is a hostname");
+        }
+        for host in [
+            "not a host!",
+            "-leading.test",
+            "trailing-.test",
+            "double..dot",
+            "",
+        ] {
+            assert!(!super::is_valid_hostname(host), "{host} is not a hostname");
+        }
+        // A name longer than the DNS limits: a `/etc/hosts` entry may be
+        // longer, so it must not be fatal either.
+        let long = format!("{}.test", "a".repeat(300));
+        assert!(
+            super::is_valid_hostname(&long),
+            "a long name may still be answered by a hosts file"
+        );
+    }
+
     // ── Webhook channels come from the factory (plan 309 step 2) ────────────
 
     /// The gateway used to construct its own WhatsApp instance for the webhook
@@ -3241,26 +3564,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    fn process_is_alive(pid: u32) -> bool {
-        // Signal 0 only probes for existence; the child was reaped by stop().
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
-
-    #[cfg(unix)]
-    async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while tokio::time::Instant::now() < deadline {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if let Ok(pid) = text.trim().parse() {
-                    return pid;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        panic!("the fake tunnel never wrote its pid to {}", path.display());
-    }
-
     /// An unknown `default_provider` follows from the config alone — the
     /// factory does no network I/O at construction, so the same config fails
     /// again on every retry — and the message names the key.
@@ -3294,6 +3597,164 @@ mod tests {
         assert!(
             message.contains("Unknown provider"),
             "the underlying factory error must stay in the chain: {message}"
+        );
+    }
+
+    /// A missing credential is NOT a config error: `rantaiclaw auth login`, an
+    /// environment variable, or a key stored in the config later can supply it
+    /// without the config file changing, so the supervisor must retry instead
+    /// of stopping the daemon for good.
+    ///
+    /// The credential is withheld from every source: no `api_key`, no stored
+    /// per-provider key, no auth profile (the profile is read from the config's
+    /// own directory, which is a fresh temp dir here), and the credential
+    /// environment variables are scrubbed while the crate-wide env lock is
+    /// held, so a sibling test's `ANTHROPIC_API_KEY` cannot supply it.
+    #[tokio::test]
+    async fn run_gateway_with_missing_anthropic_credential_is_not_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let _env_lock = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        // The Anthropic auth profile is read from the config's own directory:
+        // a fresh temp dir holds no profile, so no credential comes from disk.
+        config.config_path = workspace.path().join("config.toml");
+        config.default_provider = Some("anthropic".into());
+        config.api_key = None;
+        config.provider_api_keys.clear();
+
+        let err = super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("no credential is available anywhere");
+
+        assert_eq!(
+            classify_gateway_failure(&err),
+            GatewayFailure::Transient,
+            "a missing key must keep the retry behaviour: {err:#}"
+        );
+        assert!(
+            !err.chain()
+                .any(|c| c.downcast_ref::<super::GatewayStartupFatal>().is_some()),
+            "no fatal marker may sit in the chain: {err:#}"
+        );
+    }
+
+    /// A custom endpoint URL that cannot work follows from the config file
+    /// alone — no login, no environment variable and no DNS lookup can repair
+    /// it — so it stays fatal, and the message names the config key.
+    #[tokio::test]
+    async fn run_gateway_with_unparseable_custom_provider_url_is_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.config_path = workspace.path().join("config.toml");
+        config.default_provider = Some("custom:not-a-url".into());
+
+        let err = super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a custom provider URL that cannot parse is a config error");
+
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Fatal);
+        let message = err.to_string();
+        assert!(
+            message.contains(r#"default_provider = "custom:not-a-url""#),
+            "the message must name the config key: {message}"
+        );
+        assert!(
+            message.contains("requires a valid URL"),
+            "the underlying factory error must stay in the chain: {message}"
+        );
+    }
+
+    /// A bind host that is neither a socket address nor a valid hostname can
+    /// never resolve: the same config fails the same way on every retry, so it
+    /// is fatal.
+    ///
+    /// The public-bind opt-in is needed because the host is not loopback: the
+    /// refusal at the top of `run_gateway` would otherwise fire first and the
+    /// test would measure the wrong branch.
+    #[tokio::test]
+    async fn run_gateway_with_garbage_bind_host_is_fatal() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let mut config = crate::config::Config::default();
+        config.gateway.allow_public_bind = true;
+
+        let err = super::run_gateway(
+            "not a host!",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a host that is not a hostname cannot resolve");
+
+        assert_eq!(classify_gateway_failure(&err), GatewayFailure::Fatal);
+        assert!(
+            err.to_string().contains("invalid bind address"),
+            "the existing fatal text stays verbatim: {err:#}"
+        );
+    }
+
+    /// A well-formed hostname whose lookup fails is a DNS condition: the
+    /// resolver, the network and the resolver's cache are all outside the
+    /// config file, and a later retry can succeed. It must stay retryable.
+    ///
+    /// `gateway.invalid` uses the reserved `.invalid` TLD (RFC 2606), which
+    /// never resolves: the lookup fails locally, with no network dependency.
+    #[tokio::test]
+    async fn run_gateway_with_unresolvable_dns_host_is_transient() {
+        use crate::daemon::{classify_gateway_failure, GatewayFailure};
+
+        let mut config = crate::config::Config::default();
+        config.gateway.allow_public_bind = true;
+
+        let err = super::run_gateway(
+            "gateway.invalid",
+            0,
+            config,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the reserved .invalid TLD never resolves");
+
+        assert_eq!(
+            classify_gateway_failure(&err),
+            GatewayFailure::Transient,
+            "a DNS failure must keep the retry behaviour: {err:#}"
+        );
+        assert!(
+            !err.chain()
+                .any(|c| c.downcast_ref::<super::GatewayStartupFatal>().is_some()),
+            "no fatal marker may sit in the chain: {err:#}"
         );
     }
 

@@ -1869,9 +1869,17 @@ async fn main() -> Result<()> {
             // Standalone `gateway` command: no daemon supervisor to signal, so
             // no readiness Notify.
             match gateway::run_gateway(&host, port, config, shutdown, None, None, None).await {
-                // A configuration-driven startup error (public-bind refusal,
-                // unparseable bind) exits EX_CONFIG so a systemd unit with
-                // RestartPreventExitStatus=78 does not restart it.
+                // A configuration-driven startup error exits EX_CONFIG so a
+                // systemd unit with RestartPreventExitStatus=78 does not
+                // restart it. The fatal set: an unknown tunnel provider or a
+                // missing `[tunnel.<provider>]` section, a refused public
+                // bind, a bind host that is neither a socket address nor a
+                // valid hostname, a privileged port that cannot be bound, an
+                // unknown `default_provider`, a custom provider URL that is
+                // missing, unparseable or not http(s), an unknown `[memory]
+                // backend, and an unknown `[runtime] kind. A missing API key,
+                // a missing auth profile and a DNS lookup failure are NOT
+                // fatal: they are retried.
                 Err(e) if gateway::startup_exit_code(&e) == gateway::EX_CONFIG_EXIT_CODE => {
                     eprintln!("Error: {e:#}");
                     std::process::exit(gateway::EX_CONFIG_EXIT_CODE);
@@ -1891,11 +1899,19 @@ async fn main() -> Result<()> {
             }
             match daemon::run(config, host, port).await {
                 // A gateway startup error that follows from the config alone
-                // (bad tunnel/provider/memory/runtime settings) surfaced by the
-                // daemon supervisor exits EX_CONFIG so a systemd unit with
-                // RestartPreventExitStatus=78 leaves it stopped. AddrInUse
-                // after the retry budget stays exit 1, so systemd keeps
-                // retrying a port conflict.
+                // surfaced by the daemon supervisor exits EX_CONFIG so a
+                // systemd unit with RestartPreventExitStatus=78 leaves it
+                // stopped. The fatal set: an unknown tunnel provider or a
+                // missing `[tunnel.<provider>]` section, a refused public
+                // bind, a bind host that is neither a socket address nor a
+                // valid hostname, a privileged port that cannot be bound, an
+                // unknown `default_provider`, a custom provider URL that is
+                // missing, unparseable or not http(s), an unknown `[memory]
+                // backend, and an unknown `[runtime] kind. A missing API key,
+                // a missing auth profile and a DNS lookup failure are NOT
+                // fatal: the supervisor retries them. AddrInUse after the
+                // retry budget stays exit 1, so systemd keeps retrying a port
+                // conflict.
                 Err(e) if gateway::startup_exit_code(&e) == gateway::EX_CONFIG_EXIT_CODE => {
                     eprintln!("Error: {e:#}");
                     std::process::exit(gateway::EX_CONFIG_EXIT_CODE);

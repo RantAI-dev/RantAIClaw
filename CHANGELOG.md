@@ -239,10 +239,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   systemd units rendered from now on carry `RestartPreventExitStatus=78`, so systemd does not restart the
   stopped daemon. Existing installed units need `rantaiclaw service install` run again to pick the line
   up; `rantaiclaw update` only restarts the unit and does not re-render it.
+- Only a configuration that can never work stops the daemon for good. The fatal set is: an unknown tunnel
+  `provider` name or a missing `[tunnel.<provider>]` section, a refused public bind, a bind host that is
+  neither a socket address nor a valid hostname, a privileged port (below 1024) that cannot be bound, an
+  unknown `default_provider`, a custom provider URL that is missing, unparseable or not http(s), an unknown
+  `[memory] backend`, and an unknown `[runtime] kind`. A missing API key, a missing auth profile and a DNS
+  lookup failure are NOT in that set and are retried instead: `rantaiclaw auth login`, an environment
+  variable, a key stored in the config later, or a resolver that comes back can supply them without the
+  config file changing, so the daemon no longer exits 78 for them and no longer stays down.
 - `daemon_state.json` is now removed when the daemon stops, and the TUI doctor no longer reports a
   stopped or crashed daemon's scheduler as healthy: a state file older than three flush intervals reads
   as "daemon not running". A SIGKILL or OOM crash still leaves the file on disk, so the reader-side age
-  rule covers that case.
+  rule covers that case. The flush that writes the file is now one synchronous step, so a flush that was
+  in flight when the daemon stopped can no longer put the file back after the cleanup removed it.
 - The tunnel process is now stopped when the gateway stops. `Tunnel::stop()` had no production caller: the
   child was killed when the value was dropped, never sent `SIGTERM` and never waited for, and
   `tailscale serve reset` never ran. The gateway now calls `stop()` after serving ends, on the clean and
