@@ -1,5 +1,7 @@
-use super::{kill_shared, new_shared_process, SharedProcess, Tunnel, TunnelProcess};
-use anyhow::{bail, Result};
+use super::{
+    kill_shared, new_shared_process, program_context, SharedProcess, Tunnel, TunnelProcess,
+};
+use anyhow::{bail, Context, Result};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
@@ -49,15 +51,19 @@ impl Tunnel for CustomTunnel {
 
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {
-            bail!("Custom tunnel start_command is empty");
+            bail!("[tunnel.custom] start_command is empty — nothing to run");
         }
 
-        let mut child = Command::new(parts[0])
+        // Only the program is named in an error: the rest of `start_command`
+        // is the operator's argv, which may carry credentials.
+        let program = parts[0];
+        let mut child = Command::new(program)
             .args(&parts[1..])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .with_context(|| program_context("start", program, ""))?;
 
         let mut public_url = format!("http://{local_host}:{local_port}");
 
@@ -154,10 +160,31 @@ mod tests {
         let result = tunnel.start("127.0.0.1", 8080).await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("start_command is empty"));
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("[tunnel.custom] start_command is empty"),
+            "the error must name the config key: {message}"
+        );
+    }
+
+    /// A missing custom binary must be diagnosable: the error names the
+    /// program it tried to run.
+    #[tokio::test]
+    async fn missing_program_error_names_the_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("rantaiclaw_tunnel");
+        let tunnel = CustomTunnel::new(format!("{} {{port}}", missing.display()), None, None);
+
+        let err = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect_err("a program that does not exist cannot start");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(missing.to_str().expect("utf-8 temp path")),
+            "the error must name the program it tried to run: {message}"
+        );
     }
 
     #[tokio::test]

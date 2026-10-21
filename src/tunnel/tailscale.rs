@@ -1,5 +1,7 @@
-use super::{kill_shared, new_shared_process, SharedProcess, Tunnel, TunnelProcess};
-use anyhow::{bail, Result};
+use super::{
+    kill_shared, new_shared_process, program_context, SharedProcess, Tunnel, TunnelProcess,
+};
+use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 
 /// Tailscale Tunnel — uses `tailscale serve` (tailnet-only) or
@@ -9,6 +11,9 @@ use tokio::process::Command;
 pub struct TailscaleTunnel {
     funnel: bool,
     hostname: Option<String>,
+    /// Executable name or absolute path. A field so a test can point at a fake
+    /// binary instead of whatever `tailscale` happens to be on `PATH`.
+    program: String,
     proc: SharedProcess,
 }
 
@@ -17,8 +22,16 @@ impl TailscaleTunnel {
         Self {
             funnel,
             hostname,
+            program: "tailscale".into(),
             proc: new_shared_process(),
         }
+    }
+
+    /// Point the provider at a specific program path instead of looking up
+    /// `tailscale` on `PATH`. Test-only, for fake scripts in a tempdir.
+    pub(crate) fn with_program(mut self, program: impl Into<String>) -> Self {
+        self.program = program.into();
+        self
     }
 }
 
@@ -36,14 +49,16 @@ impl Tunnel for TailscaleTunnel {
             h.clone()
         } else {
             // Query tailscale for the current hostname
-            let output = Command::new("tailscale")
+            let output = Command::new(&self.program)
                 .args(["status", "--json"])
                 .output()
-                .await?;
+                .await
+                .with_context(|| program_context("run", &self.program, "status --json"))?;
 
             if !output.status.success() {
                 bail!(
-                    "tailscale status failed: {}",
+                    "{} (status --json) failed: {}",
+                    self.program,
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
@@ -58,12 +73,14 @@ impl Tunnel for TailscaleTunnel {
         };
 
         // tailscale serve|funnel <port>
-        let child = Command::new("tailscale")
+        let subcommand_port = format!("{subcommand} {local_port}");
+        let child = Command::new(&self.program)
             .args([subcommand, &local_port.to_string()])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .with_context(|| program_context("start", &self.program, &subcommand_port))?;
 
         let public_url = format!("https://{hostname}:{local_port}");
 
@@ -77,13 +94,29 @@ impl Tunnel for TailscaleTunnel {
     }
 
     async fn stop(&self) -> Result<()> {
-        // Also reset the tailscale serve/funnel
+        // Also reset the tailscale serve/funnel published config. A failed
+        // reset must not keep the process alive — the kill below still runs —
+        // but it is worth a warning that names the program it ran.
         let subcommand = if self.funnel { "funnel" } else { "serve" };
-        Command::new("tailscale")
+        match Command::new(&self.program)
             .args([subcommand, "reset"])
             .output()
             .await
-            .ok();
+        {
+            Ok(output) if !output.status.success() => tracing::warn!(
+                program = %self.program,
+                subcommand,
+                status = %output.status,
+                "tailscale reset failed; stopping the tunnel process anyway"
+            ),
+            Err(error) => tracing::warn!(
+                program = %self.program,
+                subcommand,
+                error = %error,
+                "tailscale reset failed; stopping the tunnel process anyway"
+            ),
+            Ok(_) => {}
+        }
 
         kill_shared(&self.proc).await
     }
@@ -126,8 +159,126 @@ mod tests {
 
     #[tokio::test]
     async fn stop_without_started_process_is_ok() {
-        let tunnel = TailscaleTunnel::new(false, None);
+        // Never the real `tailscale`: stop() runs `serve reset`, and this
+        // machine's tailscale is a live daemon.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake =
+            crate::tunnel::write_fake_program(dir.path(), "tailscale", "#!/bin/sh\nexit 0\n");
+        let tunnel =
+            TailscaleTunnel::new(false, None).with_program(fake.to_str().expect("utf-8 temp path"));
         let result = tunnel.stop().await;
         assert!(result.is_ok());
+    }
+
+    /// A missing binary must be diagnosable: the serve spawn error names the
+    /// program and the subcommand.
+    #[tokio::test]
+    async fn missing_program_serve_error_names_the_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("tailscale");
+        // A hostname skips `status --json`, so this is the serve spawn.
+        let tunnel = TailscaleTunnel::new(false, Some("rantaiclaw_node".into()))
+            .with_program(missing.to_str().expect("utf-8 temp path"));
+
+        let err = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect_err("a program that does not exist cannot serve");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(missing.to_str().expect("utf-8 temp path")),
+            "the error must name the program it tried to run: {message}"
+        );
+        assert!(
+            message.contains("serve"),
+            "the error must say which subcommand failed: {message}"
+        );
+    }
+
+    /// Without a configured hostname, start() runs `status --json` first; that
+    /// spawn error names the program too.
+    #[tokio::test]
+    async fn missing_program_status_error_names_the_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("tailscale");
+        let tunnel = TailscaleTunnel::new(false, None)
+            .with_program(missing.to_str().expect("utf-8 temp path"));
+
+        let err = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect_err("a program that does not exist cannot report status");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(missing.to_str().expect("utf-8 temp path")),
+            "the error must name the program it tried to run: {message}"
+        );
+        assert!(
+            message.contains("status"),
+            "the error must say which subcommand failed: {message}"
+        );
+    }
+
+    /// stop() must reset the published serve config through the configured
+    /// program, before it stops the child — never through a `PATH` lookup.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_resets_serve_through_the_configured_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("argv.log");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "tailscale",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n[ \"$2\" = \"reset\" ] && exit 0\nexec sleep 30\n",
+                log.display()
+            ),
+        );
+        let tunnel = TailscaleTunnel::new(false, Some("rantaiclaw_node".into()))
+            .with_program(fake.to_str().expect("utf-8 temp path"));
+
+        tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect("the fake starts");
+        tunnel.stop().await.expect("stop is ok");
+
+        let recorded = std::fs::read_to_string(&log).expect("argv log");
+        assert!(
+            recorded.lines().any(|line| line.trim() == "serve reset"),
+            "the reset must run through the configured program: {recorded}"
+        );
+    }
+
+    /// Funnel mode resets funnel, not serve.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_resets_funnel_through_the_configured_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("argv.log");
+        let fake = crate::tunnel::write_fake_program(
+            dir.path(),
+            "tailscale",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n[ \"$2\" = \"reset\" ] && exit 0\nexec sleep 30\n",
+                log.display()
+            ),
+        );
+        let tunnel = TailscaleTunnel::new(true, Some("rantaiclaw_node".into()))
+            .with_program(fake.to_str().expect("utf-8 temp path"));
+
+        tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect("the fake starts");
+        tunnel.stop().await.expect("stop is ok");
+
+        let recorded = std::fs::read_to_string(&log).expect("argv log");
+        assert!(
+            recorded.lines().any(|line| line.trim() == "funnel reset"),
+            "funnel mode must reset funnel: {recorded}"
+        );
     }
 }

@@ -1,5 +1,7 @@
-use super::{kill_shared, new_shared_process, SharedProcess, Tunnel, TunnelProcess};
-use anyhow::{bail, Result};
+use super::{
+    kill_shared, new_shared_process, program_context, SharedProcess, Tunnel, TunnelProcess,
+};
+use anyhow::{bail, Context, Result};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
@@ -10,6 +12,9 @@ use tokio::process::Command;
 pub struct NgrokTunnel {
     auth_token: String,
     domain: Option<String>,
+    /// Executable name or absolute path. A field so a test can point at a fake
+    /// binary instead of whatever `ngrok` happens to be on `PATH`.
+    program: String,
     proc: SharedProcess,
 }
 
@@ -18,8 +23,16 @@ impl NgrokTunnel {
         Self {
             auth_token,
             domain,
+            program: "ngrok".into(),
             proc: new_shared_process(),
         }
+    }
+
+    /// Point the provider at a specific program path instead of looking up
+    /// `ngrok` on `PATH`. Test-only, for fake scripts in a tempdir.
+    pub(crate) fn with_program(mut self, program: impl Into<String>) -> Self {
+        self.program = program.into();
+        self
     }
 }
 
@@ -31,10 +44,23 @@ impl Tunnel for NgrokTunnel {
 
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
         // Set auth token
-        Command::new("ngrok")
+        let output = Command::new(&self.program)
             .args(["config", "add-authtoken", &self.auth_token])
             .output()
-            .await?;
+            .await
+            .with_context(|| program_context("run", &self.program, "config add-authtoken"))?;
+
+        // The status used to be ignored: a rejected token meant the next
+        // command ran unauthenticated and failed 15 s later with a misleading
+        // "did not produce a public URL". Fail here instead, naming only the
+        // program and the subcommand — the token argument never goes in.
+        if !output.status.success() {
+            bail!(
+                "{} (config add-authtoken) failed: {}",
+                self.program,
+                output.status
+            );
+        }
 
         // Build command: ngrok http <port> [--domain <domain>]
         let mut args = vec!["http".to_string(), local_port.to_string()];
@@ -48,12 +74,13 @@ impl Tunnel for NgrokTunnel {
         args.push("--log-format".into());
         args.push("logfmt".into());
 
-        let mut child = Command::new("ngrok")
+        let mut child = Command::new(&self.program)
             .args(&args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .with_context(|| program_context("start", &self.program, "http"))?;
 
         let stdout = child
             .stdout
@@ -147,5 +174,57 @@ mod tests {
     async fn health_check_is_false_before_start() {
         let tunnel = NgrokTunnel::new("ngrok-token".into(), None);
         assert!(!tunnel.health_check().await);
+    }
+
+    /// A missing binary must be diagnosable: the error names the program it
+    /// tried to run, and never the auth token that rides in argv.
+    #[tokio::test]
+    async fn missing_program_error_names_the_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("ngrok");
+        let tunnel = NgrokTunnel::new("rantaiclaw_ngrok_token".into(), None)
+            .with_program(missing.to_str().expect("utf-8 temp path"));
+
+        let err = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect_err("a program that does not exist cannot store a token");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(missing.to_str().expect("utf-8 temp path")),
+            "the error must name the program it tried to run: {message}"
+        );
+        assert!(
+            !message.contains("rantaiclaw_ngrok_token"),
+            "the error must not echo the auth token argument: {message}"
+        );
+    }
+
+    /// `config add-authtoken` used to have its exit status ignored, so a
+    /// rejected token surfaced 15 s later as "did not produce a public URL".
+    /// It must fail here, naming the subcommand and never the token.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_add_authtoken_names_the_subcommand_and_not_the_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = crate::tunnel::write_fake_program(dir.path(), "ngrok", "#!/bin/sh\nexit 1\n");
+        let tunnel = NgrokTunnel::new("rantaiclaw_ngrok_token".into(), None)
+            .with_program(fake.to_str().expect("utf-8 temp path"));
+
+        let err = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect_err("a rejected token must stop the start");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("config add-authtoken"),
+            "the error must say which subcommand failed: {message}"
+        );
+        assert!(
+            !message.contains("rantaiclaw_ngrok_token"),
+            "the error must not echo the auth token argument: {message}"
+        );
     }
 }

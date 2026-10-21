@@ -42,6 +42,18 @@ pub trait Tunnel: Send + Sync {
     fn public_url(&self) -> Option<String>;
 }
 
+/// Context for a spawn or output failure: the program plus the subcommand
+/// words it ran, never the argument values — cloudflared and ngrok receive
+/// their auth tokens as arguments, so echoing argv would leak them.
+pub(crate) fn program_context(action: &str, program: &str, subcommand: &str) -> String {
+    let words = if subcommand.is_empty() {
+        String::new()
+    } else {
+        format!(" ({subcommand})")
+    };
+    format!("{action} {program}{words} — is {program} installed and on PATH?")
+}
+
 // ── Shared child-process handle ──────────────────────────────────
 
 /// Wraps a spawned tunnel child process so implementations can share it.
@@ -121,6 +133,42 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+/// Write an executable fake program for tests. Unix-only: the fakes are shell
+/// scripts and the signal behaviour under test is POSIX.
+///
+/// The body is written by a helper process, not by this one: tests run in
+/// parallel threads, and a `fork` in another thread while this thread holds the
+/// file open for writing makes the child inherit that handle, after which the
+/// kernel refuses to `exec` the script with `ETXTBSY` ("Text file busy").
+#[cfg(all(test, unix))]
+pub(crate) fn write_fake_program(
+    dir: &std::path::Path,
+    name: &str,
+    body: &str,
+) -> std::path::PathBuf {
+    use std::io::Write as _;
+
+    let path = dir.join(name);
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the helper that writes the fake program");
+    child
+        .stdin
+        .as_mut()
+        .expect("helper stdin is piped")
+        .write_all(body.as_bytes())
+        .expect("write the fake program");
+    let status = child.wait().expect("wait for the fake program write");
+    assert!(
+        status.success(),
+        "writing the fake program failed: {status}"
+    );
+    path
+}
 
 #[cfg(test)]
 mod tests {

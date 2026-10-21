@@ -1227,7 +1227,7 @@ pub async fn run_gateway(
                 // Saying "falling back to local-only" was only ever true
                 // because the bind guard above refuses a public bind without
                 // an explicit opt-in — so state what actually happened.
-                println!("⚠️  Tunnel failed to start: {e}");
+                println!("⚠️  Tunnel failed to start: {e:#}");
                 println!("   Continuing to serve on {display_addr} — no remote URL.");
             }
         }

@@ -1,5 +1,7 @@
-use super::{kill_shared, new_shared_process, SharedProcess, Tunnel, TunnelProcess};
-use anyhow::{bail, Result};
+use super::{
+    kill_shared, new_shared_process, program_context, SharedProcess, Tunnel, TunnelProcess,
+};
+use anyhow::{bail, Context, Result};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
@@ -9,6 +11,9 @@ use tokio::process::Command;
 /// Cloudflare Zero Trust dashboard.
 pub struct CloudflareTunnel {
     token: String,
+    /// Executable name or absolute path. A field so a test can point at a fake
+    /// binary instead of whatever `cloudflared` happens to be on `PATH`.
+    program: String,
     proc: SharedProcess,
 }
 
@@ -16,8 +21,18 @@ impl CloudflareTunnel {
     pub fn new(token: String) -> Self {
         Self {
             token,
+            program: "cloudflared".into(),
             proc: new_shared_process(),
         }
+    }
+
+    /// Point the provider at a specific program path instead of looking up
+    /// `cloudflared` on `PATH`. Test-only: tests pass the absolute path of a
+    /// fake script, so a missing fake fails the test instead of running a real
+    /// tunnel binary found on `PATH`.
+    pub(crate) fn with_program(mut self, program: impl Into<String>) -> Self {
+        self.program = program.into();
+        self
     }
 }
 
@@ -29,7 +44,7 @@ impl Tunnel for CloudflareTunnel {
 
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
         // cloudflared tunnel --no-autoupdate run --token <TOKEN> --url http://localhost:<port>
-        let mut child = Command::new("cloudflared")
+        let mut child = Command::new(&self.program)
             .args([
                 "tunnel",
                 "--no-autoupdate",
@@ -42,7 +57,8 @@ impl Tunnel for CloudflareTunnel {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .with_context(|| program_context("start", &self.program, "tunnel run"))?;
 
         // Read stderr to find the public URL (cloudflared prints it there)
         let stderr = child
@@ -137,5 +153,30 @@ mod tests {
     async fn health_check_is_false_before_start() {
         let tunnel = CloudflareTunnel::new("cf-token".into());
         assert!(!tunnel.health_check().await);
+    }
+
+    /// A missing binary must be diagnosable: the error names the program it
+    /// tried to run, and never the token that rides in argv.
+    #[tokio::test]
+    async fn missing_program_error_names_the_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("cloudflared");
+        let tunnel = CloudflareTunnel::new("rantaiclaw_cf_token".into())
+            .with_program(missing.to_str().expect("utf-8 temp path"));
+
+        let err = tunnel
+            .start("127.0.0.1", 8080)
+            .await
+            .expect_err("a program that does not exist cannot start");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(missing.to_str().expect("utf-8 temp path")),
+            "the error must name the program it tried to run: {message}"
+        );
+        assert!(
+            !message.contains("rantaiclaw_cf_token"),
+            "the error must not echo the token argument: {message}"
+        );
     }
 }
