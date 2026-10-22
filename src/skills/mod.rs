@@ -2,6 +2,10 @@ pub mod bundled;
 pub mod clawhub;
 pub mod install_deps;
 pub mod origin;
+/// Where a skill's own tools live, and how a required binary is found.
+/// Crate-internal: the lookup is an implementation detail of the gate and
+/// of the skill tool, not a public surface.
+pub(crate) mod tools_dir;
 pub mod watcher;
 
 use anyhow::{Context, Result};
@@ -145,8 +149,12 @@ pub struct SkillInstallRecipe {
     /// Number of leading directory components to strip on extract.
     #[serde(default)]
     pub strip_components: Option<usize>,
-    /// Target directory for download recipes; defaults to
-    /// `~/.rantaiclaw/tools/<skill-slug>/`.
+    /// Target directory for download recipes; defaults to the skill's own
+    /// tools directory, `<XDG data>/rantaiclaw/tools/<skill name>/` (the
+    /// skill's manifest name, not its directory slug). When the data
+    /// directory cannot be resolved the fallback is
+    /// `.rantaiclaw/tools/<skill name>`, relative to the current directory.
+    /// A relative `target_dir` narrows it to a subdirectory of that base.
     #[serde(default)]
     pub target_dir: Option<String>,
     /// Optional hex-encoded SHA-256 for `kind = download`. When present,
@@ -177,7 +185,9 @@ impl SkillInstallRecipe {
 ///       required: true
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillRequires {
-    /// Binary executables that must be on `$PATH`.
+    /// Binary executables that must be reachable: either on `$PATH`, or in
+    /// the skill's own tools directory (`<XDG data>/rantaiclaw/tools/<skill
+    /// name>/`), where the skill's install recipes put what they installed.
     #[serde(default)]
     pub bins: Vec<String>,
     /// Required environment variables (must be set and non-empty).
@@ -191,7 +201,10 @@ pub struct SkillRequires {
 impl SkillRequires {
     /// Check whether this skill's declared deps are satisfied on the
     /// current host. Returns the list of unmet reasons (empty = OK).
-    pub fn unmet(&self) -> Vec<String> {
+    ///
+    /// Takes the owning skill because a binary counts as present when it is
+    /// in that skill's own tools directory, not only when it is on `$PATH`.
+    pub fn unmet(&self, skill: &Skill) -> Vec<String> {
         let mut reasons = Vec::new();
 
         if !self.os.is_empty() {
@@ -206,7 +219,7 @@ impl SkillRequires {
         }
 
         for bin in &self.bins {
-            if which::which(bin).is_err() {
+            if tools_dir::resolve_required_bin(skill, bin).is_none() {
                 reasons.push(format!("missing binary `{bin}`"));
             }
         }
@@ -286,8 +299,9 @@ pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
 /// Applies two filtering layers on top of disk-loaded skills:
 ///
 /// 1. **`requires` gating** — skills declaring `metadata.clawdbot.requires`
-///    in their SKILL.md frontmatter (binaries on `$PATH`, env vars set,
-///    OS match) are dropped if any requirement is unmet.
+///    in their SKILL.md frontmatter (binaries reachable on `$PATH` or in the
+///    skill's own tools directory, env vars set, OS match) are dropped if any
+///    requirement is unmet.
 /// 2. **Per-skill enable flag** — skills with
 ///    `[skills.entries.<name>] enabled = false` in `config.toml` are
 ///    excluded. Default = enabled. Mirrors OpenClaw's `skills.entries.<name>.enabled`.
@@ -306,7 +320,7 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
                     return false;
                 }
             }
-            let unmet = s.requires.unmet();
+            let unmet = s.requires.unmet(s);
             if !unmet.is_empty() {
                 tracing::debug!(
                     skill = %s.name,
@@ -336,7 +350,7 @@ pub fn load_skills_with_status(
     let mut out: Vec<(Skill, Vec<String>)> = raw
         .into_iter()
         .map(|s| {
-            let mut reasons = s.requires.unmet();
+            let mut reasons = s.requires.unmet(&s);
             if let Some(entry) = entry_for(&config.skills.entries, &s.name) {
                 if !entry.enabled {
                     reasons.insert(0, "disabled in config.toml".to_string());
@@ -2194,9 +2208,10 @@ pub(crate) fn handle_command(
 /// order the targets are processed.
 ///
 /// Exit status: `Ok(())` only when every targeted skill has every required
-/// binary on `$PATH` afterwards. A skill with a missing binary and no recipe,
-/// and a recipe that failed or left a binary missing, all return `Err` after
-/// the remaining targets have been attempted.
+/// binary reachable afterwards — in the skill's own tools directory or on
+/// `$PATH`. A skill with a missing binary and no recipe, and a recipe that
+/// failed or left a binary missing, all return `Err` after the remaining
+/// targets have been attempted.
 pub(crate) fn run_install_deps_command(
     workspace_dir: &Path,
     config: &crate::config::Config,
@@ -2259,7 +2274,7 @@ fn run_install_deps_targets(
                     .requires
                     .bins
                     .iter()
-                    .filter(|b| which::which(b).is_err())
+                    .filter(|b| tools_dir::resolve_required_bin(skill, b.as_str()).is_none())
                     .map(|b| b.as_str())
                     .collect();
                 if !missing.is_empty() {
@@ -4504,6 +4519,27 @@ description = "Bare minimum"
         format!("http://{addr}")
     }
 
+    /// A skill that declares one required binary, and nothing else.
+    fn skill_with_bin(name: &str, bin: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: "A skill".to_string(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+            requires: SkillRequires {
+                bins: vec![bin.to_string()],
+                ..Default::default()
+            },
+            install_recipes: vec![],
+            remote: false,
+            origin: None,
+        }
+    }
+
     /// Write `<root>/<slug>/SKILL.md` whose frontmatter carries `metadata`,
     /// the single-line JSON blob the loader parses for `requires` and
     /// `install[]`.
@@ -4519,21 +4555,22 @@ description = "Bare minimum"
         .unwrap();
     }
 
-    /// Where a `download` recipe for `slug` places its files, resolved the
-    /// same way the runner does (`install_deps::resolve_target_dir` is
-    /// private). Call only while the data-dir env guard is in scope.
-    fn download_target_dir(slug: &str) -> PathBuf {
-        directories::ProjectDirs::from("", "", "rantaiclaw")
-            .expect("project dirs")
-            .data_dir()
-            .join("tools")
-            .join(slug)
+    /// Where a `download` recipe for `skill_name` places its files. Resolved
+    /// by the production resolver, so this helper cannot drift from the
+    /// runner. Call only while the data-dir env guard is in scope.
+    fn download_target_dir(skill_name: &str) -> PathBuf {
+        crate::skills::tools_dir::resolve_target_dir(None, skill_name).expect("tools directory")
     }
 
     /// The CLI writes recipes' progress lines to stdout because it owns the
     /// terminal. On the async thread `handle_command` runs on, the blocking
     /// HTTP client inside a `download` recipe panics; the entry point must
     /// move the recipe work to an OS thread.
+    ///
+    /// The target directory is deliberately NOT on `PATH`: the recipe puts
+    /// the binary in the skill's own tools directory, and the skill finds it
+    /// there. A `PATH` that already contained that directory would hide the
+    /// defect this test is about.
     #[cfg(unix)]
     #[tokio::test]
     async fn install_deps_download_recipe_from_cli_entry_point_does_not_panic_and_installs_bin() {
@@ -4546,11 +4583,6 @@ description = "Bare minimum"
         let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
 
         let target_dir = download_target_dir("download-probe");
-        let previous_path = std::env::var("PATH").unwrap_or_default();
-        let _path = crate::test_env::EnvGuard::set(
-            "PATH",
-            format!("{}:{previous_path}", target_dir.display()),
-        );
 
         let body = b"#!/bin/sh\necho download-probe\n".to_vec();
         let base = spawn_mock_file(body.clone());
@@ -4684,6 +4716,92 @@ description = "Bare minimum"
         assert!(
             result.is_ok(),
             "all bins present must return Ok (exit 0), got {result:?}"
+        );
+    }
+
+    /// Write an executable file, creating the directories above it.
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A binary that exists only in the skill's own tools directory satisfies
+    /// the skill's requirement. The recipe that put it there is the only way
+    /// it got there, so the skill must not stay gated because of it.
+    #[cfg(unix)]
+    #[test]
+    fn unmet_accepts_a_binary_in_the_skill_own_tools_directory() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let data = tempfile::tempdir().unwrap();
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data.path().to_string_lossy());
+
+        let skill = skill_with_bin("own-tools-skill", "own-tools-bin");
+        write_executable(
+            &data
+                .path()
+                .join("rantaiclaw/tools/own-tools-skill/own-tools-bin"),
+            "#!/bin/sh\n",
+        );
+
+        let reasons = skill.requires.unmet(&skill);
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("missing binary")),
+            "a binary in the skill's own tools directory must satisfy the requirement: {reasons:?}"
+        );
+    }
+
+    /// A binary that exists nowhere is still missing, and still reported.
+    #[test]
+    fn unmet_reports_a_binary_that_exists_nowhere() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let skill = skill_with_bin("no-bin-skill", "rantaiclaw-absent-probe-bin");
+
+        let reasons = skill.requires.unmet(&skill);
+        assert_eq!(
+            reasons,
+            vec!["missing binary `rantaiclaw-absent-probe-bin`".to_string()],
+            "a binary that exists nowhere must be reported as missing"
+        );
+    }
+
+    /// A skill whose binary a recipe installed is not reported as gated by
+    /// `load_skills_with_status` — the same loader `skills list` reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_whose_binary_lives_in_its_own_tools_directory_is_not_gated() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let data = tempfile::tempdir().unwrap();
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data.path().to_string_lossy());
+
+        write_probe_skill(
+            &workspace_dir.join("skills"),
+            "installed-skill",
+            r#"{"clawdbot":{"requires":{"bins":["installed-probe-bin"]},"install":[{"kind":"download","url":"https://example.invalid/installed-probe-bin"}]}}"#,
+        );
+        write_executable(
+            &data
+                .path()
+                .join("rantaiclaw/tools/installed-skill/installed-probe-bin"),
+            "#!/bin/sh\n",
+        );
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let with_status = load_skills_with_status(&workspace_dir, &config);
+        let (_, reasons) = with_status
+            .iter()
+            .find(|(s, _)| s.name == "installed-skill")
+            .expect("the probe skill is loaded");
+        assert!(
+            reasons.is_empty(),
+            "a skill whose binary is in its own tools directory must not be gated: {reasons:?}"
         );
     }
 

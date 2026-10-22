@@ -4352,7 +4352,20 @@ mod tests {
         let ws = tempfile::tempdir().expect("tempdir");
         let marker = ws.path().join("skill_marker.txt");
         let tool = crate::tools::skill_tool::SkillToolAdapter::new(
-            "marker-skill",
+            Arc::new(crate::skills::Skill {
+                name: "marker-skill".into(),
+                description: "writes a marker".into(),
+                version: "0.1.0".into(),
+                author: None,
+                tags: vec![],
+                tools: vec![],
+                prompts: vec![],
+                location: None,
+                requires: crate::skills::SkillRequires::default(),
+                install_recipes: Vec::new(),
+                remote: false,
+                origin: None,
+            }),
             crate::skills::SkillTool {
                 name: "touch".into(),
                 description: "writes a marker".into(),

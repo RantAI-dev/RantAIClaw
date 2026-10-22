@@ -88,6 +88,32 @@ method is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD` or `OPTIONS`, a
 Installing or enabling a skill is the trust decision. The `[[tools]]` block in its `SKILL.toml` says which program runs,
 or which URL the `http` kind calls, so read it before you enable the skill.
 
+### Where a recipe installs, and how the skill finds its own binary
+
+A skill can declare the binaries it needs in `metadata.clawdbot.requires.bins`, and how to get them in
+`metadata.clawdbot.install[]`. A `download` recipe installs into the skill's own tools directory,
+`<XDG data>/rantaiclaw/tools/<skill name>/` — the skill's manifest name, not its directory slug. When the data
+directory cannot be resolved the fallback is `.rantaiclaw/tools/<skill name>`, relative to the current directory. A
+recipe MAY narrow that to a relative subdirectory; an absolute path or one with a `..` component is refused, so a
+recipe cannot drop an executable into a directory the operator's own `PATH` reaches.
+
+A skill whose manifest name is not a single path component — it carries a separator, a `..`, a `.`, a NUL byte
+or a `:` anywhere (a drive prefix is the Windows case, but any colon is refused), or it is empty — has no tools
+directory of its own, and its `download` recipe is refused rather than writing outside `<data>/tools/`. The rule is
+the same on every platform, so a skill named the same way is treated the same way everywhere.
+
+Three places look for that binary, and they agree:
+
+- the `requires` gate, so `skills list` shows the skill as active rather than gated;
+- `skills install-deps`, so the recipe's own post-check passes and the command exits 0;
+- the process that runs the skill's tools: the child gets a `PATH` that starts with that skill's own tools
+  directory, so the binary is found by name.
+
+That directory is visible to that skill and to nothing else. Another skill's tools directory is not on the `PATH` of
+a skill's tool, a plain `shell` call never sees it, and no MCP server, cron job or the process-wide `PATH` does
+either. Nothing is symlinked into a `PATH` directory and no shell profile is edited, so a binary a recipe installed
+cannot shadow a system binary for anything but that skill's own tool call.
+
 ## Architecture
 
 ```
