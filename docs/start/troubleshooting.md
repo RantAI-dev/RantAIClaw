@@ -321,6 +321,91 @@ while dragging (Option on iTerm2) — the terminal bypasses the TUI's mouse
 capture and its normal copy shortcut works. Native selection copies the
 screen as-is, so the pane border `│` and wrapped line breaks come along.
 
+### `ssh` refuses to connect: the known-hosts file
+
+Symptom:
+
+- the `ssh` tool reports `ssh server key for <host>:<port> changed: ...`
+- the `ssh` tool reports `ssh known-hosts file ... cannot be read`, `ssh known-hosts file ... is not valid JSON` or `ssh known-hosts file ... cannot be written`
+
+The `ssh` tool verifies the server key of every host it connects to against
+`~/.rantaiclaw/ssh_known_hosts.json` in the RantaiClaw data root. The file holds
+one entry per endpoint, written as `host:port`, and the SHA256 fingerprint of the
+key that endpoint presented:
+
+```json
+{
+  "host.example.com:22": "<sha256 fingerprint>"
+}
+```
+
+A host that is not on record is pinned on first contact, and the store is written
+atomically: a temporary file in the same directory is written, flushed and renamed
+over the target, so an interrupted write leaves either the old file or the new one
+and never a half-written store under the target name. A new store is created with
+mode `0600`; an existing store keeps the mode it has. A store that does not exist
+yet is the normal first-contact case, not an error.
+
+No flag, config key or environment variable skips the check. A connection that
+cannot be verified is refused, and the message names the reason. Four refusals
+exist:
+
+**The server key changed.**
+
+```
+ssh server key for {endpoint} changed: stored {stored_id}, presented {presented_id}; the known-hosts file {path} was left unchanged - if the change is expected, remove the entry for {endpoint} from {path} deliberately before connecting again
+```
+
+The host on record presents a different key than the one stored for it. A rebuilt
+host, a rotated key and a host that is not the host you meant all look like this,
+so confirm the new key out of band before you accept it. The stored entry is left
+unchanged.
+
+If the change is expected, remove that one endpoint's line from the file on
+purpose and connect again; the next connection pins the key the host presents now.
+The other entries are not affected.
+
+**The file is not valid JSON.**
+
+```
+ssh known-hosts file {path} is not valid JSON ({error}); it was left untouched - repair it or remove it before connecting again
+```
+
+The store could not be parsed. The file was left byte for byte as it was, so no
+pinned host was lost. Repair the JSON, or move the file aside, then connect again.
+Moving it aside starts an empty store, so every host is pinned again on its next
+connection, to whatever key it presents then.
+
+**The file cannot be read.**
+
+```
+ssh known-hosts file {path} cannot be read ({error}); fix the file or the directory that holds it, then connect again
+```
+
+The store exists but could not be read. The usual causes are permissions on the
+file or on the directory that holds it. Fix the file or the directory, then
+connect again.
+
+**The file cannot be written.**
+
+```
+ssh known-hosts file {path} cannot be written ({error}); fix the file or the directory that holds it, then connect again
+```
+
+The host could not be pinned, so the connection was refused on purpose rather than
+run with an unpinned key. The usual causes are a read-only file, a directory that
+is not writable, and a full disk. Make the file and the directory that holds it
+writable, then connect again.
+
+A host that is on record and presents the same key connects exactly as before: the
+store is not rewritten, its permissions are not changed, and nothing is printed.
+
+Inspect the store with:
+
+```bash
+cat ~/.rantaiclaw/ssh_known_hosts.json
+```
+
 ## Channel Issues
 
 ### Telegram conflict: `terminated by other getUpdates request`
