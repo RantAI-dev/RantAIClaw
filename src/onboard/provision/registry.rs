@@ -2,6 +2,20 @@
 
 use super::traits::{ProvisionResponse, TuiProvisioner};
 
+/// Build a provisioner with the caller's `--force` intent.
+///
+/// Only the approvals provisioner acts on it today: without `--force` it
+/// keeps an already-configured preset instead of offering a picker it cannot
+/// honour. Every other provisioner ignores it.
+pub fn provisioner_for_with_force(name: &str, force: bool) -> Option<Box<dyn TuiProvisioner>> {
+    if name == super::approvals::APPROVALS_NAME {
+        return Some(Box::new(
+            super::approvals::ApprovalsProvisioner::with_force(force),
+        ));
+    }
+    provisioner_for(name)
+}
+
 pub fn provisioner_for(name: &str) -> Option<Box<dyn TuiProvisioner>> {
     match name {
         // Core
@@ -403,6 +417,49 @@ mod tests {
         let p = provisioner_for("persona");
         assert!(p.is_some());
         assert_eq!(p.unwrap().name(), "persona");
+    }
+
+    /// The `--force` intent has to reach the provisioner that acts on it.
+    /// The approvals provisioner is the only one that does today, and the
+    /// way to see that it did is to run it: without the flag it keeps an
+    /// already-configured preset and offers no picker, with it the picker
+    /// appears and the answer is written.
+    #[tokio::test]
+    async fn provisioner_for_with_force_builds_a_forcing_approvals_provisioner() {
+        use crate::approval::policy_writer::{self, PolicyPreset};
+        use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+        use crate::onboard::provision::ProvisionEvent;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        policy_writer::write_policy_files(&profile, PolicyPreset::Strict, false)
+            .expect("preset written");
+
+        let prov = provisioner_for_with_force("approvals", true).expect("approvals provisioner");
+        let mut config = crate::config::Config::default();
+        let t = drive(prov.as_ref(), &mut config, &profile, vec![Answer::Pick(0)]).await;
+
+        assert!(
+            t.events
+                .iter()
+                .any(|e| matches!(e, ProvisionEvent::Choose { .. })),
+            "a forced approvals run must offer the picker: {:?}",
+            t.events
+        );
+        assert_eq!(
+            policy_writer::read_active_preset(&profile.policy_dir()),
+            Some(PolicyPreset::Manual),
+            "a forced approvals run must write the chosen preset"
+        );
+    }
+
+    /// Every other provisioner ignores the flag: the factory still resolves
+    /// them, and it resolves them the same way.
+    #[test]
+    fn provisioner_for_with_force_resolves_the_other_provisioners() {
+        let p = provisioner_for_with_force("provider", true).expect("provider provisioner");
+        assert_eq!(p.name(), "provider");
+        assert!(provisioner_for_with_force("nope", true).is_none());
     }
 
     #[test]

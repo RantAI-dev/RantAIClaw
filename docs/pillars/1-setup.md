@@ -12,6 +12,29 @@ The first thing a user sees. RantaiClaw's setup story is **fullscreen TUI wizard
 - `rantaiclaw doctor` diagnostics (text / json / brief)
 - Profile creation, scaffolding, and per-section re-runs
 
+## What a fresh install sees
+
+`rantaiclaw chat` — and `rantaiclaw` with no subcommand — opens one of three
+doors before the chat appears:
+
+| The install | What opens |
+|---|---|
+| The agent could not be built, and the config stores no provider credential | The first-run wizard: provider, approvals, login, persona, skills, then channels and integrations |
+| The agent could not be built, and the config stores a provider credential | Provider setup — the profile was set up and its provider broke |
+| The agent built | Nothing; the chat starts |
+
+A provider counts as set up when `default_provider` names one **and** a key
+resolves for it. The onboarding provider section and the TUI boot read that one
+rule, so the two surfaces cannot disagree about whether a profile is fresh.
+
+A setup surface offers a choice only when it can act on it. `setup approvals`
+keeps an approval preset that is already on disk: it names the preset that is
+active and points at `rantaiclaw setup approvals --force`, which is what offers
+the picker and writes the preset you pick. `--force` regenerates the preset's
+policy files — `<profile>/policy/autonomy.toml` and
+`<profile>/policy/command_allowlist.toml` — so hand edits to them are lost. A
+profile with no preset yet is offered the picker either way.
+
 ## Vs OpenClaw / Hermes-agent
 
 | | RantaiClaw | OpenClaw | Hermes-agent |
@@ -66,6 +89,7 @@ rantaiclaw setup
 rantaiclaw setup                  # interactive wizard
 rantaiclaw setup full             # all 7 sections
 rantaiclaw setup provider         # one section
+rantaiclaw setup approvals        # pick the approval preset (an existing one is kept unless --force)
 rantaiclaw setup --non-interactive  # CI / scripted bootstrap
 rantaiclaw doctor                 # full diagnostic
 rantaiclaw doctor --brief         # one-line health

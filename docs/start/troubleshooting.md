@@ -171,9 +171,11 @@ or earlier**: choosing such a provider and leaving the key prompt empty saved
 the pair anyway.
 
 On binaries **after v0.20.0-alpha** this state no longer aborts: the TUI opens,
-reports the failure, and drops you into provider setup — enter a key or switch
-provider and the session heals in place. Setup also refuses to save the broken
-combination in the first place.
+reports the failure, and drops you into setup — enter a key or switch provider
+and the session heals in place. A profile that stores no provider credential
+opens the first-run wizard, whose first step is the provider; a profile that
+stores one opens provider setup, the surface that repairs it. Setup also refuses
+to save the broken combination in the first place.
 
 On **v0.20.0-alpha and earlier** the same config kills every launch, including
 `rantaiclaw setup`. Two manual escapes:
