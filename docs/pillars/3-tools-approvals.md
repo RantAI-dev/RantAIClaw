@@ -78,9 +78,12 @@ src/security/      ← rate limit + audit
 
 ```bash
 rantaiclaw setup approvals              # pick Manual / Smart / Strict / Off preset (wizard)
+rantaiclaw setup approvals --force      # replace a preset already on disk
 rantaiclaw autonomy                     # print active preset + 4 options
 rantaiclaw autonomy <preset>            # switch (manual | smart | strict | off | full)
 ```
+
+`setup approvals` keeps a preset that is already on disk: it names the preset that is active and points at `rantaiclaw setup approvals --force`, which is what offers the picker and writes the preset you pick. `--force` regenerates the preset's policy files — `<profile>/policy/autonomy.toml` and `<profile>/policy/command_allowlist.toml` — so hand edits to them are lost.
 
 Inside the TUI:
 - `Shift+Tab` — cycle Manual → Smart → Strict → Off → Manual

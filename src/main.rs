@@ -1575,7 +1575,9 @@ async fn main() -> Result<()> {
             // fall back to the section-by-section wizard for topics
             // that are SetupSections (provider, channels, persona, …).
             if let Some(ref topic_name) = topic {
-                if let Some(provisioner) = onboard::provision::provisioner_for(topic_name) {
+                if let Some(provisioner) =
+                    onboard::provision::provisioner_for_with_force(topic_name, force)
+                {
                     // Headless provisioner — runs on a dedicated async task,
                     // prints events to stdout, waits for Done/Fail/timeout.
                     let mut config = Config::load_or_init().await?;
@@ -1658,6 +1660,10 @@ async fn main() -> Result<()> {
 
             let tui_config = TuiConfig {
                 setup_provisioner: Some(topic.unwrap_or_default()),
+                // `--force` reaches the setup surfaces this session opens:
+                // the approvals overlay keeps an already-configured preset
+                // unless the operator asked for it to be replaced.
+                setup_force: force,
                 ..Default::default()
             };
             Box::pin(run_tui(tui_config)).await?;

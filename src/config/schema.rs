@@ -4224,6 +4224,35 @@ impl Config {
         )
     }
 
+    /// Whether this config stores a credential for its provider: a
+    /// `default_provider` is set AND a key resolves for it.
+    ///
+    /// This is the ONE rule for the CREDENTIAL question. The onboarding
+    /// provider section and the TUI boot branch both ask it, so the two
+    /// surfaces cannot drift apart on it — they were two copies of this
+    /// logic, and the copy in the TUI was dead (it asked for
+    /// `default_provider` to be unset, which `Config::default` never is), so
+    /// a fresh install never reached the first-run wizard.
+    ///
+    /// Deliberately narrow: it answers "is a key in this config?", not "can
+    /// this install send a message?". The wider question — which also accepts
+    /// environment variables, auth profiles and keyless local providers — is
+    /// what `doctor`'s `config.provider_key` check asks. The two answers
+    /// differ on purpose.
+    ///
+    /// "Not set up yet" is therefore this rule COMBINED with what the caller
+    /// knows about the provider: an install whose credential lives in the
+    /// environment, or whose provider needs none at all, stores no key here
+    /// and is still perfectly set up. The onboarding section has nothing
+    /// else to go on, so it asks this rule alone; the TUI boot asks it
+    /// together with the agent's own build result, which knows whether this
+    /// install can send at all.
+    pub fn provider_credential_resolves(&self) -> bool {
+        self.default_provider
+            .as_deref()
+            .is_some_and(|provider| self.resolve_key_for_provider(provider).is_some())
+    }
+
     /// The stored-key lookup behind [`Config::resolve_key_for_provider`], over
     /// the pieces alone. Channel paths hold these pieces without a live
     /// `Config`, so both paths share this one order.
@@ -6073,6 +6102,50 @@ mod tests {
         // provider with no stored key → None, so the env-var fallback applies
         // instead of sending the wrong key.
         assert_eq!(cfg.resolve_key_for_provider("anthropic"), None);
+    }
+
+    #[test]
+    async fn provider_credential_does_not_resolve_for_a_fresh_default() {
+        // A fresh install names a provider (`Config::default` sets
+        // `default_provider = openrouter`) but stores no key for it, so the
+        // profile is NOT set up and every door must offer onboarding.
+        let c = Config::default();
+        assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
+        assert!(!c.provider_credential_resolves());
+    }
+
+    #[test]
+    async fn provider_credential_resolves_for_a_stored_provider_key() {
+        // The key the web console writes lives in `provider_api_keys`.
+        let mut c = Config::default();
+        c.api_key = None;
+        c.provider_api_keys
+            .insert("openrouter".into(), "sk-console".into());
+        assert!(c.provider_credential_resolves());
+    }
+
+    #[test]
+    async fn provider_credential_resolves_for_a_top_level_api_key() {
+        let mut c = Config::default();
+        c.api_key = Some("sk-test".into());
+        assert!(c.provider_credential_resolves());
+    }
+
+    #[test]
+    async fn provider_credential_does_not_resolve_without_any_key() {
+        let mut c = Config::default();
+        c.default_provider = Some("openrouter".into());
+        assert!(c.api_key.is_none());
+        assert!(c.provider_api_keys.is_empty());
+        assert!(!c.provider_credential_resolves());
+    }
+
+    #[test]
+    async fn provider_credential_does_not_resolve_without_a_default_provider() {
+        let mut c = Config::default();
+        c.default_provider = None;
+        c.api_key = Some("sk-test".into());
+        assert!(!c.provider_credential_resolves());
     }
 
     // ── Defaults ─────────────────────────────────────────────
