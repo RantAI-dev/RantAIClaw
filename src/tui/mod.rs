@@ -42,6 +42,13 @@ pub struct TuiConfig {
     /// `Some("")` = open the SetupTopic category picker.
     /// `Some(name)` = open that specific provisioner's overlay.
     pub setup_provisioner: Option<String>,
+    /// The CLI's `--force` intent for the setup surfaces this session opens.
+    ///
+    /// `rantaiclaw setup --force` sets it; a plain `rantaiclaw chat` session
+    /// does not. A setup surface that cannot act on an answer (the approvals
+    /// picker, which would otherwise offer a preset the run cannot apply)
+    /// consults it.
+    pub setup_force: bool,
 }
 
 impl Default for TuiConfig {
@@ -50,6 +57,7 @@ impl Default for TuiConfig {
             model: "anthropic:claude-sonnet-4-20250514".to_string(),
             resume_session: None,
             setup_provisioner: None,
+            setup_force: false,
         }
     }
 }

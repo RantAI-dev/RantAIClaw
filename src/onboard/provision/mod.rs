@@ -23,7 +23,7 @@ pub mod validate;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 #[allow(unused_imports)]
-pub use registry::{available, provisioner_for};
+pub use registry::{available, provisioner_for, provisioner_for_with_force};
 #[allow(unused_imports)]
 pub use traits::{
     ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, ProvisionerCategory,

@@ -85,6 +85,8 @@ Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker ·
 
 `setup` walks every wired section (provider, channels, persona, skills, mcp, and — when built with the default `kb` feature — knowledge) skipping any that are already configured. Pass `--force` to re-run already-configured sections.
 
+Approval presets are kept rather than re-offered: `rantaiclaw setup approvals` on a profile that already has a preset on disk names the preset that is active and points at `rantaiclaw setup approvals --force`, because without `--force` the write would leave the preset in place anyway. With `--force` the picker appears, the preset you pick is written, and the preset's policy files — `<profile>/policy/autonomy.toml` and `<profile>/policy/command_allowlist.toml` — are regenerated from the preset bundle, so hand edits to them are lost.
+
 `--non-interactive` (or a non-TTY context) behaves differently depending on whether a topic is given:
 
 - **`rantaiclaw setup --non-interactive`** — walks the sections and emits each one's headless hint instead of prompting. Exits `0`.
@@ -93,6 +95,7 @@ Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker ·
 Single-topic examples:
 - `rantaiclaw setup provider` — re-run provider section only
 - `rantaiclaw setup channels` — re-run channels section only
+- `rantaiclaw setup approvals` — pick the Manual / Smart / Strict / Off preset; a preset already on disk is kept unless `--force` is given
 - `rantaiclaw setup knowledge` — set the Knowledge Base API keys (`[knowledge].embedding_api_key` / `vision_api_key`, encrypted at rest; vision falls back to the embedding key). Env `KB_EMBEDDING_API_KEY` / `KB_EXTRACT_VISION_API_KEY` override config at load, with `OPENROUTER_API_KEY` as the final fallback. See [config-reference.md](config.md) for the gateway `GET`/`PUT /api/v1/config/knowledge` endpoints.
 - `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (a three-minute window, the same as the console's; a timeout exits non-zero)
 

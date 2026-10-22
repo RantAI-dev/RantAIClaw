@@ -307,12 +307,20 @@ pub struct TuiApp {
     /// disk does not serialise identically to the one held in memory.
     pub channels_restarted_for_save: bool,
 
-    /// A channel restart owed once the first-run wizard finishes.
+    /// The change a deferred listener restart is owed for.
     ///
-    /// The wizard saves several channels in sequence; restarting per save
+    /// The wizard saves several sections in sequence; restarting per save
     /// would flap every listener once per provisioner, so the restart is
-    /// deferred to the end rather than dropped.
-    pub channels_restart_pending: bool,
+    /// deferred to the end rather than dropped. The variant says what
+    /// changed, because the line the wizard prints at the end may only
+    /// claim channels when channels were actually configured.
+    pub pending_setup_change: SetupChange,
+    /// The `--force` intent for the setup surfaces this session opens.
+    ///
+    /// Set from `TuiConfig::setup_force`, which the CLI fills from
+    /// `rantaiclaw setup --force`. A plain `rantaiclaw chat` session leaves
+    /// it false, so `/setup approvals` inside one does NOT force.
+    pub setup_force: bool,
     /// Active interactive list picker — Up/Down/Enter/Esc overlay used
     /// by `/model`, `/sessions`, `/resume`, `/personality`, etc. The
     /// `ListPicker.kind` tag tells the Enter handler what to do with the
@@ -635,9 +643,10 @@ impl TuiApp {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
-            channels_restart_pending: false,
+            pending_setup_change: SetupChange::None,
             channels_restarted_for_save: false,
             setup_response_tx: None,
+            setup_force: tui_config.setup_force,
             scrollback_queue: Vec::new(),
             selection_drag_anchor: None,
             selection_dragged: false,
@@ -2000,13 +2009,29 @@ impl TuiApp {
                         // save deferred its restart to here rather than flapping
                         // every listener once per provisioner. `reload_config`
                         // may already have restarted; only fire if it did not.
-                        if std::mem::take(&mut self.channels_restart_pending) {
-                            let msg = "✓ Channels configured — starting listener(s) now. \
-                                       `/channels` shows the current state."
-                                .to_string();
-                            let _ = self.context.append_system_message(&msg);
-                            self.scrollback_queue.push(("system".to_string(), msg));
-                            self.restart_channels();
+                        //
+                        // The line names what actually changed. A run that
+                        // configured no channel but did save a policy still
+                        // owes a restart — the listeners have to run under the
+                        // new policy — and it must not claim channels.
+                        match std::mem::take(&mut self.pending_setup_change) {
+                            SetupChange::None => {}
+                            SetupChange::Channels => {
+                                let msg = "✓ Channels configured — starting listener(s) now. \
+                                           `/channels` shows the current state."
+                                    .to_string();
+                                let _ = self.context.append_system_message(&msg);
+                                self.scrollback_queue.push(("system".to_string(), msg));
+                                self.restart_channels();
+                            }
+                            SetupChange::PolicyOnly => {
+                                let msg = "✓ Approval policy applied — restarting listener(s) \
+                                           now so it takes effect."
+                                    .to_string();
+                                let _ = self.context.append_system_message(&msg);
+                                self.scrollback_queue.push(("system".to_string(), msg));
+                                self.restart_channels();
+                            }
                         }
                     }
                     super::first_run_wizard::WizardPhase::RunningProvisioner { .. } => {
@@ -2351,8 +2376,7 @@ impl TuiApp {
             // Compare BEFORE the swap. The swap itself is deliberate — the next
             // provisioner's clone must see this provisioner's writes — and
             // moving it reintroduces the bug it was added to fix.
-            let before = channels_fingerprint(&self.config);
-            let after = channels_fingerprint(cfg);
+            let change = setup_change(&self.config, cfg);
             // Save succeeded — swap in the new config NOW so the next
             // provisioner's clone sees this provisioner's writes.
             self.config = cfg.clone();
@@ -2367,13 +2391,25 @@ impl TuiApp {
             // During the first-run wizard several channels are saved in
             // sequence; the restart is deferred to the end of the wizard so the
             // listeners are not flapped once per provisioner.
-            if channels_differ(before.as_ref(), after.as_ref()) {
+            if change != SetupChange::None {
                 if self.first_run_wizard.is_some() {
-                    self.channels_restart_pending = true;
+                    // Keep the strongest claim: a wizard that saved a channel
+                    // after a policy change may still say it configured one.
+                    self.pending_setup_change = self.pending_setup_change.max(change);
                 } else {
-                    let msg = "✓ Channel settings saved — restarting listener(s) now. \
-                               `/channels` shows the current state."
-                        .to_string();
+                    // The line names what changed. A save that only moved the
+                    // policy still restarts the listeners — they have to run
+                    // under it — but it saved no channel settings.
+                    let msg = match change {
+                        SetupChange::Channels => {
+                            "✓ Channel settings saved — restarting listener(s) now. \
+                             `/channels` shows the current state."
+                                .to_string()
+                        }
+                        _ => "✓ Approval policy saved — restarting listener(s) now so it \
+                              takes effect."
+                            .to_string(),
+                    };
                     let _ = self.context.append_system_message(&msg);
                     self.scrollback_queue.push(("system".to_string(), msg));
                     self.channels_restarted_for_save = true;
@@ -2780,7 +2816,6 @@ impl TuiApp {
         // next provisioner's clone sees this provisioner's writes), so reading
         // "previous" from `self.config` here read the already-swapped value:
         // previous always equalled new, and the restart never fired.
-        let prev_channels = channels_fingerprint(&self.config);
         let prev_channels_count = crate::channels::configured_channel_count(&self.config);
         self.context.provider_key_ok = provider_key_status(&config);
         self.context.approval_boundary = (
@@ -2794,7 +2829,6 @@ impl TuiApp {
             })
             .collect();
         self.context.running_whatsapp_surface = config.channels_config.running_whatsapp_surface();
-        let new_channels = channels_fingerprint(&config);
         let new_channels_count = crate::channels::configured_channel_count(&config);
         self.context.channels_autostart_count = new_channels_count;
         // When the configured channel set changes mid-session (e.g.
@@ -2808,25 +2842,35 @@ impl TuiApp {
         // already restarted for this exact configuration — `reload_config` runs
         // on Esc right after, and restarting twice costs the 409 window twice.
         // One-shot: consumed here so a later reload still restarts.
+        //
+        // A policy change restarts the listeners too — they have to run under
+        // the new policy — but it changed no channel setting, and the line
+        // says so.
         let already_restarted = std::mem::take(&mut self.channels_restarted_for_save);
-        let channels_changed =
-            channels_differ(prev_channels.as_ref(), new_channels.as_ref()) && !already_restarted;
-        if channels_changed {
-            let msg = match new_channels_count.cmp(&prev_channels_count) {
-                // Count-neutral: a token rotation, or a one-for-one swap. The
-                // old detector could not see this case at all.
-                std::cmp::Ordering::Equal => "✓ Channel settings changed — restarting listener(s) \
-                     now. `/channels` shows the current state."
+        let change = setup_change(&self.config, &config);
+        let restart_needed = change != SetupChange::None && !already_restarted;
+        if restart_needed {
+            let msg = match change {
+                SetupChange::Channels => match new_channels_count.cmp(&prev_channels_count) {
+                    // Count-neutral: a token rotation, or a one-for-one swap. The
+                    // old detector could not see this case at all.
+                    std::cmp::Ordering::Equal => {
+                        "✓ Channel settings changed — restarting listener(s) \
+                         now. `/channels` shows the current state."
+                            .to_string()
+                    }
+                    std::cmp::Ordering::Greater => format!(
+                        "✓ {} new channel(s) configured — starting listener(s) now. \
+                         `/channels` shows the current state.",
+                        new_channels_count - prev_channels_count
+                    ),
+                    std::cmp::Ordering::Less => format!(
+                        "✓ {} channel(s) removed — stopping their listener(s) now.",
+                        prev_channels_count - new_channels_count
+                    ),
+                },
+                _ => "✓ Approval policy applied — restarting listener(s) now so it takes effect."
                     .to_string(),
-                std::cmp::Ordering::Greater => format!(
-                    "✓ {} new channel(s) configured — starting listener(s) now. \
-                     `/channels` shows the current state.",
-                    new_channels_count - prev_channels_count
-                ),
-                std::cmp::Ordering::Less => format!(
-                    "✓ {} channel(s) removed — stopping their listener(s) now.",
-                    prev_channels_count - new_channels_count
-                ),
             };
             let _ = self.context.append_system_message(&msg);
             self.scrollback_queue.push(("system".to_string(), msg));
@@ -2844,8 +2888,8 @@ impl TuiApp {
         // model/providers/channels are already refreshed above; skills
         // were the missing surface.
         self.refresh_available_skills();
-        if channels_changed {
-            self.channels_restart_pending = false;
+        if restart_needed {
+            self.pending_setup_change = SetupChange::None;
             self.restart_channels();
         }
         // Push the new config to the agent actor so the next turn uses
@@ -4721,10 +4765,13 @@ impl TuiApp {
     }
 
     fn open_setup_overlay(&mut self, name: String) -> anyhow::Result<()> {
-        use crate::onboard::provision::provisioner_for;
+        use crate::onboard::provision::provisioner_for_with_force;
 
-        let prov =
-            provisioner_for(&name).ok_or_else(|| anyhow::anyhow!("unknown provisioner: {name}"))?;
+        // The session's `--force` intent travels with the provisioner, so a
+        // surface that can only act on an answer (the approvals picker)
+        // knows whether it may replace what is already on disk.
+        let prov = provisioner_for_with_force(&name, self.setup_force)
+            .ok_or_else(|| anyhow::anyhow!("unknown provisioner: {name}"))?;
 
         if prov.category() == crate::onboard::provision::ProvisionerCategory::Channel {
             let catalog_key = crate::channels::catalog_key_for_provisioner(&name);
@@ -6433,7 +6480,7 @@ fn render_approval_pane(
 /// the constructor to use whenever the code under test can touch disk.
 #[cfg(test)]
 pub(super) mod test_support {
-    use super::{AppState, CommandRegistry, TuiApp, INLINE_VIEWPORT_LINES};
+    use super::{AppState, CommandRegistry, SetupChange, TuiApp, INLINE_VIEWPORT_LINES};
     use crate::tui::context::TuiContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -6460,9 +6507,10 @@ pub(super) mod test_support {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
-            channels_restart_pending: false,
+            pending_setup_change: SetupChange::None,
             channels_restarted_for_save: false,
             setup_response_tx: None,
+            setup_force: false,
             scrollback_queue: Vec::new(),
             selection_drag_anchor: None,
             selection_dragged: false,
@@ -8700,6 +8748,75 @@ pub(crate) fn channels_differ(before: Option<&String>, after: Option<&String>) -
     }
 }
 
+/// What a setup save changed, and therefore what the app may claim about it.
+///
+/// A save answers two questions that one fingerprint used to conflate: does a
+/// listener restart need to happen (yes for a channel change AND for a policy
+/// change), and were channels actually configured (only for a channel change).
+/// Answering the second with the first is how a wizard that configured no
+/// channel at all printed "✓ Channels configured".
+///
+/// The variants are ordered by how much they claim, so `max` keeps the
+/// strongest of two changes: `None` < `PolicyOnly` < `Channels`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum SetupChange {
+    /// Nothing a listener cares about changed.
+    #[default]
+    None,
+    /// Only the policy changed: the listeners restart, but no channel was
+    /// configured.
+    PolicyOnly,
+    /// The channel configuration changed: the listeners restart and channels
+    /// were configured.
+    Channels,
+}
+
+/// A comparable fingerprint of the channel configuration alone.
+///
+/// The restart fingerprint above also covers the autonomy policy, because a
+/// policy change must restart the listeners too. That makes it the wrong
+/// instrument for the other question — "were channels actually configured?" —
+/// which this one answers on its own.
+pub(crate) fn channels_only_fingerprint(c: &crate::config::Config) -> Option<String> {
+    serde_json::to_string(&c.channels_config).ok()
+}
+
+/// Whether the channel configuration itself changed.
+///
+/// Unlike the restart fingerprint, an unprovable comparison counts as
+/// *unchanged* here: this answer decides what the app may claim about what it
+/// did, and a claim it cannot prove is a lie.
+fn channels_config_changed(before: &crate::config::Config, after: &crate::config::Config) -> bool {
+    match (
+        channels_only_fingerprint(before),
+        channels_only_fingerprint(after),
+    ) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
+/// What a save changed, in the two terms the app needs.
+///
+/// The restart is owed for anything the restart fingerprint sees — a channel
+/// change or a policy change. The channels claim is made only for a channel
+/// change.
+pub(crate) fn setup_change(
+    before: &crate::config::Config,
+    after: &crate::config::Config,
+) -> SetupChange {
+    let before_fp = channels_fingerprint(before);
+    let after_fp = channels_fingerprint(after);
+    if !channels_differ(before_fp.as_ref(), after_fp.as_ref()) {
+        return SetupChange::None;
+    }
+    if channels_config_changed(before, after) {
+        SetupChange::Channels
+    } else {
+        SetupChange::PolicyOnly
+    }
+}
+
 /// The status-bar label for a config: `provider:model`, the spelling the boot
 /// path (`boot_model_label`) and the wizard save store build. A config that
 /// names no provider labels its model alone; a config that names no model at
@@ -8802,6 +8919,55 @@ async fn restore_resumed_session(agent: &mut Agent, resume_id: &str) {
         }
         Err(e) => tracing::warn!("could not load resumed session {resume_id}: {e}"),
     }
+}
+
+/// Which door the boot opens when no explicit setup topic was given.
+#[derive(Debug, PartialEq, Eq)]
+enum BootDoor {
+    /// Nothing opens: the profile is set up and its agent booted.
+    None,
+    /// The first-run wizard: the profile has no provider credential yet.
+    FirstRunWizard,
+    /// The provider overlay: the profile was set up and its provider broke.
+    ProviderOverlay,
+}
+
+/// Decide which door the TUI boot opens when no explicit `setup <topic>` was
+/// given.
+///
+/// The agent's own build result is the FIRST question, because it is the
+/// only one that knows whether this install can talk to a provider at all:
+///
+/// - The agent built: this install can send, so there is nothing to set up
+///   and no door opens. This must be checked FIRST — an install whose
+///   credential lives in the environment, or whose provider needs no
+///   credential at all (`ollama`, `llamacpp`), stores no key in
+///   `config.toml`, but it is not a fresh install, and opening the wizard
+///   over it would be a regression.
+/// - The agent did not build and this config holds a provider credential:
+///   the profile WAS set up and something about the provider broke. The
+///   provider overlay owns exactly the keys (`default_provider` / `api_key` /
+///   `default_model`) whose current values broke the boot.
+/// - The agent did not build and no credential is stored in this config: the
+///   profile was never set up, so the first-run wizard is the door that sets
+///   it up.
+///
+/// A genuinely fresh install always lands in the last case: `Config::default`
+/// sets no model and `Agent::build` refuses to guess one, so the agent does
+/// not build and the wizard is reachable.
+///
+/// The credential question itself is asked by
+/// [`crate::config::Config::provider_credential_resolves`] — the same rule
+/// the onboarding provider section asks, so the two surfaces cannot drift
+/// apart on it.
+fn boot_door(config: &crate::config::Config, agent_boot_error: Option<&str>) -> BootDoor {
+    if agent_boot_error.is_none() {
+        return BootDoor::None;
+    }
+    if config.provider_credential_resolves() {
+        return BootDoor::ProviderOverlay;
+    }
+    BootDoor::FirstRunWizard
 }
 
 pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
@@ -8988,20 +9154,33 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
             let _ = app.context.append_system_message(&msg);
             app.scrollback_queue.push(("system".to_string(), msg));
         }
-    } else if agent_boot_error.is_some() {
-        // No explicit setup topic and the agent failed to build: open the
-        // provider provisioner directly — it owns exactly the keys
-        // (default_provider / api_key / default_model) whose current values
-        // broke the boot. The first-run-wizard branch below can't catch
-        // this: its condition requires `default_provider` to be unset, and
-        // a failed boot means it IS set (to something unusable).
-        if let Err(e) = app.open_setup_overlay("provider".to_string()) {
-            let msg = format!("Failed to open provider setup: {e}");
-            let _ = app.context.append_system_message(&msg);
-            app.scrollback_queue.push(("system".to_string(), msg));
+    } else {
+        // No explicit setup topic: the boot decides which door opens.
+        // - The agent built: this install can send, so nothing opens. An
+        //   install whose credential lives in the environment, or whose
+        //   provider needs none (ollama, llamacpp), is in this case: it
+        //   holds no key in config.toml, but it is not a fresh install, and
+        //   the wizard over it would be a regression.
+        // - The agent did not build and this config holds a credential: the
+        //   profile WAS set up and the provider broke, so the provider
+        //   overlay opens — it owns exactly the keys (default_provider /
+        //   api_key / default_model) whose current values broke the boot.
+        // - The agent did not build and no credential is stored here: the
+        //   profile was never set up, so the first-run wizard opens — it is
+        //   the door that sets a credential up.
+        match boot_door(&app_config, agent_boot_error.as_deref()) {
+            BootDoor::FirstRunWizard => {
+                app.first_run_wizard = Some(crate::tui::FirstRunWizard::new(profile.clone()));
+            }
+            BootDoor::ProviderOverlay => {
+                if let Err(e) = app.open_setup_overlay("provider".to_string()) {
+                    let msg = format!("Failed to open provider setup: {e}");
+                    let _ = app.context.append_system_message(&msg);
+                    app.scrollback_queue.push(("system".to_string(), msg));
+                }
+            }
+            BootDoor::None => {}
         }
-    } else if app_config.api_key.is_none() && app_config.default_provider.is_none() {
-        app.first_run_wizard = Some(crate::tui::FirstRunWizard::new(profile.clone()));
     }
 
     // Console login gate — when enabled, must be passed before the app is usable.
@@ -9519,6 +9698,230 @@ mod tests {
         );
     }
 
+    // ── What a setup save changed, and what the app says about it ──
+    //
+    // The restart fingerprint covers the autonomy policy as well as the
+    // channel configuration, because a policy change must restart the
+    // listeners too. That made it the wrong instrument for the other
+    // question — "were channels actually configured?" — and the wizard
+    // answered it with the policy's answer: a run that configured no
+    // channel at all printed "✓ Channels configured".
+
+    /// A `TuiApp` whose first-run wizard has reached its last phase.
+    fn app_with_wizard_at_end(ctx: TuiContext, dir: &std::path::Path) -> TuiApp {
+        let mut app = super::test_support::app_with_profile_root(ctx, dir.to_path_buf());
+        let mut wizard = crate::tui::FirstRunWizard::new(crate::profile::Profile {
+            name: "default".to_string(),
+            root: dir.to_path_buf(),
+        });
+        wizard.phase = crate::tui::first_run_wizard::WizardPhase::Complete;
+        app.first_run_wizard = Some(wizard);
+        app
+    }
+
+    /// Write a config to the profile's `config.toml`, the way a provisioner's
+    /// save lands on disk.
+    fn write_config(dir: &std::path::Path, cfg: &crate::config::Config) {
+        let text = toml::to_string_pretty(cfg).expect("serialize the config");
+        std::fs::write(dir.join("config.toml"), text).expect("write the config");
+    }
+
+    /// Hand the app the config a provisioner just saved, the way the
+    /// save-complete branch sees it.
+    fn deliver_saved_config(app: &mut TuiApp, saved: crate::config::Config) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(saved).expect("send the saved config");
+        app.setup_save_complete_rx = Some(rx);
+        app.drain_events();
+    }
+
+    /// The lines the app said, in order.
+    fn said(app: &TuiApp) -> Vec<String> {
+        app.scrollback_queue
+            .iter()
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
+
+    /// The audit drive caught this: the wizard ran the approvals provisioner,
+    /// which writes the autonomy level, and the wizard then said it had
+    /// configured channels. No channel was chosen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wizard_does_not_claim_channels_when_it_saved_only_a_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = app_with_wizard_at_end(ctx, dir.path());
+
+        // The approvals provisioner saved a policy; no channel was configured.
+        let mut saved = app.config.clone();
+        saved.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        write_config(dir.path(), &saved);
+        deliver_saved_config(&mut app, saved);
+
+        // The operator presses Enter to leave the wizard.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("the wizard closes");
+
+        let lines = said(&app);
+        assert!(
+            !lines.iter().any(|l| l.contains("Channels configured")),
+            "the wizard configured no channel; it must not claim one: {lines:?}"
+        );
+    }
+
+    /// The other half of the contract: a wizard that DID configure a channel
+    /// still says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wizard_claims_channels_when_it_saved_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = app_with_wizard_at_end(ctx, dir.path());
+
+        // A channel provisioner saved its section. The section carries no
+        // credential, so the restart starts no listener and the test reaches no
+        // network — what is under test is the claim, not the listener.
+        let mut saved = app.config.clone();
+        saved.channels_config.telegram = Some(
+            serde_json::from_value(serde_json::json!({
+                "bot_token": "",
+                "allowed_users": [],
+            }))
+            .expect("the telegram section"),
+        );
+        write_config(dir.path(), &saved);
+        deliver_saved_config(&mut app, saved);
+
+        // The operator presses Enter to leave the wizard.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("the wizard closes");
+
+        let lines = said(&app);
+        assert!(
+            lines.iter().any(|l| l.contains("Channels configured")),
+            "the wizard configured a channel; it must say so: {lines:?}"
+        );
+    }
+
+    /// A policy change still restarts the listeners: they have to run under
+    /// the new policy, and a policy the listeners ignore is a policy the
+    /// operator saw on screen but that was not enforced.
+    ///
+    /// The restart is asserted through the supervisor it replaces: the app
+    /// held one, and `restart_channels` takes the supervisor it replaces, so
+    /// an app that held one and holds none afterwards restarted. The
+    /// supervisor carries no channel here, so no listener is started and the
+    /// test reaches no network.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_only_change_still_restarts_the_listeners() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = super::test_support::app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        // A listener is running.
+        app.channel_supervisor = Some(ChannelSupervisor {
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            handle: tokio::spawn(async {}),
+        });
+
+        // A save that moved the policy and nothing else.
+        let mut saved = app.config.clone();
+        saved.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        write_config(dir.path(), &saved);
+        deliver_saved_config(&mut app, saved);
+
+        assert!(
+            app.channel_supervisor.is_none(),
+            "a policy change must restart the listeners: they have to run under the new policy"
+        );
+    }
+
+    /// The same save outside the wizard: the line names the policy, not the
+    /// channel settings it never saved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_only_save_does_not_claim_channel_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = super::test_support::app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        let mut saved = app.config.clone();
+        saved.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        write_config(dir.path(), &saved);
+        deliver_saved_config(&mut app, saved);
+
+        let lines = said(&app);
+        assert!(
+            !lines.iter().any(|l| l.contains("Channel settings saved")),
+            "no channel settings were saved; the line must not say they were: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("policy")),
+            "the line must still name what did change: {lines:?}"
+        );
+    }
+
+    /// The third case, and the one that keeps the other two honest: a save
+    /// that changed neither the channels nor the policy has nothing to
+    /// report. Both lines name a change, so a save with no change must
+    /// print no line at all — otherwise the policy line can appear for a
+    /// run that never touched the policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_that_changed_nothing_prints_no_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = super::test_support::app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        // The same config, saved again: a setup run that kept everything.
+        let saved = app.config.clone();
+        write_config(dir.path(), &saved);
+        deliver_saved_config(&mut app, saved);
+
+        let lines = said(&app);
+        assert!(
+            lines.is_empty(),
+            "a save that changed neither the channels nor the policy must \
+             print no line at all: {lines:?}"
+        );
+    }
+
+    /// The two fingerprints answer the two questions separately: the restart
+    /// one moves for a policy change, the channels one does not.
+    #[test]
+    fn a_policy_change_moves_the_restart_fingerprint_but_not_the_channels_one() {
+        let base = crate::config::Config::default();
+        let mut policy = base.clone();
+        policy.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+
+        assert_eq!(
+            channels_only_fingerprint(&base),
+            channels_only_fingerprint(&policy),
+            "the channels fingerprint must not move when only the policy moved"
+        );
+        assert!(
+            channels_differ(
+                channels_fingerprint(&base).as_ref(),
+                channels_fingerprint(&policy).as_ref()
+            ),
+            "the restart fingerprint must still move: the listeners run under the new policy"
+        );
+    }
+
+    /// And the change itself is classified the way the messages read it.
+    #[test]
+    fn setup_change_separates_a_policy_change_from_a_channel_change() {
+        let base = crate::config::Config::default();
+        assert_eq!(setup_change(&base, &base), SetupChange::None);
+
+        let mut policy = base.clone();
+        policy.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        assert_eq!(setup_change(&base, &policy), SetupChange::PolicyOnly);
+
+        let mut channel = base.clone();
+        channel.channels_config.telegram = cfg_with_telegram("123:XYZ").channels_config.telegram;
+        assert_eq!(setup_change(&base, &channel), SetupChange::Channels);
+    }
+
     /// QQ appeared nowhere in this file: configuring it left the count at zero,
     /// the restart returned early, and `/channels` listed it in neither
     /// section.
@@ -9727,6 +10130,79 @@ mod tests {
         c.api_key = Some("   ".into());
         assert_eq!(provider_key_status(&c), Some(false));
     }
+
+    #[test]
+    fn boot_door_opens_the_first_run_wizard_on_a_fresh_install() {
+        // A fresh install names a provider but stores no key, and the agent
+        // cannot even build (no model configured). The wizard is the door
+        // that sets this profile up.
+        let c = crate::config::Config::default();
+        assert_eq!(
+            boot_door(&c, Some("no model configured")),
+            BootDoor::FirstRunWizard,
+        );
+    }
+
+    #[test]
+    fn boot_door_opens_the_provider_overlay_when_a_configured_provider_breaks() {
+        // A profile that WAS set up: a key resolves for its provider, but
+        // that provider fails to build. The provider overlay owns exactly
+        // the keys whose current values broke the boot.
+        let mut c = crate::config::Config::default();
+        c.default_provider = Some("no-such-provider".into());
+        c.api_key = Some("sk-test".into());
+        assert_eq!(
+            boot_door(&c, Some("unknown provider")),
+            BootDoor::ProviderOverlay,
+        );
+    }
+
+    #[test]
+    fn boot_door_opens_nothing_on_a_configured_and_healthy_profile() {
+        let mut c = crate::config::Config::default();
+        c.api_key = Some("sk-test".into());
+        assert_eq!(boot_door(&c, None), BootDoor::None);
+    }
+
+    #[test]
+    fn boot_door_opens_nothing_when_the_credential_lives_in_the_environment() {
+        // The key is in the environment, not in config.toml: this config
+        // stores no credential, but the agent built, so the install can send
+        // and there is nothing to set up. The wizard must not open over it.
+        let mut c = crate::config::Config::default();
+        c.default_provider = Some("openrouter".into());
+        c.default_model = Some("vendor/model".into());
+        assert!(!c.provider_credential_resolves());
+        assert_eq!(boot_door(&c, None), BootDoor::None);
+    }
+
+    #[test]
+    fn boot_door_opens_nothing_for_a_keyless_local_provider() {
+        // `ollama` needs no credential at all: the agent built and the
+        // install can send, so the wizard must not open over it either.
+        let mut c = crate::config::Config::default();
+        c.default_provider = Some("ollama".into());
+        c.default_model = Some("llama3.2".into());
+        assert!(!c.provider_credential_resolves());
+        assert_eq!(boot_door(&c, None), BootDoor::None);
+    }
+
+    #[test]
+    fn boot_door_opens_the_first_run_wizard_when_only_the_environment_holds_the_credential() {
+        // The provider broke and the only credential is in the environment:
+        // this config holds none, so there is nothing here that was "set up"
+        // for the overlay to repair — the wizard is the door that sets a
+        // credential up.
+        let mut c = crate::config::Config::default();
+        c.default_provider = Some("openrouter".into());
+        c.default_model = Some("vendor/model".into());
+        assert!(!c.provider_credential_resolves());
+        assert_eq!(
+            boot_door(&c, Some("provider failed to start")),
+            BootDoor::FirstRunWizard,
+        );
+    }
+
     use crate::sessions::SessionStore;
     use crate::tui::context::TuiContext;
 
@@ -9753,9 +10229,10 @@ mod tests {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
-            channels_restart_pending: false,
+            pending_setup_change: SetupChange::None,
             channels_restarted_for_save: false,
             setup_response_tx: None,
+            setup_force: false,
             scrollback_queue: Vec::new(),
             selection_drag_anchor: None,
             selection_dragged: false,

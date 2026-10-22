@@ -31,15 +31,17 @@ impl SetupSection for ProviderSection {
     }
 
     fn is_already_configured(&self, _profile: &Profile, config: &Config) -> bool {
-        // Configured iff `default_provider` is set AND a credential resolves for
-        // it. Use `resolve_key_for_provider` — the same resolver every consumer
-        // (and `doctor`) reads — so a key configured via the console
-        // (`provider_api_keys`) counts, instead of only the top-level `api_key`.
-        // Reading only `api_key` re-prompted every run and duplicated the key.
-        config
-            .default_provider
-            .as_deref()
-            .is_some_and(|provider| config.resolve_key_for_provider(provider).is_some())
+        // Configured iff `default_provider` is set AND a credential resolves
+        // for it — ONE rule, shared with the TUI boot branch
+        // (`Config::provider_credential_resolves`), so setup and boot cannot
+        // disagree on the CREDENTIAL question. Setup has nothing else to go
+        // on: unlike the TUI boot, it cannot see whether the provider
+        // actually works.
+        //
+        // The resolver counts a key configured via the console
+        // (`provider_api_keys`), not only the top-level `api_key`. Reading
+        // only `api_key` re-prompted every run and duplicated the key.
+        config.provider_credential_resolves()
     }
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
@@ -135,5 +137,52 @@ mod tests {
             s.is_already_configured(&dummy_profile, &cfg),
             "a provider_api_keys entry must count as configured (no re-prompt)"
         );
+    }
+
+    /// The section and the shared rule must answer the same question. They
+    /// used to be two copies of the same logic, one in this section and one
+    /// in the TUI boot branch; the branch's copy was dead (it required
+    /// `default_provider` to be unset, which `Config::default` never is),
+    /// so a fresh install never reached the wizard. One rule, one answer.
+    #[test]
+    fn already_configured_agrees_with_the_shared_credential_rule() {
+        let s = ProviderSection;
+        let dummy_profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp/_rt_test"),
+        };
+
+        // Fresh install: a provider is named, no key is stored.
+        let fresh = Config::default();
+        // A key in the per-provider store only (what the console writes).
+        let mut console_key = Config::default();
+        console_key.api_key = None;
+        console_key
+            .provider_api_keys
+            .insert("openrouter".into(), "sk-console".into());
+        // A key in the top-level slot only.
+        let mut top_level_key = Config::default();
+        top_level_key.api_key = Some("sk-test".into());
+        // A provider, but no key anywhere.
+        let mut keyless = Config::default();
+        keyless.default_provider = Some("openrouter".into());
+        // No provider at all.
+        let mut no_provider = Config::default();
+        no_provider.default_provider = None;
+        no_provider.api_key = Some("sk-test".into());
+
+        for (label, cfg) in [
+            ("fresh", &fresh),
+            ("console key", &console_key),
+            ("top-level key", &top_level_key),
+            ("keyless", &keyless),
+            ("no provider", &no_provider),
+        ] {
+            assert_eq!(
+                s.is_already_configured(&dummy_profile, cfg),
+                cfg.provider_credential_resolves(),
+                "the provider section and the shared rule disagree on a {label} profile",
+            );
+        }
     }
 }

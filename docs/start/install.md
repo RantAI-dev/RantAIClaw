@@ -26,6 +26,9 @@ rantaiclaw --version
 rantaiclaw chat
 ```
 
+On a profile that was never set up, that first `rantaiclaw chat` opens the
+first-run wizard — see [What a fresh install sees](#what-a-fresh-install-sees).
+
 ---
 
 ## Supported pre-built targets
@@ -78,6 +81,15 @@ rantaiclaw setup --force        # re-walk every section
 rantaiclaw setup                # only sections not yet configured
 rantaiclaw setup provider       # one section
 ```
+
+### What a fresh install sees
+
+`rantaiclaw chat` — and `rantaiclaw` with no subcommand — decides what to open
+before the chat appears:
+
+- **The agent could not be built and the config stores no provider credential** — a fresh install, or a profile whose provider was never set up — opens the **first-run wizard**: provider, approvals, login, persona, skills, then channels and integrations.
+- **The agent could not be built and the config stores a provider credential** — the profile was set up and its provider broke — so the **provider setup** surface opens, the one that repairs `default_provider`, the key and the model.
+- **The agent built** — the install can send — so neither opens and the chat starts.
 
 ### Legacy: --onboard (pre-v0.6.52 flow)
 
