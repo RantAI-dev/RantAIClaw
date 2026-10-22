@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticate. Rolling back means reverting, then re-entering any route key saved in between.
   Channel and tunnel tokens are still plaintext and are not part of this change.
 - A ClawHub skill file listed in the version manifest without a `sha256` (for example a script or `SKILL.toml`) was installed unverified: only the literal `SKILL.md` had to carry a hash, and every other entry was verified only when one happened to be present. Installs and updates now validate the whole manifest before fetching anything and refuse a version that lists any file without a valid 64-hex hash, naming the file; `skills update` keeps the installed version. Skills already installed are not re-verified, changed or removed.
+- The `ssh` tool checked the server key against `ssh_known_hosts.json` and failed open: a store that
+  could not be read or parsed was treated as an empty store, so the connection ran with the server
+  key unverified, and the store was then rewritten with that one entry, dropping every host pinned
+  before; a write that failed was ignored, so the host stayed unpinned while the connection ran.
+  The check now fails closed: an unreadable, unparseable or unwritable store refuses the
+  connection, and the store is written atomically through a temporary file that is renamed over the
+  target, so it can no longer be left half-written. A changed server key is now reported as a
+  changed key with the stored and the presented fingerprint, where the connection used to fail with
+  `Unknown server key`. A host already on record with the same key is unaffected: the store is not
+  rewritten and its permissions are not changed. Operator cost: a store that is already corrupt or
+  unwritable is now refused where the connection previously went through, and the message names
+  the file and how to repair it.
 
 ### Added
 
