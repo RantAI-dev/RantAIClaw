@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::skills::SkillTool;
+use crate::skills::{Skill, SkillTool};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -23,8 +23,11 @@ pub struct SkillToolAdapter {
     prefixed_name: String,
     /// Original skill tool definition.
     tool: SkillTool,
-    /// Name of the parent skill (for logging/description).
-    skill_name: String,
+    /// The skill that owns this tool. Kept whole rather than as a
+    /// precomputed list of directories: the directories are resolved per
+    /// call, so a binary a recipe installed during this session is found by
+    /// the very next call.
+    skill: Arc<Skill>,
     /// Policy every shell skill's command is checked against before it runs.
     /// A skill's stored command runs without a shell, so the credential
     /// directory check reads its argv directly.
@@ -58,12 +61,12 @@ fn sanitize_name_part(part: &str) -> String {
 }
 
 impl SkillToolAdapter {
-    pub fn new(skill_name: &str, tool: SkillTool, security: Arc<SecurityPolicy>) -> Self {
-        let prefixed_name = skill_tool_name(skill_name, &tool.name);
+    pub fn new(skill: Arc<Skill>, tool: SkillTool, security: Arc<SecurityPolicy>) -> Self {
+        let prefixed_name = skill_tool_name(&skill.name, &tool.name);
         Self {
             prefixed_name,
             tool,
-            skill_name: skill_name.to_string(),
+            skill,
             security,
         }
     }
@@ -171,6 +174,16 @@ impl SkillToolAdapter {
         if !extra_args.is_empty() {
             cmd.arg(extra_args);
         }
+
+        // The skill's own tools directory comes first on this child's `PATH`,
+        // so a binary the skill's install recipe placed is found by name, and
+        // a same-named binary on the parent's `PATH` cannot shadow it. Only
+        // this child sees it: the process-wide `PATH` is never changed, and
+        // no other skill's directory is included.
+        cmd.env(
+            "PATH",
+            crate::skills::tools_dir::skill_path_env(&self.skill),
+        );
 
         let result =
             tokio::time::timeout(Duration::from_secs(SKILL_TOOL_TIMEOUT_SECS), cmd.output()).await;
@@ -299,6 +312,9 @@ pub fn skill_tools_from_skills(
     // The skill that owns each adapter name, so a collision can name both.
     let mut owners: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for skill in skills {
+        // One copy per skill: every tool of that skill shares it, and the
+        // adapter resolves the skill's tools directories per call.
+        let skill = Arc::new(skill.clone());
         for tool in &skill.tools {
             let name = skill_tool_name(&skill.name, &tool.name);
             if let Some(first_skill) = owners.get(&name) {
@@ -312,7 +328,7 @@ pub fn skill_tools_from_skills(
             }
             owners.insert(name, skill.name.clone());
             tools.push(Box::new(SkillToolAdapter::new(
-                &skill.name,
+                Arc::clone(&skill),
                 tool.clone(),
                 Arc::clone(security),
             )));
@@ -330,6 +346,165 @@ mod tests {
         Arc::new(SecurityPolicy::default())
     }
 
+    /// A skill with no tools of its own, used as the owner of an adapter
+    /// under test.
+    fn skill_stub(name: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: "A skill".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+            requires: crate::skills::SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: false,
+            origin: None,
+        }
+    }
+
+    /// The same skill, shared. An adapter keeps the skill it belongs to, so
+    /// it can resolve that skill's own tools directories per call.
+    fn owning_skill(name: &str) -> Arc<Skill> {
+        Arc::new(skill_stub(name))
+    }
+
+    /// Write an executable file, creating the directories above it.
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create dir");
+        }
+        std::fs::write(path, body).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// The directory a skill's own tools live in, under the given data home.
+    #[cfg(unix)]
+    fn tools_dir(data: &std::path::Path, skill_name: &str) -> std::path::PathBuf {
+        data.join("rantaiclaw").join("tools").join(skill_name)
+    }
+
+    /// A shell-kind tool that runs `command`.
+    #[cfg(unix)]
+    fn shell_tool(command: &str) -> SkillTool {
+        SkillTool {
+            name: "run".to_string(),
+            description: "Run a command".to_string(),
+            kind: "shell".to_string(),
+            command: command.to_string(),
+            args: HashMap::new(),
+        }
+    }
+
+    /// A binary a skill's recipe installed is in the skill's own tools
+    /// directory, which is not on the process `PATH`. The skill's own tool
+    /// still finds it, by name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_tool_runs_a_binary_from_its_own_tools_directory() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let data = tempfile::tempdir().expect("temp dir");
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
+        write_executable(
+            &tools_dir(data.path(), "runner-skill").join("own-tool-bin"),
+            "#!/bin/sh\necho own-tool-ran\n",
+        );
+
+        let adapter = SkillToolAdapter::new(
+            owning_skill("runner-skill"),
+            shell_tool("own-tool-bin"),
+            test_security(),
+        );
+        let result = adapter.execute(json!({})).await.unwrap();
+        assert!(
+            result.success,
+            "the skill's own binary must run: {result:?}"
+        );
+        assert!(
+            result.output.contains("own-tool-ran"),
+            "the skill's own binary must be the one that ran: {result:?}"
+        );
+    }
+
+    /// A skill reaches its own tools directory and nothing else: another
+    /// skill's binary is out of reach.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_tool_cannot_run_another_skills_binary() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let data = tempfile::tempdir().expect("temp dir");
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
+        write_executable(
+            &tools_dir(data.path(), "other-skill").join("other-tool-bin"),
+            "#!/bin/sh\necho other-tool-ran\n",
+        );
+
+        let adapter = SkillToolAdapter::new(
+            owning_skill("runner-skill"),
+            shell_tool("other-tool-bin"),
+            test_security(),
+        );
+        let result = adapter.execute(json!({})).await.unwrap();
+        assert!(
+            !result.success,
+            "a skill must not reach another skill's tools directory: {result:?}"
+        );
+        assert!(
+            !result.output.contains("other-tool-ran"),
+            "another skill's binary must not have run: {result:?}"
+        );
+    }
+
+    /// The skill's own binary wins over a same-named binary on the parent's
+    /// `PATH`: the skill's directories are prepended, not appended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_skills_own_binary_wins_over_a_same_named_binary_on_the_path() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let data = tempfile::tempdir().expect("temp dir");
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
+
+        // A binary with the same name on the parent's PATH.
+        let path_dir = tempfile::tempdir().expect("temp dir");
+        write_executable(
+            &path_dir.path().join("shared-tool-bin"),
+            "#!/bin/sh\necho path-copy\n",
+        );
+        let mut entries = vec![path_dir.path().to_path_buf()];
+        entries.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let _path = crate::test_env::EnvGuard::set(
+            "PATH",
+            std::env::join_paths(entries).expect("join paths"),
+        );
+
+        write_executable(
+            &tools_dir(data.path(), "runner-skill").join("shared-tool-bin"),
+            "#!/bin/sh\necho skill-copy\n",
+        );
+
+        let adapter = SkillToolAdapter::new(
+            owning_skill("runner-skill"),
+            shell_tool("shared-tool-bin"),
+            test_security(),
+        );
+        let result = adapter.execute(json!({})).await.unwrap();
+        assert!(result.success, "the binary must run: {result:?}");
+        assert!(
+            result.output.contains("skill-copy"),
+            "the skill's own binary must win over the one on the PATH: {result:?}"
+        );
+        assert!(
+            !result.output.contains("path-copy"),
+            "the PATH copy must not have run: {result:?}"
+        );
+    }
+
     #[test]
     fn skill_tool_name_prefixed() {
         let st = SkillTool {
@@ -339,7 +514,7 @@ mod tests {
             command: "curl wttr.in".to_string(),
             args: HashMap::new(),
         };
-        let adapter = SkillToolAdapter::new("weather-skill", st, test_security());
+        let adapter = SkillToolAdapter::new(owning_skill("weather-skill"), st, test_security());
         assert_eq!(adapter.name(), "skill_weather_skill_get_weather");
     }
 
@@ -352,7 +527,7 @@ mod tests {
             command: "echo hi".to_string(),
             args: HashMap::new(),
         };
-        let adapter = SkillToolAdapter::new("test", st, test_security());
+        let adapter = SkillToolAdapter::new(owning_skill("test"), st, test_security());
         let schema = adapter.parameters_schema();
         assert!(schema.get("properties").unwrap().get("args").is_some());
     }
@@ -366,7 +541,7 @@ mod tests {
             command: "echo hello".to_string(),
             args: HashMap::new(),
         };
-        let adapter = SkillToolAdapter::new("test", st, test_security());
+        let adapter = SkillToolAdapter::new(owning_skill("test"), st, test_security());
         let result = adapter.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello"));
@@ -386,7 +561,7 @@ mod tests {
         };
         let policy =
             Arc::new(SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::Full));
-        let adapter = SkillToolAdapter::new("test", st, policy);
+        let adapter = SkillToolAdapter::new(owning_skill("test"), st, policy);
         let result = adapter.execute(json!({})).await.unwrap();
         assert!(
             !result.success,
@@ -438,26 +613,15 @@ mod tests {
 
     /// A skill with one `[[tools]]` entry.
     fn skill(name: &str, tool_name: &str) -> crate::skills::Skill {
-        crate::skills::Skill {
-            name: name.to_string(),
-            description: "A skill".to_string(),
-            version: "1.0.0".to_string(),
-            author: None,
-            tags: vec![],
-            tools: vec![SkillTool {
-                name: tool_name.to_string(),
-                description: "Run something".to_string(),
-                kind: "shell".to_string(),
-                command: "echo hello".to_string(),
-                args: HashMap::new(),
-            }],
-            prompts: vec![],
-            location: None,
-            requires: crate::skills::SkillRequires::default(),
-            install_recipes: Vec::new(),
-            remote: false,
-            origin: None,
-        }
+        let mut skill = skill_stub(name);
+        skill.tools = vec![SkillTool {
+            name: tool_name.to_string(),
+            description: "Run something".to_string(),
+            kind: "shell".to_string(),
+            command: "echo hello".to_string(),
+            args: HashMap::new(),
+        }];
+        skill
     }
 
     /// The WARN lines emitted while `run` executes. A scoped subscriber, so
@@ -545,7 +709,7 @@ mod tests {
     #[test]
     fn a_skill_tool_is_not_declared_read_only() {
         let adapter = SkillToolAdapter::new(
-            "greeter",
+            owning_skill("greeter"),
             SkillTool {
                 name: "greet".to_string(),
                 description: "Greet".to_string(),

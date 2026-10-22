@@ -224,7 +224,7 @@ pub(crate) fn build_skill_items(
             }
             let has_missing_bin = s
                 .requires
-                .unmet()
+                .unmet(s)
                 .iter()
                 .any(|reason| reason.starts_with("missing binary"));
             if has_missing_bin && !s.install_recipes.is_empty() {
