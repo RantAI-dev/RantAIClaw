@@ -199,6 +199,7 @@ mod tests {
                 config: &mut config,
                 interactive: false,
                 force: false,
+                blocked: Vec::new(),
             };
             ApprovalsSection.run(&mut ctx).unwrap();
 
@@ -223,6 +224,7 @@ mod tests {
                 config: &mut config,
                 interactive: false,
                 force: false,
+                blocked: Vec::new(),
             };
             ApprovalsSection.run(&mut ctx).unwrap();
 
@@ -251,6 +253,7 @@ mod tests {
                 config: &mut config,
                 interactive: false,
                 force: false,
+                blocked: Vec::new(),
             };
             ApprovalsSection.run(&mut ctx).unwrap();
 
@@ -279,6 +282,7 @@ mod tests {
                 config: &mut config,
                 interactive: false, // headless → Smart default
                 force: true,
+                blocked: Vec::new(),
             };
             ApprovalsSection.run(&mut ctx).unwrap();
 

@@ -5,7 +5,10 @@
 //! On `run`:
 //!   * if interactive — confirm enablement, then capture username + a
 //!     double-entered password (argon2-hashed);
-//!   * if headless — no-op (the wizard's final `config.save()` still runs).
+//!   * if headless — record the section as blocked, with its
+//!     `headless_hint()`, and configure nothing (the wizard's final
+//!     `config.save()` still runs). The orchestrator prints the hint and
+//!     the run exits non-zero.
 //!
 //! This section never calls `config.save()` — the orchestrator persists once at
 //! the end of the run. Declining (or a prior credential + "no") clears the
@@ -44,6 +47,7 @@ impl SetupSection for LoginSection {
         use dialoguer::{Confirm, Input, Password, Select};
 
         if !ctx.interactive {
+            ctx.record_blocked(self.name(), self.headless_hint());
             return Ok(());
         }
         let theme = ColorfulTheme::default();

@@ -8,9 +8,12 @@
 //! that helper is large, well-tested, and not worth duplicating during the
 //! orchestrator rewrite.
 //!
-//! Headless behavior: emit `headless_hint()` and bail. Quick-setup
-//! callers (`rantaiclaw onboard --api-key ... --provider ...`) keep going
-//! through `run_quick_setup` rather than this section.
+//! Headless behavior: record the section as blocked, with its
+//! `headless_hint()`, and bail. The orchestrator prints the hint once, in
+//! the run's summary, and the command exits non-zero because this section
+//! configured nothing. Quick-setup callers (`rantaiclaw onboard --api-key
+//! ... --provider ...`) keep going through `run_quick_setup` rather than
+//! this section.
 
 use anyhow::Result;
 
@@ -46,7 +49,7 @@ impl SetupSection for ProviderSection {
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
         if !ctx.interactive {
-            eprintln!("{}", self.headless_hint());
+            ctx.record_blocked(self.name(), self.headless_hint());
             return Ok(());
         }
 
