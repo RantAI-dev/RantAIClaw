@@ -99,7 +99,7 @@ ask which configured channel to deliver to — do not imply a message will arriv
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some(crate::cron::CRON_DISABLED_MESSAGE.to_string()),
             });
         }
 
@@ -438,6 +438,36 @@ mod tests {
         assert_eq!(
             a.schedule,
             crate::cron::Schedule::Every { every_ms: 600_000 }
+        );
+    }
+
+    /// The cron feature switch closes this door: the tool refuses with the
+    /// same words every other cron door uses, and writes nothing.
+    #[tokio::test]
+    async fn errors_when_cron_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        cfg.cron.enabled = false;
+        let tool = CronAddTool::new(Arc::new(cfg.clone()), test_security(&cfg));
+
+        let result = execute_under_all_view(
+            &tool,
+            json!({
+                "schedule": { "kind": "every", "every_ms": 600_000 },
+                "job_type": "shell",
+                "command": "echo ok"
+            }),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.unwrap_or_default(),
+            crate::cron::CRON_DISABLED_MESSAGE
+        );
+        assert!(
+            cron::list_jobs(&cfg).unwrap().is_empty(),
+            "a refused add must persist nothing"
         );
     }
 

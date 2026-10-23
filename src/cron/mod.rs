@@ -20,6 +20,38 @@ pub use store::{
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
+/// The scheduler's own write path. These two are the writes the scheduler
+/// makes after a job fires (a one-shot deletes itself, a one-shot that stays
+/// is disabled). They are bookkeeping, not operator doors, so they are
+/// exempt from the `cron.enabled` gate — see [`store::update_job_ungated`].
+pub(crate) use store::{remove_job_by_scheduler, update_job_by_scheduler};
+
+/// The refusal every cron door gives when the feature switch is off.
+///
+/// One constant, so the CLI, the HTTP API, the agent tools, the TUI and the
+/// store itself all say the same thing.
+pub const CRON_DISABLED_MESSAGE: &str = "cron is disabled by config (cron.enabled=false)";
+
+/// How many characters of a job id every surface prints.
+pub const CRON_DISPLAY_ID_LEN: usize = 8;
+
+/// The shortest id prefix that may name a job.
+///
+/// It matches [`CRON_DISPLAY_ID_LEN`] on purpose: the id every surface prints
+/// must resolve, and a shorter prefix is refused rather than guessed at — a
+/// mistyped delete is worse than a refusal.
+pub const MIN_JOB_ID_PREFIX_LEN: usize = CRON_DISPLAY_ID_LEN;
+
+/// The job id as every surface prints it: the first [`CRON_DISPLAY_ID_LEN`]
+/// characters of the full id.
+///
+/// The resolver accepts this text back, so an operator can copy the id out of
+/// `cron list` and paste it into `run`, `pause`, `resume`, `update` or
+/// `remove`.
+pub fn cron_display_id(job: &CronJob) -> String {
+    job.id.chars().take(CRON_DISPLAY_ID_LEN).collect()
+}
+
 /// If a shell `command` would be refused by the scheduler's fire-time gate
 /// (allowlist + risk classification, no approval), return the human reason;
 /// `None` means it will run on schedule. **Advisory only** — callers must NOT
@@ -48,7 +80,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             | crate::CronCommands::Run { .. }
     );
     if mutating && !config.cron.enabled {
-        bail!("cron is disabled by config (cron.enabled=false)");
+        bail!("{}", CRON_DISABLED_MESSAGE);
     }
     match command {
         crate::CronCommands::List => {
@@ -71,11 +103,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
 
             crate::cli_style::section(&format!("scheduled jobs ({})", jobs.len()));
             for job in jobs {
+                let short = cron_display_id(&job);
                 let last_run = job
                     .last_run
                     .map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
-                let short = &job.id[..job.id.len().min(8)];
                 println!(
                     "  {} {short}  {}",
                     crate::cli_style::dot(job.enabled),
@@ -696,6 +728,107 @@ mod tests {
         // Reads stay open even when cron is disabled, so an operator can inspect
         // dormant jobs.
         handle_command(crate::CronCommands::List, &config).unwrap();
+    }
+
+    /// Every mutating CLI command refuses with the same words while the cron
+    /// feature switch is off — and nothing is written.
+    #[test]
+    fn every_mutating_cli_command_is_refused_when_cron_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo ok");
+        config.cron.enabled = false;
+
+        let commands = vec![
+            crate::CronCommands::Add {
+                expression: "0 9 * * *".into(),
+                tz: None,
+                command: "echo hi".into(),
+                agent: false,
+                model: None,
+            },
+            crate::CronCommands::AddAt {
+                at: "2030-01-01T00:00:00Z".into(),
+                command: "echo hi".into(),
+                agent: false,
+                model: None,
+            },
+            crate::CronCommands::AddEvery {
+                every_ms: 600_000,
+                command: "echo hi".into(),
+                agent: false,
+                model: None,
+            },
+            crate::CronCommands::Once {
+                delay: "10m".into(),
+                command: "echo hi".into(),
+                agent: false,
+                model: None,
+            },
+            crate::CronCommands::Update {
+                id: job.id.clone(),
+                expression: None,
+                tz: None,
+                command: Some("echo updated".into()),
+                name: None,
+            },
+            crate::CronCommands::Remove { id: job.id.clone() },
+            crate::CronCommands::Pause { id: job.id.clone() },
+            crate::CronCommands::Resume { id: job.id.clone() },
+            crate::CronCommands::Run { id: job.id.clone() },
+        ];
+        for command in commands {
+            let err = handle_command(command, &config).unwrap_err();
+            assert_eq!(err.to_string(), CRON_DISABLED_MESSAGE);
+        }
+
+        // The job is untouched: nothing was added, edited, paused or removed.
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job.id);
+        assert!(jobs[0].enabled);
+        assert_eq!(jobs[0].command, "echo ok");
+    }
+
+    /// The id `cron list` prints must be usable: an operator copies it out of
+    /// the list and passes it back to run, pause, resume, update and remove.
+    /// This is the test that would have caught the defect.
+    #[tokio::test]
+    async fn the_id_cron_list_prints_resolves_for_every_mutating_command() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo roundtrip");
+        let other = make_job(&config, "*/6 * * * *", None, "echo other");
+
+        // The exact text `cron list` prints for this job.
+        let printed = cron_display_id(&job);
+        assert_eq!(printed.len(), 8, "the printed id is eight characters");
+
+        // run
+        let report = run_job_report(&config, &printed).await.unwrap();
+        assert!(report.contains(&printed), "{report}");
+        assert_eq!(list_runs(&config, &job.id, 10).unwrap().len(), 1);
+
+        // pause
+        pause_job(&config, &printed).unwrap();
+        assert!(!get_job(&config, &job.id).unwrap().enabled);
+
+        // resume
+        resume_job(&config, &printed).unwrap();
+        assert!(get_job(&config, &job.id).unwrap().enabled);
+
+        // update
+        run_update(&config, &printed, None, None, Some("echo updated"), None).unwrap();
+        assert_eq!(get_job(&config, &job.id).unwrap().command, "echo updated");
+
+        // remove
+        remove_job(&config, &printed).unwrap();
+        assert!(get_job(&config, &job.id).is_err());
+
+        // The other job is untouched.
+        let untouched = get_job(&config, &other.id).unwrap();
+        assert_eq!(untouched.command, "echo other");
+        assert!(untouched.enabled);
     }
 
     #[tokio::test]

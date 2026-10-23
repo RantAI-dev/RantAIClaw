@@ -4065,7 +4065,7 @@ impl TuiApp {
         }
         Some(
             InfoPanel::new("Cron Job")
-                .with_subtitle(&job_id[..job_id.len().min(8)])
+                .with_subtitle(crate::cron::cron_display_id(&job))
                 .with_footer("[r] run · [p] pause/resume · [d] delete · Esc close")
                 .with_cron_actions(job_id)
                 .section(detail)
@@ -4074,10 +4074,20 @@ impl TuiApp {
     }
 
     /// Handle a cron detail-panel action-key (run / pause-resume / delete).
+    ///
+    /// The wrapper loads the config from disk; the work is in
+    /// [`Self::cron_panel_action_with_config`], so the gate can be tested
+    /// without a config file.
     fn cron_panel_action(&mut self, action: char) {
-        let Some(id) = self.info_panel.as_ref().and_then(|p| p.cron_job_id.clone()) else {
+        // No cron panel, no action: nothing is loaded and nothing is printed.
+        if self
+            .info_panel
+            .as_ref()
+            .and_then(|p| p.cron_job_id.as_ref())
+            .is_none()
+        {
             return;
-        };
+        }
         let config = match Self::load_config_for_cron() {
             Ok(c) => c,
             Err(e) => {
@@ -4085,12 +4095,28 @@ impl TuiApp {
                 return;
             }
         };
+        self.cron_panel_action_with_config(action, &config);
+    }
+
+    /// The action-key handler, with the config handed in.
+    ///
+    /// Every one of these keys writes (a run records history, a pause/resume
+    /// edits the job, a delete removes it), so the cron feature switch closes
+    /// them — with the same words every other door uses.
+    fn cron_panel_action_with_config(&mut self, action: char, config: &crate::config::Config) {
+        let Some(id) = self.info_panel.as_ref().and_then(|p| p.cron_job_id.clone()) else {
+            return;
+        };
+        if !config.cron.enabled {
+            self.cron_system_msg(&format!("✗ {}", crate::cron::CRON_DISABLED_MESSAGE));
+            return;
+        }
         match action {
             'r' => {
                 // Run DETACHED — a shell job (up to 120s) or agent job (up to
                 // 600s) must NOT block the render loop. `run_job_manual` records
                 // to run history; the user reopens the job to see the result.
-                let job = match crate::cron::get_job(&config, &id) {
+                let job = match crate::cron::get_job(config, &id) {
                     Ok(j) => j,
                     Err(e) => {
                         self.cron_system_msg(&format!("✗ {e}"));
@@ -4110,18 +4136,18 @@ impl TuiApp {
                 ));
             }
             'p' => {
-                let enabled = crate::cron::get_job(&config, &id).is_ok_and(|j| j.enabled);
+                let enabled = crate::cron::get_job(config, &id).is_ok_and(|j| j.enabled);
                 let r = if enabled {
-                    crate::cron::pause_job(&config, &id)
+                    crate::cron::pause_job(config, &id)
                 } else {
-                    crate::cron::resume_job(&config, &id)
+                    crate::cron::resume_job(config, &id)
                 };
                 match r {
-                    Ok(_) => self.info_panel = Self::build_cron_detail_panel(&config, &id),
+                    Ok(_) => self.info_panel = Self::build_cron_detail_panel(config, &id),
                     Err(e) => self.cron_system_msg(&format!("✗ {e}")),
                 }
             }
-            'd' => match crate::cron::remove_job(&config, &id) {
+            'd' => match crate::cron::remove_job(config, &id) {
                 Ok(()) => {
                     self.info_panel = None;
                     self.cron_system_msg(&format!("🗑 Removed cron job {id}"));
@@ -11474,6 +11500,60 @@ mod tests {
             hint.contains("Manual preset"),
             "a profile with a preset names it:\n{hint}"
         );
+    }
+
+    /// The cron detail panel's action keys are write doors: run, pause/resume
+    /// and delete. With the cron feature switch off they must refuse with the
+    /// same words every other door uses — and change nothing.
+    #[tokio::test]
+    async fn the_cron_panel_action_keys_refuse_when_cron_is_disabled() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let mut config = crate::config::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..crate::config::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let job = crate::cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        config.cron.enabled = false;
+
+        for action in ['r', 'p', 'd'] {
+            let store = SessionStore::in_memory().expect("store");
+            let mut app = make_app_from_store(store, "test-model");
+            app.info_panel = TuiApp::build_cron_detail_panel(&config, &job.id);
+            assert!(
+                app.info_panel.is_some(),
+                "the detail panel must be open for the {action} key"
+            );
+
+            app.cron_panel_action_with_config(action, &config);
+
+            let said: Vec<String> = app
+                .scrollback_queue
+                .iter()
+                .map(|(_, m)| m.clone())
+                .collect();
+            assert!(
+                said.iter()
+                    .any(|m| m.contains(crate::cron::CRON_DISABLED_MESSAGE)),
+                "the {action} key must refuse: {said:?}"
+            );
+
+            // Nothing ran, nothing was paused, nothing was deleted.
+            let stored = crate::cron::get_job(&config, &job.id).unwrap();
+            assert!(stored.enabled, "the {action} key must not pause the job");
+            assert!(
+                crate::cron::list_runs(&config, &job.id, 10)
+                    .unwrap()
+                    .is_empty(),
+                "the {action} key must not run the job"
+            );
+            assert_eq!(
+                crate::cron::list_jobs(&config).unwrap().len(),
+                1,
+                "the {action} key must not delete the job"
+            );
+        }
     }
 }
 

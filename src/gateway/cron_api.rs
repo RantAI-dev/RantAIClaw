@@ -118,7 +118,7 @@ fn ensure_cron_enabled(cfg: &crate::config::Config) -> Result<(), ApiError> {
     if cfg.cron.enabled {
         Ok(())
     } else {
-        Err(err_409("cron is disabled by config (cron.enabled=false)"))
+        Err(err_409(crate::cron::CRON_DISABLED_MESSAGE))
     }
 }
 
@@ -201,7 +201,10 @@ async fn list_cron_runs(
     let runs = tokio::task::spawn_blocking(move || cron::list_runs(&cfg, &id, q.limit))
         .await
         .map_err(err_500)?
-        .map_err(err_500)?;
+        // An id that names no job has no history (an empty list, HTTP 200). An
+        // id that names several jobs is refused, and it is the caller's
+        // mistake, not a server fault: 400, not 500.
+        .map_err(map_store_error)?;
     let count = runs.len();
     Ok(Json(json!({ "runs": runs, "count": count })))
 }
@@ -451,8 +454,9 @@ async fn delete_cron(
         .map_err(err_500)?;
     match result {
         Ok(()) => Ok(Json(json!({ "id": id, "deleted": true }))),
-        Err(e) if e.to_string().contains("not found") => Err(err_404(e.to_string())),
-        Err(e) => Err(err_500(e)),
+        // A missing job is a 404; a refused id (too short, or ambiguous) is the
+        // caller's mistake, so it is a 400 — not a 500.
+        Err(e) => Err(map_store_error(e)),
     }
 }
 

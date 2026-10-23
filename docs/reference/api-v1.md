@@ -1415,7 +1415,9 @@ configured, and while another pairing is in flight.
 
 - **Response** `200`: `{ "jobs": [...], "count": 2, "cron_enabled": true, "scheduler_enabled": true }`
   The two booleans are separate on purpose: jobs can exist while nothing runs them.
-- **Status codes**: `200`, `401`.
+- Reads stay open when `[cron].enabled = false` — the listing still answers, and
+  `cron_enabled` reports the switch as off.
+- **Status codes**: `200`, `401`, `500`.
 
 ### POST /api/v1/cron
 
@@ -1423,26 +1425,46 @@ configured, and while another pairing is in flight.
 - **`403` when `approval_owners` is configured**: agent cron jobs cannot be created over HTTP
   in that case, and must come from an owner channel or the CLI. This is deliberate — an HTTP
   caller is not an identified owner.
-- **Status codes**: `200`, `400`, `401`, `403`, `500`.
+- **`409` when `[cron].enabled = false`**: `{ "error": "cron_disabled", "detail": "cron is
+  disabled by config (cron.enabled=false)" }`. Every mutating cron route refuses the same way.
+- **Status codes**: `200`, `400`, `401`, `403`, `409`, `500`.
 
 ### PUT / DELETE /api/v1/cron/{id}
 
 - **PUT** updates a job and returns the updated job. A `command` job whose command the
   security policy rejects fails `400` with `command blocked by security policy: <cmd>`.
 - **DELETE response** `200`: `{ "id": "...", "deleted": true }`
-- **Status codes**: `200`, `400`, `401`, `404`, `500`.
+- **`409` when `[cron].enabled = false`**: `{ "error": "cron_disabled", "detail": "cron is
+  disabled by config (cron.enabled=false)" }`.
+- The `{id}` is the full job id or a prefix of it (at least 8 characters — the length
+  `cron list` prints). A prefix that names several jobs fails `400`
+  (`Ambiguous cron job id '<id>': matches N jobs — ...`); an id shorter than 8 characters
+  that is not a full id fails `400` (`Cron job id '<id>' is too short: a prefix must be at
+  least 8 characters`); an id that names no job fails `404` (`Cron job '<id>' not found`).
+- **Status codes**: `200`, `400` (ambiguous or too short an id), `401`, `404` (no such job),
+  `409`, `500`.
 
 ### POST /api/v1/cron/{id}/run
 
 - Runs a job immediately.
 - **Response** `200`: `{ "id": "...", "success": true, "output": "..." }`
-- **Status codes**: `200`, `401`, `404`, `500`.
+- **`409` when `[cron].enabled = false`**: `{ "error": "cron_disabled", "detail": "cron is
+  disabled by config (cron.enabled=false)" }`.
+- The `{id}` is the full job id or a prefix of it (at least 8 characters): an ambiguous
+  prefix or a too-short id fails `400`, an id that names no job fails `404`.
+- **Status codes**: `200`, `400` (ambiguous or too short an id, or a job the security policy
+  refuses), `401`, `404` (no such job), `409`, `500`.
 
 ### GET /api/v1/cron/{id}/runs
 
 - **Response** `200`: `{ "runs": [...], "count": 10 }` — run history, credential-scrubbed
   before storage.
-- **Status codes**: `200`, `401`, `404`.
+- An id that names no job — or one shorter than 8 characters that is not a full id — answers
+  `200` with an empty list (`{ "runs": [], "count": 0 }`), not a `404`: the job has no
+  history. A prefix that names several jobs fails `400`
+  (`Ambiguous cron job id '<id>': matches N jobs — ...`).
+- Reads stay open when `[cron].enabled = false`.
+- **Status codes**: `200`, `400` (ambiguous prefix), `401`, `500`.
 
 ## Tasks
 

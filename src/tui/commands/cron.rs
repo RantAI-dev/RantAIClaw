@@ -47,7 +47,15 @@ fn load_config_blocking() -> Result<Config> {
 /// Pure store logic (unit-tested). Returns the message text.
 fn run_cron_text(config: &Config, args: &str) -> String {
     let parts: Vec<&str> = args.split_whitespace().collect();
-    match parts.first().copied().unwrap_or("list") {
+    let sub = parts.first().copied().unwrap_or("list");
+    // Every write door refuses while the cron feature switch is off — with
+    // the same words the CLI, the HTTP API and the agent tools use. Reads
+    // (`list`) stay open, so an operator can still inspect dormant jobs. The
+    // refusal comes before the arguments are looked at: the door is closed.
+    if matches!(sub, "add" | "edit" | "remove" | "pause" | "resume") && !config.cron.enabled {
+        return format!("✗ {}", crate::cron::CRON_DISABLED_MESSAGE);
+    }
+    match sub {
         "list" | "" => list_text(config),
         "add" => add_text(config, &parts[1..]),
         "edit" => edit_text(config, &parts[1..]),
@@ -94,10 +102,16 @@ fn list_text(config: &Config) -> String {
         Ok(jobs) => {
             let mut out = format!("{banner}Scheduled tasks ({}):\n", jobs.len());
             for j in jobs {
-                let name = j
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| j.id[..j.id.len().min(8)].to_string());
+                // Every row shows the job id, so the operator can copy it and
+                // pass it back to `/cron pause|resume|remove|edit`. The name
+                // is kept when the job has one.
+                let display_id = cron::cron_display_id(&j);
+                let name = j.name.clone().unwrap_or_default();
+                let name_part = if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", crate::memory::sanitize::sanitize_for_terminal(&name))
+                };
                 let what = if j.command.is_empty() {
                     j.prompt.clone().unwrap_or_default()
                 } else {
@@ -105,8 +119,7 @@ fn list_text(config: &Config) -> String {
                 };
                 let _ = write!(
                     out,
-                    "  {} [{}] {} · next {} · {}\n    {}\n",
-                    crate::memory::sanitize::sanitize_for_terminal(&name),
+                    "  {name_part}[{display_id}] [{}] {} · next {} · {}\n    {}\n",
                     if j.enabled { "on" } else { "paused" },
                     // Render the structured schedule (Display) — the stored
                     // `expression` is empty for at/every jobs — and keep the
@@ -229,13 +242,21 @@ pub fn build_cron_picker(config: &Config) -> ListPicker {
         .unwrap_or_default()
         .into_iter()
         .map(|j| {
-            let name = j
-                .name
-                .clone()
-                .unwrap_or_else(|| j.id[..j.id.len().min(8)].to_string());
+            // The row shows the same short id every other surface prints, so
+            // the operator can copy it and paste it into a `/cron` command.
+            let display_id = cron::cron_display_id(&j);
+            let name = j.name.clone().unwrap_or_default();
+            let name_part = if name.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", crate::memory::sanitize::sanitize_for_terminal(&name))
+            };
             ListPickerItem {
                 key: j.id.clone(),
-                primary: format!("{name} [{}]", if j.enabled { "on" } else { "paused" }),
+                primary: format!(
+                    "{name_part}[{display_id}] [{}]",
+                    if j.enabled { "on" } else { "paused" }
+                ),
                 secondary: format!(
                     "{} · next {} · {}",
                     j.schedule,
@@ -345,5 +366,95 @@ mod tests {
             .filter_map(|e| e.as_item().map(|i| i.key.clone()))
             .collect();
         assert_eq!(keys, vec![id]);
+    }
+
+    /// Every write door of `/cron` refuses while the cron feature switch is
+    /// off, with the same words every other door uses — and nothing changes.
+    ///
+    /// The first group passes arguments that would otherwise produce a
+    /// *different* answer (a usage line, a parse error). The door is closed
+    /// before it looks at the arguments at all, so the refusal is the whole
+    /// answer. That is what makes this test tight: the store refuses with the
+    /// same words, so a message that merely "contains the refusal" would pass
+    /// even with this gate removed.
+    #[test]
+    fn every_write_door_refuses_when_cron_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut c = cfg(&tmp);
+        run_cron_text(&c, "add */5 * * * * echo hi");
+        let id = first_id(&c);
+        c.cron.enabled = false;
+
+        let refusal = format!("✗ {}", crate::cron::CRON_DISABLED_MESSAGE);
+
+        // Arguments that would otherwise produce a different answer.
+        for args in [
+            "add",
+            "edit",
+            "remove",
+            "pause",
+            "resume",
+            "add not-a-schedule",
+            "remove 0000000000000000",
+        ] {
+            let out = run_cron_text(&c, args);
+            assert_eq!(
+                out, refusal,
+                "`/cron {args}` must refuse with the refusal and nothing else"
+            );
+        }
+
+        // The same doors, with a real id: the refusal, and the job is
+        // untouched — it was neither edited, paused nor removed.
+        for args in [
+            "add */5 * * * * echo hi".to_string(),
+            format!("edit {id} name renamed"),
+            format!("remove {id}"),
+            format!("pause {id}"),
+            format!("resume {id}"),
+        ] {
+            let out = run_cron_text(&c, &args);
+            assert!(
+                out.contains(crate::cron::CRON_DISABLED_MESSAGE),
+                "`/cron {args}` must refuse: {out}"
+            );
+        }
+
+        let job = crate::cron::get_job(&c, &id).unwrap();
+        assert!(job.enabled);
+        assert_eq!(job.name, None);
+        assert_eq!(crate::cron::list_jobs(&c).unwrap().len(), 1);
+    }
+
+    /// `/cron list` shows the id every surface prints, so the operator can
+    /// copy it and pass it back to a `/cron` command.
+    #[test]
+    fn list_shows_the_reusable_job_id() {
+        let tmp = TempDir::new().unwrap();
+        let c = cfg(&tmp);
+        run_cron_text(&c, "add */5 * * * * echo hi");
+        let job = &crate::cron::list_jobs(&c).unwrap()[0];
+        let printed = crate::cron::cron_display_id(job);
+
+        let listed = run_cron_text(&c, "list");
+        assert!(listed.contains(&printed), "{listed}");
+    }
+
+    /// The picker's row shows the same id, so the operator can copy it there
+    /// too.
+    #[test]
+    fn the_picker_row_shows_the_reusable_job_id() {
+        let tmp = TempDir::new().unwrap();
+        let c = cfg(&tmp);
+        run_cron_text(&c, "add */5 * * * * echo hi");
+        let job = &crate::cron::list_jobs(&c).unwrap()[0];
+        let printed = crate::cron::cron_display_id(job);
+
+        let picker = build_cron_picker(&c);
+        let primary = picker.entries()[0]
+            .as_item()
+            .map(|i| i.primary.clone())
+            .unwrap_or_default();
+        assert!(primary.contains(&printed), "{primary}");
     }
 }

@@ -80,7 +80,7 @@ impl Tool for CronRemoveTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some(crate::cron::CRON_DISABLED_MESSAGE.to_string()),
             });
         }
 
@@ -201,6 +201,29 @@ mod tests {
         let result = execute_under_all_view(&tool, json!({"job_id": job.id})).await;
         assert!(result.success);
         assert!(cron::list_jobs(&cfg).unwrap().is_empty());
+    }
+
+    /// The cron feature switch closes this door: the tool refuses with the
+    /// same words every other cron door uses, and removes nothing.
+    #[tokio::test]
+    async fn errors_when_cron_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        cfg.cron.enabled = false;
+        let tool = CronRemoveTool::new(Arc::new(cfg.clone()), test_security(&cfg));
+
+        let result = execute_under_all_view(&tool, json!({ "job_id": job.id })).await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.unwrap_or_default(),
+            crate::cron::CRON_DISABLED_MESSAGE
+        );
+        assert!(
+            !cron::list_jobs(&cfg).unwrap().is_empty(),
+            "a refused remove must keep the job"
+        );
     }
 
     #[tokio::test]

@@ -48,7 +48,7 @@ impl Tool for CronListTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some(crate::cron::CRON_DISABLED_MESSAGE.to_string()),
             });
         }
 
