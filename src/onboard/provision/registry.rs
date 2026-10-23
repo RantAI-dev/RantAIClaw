@@ -518,6 +518,61 @@ mod tests {
         }
     }
 
+    /// `setup --non-interactive approvals` takes the PROVISIONER route, not
+    /// the section route. An unattended run answers a single-choice question
+    /// with its first option, so the preset written is Manual, and the
+    /// provisioner reports `Configured` — which is what lets the command
+    /// exit 0. (The section route would write Smart instead; the two are
+    /// different surfaces and must not be confused.)
+    #[tokio::test]
+    async fn headless_approvals_takes_option_zero_and_configures_manual() {
+        use crate::approval::policy_writer::{self, PolicyPreset};
+        use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = crate::config::Config::default();
+
+        let prov = provisioner_for("approvals").expect("approvals provisioner");
+        // What the headless runner sends for a single-choice question.
+        let t = drive(prov.as_ref(), &mut config, &profile, vec![Answer::Pick(0)]).await;
+
+        assert!(
+            t.configured(),
+            "an unattended approvals run must report success, not abort: {:?}",
+            t.outcome
+        );
+        assert_eq!(
+            policy_writer::read_active_preset(&profile.policy_dir()),
+            Some(PolicyPreset::Manual),
+            "option 0 of the preset menu is Manual"
+        );
+    }
+
+    /// `setup --non-interactive provider` on a fresh profile stores no
+    /// credential, and the command refuses that install — a keyless remote
+    /// provider cannot send a message — so it exits non-zero. The decision
+    /// rests on this predicate, so pin it: with the credential environment
+    /// scrubbed, a provider that stored no key has no usable credential.
+    #[tokio::test]
+    async fn a_provider_setup_that_stored_no_credential_leaves_no_usable_credential() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        // What a headless provider run on a fresh profile leaves behind: a
+        // provider name, and no key anywhere.
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("openrouter".into());
+        let key = config.resolve_key_for_provider("openrouter");
+        assert!(key.is_none(), "the fresh profile stored no key");
+
+        assert!(
+            !crate::providers::has_usable_credential("openrouter", key.as_deref(), None),
+            "a provider with no stored key and no key in the environment cannot send, \
+             so the headless setup must not report it as configured"
+        );
+    }
+
     #[test]
     fn available_is_non_empty_when_whatsapp_web_enabled() {
         #[cfg(feature = "whatsapp-web")]

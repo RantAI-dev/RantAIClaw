@@ -9,7 +9,10 @@
 //!   * if interactive — confirm enablement, then resolve an embedding key
 //!     (reuse the main provider key when it's an OpenRouter key, enter a new
 //!     one, or skip), and optionally an OCR/vision key;
-//!   * if headless — no-op (the wizard's final `config.save()` still runs).
+//!   * if headless — record the section as blocked, with its
+//!     `headless_hint()`, and configure nothing (the wizard's final
+//!     `config.save()` still runs). The orchestrator prints the hint and
+//!     the run exits non-zero.
 //!
 //! `is_already_configured` is a presence check on
 //! `config.knowledge.embedding_api_key` (or the `KB_EMBEDDING_API_KEY` env
@@ -52,6 +55,7 @@ impl SetupSection for KnowledgeSection {
         use dialoguer::{Confirm, Select};
 
         if !ctx.interactive {
+            ctx.record_blocked(self.name(), self.headless_hint());
             return Ok(());
         }
 

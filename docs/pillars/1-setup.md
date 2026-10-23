@@ -6,7 +6,7 @@ The first thing a user sees. RantaiClaw's setup story is **fullscreen TUI wizard
 
 ## What this pillar covers
 
-- First-run wizard (`rantaiclaw setup [full]`)
+- First-run wizard (`rantaiclaw setup`)
 - Section drill-down (`rantaiclaw setup <section>`)
 - Non-interactive bootstrap (`rantaiclaw setup --non-interactive`)
 - `rantaiclaw doctor` diagnostics (text / json / brief)
@@ -41,7 +41,7 @@ profile with no preset yet is offered the picker either way.
 |---|---|---|---|
 | First-run UX | Fullscreen TUI wizard, alt-screen | Shell prompts | TBD |
 | Headless mode | `--non-interactive` (CI-safe) | Partial | TBD |
-| Re-runnable per section | ✅ 7 sections | Partial | TBD |
+| Re-runnable per section | ✅ 8 sections | Partial | TBD |
 | Policy-aware (Manual / Smart / Strict / Off presets) | ✅ | ❌ | TBD |
 | Diagnostic suite | `doctor` (text/json/brief) | Partial | TBD |
 | Setup time, fresh box → working agent | < 5 min | ~5-15 min | TBD |
@@ -57,7 +57,7 @@ unverified rather than current._
 | Wizard interactive flow | Implemented · needs UX validation |
 | Wizard non-interactive | Implemented · stable |
 | `setup` section drilldown | Implemented · needs validation |
-| `setup` sections (provider / approvals / channels / persona / skills / mcp / login) | Implemented |
+| `setup` sections (provider / approvals / channels / persona / skills / mcp / login / knowledge) | Implemented |
 | `doctor` text / json / brief | Implemented · stable |
 | Hot-reload after wizard | Implemented · needs validation |
 | Wizard splash + brand polish | Implemented · stable |
@@ -74,7 +74,8 @@ rantaiclaw setup
       ├── persona.rs
       ├── skills.rs
       ├── mcp.rs
-      └── login.rs
+      ├── login.rs
+      └── knowledge.rs  (kb feature)
   → writes <profile>/config.toml + autonomy.toml + persona.toml + SYSTEM.md
 ```
 
@@ -86,8 +87,7 @@ rantaiclaw setup
 ## CLI / config
 
 ```bash
-rantaiclaw setup                  # interactive wizard
-rantaiclaw setup full             # all 7 sections
+rantaiclaw setup                  # interactive wizard (all 8 sections)
 rantaiclaw setup provider         # one section
 rantaiclaw setup approvals        # pick the approval preset (an existing one is kept unless --force)
 rantaiclaw setup --non-interactive  # CI / scripted bootstrap
@@ -95,6 +95,11 @@ rantaiclaw doctor                 # full diagnostic
 rantaiclaw doctor --brief         # one-line health
 rantaiclaw doctor --json          # machine-readable
 ```
+
+A headless setup exits **non-zero** when it could not configure a section that
+needs a prompt (`provider`, `channels`, `mcp`, `login`, `knowledge`): those
+sections are named in a closing summary as **not configured**. A script must
+check the exit code.
 
 ## Roadmap
 

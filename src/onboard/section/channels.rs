@@ -33,7 +33,7 @@ impl SetupSection for ChannelsSection {
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
         if !ctx.interactive {
-            eprintln!("{}", self.headless_hint());
+            ctx.record_blocked(self.name(), self.headless_hint());
             return Ok(());
         }
         ctx.config.channels_config = wizard::setup_channels(ctx.config.channels_config.clone())?;
