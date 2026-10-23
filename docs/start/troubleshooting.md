@@ -249,6 +249,112 @@ Checks:
 rantaiclaw doctor
 ```
 
+### `doctor` says the scheduler is unhealthy
+
+Symptom: the `daemon.scheduler` row of `rantaiclaw doctor` reads
+`unhealthy — see daemon logs`. The daemon is running, but its scheduler component
+reported `error`, so scheduled jobs are not being picked up. The row is a `Fail` verdict,
+so `rantaiclaw doctor` exits non-zero — as it does for every check that fails,
+`config.schema` among them.
+
+Cause: the scheduler component failed inside the daemon — its poll query could not read
+the cron store, or the component exited and the supervisor could not keep it running.
+
+Checks:
+
+```bash
+rantaiclaw cron list
+journalctl --user -u rantaiclaw.service -f   # Linux
+```
+
+Recovery: fix what the log names (a locked or unreadable cron store, a failing job), then
+re-run `rantaiclaw doctor`. The row reports the same verdict as the TUI's `/doctor`
+panel, so the two cannot disagree.
+
+### `doctor` says the daemon is not running
+
+Symptom: the `daemon.scheduler` row reads "daemon not running". The row reads that way
+whenever the daemon's state file is absent — and also when it exists but is older than
+about 15 seconds, which is what a crashed daemon leaves behind.
+
+Checks:
+
+```bash
+rantaiclaw service status
+ls -l ~/.rantaiclaw/profiles/<name>/daemon_state.json
+```
+
+The state file sits next to the active profile's `config.toml`.
+
+Recovery: start the daemon (`rantaiclaw service start`, or `rantaiclaw daemon` for a
+foreground run). If a stale state file is left behind, the daemon removes it on a
+clean exit; a file that survives a crash is stale by definition and never reads as
+healthy.
+
+### `doctor` says the service unit runs another binary
+
+Symptom: the `daemon.registration` row says the unit "runs <path> — not this binary
+(<path>)". The unit that answered belongs to a different installation — for example a
+release build in `/usr/local/bin` while you just ran a build in `~/.cargo/bin`.
+
+Cause: `rantaiclaw service install` writes the unit with the path of the binary that
+was running at install time. Running a different build afterwards leaves the unit
+pointing at the old one.
+
+Recovery: re-install the unit from the binary you actually want to run:
+
+```bash
+rantaiclaw service install
+rantaiclaw service start
+```
+
+The row names the manager it asked (`systemd (user)`, `launchd`) and the unit it
+asked for (`rantaiclaw.service`, `rantaiclaw@<profile>.service`), so it says which
+installation it looked at rather than reporting any unit called `rantaiclaw` as
+yours.
+
+### `doctor` says the binary the unit runs could not be verified
+
+Symptom: the `daemon.registration` row says the binary the unit runs "could not be
+verified — not confirmed as this installation". The unit is registered and the manager
+names it, but the manager named no executable the check could compare, so the unit may
+well belong to another installation. The check reports what it found instead of claiming
+a registration.
+
+Cause: the manager reported the unit without an `ExecStart` path the check could read, or
+the binary running `doctor` could not resolve its own path.
+
+Checks:
+
+```bash
+systemctl --user show rantaiclaw.service --property=ExecStart
+```
+
+The unit is `rantaiclaw.service`, or `rantaiclaw@<profile>.service` on a host that
+follows the daemon's templated name.
+
+Recovery: read the `ExecStart` path and see which binary it names. If it names another
+installation's binary, run `rantaiclaw service install` to point the unit at this one.
+
+### `doctor` says the registration status is unknown
+
+Symptom: the `daemon.registration` row says "the user service manager did not answer;
+registration status unknown". The service manager did not answer at all, so the unit's
+presence is unknown — neither registered nor absent.
+
+Cause: the query against the user service manager went unanswered. A host without a
+reachable user session bus answers `systemctl --user status` with exit code 1, and the
+check reads that answer as "nothing can be proven" rather than as "no unit".
+
+Checks:
+
+```bash
+systemctl --user status rantaiclaw.service
+```
+
+Recovery: run `doctor` in a session the user manager serves. The check cannot say
+whether the unit is installed until `systemctl --user status` answers.
+
 ### API chat succeeds but no session appears
 
 Checks:

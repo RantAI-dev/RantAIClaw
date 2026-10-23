@@ -504,7 +504,8 @@ fn version_reports_package_version() {
 /// a daemon is registered. Two fake `systemctl` programs disagree on the
 /// answer ("active" vs. "inactive") but the rendered `daemon.registration`
 /// line in `doctor --brief` is identical for both — the dev-build guard short-
-/// circuits `detect_registration` before either fake is consulted. Without the
+/// circuits `detect_registration_detailed` before either fake is consulted.
+/// Without the
 /// guard, the "active" fake would fold into `Registered` and the line would
 /// differ. The fake scripts only ever answer what their first positional
 /// argument asks; nothing the binary can spawn reaches the host's real

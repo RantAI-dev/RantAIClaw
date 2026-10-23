@@ -59,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool warn when a guest command glob is wide (its command name holds `*` or `?`, so `rm*` matches
   every command starting with `rm`) or rated high risk (`rm -rf *`). The glob is still stored; the
   warning says what it grants.
+- `rantaiclaw doctor` has a scheduler check (`daemon.scheduler`). Its help promised a scheduler
+  diagnosis that had no check behind it: the capability existed only in the TUI's `/doctor` panel,
+  so the CLI and the console reported nothing about the scheduler at all. The new check reads the
+  daemon's own state file and reports the scheduler's health — healthy, unhealthy, or the daemon
+  not running. It reads a local file, so it runs in `--brief` mode and in the console's brief mode,
+  where the promise used to go unkept. It shares one verdict with the TUI's panel, so the two
+  surfaces cannot disagree. An unhealthy scheduler is a failure, and it is the only new verdict
+  that makes `rantaiclaw doctor` exit non-zero.
 
 ### Changed
 
@@ -304,6 +312,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model can call by default: skill tools are refused under `readonly`, prompt an owner under `supervised` like any
   other tool, and need an explicit guest grant. Two skills that sanitise to the same tool name yield one adapter,
   and the collision is logged with both skill names.
+- The `doctor` daemon-registration check reported on whatever unit the host service manager happened to hold,
+  and never said what it had looked at. It now names the manager it asked and the unit it asked for, and a unit
+  whose `ExecStart` runs a different binary is reported as another installation's unit instead of this one's.
+  A host that follows the daemon's templated unit name (`rantaiclaw@<profile>.service`) is found as well as
+  one that uses the installed `rantaiclaw.service`.
+- The `doctor` daemon-registration row no longer claims a registration it did not find. A unit whose binary
+  could not be verified — the manager named no executable, or the running binary's own path could not be
+  resolved — is reported as unverified instead of as this installation's unit, and a service manager that did
+  not answer (`systemctl --user status` exiting 1 or 2, as on a host without a reachable user manager) is
+  reported as an unknown registration status instead of as a registered unit that is not running.
 
 ## [0.33.0-alpha] — 2026-10-08
 

@@ -45,6 +45,10 @@ fn ctx_with_provider(
     let mut cfg = Config::default();
     cfg.default_provider = Some(provider.to_string());
     cfg.api_key = api_key.map(str::to_string);
+    // The daemon's state file sits next to the config file. Point the config
+    // path at the temp dir so a check that reads it (the scheduler check)
+    // reads this test's file, never the operator's own.
+    cfg.config_path = tmp.path().join("config.toml");
     let profile = Profile {
         name: "test".into(),
         root: tmp.path().to_path_buf(),
@@ -204,6 +208,8 @@ async fn run_all_detailed_reports_skipped_live_checks() {
 
     let mut skipped = run.skipped.clone();
     skipped.sort();
+    // Unchanged by the scheduler check: it reads a local file, so it is not a
+    // `live` check and brief mode still runs it.
     assert_eq!(
         skipped,
         vec![
@@ -219,4 +225,25 @@ async fn run_all_detailed_reports_skipped_live_checks() {
             "skipped check {name} must not be in results"
         );
     }
+}
+
+/// The scheduler diagnosis `doctor`'s help promises has a check behind it, and
+/// the check runs at every door — brief mode is the console's mode, and a
+/// check that only ran in the full CLI would leave the console with the gap.
+#[tokio::test]
+async fn run_all_detailed_runs_the_scheduler_check_in_brief_mode() {
+    let (ctx, _tmp) = ctx_with_provider("openai", Some("sk-test"), true);
+    let run = run_all_detailed(ctx, true).await;
+
+    let scheduler = run
+        .results
+        .iter()
+        .find(|r| r.name == "daemon.scheduler")
+        .expect("the scheduler check must run in brief mode");
+    assert_eq!(scheduler.category, "system");
+    assert!(
+        scheduler.message.contains("daemon not running"),
+        "no state file in the temp dir means the daemon is not running: {}",
+        scheduler.message
+    );
 }

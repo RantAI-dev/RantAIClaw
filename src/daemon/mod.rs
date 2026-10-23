@@ -575,6 +575,66 @@ pub fn read_live_state(path: &Path) -> Option<serde_json::Value> {
     (age <= max_age).then_some(state)
 }
 
+/// The scheduler component's health, as the daemon's state file reports it.
+///
+/// One verdict for every surface that reports the scheduler — the TUI's
+/// `/doctor` panel and the `doctor` CLI's scheduler check — so the two cannot
+/// drift apart. The rules live here; each surface maps the verdict onto its
+/// own severity type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerVerdict {
+    /// No usable state file: the daemon is not running. Absent, unreadable,
+    /// unparseable and stale files all land here — [`read_live_state`] owns
+    /// the age rule.
+    DaemonNotRunning,
+    /// The scheduler component reported `ok`.
+    Healthy,
+    /// The scheduler component reported `error`.
+    Unhealthy,
+    /// The daemon is running but does not track a scheduler component yet.
+    NotTracked,
+    /// The scheduler component reported a status string this build does not
+    /// know (`starting`, for one).
+    Other(String),
+}
+
+impl SchedulerVerdict {
+    /// One line describing the verdict — the same words on every surface.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::DaemonNotRunning => {
+                "daemon not running (start `rantaiclaw daemon` for scheduled jobs)".to_string()
+            }
+            Self::Healthy => "healthy".to_string(),
+            Self::Unhealthy => "unhealthy — see daemon logs".to_string(),
+            Self::NotTracked => "not tracked yet".to_string(),
+            Self::Other(status) => status.clone(),
+        }
+    }
+}
+
+/// Classify the scheduler's health from the daemon's state file.
+///
+/// Reads through [`read_live_state`], so a state file the daemon has stopped
+/// refreshing reads exactly like an absent one: the scheduler of a daemon that
+/// is not running is not healthy.
+pub fn scheduler_verdict(state_file: &Path) -> SchedulerVerdict {
+    let Some(state) = read_live_state(state_file) else {
+        return SchedulerVerdict::DaemonNotRunning;
+    };
+    let status = state
+        .get("components")
+        .and_then(|c| c.get("scheduler"))
+        .and_then(|s| s.get("status"))
+        .and_then(|v| v.as_str());
+    match status {
+        Some("ok") => SchedulerVerdict::Healthy,
+        Some("error") => SchedulerVerdict::Unhealthy,
+        Some(other) => SchedulerVerdict::Other(other.to_string()),
+        None => SchedulerVerdict::NotTracked,
+    }
+}
+
 /// Write the daemon state file atomically: serialize to a per-pid temp file in
 /// the same directory, then `rename` it over the target. `rename` within a
 /// directory is atomic, so a concurrent reader (`doctor`, the TUI) sees either
@@ -965,6 +1025,99 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("daemon_state.json"));
+    }
+
+    /// A state file body stamped the way the daemon's state writer stamps it:
+    /// `written_at` from some seconds ago.
+    fn scheduler_state_body(status: &str, written_age_seconds: i64) -> String {
+        serde_json::json!({
+            "components": {"scheduler": {"status": status}},
+            "written_at": (chrono::Utc::now()
+                - chrono::Duration::seconds(written_age_seconds))
+                .to_rfc3339(),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn scheduler_verdict_reads_a_healthy_scheduler() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        std::fs::write(&path, scheduler_state_body("ok", 0)).unwrap();
+
+        assert_eq!(scheduler_verdict(&path), SchedulerVerdict::Healthy);
+    }
+
+    #[test]
+    fn scheduler_verdict_reads_an_unhealthy_scheduler() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        std::fs::write(&path, scheduler_state_body("error", 0)).unwrap();
+
+        assert_eq!(scheduler_verdict(&path), SchedulerVerdict::Unhealthy);
+    }
+
+    /// No state file at all: the daemon never ran, so nothing can be healthy.
+    #[test]
+    fn scheduler_verdict_reads_an_absent_state_file_as_daemon_not_running() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+
+        assert_eq!(scheduler_verdict(&path), SchedulerVerdict::DaemonNotRunning);
+    }
+
+    /// A file whose `written_at` is older than three flush intervals was
+    /// written by a daemon that has since exited or crashed. It must read
+    /// EXACTLY like an absent file — never a healthy scheduler.
+    #[test]
+    fn scheduler_verdict_reads_a_stale_state_file_as_daemon_not_running() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        std::fs::write(&path, scheduler_state_body("ok", 60)).unwrap();
+
+        assert_eq!(scheduler_verdict(&path), SchedulerVerdict::DaemonNotRunning);
+    }
+
+    #[test]
+    fn scheduler_verdict_reads_an_unparseable_state_file_as_daemon_not_running() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        assert_eq!(scheduler_verdict(&path), SchedulerVerdict::DaemonNotRunning);
+    }
+
+    /// A daemon that is running but has not published a scheduler component
+    /// yet is a different state from "not running" — and neither is healthy.
+    #[test]
+    fn scheduler_verdict_reads_a_daemon_that_does_not_track_the_scheduler() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "components": {"gateway": {"status": "ok"}},
+                "written_at": chrono::Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(scheduler_verdict(&path), SchedulerVerdict::NotTracked);
+    }
+
+    /// A status string this build does not know (`starting`, for one) is
+    /// reported as it stands rather than folded into "ok".
+    #[test]
+    fn scheduler_verdict_keeps_an_unknown_status_string() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        std::fs::write(&path, scheduler_state_body("starting", 0)).unwrap();
+
+        assert_eq!(
+            scheduler_verdict(&path),
+            SchedulerVerdict::Other("starting".to_string())
+        );
     }
 
     #[tokio::test]
