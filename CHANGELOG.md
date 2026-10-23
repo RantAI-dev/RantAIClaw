@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reached via `crypto-bigint` ← `elliptic-curve` / `rsa` ← `russh`, so the default build (the
   `ssh` tool) is affected. No config key and no behaviour of RantaiClaw itself changed.
   `Cargo.lock` only.
+- **tokio 1.53.3, for RUSTSEC-2026-0386.** The lockfile takes `tokio` 1.53.1 → 1.53.3.
+  `tokio::io::unix::AsyncFd` offers safe constructors (`new`, `with_interest`, `try_new`,
+  `try_with_interest`) that take any `T: AsRawFd`, so safe code could build an `AsyncFd` from an
+  arbitrary or already-closed file descriptor, and closing a duplicated descriptor whose number
+  the runtime then reused could free an allocation the I/O driver still points at — a
+  use-after-free when a readiness event fired. From 1.53.3 the constructors are deprecated in
+  favour of the unsafe `AsyncFd::register`, which asks the caller to prove the descriptor stays
+  valid and unchanged. RantaiClaw's own code never constructs an `AsyncFd`, so the unsound path
+  was not reachable here, but the advisory fails the License & Supply Chain check on every
+  branch. No config key and no behaviour of RantaiClaw itself changed. `Cargo.lock` only.
 - An approval reply that names a request handle typed for an expired or unknown request approved the unrelated pending request when exactly one was still pending in the same chat. The relay now refuses that path and answers the reply itself: nothing pending matches the token, and the reply lists what is still answerable in this chat — whichever verb carries the handle (`approve`, `allow`, `y`, `n`, with or without a `--persist` tail). A `/approve` or `/deny` reply that names no pending request is also answered by the relay instead of being forwarded to the model. A reply that names a command (`/approve kubectl`) no longer resolves anything — the request handle or the exact tool name does; 0.33.0-alpha resolved such a reply when one request was pending.
 - On the prompt (XML) tool protocol, a tool's output could close its `<tool_result>` frame and inject text the model read as a separate result; the output and the frame's attribute values are now escaped so each result stays one frame. MCP tool output had no size limit; it is now capped at 1 MiB with a marker saying how many bytes were dropped.
 - The shell, `pty`, `ssh exec`, skill tools and cron jobs refuse a command that names a credential
