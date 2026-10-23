@@ -67,6 +67,85 @@ pub(crate) const SAFE_ENV_VARS: &[&str] = &[
     "KRB5CCNAME",                     // kerberos credential-cache path
 ];
 
+/// Apply the agent shell's cleared environment to a command builder.
+///
+/// The child sees only what the agent's `shell` tool gives it: nothing from
+/// the parent process except the names in [`SAFE_ENV_VARS`], then the
+/// per-skill env overlay, then the loaded skills' tools directories appended
+/// to the `PATH`.
+///
+/// One function, so the agent's `shell` tool and a scheduled shell job
+/// cannot drift apart.
+pub(crate) fn apply_safe_env(
+    cmd: &mut tokio::process::Command,
+    overlay: &std::collections::HashMap<String, String>,
+    tool_dirs: &[std::path::PathBuf],
+) {
+    cmd.env_clear();
+
+    for var in SAFE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+
+    // Per-skill env overlay (`[skills.entries.<n>]` from config). User
+    // explicitly opts in by writing values into config; this is *not*
+    // an automatic leak of process env. SAFE_ENV_VARS comes first so
+    // skills can override PATH (intentional, e.g. add brew to PATH).
+    for (k, v) in overlay {
+        cmd.env(k, v);
+    }
+
+    // The loaded skills' own tools directories, APPENDED to the child's
+    // PATH: a binary an install recipe put in a skill's tools directory
+    // is reachable by name from the agent's shell. They come after every
+    // other entry, so a command that resolves today resolves to the same
+    // file — a skill binary can never shadow a system binary such as
+    // `git`. The process-wide PATH is never changed.
+    if !tool_dirs.is_empty() {
+        // The PATH the child would get without the directories: the
+        // overlay's value when the overlay set one, else the inherited
+        // one. Read from the command itself — after `env_clear()` and
+        // the two loops above — so it is exactly that value.
+        let effective_path = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string));
+        match effective_path {
+            Some(path) => {
+                let mut entries = std::env::split_paths(&path).collect::<Vec<_>>();
+                entries.extend(tool_dirs.iter().cloned());
+                match std::env::join_paths(entries) {
+                    Ok(joined) => {
+                        cmd.env("PATH", joined);
+                    }
+                    Err(e) => {
+                        // A path the platform separator cannot express.
+                        // Keep the PATH the child had rather than hand it
+                        // a broken one — and say so, so a skill whose
+                        // binary cannot be found has an explanation.
+                        tracing::warn!(
+                            error = %e,
+                            "the loaded skills' tools directories could not be put on the child's PATH; \
+                             the child runs with the PATH it had"
+                        );
+                    }
+                }
+            }
+            None => {
+                // No PATH at all: leave the child's PATH unset rather
+                // than invent one that holds only the skill directories,
+                // which would narrow what the child can find.
+                tracing::warn!(
+                    "the child has no PATH, so the loaded skills' tools directories were not added to it"
+                );
+            }
+        }
+    }
+}
+
 /// Appended to hard-blocked shell errors so the operator discovers a concrete
 /// next step instead of dead-ending. Real sessions showed users grinding
 /// through manual config edits because the bare "Command not allowed" message
@@ -528,69 +607,7 @@ impl Tool for ShellTool {
                 });
             }
         };
-        cmd.env_clear();
-
-        for var in SAFE_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-
-        // Per-skill env overlay (`[skills.entries.<n>]` from config). User
-        // explicitly opts in by writing values into config; this is *not*
-        // an automatic leak of process env. SAFE_ENV_VARS comes first so
-        // skills can override PATH (intentional, e.g. add brew to PATH).
-        for (k, v) in &self.skill_env {
-            cmd.env(k, v);
-        }
-
-        // The loaded skills' own tools directories, APPENDED to the child's
-        // PATH: a binary an install recipe put in a skill's tools directory
-        // is reachable by name from the agent's shell. They come after every
-        // other entry, so a command that resolves today resolves to the same
-        // file — a skill binary can never shadow a system binary such as
-        // `git`. The process-wide PATH is never changed.
-        if !self.skill_tool_dirs.is_empty() {
-            // The PATH the child would get without the directories: the
-            // overlay's value when the overlay set one, else the inherited
-            // one. Read from the command itself — after `env_clear()` and
-            // the two loops above — so it is exactly that value.
-            let effective_path = cmd
-                .as_std()
-                .get_envs()
-                .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
-                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string));
-            match effective_path {
-                Some(path) => {
-                    let mut entries = std::env::split_paths(&path).collect::<Vec<_>>();
-                    entries.extend(self.skill_tool_dirs.iter().cloned());
-                    match std::env::join_paths(entries) {
-                        Ok(joined) => {
-                            cmd.env("PATH", joined);
-                        }
-                        Err(e) => {
-                            // A path the platform separator cannot express.
-                            // Keep the PATH the child had rather than hand it
-                            // a broken one — and say so, so a skill whose
-                            // binary cannot be found has an explanation.
-                            tracing::warn!(
-                                error = %e,
-                                "the loaded skills' tools directories could not be put on the child's PATH; \
-                                 the child runs with the PATH it had"
-                            );
-                        }
-                    }
-                }
-                None => {
-                    // No PATH at all: leave the child's PATH unset rather
-                    // than invent one that holds only the skill directories,
-                    // which would narrow what the child can find.
-                    tracing::warn!(
-                        "the child has no PATH, so the loaded skills' tools directories were not added to it"
-                    );
-                }
-            }
-        }
+        apply_safe_env(&mut cmd, &self.skill_env, &self.skill_tool_dirs);
 
         // Spawn with piped stdio so we can (a) bound-read the output to cap memory
         // and (b) reap the whole process group on cancel/timeout. `Command::output`

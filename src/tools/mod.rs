@@ -479,12 +479,7 @@ pub fn all_tools_with_runtime(
         .filter(|(_, reasons)| reasons.is_empty())
         .map(|(skill, _)| skill.clone())
         .collect();
-    let reachable_skills: Vec<crate::skills::Skill> = skills_with_status
-        .iter()
-        .filter(|(skill, _)| !crate::skills::skill_disabled_in_config(root_config, &skill.name))
-        .map(|(skill, _)| skill.clone())
-        .collect();
-    let skill_tool_dirs = crate::skills::tools_dir::skill_tool_dirs_for_skills(&reachable_skills);
+    let skill_tool_dirs = reachable_skill_tool_dirs(&skills_with_status, root_config);
 
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(
@@ -753,6 +748,46 @@ pub fn all_tools_with_runtime(
     boxed_registry_from_arcs(tool_arcs)
 }
 
+/// The per-skill environment a command runs with, on top of
+/// [`shell::SAFE_ENV_VARS`]: the `[skills.entries.<n>]` overlay and the loaded
+/// skills' tools directories.
+pub(crate) struct AgentShellEnv {
+    /// The `[skills.entries.<n>]` overlay (`env`, `api_key`, `config.*`).
+    pub(crate) overlay: HashMap<String, String>,
+    /// The loaded skills' own tools directories, APPENDED to the child's `PATH`.
+    pub(crate) tool_dirs: Vec<std::path::PathBuf>,
+}
+
+/// The tools directories of the skills a session loaded, minus the ones the
+/// config disabled. One place, so the agent's shell and a scheduled shell job
+/// get the same list.
+fn reachable_skill_tool_dirs(
+    skills_with_status: &[(crate::skills::Skill, Vec<String>)],
+    config: &crate::config::Config,
+) -> Vec<std::path::PathBuf> {
+    let reachable: Vec<crate::skills::Skill> = skills_with_status
+        .iter()
+        .filter(|(skill, _)| !crate::skills::skill_disabled_in_config(config, &skill.name))
+        .map(|(skill, _)| skill.clone())
+        .collect();
+    crate::skills::tools_dir::skill_tool_dirs_for_skills(&reachable)
+}
+
+/// The per-skill environment the agent's shell gives a command.
+///
+/// Built from ONE config and ONE skill load, so a scheduled shell job gets
+/// exactly what the agent's shell would get.
+pub(crate) fn agent_shell_env(
+    workspace_dir: &std::path::Path,
+    config: &crate::config::Config,
+) -> AgentShellEnv {
+    let skills_with_status = crate::skills::load_skills_with_status(workspace_dir, config);
+    AgentShellEnv {
+        overlay: compose_skill_env(config),
+        tool_dirs: reachable_skill_tool_dirs(&skills_with_status, config),
+    }
+}
+
 /// Build the per-skill env overlay merged onto every shell exec.
 ///
 /// For each enabled skill (`[skills.entries.<name>]`), we surface:
@@ -772,7 +807,7 @@ pub fn all_tools_with_runtime(
 ///
 /// Disabled skills (`enabled = false`) contribute nothing — gating
 /// happens at the loader, this is a cheap sanity check.
-fn compose_skill_env(config: &crate::config::Config) -> HashMap<String, String> {
+pub(crate) fn compose_skill_env(config: &crate::config::Config) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
 
     for (name, entry) in &config.skills.entries {
