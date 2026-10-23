@@ -346,7 +346,13 @@ pub(crate) struct ChannelRuntimeDefaults {
     /// from startup, so without carrying this the prompt kept describing
     /// whatever preset was active when the daemon started — the gate moved, the
     /// briefing did not.
-    pub(crate) autonomy_preset: crate::approval::policy_writer::PolicyPreset,
+    ///
+    /// `None` means the profile has no preset: the on-disk marker
+    /// (`<profile>/policy/autonomy.toml`) is absent, so nothing was chosen.
+    /// The config cannot stand in for it — it cannot tell "no preset chosen"
+    /// from "the default" — so the prompt names no preset rather than a
+    /// guessed one.
+    pub(crate) autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
     /// Per-channel sender allowlists, keyed by the same lowercase channel name
     /// used by `channels_by_name`. Reloaded from disk so a console or CLI
     /// allowlist edit reaches a running listener without restarting the daemon —
@@ -1471,10 +1477,18 @@ pub(crate) async fn build_channel_runtime(
     // keyed by config path, which the reload then looked up under a *separately
     // derived* key; the two derivations agreeing was an invariant nothing
     // checked. Owning one state removes the key, and with it that whole class.
+    //
+    // The profile's policy dir: it holds the on-disk marker (`autonomy.toml`)
+    // that says which approval preset the profile chose, and the runtime
+    // allowlist overlay. Resolved once, here, so the gate and the briefing
+    // read the same profile.
+    let policy_dir = crate::profile::ProfileManager::active()
+        .ok()
+        .map(|p| p.policy_dir());
     let initial_stamp = routing::config_file_stamp(&config.config_path).await.ok();
     let runtime_config = Arc::new(Mutex::new(routing::RuntimeConfigSlot {
         state: Some(routing::RuntimeConfigState {
-            defaults: routing::runtime_defaults_from_config(&config),
+            defaults: routing::runtime_defaults_from_config(&config, policy_dir.as_deref()),
             last_applied_stamp: initial_stamp,
             last_reload_error: None,
         }),
@@ -1485,9 +1499,6 @@ pub(crate) async fn build_channel_runtime(
         .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
-    let policy_dir = crate::profile::ProfileManager::active()
-        .ok()
-        .map(|p| p.policy_dir());
     let security = Arc::new(SecurityPolicy::from_config_with_policy_dir(
         &config.autonomy,
         &config.workspace_dir,

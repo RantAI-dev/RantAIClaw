@@ -61,7 +61,9 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 
 Profile-level operation. Writes `<profile>/policy/{autonomy,command_allowlist}.toml` from the bundled preset AND mirrors `[autonomy].level`, `[autonomy].always_ask`, and `[autonomy].allowed_commands` into `config.toml` so the runtime gate actually consumes the change. `runtime_allowlist.toml` (from `/allow X --persist`) is preserved across preset switches.
 
-The preset is encoded in `config.toml` as a `level` + `always_ask` pair — the same encoding the web console reads and writes — so a preset switched here is visible in the console (and vice versa) without a restart.
+The preset is read from the profile's marker (`<profile>/policy/autonomy.toml`), which is the one source of truth every surface reads — `rantaiclaw status`, this command, the channel prompt, and `GET /api/v1/status`. A profile with no marker has no preset: the command says `not provisioned — run \`rantaiclaw setup approvals\`` rather than naming a preset derived from `config.toml`, because the config cannot tell "no preset chosen" from "the default".
+
+The preset's *effect* is encoded in `config.toml` as a `level` + `always_ask` pair — the same encoding the web console reads and writes — so a preset switched here is visible in the console (and vice versa) without a restart. The preset's *name* comes from the marker, not from that pair.
 
 | Preset | `[autonomy].level` | `[autonomy].always_ask` | `[autonomy].auto_approve` | Behaviour |
 |---|---|---|---|---|
@@ -73,6 +75,14 @@ The preset is encoded in `config.toml` as a `level` + `always_ask` pair — the 
 Each preset sets the fields in its row to that preset's values, whatever the previous preset left behind. `manual` then `smart` gives the same config as `smart` on a fresh config. `"*"` is Manual's mark: only `manual` keeps it, and `strict` and `off` drop it. Named entries an operator wrote (for example `ssh`, `pty`) survive `strict` and `off`. An install already left in the old `full` plus `"*"` state is repaired by running `rantaiclaw autonomy off` again.
 
 Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker · `/autonomy <preset>` skips the picker.
+
+### `status`
+
+- `rantaiclaw status` — print the active configuration and a system summary
+
+The `Autonomy` row names the approval preset the active profile has, read from the profile's marker (`<profile>/policy/autonomy.toml`) — the same source `rantaiclaw autonomy` reads, so the two cannot disagree. A profile with no marker has no preset, and the row reads `not provisioned — run \`rantaiclaw setup approvals\`` rather than a preset name derived from `config.toml`.
+
+The `Enforced` row right after it names the autonomy level the runtime gate actually enforces, read from `config.toml`. A profile whose marker has drifted from its config therefore shows both: the preset the profile chose and the level in force.
 
 ### `setup`
 

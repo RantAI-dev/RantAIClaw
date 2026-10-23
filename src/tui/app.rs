@@ -2983,16 +2983,7 @@ impl TuiApp {
                     self.shell_blocks_this_turn = self.shell_blocks_this_turn.saturating_add(1);
                     if self.shell_blocks_this_turn == 3 && !self.autonomy_hint_shown_this_turn {
                         self.autonomy_hint_shown_this_turn = true;
-                        let preset = self
-                            .context
-                            .autonomy_preset
-                            .map(|p| p.label())
-                            .unwrap_or("Smart");
-                        let hint = format!(
-                            "⚠ Multiple shell commands blocked by {preset} preset. \
-                             If this is a trusted skill bootstrap, run /autonomy off \
-                             (then /autonomy smart when done) for unrestricted access."
-                        );
+                        let hint = shell_block_hint(self.context.autonomy_preset);
                         let _ = self.context.append_system_message(&hint);
                         self.scrollback_queue.push(("system".into(), hint));
                     }
@@ -5661,6 +5652,27 @@ pub(crate) fn append_autonomy_segment(
         p.label().to_string(),
         Style::default().fg(colour).add_modifier(Modifier::BOLD),
     ));
+}
+
+/// The one-shot nudge shown when the agent keeps hitting the security gate.
+///
+/// The preset is named only when the profile has one. The config cannot tell
+/// "no preset chosen" from "the default", so naming a preset here told the
+/// user a policy was in force that was never selected.
+///
+/// With no preset, the hint says so in plain words rather than staying quiet
+/// about it: silence reads as "a policy is in force but unnamed", which is the
+/// same confusion as naming one.
+fn shell_block_hint(preset: Option<crate::approval::policy_writer::PolicyPreset>) -> String {
+    let subject = match preset {
+        Some(preset) => format!("by {} preset", preset.label()),
+        None => "by the approval policy — no preset is set".to_string(),
+    };
+    format!(
+        "⚠ Multiple shell commands blocked {subject}. \
+         If this is a trusted skill bootstrap, run /autonomy off \
+         (then /autonomy smart when done) for unrestricted access."
+    )
 }
 
 /// One-line description for each approval preset, used by the Shift+Tab
@@ -11414,6 +11426,54 @@ mod tests {
         assert_eq!(app.context.messages.len(), 1);
         assert_eq!(app.context.messages[0].role, "note");
         assert_ne!(app.context.session_id, first_session_id);
+    }
+
+    /// The shell-block hint names the preset the profile has, and says plainly
+    /// that no preset is set when the profile has none. The hint used to fall
+    /// back to "Smart", because the config cannot tell "no preset chosen" from
+    /// "the default" — so a profile that chose nothing was told a policy was
+    /// in force. Naming any preset there was the same bug in a different
+    /// coat, and staying silent about it left the reader unable to tell
+    /// "nothing was chosen" from "a policy is in force but unnamed".
+    #[test]
+    fn the_shell_block_hint_names_no_preset_without_one() {
+        use crate::approval::policy_writer::PolicyPreset;
+
+        let hint = shell_block_hint(None);
+        assert!(
+            !hint.contains("Smart"),
+            "a profile with no preset must not be told it is under Smart:\n{hint}"
+        );
+        // The other three labels: a `None` arm naming Manual, Strict or Off
+        // instead of Smart would be the same bug wearing a different label.
+        // The advice that follows ("/autonomy off", "/autonomy smart") names
+        // the commands in lower case, so a preset label cannot hide there.
+        for preset in [
+            PolicyPreset::Manual,
+            PolicyPreset::Strict,
+            PolicyPreset::Off,
+        ] {
+            assert!(
+                !hint.contains(preset.label()),
+                "a profile with no preset must not be told it is under {}:\n{hint}",
+                preset.label()
+            );
+        }
+        assert!(
+            hint.contains("approval policy"),
+            "the hint must still say what blocked the commands:\n{hint}"
+        );
+        assert!(
+            hint.contains("no preset is set"),
+            "the hint must say that no preset is set — silence reads as a policy \
+             in force:\n{hint}"
+        );
+
+        let hint = shell_block_hint(Some(PolicyPreset::Manual));
+        assert!(
+            hint.contains("Manual preset"),
+            "a profile with a preset names it:\n{hint}"
+        );
     }
 }
 

@@ -85,6 +85,8 @@ rantaiclaw autonomy <preset>            # switch (manual | smart | strict | off 
 
 `setup approvals` keeps a preset that is already on disk: it names the preset that is active and points at `rantaiclaw setup approvals --force`, which is what offers the picker and writes the preset you pick. `--force` regenerates the preset's policy files — `<profile>/policy/autonomy.toml` and `<profile>/policy/command_allowlist.toml` — so hand edits to them are lost.
 
+The preset a profile has is the one its marker names — `<profile>/policy/autonomy.toml` — and every surface reads that same marker: `rantaiclaw status`, `rantaiclaw autonomy`, the channel prompt, and `GET /api/v1/status` (whose `autonomy_preset` is `null` when the profile has no preset). A profile with no marker has no preset, and no surface names one for it: `config.toml` cannot tell "no preset chosen" from "the default".
+
 Inside the TUI:
 - `Shift+Tab` — cycle Manual → Smart → Strict → Off → Manual
 - `/autonomy` — interactive picker; `/autonomy <preset>` for direct switch

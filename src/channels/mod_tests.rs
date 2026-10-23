@@ -3038,7 +3038,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
                 guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
                 allowed_commands: Arc::new(Vec::new()),
                 autonomy_level: crate::security::AutonomyLevel::Supervised,
-                autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
+                autonomy_preset: Some(crate::approval::policy_writer::PolicyPreset::Manual),
                 allowlists: Arc::new(HashMap::new()),
                 message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
                 max_tool_iterations: 5,
@@ -3808,6 +3808,135 @@ async fn snapshot_fallback_warns_once() {
     );
 }
 
+/// The runtime defaults name the preset the profile's marker names. The
+/// config cannot stand in for the marker: the shipped `always_ask` is
+/// non-empty, so a config-derived preset called a profile that chose nothing
+/// "Manual".
+#[test]
+fn the_runtime_defaults_name_the_preset_the_marker_names() {
+    use crate::approval::policy_writer::PolicyPreset;
+
+    let config = crate::config::Config::default();
+    assert!(
+        !config.autonomy.always_ask.is_empty(),
+        "the shipped default `always_ask` is what made a fresh profile look Manual"
+    );
+
+    let policy_dir = tempfile::tempdir().expect("temp policy dir");
+    let defaults = routing::runtime_defaults_from_config(&config, Some(policy_dir.path()));
+    assert_eq!(
+        defaults.autonomy_preset, None,
+        "no marker means no preset, whatever the config says"
+    );
+
+    // The marker is written with the production writer, so the file on disk is
+    // byte-for-byte what production writes and reads: `<policy_dir>/autonomy.toml`
+    // with `[autonomy].preset`. A hand-written TOML string would let the test
+    // pass against a format production never reads.
+    crate::approval::policy_writer::write_active_preset(policy_dir.path(), PolicyPreset::Strict)
+        .expect("write marker");
+    let defaults = routing::runtime_defaults_from_config(&config, Some(policy_dir.path()));
+    assert_eq!(
+        defaults.autonomy_preset,
+        Some(PolicyPreset::Strict),
+        "the marker decides — the config still reads Manual"
+    );
+}
+
+/// A channel prompt names the preset the profile has, and names no preset
+/// when the profile has none. The safety section used to be rendered from a
+/// config-derived preset, so a profile that chose nothing was told it was
+/// under "Manual (paranoid)" — a policy that was never selected.
+///
+/// The guest prompt carries the `## Safety + Approval Policy` heading, the
+/// way the prompt the runtime builds at start-up does. The per-turn safety
+/// section is spliced into the built prompt by that heading, so a prompt
+/// without it keeps the start-up text and this test would pass whatever
+/// preset the runtime carried. The floor assertion below is what proves the
+/// splice happened.
+///
+/// The preset reaches the runtime the way production sets it: from the
+/// profile's marker, through the runtime defaults. So this fails when the
+/// prompt names a preset the marker does not name (a substituted one), and
+/// when the preset comes from the config instead of the marker — the shipped
+/// config reads as Manual, the preset that was never chosen.
+#[tokio::test]
+async fn the_channel_prompt_names_no_preset_without_one() {
+    use crate::approval::policy_writer::PolicyPreset;
+
+    // The guest prompt as the runtime builds it at start-up: the safety
+    // heading is there, so the per-turn section reaches the prompt.
+    const GUEST_PROMPT: &str =
+        "## Safety + Approval Policy\n\nthe safety text from channel start-up\n";
+
+    // The system prompt one guest turn is sent, for a runtime whose defaults
+    // carry `preset`.
+    async fn guest_prompt_with_preset(preset: Option<PolicyPreset>) -> String {
+        let provider_impl = Arc::new(ReplyAndPromptProvider {
+            reply: "ok".to_string(),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let mut ctx = dispatch_ctx(
+            vec![channel],
+            provider_impl.clone(),
+            seeded_defaults_slot(preset, gate_of(&[])),
+        );
+        {
+            let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");
+            inner.guest_system_prompt = Arc::new(GUEST_PROMPT.to_string());
+        }
+
+        send_guest_message(&ctx, GUEST_SENDER, "guest-msg-1").await;
+
+        let prompts = prompts_seen_by(&provider_impl);
+        prompts
+            .into_iter()
+            .next()
+            .expect("the guest turn reached the provider")
+    }
+
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+
+    // The profile's policy dir: the marker that names the chosen preset lives
+    // here. There is no marker yet, so the profile has chosen no preset.
+    let policy_dir = tempfile::tempdir().expect("temp policy dir");
+    let config = crate::config::Config::default();
+    let defaults = routing::runtime_defaults_from_config(&config, Some(policy_dir.path()));
+    assert_eq!(
+        defaults.autonomy_preset, None,
+        "a profile with no marker has chosen no preset, whatever the config says"
+    );
+
+    let prompt = guest_prompt_with_preset(defaults.autonomy_preset).await;
+    assert!(
+        !prompt.contains("Active approval policy:"),
+        "a profile with no preset must not be told one is in force:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("Do not bypass oversight or approval mechanisms."),
+        "the safety floor must survive even with no preset:\n{prompt}"
+    );
+
+    // The positive control: a marker naming Manual puts Manual in the prompt.
+    // Without it, the assertion above would hold for a prompt that names no
+    // preset whatever the runtime carries.
+    crate::approval::policy_writer::write_active_preset(policy_dir.path(), PolicyPreset::Manual)
+        .expect("write marker");
+    let defaults = routing::runtime_defaults_from_config(&config, Some(policy_dir.path()));
+    assert_eq!(
+        defaults.autonomy_preset,
+        Some(PolicyPreset::Manual),
+        "the marker decides the preset the prompt names"
+    );
+
+    let prompt = guest_prompt_with_preset(defaults.autonomy_preset).await;
+    assert!(
+        prompt.contains("Active approval policy: Manual (messaging channel)"),
+        "the prompt must name the preset the marker names:\n{prompt}"
+    );
+}
+
 /// Two runtimes in one process used to share a global map keyed by config
 /// path, so they clobbered each other's applied state. Each context now owns
 /// its own.
@@ -3842,9 +3971,13 @@ async fn two_runtimes_do_not_share_applied_config_state() {
 /// A config reload whose NEW provider can't be built must still apply the
 /// non-provider settings. A safety autonomy downgrade bundled with a broken
 /// provider previously never took effect — the reload returned early on the
-/// keep-old-provider branch before touching the SecurityPolicy.
+/// keep-old-provider branch before touching the SecurityPolicy. The same
+/// reload must also RE-READ the preset marker: a marker change takes effect
+/// on a config reload, without a restart.
 #[tokio::test]
-async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_fails() {
+async fn maybe_apply_runtime_config_update_rereads_the_preset_marker_when_provider_build_fails() {
+    use crate::approval::policy_writer::PolicyPreset;
+
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
 
@@ -3863,6 +3996,20 @@ async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_
 
     // Initial: a buildable provider at Full autonomy.
     write_config("openrouter", crate::security::AutonomyLevel::Full, vec![]);
+
+    // The profile's policy dir, with a marker that names Manual. The reload
+    // reads the preset from here, so the marker — not the autonomy level — is
+    // what the briefing is rendered from.
+    //
+    // The marker is written with the production writer, so the file on disk is
+    // byte-for-byte what production writes and reads: `<policy_dir>/autonomy.toml`
+    // with `[autonomy].preset`. A hand-written TOML string would let the test
+    // pass against a format production never reads. The dir is the temp
+    // profile's `policy/` subdir — the same shape as `<profile>/policy` — and
+    // nothing here reads the operator's real HOME.
+    let policy_dir = temp.path().join("policy");
+    crate::approval::policy_writer::write_active_preset(&policy_dir, PolicyPreset::Manual)
+        .expect("write marker");
 
     let mut channels_by_name = HashMap::new();
     let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
@@ -3900,13 +4047,30 @@ async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         interrupt_on_new_message: false,
         multimodal: crate::config::MultimodalConfig::default(),
-        security: Arc::new(crate::security::SecurityPolicy::default()),
+        security: Arc::new(
+            crate::security::SecurityPolicy::from_config_with_policy_dir(
+                &crate::config::Config::default().autonomy,
+                &std::env::temp_dir(),
+                Some(policy_dir.clone()),
+            ),
+        ),
         channel_approval: None,
         approval_owners: Arc::new(Vec::new()),
         tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
         in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    // The reload reads the marker from the policy dir bound to the security
+    // policy — production binds the active profile's `<profile>/policy`, and
+    // the reload reads that same binding. Pin it here, so a reload that read
+    // the marker from anywhere else fails on this line instead of silently
+    // reading no marker at all.
+    assert_eq!(
+        ctx.security.policy_dir.as_deref(),
+        Some(policy_dir.as_path()),
+        "the reload must read the marker from the policy dir bound to the runtime"
+    );
 
     routing::maybe_apply_runtime_config_update(&ctx)
         .await
@@ -3915,6 +4079,22 @@ async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_
         ctx.security.effective_autonomy(),
         crate::security::AutonomyLevel::Full
     );
+    assert_eq!(
+        routing::runtime_defaults_snapshot(&ctx).autonomy_preset,
+        Some(PolicyPreset::Manual),
+        "the first apply takes the preset from the marker"
+    );
+
+    // The marker changes on disk between the two applies. A reload has to
+    // re-read it — the preset the prompt is rendered from follows the marker
+    // without a restart.
+    //
+    // The new value is Off on purpose: it differs from the preset the first
+    // apply stored (Manual), and from the one the reloaded config would
+    // derive on its own (a ReadOnly level derives Strict). A marker of Strict
+    // would therefore pass on a reload that never looked at the marker.
+    crate::approval::policy_writer::write_active_preset(&policy_dir, PolicyPreset::Off)
+        .expect("rewrite marker");
 
     // Rewrite: an UNKNOWN provider (build fails) + a safety downgrade to ReadOnly.
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3942,12 +4122,19 @@ async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_
     // ...and so did the preset the system prompt is rendered from. The gate
     // and the briefing have to move together: `or_insert_with` on this path
     // leaves an existing store entry untouched, so without carrying the
-    // autonomy-derived defaults forward the prompt would keep describing
-    // the pre-reload preset while the gate enforced ReadOnly.
+    // reloaded defaults forward the prompt would keep describing the
+    // pre-reload preset while the gate enforced ReadOnly.
+    //
+    // The preset comes from the profile's marker, not from the autonomy level:
+    // the marker said Manual at the first apply and says Off now, and neither
+    // the level (ReadOnly) nor the preset the first apply stored (Manual) may
+    // stand in for it. The marker moved between the two applies, so this fails
+    // unless the reload re-read it — the previous assertion (the marker
+    // unchanged) passed on a reload that never looked at the marker.
     assert_eq!(
         routing::runtime_defaults_snapshot(&ctx).autonomy_preset,
-        crate::approval::policy_writer::PolicyPreset::Strict,
-        "the prompt preset must follow a downgrade even when the provider build fails"
+        Some(PolicyPreset::Off),
+        "the reload must re-read the preset marker, not keep the preset it already had"
     );
 
     // A reload must refresh the WHOLE `[autonomy]` section, not just the two
@@ -7525,7 +7712,7 @@ async fn threading_off_clears_both_the_thread_and_the_quote() {
                 guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
                 allowed_commands: Arc::new(Vec::new()),
                 autonomy_level: crate::security::AutonomyLevel::Supervised,
-                autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
+                autonomy_preset: Some(crate::approval::policy_writer::PolicyPreset::Manual),
                 allowlists: Arc::new(HashMap::new()),
                 message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
                 max_tool_iterations: 5,
@@ -14502,7 +14689,7 @@ async fn owner_turn_prompt(mode: crate::config::SkillsPromptInjectionMode) -> St
         vec![channel],
         provider_impl.clone(),
         seeded_defaults_slot(
-            crate::approval::policy_writer::PolicyPreset::Strict,
+            Some(crate::approval::policy_writer::PolicyPreset::Strict),
             crate::approval::GuestGate::new(&[], &[]),
         ),
     );

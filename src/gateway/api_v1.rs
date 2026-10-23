@@ -409,10 +409,18 @@ async fn status(
         // The level alone cannot name the active preset: Manual and Smart are
         // both `Supervised` and differ only in `always_ask`. Consumers that
         // showed the level were therefore stuck reporting "Smart" while Manual
-        // was in force. Resolve the preset here — same inverse the config API
-        // uses to keep the on-disk marker in step — and leave `autonomy` alone
-        // so an older console keeps working.
-        "autonomy_preset": crate::approval::policy_writer::preset_for_autonomy(&cfg.autonomy).id(),
+        // was in force. Resolve the preset here — but from the on-disk marker,
+        // the same source every other surface reads. The config cannot tell
+        // "no preset was chosen" from "the default", so a config-derived value
+        // would name a preset for a profile that never chose one. `null` means
+        // exactly that: no preset is in force. `autonomy` is left alone so an
+        // older console keeps working.
+        "autonomy_preset": crate::profile::ProfileManager::active()
+            .ok()
+            .and_then(|profile| {
+                crate::approval::policy_writer::read_active_preset(&profile.policy_dir())
+            })
+            .map(|preset| preset.id()),
         "workspace_dir": cfg.workspace_dir.display().to_string(),
         "paired": state.pairing.is_paired(),
         "runtime": crate::health::snapshot_json(),
@@ -4744,13 +4752,27 @@ mod tests {
     async fn status_names_the_preset_the_level_alone_cannot() {
         // Manual and Smart are both `Supervised`; only `always_ask` tells them
         // apart. A consumer reading `autonomy` therefore reported "Smart" while
-        // Manual was in force — `autonomy_preset` is what disambiguates.
+        // Manual was in force — `autonomy_preset` is what disambiguates, and it
+        // names the preset the profile actually chose (the on-disk marker), not
+        // one derived from the config.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let _profile_name = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
         let state = test_state();
         {
             let mut cfg = state.config.lock();
             cfg.autonomy.level = crate::security::AutonomyLevel::Supervised;
             cfg.autonomy.always_ask = vec!["shell".to_string()];
         }
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        assert!(
+            profile.policy_dir().starts_with(tmp.path()),
+            "test must own its policy dir"
+        );
+
+        // No marker: the profile never chose a preset, so there is none to
+        // name — the config's default `always_ask` must not become one.
         let response = status(State(state.clone()), HeaderMap::new())
             .await
             .expect("status ok")
@@ -4758,10 +4780,19 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&response_text(response).await).expect("json body");
         assert_eq!(json["autonomy"], "Supervised");
-        assert_eq!(json["autonomy_preset"], "manual");
+        assert!(
+            json["autonomy_preset"].is_null(),
+            "a profile with no marker has no preset, got {}",
+            json["autonomy_preset"]
+        );
 
-        // Clearing always_ask is the whole difference between the two rungs.
-        state.config.lock().autonomy.always_ask.clear();
+        // The marker names it — and it wins over the config, which still says
+        // Manual (a non-empty `always_ask` under `Supervised`).
+        std::fs::write(
+            profile.policy_dir().join("autonomy.toml"),
+            "[autonomy]\npreset = \"strict\"\n",
+        )
+        .expect("write marker");
         let response = status(State(state.clone()), HeaderMap::new())
             .await
             .expect("status ok")
@@ -4769,7 +4800,10 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&response_text(response).await).expect("json body");
         assert_eq!(json["autonomy"], "Supervised", "level must not change");
-        assert_eq!(json["autonomy_preset"], "smart");
+        assert_eq!(
+            json["autonomy_preset"], "strict",
+            "the marker decides, not the config"
+        );
     }
 
     /// Build a state fixture with pairing enabled and one known token.
