@@ -2,8 +2,9 @@ use crate::channels::conversation::ConversationKey;
 use crate::channels::SendMessage;
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, remove_job, reschedule_after_run, update_job,
-    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
+    due_jobs, next_run_for_schedule, record_last_run, remove_job_by_scheduler,
+    reschedule_after_run, update_job_by_scheduler, CronJob, CronJobPatch, DeliveryConfig, JobType,
+    Schedule,
 };
 use crate::memory::MemoryView;
 use crate::security::SecurityPolicy;
@@ -686,7 +687,8 @@ async fn persist_job_result(
         if job.delete_after_run && success {
             let cfg = config.clone();
             let job_id = job.id.clone();
-            match tokio::task::spawn_blocking(move || remove_job(&cfg, &job_id)).await {
+            match tokio::task::spawn_blocking(move || remove_job_by_scheduler(&cfg, &job_id)).await
+            {
                 Ok(Err(e)) => {
                     tracing::warn!("Failed to remove one-shot cron job after success: {e}");
                 }
@@ -702,7 +704,7 @@ async fn persist_job_result(
             let cfg = config.clone();
             let job_id = job.id.clone();
             match tokio::task::spawn_blocking(move || {
-                update_job(
+                update_job_by_scheduler(
                     &cfg,
                     &job_id,
                     CronJobPatch {

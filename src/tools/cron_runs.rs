@@ -61,7 +61,7 @@ impl Tool for CronRunsTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some(crate::cron::CRON_DISABLED_MESSAGE.to_string()),
             });
         }
 
@@ -213,6 +213,24 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("..."));
+    }
+
+    /// This door refuses reads too while the cron feature switch is off —
+    /// with the same words every other cron door uses.
+    #[tokio::test]
+    async fn errors_when_cron_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        cfg.cron.enabled = false;
+        let tool = CronRunsTool::new(Arc::new(cfg.clone()));
+
+        let result = execute_under_all_view(&tool, json!({ "job_id": "any-job" })).await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.unwrap_or_default(),
+            crate::cron::CRON_DISABLED_MESSAGE
+        );
     }
 
     #[tokio::test]

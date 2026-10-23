@@ -81,7 +81,7 @@ impl Tool for CronUpdateTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some(crate::cron::CRON_DISABLED_MESSAGE.to_string()),
             });
         }
 
@@ -262,6 +262,36 @@ mod tests {
                 .map(Vec::len),
             Some(3),
             "patch.schedule must carry the typed variants: {patch}"
+        );
+    }
+
+    /// The cron feature switch closes this door: the tool refuses with the
+    /// same words every other cron door uses, and edits nothing.
+    #[tokio::test]
+    async fn errors_when_cron_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        cfg.cron.enabled = false;
+        let tool = CronUpdateTool::new(Arc::new(cfg.clone()), test_security(&cfg));
+
+        let result = execute_under_all_view(
+            &tool,
+            json!({
+                "job_id": job.id,
+                "patch": { "enabled": false }
+            }),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.unwrap_or_default(),
+            crate::cron::CRON_DISABLED_MESSAGE
+        );
+        assert!(
+            cron::get_job(&cfg, &job.id).unwrap().enabled,
+            "a refused update must not edit the job"
         );
     }
 

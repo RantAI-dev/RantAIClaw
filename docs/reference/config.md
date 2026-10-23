@@ -293,6 +293,34 @@ Notes:
   the same rule the other root routes follow.
 - State lives in `<workspace>/tasks.db`.
 
+## `[cron]`
+
+The scheduled-job subsystem: the job store, the scheduler that fires it, and
+every surface that creates, edits or runs a job.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | The cron subsystem. With `enabled = false` every door that creates, edits, deletes, pauses, resumes or manually runs a job refuses |
+| `max_run_history` | `50` | How many run records are kept per job (the newest ones; older records are pruned) |
+| `max_catchup_age_secs` | `86400` | Skip a run whose `next_run` is older than this many seconds instead of firing it late (one day). A skipped recurring job re-anchors to its next occurrence; a skipped one-shot is disabled. `0` disables the gate |
+
+Notes:
+
+- **Every door that writes a cron job honours `enabled = false`.** The CLI
+  (`cron add/add-at/add-every/once/update/remove/pause/resume/run`), the
+  `cron_*` agent tools, the mutating HTTP endpoints, the TUI `/cron` commands
+  and the cron detail panel's action keys all refuse with the same message:
+  `cron is disabled by config (cron.enabled=false)`. The store refuses the
+  write too, so a door that forgets to check cannot reach it.
+- **Reads stay open.** Listing jobs and reading run history still work while
+  `enabled = false`, so an operator can inspect dormant jobs. (The two
+  read-only agent tools, `cron_list` and `cron_runs`, refuse reads while
+  disabled — that is unchanged.)
+- **The scheduler's own bookkeeping is exempt.** Recording a run, re-anchoring
+  a stale schedule, and deleting or disabling a one-shot that already fired
+  still land, so flipping `enabled` at runtime cannot make a fired one-shot
+  fire again.
+
 ## `[identity]`
 
 | Key | Default | Purpose |
