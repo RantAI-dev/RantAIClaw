@@ -69,6 +69,45 @@ rantaiclaw usage
 | Daemon heartbeat/state | `~/.rantaiclaw/daemon_state.json` | file updates periodically; it is removed when the daemon stops, and a file older than ~15 seconds is treated as "daemon not running" (relevant after a crash) |
 | Session persistence | `rantaiclaw session list` or `GET /api/v1/sessions` | recent CLI/TUI/API turns are listed |
 
+### The daemon rows of `rantaiclaw doctor`
+
+`rantaiclaw doctor` reports two rows about the daemon: `daemon.scheduler` and
+`daemon.registration`. Both read local state — the daemon's own state file and the host
+service manager — so both run under `--brief` and in the console's brief mode.
+
+| Row | Verdict | Meaning | What to do |
+|---|---|---|---|
+| `daemon.scheduler` | `healthy` | The daemon is running and its scheduler component reports `ok` | nothing |
+| `daemon.scheduler` | `unhealthy — see daemon logs` | The daemon is running and its scheduler component reports `error` | read the daemon log (`journalctl --user -u rantaiclaw.service -f` on Linux) |
+| `daemon.scheduler` | `daemon not running …` | No state file, or one the daemon has stopped refreshing (older than ~15 s) | `rantaiclaw service start` (or `rantaiclaw daemon`) |
+| `daemon.scheduler` | `not tracked yet` | The daemon is running but has not published a scheduler component | normally transient during startup; re-run `doctor` after a few seconds |
+| `daemon.scheduler` | a status string this build does not know (for example `starting`) | The daemon reported a scheduler status the build does not recognise | read the daemon log; the row is a warning, not a failure |
+| `daemon.registration` | `daemon registered via systemd (user) as unit rantaiclaw.service (runs <path>)` | This installation's unit is installed and runs this binary | nothing |
+| `daemon.registration` | `… but runs <path> — not this binary (<path>)` | The unit that answered belongs to a different installation | `rantaiclaw service install` to point the unit at this binary |
+| `daemon.registration` | `daemon not registered with <manager> (optional) — looked for <units>` | No unit of that name is installed | `rantaiclaw service install` (optional) |
+| `daemon.registration` | `daemon registered with <manager> as unit <unit> but not running` | The unit is installed but stopped | `rantaiclaw service start` |
+| `daemon.registration` | `unit <unit> is registered with <manager> and is active, but the binary it runs could not be verified — not confirmed as this installation` | The unit is installed and running, but the manager named no executable the check could compare, so the unit may belong to another installation | check the unit's `ExecStart` to see which binary it runs |
+| `daemon.registration` | `unit <unit> is registered with <manager> but is not running, and the binary it runs could not be verified — not confirmed as this installation` | The unit is installed but stopped, and the binary it runs could not be verified | check the unit's `ExecStart` to see which binary it runs |
+| `daemon.registration` | `could not query <manager> for unit <unit> — the user service manager did not answer; registration status unknown` | The service manager could not be reached (no user session bus, for one), so the unit's presence is unknown — neither registered nor absent | run `doctor` in a session the user manager serves; `systemctl --user status` has to answer |
+
+The `daemon.registration` row also prints two lines that are informational rather than
+registration verdicts. The first is `init system not detected (skipped)`, printed when
+the host has no init system the check can ask. The second is
+`development build does not talk to the service manager`, printed when the binary is a
+debug or test build — the guard that keeps a developer's build away from the operator's
+service manager. Both are `info`.
+
+Within these two rows, only the `unhealthy` scheduler verdict is a failure. Every other
+scheduler verdict and every registration verdict is reported as `ok`, `warn` or `info` —
+including the two registration verdicts that report what could not be established: a unit
+whose binary could not be verified (`not confirmed as this installation`), and a service
+manager that did not answer (`registration status unknown`).
+
+That is about these rows alone. `rantaiclaw doctor` exits non-zero when any check it
+runs reports a `Fail` verdict — a warning never changes the exit code — and
+`config.schema` is one of those checks: a config that does not validate fails the doctor
+on its own.
+
 ## Session Persistence Checks
 
 `agent -m`, the TUI, and `POST /api/v1/agent/chat` all write completed turns to

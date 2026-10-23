@@ -174,9 +174,10 @@ tokens, session ids, or paths.
   `severity` is one of `"Ok"`, `"Warn"`, `"Fail"`, `"Info"` (Rust `Debug`
   formatting of `doctor::Severity`, PascalCase — not the lowercase
   `as_str()` form the CLI uses elsewhere). This endpoint runs in
-  **offline/brief mode**: it runs the nine non-live checks (config schema,
+  **offline/brief mode**: it runs the eleven non-live checks (config schema,
   provider-key presence, api-url, paths, allowlist, approval owners, channels
-  DM detection, daemon registration, system deps) and makes no network calls.
+  DM detection, memory embedding, daemon registration, daemon scheduler, system
+  deps) and makes no network calls.
   It is **not** fully side-effect-free
   — it spawns `systemctl`/`launchctl` to detect the daemon and writes a
   short-lived probe file in the workspace to verify writability (both moved off

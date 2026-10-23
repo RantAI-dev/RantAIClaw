@@ -427,11 +427,19 @@ Examples:
         service_command: ServiceCommands,
     },
 
-    /// Run diagnostics for daemon/scheduler/channel freshness.
+    /// Run diagnostics for configuration, daemon, scheduler and channel freshness.
     ///
     /// With no subcommand, runs the full new-style health check
     /// pipeline (config + live + system). Use `--brief` for a sub-second
     /// offline-friendly summary or `--format json` for CI consumption.
+    ///
+    /// Checks: config.schema, config.provider_key, config.api_url, config.paths,
+    /// policy.allowlist, policy.approval_owners, channels.dm_detection,
+    /// memory.embedding, provider.ping, channels.auth, mcp.startup,
+    /// daemon.registration, daemon.scheduler, system.deps. `--brief` skips the
+    /// three network probes (provider.ping, channels.auth, mcp.startup) and
+    /// `--offline` reports them as skipped without probing; every other check
+    /// reads local state.
     Doctor {
         /// Output format: text (default), json, brief.
         #[arg(long, default_value = "text", value_enum)]

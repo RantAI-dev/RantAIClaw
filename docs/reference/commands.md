@@ -28,7 +28,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `gateway` | Start webhook and WhatsApp HTTP gateway |
 | `daemon` | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
 | `service` | Manage user-level OS service lifecycle |
-| `doctor` | Run diagnostics and freshness checks |
+| `doctor` | Run diagnostics for configuration, daemon, scheduler and channel freshness |
 | `status` | Print current configuration and system summary |
 | `usage` | Print today's token usage against the daily ceiling |
 | `cron` | Manage scheduled tasks |
@@ -539,6 +539,67 @@ commands now say which one they are in their own output.
 
 Checks that never ran are listed under `[skipped]` rather than counted as passes — a check
 that did not run is not a pass.
+
+#### The checks `doctor` runs
+
+| Check | Category | What it answers |
+|---|---|---|
+| `config.schema` | `config` | Does the active config parse and validate against the schema? |
+| `config.provider_key` | `config` | Does a provider credential resolve, and from where? |
+| `config.api_url` | `config` | Is the provider `api_url` override a usable URL? |
+| `config.paths` | `config` | Do the configured workspace and data directories exist and are they writable? |
+| `policy.allowlist` | `config` | Is the shell command allowlist coherent (missing, empty, or healthy)? |
+| `policy.approval_owners` | `config` | Are approval owners configured? |
+| `channels.dm_detection` | `config` | Can the DM-detection policy be read for the configured channels? |
+| `memory.embedding` | `config` | Is the memory search mode usable (embedding provider present, index populated)? |
+| `provider.ping` | `live` | Does the provider actually accept the credential? |
+| `channels.auth` | `live` | Do the configured channels authenticate? |
+| `mcp.startup` | `live` | Do the configured MCP servers start? |
+| `daemon.registration` | `system` | Is **this** installation's daemon registered with the host service manager, and does the unit run this binary? |
+| `daemon.scheduler` | `system` | Is the running daemon's scheduler component healthy? |
+| `system.deps` | `system` | Are the required system dependencies present on the host? |
+
+`--brief` skips the three `live` checks (`provider.ping`, `channels.auth`,
+`mcp.startup`); `--offline` reports them as skipped without probing. Every other check
+reads local state — the daemon's state file, the config, and the host service manager —
+so the console's brief mode still reports on the daemon and its scheduler.
+
+#### The daemon checks
+
+`daemon.registration` names what it looked at: the service manager it asked, the unit
+it asked for, and the binary that unit runs. A unit that runs a different binary than
+the `rantaiclaw` you just invoked belongs to another installation, and the check says so
+instead of reporting it as this one's service.
+
+`daemon.registration` reports one of these registration verdicts:
+
+| Verdict | Meaning | Severity |
+|---|---|---|
+| `daemon registered via <manager> as unit <unit> (runs <path>)` | This installation's unit is installed and runs this binary | ok |
+| `daemon registered with <manager> as unit <unit> but not running` | The unit is installed but stopped | info |
+| `… but runs <path> — not this binary (<path>)` | The unit that answered belongs to a different installation | warn |
+| `unit <unit> is registered with <manager> … could not be verified — not confirmed as this installation` | The unit is installed, but the manager named no executable the check could compare — the unit may belong to another installation | warn |
+| `could not query <manager> for unit <unit> — the user service manager did not answer; registration status unknown` | The service manager could not be reached, so the unit's presence is unknown — neither registered nor absent | warn |
+| `daemon not registered with <manager> (optional) — looked for <units>` | No unit of that name is installed | info |
+
+Two more lines are informational rather than registration verdicts. The first is
+`init system not detected (skipped)`, printed when the host has no init system the check
+can ask. The second is `development build does not talk to the service manager`, printed
+when the binary is a debug or test build — the guard that keeps a developer's build away
+from the operator's service manager. Both are `info`.
+
+`daemon.scheduler` reads the daemon's own state file and reports one of:
+
+| Verdict | Meaning | Severity |
+|---|---|---|
+| `healthy` | The daemon is running and its scheduler component reports `ok` | ok |
+| `unhealthy — see daemon logs` | The daemon is running and its scheduler component reports `error` | fail |
+| `daemon not running` | No state file, or one the daemon has stopped refreshing — start `rantaiclaw daemon` for scheduled jobs | warn |
+| `not tracked yet` | The daemon is running but does not publish a scheduler component | warn |
+| the raw status string | The daemon reported a status this build does not know (`starting`) | warn |
+
+The TUI's `/doctor` panel reports the same scheduler verdict in its own row, so the two
+surfaces cannot disagree.
 
 `doctor models` options:
 

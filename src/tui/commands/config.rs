@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
+use crate::daemon::SchedulerVerdict;
 use crate::tui::context::TuiContext;
 use crate::tui::widgets::{InfoPanel, InfoSection, StatusKind};
 
@@ -524,25 +525,19 @@ impl CommandHandler for ChannelsCommand {
 /// file. Anything `read_live_state` refuses — absent file, unparseable body,
 /// or a `written_at` whose daemon has stopped flushing — is exactly the same
 /// "daemon not running" Warn (the file can only appear once a daemon flushes).
+///
+/// The verdict comes from [`crate::daemon::scheduler_verdict`], which the
+/// `doctor` CLI's scheduler check reads too: one set of rules, two surfaces.
 fn scheduler_diag(state_file: &std::path::Path) -> (StatusKind, String) {
-    let Some(state) = crate::daemon::read_live_state(state_file) else {
-        return (
-            StatusKind::Warn,
-            "daemon not running (start `rantaiclaw daemon` for scheduled jobs)".to_string(),
-        );
+    let verdict = crate::daemon::scheduler_verdict(state_file);
+    let kind = match verdict {
+        SchedulerVerdict::Healthy => StatusKind::Ok,
+        SchedulerVerdict::Unhealthy => StatusKind::Fail,
+        SchedulerVerdict::DaemonNotRunning
+        | SchedulerVerdict::NotTracked
+        | SchedulerVerdict::Other(_) => StatusKind::Warn,
     };
-    let status = state
-        .get("components")
-        .and_then(|c| c.get("scheduler"))
-        .and_then(|s| s.get("status"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    match status.as_deref() {
-        Some("ok") => (StatusKind::Ok, "healthy".to_string()),
-        Some("error") => (StatusKind::Fail, "unhealthy — see daemon logs".to_string()),
-        Some(other) => (StatusKind::Warn, other.to_string()),
-        None => (StatusKind::Warn, "not tracked yet".to_string()),
-    }
+    (kind, verdict.detail())
 }
 
 #[cfg(test)]
@@ -726,5 +721,70 @@ mod tests {
             message.contains("daemon not running"),
             "stale ok must carry the same message as an absent file: {message}"
         );
+    }
+
+    /// The TUI's scheduler row and the `doctor` CLI's scheduler check must
+    /// never disagree. They read one verdict — `crate::daemon::scheduler_verdict`
+    /// — and each maps it onto its own severity type, so a state file that
+    /// reads as a healthy scheduler on one surface reads as a healthy
+    /// scheduler on the other. Driven through both real surfaces, for every
+    /// state file that matters.
+    #[tokio::test]
+    async fn the_scheduler_row_and_the_doctor_check_agree_on_every_state_file() {
+        use crate::doctor::checks::daemon::SchedulerCheck;
+        use crate::doctor::{DoctorCheck, DoctorContext, Severity};
+        use crate::profile::Profile;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        let mut cfg = crate::config::Config::default();
+        cfg.config_path = tmp.path().join("config.toml");
+        let ctx = DoctorContext {
+            profile: Profile {
+                name: "test".into(),
+                root: tmp.path().to_path_buf(),
+            },
+            config: cfg,
+            offline: false,
+        };
+
+        // (state file body, the TUI's row, the doctor's line)
+        let cases: Vec<(Option<String>, StatusKind, Severity)> = vec![
+            (None, StatusKind::Warn, Severity::Warn),
+            (Some(state_body("ok", 0)), StatusKind::Ok, Severity::Ok),
+            (
+                Some(state_body("error", 0)),
+                StatusKind::Fail,
+                Severity::Fail,
+            ),
+            (Some(state_body("ok", 60)), StatusKind::Warn, Severity::Warn),
+            (
+                Some(state_body("error", 60)),
+                StatusKind::Warn,
+                Severity::Warn,
+            ),
+            (
+                Some("{ not json".to_string()),
+                StatusKind::Warn,
+                Severity::Warn,
+            ),
+        ];
+
+        for (body, tui_kind, doctor_severity) in cases {
+            match &body {
+                Some(body) => std::fs::write(&path, body).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            let (kind, _) = scheduler_diag(&path);
+            assert_eq!(kind, tui_kind, "TUI verdict for {body:?}");
+            let result = SchedulerCheck.run(&ctx).await;
+            assert_eq!(
+                result.severity, doctor_severity,
+                "doctor verdict for {body:?}: {}",
+                result.message
+            );
+        }
     }
 }
