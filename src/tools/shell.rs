@@ -235,6 +235,17 @@ pub struct ShellTool {
     /// outer env var gets that value re-exported into the child
     /// process; `config.*` values become `RANTAICLAW_SKILL_<NAME>_<KEY>`.
     skill_env: std::collections::HashMap<String, String>,
+    /// The tools directories of the loaded skills, APPENDED to the child's
+    /// `PATH`. A binary an install recipe put in a skill's own tools
+    /// directory is then reachable by name from the agent's shell — the
+    /// way a recipe-carrying skill is actually used, since such a skill
+    /// has no tool of its own.
+    ///
+    /// Appended, never prepended: they come after every other entry, so a
+    /// command that resolves today resolves to the same file and a skill
+    /// binary can never shadow a system binary such as `git`. The
+    /// process-wide `PATH` is never changed.
+    skill_tool_dirs: Vec<std::path::PathBuf>,
 }
 
 impl ShellTool {
@@ -243,6 +254,7 @@ impl ShellTool {
             security,
             runtime,
             skill_env: std::collections::HashMap::new(),
+            skill_tool_dirs: Vec::new(),
         }
     }
 
@@ -257,6 +269,19 @@ impl ShellTool {
             security,
             runtime,
             skill_env,
+            skill_tool_dirs: Vec::new(),
+        }
+    }
+
+    /// Add the loaded skills' own tools directories to the child's `PATH`.
+    ///
+    /// They are appended, never prepended: a skill binary can never shadow
+    /// a system binary, and a command that resolves today resolves to the
+    /// same file after the change.
+    pub fn with_skill_tool_dirs(self, dirs: Vec<std::path::PathBuf>) -> Self {
+        Self {
+            skill_tool_dirs: dirs,
+            ..self
         }
     }
 }
@@ -519,6 +544,54 @@ impl Tool for ShellTool {
             cmd.env(k, v);
         }
 
+        // The loaded skills' own tools directories, APPENDED to the child's
+        // PATH: a binary an install recipe put in a skill's tools directory
+        // is reachable by name from the agent's shell. They come after every
+        // other entry, so a command that resolves today resolves to the same
+        // file — a skill binary can never shadow a system binary such as
+        // `git`. The process-wide PATH is never changed.
+        if !self.skill_tool_dirs.is_empty() {
+            // The PATH the child would get without the directories: the
+            // overlay's value when the overlay set one, else the inherited
+            // one. Read from the command itself — after `env_clear()` and
+            // the two loops above — so it is exactly that value.
+            let effective_path = cmd
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string));
+            match effective_path {
+                Some(path) => {
+                    let mut entries = std::env::split_paths(&path).collect::<Vec<_>>();
+                    entries.extend(self.skill_tool_dirs.iter().cloned());
+                    match std::env::join_paths(entries) {
+                        Ok(joined) => {
+                            cmd.env("PATH", joined);
+                        }
+                        Err(e) => {
+                            // A path the platform separator cannot express.
+                            // Keep the PATH the child had rather than hand it
+                            // a broken one — and say so, so a skill whose
+                            // binary cannot be found has an explanation.
+                            tracing::warn!(
+                                error = %e,
+                                "the loaded skills' tools directories could not be put on the child's PATH; \
+                                 the child runs with the PATH it had"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    // No PATH at all: leave the child's PATH unset rather
+                    // than invent one that holds only the skill directories,
+                    // which would narrow what the child can find.
+                    tracing::warn!(
+                        "the child has no PATH, so the loaded skills' tools directories were not added to it"
+                    );
+                }
+            }
+        }
+
         // Spawn with piped stdio so we can (a) bound-read the output to cap memory
         // and (b) reap the whole process group on cancel/timeout. `Command::output`
         // instead buffers to EOF (OOM risk) and stops only the direct child.
@@ -699,6 +772,27 @@ mod tests {
         Arc::new(NativeRuntime::new())
     }
 
+    /// A policy that allows exactly the named commands, so a test can run a
+    /// binary whose name the default allowlist does not carry.
+    fn policy_allowing(names: &[&str]) -> Arc<SecurityPolicy> {
+        Arc::new(
+            SecurityPolicy::default()
+                .with_workspace_dir(std::env::temp_dir())
+                .with_allowed_commands(names.iter().map(|n| n.to_string()).collect()),
+        )
+    }
+
+    /// Write an executable file, creating the directories above it.
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create dir");
+        }
+        std::fs::write(path, body).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
     #[test]
     fn shell_tool_name() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -711,12 +805,12 @@ mod tests {
         assert!(!tool.description().is_empty());
     }
 
-    /// A plain shell call, outside any skill, must not reach a skill's own
-    /// tools directory. That directory is only ever put on the `PATH` of the
-    /// child that runs that skill's own tool.
+    /// A skill that is NOT loaded contributes nothing: its tools directory
+    /// is not on the child's `PATH`, so a plain shell call cannot run a
+    /// binary that lives in it.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_plain_shell_call_cannot_run_a_binary_in_a_tools_directory() {
+    async fn a_skill_that_is_not_loaded_keeps_its_tools_directory_out_of_reach() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let data = tempfile::tempdir().expect("temp dir");
         let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
@@ -747,6 +841,128 @@ mod tests {
         assert!(
             error.contains("not found"),
             "the shell must be the one that could not find the binary, not a policy block: {error}"
+        );
+    }
+
+    /// A skill's binary is APPENDED to the child's `PATH`, so a command that
+    /// resolves today resolves to the same file: a same-named binary that is
+    /// already on the `PATH` still wins over the skill's copy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_same_named_binary_earlier_on_the_path_wins_over_the_skill_copy() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let system_dir = tempfile::tempdir().expect("temp dir");
+        let skill_dir = tempfile::tempdir().expect("temp dir");
+        write_executable(
+            &system_dir.path().join("dup-bin"),
+            "#!/bin/sh\necho SYSTEM_COPY\n",
+        );
+        write_executable(
+            &skill_dir.path().join("dup-bin"),
+            "#!/bin/sh\necho SKILL_COPY\n",
+        );
+
+        // The system copy sits earlier on the PATH than the skill's copy
+        // would be.
+        let mut entries = vec![system_dir.path().to_path_buf()];
+        entries.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(entries).expect("join paths");
+        let _path = crate::test_env::EnvGuard::set("PATH", &path);
+
+        let tool = ShellTool::new(policy_allowing(&["dup-bin"]), test_runtime())
+            .with_skill_tool_dirs(vec![skill_dir.path().to_path_buf()]);
+        let res = tool
+            .execute(json!({"command": "dup-bin"}))
+            .await
+            .expect("command should return a result");
+        assert!(res.success, "the command must run: {res:?}");
+        assert!(
+            res.output.contains("SYSTEM_COPY"),
+            "the binary earlier on the PATH must win over the skill's copy: {res:?}"
+        );
+        assert!(
+            !res.output.contains("SKILL_COPY"),
+            "the skill's copy must not have run: {res:?}"
+        );
+    }
+
+    /// The `PATH` a skill entry sets in the config overlay is kept, and the
+    /// loaded skills' own tools directories come after it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_path_set_by_a_skill_entry_env_is_kept_with_the_directories_after_it() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let overlay_dir = tempfile::tempdir().expect("temp dir");
+        let skill_dir = tempfile::tempdir().expect("temp dir");
+        // Only in the overlay's directory: it is reachable only if the
+        // overlay's PATH is the one the child gets.
+        write_executable(
+            &overlay_dir.path().join("overlay-bin"),
+            "#!/bin/sh\necho OVERLAY_COPY\n",
+        );
+        // In both: the overlay's copy must win, because the skill's
+        // directory comes after the overlay's PATH.
+        write_executable(
+            &overlay_dir.path().join("shared-bin"),
+            "#!/bin/sh\necho OVERLAY_SHARED\n",
+        );
+        write_executable(
+            &skill_dir.path().join("shared-bin"),
+            "#!/bin/sh\necho SKILL_SHARED\n",
+        );
+        // Only in the skill's directory: it is reachable only if the
+        // directory was appended to the overlay's PATH.
+        write_executable(
+            &skill_dir.path().join("skill-bin"),
+            "#!/bin/sh\necho SKILL_COPY\n",
+        );
+
+        let mut skill_env = std::collections::HashMap::new();
+        skill_env.insert(
+            "PATH".to_string(),
+            overlay_dir.path().to_string_lossy().into_owned(),
+        );
+        let tool = ShellTool::with_skill_env(
+            policy_allowing(&["overlay-bin", "shared-bin", "skill-bin"]),
+            test_runtime(),
+            skill_env,
+        )
+        .with_skill_tool_dirs(vec![skill_dir.path().to_path_buf()]);
+
+        let res = tool
+            .execute(json!({"command": "overlay-bin"}))
+            .await
+            .expect("command should return a result");
+        assert!(res.success, "the command must run: {res:?}");
+        assert!(
+            res.output.contains("OVERLAY_COPY"),
+            "the PATH the skill entry set must be kept: {res:?}"
+        );
+
+        let res = tool
+            .execute(json!({"command": "skill-bin"}))
+            .await
+            .expect("command should return a result");
+        assert!(res.success, "the command must run: {res:?}");
+        assert!(
+            res.output.contains("SKILL_COPY"),
+            "the skill's own directory must be on the child's PATH: {res:?}"
+        );
+
+        let res = tool
+            .execute(json!({"command": "shared-bin"}))
+            .await
+            .expect("command should return a result");
+        assert!(res.success, "the command must run: {res:?}");
+        assert!(
+            res.output.contains("OVERLAY_SHARED"),
+            "the skill's directory must come after the PATH the skill entry set: {res:?}"
+        );
+        assert!(
+            !res.output.contains("SKILL_SHARED"),
+            "the skill's copy must not have run: {res:?}"
         );
     }
 

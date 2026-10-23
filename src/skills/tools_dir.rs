@@ -130,6 +130,11 @@ pub(crate) fn resolve_target_dir(target_dir: Option<&str>, skill_name: &str) -> 
 /// A skill whose name is not a single path component has no directory at
 /// all: that is the whole isolation guarantee — no directory, no `PATH`
 /// entry, nothing to reach.
+///
+/// The directories of the skills a session loaded are also **appended** to
+/// the `PATH` of the child the agent's `shell` tool runs, so a binary an
+/// install recipe put there is reachable by name. Appended, not prepended:
+/// a skill binary can never shadow a system binary such as `git`.
 pub(crate) fn skill_tool_dirs(skill: &Skill) -> Vec<PathBuf> {
     let Some(base) = tools_base_dir(&skill.name) else {
         return Vec::new();
@@ -144,6 +149,32 @@ pub(crate) fn skill_tool_dirs(skill: &Skill) -> Vec<PathBuf> {
         };
         if !dirs.contains(&dir) {
             dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// The tools directories of every skill in `skills`, de-duplicated and in
+/// the order the skills give them.
+///
+/// One list for a whole session: the agent's shell puts these on the
+/// child's `PATH`, so a binary an install recipe put in a skill's own
+/// tools directory is reachable by name. The per-skill rules stay in
+/// [`skill_tool_dirs`], so the narrowed `target_dir` rule and the plain
+/// component name check live in one place — a skill whose name is not
+/// one path component contributes no directory at all.
+///
+/// One entry can be relative: when the data directory cannot be resolved
+/// the base is `.rantaiclaw/tools/<skill name>`, and on the child's `PATH`
+/// a relative entry resolves against the child's working directory (the
+/// workspace), not against the agent's.
+pub(crate) fn skill_tool_dirs_for_skills(skills: &[Skill]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for skill in skills {
+        for dir in skill_tool_dirs(skill) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
         }
     }
     dirs
@@ -200,6 +231,10 @@ fn executable_in(dir: &Path, bin: &str) -> Option<PathBuf> {
 /// `PATH`, so the directories are prepended rather than appended. Only the
 /// child that runs this skill's tool sees this value — the process-wide
 /// `PATH` is never changed, and no other skill's directory is included.
+///
+/// The agent's `shell` tool is the other side of the same coin: it carries
+/// the loaded skills' directories **appended**, so the same binary is
+/// reachable from a plain shell call without ever shadowing a system binary.
 pub(crate) fn skill_path_env(skill: &Skill) -> OsString {
     let mut paths = skill_tool_dirs(skill);
     if let Some(parent) = std::env::var_os("PATH") {
@@ -615,6 +650,42 @@ mod tests {
                     .iter()
                     .any(|entry| entry.starts_with(data.join("rantaiclaw/tools"))),
                 "the child's PATH must carry no tools directory: {entries:?}"
+            );
+        });
+    }
+
+    /// The list of tools directories is de-duplicated and stable: a
+    /// directory two skills would contribute appears once, and the order
+    /// the skills are given in is the order the directories come in.
+    #[test]
+    fn the_tools_directory_list_is_de_duplicated_and_stable() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        with_data_home(|data| {
+            let first = skill_with("first-skill", vec![]);
+            let second = skill_with("second-skill", vec![download_recipe(Some("bin"))]);
+            let dirs = skill_tool_dirs_for_skills(&[first.clone(), second.clone(), first.clone()]);
+            assert_eq!(
+                dirs,
+                vec![
+                    data.join("rantaiclaw/tools/first-skill"),
+                    data.join("rantaiclaw/tools/second-skill"),
+                    data.join("rantaiclaw/tools/second-skill/bin"),
+                ],
+                "every directory must be listed once, in the order the skills give them"
+            );
+        });
+    }
+
+    /// A skill whose name is not a plain path component contributes no
+    /// directory to the list: it has no tools directory of its own.
+    #[test]
+    fn a_name_that_is_not_a_plain_component_contributes_no_directory_to_the_list() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        with_data_home(|_| {
+            let skill = skill_with("victim/../victim", vec![]);
+            assert!(
+                skill_tool_dirs_for_skills(&[skill]).is_empty(),
+                "a skill without a tools directory must contribute none"
             );
         });
     }
