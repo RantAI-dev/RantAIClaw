@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **ctutils 0.4.4, for RUSTSEC-2026-0385.** The lockfile takes `ctutils` 0.4.2 → 0.4.4. The
+  `ctutils::Choice` mask generators are `const fn`, so before 0.4.4 the generated code could
+  branch on the secret value on common platforms, and the `u128` comparisons could branch on
+  32-bit targets; 0.4.4 removes those branches and checks the generated code with BINSEC.
+  Reached via `crypto-bigint` ← `elliptic-curve` / `rsa` ← `russh`, so the default build (the
+  `ssh` tool) is affected. No config key and no behaviour of RantaiClaw itself changed.
+  `Cargo.lock` only.
 - An approval reply that names a request handle typed for an expired or unknown request approved the unrelated pending request when exactly one was still pending in the same chat. The relay now refuses that path and answers the reply itself: nothing pending matches the token, and the reply lists what is still answerable in this chat — whichever verb carries the handle (`approve`, `allow`, `y`, `n`, with or without a `--persist` tail). A `/approve` or `/deny` reply that names no pending request is also answered by the relay instead of being forwarded to the model. A reply that names a command (`/approve kubectl`) no longer resolves anything — the request handle or the exact tool name does; 0.33.0-alpha resolved such a reply when one request was pending.
 - On the prompt (XML) tool protocol, a tool's output could close its `<tool_result>` frame and inject text the model read as a separate result; the output and the frame's attribute values are now escaped so each result stays one frame. MCP tool output had no size limit; it is now capped at 1 MiB with a marker saying how many bytes were dropped.
 - The shell, `pty`, `ssh exec`, skill tools and cron jobs refuse a command that names a credential
