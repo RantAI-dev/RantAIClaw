@@ -559,8 +559,16 @@ fn classify_systemctl(code: Option<i32>, unit: &str) -> ProbeOutcome {
 /// unit exists and is running, `show` says what it runs. A manager that does
 /// not answer yields [`ProbeOutcome::Indeterminate`] and the second query is
 /// not made: a unit that was never found has no `ExecStart` to read.
+///
+/// The dev-build guard sits here, at the spawn, so this helper is safe on its
+/// own rather than only through its caller. A refused probe proves nothing
+/// about the unit, so it is [`ProbeOutcome::Indeterminate`] — the caller reads
+/// that as "registration status unknown", not as "not registered".
 #[cfg(target_os = "linux")]
 fn probe_systemd(unit: &str) -> ProbeOutcome {
+    if is_dev_build() {
+        return ProbeOutcome::Indeterminate;
+    }
     let outcome = match std::process::Command::new("systemctl")
         .args(["--user", "status", unit])
         .output()
@@ -685,6 +693,35 @@ mod tests {
         let _fake = crate::test_env::FakeServiceManager::new();
         let registration = detect_registration_detailed("default");
         assert_eq!(registration, Registration::DevBuild);
+    }
+
+    /// The probe helper must be safe on its own, not only because its caller
+    /// short-circuits first: a debug or test build must not spawn the service
+    /// manager from `probe_systemd`, and a refused probe must not read as
+    /// "absent" — the operator would be told to install a unit that may
+    /// already be there. It proves nothing, so it is indeterminate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_systemd_refuses_to_spawn_in_a_dev_build() {
+        use crate::service::is_dev_build;
+        assert!(
+            is_dev_build(),
+            "this test only proves its point under a debug/test build"
+        );
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let fake = crate::test_env::FakeServiceManager::new();
+        let outcome = probe_systemd("rantaiclaw.service");
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Indeterminate,
+            "a refused probe proves nothing about the unit"
+        );
+        let log = fake.dir.path().join("systemctl.log");
+        assert!(
+            !log.exists(),
+            "fake systemctl must not be reached; call log at {}",
+            log.display()
+        );
     }
 
     // ── The scheduler check ─────────────────────────────────────────
