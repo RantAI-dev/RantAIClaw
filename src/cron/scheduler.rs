@@ -1077,16 +1077,22 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match Command::new("sh")
-        .arg("-lc")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-lc")
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+
+    // The same cleared environment the agent's `shell` tool gives a command:
+    // a job that inherited the daemon's environment would hand the model
+    // every secret the daemon holds, and the model reads the output back.
+    let env = crate::tools::agent_shell_env(&config.workspace_dir, config);
+    crate::tools::shell::apply_safe_env(&mut cmd, &env.overlay, &env.tool_dirs);
+
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => return (false, format!("spawn error: {e}")),
     };
@@ -1150,6 +1156,7 @@ mod tests {
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::json;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Config {
@@ -1679,6 +1686,120 @@ mod tests {
             "low-risk allowlisted command must still run: {output}"
         );
         assert!(output.contains("scheduled-ok"));
+    }
+
+    // ── the environment a shell job runs with ──────────────────────────────
+    //
+    // A shell job's child sees the same cleared environment the agent's
+    // `shell` tool gives a command: nothing from the daemon's own environment
+    // except the allowlisted names in `SAFE_ENV_VARS`, then the per-skill env
+    // overlay, then the loaded skills' tools directories on the child's `PATH`.
+    // The model can create a shell job through `cron_add` and read the output
+    // back through `cron_runs`, so an inherited secret is a secret the model
+    // can read.
+
+    /// The regression test: a shell job must not inherit the daemon's
+    /// environment. `RANTAICLAW_TEST_JOB_SECRET` is not in `SAFE_ENV_VARS`,
+    /// so the child must not see it — before the fix the child inherited the
+    /// daemon's whole environment and the marker came back in the output the
+    /// model reads.
+    #[tokio::test]
+    async fn a_shell_job_does_not_inherit_the_daemons_environment() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _secret = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_TEST_JOB_SECRET",
+            "rantaiclaw-job-secret-marker",
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("echo $RANTAICLAW_TEST_JOB_SECRET");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success, "the job ran: {output}");
+        assert!(
+            !output.contains("rantaiclaw-job-secret-marker"),
+            "a shell job must not inherit the daemon's environment: {output}"
+        );
+    }
+
+    /// A variable whose name IS in `SAFE_ENV_VARS` still reaches the job.
+    ///
+    /// `TERM` rather than `LANG`: the job runs through `sh -lc`, and a login
+    /// shell rewrites `LANG` from `/etc/profile.d` on a stock Ubuntu image, so
+    /// `LANG` would not survive even with the allowlist in place.
+    #[tokio::test]
+    async fn a_shell_job_still_gets_the_safe_environment_variables() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _term = crate::test_env::EnvGuard::set("TERM", "rantaiclaw-safe-env-marker");
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("echo $TERM");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success, "the job ran: {output}");
+        assert!(
+            output.contains("rantaiclaw-safe-env-marker"),
+            "an allowlisted variable must still reach the job: {output}"
+        );
+    }
+
+    /// A variable from `[skills.entries.<n>].env` reaches the job, exactly as
+    /// it reaches a command the agent's `shell` tool runs.
+    #[tokio::test]
+    async fn a_shell_job_gets_the_skill_entry_environment_overlay() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.skills.entries.insert(
+            "env-probe".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: true,
+                api_key: None,
+                env: HashMap::from([(
+                    "RANTAICLAW_TEST_SKILL_ENV".to_string(),
+                    "rantaiclaw-skill-env-marker".to_string(),
+                )]),
+                config: HashMap::new(),
+            },
+        );
+        let job = test_job("echo $RANTAICLAW_TEST_SKILL_ENV");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success, "the job ran: {output}");
+        assert!(
+            output.contains("rantaiclaw-skill-env-marker"),
+            "the per-skill env overlay must reach the job: {output}"
+        );
+    }
+
+    /// The manual-run path gets the same environment as the scheduled path:
+    /// both dispatch through `run_job_command`.
+    #[tokio::test]
+    async fn a_manual_run_gets_the_same_environment_as_a_scheduled_run() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _secret = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_TEST_JOB_SECRET",
+            "rantaiclaw-job-secret-marker",
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo $RANTAICLAW_TEST_JOB_SECRET")
+            .expect("add the job");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_manual(&config, &security, &job, None, None).await;
+        assert!(success, "the manual run succeeded: {output}");
+        assert!(
+            !output.contains("rantaiclaw-job-secret-marker"),
+            "a manual run must not inherit the daemon's environment either: {output}"
+        );
     }
 
     #[tokio::test]

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A scheduled shell job ran with the daemon's whole environment.** The cron
+  scheduler spawned the job's command with no `env_clear()`, so the child inherited
+  every variable the daemon holds — a provider API key, a channel token. The model
+  could schedule such a job itself through the `cron_add` tool and read the output
+  back through `cron_runs` or the job's `last_output`, so every daemon-held secret
+  was readable by the model. A shell job now runs with the same cleared environment
+  the agent's `shell` tool gives a command: an empty environment, then only the
+  allowlisted functional variables in `SAFE_ENV_VARS`, then the
+  `[skills.entries.<n>]` env overlay, then the loaded skills' own tools directories
+  appended to the child's `PATH`. `SAFE_ENV_VARS` is unchanged and the agent's
+  `shell` tool behaves exactly as before. This holds for every shell job,
+  operator-created ones included — `created_by` cannot separate them reliably, so
+  it is not used — and for every way a job is run (the scheduler, `cron run`, the
+  `cron_run` tool, the gateway route, the TUI), because all of them dispatch
+  through the same function. An operator job that needs a secret reads it itself:
+  `sh -c '. ~/.config/myjob.env && mycmd'`. No config key changed and nothing
+  migrates, so rolling back means reverting this change. One limit remains: the
+  job runs through `sh -lc`, a login shell, so it still sources the operator's own
+  `/etc/profile` and `~/.profile`; the agent's `shell` tool runs a non-login shell
+  and does not source profiles. Those files are readable by the agent's shell
+  anyway, so this does not widen what the model can reach, but the two are not
+  byte-identical.
 - **ctutils 0.4.4, for RUSTSEC-2026-0385.** The lockfile takes `ctutils` 0.4.2 → 0.4.4. The
   `ctutils::Choice` mask generators are `const fn`, so before 0.4.4 the generated code could
   branch on the secret value on common platforms, and the `u128` comparisons could branch on
