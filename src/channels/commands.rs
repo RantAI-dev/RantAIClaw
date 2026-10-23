@@ -1134,7 +1134,7 @@ mod tests {
             vec![channel_dyn.clone()],
             provider_impl.clone(),
             super::super::test_support::seeded_defaults_slot(
-                crate::approval::policy_writer::PolicyPreset::Strict,
+                Some(crate::approval::policy_writer::PolicyPreset::Strict),
                 crate::approval::GuestGate::new(&[], &[]),
             ),
         );
@@ -1241,7 +1241,7 @@ mod tests {
             vec![channel_dyn.clone()],
             provider_impl.clone(),
             super::super::test_support::seeded_defaults_slot(
-                crate::approval::policy_writer::PolicyPreset::Strict,
+                Some(crate::approval::policy_writer::PolicyPreset::Strict),
                 crate::approval::GuestGate::new(&[], &[]),
             ),
         );

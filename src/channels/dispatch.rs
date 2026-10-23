@@ -1177,14 +1177,14 @@ pub(crate) async fn process_channel_message(
     let safety_section = if sender_is_owner {
         crate::agent::prompt::render_safety_section(
             safety_surface,
-            Some(runtime_defaults.autonomy_preset),
+            runtime_defaults.autonomy_preset,
             ctx.tools_registry.as_ref(),
             &[],
         )
     } else {
         crate::agent::prompt::render_guest_safety_section(
             safety_surface,
-            Some(runtime_defaults.autonomy_preset),
+            runtime_defaults.autonomy_preset,
             &guest_turn_tools,
         )
     };

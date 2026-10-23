@@ -1752,16 +1752,13 @@ async fn main() -> Result<()> {
                 const W: usize = 9;
                 let current = policy_writer::read_active_preset(&profile.policy_dir());
                 cli_style::section("autonomy");
-                match current {
-                    Some(p) => {
-                        cli_style::field("Preset", W, &format!("{} ({})", p.label(), p.id()));
-                    }
-                    None => cli_style::field(
-                        "Preset",
-                        W,
-                        "not provisioned — run `rantaiclaw setup approvals`",
-                    ),
-                }
+                // The preset is whatever the marker says — the same helper
+                // `status` uses, so the two surfaces cannot disagree.
+                cli_style::field(
+                    "Preset",
+                    W,
+                    &cli_style::autonomy_preset_text(&profile.policy_dir()),
+                );
                 cli_style::field("Enforced", W, &format!("{enforced:?}  (config.toml)"));
                 if let Some(p) = current {
                     if p.autonomy_level() != enforced {
@@ -1945,13 +1942,16 @@ async fn main() -> Result<()> {
             cli_style::field("Observ.", W, &config.observability.backend.to_string());
             // Show the preset, not just the level: Manual and Smart are both
             // `Supervised` and differ only in `always_ask`, so the level alone
-            // can't say whether a shell command will prompt.
-            let autonomy_preset =
-                crate::approval::policy_writer::preset_for_autonomy(&config.autonomy);
+            // can't say whether a shell command will prompt. The preset comes
+            // from the on-disk marker through the same helper `autonomy` uses,
+            // so the two surfaces cannot disagree — and a profile that never
+            // chose a preset reads as unset, not as the config's default.
+            let policy_dir = profile::ProfileManager::active()?.policy_dir();
+            cli_style::field("Autonomy", W, &cli_style::autonomy_preset_text(&policy_dir));
             cli_style::field(
-                "Autonomy",
+                "Enforced",
                 W,
-                &format!("{} ({:?})", autonomy_preset.id(), config.autonomy.level),
+                &format!("{:?}  (config.toml)", config.autonomy.level),
             );
             cli_style::field("Runtime", W, &config.runtime.kind.to_string());
             cli_style::field(

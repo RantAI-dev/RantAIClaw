@@ -485,9 +485,9 @@ impl Provider for NativeSpecRecorder {
 
 /// A runtime-defaults slot seeded with `preset` and `guest_gate`, so a turn
 /// reads them from the reloaded state the way a daemon that has applied its
-/// config does.
+/// config does. `preset` is `None` for a profile that chose no preset.
 pub(super) fn seeded_defaults_slot(
-    preset: crate::approval::policy_writer::PolicyPreset,
+    preset: Option<crate::approval::policy_writer::PolicyPreset>,
     guest_gate: crate::approval::GuestGate,
 ) -> routing::RuntimeConfigSlot {
     routing::RuntimeConfigSlot {
@@ -542,7 +542,7 @@ pub(super) fn guest_turn_context(
     let mut ctx = dispatch_ctx(
         vec![channel],
         provider,
-        seeded_defaults_slot(preset, gate_of(reloaded_gate)),
+        seeded_defaults_slot(Some(preset), gate_of(reloaded_gate)),
     );
     {
         let inner = Arc::get_mut(&mut ctx).expect("the context is not shared yet");

@@ -326,8 +326,12 @@ pub fn sync_config_to_active_preset(policy_dir: &Path, config: &mut crate::confi
 /// Returns `None` if the file is missing, unparseable, or the
 /// `[autonomy].preset` field is absent — all of which mean "the policy
 /// dir hasn't been provisioned yet" (the user is pre-onboarding) rather
-/// than an error worth surfacing. Callers should treat `None` as
-/// "Smart-equivalent unknown" for display purposes.
+/// than an error worth surfacing.
+///
+/// `None` means "no preset was chosen". The config cannot tell an unset
+/// preset from the default, so a caller that substitutes a preset here
+/// names a policy the user never selected — report the state as unset
+/// instead.
 pub fn read_active_preset(policy_dir: &Path) -> Option<PolicyPreset> {
     let raw = fs::read_to_string(policy_dir.join("autonomy.toml")).ok()?;
     let table: toml::value::Table = toml::from_str(&raw).ok()?;

@@ -181,7 +181,15 @@ pub(crate) fn resolved_default_model(config: &Config) -> String {
     config.default_model.clone().unwrap_or_default()
 }
 
-pub(crate) fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
+/// Build the runtime defaults from a loaded config.
+///
+/// `policy_dir` is the profile's policy dir — the one that holds the on-disk
+/// marker (`autonomy.toml`) saying which approval preset the profile chose.
+/// It is `None` when no profile could be resolved, which means no preset.
+pub(crate) fn runtime_defaults_from_config(
+    config: &Config,
+    policy_dir: Option<&Path>,
+) -> ChannelRuntimeDefaults {
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
@@ -194,7 +202,10 @@ pub(crate) fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDef
         guest_gate: Arc::new(guest_gate_from_config(config)),
         allowed_commands: Arc::new(config.autonomy.allowed_commands.clone()),
         autonomy_level: config.autonomy.level,
-        autonomy_preset: crate::approval::policy_writer::preset_for_autonomy(&config.autonomy),
+        // The preset is whatever the marker says. The config cannot tell "no
+        // preset was chosen" from "the default", so deriving it from the
+        // config named a preset for a profile that never chose one.
+        autonomy_preset: policy_dir.and_then(crate::approval::policy_writer::read_active_preset),
         allowlists: Arc::new(channel_allowlists(&config.channels_config)),
         message_timeout_secs: effective_channel_message_timeout_secs(
             config.channels_config.message_timeout_secs,
@@ -222,15 +233,15 @@ pub(crate) fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelR
         }
         // No state loaded: everything below is synthesised. In production
         // `start_channels` always seeds this, so reaching here means the runtime
-        // is answering messages against a *guessed* autonomy preset that the
-        // live gate is not enforcing. Say so — but once, since this is consulted
-        // per message.
+        // is answering messages against boot-time context values while the live
+        // gate enforces something else. Say so — but once, since this is
+        // consulted per message.
         if !slot.fallback_warned {
             slot.fallback_warned = true;
             tracing::warn!(
                 "Channel runtime has no loaded config state; falling back to \
-                 boot-time context values and a guessed autonomy preset. The \
-                 enforced policy is whatever SecurityPolicy holds, not this."
+                 boot-time context values. The enforced policy is whatever \
+                 SecurityPolicy holds, not this."
             );
         }
     }
@@ -276,23 +287,14 @@ pub(crate) fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelR
         // cannot widen anything.
         thread_replies: Arc::new(HashMap::new()),
         autonomy_level: ctx.security.effective_autonomy(),
-        // Fallback path only (the store has no entry — ad-hoc/tests). The
-        // live policy carries the enforced level but not `always_ask`, which
-        // is what separates Manual from Smart, so Supervised resolves to the
-        // stricter of the two. Production goes through
-        // `runtime_defaults_from_config`, which has the full config and
-        // resolves the preset exactly.
-        autonomy_preset: match ctx.security.effective_autonomy() {
-            crate::security::AutonomyLevel::ReadOnly => {
-                crate::approval::policy_writer::PolicyPreset::Strict
-            }
-            crate::security::AutonomyLevel::Full => {
-                crate::approval::policy_writer::PolicyPreset::Off
-            }
-            crate::security::AutonomyLevel::Supervised => {
-                crate::approval::policy_writer::PolicyPreset::Manual
-            }
-        },
+        // No preset. This is the fallback for a context with no config state,
+        // and production always seeds the store (`start_channels`), so the
+        // store's marker-named preset is what the prompt renders there. The
+        // marker is reachable here through `ctx.security.policy_dir`, but a
+        // preset named on the fallback would be free to disagree with the
+        // enforced level above, which comes from
+        // `ctx.security.effective_autonomy()`.
+        autonomy_preset: None,
     }
 }
 
@@ -333,8 +335,15 @@ pub(crate) async fn config_file_stamp(path: &Path) -> Result<ConfigFileStamp> {
     })
 }
 
+/// Load the runtime defaults from a config file on disk.
+///
+/// `policy_dir` is the profile's policy dir — the one holding the on-disk
+/// marker that says which approval preset the profile chose. It is passed in
+/// rather than resolved here so the reload reads the same profile the runtime
+/// is bound to.
 pub(crate) async fn load_runtime_defaults_from_config_file(
     path: &Path,
+    policy_dir: Option<&Path>,
 ) -> Result<(ChannelRuntimeDefaults, crate::config::AutonomyConfig)> {
     // Use the shared, side-effect-free loader so this reload path decrypts EVERY
     // secret (not just `api_key`) and runs the migration chain — it previously
@@ -345,7 +354,7 @@ pub(crate) async fn load_runtime_defaults_from_config_file(
     // Hand back the whole `[autonomy]` section, not just the two fields the
     // couriers used to carry: `apply_config` refreshes all eight at once.
     let autonomy = parsed.autonomy.clone();
-    Ok((runtime_defaults_from_config(&parsed), autonomy))
+    Ok((runtime_defaults_from_config(&parsed, policy_dir), autonomy))
 }
 
 pub(crate) async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -389,7 +398,8 @@ pub(crate) async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContex
     }
 
     let (next_defaults, next_autonomy) =
-        load_runtime_defaults_from_config_file(&config_path).await?;
+        load_runtime_defaults_from_config_file(&config_path, ctx.security.policy_dir.as_deref())
+            .await?;
     // Snapshot the currently-applied defaults BEFORE we overwrite the store, so we
     // can tell whether the operator actually changed the provider/model.
     let prev_defaults = runtime_defaults_snapshot(ctx);

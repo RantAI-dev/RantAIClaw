@@ -82,7 +82,7 @@ mod recording {
             vec![channel_dyn],
             provider_impl.clone(),
             seeded_defaults_slot(
-                crate::approval::policy_writer::PolicyPreset::Strict,
+                Some(crate::approval::policy_writer::PolicyPreset::Strict),
                 crate::approval::GuestGate::new(&[], &[]),
             ),
         );
@@ -178,7 +178,7 @@ mod recording {
             vec![channel_dyn],
             provider_impl.clone(),
             seeded_defaults_slot(
-                crate::approval::policy_writer::PolicyPreset::Strict,
+                Some(crate::approval::policy_writer::PolicyPreset::Strict),
                 crate::approval::GuestGate::new(&[], &[]),
             ),
         );
@@ -4978,7 +4978,7 @@ impl CommandChat {
             vec![as_channel],
             provider.clone(),
             seeded_defaults_slot(
-                crate::approval::policy_writer::PolicyPreset::Manual,
+                Some(crate::approval::policy_writer::PolicyPreset::Manual),
                 gate_of(&[]),
             ),
         );

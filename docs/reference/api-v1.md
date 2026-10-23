@@ -124,6 +124,7 @@ tokens, session ids, or paths.
     "model": "some-model-id",
     "memory_backend": "...",
     "autonomy": "Supervised",
+    "autonomy_preset": null,
     "workspace_dir": "/path/to/workspace",
     "paired": true,
     "runtime": {
@@ -143,6 +144,11 @@ tokens, session ids, or paths.
   `runtime` is `crate::health::snapshot_json()` — a process health snapshot
   keyed by component name; the shape above is confirmed from its own test
   assertions, not enumerated exhaustively in `api_v1.rs`.
+  `autonomy_preset` names the approval preset the profile chose, read from
+  `<profile>/policy/autonomy.toml` — one of `manual`, `smart`, `strict`, `off` —
+  and it is `null` when the profile has no preset. The `autonomy` level alone
+  cannot tell Manual from Smart: both are `Supervised` and differ only in
+  `always_ask`.
 - **Status codes**: `200`, `401`.
 
 ### GET /api/v1/doctor
