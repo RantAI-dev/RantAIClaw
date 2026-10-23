@@ -309,7 +309,7 @@ ClawHub serves a skill one file at a time, each with its own `sha256` in the ver
 
 This applies to `skills install` and `skills update` only. A skill already on disk is never re-verified, changed or removed because of it, and `skills update` of an installed skill to such a version fails while keeping the installed version.
 
-Skill manifests (`SKILL.md`) support YAML frontmatter, `requires` gating, environment injection, and `metadata.clawdbot.install[]` recipes. `install-deps` runs the preferred host recipe (`brew`, `uv`, Node package managers, `go`, or `download`) and validates declared binaries afterward. It exits 0 only when every targeted skill has every required binary on `$PATH` afterwards, and non-zero otherwise — including when a skill declares no recipe for a missing binary. A failing recipe reports the tool's exit status and the last lines of its error output.
+Skill manifests (`SKILL.md`) support YAML frontmatter, `requires` gating, environment injection, and `metadata.clawdbot.install[]` recipes. `install-deps` runs the preferred host recipe (`brew`, `uv`, Node package managers, `go`, or `download`) and validates declared binaries afterward. It exits 0 only when every targeted skill has every required binary reachable afterwards — in that skill's own tools directory or on `$PATH` — and non-zero otherwise, including when a skill declares no recipe for a missing binary. A failing recipe reports the tool's exit status and the last lines of its error output.
 
 In the TUI, `/skills` opens the local skills picker. Press `Ctrl+I` (or Tab in terminals that send Ctrl+I as Tab) on a gated skill row to run its install-deps recipe without leaving the picker.
 

@@ -7,7 +7,8 @@
 //! 2. Filter recipes that don't actually provide any of the missing bins.
 //! 3. Sort by preference: brew → uv → npm → go → download (configurable).
 //! 4. Pick the first eligible recipe.
-//! 5. Run it. Validate that all `bins[]` now exist on `$PATH`.
+//! 5. Run it. Validate that all `bins[]` now exist — in the skill's own
+//!    tools directory or on `$PATH`.
 //!
 //! Each recipe kind shells out to its native tool — we never bundle a
 //! package manager, just orchestrate. If a recipe's tool is missing
@@ -19,7 +20,7 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use super::{Skill, SkillInstallRecipe};
+use super::{tools_dir, Skill, SkillInstallRecipe};
 
 /// Outcome of a single `install-deps` invocation. Reported to the user.
 #[derive(Debug)]
@@ -103,7 +104,7 @@ pub fn install_deps_for_with_prefs(
         .requires
         .bins
         .iter()
-        .filter(|b| which::which(b).is_err())
+        .filter(|b| tools_dir::resolve_required_bin(skill, b.as_str()).is_none())
         .cloned()
         .collect();
 
@@ -173,7 +174,7 @@ pub fn install_deps_for_with_prefs(
         .requires
         .bins
         .iter()
-        .filter(|b| which::which(b).is_err())
+        .filter(|b| tools_dir::resolve_required_bin(skill, b.as_str()).is_none())
         .cloned()
         .collect();
 
@@ -258,7 +259,7 @@ fn pick_preferred_with_prefs<'a>(
     ranked
 }
 
-fn run_recipe(recipe: &SkillInstallRecipe, slug: &str, progress: bool) -> Result<()> {
+fn run_recipe(recipe: &SkillInstallRecipe, skill_name: &str, progress: bool) -> Result<()> {
     match recipe.kind.as_str() {
         "brew" => run_brew(recipe, progress),
         "uv" => run_uv(recipe, progress),
@@ -266,7 +267,7 @@ fn run_recipe(recipe: &SkillInstallRecipe, slug: &str, progress: bool) -> Result
         "pnpm" => run_pnpm(recipe, progress),
         "yarn" => run_yarn(recipe, progress),
         "go" => run_go(recipe, progress),
-        "download" => run_download(recipe, slug, progress),
+        "download" => run_download(recipe, skill_name, progress),
         other => bail!("unsupported install kind `{other}`"),
     }
 }
@@ -331,34 +332,6 @@ fn run_go(recipe: &SkillInstallRecipe, progress: bool) -> Result<()> {
     run_subprocess("go", &["install", module], progress)
 }
 
-/// Resolve the directory a `download` recipe may write into.
-///
-/// The base is always `<data>/tools/<slug>/` (the historical default). A
-/// recipe MAY narrow to a subdirectory by supplying a **relative**
-/// `target_dir` with no parent (`..`) components; an absolute path or any
-/// `..` is rejected so an untrusted recipe cannot escape the base (e.g.
-/// dropping an executable into `~/.local/bin` to hijack `$PATH`).
-fn resolve_target_dir(target_dir: Option<&str>, slug: &str) -> Result<PathBuf> {
-    let base = directories::ProjectDirs::from("", "", "rantaiclaw")
-        .map(|d| d.data_dir().join("tools").join(slug))
-        .unwrap_or_else(|| PathBuf::from(format!(".rantaiclaw/tools/{slug}")));
-
-    let Some(raw) = target_dir else {
-        return Ok(base);
-    };
-    let rel = Path::new(raw);
-    if rel.is_absolute() {
-        bail!("download recipe target_dir must be relative, got absolute `{raw}`");
-    }
-    for comp in rel.components() {
-        match comp {
-            Component::Normal(_) | Component::CurDir => {}
-            _ => bail!("download recipe target_dir `{raw}` has a forbidden path component"),
-        }
-    }
-    Ok(base.join(rel))
-}
-
 /// Verify a body against its hex-encoded SHA-256. Comparison is case-insensitive.
 fn verify_sha256(body: &[u8], expected_hex: &str) -> Result<()> {
     use sha2::{Digest, Sha256};
@@ -371,12 +344,16 @@ fn verify_sha256(body: &[u8], expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_download(recipe: &SkillInstallRecipe, slug: &str, progress: bool) -> Result<()> {
+fn run_download(recipe: &SkillInstallRecipe, skill_name: &str, progress: bool) -> Result<()> {
     let url = recipe
         .url
         .as_ref()
         .ok_or_else(|| anyhow!("download recipe missing `url`"))?;
-    let target_dir = resolve_target_dir(recipe.target_dir.as_deref(), slug)?;
+    // `tools_dir::resolve_target_dir` owns the rule, so the writer and the
+    // reader of that directory cannot drift apart: an absolute `target_dir`
+    // or one with a `..` component is rejected, and the lookup that looks
+    // for the installed binary never looks there.
+    let target_dir = tools_dir::resolve_target_dir(recipe.target_dir.as_deref(), skill_name)?;
     std::fs::create_dir_all(&target_dir)
         .with_context(|| format!("create target dir {}", target_dir.display()))?;
 
@@ -442,7 +419,7 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str, progress: bool) -> Resu
     if progress {
         println!("  · placed in {}", target_dir.display());
         println!(
-            "  · ⚠ make sure `{}` is on your $PATH",
+            "  · ⚠ `{}` is in the skill's own tools directory — the skill finds the binary there",
             target_dir.display()
         );
     }
@@ -799,21 +776,21 @@ mod tests {
 
     #[test]
     fn target_dir_absolute_is_rejected() {
-        assert!(resolve_target_dir(Some("/home/x/.local/bin"), "demo").is_err());
-        assert!(resolve_target_dir(Some("/etc/cron.d"), "demo").is_err());
+        assert!(tools_dir::resolve_target_dir(Some("/home/x/.local/bin"), "demo").is_err());
+        assert!(tools_dir::resolve_target_dir(Some("/etc/cron.d"), "demo").is_err());
     }
 
     #[test]
     fn target_dir_parent_escape_is_rejected() {
-        assert!(resolve_target_dir(Some("../../bin"), "demo").is_err());
-        assert!(resolve_target_dir(Some("sub/../../escape"), "demo").is_err());
+        assert!(tools_dir::resolve_target_dir(Some("../../bin"), "demo").is_err());
+        assert!(tools_dir::resolve_target_dir(Some("sub/../../escape"), "demo").is_err());
     }
 
     #[test]
     fn target_dir_default_and_relative_subdir_are_allowed() {
-        let base = resolve_target_dir(None, "demo").unwrap();
+        let base = tools_dir::resolve_target_dir(None, "demo").unwrap();
         assert!(base.ends_with("tools/demo") || base.ends_with("demo"));
-        let sub = resolve_target_dir(Some("bin"), "demo").unwrap();
+        let sub = tools_dir::resolve_target_dir(Some("bin"), "demo").unwrap();
         assert!(sub.ends_with("demo/bin"));
     }
 

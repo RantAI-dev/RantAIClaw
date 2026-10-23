@@ -574,8 +574,9 @@ not — `validate_slug` runs first there.
   reflects only `[skills.entries.<name>] enabled` in `config.toml` (default
   `true`) — it's what the `PUT .../enabled` route below flips. `active` is
   `true` only when the skill is both enabled **and** its `requires` gates
-  (binaries on `$PATH`, env vars, OS) are met; `reasons` lists why it isn't,
-  with `"disabled in config.toml"` first when the config flag is off.
+  (binaries reachable on `$PATH` or in that skill's own tools directory, env
+  vars, OS) are met; `reasons` lists why it isn't, with
+  `"disabled in config.toml"` first when the config flag is off.
   Disabled/gated skills are still included in this list (previously they were
   silently dropped, which is why the console's toggle always looked "on").
 - **Status codes**: `200`, `401`.

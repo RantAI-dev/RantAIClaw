@@ -711,6 +711,45 @@ mod tests {
         assert!(!tool.description().is_empty());
     }
 
+    /// A plain shell call, outside any skill, must not reach a skill's own
+    /// tools directory. That directory is only ever put on the `PATH` of the
+    /// child that runs that skill's own tool.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plain_shell_call_cannot_run_a_binary_in_a_tools_directory() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let data = tempfile::tempdir().expect("temp dir");
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
+        let tools_dir = data.path().join("rantaiclaw/tools/plain-skill");
+        std::fs::create_dir_all(&tools_dir).expect("create tools dir");
+        let bin = tools_dir.join("skill-only-bin");
+        std::fs::write(&bin, "#!/bin/sh\necho skill-only-ran\n").expect("write bin");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod bin");
+        }
+
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        let res = tool
+            .execute(json!({"command": "skill-only-bin"}))
+            .await
+            .expect("command should return a result");
+        assert!(
+            !res.success,
+            "a plain shell call must not reach a skill's tools directory: {res:?}"
+        );
+        assert!(
+            !res.output.contains("skill-only-ran"),
+            "the skill's binary must not have run: {res:?}"
+        );
+        let error = res.error.unwrap_or_default();
+        assert!(
+            error.contains("not found"),
+            "the shell must be the one that could not find the binary, not a policy block: {error}"
+        );
+    }
+
     #[test]
     fn shell_tool_schema_has_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());

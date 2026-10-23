@@ -190,10 +190,11 @@ impl Tool for SkillsInstallDepsTool {
 
     fn description(&self) -> &str {
         "Run the install recipe (brew/uv/npm/go/download) for an already-\
-         installed skill whose declared binary dependencies aren't on \
-         $PATH. Pair with `skills_list` to find which skills are gated \
-         and on what bin. Requires user approval in supervised mode — \
-         the runner will shell out to brew / npm / etc."
+         installed skill whose declared binary dependencies are neither in \
+         the skill's own tools directory nor on $PATH. Pair with \
+         `skills_list` to find which skills are gated and on what bin. \
+         Requires user approval in supervised mode — the runner will shell \
+         out to brew / npm / etc."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -283,7 +284,8 @@ impl Tool for SkillsInstallDepsTool {
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "Skill `{}` already had its binaries on $PATH — nothing to install.",
+                        "Skill `{}` already had its binaries reachable — in its own \
+                         tools directory or on $PATH — nothing to install.",
                         o.skill
                     ),
                     error: None,
