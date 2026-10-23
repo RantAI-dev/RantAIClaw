@@ -289,6 +289,18 @@ fn entry_for<'a>(
         .map(|(_, v)| v)
 }
 
+/// Whether the config disables this skill by name.
+///
+/// One rule for every caller: `[skills.entries.<name>] enabled = false`
+/// disables the skill whose manifest name is `<name>` (matched
+/// case-insensitively, see [`entry_for`]). A skill the config says
+/// nothing about is not disabled.
+pub(crate) fn skill_disabled_in_config(config: &crate::config::Config, skill_name: &str) -> bool {
+    entry_for(&config.skills.entries, skill_name)
+        .map(|entry| !entry.enabled)
+        .unwrap_or(false)
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_with_open_skills_config(workspace_dir, None, None, None)
@@ -314,11 +326,9 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
     );
     raw.into_iter()
         .filter(|s| {
-            if let Some(entry) = entry_for(&config.skills.entries, &s.name) {
-                if !entry.enabled {
-                    tracing::debug!(skill = %s.name, "skipped: disabled in config.toml");
-                    return false;
-                }
+            if skill_disabled_in_config(config, &s.name) {
+                tracing::debug!(skill = %s.name, "skipped: disabled in config.toml");
+                return false;
             }
             let unmet = s.requires.unmet(s);
             if !unmet.is_empty() {
@@ -351,10 +361,8 @@ pub fn load_skills_with_status(
         .into_iter()
         .map(|s| {
             let mut reasons = s.requires.unmet(&s);
-            if let Some(entry) = entry_for(&config.skills.entries, &s.name) {
-                if !entry.enabled {
-                    reasons.insert(0, "disabled in config.toml".to_string());
-                }
+            if skill_disabled_in_config(config, &s.name) {
+                reasons.insert(0, "disabled in config.toml".to_string());
             }
             (s, reasons)
         })

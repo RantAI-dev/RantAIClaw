@@ -449,13 +449,48 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    // The skill block below reads ONE config: `root_config`, the profile
+    // config that carries `[skills.entries]`. The skill list, the
+    // enablement rule and the env overlay are all profile-level, so they
+    // come from one source and never from two: the tools themselves still
+    // take `config`.
     let skill_env = compose_skill_env(root_config);
+
+    // Skills declare `[[tools]]` blocks in SKILL.toml that become real
+    // callable shell/http tools. Every door builds its registry through this
+    // function, so the model can call a skill's tool wherever it talks.
+    //
+    // The STATUS loader is used, so a skill the config disabled and a skill
+    // gated by an unmet `requires` are both known here. The ACTIVE ones (no
+    // reasons) become the skill's own tools, exactly as before; every skill
+    // the config has NOT disabled contributes its tools directory to the
+    // agent shell's PATH, so a binary an install recipe put there is
+    // reachable by name. A gated skill counts: its directory is empty until
+    // `install-deps` fills it, and including it means an in-session
+    // `skills_install_deps` call works without a reload.
+    //
+    // The load sits here, above the shell, because the shell needs the
+    // directories. The adapters still go in BEFORE the delegate snapshot
+    // below, so a delegate sub-agent inherits them under its own
+    // `allowed_tools` filter.
+    let skills_with_status = crate::skills::load_skills_with_status(workspace_dir, root_config);
+    let active_skills: Vec<crate::skills::Skill> = skills_with_status
+        .iter()
+        .filter(|(_, reasons)| reasons.is_empty())
+        .map(|(skill, _)| skill.clone())
+        .collect();
+    let reachable_skills: Vec<crate::skills::Skill> = skills_with_status
+        .iter()
+        .filter(|(skill, _)| !crate::skills::skill_disabled_in_config(root_config, &skill.name))
+        .map(|(skill, _)| skill.clone())
+        .collect();
+    let skill_tool_dirs = crate::skills::tools_dir::skill_tool_dirs_for_skills(&reachable_skills);
+
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::with_skill_env(
-            security.clone(),
-            runtime,
-            skill_env,
-        )),
+        Arc::new(
+            ShellTool::with_skill_env(security.clone(), runtime, skill_env)
+                .with_skill_tool_dirs(skill_tool_dirs),
+        ),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(
             FileWriteTool::new(security.clone())
@@ -679,16 +714,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(TaskReadCommentsTool::new(config.clone())));
     }
 
-    // Skills declare `[[tools]]` blocks in SKILL.toml that become real
-    // callable shell/http tools. Every door builds its registry through this
-    // function, so the model can call a skill's tool wherever it talks. The
-    // FILTERED loader is used, so a skill disabled in the config (or gated by
-    // an unmet `requires`) contributes nothing.
-    //
-    // The adapters go in BEFORE the delegate snapshot below, so a delegate
-    // sub-agent inherits them under its own `allowed_tools` filter.
-    let skills = crate::skills::load_skills_with_config(workspace_dir, config.as_ref());
-    for skill_tool in skill_tools_from_skills(&skills, security) {
+    for skill_tool in skill_tools_from_skills(&active_skills, security) {
         tool_arcs.push(Arc::from(skill_tool));
     }
 
@@ -1493,6 +1519,212 @@ mod tests {
         assert!(
             tools.iter().any(|t| t.name() == "skill_greeter_greet"),
             "an enabled skill contributed no tool"
+        );
+    }
+
+    /// A skill whose manifest name is not one plain path component has no
+    /// tools directory of its own, so it contributes none to the shell's
+    /// `PATH`: the directory a naive join would reach stays unreachable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_whose_name_is_not_a_plain_component_contributes_no_directory() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().unwrap();
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let data = TempDir::new().unwrap();
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let skill_dir = config.workspace_dir.join("skills/odd-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: victim/../victim\ndescription: A skill with an unsafe name\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        // The skill IS loaded: the loader takes the manifest name as it
+        // stands, without validating it. Assert that here, so this test
+        // proves the NAME rule and not "the skill was never loaded".
+        let loaded = crate::skills::load_skills_with_status(&config.workspace_dir, &config);
+        assert!(
+            loaded.iter().any(|(skill, _)| skill.name == "victim/../victim"),
+            "the unsafe-named skill must be loaded for this test to prove the name rule: {loaded:?}"
+        );
+
+        // Where a naive join of that name would land.
+        let other = data.path().join("rantaiclaw/tools/victim");
+        std::fs::create_dir_all(&other).unwrap();
+        let bin = other.join("victim-bin");
+        std::fs::write(&bin, "#!/bin/sh\necho VICTIM_RAN\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_allowed_commands(vec!["victim-bin".into()]),
+        );
+        let tools = registry_for(&config, &security);
+        let shell = tools
+            .iter()
+            .find(|t| t.name() == "shell")
+            .expect("the registry holds the shell tool");
+        let res = shell
+            .execute(serde_json::json!({"command": "victim-bin"}))
+            .await
+            .expect("the shell returns a result");
+        assert!(
+            !res.success,
+            "a skill whose name is not one path component must contribute no directory: {res:?}"
+        );
+        assert!(
+            !res.output.contains("VICTIM_RAN"),
+            "the binary must not have run: {res:?}"
+        );
+        let error = res.error.unwrap_or_default();
+        assert!(
+            error.contains("not found"),
+            "the shell must be the one that could not find the binary, not a policy block: {error}"
+        );
+    }
+
+    /// A skill the config disabled contributes no directory: its tools
+    /// directory is not on the shell's `PATH`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_disabled_in_the_config_contributes_no_directory() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().unwrap();
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let data = TempDir::new().unwrap();
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let skill_dir = config.workspace_dir.join("skills/disabled-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: disabled-skill\ndescription: A skill the operator disabled\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry.enabled = false;
+        config.skills.entries.insert("disabled-skill".into(), entry);
+
+        // The skill IS loaded, and it is loaded WITH the reason that the
+        // config disabled it. Assert that here, so this test proves the
+        // GATE and not "the skill was never loaded".
+        let loaded = crate::skills::load_skills_with_status(&config.workspace_dir, &config);
+        let disabled = loaded
+            .iter()
+            .find(|(skill, _)| skill.name == "disabled-skill")
+            .expect("the disabled skill is still loaded, with the reason it was disabled");
+        assert!(
+            disabled
+                .1
+                .iter()
+                .any(|reason| reason == "disabled in config.toml"),
+            "the loader must report the config as the reason: {disabled:?}"
+        );
+
+        let tools_dir = data.path().join("rantaiclaw/tools/disabled-skill");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let bin = tools_dir.join("disabled-bin");
+        std::fs::write(&bin, "#!/bin/sh\necho DISABLED_RAN\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_allowed_commands(vec!["disabled-bin".into()]),
+        );
+        let tools = registry_for(&config, &security);
+        let shell = tools
+            .iter()
+            .find(|t| t.name() == "shell")
+            .expect("the registry holds the shell tool");
+        let res = shell
+            .execute(serde_json::json!({"command": "disabled-bin"}))
+            .await
+            .expect("the shell returns a result");
+        assert!(
+            !res.success,
+            "a skill disabled in the config must contribute no directory: {res:?}"
+        );
+        assert!(
+            !res.output.contains("DISABLED_RAN"),
+            "the disabled skill's binary must not have run: {res:?}"
+        );
+        let error = res.error.unwrap_or_default();
+        assert!(
+            error.contains("not found"),
+            "the shell must be the one that could not find the binary, not a policy block: {error}"
+        );
+    }
+
+    /// A binary an install recipe put in a loaded skill's own tools directory
+    /// is reachable from the agent's shell. That is the way a
+    /// recipe-carrying skill is used: a skill with a recipe has no tool of
+    /// its own, so the agent runs its binary through the plain `shell`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_agent_shell_runs_a_binary_that_exists_only_in_a_loaded_skill_tools_directory() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().unwrap();
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let data = TempDir::new().unwrap();
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let skill_dir = config.workspace_dir.join("skills/recipe-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: recipe-skill\ndescription: A skill whose recipe installs a binary\n---\n\nRun the binary.\n",
+        )
+        .unwrap();
+
+        // The binary the recipe installed, in the skill's own tools
+        // directory and nowhere else.
+        let tools_dir = data.path().join("rantaiclaw/tools/recipe-skill");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let bin = tools_dir.join("recipe-bin");
+        std::fs::write(&bin, "#!/bin/sh\necho RECIPE_BIN_RAN\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_allowed_commands(vec!["recipe-bin".into()]),
+        );
+        let tools = registry_for(&config, &security);
+        let shell = tools
+            .iter()
+            .find(|t| t.name() == "shell")
+            .expect("the registry holds the shell tool");
+        let res = shell
+            .execute(serde_json::json!({"command": "recipe-bin"}))
+            .await
+            .expect("the shell returns a result");
+        assert!(
+            res.success,
+            "the agent shell must run a binary that exists only in a loaded skill's tools directory: {res:?}"
+        );
+        assert!(
+            res.output.contains("RECIPE_BIN_RAN"),
+            "the skill's binary must have run: {res:?}"
         );
     }
 
