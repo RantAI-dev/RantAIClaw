@@ -102,17 +102,26 @@ or a `:` anywhere (a drive prefix is the Windows case, but any colon is refused)
 directory of its own, and its `download` recipe is refused rather than writing outside `<data>/tools/`. The rule is
 the same on every platform, so a skill named the same way is treated the same way everywhere.
 
-Three places look for that binary, and they agree:
+Four places look for that binary, and they agree:
 
 - the `requires` gate, so `skills list` shows the skill as active rather than gated;
 - `skills install-deps`, so the recipe's own post-check passes and the command exits 0;
-- the process that runs the skill's tools: the child gets a `PATH` that starts with that skill's own tools
-  directory, so the binary is found by name.
+- the process that runs the skill's own tool: the child gets a `PATH` that starts with that skill's own tools
+  directory, so the binary is found by name;
+- the agent's `shell` tool: the tools directories of the loaded skills are **appended** to the `PATH` of the child
+  the shell runs. A skill that carries a recipe has no tool of its own, so the agent runs that recipe's binary
+  through the plain `shell` — and now it finds it.
 
-That directory is visible to that skill and to nothing else. Another skill's tools directory is not on the `PATH` of
-a skill's tool, a plain `shell` call never sees it, and no MCP server, cron job or the process-wide `PATH` does
-either. Nothing is symlinked into a `PATH` directory and no shell profile is edited, so a binary a recipe installed
-cannot shadow a system binary for anything but that skill's own tool call.
+Appended means last. The skill's directory comes after every other `PATH` entry, so a command name that resolves
+today resolves to the same file afterwards, and a binary a recipe installed can never shadow a system binary such
+as `git`. The accepted cost of that order is that any shell call can run any installed skill binary, not only the
+binary of the skill whose instructions the agent is following.
+
+Only the skills the loader returns for this profile and that the config has not disabled contribute a directory. A
+skill the config disabled, and a skill whose manifest name is not a single path component, contribute none. Another
+skill's tools directory is not on the `PATH` of a skill's own tool, and no MCP server, cron job or the
+process-wide `PATH` sees one either — the process-wide `PATH` is never changed. Nothing is symlinked into a `PATH`
+directory and no shell profile is edited, so a binary a recipe installed cannot shadow a system binary.
 
 ## Architecture
 
