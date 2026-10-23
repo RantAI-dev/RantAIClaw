@@ -179,7 +179,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+            - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
             - name: Schema-drift snapshots + migration round-trip
               run: |
                   export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
@@ -220,7 +220,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+            - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
             - name: Migration and snapshot tests
               shell: bash
               run: |
@@ -303,7 +303,7 @@ jobs:
                   toolchain: 1.92.0
                   targets: ${{ matrix.target }}
 
-            - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+            - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
             - name: Install cross-compilation toolchain (Linux)
               if: runner.os == 'Linux' && matrix.cross_compiler != ''
@@ -403,7 +403,7 @@ jobs:
                   7z a ../../../rantaiclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
 
             - name: Upload artifact
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
               with:
                   name: rantaiclaw-${{ matrix.target }}
                   path: rantaiclaw-${{ matrix.target }}.${{ matrix.archive_ext }}
@@ -415,7 +415,7 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             - name: Download all artifacts
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
               with:
                   path: artifacts
 
@@ -469,7 +469,7 @@ jobs:
                   ref: ${{ needs.prepare.outputs.release_ref }}
 
             - name: Download all artifacts
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
               with:
                   path: artifacts
 
