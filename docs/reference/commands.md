@@ -93,14 +93,14 @@ The `Enforced` row right after it names the autonomy level the runtime gate actu
 - `rantaiclaw setup --non-interactive`
 - `rantaiclaw setup whatsapp-web --non-interactive`
 
-`setup` walks every wired section (provider, channels, persona, skills, mcp, and — when built with the default `kb` feature — knowledge) skipping any that are already configured. Pass `--force` to re-run already-configured sections.
+`setup` walks every wired section (provider, approvals, channels, persona, skills, mcp, login, and — when built with the default `kb` feature — knowledge) skipping any that are already configured. Pass `--force` to re-run already-configured sections.
 
 Approval presets are kept rather than re-offered: `rantaiclaw setup approvals` on a profile that already has a preset on disk names the preset that is active and points at `rantaiclaw setup approvals --force`, because without `--force` the write would leave the preset in place anyway. With `--force` the picker appears, the preset you pick is written, and the preset's policy files — `<profile>/policy/autonomy.toml` and `<profile>/policy/command_allowlist.toml` — are regenerated from the preset bundle, so hand edits to them are lost.
 
 `--non-interactive` (or a non-TTY context) behaves differently depending on whether a topic is given:
 
-- **`rantaiclaw setup --non-interactive`** — walks the sections and emits each one's headless hint instead of prompting. Exits `0`.
-- **`rantaiclaw setup <topic> --non-interactive`** — runs that topic's provisioner unattended. Text prompts take the default the provisioner declared, secret prompts get an empty value, a single-choice question takes its first option, and a multi-select selects **nothing**. The config is saved only when the provisioner reports that it configured something; a provisioner that aborted, errored or timed out exits **non-zero** and writes nothing. Scripts should check the exit code.
+- **`rantaiclaw setup --non-interactive`** — walks the sections and emits each one's headless hint instead of prompting. A section that needs a prompt (`provider`, `channels`, `mcp`, `login`, `knowledge`) cannot run, so it is named in a closing summary as **not configured**, together with the command that configures it instead, and the command exits **non-zero**. The sections that work without a prompt (`approvals`, `persona`, `skills`) are still configured. A profile where every section is already configured exits **0**. Scripts should check the exit code.
+- **`rantaiclaw setup <topic> --non-interactive`** — runs that topic's provisioner unattended. Text prompts take the default the provisioner declared, secret prompts get an empty value, a single-choice question takes its first option, and a multi-select selects **nothing**. The config is saved only when the provisioner reports that it configured something; a provisioner that aborted, errored or timed out exits **non-zero** and writes nothing. A topic with no provisioner (`channels`) runs its section instead and behaves like the sweep above: it exits **non-zero** when that section could not run. Scripts should check the exit code.
 
 Single-topic examples:
 - `rantaiclaw setup provider` — re-run provider section only

@@ -17,7 +17,7 @@ This downloads the latest pre-built binary for your platform, verifies its
 SHA256 checksum, and installs it to `~/.cargo/bin` (or `~/.local/bin` if
 cargo isn't present). No Rust toolchain, no compiler, no git clone needed.
 
-**As of v0.6.52-alpha the installer automatically runs `rantaiclaw setup --force` at the end** — the full guided wizard (provider, approvals, channels, persona, skills, MCP). You don't need to invoke it yourself. Opt out with `--skip-setup` or `RANTAICLAW_SKIP_SETUP=1` if you're just unpacking the binary for later configuration.
+**As of v0.6.52-alpha the installer automatically runs `rantaiclaw setup --force` at the end** — the full guided wizard (provider, approvals, channels, persona, skills, MCP, login, knowledge). You don't need to invoke it yourself. Opt out with `--skip-setup` or `RANTAICLAW_SKIP_SETUP=1` if you're just unpacking the binary for later configuration.
 
 After install:
 
@@ -251,7 +251,7 @@ What the script does (parity with `scripts/bootstrap.sh`):
 4. Extracts `rantaiclaw.exe` to `%LOCALAPPDATA%\Programs\rantaiclaw\` — the same convention VS Code, Slack, and Discord use, no admin needed.
 5. Amends your **User** `PATH` via the registry (not `setx` — which truncates at 1024 chars) and broadcasts `WM_SETTINGCHANGE` so Explorer-spawned shells pick it up without a logoff.
 6. Prints a bold **ACTION REQUIRED** reminder to open a new terminal (because cmd.exe / VS Code / Git Bash tabs cache the old `PATH`).
-7. **Runs `rantaiclaw.exe setup --force` automatically** (full guided wizard — provider, approvals, channels, persona, skills, MCP). Skipped only when stdin is redirected (piped via `iwr | iex` directly) or when you pass `-SkipSetup`; in those cases a clear "run setup manually" reminder is printed instead.
+7. **Runs `rantaiclaw.exe setup --force` automatically** (full guided wizard — provider, approvals, channels, persona, skills, MCP, login, knowledge). Skipped only when stdin is redirected (piped via `iwr | iex` directly) or when you pass `-SkipSetup`; in those cases a clear "run setup manually" reminder is printed instead.
 
 **Options** (env vars and flags mirror `bootstrap.sh`):
 

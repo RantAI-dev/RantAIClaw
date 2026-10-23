@@ -43,14 +43,16 @@ fn cmd(home: &TempDir) -> Command {
 }
 
 #[test]
-fn setup_non_interactive_visits_all_sections_and_exits_zero() {
+fn setup_non_interactive_visits_every_section_and_exits_one_when_a_section_needs_a_prompt() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = TempDir::new().expect("tempdir");
 
+    // A headless sweep cannot prompt, so the sections that need one
+    // configure nothing — the command names them and exits 1.
     let assert = cmd(&home)
         .args(["setup", "--non-interactive"])
         .assert()
-        .success();
+        .code(1);
 
     let output = assert.get_output();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -59,8 +61,9 @@ fn setup_non_interactive_visits_all_sections_and_exits_zero() {
 
     // The summary line is the canonical machine-readable signal that
     // every section was dispatched. `visited` ∪ `skipped` must equal the
-    // canonical six-section list (provider, approvals, channels,
-    // persona, skills, mcp).
+    // canonical section list (provider, approvals, channels, persona,
+    // skills, mcp, login, and — when built with the default `kb` feature —
+    // knowledge).
     assert!(
         combined.contains("setup: visited=") && combined.contains("skipped="),
         "expected single-line summary; got:\n{combined}"
@@ -72,6 +75,7 @@ fn setup_non_interactive_visits_all_sections_and_exits_zero() {
         "persona",
         "skills",
         "mcp",
+        "login",
     ] {
         assert!(
             combined.contains(section),
@@ -101,6 +105,26 @@ fn setup_non_interactive_visits_all_sections_and_exits_zero() {
             "expected {label} headless hint substring `{needle}`; got:\n{combined}"
         );
     }
+
+    // The closing summary names every section that needed a prompt this
+    // run could not have, and says those sections were NOT configured.
+    assert!(
+        combined.contains("could not be configured"),
+        "the summary must name the sections that needed a prompt; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("Those sections were NOT configured."),
+        "the summary must say the blocked sections were not configured; got:\n{combined}"
+    );
+    for section in ["provider", "channels", "mcp", "login"] {
+        let listed = format!("  - {section}");
+        assert!(
+            combined
+                .lines()
+                .any(|line| line.trim_end() == listed.as_str()),
+            "the summary must list {section} as not configured; got:\n{combined}"
+        );
+    }
 }
 
 #[test]
@@ -108,10 +132,13 @@ fn setup_non_interactive_then_doctor_brief_reports_the_written_allowlist() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = TempDir::new().expect("tempdir");
 
+    // The headless setup exits 1: the sections that need a prompt could not
+    // run. The config it wrote is still on disk, and that file is what the
+    // doctor check below reads.
     cmd(&home)
         .args(["setup", "--non-interactive"])
         .assert()
-        .success();
+        .code(1);
 
     // After a headless setup, no provider has been configured and no
     // daemon is registered. `doctor --brief` must run cleanly (exit 0)
@@ -493,11 +520,12 @@ fn doctor_brief_dev_build_skips_the_service_manager_regardless_of_fake_state() {
     let fake_inactive = write_fake_systemctl(b"#!/bin/sh\necho inactive\nexit 3\n");
 
     // A headless setup is required so the doctor's other checks don't fail on
-    // missing config; the test does not depend on what setup writes.
+    // missing config; the test does not depend on what setup writes. The
+    // setup exits 1 because the sections that need a prompt could not run.
     cmd(&home)
         .args(["setup", "--non-interactive"])
         .assert()
-        .success();
+        .code(1);
 
     let run_with_fake = |fake_dir: &std::path::Path| {
         let prepended = prepend_path(fake_dir);

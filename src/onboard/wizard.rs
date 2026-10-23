@@ -111,14 +111,13 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 
 use crate::onboard::section::{
     approvals::ApprovalsSection, channels::ChannelsSection, login::LoginSection, mcp::McpSection,
-    persona::PersonaSection, provider::ProviderSection, skills::SkillsSection, SetupContext,
-    SetupSection,
+    persona::PersonaSection, provider::ProviderSection, skills::SkillsSection, BlockedSection,
+    SetupContext, SetupSection,
 };
 use crate::profile::Profile;
 
-/// Returns the canonical section order. Wave 3 wires five sections; later
-/// waves grow this list (workspace, tunnel, tools, memory,
-/// project_context, workspace_files, daemon, doctor_handoff).
+/// Returns the canonical section order: `provider`, `approvals`, `channels`,
+/// `persona`, `skills`, `mcp`, `login`, plus `knowledge` in `kb` builds.
 pub fn canonical_section_order() -> Vec<&'static str> {
     canonical_sections().iter().map(|s| s.name()).collect()
 }
@@ -153,6 +152,74 @@ pub struct SetupReport {
     /// Sections skipped because `is_already_configured` returned `true`
     /// and `--force` was not set.
     pub skipped: Vec<String>,
+    /// Sections that needed a prompt this run could not have, so they
+    /// configured nothing.
+    pub blocked: Vec<BlockedSection>,
+}
+
+/// The exit code `setup` uses when it could not configure every section it
+/// was asked to run.
+///
+/// `1` — the same code every other failure of this command already exits
+/// with: a section that errored, a provisioner that aborted, a config that
+/// would not validate. A setup that needed a prompt it could not have is a
+/// failure of the run, not a different kind of failure.
+pub const SETUP_INCOMPLETE_EXIT_CODE: i32 = 1;
+
+/// The exit code `setup` uses when it configured everything it could.
+pub const SETUP_COMPLETE_EXIT_CODE: i32 = 0;
+
+impl SetupReport {
+    /// `true` when the run could not configure every section it was asked to.
+    ///
+    /// The CLI turns this into a non-zero exit: a setup that printed hints
+    /// and configured nothing is not a setup that finished.
+    pub fn is_incomplete(&self) -> bool {
+        !self.blocked.is_empty()
+    }
+
+    /// The process exit code this run must use.
+    pub fn exit_code(&self) -> i32 {
+        if self.is_incomplete() {
+            SETUP_INCOMPLETE_EXIT_CODE
+        } else {
+            SETUP_COMPLETE_EXIT_CODE
+        }
+    }
+}
+
+/// The summary of the sections a run could not configure.
+///
+/// A value, not a side effect: the CLI prints it and a test asserts on it.
+/// It names every section that needed a prompt and could not have one, and
+/// says what to run instead. It does NOT claim the run configured nothing —
+/// the sections that work without a prompt (`approvals`, `persona`,
+/// `skills`) did their work.
+pub fn blocked_summary(blocked: &[BlockedSection]) -> String {
+    if blocked.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "setup: {} section(s) could not be configured - each one needs a prompt, \
+         and this run had none:",
+        blocked.len()
+    ));
+    for section in blocked {
+        let name = &section.name;
+        lines.push(format!("  - {name}"));
+        for line in section.hint.lines() {
+            lines.push(format!("      {line}"));
+        }
+    }
+    lines.push(
+        "Those sections were NOT configured. Run the command shown above for each of \
+         them, or run `rantaiclaw setup` at a terminal to configure them interactively."
+            .to_string(),
+    );
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 /// Walk the canonical section list (or a single topic) and persist any
@@ -163,8 +230,16 @@ pub struct SetupReport {
 /// * `topic = Some("foo")` → dispatch to the single section named `foo`;
 ///   error with the valid topic list if no match.
 /// * `force = true` → bypass `is_already_configured` skip logic.
-/// * `non_interactive = true` → sections that prompt should bail with
-///   their `headless_hint()` rather than calling `dialoguer`.
+/// * `non_interactive = true` → sections that prompt record themselves in
+///   `report.blocked` (with their `headless_hint()`) rather than calling
+///   `dialoguer`. The run continues to the end, so the operator sees every
+///   hint in one pass; the caller turns a non-empty `report.blocked` into a
+///   non-zero exit.
+///
+/// A section that errors ends the run. The blocked sections are reported
+/// before the error is returned: the caller prints the summary only after a
+/// successful run, so a failed run that stayed quiet would hide the hints the
+/// operator needs.
 pub fn run_setup(
     profile: &Profile,
     config: &mut Config,
@@ -172,12 +247,34 @@ pub fn run_setup(
     force: bool,
     non_interactive: bool,
 ) -> Result<SetupReport> {
+    let sections = canonical_sections();
+    run_setup_with(
+        &sections,
+        profile,
+        config,
+        topic,
+        force,
+        non_interactive,
+        &mut std::io::stderr(),
+    )
+}
+
+/// The body of `run_setup`, with the section list and the summary writer
+/// injected: a test drives it with a failing section and reads back what the
+/// error path printed.
+fn run_setup_with(
+    sections: &[Box<dyn SetupSection>],
+    profile: &Profile,
+    config: &mut Config,
+    topic: Option<String>,
+    force: bool,
+    non_interactive: bool,
+    summary_out: &mut dyn std::io::Write,
+) -> Result<SetupReport> {
     let interactive = !non_interactive;
     if interactive {
         ui::print_welcome_banner();
     }
-
-    let sections = canonical_sections();
 
     // Topic dispatch — single-section path.
     if let Some(name) = topic.as_deref() {
@@ -189,7 +286,7 @@ pub fn run_setup(
             )
         })?;
         let mut report = SetupReport::default();
-        run_one(
+        if let Err(e) = run_one(
             section.as_ref(),
             profile,
             config,
@@ -199,7 +296,10 @@ pub fn run_setup(
             interactive,
             1,
             1,
-        )?;
+        ) {
+            let _ = write_blocked_summary(summary_out, &report);
+            return Err(e);
+        }
         if interactive {
             print_setup_completion();
         }
@@ -208,12 +308,31 @@ pub fn run_setup(
 
     // Full sweep.
     let mut report = SetupReport::default();
-    run_section_sweep(&sections, profile, config, interactive, force, &mut report)?;
+    if let Err(e) = run_section_sweep(sections, profile, config, interactive, force, &mut report) {
+        let _ = write_blocked_summary(summary_out, &report);
+        return Err(e);
+    }
 
     if interactive {
         print_setup_completion();
     }
     Ok(report)
+}
+
+/// Write the summary of the sections a run could not configure to `out`.
+///
+/// The CLI prints the same summary on the success path, so exactly one of
+/// the two fires: this one runs only when the run failed, and the CLI prints
+/// only after `run_setup` returned `Ok`.
+fn write_blocked_summary(
+    out: &mut dyn std::io::Write,
+    report: &SetupReport,
+) -> std::io::Result<()> {
+    let summary = blocked_summary(&report.blocked);
+    if summary.is_empty() {
+        return Ok(());
+    }
+    out.write_all(summary.as_bytes())
 }
 
 /// Run every section in canonical order, stopping at the first failure. `report`
@@ -283,8 +402,13 @@ fn run_one(
         config,
         interactive,
         force,
+        blocked: Vec::new(),
     };
-    section.run(&mut ctx)?;
+    let outcome = section.run(&mut ctx);
+    // A section that needed a prompt recorded itself; the report carries
+    // that even when the section went on to fail.
+    report.blocked.append(&mut ctx.blocked);
+    outcome?;
     report.visited.push(section.name().to_string());
     Ok(())
 }
@@ -5706,6 +5830,281 @@ mod tests {
         assert!(
             !report.visited.contains(&"later".to_string()),
             "the section after the failure must not run"
+        );
+    }
+
+    // ── Headless setup: a section that could not run is reported ────
+
+    /// A section that errors after a section that was blocked must not
+    /// swallow the blocked section's name and hint. The hints used to be
+    /// printed as the sweep went, so a later hard error could not hide
+    /// them; they now live in the report, and the CLI prints the report only
+    /// after the run succeeded. The error path prints them instead — exactly
+    /// once, and never together with the CLI's own print.
+    #[test]
+    fn a_failing_section_still_reports_the_sections_that_were_blocked() {
+        struct StubSection {
+            name: &'static str,
+            block: bool,
+            fail: bool,
+        }
+        impl SetupSection for StubSection {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn description(&self) -> &'static str {
+                "stub section"
+            }
+            fn is_already_configured(&self, _profile: &Profile, _config: &Config) -> bool {
+                false
+            }
+            fn run(&self, ctx: &mut SetupContext) -> Result<()> {
+                if self.block {
+                    ctx.record_blocked(self.name, self.headless_hint());
+                }
+                if self.fail {
+                    anyhow::bail!("stub section '{}' failed", self.name);
+                }
+                Ok(())
+            }
+            fn headless_hint(&self) -> &'static str {
+                "run `rantaiclaw setup stub` to configure it"
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        let sections: Vec<Box<dyn SetupSection>> = vec![
+            Box::new(StubSection {
+                name: "blocked",
+                block: true,
+                fail: false,
+            }),
+            Box::new(StubSection {
+                name: "boom",
+                block: false,
+                fail: true,
+            }),
+        ];
+
+        let mut printed: Vec<u8> = Vec::new();
+        let err = run_setup_with(
+            &sections,
+            &profile,
+            &mut config,
+            None,
+            false,
+            true,
+            &mut printed,
+        )
+        .expect_err("a failing section must propagate its error");
+
+        assert!(err.to_string().contains("boom"), "error propagates: {err}");
+        let printed = String::from_utf8(printed).expect("the summary is utf-8");
+        assert!(
+            printed.contains("blocked"),
+            "the failed run must still report the blocked section: {printed}"
+        );
+        assert!(
+            printed.contains("run `rantaiclaw setup stub`"),
+            "the failed run must still report the blocked section's hint: {printed}"
+        );
+    }
+
+    /// A profile rooted in a temp dir. `Profile` reads every path from its
+    /// `root`, so a scratch profile needs no process-global `HOME`.
+    fn scratch_profile(root: &std::path::Path) -> Profile {
+        Profile {
+            name: "headless-test".to_string(),
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// A config and a profile where every section's own
+    /// `is_already_configured` answers `true` — built the way each
+    /// section's own test builds it.
+    fn fully_configured(profile: &Profile) -> Config {
+        // provider: a stored key for the default provider.
+        // channels: one catalog channel populated.
+        let mut config = crate::channels::tests::config_with_only_channel("telegram");
+        config.default_provider = Some("openrouter".into());
+        config.api_key = Some("sk-test".into());
+        // mcp: a curated server registered.
+        config.mcp_servers.insert(
+            "notion".into(),
+            crate::config::schema::McpServerConfig {
+                command: "npx".into(),
+                args: vec![],
+                env: std::collections::HashMap::default(),
+            },
+        );
+        // login: a stored password hash.
+        config.gateway.login.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$a$b".into());
+        // knowledge (kb builds only): a stored embedding key.
+        config.knowledge.embedding_api_key = Some("k".into());
+
+        // approvals: the policy marker on disk.
+        crate::approval::policy_writer::write_policy_files(
+            profile,
+            crate::approval::policy_writer::PolicyPreset::Smart,
+            false,
+        )
+        .unwrap();
+        // persona: the persona file on disk.
+        crate::persona::write_persona_toml(
+            profile,
+            &crate::persona::PersonaToml::default_for("RantaiClaw", "UTC"),
+        )
+        .unwrap();
+        // skills: the starter pack on disk.
+        crate::skills::bundled::install_starter_pack(profile).unwrap();
+        config
+    }
+
+    /// A headless sweep on a fresh profile configures nothing it needed a
+    /// prompt for — and says so, by name, and exits non-zero. The old
+    /// behaviour printed the hints and exited 0: a script could not tell a
+    /// finished setup from an empty one.
+    #[test]
+    fn headless_sweep_on_a_fresh_profile_names_the_sections_it_could_not_configure() {
+        let tmp = TempDir::new().unwrap();
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let report = run_setup(&profile, &mut config, None, false, true).unwrap();
+
+        let blocked: Vec<&str> = report.blocked.iter().map(|b| b.name.as_str()).collect();
+        assert!(
+            blocked.contains(&"provider"),
+            "the provider section needs a prompt and cannot run headless: {blocked:?}"
+        );
+        for name in ["channels", "mcp", "login"] {
+            assert!(
+                blocked.contains(&name),
+                "{name} needs a prompt and cannot run headless: {blocked:?}"
+            );
+        }
+        // The knowledge section is part of the default build (`kb` is a
+        // default feature), so a default build blocks it too.
+        #[cfg(feature = "kb")]
+        assert!(
+            blocked.contains(&"knowledge"),
+            "knowledge needs a prompt and cannot run headless: {blocked:?}"
+        );
+
+        // The summary names the section, the command that does the work
+        // instead, and says the section was not configured.
+        let summary = blocked_summary(&report.blocked);
+        assert!(summary.contains("provider"), "{summary}");
+        assert!(
+            summary.contains("rantaiclaw onboard --api-key"),
+            "the summary must name the command that does the work: {summary}"
+        );
+        assert!(
+            summary.contains("NOT configured"),
+            "the summary must say those sections were not configured: {summary}"
+        );
+
+        // The command exits non-zero: the run did not configure everything.
+        assert!(report.is_incomplete());
+        assert_ne!(report.exit_code(), 0);
+        assert_eq!(report.exit_code(), SETUP_INCOMPLETE_EXIT_CODE);
+    }
+
+    /// The sections that do real work headless are never reported as "could
+    /// not run" — they wrote their defaults, and saying otherwise would be a
+    /// lie about the install.
+    #[test]
+    fn headless_sweep_leaves_the_sections_that_need_no_prompt_configured() {
+        let tmp = TempDir::new().unwrap();
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let report = run_setup(&profile, &mut config, None, false, true).unwrap();
+
+        for name in ["approvals", "persona", "skills"] {
+            assert!(
+                report.visited.contains(&name.to_string()),
+                "{name} does real work headless and must be visited: {:?}",
+                report.visited
+            );
+            assert!(
+                !report.blocked.iter().any(|b| b.name == name),
+                "{name} does real work headless and must never be reported as blocked"
+            );
+        }
+        // It really did write them.
+        assert!(profile.policy_dir().join("autonomy.toml").exists());
+        assert!(profile.persona_dir().join("persona.toml").exists());
+        assert!(profile.skills_dir().join("web-search").exists());
+    }
+
+    /// Nothing left to do is not a failure: every section is skipped, no
+    /// section is reported as blocked, and the command exits 0.
+    #[test]
+    fn headless_sweep_on_a_fully_configured_profile_exits_zero() {
+        let tmp = TempDir::new().unwrap();
+        let profile = scratch_profile(tmp.path());
+        let mut config = fully_configured(&profile);
+
+        let report = run_setup(&profile, &mut config, None, false, true).unwrap();
+
+        assert!(
+            report.visited.is_empty(),
+            "an already-configured profile has nothing to run: {:?}",
+            report.visited
+        );
+        for name in canonical_section_order() {
+            assert!(
+                report.skipped.contains(&name.to_string()),
+                "{name} should be skipped: {:?}",
+                report.skipped
+            );
+        }
+        assert!(
+            report.blocked.is_empty(),
+            "nothing was blocked on a fully configured profile: {:?}",
+            report.blocked
+        );
+        assert!(!report.is_incomplete());
+        assert_eq!(report.exit_code(), SETUP_COMPLETE_EXIT_CODE);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    /// A single topic behaves like the sweep. `channels` has no provisioner,
+    /// so `setup --non-interactive channels` runs the section — and the
+    /// section needs a prompt, so the command exits non-zero.
+    #[test]
+    fn headless_topic_run_that_needs_a_prompt_exits_non_zero() {
+        let tmp = TempDir::new().unwrap();
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let report = run_setup(
+            &profile,
+            &mut config,
+            Some("channels".to_string()),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report
+                .blocked
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["channels"],
+            "only the requested section ran"
+        );
+        assert!(report.is_incomplete());
+        assert_ne!(report.exit_code(), 0);
+        let summary = blocked_summary(&report.blocked);
+        assert!(
+            summary.contains("rantaiclaw channel add"),
+            "the summary must name the command that does the work: {summary}"
         );
     }
 

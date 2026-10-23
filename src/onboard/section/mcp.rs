@@ -7,6 +7,8 @@
 //! is reusable from `rantaiclaw setup mcp` once Wave 3 wires the
 //! subcommand.
 
+use std::fmt::Write as _;
+
 use anyhow::Result;
 
 use super::{SetupContext, SetupSection};
@@ -44,7 +46,7 @@ impl SetupSection for McpSection {
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
         if !ctx.interactive {
-            print_headless_hint();
+            ctx.record_blocked(self.name(), &blocked_hint(self.headless_hint()));
             return Ok(());
         }
 
@@ -71,17 +73,27 @@ impl SetupSection for McpSection {
     }
 }
 
-fn print_headless_hint() {
-    eprintln!(
-        "skipping MCP section in headless mode — re-run interactively to install \
-         from {} curated servers (zero-auth: {}, authed: {}).",
+/// The hint the MCP section records when it could not prompt.
+///
+/// `SetupSection::headless_hint()` is a `&'static str` and cannot carry the
+/// per-server commands, so the section builds the full hint here: the trait's
+/// base text, then one `rantaiclaw mcp add <slug>` line per curated server.
+/// The orchestrator prints the result once, with the other blocked sections.
+fn blocked_hint(base: &str) -> String {
+    let mut hint = String::new();
+    hint.push_str(base);
+    hint.push('\n');
+    let _ = write!(
+        hint,
+        "Curated servers ({} total: {} zero-auth, {} needing auth):",
         curated_count(),
         NO_AUTH.len(),
         AUTHED.len(),
     );
     for server in NO_AUTH.iter().chain(AUTHED.iter()) {
-        eprintln!("  rantaiclaw mcp add {}", server.slug);
+        let _ = write!(hint, "\nrantaiclaw mcp add {}", server.slug);
     }
+    hint
 }
 
 #[cfg(test)]
@@ -95,6 +107,56 @@ mod tests {
         assert_eq!(section.name(), "mcp");
         assert!(!section.description().is_empty());
         assert!(!section.headless_hint().is_empty());
+    }
+
+    /// A headless MCP section records itself as blocked, and the hint it
+    /// records must still name the commands that would set the section up.
+    /// The trait's `headless_hint()` is a `&'static str` and cannot carry
+    /// them, so the section builds the full hint itself.
+    #[test]
+    fn a_blocked_mcp_section_records_the_commands_that_would_set_it_up() {
+        let section = McpSection;
+        let mut config = Config::default();
+        let profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp"),
+        };
+        let mut ctx = SetupContext {
+            profile: &profile,
+            config: &mut config,
+            interactive: false,
+            force: false,
+            blocked: Vec::new(),
+        };
+
+        section.run(&mut ctx).unwrap();
+
+        assert_eq!(
+            ctx.blocked.len(),
+            1,
+            "a headless MCP section records itself as blocked"
+        );
+        let blocked = &ctx.blocked[0];
+        assert_eq!(blocked.name, "mcp");
+        assert!(
+            blocked.hint.contains(section.headless_hint()),
+            "the recorded hint keeps the trait's base hint: {}",
+            blocked.hint
+        );
+        assert!(
+            blocked.hint.contains("rantaiclaw mcp add"),
+            "the recorded hint must name the command that adds a server: {}",
+            blocked.hint
+        );
+        for server in NO_AUTH.iter().chain(AUTHED.iter()) {
+            assert!(
+                blocked
+                    .hint
+                    .contains(&format!("rantaiclaw mcp add {}", server.slug)),
+                "the recorded hint must name every curated server: {}",
+                blocked.hint
+            );
+        }
     }
 
     #[test]

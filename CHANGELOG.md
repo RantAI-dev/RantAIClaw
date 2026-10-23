@@ -62,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `rantaiclaw setup --non-interactive` now exits **non-zero** when it could not configure a section, instead of exiting 0 after printing hints. A section that needs a prompt it cannot have (`provider`, `channels`, `mcp`, `login`, `knowledge`) is now named in a closing summary as **not configured**, together with the command that configures it instead. The sections that work without a prompt (`approvals`, `persona`, `skills`) are still configured, and a run that had nothing left to do still exits 0. This is a behaviour change a script may rely on: check the exit code of a headless setup.
 - When a fallback provider answers, the CLI agent (`agent -m` and the REPL) prints one line on stdout
   before the reply, naming the provider asked for and the fallback that answered. A reply from the primary
   prints nothing new. Channels and the gateway do not print it.

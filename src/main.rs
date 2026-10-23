@@ -279,8 +279,9 @@ enum Commands {
 
     /// Run the canonical setup wizard, or re-run a single section.
     ///
-    /// With no `<topic>`, walks every wired section (provider, channels,
-    /// persona, skills, mcp) skipping any that are already configured.
+    /// With no `<topic>`, walks every wired section (provider, approvals,
+    /// channels, persona, skills, mcp, login, and — with the `kb` feature —
+    /// knowledge) skipping any that are already configured.
     /// Pass `--force` to re-run already-configured sections.
     /// Pass `--non-interactive` in CI / scripts — sections that prompt
     /// will bail with their CLI hint instead of blocking on stdin.
@@ -1649,6 +1650,18 @@ async fn main() -> Result<()> {
                     report.visited.join(","),
                     report.skipped.join(","),
                 );
+            }
+            // A section that needed a prompt this run could not give was NOT
+            // configured. The sections that work headless still ran, so this
+            // is not "setup did nothing" — but exit 0 would read as "setup
+            // finished", which it did not.
+            let summary = onboard::wizard::blocked_summary(&report.blocked);
+            if !summary.is_empty() {
+                eprint!("{summary}");
+            }
+            let exit_code = report.exit_code();
+            if exit_code != 0 {
+                std::process::exit(exit_code);
             }
             return Ok(());
         }
