@@ -181,6 +181,7 @@ The same `--allow-unverified` flag exists on `rantaiclaw update` and `rantaiclaw
 - `rantaiclaw cron add-at <rfc3339_timestamp> [--agent] [--model <name>] <command|prompt>`
 - `rantaiclaw cron add-every <every_ms> [--agent] [--model <name>] <command|prompt>`
 - `rantaiclaw cron once <delay> [--agent] [--model <name>] <command|prompt>`
+- `rantaiclaw cron update <id> [--expression <expr>] [--tz <IANA_TZ>] [--command <command>] [--name <name>]`
 - `rantaiclaw cron run <id>` — force-run now and record the run (does not reschedule)
 - `rantaiclaw cron runs <id> [--limit <n>]` — print recent run history
 - `rantaiclaw cron remove <id>`
@@ -191,7 +192,11 @@ Notes:
 
 - `--agent` creates an AGENT job — the positional is the prompt, not a shell command. `--model` overrides the model for an agent job (ignored for shell jobs). Example: `rantaiclaw cron add --agent '0 9 * * *' 'Summarize overnight emails' --model claude-opus-4-8`.
 - `cron run` reuses the same manual-run path as the `cron_run` tool and the web `POST /api/v1/cron/{id}/run`: it records to run history but does not shift the schedule or consume a one-shot.
-- Mutating schedule/cron actions (CLI `cron add/add-at/add-every/once/update/remove/pause/resume/run`, the `cron_*` tools, and the `POST`/`PUT`/`DELETE` `/api/v1/cron*` endpoints) require `cron.enabled = true`; when it is false they are refused. Listing and run history stay readable. If `scheduler.enabled = false`, jobs persist but never fire — `cron list` shows a "scheduler disabled" banner.
+- **The id `cron list` prints is the id every command takes.** `cron list` prints the first 8 characters of a job id, and that text can be handed back to every command that takes a job id: `cron run`, `cron pause`, `cron resume`, `cron update`, `cron remove`, `cron runs`, the `/cron` TUI commands, the `/api/v1/cron/{id}` HTTP endpoints and the `cron_*` agent tools. A full id always wins, even when it is also the prefix of another job's id. Otherwise the text is a prefix, and it must be at least 8 characters — a shorter one is refused with `Cron job id '<id>' is too short: a prefix must be at least 8 characters`, because a mistyped delete is worse than a refusal. A prefix that names exactly one job resolves to it; a prefix that names several is refused with `Ambiguous cron job id '<id>': matches N jobs — '<full id>' (<name>), '<full id>' (<name>)`, so the candidates can be picked from the message. A prefix that names nothing is refused with `Cron job '<id>' not found` (`cron runs` and `GET /api/v1/cron/{id}/runs` report an empty history instead, as they always did). The comparison is literal, not a `LIKE` pattern, so `%` and `_` in a typed id match nothing rather than everything.
+- The TUI shows the id in every listing: `/cron list` rows and the cron picker rows carry the 8-character id next to the job name. Before, a named job was listed without any id.
+- **Every door that writes a cron job honours `cron.enabled = true`.** With the switch off, the CLI (`cron add/add-at/add-every/once/update/remove/pause/resume/run`), the `cron_*` agent tools, the mutating HTTP endpoints (`POST /api/v1/cron`, `PUT /api/v1/cron/{id}`, `DELETE /api/v1/cron/{id}`, `POST /api/v1/cron/{id}/run`), the TUI `/cron` commands (`/cron add`, `/cron edit`, `/cron remove`, `/cron pause`, `/cron resume`) and the cron detail panel's action keys (`r` run, `p` pause/resume, `d` delete) all refuse with the same message: `cron is disabled by config (cron.enabled=false)`. The store refuses the write as well, so a door that forgets to check cannot reach it. Reads stay open: `cron list`, `cron runs`, `GET /api/v1/cron` and `GET /api/v1/cron/{id}/runs` still work — the two read-only agent tools (`cron_list`, `cron_runs`) are the exception and refuse reads too, as they always did.
+- The scheduler's own bookkeeping is exempt from the gate: recording a run, re-anchoring a stale schedule, and deleting or disabling a one-shot that already fired still land, so a runtime flip of `cron.enabled` cannot make a fired one-shot fire again.
+- If `scheduler.enabled = false`, jobs persist but never fire — `cron list` shows a "scheduler disabled" banner.
 - Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
 - **A job created from a chat reads only that chat.** A job that `cron_add` created
   from a chat carries that chat's channel and reply target. Its run reads the
@@ -224,6 +229,14 @@ Exposure: every route is auth-gated exactly like the rest of `/api/v1` (bearer
 token when pairing is required). Shell commands supplied over HTTP are
 security-checked (`is_command_allowed`) before persistence — the same policy the
 CLI/tool enforce, applied up-front for the HTTP surface's blast radius.
+
+Job ids: every `{id}` takes the full job id or a prefix of it (at least 8
+characters — the length `cron list` prints). On the mutating routes (`PUT`,
+`DELETE`, `POST /api/v1/cron/{id}/run`) a too-short id or a prefix that names
+several jobs is a `400 Bad Request`, and a missing job is a `404`.
+`GET /api/v1/cron/{id}/runs` answers `200` with an empty run list for an id that
+names no job — as it always did — and a `400` for a prefix that names several
+jobs.
 
 ### `models`
 

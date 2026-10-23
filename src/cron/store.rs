@@ -1,13 +1,134 @@
 use crate::config::Config;
 use crate::cron::{
     next_run_for_schedule, schedule_cron_expression, validate_schedule, CronJob, CronJobPatch,
-    CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    CronRun, DeliveryConfig, JobType, Schedule, SessionTarget, CRON_DISABLED_MESSAGE,
+    MIN_JOB_ID_PREFIX_LEN,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
+
+/// Refuse an operator-facing write while the cron feature switch is off.
+///
+/// Every door checks the flag too — they give a better message earlier — but
+/// this is the line that cannot be skipped: a door that forgets to ask cannot
+/// reach the store. The message is byte-identical to the one the doors use.
+fn ensure_cron_enabled(config: &Config) -> Result<()> {
+    if config.cron.enabled {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", CRON_DISABLED_MESSAGE)
+    }
+}
+
+/// What a user-supplied job id resolved to.
+enum JobIdMatch {
+    /// Exactly one job matched — its full id.
+    Job(String),
+    /// Nothing matched the id or any prefix of it.
+    NotFound,
+    /// The string was shorter than [`MIN_JOB_ID_PREFIX_LEN`], so it cannot be
+    /// used as a prefix.
+    TooShort,
+    /// Several jobs share the prefix — their full ids and names.
+    Ambiguous(Vec<(String, Option<String>)>),
+}
+
+/// Resolve a user-supplied job id (a full id, or a prefix of one) to the full
+/// id of exactly one job.
+///
+/// The rules, in order:
+///
+/// - An **exact** match on the full id always wins, so a full id is never
+///   ambiguous even when it is also a prefix of another id.
+/// - Otherwise the string is a prefix: it must be at least
+///   [`MIN_JOB_ID_PREFIX_LEN`] characters (what every surface prints) and it
+///   must match exactly one job id. Several matches are refused with the
+///   candidates named; none is the "not found" refusal.
+///
+/// The prefix is compared with `substr(id, 1, length(?1)) = ?1` — a literal
+/// comparison, not `LIKE`, so a `%` or `_` in the input matches nothing
+/// instead of everything.
+fn resolve_job_id_in_conn(conn: &Connection, job_id: &str) -> Result<JobIdMatch> {
+    match conn.query_row(
+        "SELECT id FROM cron_jobs WHERE id = ?1",
+        params![job_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(id) => return Ok(JobIdMatch::Job(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(e) => return Err(e).context("Failed to look up cron job"),
+    }
+
+    if job_id.chars().count() < MIN_JOB_ID_PREFIX_LEN {
+        return Ok(JobIdMatch::TooShort);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, name FROM cron_jobs WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![job_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut candidates: Vec<(String, Option<String>)> = Vec::new();
+    for row in rows {
+        candidates.push(row?);
+    }
+    if candidates.is_empty() {
+        return Ok(JobIdMatch::NotFound);
+    }
+    if candidates.len() == 1 {
+        let (id, _name) = candidates.remove(0);
+        return Ok(JobIdMatch::Job(id));
+    }
+    Ok(JobIdMatch::Ambiguous(candidates))
+}
+
+/// The refusal for a prefix that names more than one job: every candidate's
+/// full id and name, so the operator can pick one.
+///
+/// The name is sanitized for the terminal: it reaches the operator's screen
+/// (CLI, TUI, HTTP body), and a job name can come from a model-created job.
+fn ambiguous_job_id_message(input: &str, candidates: &[(String, Option<String>)]) -> String {
+    let listed = candidates
+        .iter()
+        .map(|(id, name)| {
+            let label = name
+                .as_deref()
+                .filter(|n| !n.trim().is_empty())
+                .map(crate::memory::sanitize::sanitize_for_terminal)
+                .unwrap_or_else(|| "unnamed".to_string());
+            format!("'{id}' ({label})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Ambiguous cron job id '{input}': matches {} jobs — {listed}",
+        candidates.len()
+    )
+}
+
+/// Turn a resolution outcome into the full job id, or into the refusal the
+/// operator sees.
+///
+/// The "not found" wording is unchanged (the HTTP API maps it to a 404 by
+/// substring); the other two refusals deliberately avoid that wording, so
+/// they read as a bad request rather than a missing job.
+fn resolved_job_id(input: &str, matched: JobIdMatch) -> Result<String> {
+    match matched {
+        JobIdMatch::Job(id) => Ok(id),
+        JobIdMatch::NotFound => anyhow::bail!("Cron job '{input}' not found"),
+        JobIdMatch::TooShort => anyhow::bail!(
+            "Cron job id '{input}' is too short: a prefix must be at least \
+             {MIN_JOB_ID_PREFIX_LEN} characters"
+        ),
+        JobIdMatch::Ambiguous(candidates) => {
+            anyhow::bail!("{}", ambiguous_job_id_message(input, &candidates))
+        }
+    }
+}
 
 /// Refuse to persist a job whose announce delivery names a locked channel.
 /// `deliver_if_configured` (`scheduler.rs`) already refuses this at delivery
@@ -63,6 +184,7 @@ pub fn add_shell_job(
     origin_chat: Option<&str>,
     origin_thread: Option<&str>,
 ) -> Result<CronJob> {
+    ensure_cron_enabled(config)?;
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -118,6 +240,7 @@ pub fn add_agent_job(
     origin_chat: Option<&str>,
     origin_thread: Option<&str>,
 ) -> Result<CronJob> {
+    ensure_cron_enabled(config)?;
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -231,15 +354,22 @@ pub fn ensure_visible_to_origin(
     }
 }
 
+/// Read one job by its id.
+///
+/// The id may be the full id or a prefix of it (at least
+/// [`MIN_JOB_ID_PREFIX_LEN`] characters) — see [`resolve_job_id_in_conn`].
+/// Reads stay open when `cron.enabled` is off, exactly like the CLI's.
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     with_connection(config, |conn| {
+        let matched = resolve_job_id_in_conn(conn, job_id)?;
+        let id = resolved_job_id(job_id, matched)?;
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat, origin_thread
              FROM cron_jobs WHERE id = ?1",
         )?;
 
-        let mut rows = stmt.query(params![job_id])?;
+        let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
             map_cron_job_row(row).map_err(Into::into)
         } else {
@@ -248,17 +378,36 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     })
 }
 
+/// Delete one job by its id (full id or a prefix of it).
+///
+/// Gated: a delete is an operator door, so it is refused while `cron.enabled`
+/// is off.
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
-    let changed = with_connection(config, |conn| {
-        conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
-            .context("Failed to delete cron job")
-    })?;
+    ensure_cron_enabled(config)?;
+    remove_job_ungated(config, id)
+}
 
-    if changed == 0 {
-        anyhow::bail!("Cron job '{id}' not found");
-    }
+/// The scheduler's own delete: a fired one-shot that asked to be removed
+/// deletes itself.
+///
+/// Exempt from the `cron.enabled` gate — it is bookkeeping for a run that
+/// already happened, not an operator door.
+pub(crate) fn remove_job_by_scheduler(config: &Config, id: &str) -> Result<()> {
+    remove_job_ungated(config, id)
+}
 
-    Ok(())
+fn remove_job_ungated(config: &Config, id: &str) -> Result<()> {
+    with_connection(config, |conn| {
+        let matched = resolve_job_id_in_conn(conn, id)?;
+        let resolved = resolved_job_id(id, matched)?;
+        let changed = conn
+            .execute("DELETE FROM cron_jobs WHERE id = ?1", params![resolved])
+            .context("Failed to delete cron job")?;
+        if changed == 0 {
+            anyhow::bail!("Cron job '{id}' not found");
+        }
+        Ok(())
+    })
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
@@ -315,10 +464,13 @@ pub fn set_next_run(config: &Config, job_id: &str, next_run: DateTime<Utc>) -> R
 /// its next future occurrence (and stays enabled — never silently disable a
 /// recurring job on a long outage); a one-shot `At` is disabled (a missed
 /// reminder must not fire late).
+///
+/// Bookkeeping for a run that already came due — exempt from the
+/// `cron.enabled` gate, like every other scheduler write.
 pub fn skip_stale_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
     match job.schedule {
         Schedule::At { .. } => {
-            update_job(
+            update_job_by_scheduler(
                 config,
                 &job.id,
                 CronJobPatch {
@@ -335,7 +487,41 @@ pub fn skip_stale_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Res
     Ok(())
 }
 
+/// Edit one job by its id (full id or a prefix of it).
+///
+/// Gated: an edit is an operator door, so it is refused while `cron.enabled`
+/// is off.
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+    ensure_cron_enabled(config)?;
+    update_job_ungated(config, job_id, patch)
+}
+
+/// The scheduler's own edit: a fired one-shot that stays in the table is
+/// disabled so the poller cannot re-fire it.
+///
+/// Exempt from the `cron.enabled` gate — it records what already ran, and the
+/// daemon decides ONCE at startup whether the scheduler runs at all. Refusing
+/// it here would leave a fired one-shot enabled and it would fire forever.
+pub(crate) fn update_job_by_scheduler(
+    config: &Config,
+    job_id: &str,
+    patch: CronJobPatch,
+) -> Result<CronJob> {
+    update_job_ungated(config, job_id, patch)
+}
+
+/// The body of [`update_job`], without the `cron.enabled` gate.
+///
+/// The gate lives in the callers that are operator doors; this one is the
+/// shared body the scheduler's own writes use.
+fn update_job_ungated(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+    let resolved = with_connection(config, |conn| {
+        // Resolve the id (a full id, or a prefix of one) before the write
+        // transaction opens.
+        let matched = resolve_job_id_in_conn(conn, job_id)?;
+        resolved_job_id(job_id, matched)
+    })?;
+
     with_connection(config, |conn| {
         // IMMEDIATE takes the write lock up front so a concurrent
         // reschedule_after_run cannot commit between our read and our write —
@@ -352,7 +538,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                         enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, origin_channel, origin_chat, origin_thread
                  FROM cron_jobs WHERE id = ?1",
             )?;
-            let mut rows = stmt.query(params![job_id])?;
+            let mut rows = stmt.query(params![resolved])?;
             match rows.next()? {
                 Some(row) => map_cron_job_row(row).map_err(anyhow::Error::from)?,
                 None => anyhow::bail!("Cron job '{job_id}' not found"),
@@ -474,7 +660,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         Ok(())
     })?;
 
-    get_job(config, job_id)
+    get_job(config, &resolved)
 }
 
 pub fn record_last_run(
@@ -643,8 +829,22 @@ fn truncate_cron_output(output: &str) -> String {
     truncated
 }
 
+/// The run history of one job, newest first.
+///
+/// The id may be the full id or a prefix of it. An id that names no job has
+/// no history, so the answer is an empty list (as it always was); a prefix
+/// that names several jobs is refused, because silently returning the wrong
+/// job's history would be worse than an error.
 pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
     with_connection(config, |conn| {
+        let matched = resolve_job_id_in_conn(conn, job_id)?;
+        let resolved = match matched {
+            JobIdMatch::Job(id) => id,
+            JobIdMatch::NotFound | JobIdMatch::TooShort => return Ok(Vec::new()),
+            JobIdMatch::Ambiguous(candidates) => {
+                anyhow::bail!("{}", ambiguous_job_id_message(job_id, &candidates))
+            }
+        };
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
         let mut stmt = conn.prepare(
             "SELECT id, job_id, started_at, finished_at, status, output, duration_ms, attempt
@@ -654,7 +854,7 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
              LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map(params![job_id, lim], |row| {
+        let rows = stmt.query_map(params![resolved, lim], |row| {
             Ok(CronRun {
                 id: row.get(0)?,
                 job_id: row.get(1)?,
@@ -985,6 +1185,252 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
+    }
+
+    /// Insert a job row with a controlled id.
+    ///
+    /// The store generates a UUID for every job it creates, so a test that
+    /// needs a specific id (two ids sharing a prefix, a full id that is also
+    /// a prefix of another) has to write the row itself.
+    fn insert_job_with_id(config: &Config, id: &str, name: Option<&str>) {
+        let now = Utc::now();
+        with_connection(config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (
+                    id, expression, command, schedule, job_type, name, session_target,
+                    enabled, delete_after_run, created_at, next_run
+                 ) VALUES (?1, '*/5 * * * *', 'echo ok', NULL, 'shell', ?2, 'isolated', 1, 0, ?3, ?4)",
+                params![
+                    id,
+                    name,
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A prefix that names exactly one job resolves to that job — this is the
+    /// whole point of the resolver: the id `cron list` prints must work.
+    #[test]
+    fn a_unique_id_prefix_resolves_to_its_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        insert_job_with_id(&config, "abcdef0123456789", Some("nightly"));
+
+        let job = get_job(&config, "abcdef01").unwrap();
+        assert_eq!(job.id, "abcdef0123456789");
+        assert_eq!(job.name.as_deref(), Some("nightly"));
+    }
+
+    /// A prefix that names several jobs is refused, and the refusal names
+    /// every candidate (full id + name) so the operator can pick one.
+    #[test]
+    fn an_ambiguous_id_prefix_is_refused_and_names_every_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        insert_job_with_id(&config, "abcdef01-one", Some("nightly"));
+        insert_job_with_id(&config, "abcdef01-two", Some("weekly"));
+
+        let err = get_job(&config, "abcdef01").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("abcdef01-one"), "{msg}");
+        assert!(msg.contains("nightly"), "{msg}");
+        assert!(msg.contains("abcdef01-two"), "{msg}");
+        assert!(msg.contains("weekly"), "{msg}");
+        assert!(
+            !msg.contains("not found"),
+            "an ambiguous id is a bad request, not a missing job: {msg}"
+        );
+    }
+
+    /// A prefix shorter than the minimum is refused with its own message, and
+    /// that message never says "not found" (the HTTP API maps "not found" to
+    /// a 404 by substring).
+    #[test]
+    fn an_id_prefix_below_the_minimum_length_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        insert_job_with_id(&config, "abcdef0123456789", Some("nightly"));
+
+        let err = get_job(&config, "abc").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains('8'), "the refusal names the minimum: {msg}");
+        assert!(
+            !msg.contains("not found"),
+            "a too-short id is a bad request, not a missing job: {msg}"
+        );
+    }
+
+    /// A full id is never ambiguous, even when it is also the prefix of
+    /// another job's id.
+    #[test]
+    fn a_full_id_that_is_also_a_prefix_of_another_resolves_to_itself() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        insert_job_with_id(&config, "abcdef0123456789", Some("first"));
+        insert_job_with_id(&config, "abcdef0123456789-extra", Some("second"));
+
+        let job = get_job(&config, "abcdef0123456789").unwrap();
+        assert_eq!(job.id, "abcdef0123456789");
+        assert_eq!(job.name.as_deref(), Some("first"));
+    }
+
+    /// An id that names nothing is still "not found" — the wording the HTTP
+    /// API maps to a 404.
+    #[test]
+    fn an_unknown_id_is_still_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let err = get_job(&config, "ffffffffffffffff").unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "expected a not-found refusal, got: {err}"
+        );
+    }
+
+    /// The prefix comparison is literal, not a `LIKE` pattern: a `%` or a `_`
+    /// in the input matches nothing, not everything.
+    #[test]
+    fn a_like_metacharacter_in_an_id_matches_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        insert_job_with_id(&config, "abcdef0123456789", Some("only"));
+
+        for meta in ["________", "%_______"] {
+            let err = get_job(&config, meta).unwrap_err();
+            assert!(
+                err.to_string().contains("not found"),
+                "a LIKE metacharacter must match nothing, got: {err}"
+            );
+        }
+    }
+
+    /// An id that names no job has no history: the answer is an empty list,
+    /// not an error. A prefix that names several jobs is refused — silently
+    /// returning the wrong job's history would be worse.
+    #[test]
+    fn list_runs_of_an_unknown_job_is_empty_and_an_ambiguous_prefix_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        insert_job_with_id(&config, "abcdef01-one", Some("nightly"));
+        insert_job_with_id(&config, "abcdef01-two", Some("weekly"));
+
+        assert!(list_runs(&config, "does-not-exist", 10).unwrap().is_empty());
+        assert!(list_runs(&config, "abc", 10).unwrap().is_empty());
+
+        let err = list_runs(&config, "abcdef01", 10).unwrap_err();
+        assert!(
+            err.to_string().contains("abcdef01-one"),
+            "the refusal names the candidates: {err}"
+        );
+    }
+
+    /// The store gate: a mutating function refuses while `cron.enabled` is
+    /// off, even when it is called directly — a door that forgets to ask
+    /// cannot reach the store.
+    #[test]
+    fn mutating_store_functions_refuse_when_cron_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let job = add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        config.cron.enabled = false;
+
+        let shell = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(shell.to_string(), CRON_DISABLED_MESSAGE);
+
+        let agent = add_agent_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "remind",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(agent.to_string(), CRON_DISABLED_MESSAGE);
+
+        let edit = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed".into()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(edit.to_string(), CRON_DISABLED_MESSAGE);
+
+        let delete = remove_job(&config, &job.id).unwrap_err();
+        assert_eq!(delete.to_string(), CRON_DISABLED_MESSAGE);
+
+        // Nothing was written: the job is untouched.
+        let stored = get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.name, None);
+        assert_eq!(stored.command, "echo ok");
+    }
+
+    /// The scheduler's own writes are bookkeeping for a run that already
+    /// happened, so they are exempt from the gate. Without the exemption, a
+    /// fired one-shot would stay enabled and fire forever.
+    #[test]
+    fn the_scheduler_bookkeeping_writes_still_land_when_cron_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let job = add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        config.cron.enabled = false;
+
+        // A stale recurring run re-anchors to the future and stays enabled.
+        set_next_run(&config, &job.id, now - ChronoDuration::hours(3)).unwrap();
+        let stale = get_job(&config, &job.id).unwrap();
+        skip_stale_run(&config, &stale, now).unwrap();
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(after.enabled, "a recurring job must stay enabled");
+        assert!(after.next_run > now, "a recurring job must re-anchor");
+
+        // The run history is still recorded.
+        record_run(&config, &job.id, now, now, "ok", Some("ok"), 1).unwrap();
+        assert_eq!(list_runs(&config, &job.id, 10).unwrap().len(), 1);
+
+        // The scheduler's own one-shot cleanup still writes.
+        update_job_by_scheduler(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!get_job(&config, &job.id).unwrap().enabled);
     }
 
     #[test]

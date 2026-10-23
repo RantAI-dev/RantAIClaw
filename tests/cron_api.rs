@@ -149,12 +149,21 @@ async fn cron_get_missing_job_runs_returns_empty() {
     assert_eq!(body["count"], 0);
 }
 
+/// A job id that names no job is a 404.
+///
+/// The id is a full-length unknown uuid rather than a short string such as
+/// `nope`, because an id shorter than the 8-character prefix minimum is
+/// refused as too short (HTTP 400) before it is ever looked up. The contract
+/// pinned here is "a missing job is a 404", and a full-length id that matches
+/// nothing is exactly that.
 #[tokio::test]
 async fn cron_update_missing_job_returns_404() {
     let ws = tempfile::tempdir().unwrap();
     let base = spawn_test_gateway(test_config(ws.path())).await;
     let resp = reqwest::Client::new()
-        .put(format!("{base}/api/v1/cron/nope"))
+        .put(format!(
+            "{base}/api/v1/cron/00000000-0000-0000-0000-000000000000"
+        ))
         .bearer_auth(TEST_TOKEN)
         .json(&serde_json::json!({ "enabled": false }))
         .send()
@@ -224,4 +233,88 @@ async fn cron_run_honours_an_operator_supplied_approval() {
         reqwest::StatusCode::OK,
         "an authenticated operator must still be able to force-run a gated job"
     );
+}
+
+/// Every mutating cron endpoint refuses while the cron feature switch is
+/// off, with the same words every other door uses. The read endpoints stay
+/// open, so an operator can still inspect dormant jobs.
+#[tokio::test]
+async fn every_mutating_cron_endpoint_is_refused_when_cron_is_disabled() {
+    let ws = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(ws.path());
+    cfg.cron.enabled = false;
+    let base = spawn_test_gateway(cfg).await;
+    let client = reqwest::Client::new();
+    let expected = "cron is disabled by config (cron.enabled=false)";
+
+    // POST /cron
+    let resp = client
+        .post(format!("{base}/api/v1/cron"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+            "prompt": "Good morning"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["detail"], expected);
+
+    // PUT /cron/{id}
+    let resp = client
+        .put(format!("{base}/api/v1/cron/does-not-exist"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({ "enabled": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["detail"], expected);
+
+    // DELETE /cron/{id}
+    let resp = client
+        .delete(format!("{base}/api/v1/cron/does-not-exist"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["detail"], expected);
+
+    // POST /cron/{id}/run
+    let resp = client
+        .post(format!("{base}/api/v1/cron/does-not-exist/run"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["detail"], expected);
+
+    // The reads stay open: an operator can still see what is dormant.
+    let resp = client
+        .get(format!("{base}/api/v1/cron"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["cron_enabled"], false);
+    assert_eq!(body["count"], 0);
+
+    let resp = client
+        .get(format!("{base}/api/v1/cron/does-not-exist/runs"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["count"], 0);
 }
