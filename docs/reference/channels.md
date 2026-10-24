@@ -266,7 +266,7 @@ All channel settings live under `channels_config` in `~/.rantaiclaw/config.toml`
 
 ```toml
 [channels_config]
-cli = true
+message_timeout_secs = 600
 ```
 
 Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).

@@ -1074,6 +1074,20 @@ Notes:
 - `RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
 - See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for setup and troubleshooting.
 
+## Unknown configuration keys
+
+The loader checks the configuration against the generated schema at every
+nested depth. An unknown key produces a warning that names its full dotted
+path, such as `knowledge.retention_days` or `gateway.foo`, and the unknown
+value is ignored. Suggestions are made against the known keys at the same
+level.
+
+Keys that name a user-defined map entry — an MCP server, provider key, agent,
+skill, model price, or route index — are part of the operator's data and are
+not warned about. The loader still checks the known fields inside each entry;
+for example, a misspelled `commnad` under `[mcp_servers.example]` is reported
+as `mcp_servers.example.commnad`.
+
 ## Schema version and downgrades
 
 `config.toml` carries a `schema_version` line. On launch the binary runs any
@@ -1083,6 +1097,16 @@ is refused rather than half-understood.
 
 Migrations only move forward. There is no automatic downgrade, so reverting to a
 binary older than your config's `schema_version` needs a manual edit.
+
+### v40: the `[channels_config].cli` key retired
+
+`[channels_config].cli` is removed. It did not gate the CLI channel and no
+production code read it. Existing configs drop the key on load (config schema
+**39 → 40**) while every other channel setting is preserved.
+
+A config written by this schema is refused by a binary that knows only schema
+39. Keep `config.toml.bak`, which the migrator leaves next to `config.toml`, to
+go back.
 
 ### v38: the `[memory].auto_save` key retired
 

@@ -63,7 +63,6 @@ const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     let ChannelsConfig {
-        cli: _,     // `cli` is always available and does not require channel server startup
         webhook: _, // webhook traffic is handled by gateway, not `rantaiclaw channel start`
         telegram,
         discord,

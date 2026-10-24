@@ -206,7 +206,8 @@ A stale document asserting an active security control is worse than silence, so:
   rather than left as a promise. **What confines commands is `[runtime].kind`** —
   `native` or `docker` — which the shell tool actually goes through. Writing
   `[security.*]` produces an `unknown config key` warning at load, as it did
-  before; that has not changed.
+  before; that has not changed. The loader now checks unknown keys at every
+  nested depth, not only at the top level.
 - **The tool-call audit trail is on, but `[security.audit]` still configures
   nothing.** Every tool call — executed and refused — now writes one JSON record to
   `<profile>/audit.log` (channel, tool name, approved, allowed, succeeded,

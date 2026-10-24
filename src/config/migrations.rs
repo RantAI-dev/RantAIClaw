@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 39;
+pub const CURRENT_VERSION: u32 = 40;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -508,7 +508,14 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; default-value change only)
     }
 
-    // Future migrations (v40, …) inserted here in order.
+    // v39 → v40: remove `[channels_config].cli`. The flag had no production
+    // reader; serde ignored it while the CLI channel remained available. Drop
+    // only this key and leave every other channel setting untouched.
+    if from < 40 {
+        migrate_v40(raw);
+    }
+
+    // Future migrations (v41, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -971,6 +978,21 @@ fn migrate_v38(raw: &mut Value) {
     }
 }
 
+/// v39 → v40: drop `[channels_config] cli`. The key toggled an interactive CLI
+/// channel that nothing read any more, so leaving it in a config would
+/// advertise a behaviour that does not exist.
+///
+/// A pure `toml::Value` transform with no I/O, like every other `migrate_vN`.
+fn migrate_v40(raw: &mut Value) {
+    if let Some(channels) = raw
+        .as_table_mut()
+        .and_then(|root| root.get_mut("channels_config"))
+        .and_then(Value::as_table_mut)
+    {
+        channels.remove("cli");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,7 +1215,7 @@ backend = \"markdown\"
         // v2 → v3 only added `[channels_config].autonomous_tools` (additive,
         // default false). A v2 config migrates to v3 with all content intact
         // and without the migration injecting autonomous_tools.
-        let mut v = parse("schema_version = 2\n[channels_config]\ncli = true\n");
+        let mut v = parse("schema_version = 2\n[channels_config]\nmessage_timeout_secs = 600\n");
         let migrated = migrate(&mut v).unwrap();
         assert!(migrated, "v2 bump should be reported as transformed");
         // migrate() always stamps to CURRENT_VERSION (the chain can't stop at an
@@ -1201,7 +1223,10 @@ backend = \"markdown\"
         // field, which must not be injected by the migration.
         assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let cc = v.get("channels_config").unwrap().as_table().unwrap();
-        assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
+        assert_eq!(
+            cc.get("message_timeout_secs").unwrap().as_integer(),
+            Some(600)
+        );
         assert!(
             cc.get("autonomous_tools").is_none(),
             "migration must not inject autonomous_tools; serde default handles it"
@@ -1249,12 +1274,15 @@ backend = \"markdown\"
         // v3 → v4 only added `[channels_config].approval_owners` (additive,
         // default empty). A v3 config migrates to v4 with all content intact
         // and without the migration injecting approval_owners.
-        let mut v = parse("schema_version = 3\n[channels_config]\ncli = true\n");
+        let mut v = parse("schema_version = 3\n[channels_config]\nmessage_timeout_secs = 600\n");
         let migrated = migrate(&mut v).unwrap();
         assert!(migrated, "v3 bump should be reported as transformed");
         assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let cc = v.get("channels_config").unwrap().as_table().unwrap();
-        assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
+        assert_eq!(
+            cc.get("message_timeout_secs").unwrap().as_integer(),
+            Some(600)
+        );
         assert!(
             cc.get("approval_owners").is_none(),
             "migration must not inject approval_owners; serde default handles it"
@@ -1267,12 +1295,15 @@ backend = \"markdown\"
         // `guest_allowed_commands` (additive, default empty). A v4 config
         // migrates to current with content intact and without the migration
         // injecting the guest fields.
-        let mut v = parse("schema_version = 4\n[channels_config]\ncli = true\n");
+        let mut v = parse("schema_version = 4\n[channels_config]\nmessage_timeout_secs = 600\n");
         let migrated = migrate(&mut v).unwrap();
         assert!(migrated, "v4 bump should be reported as transformed");
         assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let cc = v.get("channels_config").unwrap().as_table().unwrap();
-        assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
+        assert_eq!(
+            cc.get("message_timeout_secs").unwrap().as_integer(),
+            Some(600)
+        );
         assert!(
             cc.get("guest_allowed_tools").is_none() && cc.get("guest_allowed_commands").is_none(),
             "migration must not inject guest fields; serde defaults handle them"
@@ -2575,7 +2606,7 @@ allowed_users = ["*"]
             cfg.browser.allowed_domains.is_empty(),
             "an explicit [] is a user choice and must survive the migration"
         );
-        assert_eq!(cfg.schema_version, 39);
+        assert_eq!(cfg.schema_version, 40);
     }
 
     #[test]
@@ -2601,5 +2632,59 @@ allowed_users = ["*"]
             crate::config::Config::default().memory.min_relevance_score,
             0.6
         );
+    }
+    #[test]
+    fn v40_removes_only_the_dead_channels_config_cli_key() {
+        let mut v = parse(
+            "schema_version = 39\n\
+             [channels_config]\n\
+             cli = false\n\
+             message_timeout_secs = 600\n\
+             [channels_config.telegram]\n\
+             bot_token = \"t\"\n",
+        );
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(40));
+        let channels = v.get("channels_config").and_then(Value::as_table).unwrap();
+        assert!(!channels.contains_key("cli"));
+        assert_eq!(
+            channels
+                .get("message_timeout_secs")
+                .and_then(Value::as_integer),
+            Some(600)
+        );
+        assert!(channels.get("telegram").and_then(Value::as_table).is_some());
+    }
+
+    #[test]
+    fn v40_is_a_no_op_when_channels_config_cli_is_absent() {
+        let mut v = parse(
+            "schema_version = 39\n\
+             [channels_config]\n\
+             message_timeout_secs = 600\n",
+        );
+        assert!(migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(40));
+        let channels = v.get("channels_config").and_then(Value::as_table).unwrap();
+        assert!(!channels.contains_key("cli"));
+        assert_eq!(
+            channels
+                .get("message_timeout_secs")
+                .and_then(Value::as_integer),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn v40_is_idempotent() {
+        let mut v = parse("schema_version = 39\n[channels_config]\ncli = false\n");
+        assert!(migrate(&mut v).unwrap());
+        assert!(!migrate(&mut v).unwrap());
+        assert_eq!(version_of(&v), Some(40));
+        assert!(!v
+            .get("channels_config")
+            .and_then(Value::as_table)
+            .unwrap()
+            .contains_key("cli"));
     }
 }

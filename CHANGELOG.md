@@ -87,6 +87,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The config loader now warns about an unknown key at any depth, not only at
+  the top level. A mistyped nested key such as `knowledge.retention_days` was
+  dropped silently; the warning now names the full dotted path and suggests a
+  known sibling at the same level. Keys that name operator-defined map entries
+  remain exempt, while known fields inside those entries are still checked.
+
 - An installed skill's binary is now reachable from the agent's `shell` tool. The tools directory of every loaded
   skill — `<XDG data>/rantaiclaw/tools/<skill name>/`, where a `download` install recipe puts what it installed — is
   now **appended** to the `PATH` of the child a shell call runs. A skill that carries a recipe has no tool of its
@@ -116,6 +122,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers that the model is changed with `/model`, and the debug toggle is removed with the `/config debug`
   key, the `/debug` command and the `/status` Debug row. `/model <provider:model>` changes the model.
 - `[browser] allowed_domains` now defaults to `["*"]` (config schema 38 → 39), so `browser` and `browser_open` take a public host on a fresh install. An existing config is left as written.
+
+### Removed
+
+- `[channels_config] cli`, which nothing read, is dropped by a migration to
+  config schema 40. Every other channel setting is preserved. A config written
+  by this version is refused by a binary that knows only schema 39; restore the
+  previous config from `config.toml.bak`, which the migrator leaves next to
+  `config.toml`, to go back.
 
 ### Fixed
 
