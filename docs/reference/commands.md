@@ -198,6 +198,15 @@ Notes:
 - The scheduler's own bookkeeping is exempt from the gate: recording a run, re-anchoring a stale schedule, and deleting or disabling a one-shot that already fired still land, so a runtime flip of `cron.enabled` cannot make a fired one-shot fire again.
 - If `scheduler.enabled = false`, jobs persist but never fire — `cron list` shows a "scheduler disabled" banner.
 - Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
+- **A shell job runs with the agent shell's environment, not the daemon's.** The job's child
+  process sees an empty environment plus the allowlisted functional variables (`PATH`, `HOME`,
+  `TERM`, `LANG`, the proxy variables and the cloud-tool pointers), the `[skills.entries.<n>]`
+  env overlay, and the loaded skills' own tools directories appended to its `PATH`. It never
+  inherits the daemon's own environment, so a provider API key or a channel token the daemon
+  holds cannot be read back through a job's output. This holds for every shell job, whoever
+  created it, and for every way one is run (the scheduler, `cron run`, the `cron_run` tool,
+  the HTTP route, the TUI). An operator job that needs a secret reads it itself, for example
+  `sh -c '. ~/.config/myjob.env && mycmd'`.
 - **A job created from a chat reads only that chat.** A job that `cron_add` created
   from a chat carries that chat's channel and reply target. Its run reads the
   conversation of that chat, built the way channel dispatch builds it, and

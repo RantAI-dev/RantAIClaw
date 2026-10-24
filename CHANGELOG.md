@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **RUSTSEC-2026-0387 waived while no patched `crypto-bigint` is selectable.** The advisory
+  (timing variability in operations intended to be constant-time) is fixed only in
+  `crypto-bigint` >= 0.7.6, and the lockfile cannot take that version: `russh 0.60.3` pins
+  `crypto-bigint = "=0.7.0-rc.28"` exactly, so `cargo update` refuses it. The advisory is
+  waived by id in `deny.toml` and the Security Audit job's ignore list — kept identical as
+  `deny.toml` requires — with the same reasoning and review date as the neighbouring `rsa`
+  Marvin waiver (RUSTSEC-2023-0071): the keys in play are the operator's own SSH identities
+  against hosts the operator explicitly targets, not a multi-tenant extraction surface.
+  Upstream `russh` 0.63+ already requires `crypto-bigint ^0.7.3`, which resolves to the
+  patched 0.7.6, so the waiver dies with a future russh port (review by 2026-11-15). No
+  config key and no behaviour of RantaiClaw itself changed.
+
+- **A scheduled shell job ran with the daemon's whole environment.** The cron
+  scheduler spawned the job's command with no `env_clear()`, so the child inherited
+  every variable the daemon holds — a provider API key, a channel token. The model
+  could schedule such a job itself through the `cron_add` tool and read the output
+  back through `cron_runs` or the job's `last_output`, so every daemon-held secret
+  was readable by the model. A shell job now runs with the same cleared environment
+  the agent's `shell` tool gives a command: an empty environment, then only the
+  allowlisted functional variables in `SAFE_ENV_VARS`, then the
+  `[skills.entries.<n>]` env overlay, then the loaded skills' own tools directories
+  appended to the child's `PATH`. `SAFE_ENV_VARS` is unchanged and the agent's
+  `shell` tool behaves exactly as before. This holds for every shell job,
+  operator-created ones included — `created_by` cannot separate them reliably, so
+  it is not used — and for every way a job is run (the scheduler, `cron run`, the
+  `cron_run` tool, the gateway route, the TUI), because all of them dispatch
+  through the same function. An operator job that needs a secret reads it itself:
+  `sh -c '. ~/.config/myjob.env && mycmd'`. No config key changed and nothing
+  migrates, so rolling back means reverting this change. One limit remains: the
+  job runs through `sh -lc`, a login shell, so it still sources the operator's own
+  `/etc/profile` and `~/.profile`; the agent's `shell` tool runs a non-login shell
+  and does not source profiles. Those files are readable by the agent's shell
+  anyway, so this does not widen what the model can reach, but the two are not
+  byte-identical.
 - **ctutils 0.4.4, for RUSTSEC-2026-0385.** The lockfile takes `ctutils` 0.4.2 → 0.4.4. The
   `ctutils::Choice` mask generators are `const fn`, so before 0.4.4 the generated code could
   branch on the secret value on common platforms, and the `u128` comparisons could branch on

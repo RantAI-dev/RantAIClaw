@@ -115,8 +115,8 @@ at `src/config/schema.rs:2099`). A budget of `0` refuses every call, because
 ### 2.4 Environment isolation (`env_clear` + `SAFE_ENV_VARS`)
 
 The child starts with an empty environment: `cmd.env_clear()`
-(`src/tools/shell.rs:506`). The tool then restores only the variables in
-`SAFE_ENV_VARS` (`src/tools/shell.rs:508-512`, list at
+(`src/tools/shell.rs:84`). The tool then restores only the variables in
+`SAFE_ENV_VARS` (`src/tools/shell.rs:86`, list at
 `src/tools/shell.rs:37-68`):
 
 - shell essentials: `PATH`, `HOME`, `TERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `USER`,
@@ -130,13 +130,30 @@ The child starts with an empty environment: `cmd.env_clear()`
 Most entries are a path, a socket or a region and profile selector, so common
 operator tooling works without forwarding a credential. A secret value such as
 `AWS_SECRET_ACCESS_KEY` is not on the list and does not reach the child.
-`shell_does_not_leak_api_key` (`src/tools/shell.rs:926`) and
-`shell_safe_env_vars_excludes_secrets` (`src/tools/shell.rs:1260`) guard this.
+`shell_does_not_leak_api_key` (`src/tools/shell.rs:1198`) and
+`shell_safe_env_vars_excludes_secrets` (`src/tools/shell.rs:1532`) guard this.
 
 One limit is worth stating: the guard checks variable names, not values. A
 `*_PROXY` URL may embed `user:pass@` basic auth, so a command that prints the
 environment (`env`) can surface it. That is the accepted cost of supporting an
 authenticated corporate proxy (`src/tools/shell.rs:23-36`).
+
+A scheduled cron shell job gets the same isolation. The environment lives in one
+function, `apply_safe_env` (`src/tools/shell.rs:79`), called both by the shell tool
+(`src/tools/shell.rs:610`) and by the cron scheduler
+(`src/cron/scheduler.rs:1093`), so the two cannot drift apart. The scheduler builds
+the `[skills.entries.<n>]` overlay and the loaded skills' tools directories from the
+same config and the same skill loader the agent's shell uses
+(`crate::tools::agent_shell_env`, `src/tools/mod.rs:780`). This holds for every
+shell job, whoever created it: `CronJob.created_by` is deliberately not used to
+exclude operator-created jobs, because older rows carry no value for it and a
+gateway principal may be a model acting through the console. One difference
+remains: the job runs through `sh -lc`, a login shell, so it still sources
+`/etc/profile` and `~/.profile`; the shell tool runs a non-login shell and does not
+source profiles. A variable the operator exports in their own profile file reaches
+the job that way. Those files are readable by the agent's shell anyway, so this
+does not widen what the model can reach, but the two environments are not
+byte-identical.
 
 ### 2.5 Timeout (600 seconds)
 
