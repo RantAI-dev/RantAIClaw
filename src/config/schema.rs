@@ -2586,12 +2586,10 @@ pub struct CustomTunnelConfig {
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
 /// setting it to `Some(...)` enables that channel.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-// Partial `[channels_config]` fills missing fields (e.g. `cli`) from
-// `impl Default` instead of failing to load.
+// Partial `[channels_config]` fills missing fields (e.g. `message_timeout_secs`)
+// from `impl Default` instead of failing to load.
 #[serde(default)]
 pub struct ChannelsConfig {
-    /// Enable the CLI interactive channel. Default: `true`.
-    pub cli: bool,
     /// Telegram bot channel configuration. Support: **supported**. Verification: **verified**.
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration. Support: **supported**. Verification: **verified**.
@@ -2707,7 +2705,6 @@ fn default_channel_message_timeout_secs() -> u64 {
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
-            cli: true,
             telegram: None,
             discord: None,
             slack: None,
@@ -3233,7 +3230,7 @@ pub struct LarkConfig {
 /// build one with `AuditConfig::default()`. The container that used to hold
 /// this alongside the now-deleted `sandbox` and `resources` sections was
 /// removed; the `[security.*]` block stays an unknown top-level config key so
-/// `warn_on_unknown_top_level_config_keys` keeps reporting it at startup. That
+/// `warn_on_unknown_config_keys` keeps reporting it at startup. That
 /// is the point: the audit trail runs on defaults today, and making the
 /// section parse would replace the unknown-key warning with silence. The
 /// `security_is_not_a_known_top_level_key` test exists to pin that.
@@ -4090,22 +4087,6 @@ fn encrypt_optional_secret(
     Ok(())
 }
 
-/// Top-level config keys the schema recognizes, derived from the generated
-/// JSON schema so it can never drift from the struct. Computed paths that are
-/// skipped during (de)serialization (`config_path`, `workspace_dir`) are
-/// already absent from the schema's `properties`, so they are not treated as
-/// writable keys.
-fn known_top_level_config_keys() -> std::collections::HashSet<String> {
-    let schema = schemars::schema_for!(Config);
-    serde_json::to_value(&schema)
-        .ok()
-        .as_ref()
-        .and_then(|json| json.get("properties"))
-        .and_then(serde_json::Value::as_object)
-        .map(|props| props.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
 /// Case-insensitive Levenshtein distance, used only to suggest a near miss for
 /// an unrecognized key. Bounded by the two key lengths and runs at most once
 /// per unknown key, so cost is negligible.
@@ -4141,27 +4122,179 @@ fn nearest_known_key<'a>(
         .map(|(_, k)| k.as_str())
 }
 
-/// Warn (never fail) on top-level config keys the schema does not recognize.
-/// serde ignores unknown fields, so a mistyped section or key silently loads
-/// as its default; this restores a signal without a hard `deny_unknown_fields`
-/// that would reject forward-compat keys outright.
-fn warn_on_unknown_top_level_config_keys(raw: &toml::Value, config_path: &Path) {
-    let Some(table) = raw.as_table() else {
+/// Keys serde accepts under another name, as `(table path, alias)`. The
+/// generated JSON schema does not express `#[serde(alias)]`, so a schema walk
+/// alone would warn about a correct config.
+///
+/// The list is hand-maintained because the schema cannot carry the alias, so
+/// the `every_serde_alias_is_accepted_by_the_unknown_key_warner` test is the
+/// guard: it scans every `.rs` file under `src/`, keeps the aliases whose
+/// owning type sits at a config path in the generated schema, and fails when
+/// the code and the list disagree — an alias the list does not name for the
+/// path its owner sits at, a listed pair whose alias is gone, and a name the
+/// two count differently.
+const SERDE_ALIAS_KEYS: [(&str, &str); 2] = [
+    ("composio", "enable"),
+    ("channels_config.email", "poll_interval_secs"),
+];
+
+/// Warn (never fail) on config keys the schema does not recognize, at any
+/// depth. serde ignores unknown fields, so a mistyped section or key silently
+/// loads as its default; this restores a signal without a hard
+/// `deny_unknown_fields` that would reject forward-compat keys outright.
+fn warn_on_unknown_config_keys(raw: &toml::Value, config_path: &Path) {
+    let schema = schemars::schema_for!(Config);
+    let Ok(schema_json) = serde_json::to_value(&schema) else {
         return;
     };
-    let known = known_top_level_config_keys();
-    if known.is_empty() {
+    let mut defs = serde_json::Map::new();
+    if let Some(serde_json::Value::Object(definitions)) = schema_json.get("$defs") {
+        defs = definitions.clone();
+    }
+    let root = schema_json.as_object().cloned().unwrap_or_default();
+    warn_unknown_config_node(raw, &root, &defs, "", config_path);
+}
+
+fn resolve_schema<'a>(
+    schema: &'a serde_json::Map<String, serde_json::Value>,
+    defs: &'a serde_json::Map<String, serde_json::Value>,
+) -> &'a serde_json::Map<String, serde_json::Value> {
+    let Some(reference) = schema
+        .get("$ref")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.strip_prefix("#/$defs/"))
+    else {
+        return schema;
+    };
+    defs.get(reference)
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(schema)
+}
+
+fn warn_unknown_config_node(
+    value: &toml::Value,
+    schema: &serde_json::Map<String, serde_json::Value>,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    config_path: &Path,
+) {
+    let schema = resolve_schema(schema, defs);
+    // The first of three descents: a map walks into its values. The keys of
+    // a map are the operator's, so nothing warns about them; the walk
+    // continues into each value so a typo inside `[mcp_servers.foo]` is
+    // still caught. The map check comes first on purpose: a node that is a map
+    // is walked as one. No `Config` struct mixes named properties with
+    // `additionalProperties` — there is no `#[serde(flatten)]` in the config
+    // schema — so nothing is skipped by the order.
+    if let Some(additional) = schema
+        .get("additionalProperties")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(table) = value.as_table() {
+            for (key, child) in table {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                warn_unknown_config_node(child, additional, defs, &child_path, config_path);
+            }
+        }
         return;
     }
-    for key in table.keys() {
-        if known.contains(key.as_str()) {
+    // The second descent: an array of structs is walked per element.
+    if schema.get("type").and_then(serde_json::Value::as_str) == Some("array") {
+        if let Some(items) = schema.get("items").and_then(serde_json::Value::as_object) {
+            if let Some(array) = value.as_array() {
+                for (index, child) in array.iter().enumerate() {
+                    let child_path = format!("{path}[{index}]");
+                    warn_unknown_config_node(child, items, defs, &child_path, config_path);
+                }
+            }
+        }
+        return;
+    }
+    // A free-form map (`additionalProperties: true`, as in
+    // `skills.entries.<name>.config`) is not an object, so it is not walked
+    // as a map: it falls through to the property branch below, finds no
+    // `properties` and returns. Nothing under it warns, which is the intent —
+    // the operator's free-form values are the operator's.
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    let known = properties
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    for (key, child) in table {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        if let Some(property_schema) = properties.get(key).and_then(serde_json::Value::as_object) {
+            let resolved = resolve_schema(property_schema, defs);
+            // `Option<T>` is generated as `anyOf: [{$ref}, {type: "null"}]`;
+            // the `null` variant has no properties of its own, so walking each
+            // variant is enough. An `anyOf` of inline objects (an untagged
+            // enum) has no `$ref` variant, so it is not walked at all and
+            // nothing under it warns; no such enum is reachable from `Config`
+            // today.
+            let is_nullable_ref = resolved
+                .get("anyOf")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|variants| {
+                    variants.iter().any(|variant| {
+                        variant
+                            .get("$ref")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                    })
+                });
+            if is_nullable_ref {
+                if let Some(variants) = resolved.get("anyOf").and_then(serde_json::Value::as_array)
+                {
+                    for variant in variants {
+                        if let Some(variant_schema) = variant.as_object() {
+                            warn_unknown_config_node(
+                                child,
+                                variant_schema,
+                                defs,
+                                &child_path,
+                                config_path,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            // The third descent: the node decides how to descend — a map walks
+            // into its values, an array into its elements, anything else into
+            // the properties of the resolved schema.
+            warn_unknown_config_node(child, property_schema, defs, &child_path, config_path);
+            continue;
+        }
+        // A real property wins over an alias entry: the lookup above already
+        // handled every name the schema knows, so an alias can never shadow
+        // one.
+        if SERDE_ALIAS_KEYS
+            .iter()
+            .any(|(alias_path, alias)| *alias_path == path && *alias == key.as_str())
+        {
             continue;
         }
         let suggestion = nearest_known_key(key, &known)
             .map(|hint| format!(" (did you mean `{hint}`?)"))
             .unwrap_or_default();
         tracing::warn!(
-            "unknown config key `{key}` in {} was ignored{suggestion}",
+            "unknown config key `{child_path}` in {} was ignored{suggestion}",
             config_path.display()
         );
     }
@@ -4549,12 +4682,13 @@ impl Config {
                     );
                 }
             }
-            // Flag top-level keys the schema does not recognize. A mistyped
-            // section or key (`[gatway]`, `defualt_provider`) otherwise
-            // deserializes silently to the default and no-ops with no signal.
-            // Runs AFTER migration, so keys a past migration legitimately
-            // removed are already gone and never warned about.
-            warn_on_unknown_top_level_config_keys(&raw, &config_path);
+            // Flag config keys the schema does not recognize, at any depth. A
+            // mistyped section or key (`[gatway]`, `defualt_provider`,
+            // `[gateway] foo`) otherwise deserializes silently to the default
+            // and no-ops with no signal. Runs AFTER migration, so keys a past
+            // migration legitimately removed are already gone and never
+            // warned about.
+            warn_on_unknown_config_keys(&raw, &config_path);
             // The v34 → v35 bump retires the `postgres` memory backend and
             // the entire `[storage]` section. `migrate_v35` rewrites the
             // backend name on disk and strips the storage table (including
@@ -6045,6 +6179,22 @@ mod tests {
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
 
+    /// Top-level config keys the schema recognizes, derived from the generated
+    /// JSON schema so it can never drift from the struct. Computed paths that
+    /// are skipped during (de)serialization (`config_path`, `workspace_dir`)
+    /// are already absent from the schema's `properties`, so they are not
+    /// treated as writable keys.
+    fn known_top_level_config_keys() -> std::collections::HashSet<String> {
+        let schema = schemars::schema_for!(Config);
+        serde_json::to_value(&schema)
+            .ok()
+            .as_ref()
+            .and_then(|json| json.get("properties"))
+            .and_then(serde_json::Value::as_object)
+            .map(|props| props.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     #[tokio::test]
     async fn gateway_login_defaults_to_disabled() {
         let g = GatewayConfig::default();
@@ -6237,7 +6387,731 @@ mod tests {
         // config; this exercises the table walk over every real top-level key.
         let raw =
             toml::Value::try_from(Config::default()).expect("default config serializes to toml");
-        warn_on_unknown_top_level_config_keys(&raw, Path::new("/tmp/config.toml"));
+        warn_on_unknown_config_keys(&raw, Path::new("/tmp/config.toml"));
+    }
+
+    /// Everything the unknown-key warner logged for `toml_src`.
+    fn unknown_key_log(toml_src: &str) -> String {
+        let raw: toml::Value = toml::from_str(toml_src).expect("fixture parses");
+        let (logs, _guard) = capture_logs();
+        warn_on_unknown_config_keys(&raw, Path::new("/tmp/config.toml"));
+        logs.contents()
+    }
+
+    fn assert_no_unknown_key_warning(toml_src: &str) {
+        let log = unknown_key_log(toml_src);
+        assert!(
+            !log.contains("unknown config key"),
+            "expected no warning for:\n{toml_src}\ngot:\n{log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_names_the_full_path_of_a_nested_key() {
+        let log = unknown_key_log("[knowledge]\nretention_days = 30\n");
+        assert!(
+            log.contains("unknown config key `knowledge.retention_days`"),
+            "got: {log}"
+        );
+
+        let log = unknown_key_log("[gateway]\nfoo = 1\n");
+        assert!(
+            log.contains("unknown config key `gateway.foo`"),
+            "got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_suggests_a_sibling_at_the_same_depth() {
+        let log = unknown_key_log("[gateway]\nreqire_pairing = true\n");
+        assert!(
+            log.contains("unknown config key `gateway.reqire_pairing`")
+                && log.contains("did you mean `require_pairing`?"),
+            "got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_still_names_a_top_level_key_without_a_prefix() {
+        let log = unknown_key_log("[security.audit]\nenabled = true\n");
+        assert!(log.contains("unknown config key `security`"), "got: {log}");
+    }
+
+    #[test]
+    async fn unknown_key_warning_reaches_a_key_below_two_nested_tables() {
+        let log = unknown_key_log("[browser.computer_use]\nendpoinnt = \"x\"\n");
+        assert!(
+            log.contains("unknown config key `browser.computer_use.endpoinnt`"),
+            "got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_a_known_channel_entry_and_names_a_typo_in_it() {
+        assert_no_unknown_key_warning(
+            "[channels_config.telegram]\nbot_token = \"t\"\nallowed_users = [\"u\"]\n",
+        );
+        let log = unknown_key_log("[channels_config.telegram]\nbot_tokn = \"t\"\n");
+        assert!(
+            log.contains("unknown config key `channels_config.telegram.bot_tokn`"),
+            "got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_mcp_server_names() {
+        assert_no_unknown_key_warning(
+            "[mcp_servers.anything]\ncommand = \"npx\"\nargs = [\"-y\"]\n\n\
+             [mcp_servers.anything.env]\nANY_ENV_NAME = \"v\"\n",
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_names_a_typo_inside_an_mcp_server_entry() {
+        let log = unknown_key_log("[mcp_servers.foo]\ncommnad = \"x\"\n");
+        assert!(
+            log.contains("unknown config key `mcp_servers.foo.commnad`"),
+            "got: {log}"
+        );
+        assert!(
+            !log.contains("`mcp_servers.foo`"),
+            "the server name itself is the operator's, got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_model_names_in_reliability_model_fallbacks() {
+        assert_no_unknown_key_warning(
+            "[reliability.model_fallbacks.\"some/model\"]\nfallbacks = [\"other/model\"]\n",
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_walks_every_element_of_a_query_classification_rule_array() {
+        assert_no_unknown_key_warning(
+            "[[query_classification.rules]]\nhint = \"fast\"\nkeywords = [\"hi\"]\n",
+        );
+        let log =
+            unknown_key_log("[[query_classification.rules]]\nhint = \"fast\"\nkwrods = [\"hi\"]\n");
+        assert!(
+            log.contains("unknown config key `query_classification.rules[0].kwrods`"),
+            "got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_provider_names_in_provider_api_keys() {
+        assert_no_unknown_key_warning(
+            "[provider_api_keys]\nsome-provider = \"k\"\nother = \"k\"\n",
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_delegate_agent_names() {
+        assert_no_unknown_key_warning("[agents.researcher]\nprovider = \"p\"\nmodel = \"m\"\n");
+        let log = unknown_key_log("[agents.researcher]\nprovidr = \"p\"\n");
+        assert!(
+            log.contains("unknown config key `agents.researcher.providr`"),
+            "got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_gateway_agent_names() {
+        assert_no_unknown_key_warning(
+            "[gateway_agents.persona_a]\nprovider = \"p\"\nmodel = \"m\"\n",
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_model_names_in_cost_prices() {
+        assert_no_unknown_key_warning(
+            "[cost.prices.\"some/model\"]\ninput_per_million = 1.0\noutput_per_million = 2.0\n",
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_skill_entry_names_and_their_free_form_config() {
+        assert_no_unknown_key_warning(
+            "[skills.entries.my-skill]\nenabled = true\n\n\
+             [skills.entries.my-skill.env]\nANY_NAME = \"v\"\n\n\
+             [skills.entries.my-skill.config]\nanything = 1\n\n\
+             [skills.entries.my-skill.config.nested]\nalso_anything = \"x\"\n",
+        );
+        let log = unknown_key_log("[skills.entries.my-skill]\nenabld = true\n");
+        assert!(
+            log.contains("unknown config key `skills.entries.my-skill.enabld`"),
+            "got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_walks_every_element_of_an_array_of_tables() {
+        assert_no_unknown_key_warning(
+            "[[model_routes]]\nhint = \"fast\"\nprovider = \"p\"\nmodel = \"m\"\n\n\
+             [[embedding_routes]]\nhint = \"e\"\nprovider = \"p\"\nmodel = \"m\"\n",
+        );
+        let log = unknown_key_log(
+            "[[model_routes]]\nhint = \"a\"\n\n[[model_routes]]\nhint = \"b\"\nmodle = \"m\"\n",
+        );
+        assert!(
+            log.contains("unknown config key `model_routes[1].modle`"),
+            "got: {log}"
+        );
+        assert!(
+            !log.contains("model_routes[0]"),
+            "the first element is valid, got: {log}"
+        );
+        let log = unknown_key_log("[[embedding_routes]]\ndimensoins = 3\n");
+        assert!(
+            log.contains("unknown config key `embedding_routes[0].dimensoins`"),
+            "got: {log}"
+        );
+    }
+
+    #[test]
+    async fn unknown_key_warning_is_silent_for_a_serialised_default_config() {
+        // The guard against an over-eager walker: every key the schema itself
+        // writes, at every depth, must be recognised.
+        let raw =
+            toml::Value::try_from(Config::default()).expect("default config serializes to toml");
+        let (logs, _guard) = capture_logs();
+        warn_on_unknown_config_keys(&raw, Path::new("/tmp/config.toml"));
+        let log = logs.contents();
+        assert!(!log.contains("unknown config key"), "got: {log}");
+    }
+
+    /// `[composio] enable` is a serde alias of `enabled`; the generated schema
+    /// does not express aliases, so the walker must accept it by name.
+    #[test]
+    async fn unknown_key_warning_is_silent_for_the_composio_enable_alias() {
+        assert_no_unknown_key_warning("[composio]\nenable = true\n");
+    }
+
+    /// `[channels_config.email] poll_interval_secs` is a serde alias of
+    /// `idle_timeout_secs`. `EmailConfig` reaches `Config` through
+    /// `channels_config.email`, so a legacy config that still uses the old
+    /// name must not be warned about.
+    #[test]
+    async fn unknown_key_warning_is_silent_for_the_email_poll_interval_alias() {
+        assert_no_unknown_key_warning("[channels_config.email]\npoll_interval_secs = 60\n");
+    }
+
+    /// Every `#[serde(alias = ...)]` on a type that sits at a config path is
+    /// either a no-op (the alias equals the field name) or is accepted by
+    /// the warner at every path its type sits at. The generated JSON schema
+    /// cannot express an alias, so `SERDE_ALIAS_KEYS` is a hand-maintained
+    /// list; this test is the guard against it going stale.
+    ///
+    /// The scan walks every `.rs` file under `src/` and lets the schema
+    /// decide what is in scope: an alias on a type the schema does not
+    /// contain cannot reach a config file, so it is not this list's business.
+    ///
+    /// The owning type must sit at fixed paths only. The walker's exemption
+    /// matches exact paths, so an alias under a key the operator chooses
+    /// could never be exempted there, and the warner would reject it
+    /// wherever it appears.
+    #[test]
+    async fn every_serde_alias_is_accepted_by_the_unknown_key_warner() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(Config)).expect("schema serializes");
+        let defs = schema
+            .get("$defs")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let root = schema.as_object().cloned().unwrap_or_default();
+
+        // Where each type sits in the config tree, taken from the schema.
+        let paths = config_type_paths(&root, &defs);
+
+        // The path map is checked against the schema: an object-like type
+        // that sits at no path would let an alias slip through unreported.
+        for (name, def) in &defs {
+            let is_object_like = def
+                .as_object()
+                .is_some_and(|def| def.get("properties").is_some());
+            if is_object_like {
+                assert!(
+                    !paths_of_type(&paths, name).is_empty(),
+                    "the schema type `{name}` sits at no config path; the path map \
+                     is wrong and an alias on it would go unnoticed"
+                );
+            }
+        }
+
+        // Every alias the crate declares, with the type that owns it.
+        let scanned = scan_serde_aliases();
+        assert!(
+            !scanned.is_empty(),
+            "the scan found no alias; the guard is inert"
+        );
+
+        // The pairs the code requires the warner to accept: one per
+        // `(config path, alias)` the owner of the alias sits at.
+        let mut found: std::collections::HashMap<(String, String), AliasPair> =
+            std::collections::HashMap::new();
+        for alias in &scanned {
+            let owner_paths = paths_of_type(&paths, &alias.owner);
+            if owner_paths.is_empty() {
+                // The owning type does not sit at a config path, so the alias
+                // cannot reach a config file.
+                continue;
+            }
+            // The walker's exemption matches exact paths only, so an alias
+            // under a key the operator chooses could never be exempted there:
+            // the warner would reject it wherever it appears. A type that
+            // sits under such a path is refused outright, whether or not it
+            // also sits at a fixed path.
+            let wildcard: Vec<&str> = owner_paths
+                .iter()
+                .filter(|path| path.contains('*'))
+                .map(|path| path.as_str())
+                .collect();
+            assert!(
+                wildcard.is_empty(),
+                "serde alias `{}` on `{}` in {} sits under a key the operator \
+                 chooses (`{}`), and the walker's exemption matches exact \
+                 paths only, so the alias could not be exempted there",
+                alias.alias,
+                alias.owner,
+                alias.file.display(),
+                wildcard.join(", ")
+            );
+            if alias.field.as_deref() == Some(alias.alias.as_str()) {
+                // An alias equal to the field name is a no-op: serde accepts
+                // the key under its own name, and the schema carries it.
+                continue;
+            }
+            let fixed: Vec<&String> = owner_paths
+                .iter()
+                .filter(|path| !path.contains('*'))
+                .collect();
+            for path in fixed {
+                found
+                    .entry((path.clone(), alias.alias.clone()))
+                    .or_insert_with(|| AliasPair {
+                        path: path.clone(),
+                        alias: alias.alias.clone(),
+                        owner: alias.owner.clone(),
+                        file: alias.file.clone(),
+                        count: 0,
+                    })
+                    .count += 1;
+            }
+        }
+
+        // Every alias the code declares is listed for the path its owner sits
+        // at. A second owner carrying an alias of the same name does not pass
+        // here: its own path is not in the list.
+        for pair in found.values() {
+            assert!(
+                SERDE_ALIAS_KEYS
+                    .iter()
+                    .any(|(path, alias)| *path == pair.path && *alias == pair.alias),
+                "serde alias `{}` on `{}` in {} is not listed in SERDE_ALIAS_KEYS \
+                 for the path `{}`",
+                pair.alias,
+                pair.owner,
+                pair.file.display(),
+                pair.path
+            );
+        }
+
+        // Every listed pair is live: the alias still exists, on the type that
+        // sits at the listed path.
+        for (path, alias) in SERDE_ALIAS_KEYS {
+            let owner = paths.get(path).unwrap_or_else(|| {
+                panic!("SERDE_ALIAS_KEYS names the path `{path}`, which the schema does not have")
+            });
+            assert!(
+                found.contains_key(&(path.to_string(), alias.to_string())),
+                "SERDE_ALIAS_KEYS lists `{alias}` at `{path}`, but no serde alias on \
+                 `{owner}` provides it there"
+            );
+        }
+
+        // The counts agree: a name the code declares twice needs two entries,
+        // and an entry needs a live alias.
+        let mut names: std::collections::HashSet<&str> =
+            found.values().map(|pair| pair.alias.as_str()).collect();
+        for (_, alias) in SERDE_ALIAS_KEYS {
+            names.insert(alias);
+        }
+        for name in names {
+            let scanned_count: usize = found
+                .values()
+                .filter(|pair| pair.alias == name)
+                .map(|pair| pair.count)
+                .sum();
+            let listed_count = SERDE_ALIAS_KEYS
+                .iter()
+                .filter(|(_, alias)| *alias == name)
+                .count();
+            assert_eq!(
+                scanned_count, listed_count,
+                "the serde alias `{name}` is declared {scanned_count} time(s) but \
+                 SERDE_ALIAS_KEYS lists it {listed_count} time(s)"
+            );
+        }
+
+        // Being listed is not enough: each pair must be accepted at the path
+        // it names, so an alias that moves to another struct fails here.
+        for (path, alias) in SERDE_ALIAS_KEYS {
+            let fixture = match (path, alias) {
+                ("composio", "enable") => "[composio]\nenable = true\n",
+                ("channels_config.email", "poll_interval_secs") => {
+                    "[channels_config.email]\npoll_interval_secs = 60\n"
+                }
+                (path, alias) => panic!("no fixture for the serde alias `{alias}` at `{path}`"),
+            };
+            let log = unknown_key_log(fixture);
+            assert!(
+                !log.contains("unknown config key"),
+                "serde alias `{alias}` at `{path}` is warned about: {log}"
+            );
+        }
+    }
+
+    /// A `(config path, alias)` pair the guard requires, with the type that
+    /// owns the alias and the file it was found in.
+    struct AliasPair {
+        path: String,
+        alias: String,
+        owner: String,
+        file: std::path::PathBuf,
+        count: usize,
+    }
+
+    /// A `#[serde(alias = ...)]` site found in the source.
+    struct ScannedAlias {
+        file: std::path::PathBuf,
+        alias: String,
+        owner: String,
+        field: Option<String>,
+    }
+
+    /// Dotted config path -> the `$defs` type whose keys live at that path.
+    ///
+    /// Derived from the generated schema, so it cannot drift from the
+    /// structs: the root's `properties` give the top-level paths, and each
+    /// `$defs` entry's `properties` give the paths below them. A path with a
+    /// `*` segment is one the operator names (`mcp_servers.<name>`), so the
+    /// warner has no fixed path to match an alias against.
+    fn config_type_paths(
+        root: &serde_json::Map<String, serde_json::Value>,
+        defs: &serde_json::Map<String, serde_json::Value>,
+    ) -> std::collections::HashMap<String, String> {
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(String::new(), "Config".to_string());
+        collect_config_type_paths(root, defs, "", &mut paths);
+        paths
+    }
+
+    /// Record the path of every object-like node of the schema.
+    fn collect_config_type_paths(
+        node: &serde_json::Map<String, serde_json::Value>,
+        defs: &serde_json::Map<String, serde_json::Value>,
+        path: &str,
+        paths: &mut std::collections::HashMap<String, String>,
+    ) {
+        // A map: the operator chooses the key, so the value type's keys live
+        // under a wildcard segment.
+        if let Some(additional) = node
+            .get("additionalProperties")
+            .and_then(serde_json::Value::as_object)
+        {
+            collect_config_type_paths(additional, defs, &format!("{path}.*"), paths);
+            return;
+        }
+        // An array of structs: the index is the operator's too.
+        if node.get("type").and_then(serde_json::Value::as_str) == Some("array") {
+            if let Some(items) = node.get("items").and_then(serde_json::Value::as_object) {
+                collect_config_type_paths(items, defs, &format!("{path}[*]"), paths);
+            }
+            return;
+        }
+        // An object-like node. `Option<T>` arrives as
+        // `anyOf: [{$ref}, {type: "null"}]`, so the type name comes from the
+        // first `$ref` variant.
+        let owner = schema_type_name(node);
+        let resolved = owner
+            .as_deref()
+            .and_then(|name| defs.get(name))
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or(node);
+        let Some(properties) = resolved
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return;
+        };
+        if let Some(owner) = owner {
+            paths.insert(path.to_string(), owner);
+        }
+        for (key, sub) in properties {
+            let Some(sub) = sub.as_object() else {
+                continue;
+            };
+            collect_config_type_paths(sub, defs, &join_config_path(path, key), paths);
+        }
+    }
+
+    /// The `$defs` type a schema node refers to, following the `anyOf`
+    /// wrapper serde's `Option<T>` produces (`anyOf: [{$ref}, {type: null}]`).
+    fn schema_type_name(node: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+        if let Some(reference) = node.get("$ref").and_then(serde_json::Value::as_str) {
+            return reference.strip_prefix("#/$defs/").map(str::to_string);
+        }
+        if let Some(variants) = node.get("anyOf").and_then(serde_json::Value::as_array) {
+            for variant in variants {
+                let Some(variant) = variant.as_object() else {
+                    continue;
+                };
+                if let Some(name) = schema_type_name(variant) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+
+    /// The dotted path of a key inside a table.
+    fn join_config_path(path: &str, key: &str) -> String {
+        if path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{path}.{key}")
+        }
+    }
+
+    /// Every config path the given type sits at.
+    fn paths_of_type(
+        paths: &std::collections::HashMap<String, String>,
+        owner: &str,
+    ) -> Vec<String> {
+        paths
+            .iter()
+            .filter(|(_, name)| name.as_str() == owner)
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Every serde alias in `src/`, with the type that owns it.
+    ///
+    /// The scan is textual because the generated schema cannot express an
+    /// alias. It has to be tight: an alias it misses ships a config that
+    /// serde accepts and the warner rejects.
+    fn scan_serde_aliases() -> Vec<ScannedAlias> {
+        let mut files = Vec::new();
+        collect_rust_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "no source file was scanned; the guard is inert"
+        );
+
+        let mut found = Vec::new();
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("read source file");
+            for offset in alias_value_offsets(&src) {
+                if is_comment_line(&src, offset) {
+                    continue;
+                }
+                // The alias must sit inside a serde attribute, which may span
+                // several lines and may be a `cfg_attr`.
+                let Some(attribute) = src[..offset].rfind("#[") else {
+                    continue;
+                };
+                if !src[attribute..offset].contains("serde(") {
+                    continue;
+                }
+                let alias = alias_value_at(&src, offset);
+                let Some(owner) = owning_type(&src[..offset]) else {
+                    panic!(
+                        "serde alias `{alias}` at {}:{offset} has no owning type",
+                        file.display()
+                    );
+                };
+                found.push(ScannedAlias {
+                    file: file.clone(),
+                    alias,
+                    owner,
+                    field: field_after(&src, offset),
+                });
+            }
+        }
+        found
+    }
+
+    /// The byte offsets of every `alias = "..."` value in `src`.
+    ///
+    /// Serde accepts `alias = "x"`, `alias="x"` and `alias = r"x"`, so the
+    /// marker cannot be a fixed string.
+    fn alias_value_offsets(src: &str) -> Vec<usize> {
+        let bytes = src.as_bytes();
+        let mut offsets = Vec::new();
+        let mut search_from = 0;
+        while let Some(found) = src[search_from..].find("alias") {
+            let at = search_from + found;
+            search_from = at + "alias".len();
+            // The word must not be part of a longer identifier.
+            if at > 0 && is_identifier_byte(bytes[at - 1]) {
+                continue;
+            }
+            let mut cursor = skip_whitespace(bytes, at + "alias".len());
+            if bytes.get(cursor) != Some(&b'=') {
+                continue;
+            }
+            cursor = skip_whitespace(bytes, cursor + 1);
+            if bytes.get(cursor) == Some(&b'r') {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'"') {
+                continue;
+            }
+            offsets.push(cursor);
+        }
+        offsets
+    }
+
+    /// The alias name the string literal at `offset` opens.
+    fn alias_value_at(src: &str, offset: usize) -> String {
+        src[offset + 1..]
+            .split('"')
+            .next()
+            .expect("alias literal closes")
+            .to_string()
+    }
+
+    /// Whether the byte at `offset` sits on a comment-only line.
+    fn is_comment_line(src: &str, offset: usize) -> bool {
+        let line_start = src[..offset].rfind('\n').map_or(0, |at| at + 1);
+        let line = src[line_start..].trim_start();
+        line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
+    }
+
+    fn is_identifier_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    fn skip_whitespace(bytes: &[u8], mut cursor: usize) -> usize {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        cursor
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn collect_rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path
+                .extension()
+                .is_some_and(|ext| ext == std::ffi::OsStr::new("rs"))
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The type that owns the code before `offset`: the nearest `struct` or
+    /// `enum` declaration above it.
+    ///
+    /// Comment lines are skipped, so a doc comment that mentions "struct" or
+    /// "enum" cannot re-point the owner at a name that is not in the schema.
+    fn owning_type(prefix: &str) -> Option<String> {
+        for line in prefix.lines().rev() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+            {
+                continue;
+            }
+            let at = match (trimmed.rfind("struct "), trimmed.rfind("enum ")) {
+                (Some(s), Some(e)) => s.max(e),
+                (Some(s), None) => s,
+                (None, Some(e)) => e,
+                (None, None) => continue,
+            };
+            let name = trimmed[at..]
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .split('<')
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            if name.is_empty() {
+                continue;
+            }
+            return Some(name.to_string());
+        }
+        None
+    }
+
+    /// The name of the field the alias attribute belongs to, when the next
+    /// declaration is that field.
+    ///
+    /// A private field counts: stopping only at `pub` fields would answer
+    /// with some later field and could hide a live alias.
+    fn field_after(src: &str, index: usize) -> Option<String> {
+        for line in src[index..].lines().skip(1) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                // A blank line or another attribute: the field is further down.
+                continue;
+            }
+            if trimmed == "}" || trimmed == "};" {
+                // The block ended without a field.
+                return None;
+            }
+            // The field declaration, public or private: `name: Type`.
+            let name = strip_visibility(trimmed);
+            let name = name.split(':').next().unwrap_or_default().trim();
+            if !is_identifier(name) {
+                return None;
+            }
+            return Some(name.to_string());
+        }
+        None
+    }
+
+    /// The declaration text without its visibility (`pub`, `pub(crate)`, ...).
+    fn strip_visibility(declaration: &str) -> &str {
+        let Some(rest) = declaration.strip_prefix("pub") else {
+            return declaration;
+        };
+        if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            return declaration;
+        }
+        let rest = rest.trim_start();
+        match rest.strip_prefix('(') {
+            Some(inner) => inner
+                .split_once(')')
+                .map_or(rest, |(_, after)| after)
+                .trim_start(),
+            None => rest,
+        }
+    }
+
+    /// Whether `text` is a plain identifier.
+    fn is_identifier(text: &str) -> bool {
+        let mut chars = text.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
 
     /// `[security.*]` has to stay an unknown top-level key so the
@@ -6343,7 +7217,6 @@ default_temperature = 0.7
     #[test]
     async fn channels_config_default() {
         let c = ChannelsConfig::default();
-        assert!(c.cli);
         assert!(c.telegram.is_none());
         assert!(c.discord.is_none());
     }
@@ -6399,7 +7272,6 @@ default_temperature = 0.7
             cron: CronConfig::default(),
             tasks: TasksConfig::default(),
             channels_config: ChannelsConfig {
-                cli: true,
                 telegram: Some(TelegramConfig {
                     bot_token: "123:ABC".into(),
                     allowed_users: vec!["user1".into()],
@@ -6486,7 +7358,6 @@ default_temperature = 0.7
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
         assert!(!parsed.heartbeat.enabled);
-        assert!(parsed.channels_config.cli);
         assert!(parsed.memory.hygiene_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
@@ -7240,7 +8111,6 @@ allowed_users = ["@ops:matrix.org"]
     #[test]
     async fn channels_config_with_imessage_and_matrix() {
         let c = ChannelsConfig {
-            cli: true,
             telegram: None,
             discord: None,
             slack: None,
@@ -7468,7 +8338,6 @@ channel_id = "C123"
     #[test]
     async fn channels_config_with_whatsapp() {
         let c = ChannelsConfig {
-            cli: true,
             telegram: None,
             discord: None,
             slack: None,
@@ -7523,12 +8392,13 @@ channel_id = "C123"
     async fn channels_config_autonomous_tools_defaults_off_and_parses() {
         // Default posture must stay safe: channel webhooks auto-deny tools.
         assert!(!ChannelsConfig::default().autonomous_tools);
-        // Old configs without the key still deserialize (serde default).
-        let legacy: ChannelsConfig = toml::from_str("cli = true\n").unwrap();
+        // An old config without the `autonomous_tools` key still deserializes
+        // (serde default).
+        let legacy: ChannelsConfig = toml::from_str("message_timeout_secs = 600\n").unwrap();
         assert!(!legacy.autonomous_tools);
         // Opt-in parses through.
         let opted: ChannelsConfig =
-            toml::from_str("cli = true\nautonomous_tools = true\n").unwrap();
+            toml::from_str("message_timeout_secs = 600\nautonomous_tools = true\n").unwrap();
         assert!(opted.autonomous_tools);
     }
 
