@@ -427,7 +427,7 @@ Examples:
         service_command: ServiceCommands,
     },
 
-    /// Run diagnostics for configuration, daemon, scheduler and channel freshness.
+    /// Run diagnostics for configuration, channels, daemon and scheduler state.
     ///
     /// With no subcommand, runs the full new-style health check
     /// pipeline (config + live + system). Use `--brief` for a sub-second
@@ -439,7 +439,8 @@ Examples:
     /// daemon.registration, daemon.scheduler, system.deps. `--brief` skips the
     /// three network probes (provider.ping, channels.auth, mcp.startup) and
     /// `--offline` reports them as skipped without probing; every other check
-    /// reads local state.
+    /// reads local state. Every name above has a check behind it — the help
+    /// must not promise what no check reads.
     Doctor {
         /// Output format: text (default), json, brief.
         #[arg(long, default_value = "text", value_enum)]

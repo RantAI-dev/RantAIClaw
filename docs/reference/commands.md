@@ -28,7 +28,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `gateway` | Start webhook and WhatsApp HTTP gateway |
 | `daemon` | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
 | `service` | Manage user-level OS service lifecycle |
-| `doctor` | Run diagnostics for configuration, daemon, scheduler and channel freshness |
+| `doctor` | Run diagnostics for configuration, channels, daemon and scheduler state |
 | `status` | Print current configuration and system summary |
 | `usage` | Print today's token usage against the daily ceiling |
 | `cron` | Manage scheduled tasks |
@@ -564,8 +564,8 @@ that did not run is not a pass.
 | `provider.ping` | `live` | Does the provider actually accept the credential? |
 | `channels.auth` | `live` | Do the configured channels authenticate? |
 | `mcp.startup` | `live` | Do the configured MCP servers start? |
-| `daemon.registration` | `system` | Is **this** installation's daemon registered with the host service manager, and does the unit run this binary? |
-| `daemon.scheduler` | `system` | Is the running daemon's scheduler component healthy? |
+| `daemon.registration` | `system` | Is **this** installation's daemon registered with the host service manager — does the unit run this binary and this profile? |
+| `daemon.scheduler` | `system` | Is the running daemon's scheduler component healthy — or disabled by config? |
 | `system.deps` | `system` | Are the required system dependencies present on the host? |
 
 `--brief` skips the three `live` checks (`provider.ping`, `channels.auth`,
@@ -576,9 +576,12 @@ so the console's brief mode still reports on the daemon and its scheduler.
 #### The daemon checks
 
 `daemon.registration` names what it looked at: the service manager it asked, the unit
-it asked for, and the binary that unit runs. A unit that runs a different binary than
-the `rantaiclaw` you just invoked belongs to another installation, and the check says so
-instead of reporting it as this one's service.
+it asked for, the binary that unit runs, and — from the unit's `Environment=` — the
+profile that unit serves. A unit that runs a different binary than the `rantaiclaw` you
+just invoked belongs to another installation, and a unit stamped with another profile
+belongs to that profile; the check says so instead of reporting either as this one's
+service. On macOS the registration cannot be verified the same way: `launchctl list`
+names no executable, so the verdict there is always the warn "could not be verified".
 
 `daemon.registration` reports one of these registration verdicts:
 
@@ -586,6 +589,7 @@ instead of reporting it as this one's service.
 |---|---|---|
 | `daemon registered via <manager> as unit <unit> (runs <path>)` | This installation's unit is installed and runs this binary | ok |
 | `daemon registered with <manager> as unit <unit> but not running` | The unit is installed but stopped | info |
+| `unit <unit> is registered with <manager> but runs profile <p>, not <this profile> — this profile's daemon is not registered` | A unit for another profile answered (the installer stamps each unit with its profile); this profile has no unit | info |
 | `… but runs <path> — not this binary (<path>)` | The unit that answered belongs to a different installation | warn |
 | `unit <unit> is registered with <manager> … could not be verified — not confirmed as this installation` | The unit is installed, but the manager named no executable the check could compare — the unit may belong to another installation | warn |
 | `could not query <manager> for unit <unit> — the user service manager did not answer; registration status unknown` | The service manager could not be reached, so the unit's presence is unknown — neither registered nor absent | warn |
@@ -602,6 +606,7 @@ from the operator's service manager. Both are `info`.
 | Verdict | Meaning | Severity |
 |---|---|---|
 | `healthy` | The daemon is running and its scheduler component reports `ok` | ok |
+| `disabled by config — scheduled jobs do not run` | The daemon is running with the scheduler turned off (`[cron].enabled` and `[scheduler].enabled` gate it together); the component records `disabled`, not `ok` | info |
 | `unhealthy — see daemon logs` | The daemon is running and its scheduler component reports `error` | fail |
 | `daemon not running` | No state file, or one the daemon has stopped refreshing — start `rantaiclaw daemon` for scheduled jobs | warn |
 | `not tracked yet` | The daemon is running but does not publish a scheduler component | warn |

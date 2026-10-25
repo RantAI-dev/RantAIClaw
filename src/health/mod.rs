@@ -97,6 +97,16 @@ pub fn mark_component_ok(component: &str) {
     });
 }
 
+/// A component the config turned off. The supervisor never started it, so
+/// nothing about it is ok — the status names the choice, and every surface
+/// that reads the state file reports "disabled", not "healthy".
+pub fn mark_component_disabled(component: &str) {
+    upsert_component(component, |entry| {
+        entry.status = "disabled".into();
+        entry.last_error = None;
+    });
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub fn mark_component_error(component: &str, error: impl ToString) {
     // Scrub secret-looking tokens before storing: even the bearer-gated
@@ -177,6 +187,29 @@ mod tests {
         assert_eq!(entry.status, "ok");
         assert!(entry.last_ok.is_some());
         assert!(entry.last_error.is_none());
+    }
+
+    /// A disabled component is recorded as "disabled" — the status the
+    /// scheduler verdict and the TUI read — never as "ok", which read as
+    /// healthy on every surface while the component never ran.
+    #[test]
+    fn mark_component_disabled_records_disabled_not_ok() {
+        let component = unique_component("health-disabled");
+
+        mark_component_error(&component, "earlier failure");
+        mark_component_disabled(&component);
+
+        let snapshot = snapshot();
+        let entry = snapshot
+            .components
+            .get(&component)
+            .expect("component should be present after mark_component_disabled");
+        assert_eq!(entry.status, "disabled");
+        assert_ne!(entry.status, "ok");
+        assert!(
+            entry.last_error.is_none(),
+            "a config-disabled component carries no error"
+        );
     }
 
     #[test]

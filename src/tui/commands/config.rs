@@ -532,6 +532,7 @@ fn scheduler_diag(state_file: &std::path::Path) -> (StatusKind, String) {
     let verdict = crate::daemon::scheduler_verdict(state_file);
     let kind = match verdict {
         SchedulerVerdict::Healthy => StatusKind::Ok,
+        SchedulerVerdict::Disabled => StatusKind::Info,
         SchedulerVerdict::Unhealthy => StatusKind::Fail,
         SchedulerVerdict::DaemonNotRunning
         | SchedulerVerdict::NotTracked

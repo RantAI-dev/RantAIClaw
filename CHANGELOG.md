@@ -408,6 +408,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved — is reported as unverified instead of as this installation's unit, and a service manager that did
   not answer (`systemctl --user status` exiting 1 or 2, as on a host without a reachable user manager) is
   reported as an unknown registration status instead of as a registered unit that is not running.
+- `doctor` no longer says what it did not check, and its verdicts describe the install
+  they looked at. The help and the command table promised "channel freshness" — no check
+  reads channel freshness, so the promise is gone (the checks themselves are unchanged).
+  `daemon.registration` reads the profile a unit serves from the unit's `Environment=`
+  (the same `systemctl show` probe it already made): a unit stamped with another profile
+  no longer counts as this profile's registration — doctor in profile `work` used to
+  report "registered" while the unit ran `default` — and the verdict names the unit and
+  the profile it found. The template unit `rantaiclaw@<profile>.service` is asked for
+  whenever the plain unit does not match. On macOS the registration verdict stays a warn
+  ("could not be verified"): `launchctl list` names no executable; the docs now say so.
+  `daemon.scheduler` reports a config-disabled scheduler as info "disabled by config —
+  scheduled jobs do not run" instead of "healthy": the daemon records the component as
+  `disabled` (not `ok`), and the TUI row follows the same verdict.
 
 ## [0.33.0-alpha] — 2026-10-08
 
