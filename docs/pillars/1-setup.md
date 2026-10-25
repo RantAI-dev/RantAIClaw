@@ -96,10 +96,12 @@ rantaiclaw doctor --brief         # one-line health
 rantaiclaw doctor --json          # machine-readable
 ```
 
-A headless setup exits **non-zero** when it could not configure a section that
-needs a prompt (`provider`, `channels`, `mcp`, `login`, `knowledge`): those
-sections are named in a closing summary as **not configured**. A script must
-check the exit code.
+A headless setup exits **non-zero** when the agent cannot run: the provider —
+the one required section — could not be configured, or the one section the
+caller named on the command line was blocked. The other sections that need a
+prompt (`channels`, `mcp`, `login`, `knowledge`) are optional: they are named
+in a closing summary as **not configured**, the summary says they are
+optional, and they do not fail the run. A script must check the exit code.
 
 ## Roadmap
 

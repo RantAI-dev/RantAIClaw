@@ -27,6 +27,36 @@ use tempfile::TempDir;
 static CMD_LOCK: Mutex<()> = Mutex::new(());
 
 fn cmd(home: &TempDir) -> Command {
+    // Credential material the parent shell may hold must not leak into the
+    // child: `RANTAICLAW_API_KEY`/`API_KEY` fold into the loaded config
+    // (`apply_env_overrides`) and would make the provider section count as
+    // configured, `RANTAICLAW_PROVIDER`/`PROVIDER` rename the provider, and
+    // `KB_EMBEDDING_API_KEY` does the same for the knowledge section. The
+    // list mirrors the credential scrub the lib tests use
+    // (`crate::test_env`), minus `XDG_CONFIG_HOME` — the child must inherit
+    // the caller's scrubbed value.
+    const CREDENTIAL_ENV: &[&str] = &[
+        "RANTAICLAW_API_KEY",
+        "API_KEY",
+        "RANTAICLAW_PROVIDER",
+        "PROVIDER",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "OPENROUTER_API_KEY",
+        "GROQ_API_KEY",
+        "OLLAMA_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "QWEN_OAUTH_TOKEN",
+        "QWEN_OAUTH_REFRESH_TOKEN",
+        "KB_EMBEDDING_API_KEY",
+        "KB_EXTRACT_VISION_API_KEY",
+    ];
     let mut c = Command::cargo_bin("rantaiclaw").expect("cargo build rantaiclaw");
     c.env("HOME", home.path())
         // Force a clean profile resolve — the wizard promotes `default`
@@ -39,16 +69,23 @@ fn cmd(home: &TempDir) -> Command {
         // default resolution under the temp HOME.
         .env_remove("RANTAICLAW_CONFIG_DIR")
         .env_remove("RANTAICLAW_WORKSPACE");
+    for key in CREDENTIAL_ENV {
+        c.env_remove(key);
+    }
     c
 }
 
 #[test]
-fn setup_non_interactive_visits_every_section_and_exits_one_when_a_section_needs_a_prompt() {
+fn setup_non_interactive_on_a_fresh_profile_exits_one_because_the_provider_is_missing() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = TempDir::new().expect("tempdir");
 
     // A headless sweep cannot prompt, so the sections that need one
-    // configure nothing — the command names them and exits 1.
+    // configure nothing — the command names them. It exits 1 because the
+    // provider — the one required section — could not be configured: the
+    // agent cannot run without a provider credential. The optional blocked
+    // sections (channels, mcp, login) are named in the same summary, but
+    // as things the agent runs without.
     let assert = cmd(&home)
         .args(["setup", "--non-interactive"])
         .assert()
@@ -123,6 +160,77 @@ fn setup_non_interactive_visits_every_section_and_exits_one_when_a_section_needs
                 .lines()
                 .any(|line| line.trim_end() == listed.as_str()),
             "the summary must list {section} as not configured; got:\n{combined}"
+        );
+    }
+
+    // The summary separates the failure from the housekeeping: the
+    // optional blocked sections are named as optional, and the required
+    // provider is not.
+    let optional_line = combined
+        .lines()
+        .find(|l| l.starts_with("Optional section(s)"))
+        .expect("the summary must name the optional blocked sections");
+    for section in ["channels", "mcp", "login"] {
+        assert!(
+            optional_line.contains(section),
+            "the optional line must name {section}; got: {optional_line}"
+        );
+    }
+    assert!(
+        !optional_line.contains("provider"),
+        "the provider is required and must not be called optional; got: {optional_line}"
+    );
+}
+
+#[test]
+fn setup_non_interactive_with_a_configured_provider_exits_zero_and_lists_the_optional_sections() {
+    let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = TempDir::new().expect("tempdir");
+
+    // The minimum a working install needs: a provider and a key. Written
+    // straight to the profile's config.toml — the sweep below must count
+    // the provider as configured and exit 0 even though the optional
+    // sections still cannot run headless.
+    let config_dir = home.path().join(".rantaiclaw/profiles/default");
+    std::fs::create_dir_all(&config_dir).expect("profile dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "default_provider = \"openai\"\napi_key = \"sk-test\"\n",
+    )
+    .expect("write config.toml");
+
+    let assert = cmd(&home)
+        .args(["setup", "--non-interactive"])
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+
+    // The provider is skipped, so the summary reports the run as done —
+    // the exit code is 0 — while the optional sections still carry their
+    // hints and their "not configured" lines.
+    assert!(
+        combined.contains("skipped=[provider"),
+        "the provider must be skipped as already configured; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("could not be configured"),
+        "the optional sections are still named; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("Optional section(s) the agent runs without"),
+        "the summary must say the blocked sections are optional; got:\n{combined}"
+    );
+    for section in ["channels", "mcp", "login"] {
+        let listed = format!("  - {section}");
+        assert!(
+            combined
+                .lines()
+                .any(|line| line.trim_end() == listed.as_str()),
+            "the summary must still list {section} as not configured; got:\n{combined}"
         );
     }
 }

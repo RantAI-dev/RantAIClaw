@@ -82,6 +82,13 @@ impl SetupSection for ProviderSection {
     fn headless_hint(&self) -> &'static str {
         "rantaiclaw onboard --api-key <KEY> --provider <NAME> [--model <ID>]"
     }
+
+    fn required(&self) -> bool {
+        // The one section the agent cannot run without: with no provider
+        // credential the runtime has nothing to talk to. The headless exit
+        // code counts this section and nothing else (a named topic excepted).
+        true
+    }
 }
 
 #[cfg(test)]

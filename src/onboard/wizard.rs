@@ -154,6 +154,11 @@ pub struct SetupReport {
     /// Sections that needed a prompt this run could not have, so they
     /// configured nothing.
     pub blocked: Vec<BlockedSection>,
+    /// The topic the caller asked for by name, when the run was
+    /// `setup <topic>`. A blocked section under a named topic fails the run
+    /// even when the section is optional: the caller asked for that one
+    /// section, so "the agent runs anyway" is no comfort.
+    pub topic: Option<String>,
 }
 
 /// The exit code `setup` uses when it could not configure every section it
@@ -169,12 +174,31 @@ pub const SETUP_INCOMPLETE_EXIT_CODE: i32 = 1;
 pub const SETUP_COMPLETE_EXIT_CODE: i32 = 0;
 
 impl SetupReport {
-    /// `true` when the run could not configure every section it was asked to.
+    /// `true` when the run left the agent unable to start, or could not run
+    /// the one section a caller asked for by name.
     ///
-    /// The CLI turns this into a non-zero exit: a setup that printed hints
-    /// and configured nothing is not a setup that finished.
+    /// Three things make a run incomplete:
+    ///
+    /// * a blocked **required** section — the provider is the only one, and
+    ///   without a provider credential the agent cannot run at all;
+    /// * a blocked section under a **named topic** — `setup <topic>` was
+    ///   asked for that one section, so the run must say it failed;
+    /// * a section that **errored** — but that path returns `Err` from
+    ///   `run_setup` and never reaches this method; the CLI turns the error
+    ///   into a non-zero exit of its own.
+    ///
+    /// Blocked optional sections (`channels`, `mcp`, `login`, `knowledge`)
+    /// do NOT make the run incomplete: the agent runs without them, and a
+    /// sweep that left the provider configured did its job. They are still
+    /// named in the summary, and the summary says they are optional.
     pub fn is_incomplete(&self) -> bool {
-        !self.blocked.is_empty()
+        if self.blocked.iter().any(|b| b.required) {
+            return true;
+        }
+        match &self.topic {
+            Some(topic) => self.blocked.iter().any(|b| &b.name == topic),
+            None => false,
+        }
     }
 
     /// The process exit code this run must use.
@@ -193,7 +217,9 @@ impl SetupReport {
 /// It names every section that needed a prompt and could not have one, and
 /// says what to run instead. It does NOT claim the run configured nothing —
 /// the sections that work without a prompt (`approvals`, `persona`,
-/// `skills`) did their work.
+/// `skills`) did their work. When any blocked section is optional, one line
+/// names them as such: the agent runs without them, so the summary they
+/// appear in is not by itself an error.
 pub fn blocked_summary(blocked: &[BlockedSection]) -> String {
     if blocked.is_empty() {
         return String::new();
@@ -210,6 +236,21 @@ pub fn blocked_summary(blocked: &[BlockedSection]) -> String {
         for line in section.hint.lines() {
             lines.push(format!("      {line}"));
         }
+    }
+    let optional: Vec<&str> = blocked
+        .iter()
+        .filter(|b| !b.required)
+        .map(|b| b.name.as_str())
+        .collect();
+    if !optional.is_empty() {
+        // Exit 0 with this summary must not read as an error: the agent
+        // runs without the optional sections, and only a required one (or
+        // a named topic) turns the run into a failure.
+        lines.push(format!(
+            "Optional section(s) the agent runs without: {}. \
+             They do not fail a full setup run.",
+            optional.join(", ")
+        ));
     }
     lines.push(
         "Those sections were NOT configured. Run the command shown above for each of \
@@ -285,6 +326,7 @@ fn run_setup_with(
             )
         })?;
         let mut report = SetupReport::default();
+        report.topic = Some(name.to_string());
         if let Err(e) = run_one(
             section.as_ref(),
             profile,
@@ -405,8 +447,14 @@ fn run_one(
     };
     let outcome = section.run(&mut ctx);
     // A section that needed a prompt recorded itself; the report carries
-    // that even when the section went on to fail.
+    // that even when the section went on to fail. The orchestrator stamps
+    // each appended entry with the section's `required()` — the exit code
+    // is the orchestrator's decision, made per section here.
+    let first_appended = report.blocked.len();
     report.blocked.append(&mut ctx.blocked);
+    for entry in &mut report.blocked[first_appended..] {
+        entry.required = section.required();
+    }
     outcome?;
     report.visited.push(section.name().to_string());
     Ok(())
@@ -5911,6 +5959,16 @@ mod tests {
         );
     }
 
+    /// A `BlockedSection` for the exit-code tests. `required` is the
+    /// orchestrator-stamped flag the exit code reads.
+    fn blocked_section(name: &str, required: bool) -> BlockedSection {
+        BlockedSection {
+            name: name.to_string(),
+            hint: format!("run `rantaiclaw setup {name}`"),
+            required,
+        }
+    }
+
     /// A profile rooted in a temp dir. `Profile` reads every path from its
     /// `root`, so a scratch profile needs no process-global `HOME`.
     fn scratch_profile(root: &std::path::Path) -> Profile {
@@ -5961,10 +6019,11 @@ mod tests {
         config
     }
 
-    /// A headless sweep on a fresh profile configures nothing it needed a
-    /// prompt for — and says so, by name, and exits non-zero. The old
-    /// behaviour printed the hints and exited 0: a script could not tell a
-    /// finished setup from an empty one.
+    /// A headless sweep on a fresh profile cannot configure the sections
+    /// that need a prompt — it says so, by name. The provider is the one
+    /// required section, so the run is incomplete and exits non-zero; the
+    /// optional blocked sections are named in the summary as things the
+    /// agent runs without.
     #[test]
     fn headless_sweep_on_a_fresh_profile_names_the_sections_it_could_not_configure() {
         let tmp = TempDir::new().unwrap();
@@ -5992,6 +6051,15 @@ mod tests {
             "knowledge needs a prompt and cannot run headless: {blocked:?}"
         );
 
+        // The provider entry carries the required flag: it is the section
+        // that decides the exit code.
+        let provider = report
+            .blocked
+            .iter()
+            .find(|b| b.name == "provider")
+            .expect("the provider section was blocked");
+        assert!(provider.required, "the provider section is required");
+
         // The summary names the section, the command that does the work
         // instead, and says the section was not configured.
         let summary = blocked_summary(&report.blocked);
@@ -6004,8 +6072,23 @@ mod tests {
             summary.contains("NOT configured"),
             "the summary must say those sections were not configured: {summary}"
         );
+        let optional_line = summary
+            .lines()
+            .find(|l| l.starts_with("Optional section(s)"))
+            .expect("the summary must name the optional blocked sections");
+        for name in ["channels", "mcp", "login"] {
+            assert!(
+                optional_line.contains(name),
+                "the optional line must name {name}: {optional_line}"
+            );
+        }
+        assert!(
+            !optional_line.contains("provider"),
+            "the provider is required and must not be called optional: {optional_line}"
+        );
 
-        // The command exits non-zero: the run did not configure everything.
+        // The command exits non-zero: the provider — the one required
+        // section — could not be configured.
         assert!(report.is_incomplete());
         assert_ne!(report.exit_code(), 0);
         assert_eq!(report.exit_code(), SETUP_INCOMPLETE_EXIT_CODE);
@@ -6071,9 +6154,10 @@ mod tests {
         assert_eq!(report.exit_code(), 0);
     }
 
-    /// A single topic behaves like the sweep. `channels` has no provisioner,
-    /// so `setup --non-interactive channels` runs the section — and the
-    /// section needs a prompt, so the command exits non-zero.
+    /// A single topic is asked for by name. `channels` is optional — the
+    /// agent runs without it — but `setup --non-interactive channels` was
+    /// asked for exactly that section, so a blocked run of it still exits
+    /// non-zero. A sweep over the same profile would exit 0.
     #[test]
     fn headless_topic_run_that_needs_a_prompt_exits_non_zero() {
         let tmp = TempDir::new().unwrap();
@@ -6098,6 +6182,14 @@ mod tests {
             vec!["channels"],
             "only the requested section ran"
         );
+        assert_eq!(
+            report.topic.as_deref(),
+            Some("channels"),
+            "the report must remember the topic the caller named"
+        );
+        // The section itself is optional; the named-topic rule is what
+        // makes this run incomplete.
+        assert!(!report.blocked[0].required);
         assert!(report.is_incomplete());
         assert_ne!(report.exit_code(), 0);
         let summary = blocked_summary(&report.blocked);
@@ -6105,6 +6197,118 @@ mod tests {
             summary.contains("rantaiclaw channel add"),
             "the summary must name the command that does the work: {summary}"
         );
+    }
+
+    /// Blocked optional sections alone never fail a sweep: the agent runs
+    /// without them, and the exit code must say the run succeeded. The old
+    /// behaviour failed every sweep on a working profile, because a working
+    /// profile always has optional sections left to set up.
+    #[test]
+    fn blocked_optional_sections_leave_the_exit_code_at_zero() {
+        let report = SetupReport {
+            visited: vec!["approvals".into(), "persona".into(), "skills".into()],
+            skipped: Vec::new(),
+            blocked: vec![
+                blocked_section("channels", false),
+                blocked_section("mcp", false),
+                blocked_section("login", false),
+            ],
+            topic: None,
+        };
+        assert!(!report.is_incomplete());
+        assert_eq!(report.exit_code(), SETUP_COMPLETE_EXIT_CODE);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    /// A blocked provider is the one blocked section that fails a sweep:
+    /// with no provider credential the agent cannot run at all.
+    #[test]
+    fn a_blocked_provider_makes_the_run_incomplete() {
+        let report = SetupReport {
+            visited: vec!["approvals".into(), "persona".into(), "skills".into()],
+            skipped: Vec::new(),
+            blocked: vec![
+                blocked_section("provider", true),
+                blocked_section("channels", false),
+                blocked_section("mcp", false),
+            ],
+            topic: None,
+        };
+        assert!(report.is_incomplete());
+        assert_eq!(report.exit_code(), SETUP_INCOMPLETE_EXIT_CODE);
+    }
+
+    /// A sweep with the provider configured — the minimum a working
+    /// install needs — exits 0 even though the optional sections could not
+    /// run headless, and the summary still names them as optional.
+    #[test]
+    fn headless_sweep_with_only_the_provider_configured_exits_zero_and_names_the_optional_sections()
+    {
+        let tmp = TempDir::new().unwrap();
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        config.api_key = Some("sk-test".into());
+
+        let report = run_setup(&profile, &mut config, None, false, true).unwrap();
+
+        assert!(
+            report.skipped.contains(&"provider".to_string()),
+            "a configured provider is skipped: {:?}",
+            report.skipped
+        );
+        for entry in &report.blocked {
+            assert!(
+                !entry.required,
+                "no blocked section on this profile may be required: {entry:?}"
+            );
+        }
+        assert!(!report.is_incomplete());
+        assert_eq!(report.exit_code(), SETUP_COMPLETE_EXIT_CODE);
+
+        let summary = blocked_summary(&report.blocked);
+        assert!(
+            !summary.is_empty(),
+            "the optional blocked sections are still named: {summary}"
+        );
+        assert!(
+            summary.contains("Optional section(s) the agent runs without"),
+            "the summary must say the blocked sections are optional: {summary}"
+        );
+        assert!(
+            summary.contains("NOT configured"),
+            "the summary must still say what was not configured: {summary}"
+        );
+    }
+
+    /// The optional line names exactly the optional blocked sections — not
+    /// the required one — so an operator skimming the summary can tell the
+    /// failure from the housekeeping.
+    #[test]
+    fn blocked_summary_says_which_blocked_sections_are_optional() {
+        let mixed = [
+            blocked_section("provider", true),
+            blocked_section("channels", false),
+            blocked_section("mcp", false),
+        ];
+        let summary = blocked_summary(&mixed);
+        let optional_line = summary
+            .lines()
+            .find(|l| l.starts_with("Optional section(s)"))
+            .expect("a mixed summary names its optional sections");
+        assert!(optional_line.contains("channels"), "{optional_line}");
+        assert!(optional_line.contains("mcp"), "{optional_line}");
+        assert!(
+            !optional_line.contains("provider"),
+            "the required section must not be listed as optional: {optional_line}"
+        );
+
+        let required_only = [blocked_section("provider", true)];
+        let summary = blocked_summary(&required_only);
+        assert!(
+            !summary.contains("Optional section(s)"),
+            "a required-only summary has no optional line: {summary}"
+        );
+        assert!(summary.contains("provider"), "{summary}");
     }
 
     #[test]
