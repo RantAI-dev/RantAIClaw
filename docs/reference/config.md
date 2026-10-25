@@ -1106,8 +1106,12 @@ production code read it. Existing configs drop the key on load (config schema
 **39 → 40**) while every other channel setting is preserved.
 
 A config written by this schema is refused by a binary that knows only schema
-39. Keep `config.toml.bak`, which the migrator leaves next to `config.toml`, to
-go back.
+39. The dependable rollback is to revert the binary and set `schema_version =
+39` in `config.toml` by hand — v40 only removed a key that v39 fills from its
+default, so nothing else is lost. `config.toml.bak`, which the migrator leaves
+next to `config.toml`, helps only if nothing has saved the config since the
+upgrade: the first later save (pairing, `permissions add`, the TUI, the
+console) deletes it.
 
 ### v38: the `[memory].auto_save` key retired
 

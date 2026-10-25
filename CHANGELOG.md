@@ -161,9 +161,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `[channels_config] cli`, which nothing read, is dropped by a migration to
   config schema 40. Every other channel setting is preserved. A config written
-  by this version is refused by a binary that knows only schema 39; restore the
-  previous config from `config.toml.bak`, which the migrator leaves next to
-  `config.toml`, to go back.
+  by this version is refused by a binary that knows only schema 39. The
+  dependable rollback is to revert the binary and set `schema_version = 39` in
+  `config.toml` by hand — v40 only removed a key that v39 fills from its
+  default, so nothing else is lost. `config.toml.bak`, which the migrator
+  leaves next to `config.toml`, helps only if nothing has saved the config
+  since the upgrade: the first later save (pairing, `permissions add`, the
+  TUI, the console) deletes it.
 
 ### Fixed
 

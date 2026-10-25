@@ -53,7 +53,6 @@ default_temperature = 0.7
 
 # ── unified-agent-runtime test knobs ───────────────────────────────────────
 [channels_config]
-cli = true
 # PR3 owner-gate: sender ids allowed to APPROVE tool calls over a channel.
 # Empty = secure default (approval-required tools auto-deny). Add your channel
 # sender id (e.g. a Telegram user id) here to test that only an owner's Y/A is

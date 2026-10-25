@@ -6481,9 +6481,15 @@ mod tests {
 
     #[test]
     async fn unknown_key_warning_is_silent_for_model_names_in_reliability_model_fallbacks() {
-        assert_no_unknown_key_warning(
-            "[reliability.model_fallbacks.\"some/model\"]\nfallbacks = [\"other/model\"]\n",
-        );
+        // The type is HashMap<String, Vec<String>>, so a model name is a KEY
+        // under `[reliability.model_fallbacks]`, mapping to the fallback
+        // list. A fixture in the invalid table shape
+        // `[reliability.model_fallbacks."some/model"] fallbacks = [...]`
+        // passed the warning check while the config could not deserialize at
+        // all — so the shape is proven to load before the warning is checked.
+        let src = "[reliability.model_fallbacks]\n\"some/model\" = [\"other/model\"]\n";
+        toml::from_str::<Config>(src).expect("the fixture is a config that loads");
+        assert_no_unknown_key_warning(src);
     }
 
     #[test]
