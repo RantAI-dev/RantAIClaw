@@ -453,7 +453,7 @@ mode `0600`; an existing store keeps the mode it has. A store that does not exis
 yet is the normal first-contact case, not an error.
 
 No flag, config key or environment variable skips the check. A connection that
-cannot be verified is refused, and the message names the reason. Four refusals
+cannot be verified is refused, and the message names the reason. Five refusals
 exist:
 
 **The server key changed.**
@@ -502,6 +502,16 @@ The host could not be pinned, so the connection was refused on purpose rather th
 run with an unpinned key. The usual causes are a read-only file, a directory that
 is not writable, and a full disk. Make the file and the directory that holds it
 writable, then connect again.
+
+**The server presents a certificate host key.**
+
+```
+ssh server key for {endpoint} is an OpenSSH certificate; this client pins plain public keys only and accepts no certificate host keys - the known-hosts file {path} was left unchanged
+```
+
+The endpoint presents an OpenSSH certificate instead of a plain public key. This
+client pins plain public keys only, so the connection is refused and nothing is
+pinned; certificates were never accepted here.
 
 A host that is on record and presents the same key connects exactly as before: the
 store is not rewritten, its permissions are not changed, and nothing is printed.

@@ -9,17 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **RUSTSEC-2026-0387 waived while no patched `crypto-bigint` is selectable.** The advisory
+- **RUSTSEC-2026-0387 fixed: the `ssh` transport runs on the patched crypto stack.** The advisory
   (timing variability in operations intended to be constant-time) is fixed only in
-  `crypto-bigint` >= 0.7.6, and the lockfile cannot take that version: `russh 0.60.3` pins
-  `crypto-bigint = "=0.7.0-rc.28"` exactly, so `cargo update` refuses it. The advisory is
-  waived by id in `deny.toml` and the Security Audit job's ignore list — kept identical as
-  `deny.toml` requires — with the same reasoning and review date as the neighbouring `rsa`
-  Marvin waiver (RUSTSEC-2023-0071): the keys in play are the operator's own SSH identities
-  against hosts the operator explicitly targets, not a multi-tenant extraction surface.
-  Upstream `russh` 0.63+ already requires `crypto-bigint ^0.7.3`, which resolves to the
-  patched 0.7.6, so the waiver dies with a future russh port (review by 2026-11-15). No
-  config key and no behaviour of RantaiClaw itself changed.
+  `crypto-bigint` >= 0.7.6, which `russh` 0.60.3 could never select: it pins
+  `crypto-bigint = "=0.7.0-rc.28"` exactly, so `cargo update` refuses the bump. The transport
+  now uses `russh` 0.63.3, whose `crypto-bigint ^0.7.3` requirement resolves to the patched
+  0.7.8, and the advisory is no longer waived in `deny.toml` or the Security Audit job's ignore
+  list. Host keys already pinned in `ssh_known_hosts.json` keep the same fingerprints and the
+  same accept-or-refuse outcomes, and the offered key-exchange and host-key algorithm lists are
+  unchanged. One refusal is explicit now: a server that presents an OpenSSH certificate host
+  key is refused with a message that says so, and nothing is pinned — certificates were never
+  accepted, so the behaviour does not change, only the clarity of the error. No config key
+  changed.
 
 - **A scheduled shell job ran with the daemon's whole environment.** The cron
   scheduler spawned the job's command with no `env_clear()`, so the child inherited

@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use russh::client::{Config, Handle, Handler};
-use russh::keys::{Algorithm, EcdsaCurve, HashAlg, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{
+    Algorithm, EcdsaCurve, HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate,
+};
 use russh::{kex, ChannelMsg, Preferred};
 
 use super::registry;
@@ -314,6 +316,10 @@ enum TofuOutcome {
     StoreUnparseable { path: PathBuf, error: String },
     /// The store cannot be written.
     StoreUnwritable { path: PathBuf, error: String },
+    /// The server presented an OpenSSH certificate as its host key. This
+    /// client pins plain public keys only; the certificate is refused before
+    /// the store is read or written.
+    CertificateHostKey,
 }
 
 /// Why a connection was refused before authentication.
@@ -355,13 +361,22 @@ impl Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let outcome = tofu_check(
-            &self.known_hosts,
-            &self.endpoint,
-            &host_key_id(server_public_key),
-        );
+        // A certificate host key is refused before the store is consulted:
+        // this client pins plain public keys only, and a certificate was never
+        // accepted, so refusing keeps the pinned-host behaviour unchanged.
+        let key = match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            PublicKeyOrCertificate::Certificate(_) => {
+                return Err(SshError::HostKeyRefused {
+                    endpoint: self.endpoint.clone(),
+                    path: self.known_hosts.clone(),
+                    outcome: TofuOutcome::CertificateHostKey,
+                });
+            }
+        };
+        let outcome = tofu_check(&self.known_hosts, &self.endpoint, &host_key_id(key));
         match outcome {
             TofuOutcome::Matched { .. } | TofuOutcome::NewlyPinned { .. } => Ok(true),
             outcome => Err(SshError::HostKeyRefused {
@@ -594,6 +609,11 @@ fn refusal_message(endpoint: &str, path: &Path, outcome: &TofuOutcome) -> String
             "ssh known-hosts file {path} cannot be read ({error}); fix the file or the directory \
              that holds it, then connect again"
         ),
+        TofuOutcome::CertificateHostKey => format!(
+            "ssh server key for {endpoint} is an OpenSSH certificate; this client pins plain \
+             public keys only and accepts no certificate host keys - the known-hosts file \
+             {path} was left unchanged"
+        ),
         // Unreachable. A matched or newly pinned key is accepted, so it never produces a
         // refusal. The arm keeps the match exhaustive.
         TofuOutcome::Matched { key_id } | TofuOutcome::NewlyPinned { key_id } => {
@@ -618,6 +638,12 @@ fn connect_error(host: &str, port: u16, error: SshError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway ed25519 host certificate (public half only; `ssh-keygen -s
+    /// ca -h -n host.example.com`), with a neutral id. The client refuses
+    /// certificates on the key type alone, so the fixture needs no valid
+    /// signature path — it only has to decode.
+    const TEST_HOST_CERT: &str = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIJcmCai0Xfk99r1GMUQctkIXP87wZfzXQQ1QjuFC1SoEAAAAIDOqSBt5dE00Qg8qWn8mDkDgvbIpITqXrMSPhAQofSy0AAAAAAAAAAAAAAACAAAAFHJhbnRhaWNsYXctdGVzdC1ob3N0AAAAFAAAABBob3N0LmV4YW1wbGUuY29tAAAAAFgR+8YAAAAAfaoBxgAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAg67dWFJmRpyuvRwDMf8TyVDKx7ECOzocoJ1kts5ALkH4AAABTAAAAC3NzaC1lZDI1NTE5AAAAQExrq71BoYpAePNA8Xw3EJY34D+UMBgZ4gIWPfwyX/tevbWM8ZeYN3zW7FRYP9H/tgujmzI1XRYTv1ZMqloQGAw= rantaiclaw-test-host";
 
     #[test]
     fn session_id_format() {
@@ -697,6 +723,97 @@ mod tests {
         );
     }
 
+    // Throwaway private-key fixtures for the load paths in `authenticate`,
+    // generated with ssh-keygen solely for these tests. None of them has ever
+    // authenticated to a real host.
+    const TEST_ED25519_UNENCRYPTED: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACAVAkbc2UmUO43eCkqcvTgSkfNklTrHgDVoje01AmvT+AAAAJjeY+f83mPn
+/AAAAAtzc2gtZWQyNTUxOQAAACAVAkbc2UmUO43eCkqcvTgSkfNklTrHgDVoje01AmvT+A
+AAAECbigWf+gxyQQYkDyRyW4iYhaYH/JIMrbSSQu0jvrhQUhUCRtzZSZQ7jd4KSpy9OBKR
+82SVOseANWiN7TUCa9P4AAAAE3JhbnRhaWNsYXctdGVzdC1rZXkBAg==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    const TEST_ED25519_PASSPHRASE: &str = "rantaiclaw-test-passphrase";
+
+    const TEST_ED25519_ENCRYPTED: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDkKO1w5D
+re+QUCI/Ha8D3OAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIEDrvrDP/ZBci420
+wlpT6d0PHK4doPk/1ndBSbPXqLRwAAAAoCppI2gGLZKGjz76aCbx5jKsMYjPT+lDIzVflS
+4qsxoS/fl6pO+Z8VyRZaT8TLPctu0tq6IVQr+ZMYDzYiiRV6PiLmJV/rIIcjqBdz1hD+U/
+h8/wEdxq2xYCtfZrS7/XvOn2tgBk7N4tpzTHfqqwR0cKeL9+Cs6cFdmO2Fd7HMG1MujkXl
+wU4ifA2R8IvGsogdgrb5tPaLeul4zHTIqVJzc=
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    const TEST_RSA_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAqFJkv7ny1zfo5qojB2QeJnfwsU9U/1aBfVQ9gRXmXzkh5EbQ
+IE5MDnfc6mb7ZTaA/Giy/Qm3Zm7pKW8MO0fLady1eJe9WEHLXxgisEJgjH3lpB3q
+UOELwQj0XY5Z3wCl2yLeapARX5VgldfGCXzq+ZifF1F0HEX2Kpk4/vW0GxojdjhC
+hj+rwQf6IQrcktACKh8xLb3SnFqAvkqEQVqY+dKofAPs0pImC2MT2L1IOmPFy67E
+Hw/K7S15Big7cNjp/rELtPFLIk1NFIoFPxtYgdgxBFuXysdBfu1NC1YunzrHj3eZ
+qjhCDoMREV9sysicvd83OCClNzT5Xfffd62B9QIDAQABAoIBAAPmaNQybEiFUJ2r
+moUs0jAE/mw1UNxbtkNfpM8tYTmamsjtxRvChKufJly+Bxwov6NZj7AiPgAfGMLv
+gkKLXtC0nvXM2kPFvn8VEZSw7QjEUAJV+RxnonyWBwd16Wor2yvxKmMgtG5ZCTRf
+nASTQuSGn0UMi5quGk6RX0s1CTfJgRvKClEsvFFJSaTmkds/y/Bc+76fZd8gHM3K
+Q+K9EI/DIs0EAt/Xxf74ug8m5twsAinInTgvFDYJpGFyYjQEdneUAttWmjyR6n3i
+tiwXesxvohrAJY2KWIYAoCagHOGKFkizn2jxR3ACKB/Pv/90uuZELsCUz1sFhF8j
+mghyNP8CgYEA4F1v/QpLA2hu3xrfZd78MfWNhEk5naB39/kwFT3uxgZ2FeQYXV/f
+9CSxD5sa/IXSe85gbhEgrVpnrHXJPkgJIcQfrlDyaM2cnJ8kcn+UXPg1EbduZwQ0
+6oHCZ+ETX3sLg1jKrz4s/ophoXvvlfnAT4m1c04hjzdkpoQiesRGW7sCgYEAwA4N
+SkCwNmCWlqa2ltlP8juprk7Jab9y8PkvZKUFRbQbp+TpeLacpJVmEA/0DwBeqAMT
+VHylSrwvhGS/JIqQeuyvIabY8HaM8DfT/P3LcpMW71th+G+Y/P0kdoeHl3tZhwKD
+bKUUOBaIa6CVuBlRaJmN/MSPPSPUIoY3/O1bRg8CgYEAprvpYHOIwXSXiEdRI0Rt
+yLbBv0AniANbhDVzzSVkT1c35BbJIIMCTE4EIyPSDz1n6Ue6E7G4xfr8Noal0hn4
+Z1Z3cLSJIOdD7oS5sjkrSVfPIGZfrkDLDkb18PqryfYH3Ulb/pVHHLY7zaTrrFmY
+18LvzEuQ1vyEWNazROadnscCgYAgdr+cW47twinyUT/wA8/VvGwUQNEfBPOi9Bwk
+wRhBDg7WtIUamJOl5nMYJ/ozRva5I7vyvhcaqPDHSlhdDucZQETiRVfKXd+5A1bc
+HvJy7ZYk46eN3R9ZNFkjiAlNe9ZIUg5xIP5n9LceqkhklDMEoWA05+zmgtXq+BEi
+ueSB1QKBgHW5CfKhv8Vf2HSqcujR3dOXNyOp0aVdaOjotvv7LKx/zIHDdoMPOyjl
+9p2lVrk6/iLfaIseTjZCyAQ+7rixA9av177WdmFm2o9PCKVQi0ZklvJJj63tx7i2
+pX6pKurg8Un8QmSz3Esa07vu9dP5Xt78K/GFuKC8JWxyEovZGzlI
+-----END RSA PRIVATE KEY-----
+";
+
+    // The russh 0.63 port moved key loading onto the ssh-key 0.7 stack. One
+    // test per private-key format the `ssh` tool accepts, plus the file-path
+    // loader `authenticate` uses when no `key_pem` is given.
+    #[test]
+    fn decode_secret_key_loads_an_unencrypted_openssh_ed25519_key() {
+        let key = russh::keys::decode_secret_key(TEST_ED25519_UNENCRYPTED, None)
+            .expect("unencrypted ed25519 key loads");
+        assert!(matches!(key.algorithm(), Algorithm::Ed25519));
+    }
+
+    #[test]
+    fn decode_secret_key_loads_an_encrypted_key_with_its_passphrase() {
+        let key =
+            russh::keys::decode_secret_key(TEST_ED25519_ENCRYPTED, Some(TEST_ED25519_PASSPHRASE))
+                .expect("encrypted key loads with its passphrase");
+        assert!(matches!(key.algorithm(), Algorithm::Ed25519));
+        assert!(
+            russh::keys::decode_secret_key(TEST_ED25519_ENCRYPTED, Some("not the passphrase"))
+                .is_err(),
+            "a wrong passphrase must not load the key"
+        );
+    }
+
+    #[test]
+    fn decode_secret_key_loads_an_rsa_pem_key() {
+        let key = russh::keys::decode_secret_key(TEST_RSA_PEM, None).expect("rsa pem key loads");
+        assert!(key.algorithm().is_rsa());
+    }
+
+    #[test]
+    fn load_secret_key_loads_a_key_from_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        std::fs::write(&path, TEST_ED25519_UNENCRYPTED).unwrap();
+        let key = russh::keys::load_secret_key(&path, None).expect("key loads from a path");
+        assert!(matches!(key.algorithm(), Algorithm::Ed25519));
+    }
+
     fn handler_in(dir: &tempfile::TempDir) -> ClientHandler {
         ClientHandler {
             endpoint: "host.example.com:22".to_string(),
@@ -708,7 +825,7 @@ mod tests {
     async fn check_server_key_records_first_key_and_accepts_it_again() {
         let dir = tempfile::tempdir().unwrap();
         let mut handler = handler_in(&dir);
-        let key = parse(ED25519_A);
+        let key = PublicKeyOrCertificate::from(parse(ED25519_A));
         assert!(handler.check_server_key(&key).await.unwrap());
         assert!(handler.check_server_key(&key).await.unwrap());
         let stored: HashMap<String, String> =
@@ -720,10 +837,13 @@ mod tests {
     async fn check_server_key_rejects_a_changed_host_key() {
         let dir = tempfile::tempdir().unwrap();
         let mut handler = handler_in(&dir);
-        assert!(handler.check_server_key(&parse(ED25519_A)).await.unwrap());
+        assert!(handler
+            .check_server_key(&parse(ED25519_A).into())
+            .await
+            .unwrap());
 
         let error = handler
-            .check_server_key(&parse(ED25519_B))
+            .check_server_key(&parse(ED25519_B).into())
             .await
             .unwrap_err();
         match error {
@@ -739,10 +859,45 @@ mod tests {
             }
         }
         // The rejected key must not overwrite the trusted one.
-        assert!(handler.check_server_key(&parse(ED25519_A)).await.unwrap());
+        assert!(handler
+            .check_server_key(&parse(ED25519_A).into())
+            .await
+            .unwrap());
         let stored: HashMap<String, String> =
             serde_json::from_str(&std::fs::read_to_string(&handler.known_hosts).unwrap()).unwrap();
         assert_eq!(stored["host.example.com:22"], ED25519_A_ID);
+    }
+
+    /// A certificate host key is refused before the store is consulted, and
+    /// nothing is pinned: the known-hosts file must not come into existence.
+    #[tokio::test]
+    async fn check_server_key_refuses_a_certificate_and_pins_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut handler = handler_in(&dir);
+        let cert = russh::keys::Certificate::from_openssh(TEST_HOST_CERT).unwrap();
+
+        let error = handler
+            .check_server_key(&PublicKeyOrCertificate::Certificate(cert))
+            .await
+            .unwrap_err();
+        match error {
+            SshError::HostKeyRefused {
+                endpoint,
+                path,
+                outcome,
+            } => {
+                assert_eq!(endpoint, "host.example.com:22");
+                assert_eq!(path, handler.known_hosts);
+                assert_eq!(outcome, TofuOutcome::CertificateHostKey);
+            }
+            other @ SshError::Transport(_) => {
+                panic!("expected a host-key refusal, got {other:?}")
+            }
+        }
+        assert!(
+            !handler.known_hosts.exists(),
+            "a refused certificate must not pin anything"
+        );
     }
 
     #[test]
@@ -957,10 +1112,13 @@ mod tests {
     async fn check_server_key_refuses_a_changed_host_key_with_both_fingerprints() {
         let dir = tempfile::tempdir().unwrap();
         let mut handler = handler_in(&dir);
-        assert!(handler.check_server_key(&parse(ED25519_A)).await.unwrap());
+        assert!(handler
+            .check_server_key(&parse(ED25519_A).into())
+            .await
+            .unwrap());
 
         let error = handler
-            .check_server_key(&parse(ED25519_B))
+            .check_server_key(&parse(ED25519_B).into())
             .await
             .unwrap_err();
         let message = error.to_string();
@@ -1005,10 +1163,13 @@ mod tests {
             endpoint: "audit@127.0.0.1:22022".to_string(),
             known_hosts: dir.path().join("ssh_known_hosts.json"),
         };
-        assert!(handler.check_server_key(&parse(ED25519_A)).await.unwrap());
+        assert!(handler
+            .check_server_key(&parse(ED25519_A).into())
+            .await
+            .unwrap());
 
         let error = handler
-            .check_server_key(&parse(ED25519_B))
+            .check_server_key(&parse(ED25519_B).into())
             .await
             .unwrap_err();
 
