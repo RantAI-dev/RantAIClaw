@@ -211,7 +211,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             },
         ));
     } else {
-        crate::health::mark_component_ok("scheduler");
+        // "ok" read as healthy on every surface that reads the state file,
+        // while the cron docs promise that a disabled scheduler never runs
+        // a job. The component records the config's choice instead.
+        crate::health::mark_component_disabled("scheduler");
         tracing::info!(
             "Scheduler disabled (cron.enabled/scheduler.enabled); supervisor not started"
         );
@@ -591,6 +594,11 @@ pub enum SchedulerVerdict {
     Healthy,
     /// The scheduler component reported `error`.
     Unhealthy,
+    /// The daemon is running with the scheduler turned off in config
+    /// (`[cron].enabled` and `[scheduler].enabled` gate it together): the
+    /// supervisor never started the component, so there is nothing healthy
+    /// to report.
+    Disabled,
     /// The daemon is running but does not track a scheduler component yet.
     NotTracked,
     /// The scheduler component reported a status string this build does not
@@ -606,6 +614,7 @@ impl SchedulerVerdict {
                 "daemon not running (start `rantaiclaw daemon` for scheduled jobs)".to_string()
             }
             Self::Healthy => "healthy".to_string(),
+            Self::Disabled => "disabled by config — scheduled jobs do not run".to_string(),
             Self::Unhealthy => "unhealthy — see daemon logs".to_string(),
             Self::NotTracked => "not tracked yet".to_string(),
             Self::Other(status) => status.clone(),
@@ -629,6 +638,7 @@ pub fn scheduler_verdict(state_file: &Path) -> SchedulerVerdict {
         .and_then(|v| v.as_str());
     match status {
         Some("ok") => SchedulerVerdict::Healthy,
+        Some("disabled") => SchedulerVerdict::Disabled,
         Some("error") => SchedulerVerdict::Unhealthy,
         Some(other) => SchedulerVerdict::Other(other.to_string()),
         None => SchedulerVerdict::NotTracked,
@@ -1004,6 +1014,32 @@ mod tests {
         config
     }
 
+    /// The config-disabled branch must record the component as `disabled`,
+    /// never `ok`: `mark_component_ok` on this path was the defect — every
+    /// surface that reads the state file called a scheduler the config
+    /// turned off healthy, while the jobs never ran. No state-file test can
+    /// catch a regression here (the write happens inside `run`, which no
+    /// unit test drives), so the branch source is scanned the way the
+    /// surface guards scan their own module.
+    #[test]
+    fn the_disabled_scheduler_branch_records_disabled_not_ok() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("if scheduler_enabled(&config)")
+            .expect("the scheduler gate must stay in run()");
+        let region = &source[start..];
+        let end = region.find("// Gate the").unwrap_or(region.len());
+        let branch = &region[..end];
+        assert!(
+            branch.contains(r#"mark_component_disabled("scheduler")"#),
+            "the config-disabled branch must record the component as disabled:\n{branch}"
+        );
+        assert!(
+            !branch.contains(r#"mark_component_ok("scheduler")"#),
+            "mark_component_ok on the disabled path is the defect:\n{branch}"
+        );
+    }
+
     #[test]
     fn scheduler_enabled_requires_both_cron_and_scheduler_flags() {
         let mut c = crate::config::Config::default();
@@ -1055,6 +1091,31 @@ mod tests {
         std::fs::write(&path, scheduler_state_body("error", 0)).unwrap();
 
         assert_eq!(scheduler_verdict(&path), SchedulerVerdict::Unhealthy);
+    }
+
+    /// The daemon records a config-disabled scheduler as "disabled", and the
+    /// verdict must carry that as its own fact — never as "healthy", which
+    /// is what `mark_component_ok` on the disabled path used to say while
+    /// the cron docs promised the jobs never run.
+    #[test]
+    fn scheduler_verdict_reads_a_disabled_scheduler_as_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        std::fs::write(&path, scheduler_state_body("disabled", 0)).unwrap();
+
+        assert_eq!(scheduler_verdict(&path), SchedulerVerdict::Disabled);
+        assert!(
+            scheduler_verdict(&path)
+                .detail()
+                .contains("disabled by config"),
+            "the detail must say the config turned it off: {}",
+            scheduler_verdict(&path).detail()
+        );
+        assert_ne!(
+            scheduler_verdict(&path),
+            SchedulerVerdict::Healthy,
+            "a disabled scheduler is not a healthy one"
+        );
     }
 
     /// No state file at all: the daemon never ran, so nothing can be healthy.

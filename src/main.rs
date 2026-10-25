@@ -427,7 +427,7 @@ Examples:
         service_command: ServiceCommands,
     },
 
-    /// Run diagnostics for configuration, daemon, scheduler and channel freshness.
+    /// Run diagnostics for configuration, channels, daemon and scheduler state.
     ///
     /// With no subcommand, runs the full new-style health check
     /// pipeline (config + live + system). Use `--brief` for a sub-second
@@ -439,7 +439,8 @@ Examples:
     /// daemon.registration, daemon.scheduler, system.deps. `--brief` skips the
     /// three network probes (provider.ping, channels.auth, mcp.startup) and
     /// `--offline` reports them as skipped without probing; every other check
-    /// reads local state.
+    /// reads local state. Every name above has a check behind it — the help
+    /// must not promise what no check reads.
     Doctor {
         /// Output format: text (default), json, brief.
         #[arg(long, default_value = "text", value_enum)]
@@ -1781,17 +1782,11 @@ async fn main() -> Result<()> {
                     &cli_style::autonomy_preset_text(&profile.policy_dir()),
                 );
                 cli_style::field("Enforced", W, &format!("{enforced:?}  (config.toml)"));
-                if let Some(p) = current {
-                    if p.autonomy_level() != enforced {
-                        println!(
-                            "  {}",
-                            cli_style::warn(&format!(
-                                "⚠ preset marker implies {:?} but the runtime enforces {enforced:?}; run `rantaiclaw autonomy {}` to resync.",
-                                p.autonomy_level(),
-                                p.id()
-                            ))
-                        );
-                    }
+                // The drift note is the helper's words, so `status` warns in
+                // exactly the same words when it shows the same state.
+                if let Some(note) = cli_style::autonomy_drift_note(&profile.policy_dir(), enforced)
+                {
+                    println!("  {}", cli_style::warn(&note));
                 }
                 cli_style::section("presets");
                 for p in PolicyPreset::ALL {
@@ -1974,6 +1969,14 @@ async fn main() -> Result<()> {
                 W,
                 &format!("{:?}  (config.toml)", config.autonomy.level),
             );
+            // The marker and the config are written together by every
+            // sanctioned path, so a disagreement means a hand edit or a
+            // failed best-effort marker write. Say so here — the model is
+            // already protected (`preset_for_prompt` names no preset on a
+            // mismatch); the operator gets the same note `autonomy` prints.
+            if let Some(note) = cli_style::autonomy_drift_note(&policy_dir, config.autonomy.level) {
+                println!("  {}", cli_style::warn(&note));
+            }
             cli_style::field("Runtime", W, &config.runtime.kind.to_string());
             cli_style::field(
                 "Heartbeat",

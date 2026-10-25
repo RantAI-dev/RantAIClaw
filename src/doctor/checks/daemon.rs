@@ -50,6 +50,9 @@ fn render_scheduler(name: &str, category: &'static str, verdict: &SchedulerVerdi
         SchedulerVerdict::Healthy => {
             CheckResult::ok(name, verdict.detail()).with_category(category)
         }
+        SchedulerVerdict::Disabled => CheckResult::info(name, verdict.detail())
+            .with_category(category)
+            .with_hint("set [cron].enabled and [scheduler].enabled to run scheduled jobs"),
         SchedulerVerdict::Unhealthy => CheckResult::fail(name, verdict.detail())
             .with_category(category)
             .with_hint("see the daemon log for the scheduler component"),
@@ -98,6 +101,10 @@ pub(crate) struct UnitReport {
     pub(crate) exec_start: Option<String>,
     /// The unit file the manager loaded the unit from.
     pub(crate) fragment_path: Option<String>,
+    /// The unit's `Environment` property, when the manager reported one —
+    /// the raw `KEY=VALUE …` assignments, from which the profile a unit
+    /// runs is read ([`unit_reported_profile`]).
+    pub(crate) environment: Option<String>,
 }
 
 /// What one query of the service manager answered.
@@ -137,6 +144,18 @@ pub(crate) enum Registration {
         manager: &'static str,
         unit: String,
         fragment_path: Option<String>,
+    },
+    /// A unit is installed, but it runs another profile — the unit the
+    /// installer wrote from a different profile, or a template for one.
+    /// It is a real registration of this binary, but not this profile's,
+    /// so it cannot be claimed here.
+    ForeignProfile {
+        manager: &'static str,
+        unit: String,
+        /// The profile the unit's `Environment` names.
+        runs_profile: String,
+        /// The profile doctor is diagnosing.
+        expected_profile: String,
     },
     /// A unit is installed, but it runs a different binary — another
     /// installation's unit, not this one's.
@@ -243,6 +262,32 @@ fn unquote(value: &str) -> &str {
         .strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
         .unwrap_or(value)
+}
+
+/// The profile a unit's `Environment=` property names, when it names one.
+///
+/// The installer stamps every unit it writes with
+/// `Environment=RANTAICLAW_PROFILE=<profile>` (`src/service/mod.rs`), so a
+/// unit that carries the property says which profile its daemon serves —
+/// the fact a registration claim for the profile being diagnosed must
+/// agree with. `Environment` holds space-separated `KEY=VALUE` assignments;
+/// the installer quotes a value only when it contains whitespace, which no
+/// supported profile name does — a value the whitespace split tears apart
+/// reads as no profile rather than as a wrong one.
+pub(crate) fn unit_reported_profile(environment: Option<&str>) -> Option<String> {
+    let environment = environment?;
+    for assignment in environment.split_whitespace() {
+        let Some(value) = assignment.strip_prefix("RANTAICLAW_PROFILE=") else {
+            continue;
+        };
+        let value = value.trim();
+        if value.starts_with('"') && !value.ends_with('"') {
+            return None;
+        }
+        let value = unquote(value);
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    None
 }
 
 /// One `Key=Value` line out of `systemctl show` output.
@@ -366,6 +411,20 @@ pub(crate) fn render_registration(
         )
         .with_category(category)
         .with_hint("run: rantaiclaw service start"),
+        Registration::ForeignProfile {
+            manager,
+            unit,
+            runs_profile,
+            expected_profile,
+        } => CheckResult::info(
+            name,
+            format!(
+                "unit {unit} is registered with {manager} but runs profile {runs_profile}, not \
+                 {expected_profile} — this profile's daemon is not registered"
+            ),
+        )
+        .with_category(category)
+        .with_hint("run: rantaiclaw service install"),
         Registration::ForeignBinary {
             manager,
             unit,
@@ -439,14 +498,29 @@ pub(crate) fn render_registration(
 /// status is unknown, not absent.
 fn registration_from_probes(
     manager: &'static str,
+    profile: &str,
     candidates: &[String],
     probe: impl Fn(&str) -> ProbeOutcome,
     expected: Option<&Path>,
 ) -> Registration {
+    // Units that answered but serve another profile. A unit the installer
+    // wrote from profile `default` is a real registration — of that
+    // profile. Claiming it for the profile being diagnosed is the defect:
+    // doctor in `work` reported "registered" while the unit ran `default`,
+    // and the template unit for `work` was never asked for.
+    let mut foreign_profiles: Vec<(String, String)> = Vec::new();
     for unit in candidates {
         match probe(unit) {
             ProbeOutcome::Absent => {}
-            ProbeOutcome::Present(report) => return classify_unit(manager, &report, expected),
+            ProbeOutcome::Present(report) => {
+                if let Some(runs) = unit_reported_profile(report.environment.as_deref()) {
+                    if runs != profile {
+                        foreign_profiles.push((report.unit.clone(), runs));
+                        continue;
+                    }
+                }
+                return classify_unit(manager, &report, expected);
+            }
             ProbeOutcome::Indeterminate => {
                 return Registration::ManagerUnreachable {
                     manager,
@@ -454,6 +528,14 @@ fn registration_from_probes(
                 };
             }
         }
+    }
+    if let Some((unit, runs)) = foreign_profiles.first() {
+        return Registration::ForeignProfile {
+            manager,
+            unit: unit.clone(),
+            runs_profile: runs.clone(),
+            expected_profile: profile.to_string(),
+        };
     }
     Registration::NotRegistered {
         manager,
@@ -480,6 +562,7 @@ pub(crate) fn detect_registration_detailed(profile: &str) -> Registration {
             let candidates = candidate_units(profile);
             return registration_from_probes(
                 "systemd (user)",
+                profile,
                 &candidates,
                 probe_systemd,
                 expected.as_deref(),
@@ -504,6 +587,7 @@ pub(crate) fn detect_registration_detailed(profile: &str) -> Registration {
                             active: true,
                             exec_start: None,
                             fragment_path: None,
+                            environment: None,
                         })
                     } else {
                         ProbeOutcome::Absent
@@ -512,7 +596,13 @@ pub(crate) fn detect_registration_detailed(profile: &str) -> Registration {
                 // launchctl is installed but did not answer.
                 _ => ProbeOutcome::Indeterminate,
             };
-            return registration_from_probes("launchd", &candidates, |_| outcome.clone(), None);
+            return registration_from_probes(
+                "launchd",
+                profile,
+                &candidates,
+                |_| outcome.clone(),
+                None,
+            );
         }
     }
     Registration::Unsupported
@@ -540,12 +630,14 @@ fn classify_systemctl(code: Option<i32>, unit: &str) -> ProbeOutcome {
             active: true,
             exec_start: None,
             fragment_path: None,
+            environment: None,
         }),
         Some(3) => ProbeOutcome::Present(UnitReport {
             unit: unit.to_string(),
             active: false,
             exec_start: None,
             fragment_path: None,
+            environment: None,
         }),
         Some(4) => ProbeOutcome::Absent,
         _ => ProbeOutcome::Indeterminate,
@@ -585,6 +677,7 @@ fn probe_systemd(unit: &str) -> ProbeOutcome {
                     "show",
                     "--property=ExecStart",
                     "--property=FragmentPath",
+                    "--property=Environment",
                     unit,
                 ])
                 .output()
@@ -593,6 +686,7 @@ fn probe_systemd(unit: &str) -> ProbeOutcome {
                     let text = String::from_utf8_lossy(&out.stdout);
                     report.exec_start = property_value(&text, "ExecStart");
                     report.fragment_path = property_value(&text, "FragmentPath");
+                    report.environment = property_value(&text, "Environment");
                 }
             }
             ProbeOutcome::Present(report)
@@ -625,6 +719,7 @@ mod tests {
                 active,
                 exec_start: None,
                 fragment_path: None,
+                environment: None,
             })
         };
         assert_eq!(classify_systemctl(Some(0), unit), present(true), "active");
@@ -850,6 +945,44 @@ mod tests {
         assert_ne!(SchedulerCheck.category(), "live");
     }
 
+    /// A scheduler the config turned off is a fact, not a failure — but it
+    /// is also not "healthy", which is what the daemon's old
+    /// `mark_component_ok` on the disabled path made every surface say
+    /// while the jobs never ran.
+    #[tokio::test]
+    async fn scheduler_check_reports_a_disabled_scheduler_as_info_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = scheduler_ctx(&tmp);
+        let path = crate::daemon::state_file_path(&ctx.config);
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "components": {"scheduler": {"status": "disabled"}},
+                "written_at": chrono::Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = SchedulerCheck.run(&ctx).await;
+        assert_eq!(
+            result.severity,
+            Severity::Info,
+            "a disabled scheduler is informational: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("disabled by config"),
+            "the line must say the config turned the scheduler off: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("healthy"),
+            "a disabled scheduler must never read as healthy: {}",
+            result.message
+        );
+    }
+
     // ── The registration check names what it looked at ──────────────
 
     /// A unit that runs a different binary belongs to another installation.
@@ -874,6 +1007,7 @@ mod tests {
                 other.display()
             )),
             fragment_path: Some("/home/operator/.config/systemd/user/rantaiclaw.service".into()),
+            environment: None,
         };
 
         let registration = classify_unit("systemd (user)", &report, Some(&expected));
@@ -919,6 +1053,7 @@ mod tests {
                 expected.display()
             )),
             fragment_path: Some("/home/operator/.config/systemd/user/rantaiclaw.service".into()),
+            environment: None,
         };
 
         let registration = classify_unit("systemd (user)", &report, Some(&expected));
@@ -963,6 +1098,7 @@ mod tests {
             active: true,
             exec_start: None,
             fragment_path: Some("/home/operator/.config/systemd/user/rantaiclaw.service".into()),
+            environment: None,
         };
 
         let registration = classify_unit("systemd (user)", &report, Some(&expected));
@@ -1005,6 +1141,7 @@ mod tests {
             active: false,
             exec_start: None,
             fragment_path: None,
+            environment: None,
         };
         let registration = classify_unit("systemd (user)", &report, Some(&expected));
         assert!(
@@ -1038,6 +1175,7 @@ mod tests {
                 other.display()
             )),
             fragment_path: None,
+            environment: None,
         };
 
         let registration = classify_unit("systemd (user)", &report, None);
@@ -1065,6 +1203,7 @@ mod tests {
 
             let registration = registration_from_probes(
                 "systemd (user)",
+                "default",
                 &[unit.to_string()],
                 |_| outcome.clone(),
                 None,
@@ -1116,6 +1255,192 @@ mod tests {
         );
     }
 
+    /// A unit the installer wrote from another profile is a real
+    /// registration — of that profile. Doctor diagnosing profile `work`
+    /// must not claim the plain unit that runs `default`, and must say
+    /// what it found instead.
+    #[test]
+    fn a_unit_running_another_profile_is_not_this_profiles_registration() {
+        let candidates = vec!["rantaiclaw.service".to_string()];
+        let unit_environment = "RANTAICLAW_PROFILE=default RANTAICLAW_UNIT=rantaiclaw.service";
+        let registration = registration_from_probes(
+            "systemd (user)",
+            "work",
+            &candidates,
+            |unit| {
+                assert_eq!(unit, "rantaiclaw.service");
+                ProbeOutcome::Present(UnitReport {
+                    unit: unit.to_string(),
+                    active: true,
+                    exec_start: None,
+                    fragment_path: None,
+                    environment: Some(unit_environment.to_string()),
+                })
+            },
+            None,
+        );
+        let Registration::ForeignProfile {
+            unit,
+            runs_profile,
+            expected_profile,
+            ..
+        } = &registration
+        else {
+            panic!("another profile's unit is not this profile's registration: {registration:?}")
+        };
+        assert_eq!(unit, "rantaiclaw.service");
+        assert_eq!(runs_profile, "default");
+        assert_eq!(expected_profile, "work");
+
+        let result = render_registration("daemon.registration", "system", &registration);
+        assert_ne!(
+            result.severity,
+            Severity::Ok,
+            "the line must not read as registered: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("profile default"),
+            "the line must name the profile the unit runs: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("not work"),
+            "the line must name the profile being diagnosed: {}",
+            result.message
+        );
+    }
+
+    /// A template unit for the profile being diagnosed is the registration
+    /// the plain unit could not claim — and the line names it.
+    #[test]
+    fn a_template_unit_for_this_profile_is_reported_as_registered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expected = tmp.path().join("bin/rantaiclaw");
+        std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        std::fs::write(&expected, b"").unwrap();
+
+        let candidates = vec![
+            "rantaiclaw.service".to_string(),
+            "rantaiclaw@work.service".to_string(),
+        ];
+        let registration = registration_from_probes(
+            "systemd (user)",
+            "work",
+            &candidates,
+            |unit| {
+                if unit == "rantaiclaw.service" {
+                    // The plain unit runs profile `default`.
+                    ProbeOutcome::Present(UnitReport {
+                        unit: unit.to_string(),
+                        active: true,
+                        exec_start: None,
+                        fragment_path: None,
+                        environment: Some("RANTAICLAW_PROFILE=default".to_string()),
+                    })
+                } else {
+                    // The template unit runs this profile and this binary.
+                    ProbeOutcome::Present(UnitReport {
+                        unit: unit.to_string(),
+                        active: true,
+                        exec_start: Some(format!(
+                            "{{ path={} ; argv[]={} daemon ; }}",
+                            expected.display(),
+                            expected.display()
+                        )),
+                        fragment_path: None,
+                        environment: Some("RANTAICLAW_PROFILE=work".to_string()),
+                    })
+                }
+            },
+            Some(&expected),
+        );
+        let Registration::Registered {
+            unit,
+            binary,
+            fragment_path: _,
+            manager: _,
+        } = &registration
+        else {
+            panic!("the template unit for this profile is the registration: {registration:?}")
+        };
+        assert_eq!(unit, "rantaiclaw@work.service");
+        assert_eq!(binary.as_str(), expected.display().to_string());
+
+        let result = render_registration("daemon.registration", "system", &registration);
+        assert_eq!(result.severity, Severity::Ok, "{}", result.message);
+        assert!(
+            result.message.contains("rantaiclaw@work.service"),
+            "the line must name the unit that is registered: {}",
+            result.message
+        );
+    }
+
+    /// A plain unit that runs this profile is this profile's registration,
+    /// as before — the profile comparison must not break the install the
+    /// installer writes today.
+    #[test]
+    fn a_plain_unit_running_this_profile_is_reported_as_registered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expected = tmp.path().join("bin/rantaiclaw");
+        std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        std::fs::write(&expected, b"").unwrap();
+
+        let candidates = vec!["rantaiclaw.service".to_string()];
+        let registration = registration_from_probes(
+            "systemd (user)",
+            "work",
+            &candidates,
+            |_| {
+                ProbeOutcome::Present(UnitReport {
+                    unit: "rantaiclaw.service".to_string(),
+                    active: true,
+                    exec_start: Some(format!(
+                        "{{ path={} ; argv[]={} daemon ; }}",
+                        expected.display(),
+                        expected.display()
+                    )),
+                    fragment_path: None,
+                    environment: Some("RANTAICLAW_PROFILE=work".to_string()),
+                })
+            },
+            Some(&expected),
+        );
+        let Registration::Registered { unit, .. } = &registration else {
+            panic!("this profile's own unit is the registration: {registration:?}")
+        };
+        assert_eq!(unit, "rantaiclaw.service");
+    }
+
+    /// The profile a unit runs is read out of the raw `Environment=`
+    /// property the probe already asks for — the assignment the installer
+    /// stamps into every unit it writes.
+    #[test]
+    fn the_unit_profile_is_read_from_the_environment_property() {
+        assert_eq!(
+            unit_reported_profile(Some("RANTAICLAW_PROFILE=work")),
+            Some("work".to_string())
+        );
+        // Other assignments around it do not disturb the read.
+        assert_eq!(
+            unit_reported_profile(Some(
+                "RANTAICLAW_UNIT=rantaiclaw.service RANTAICLAW_PROFILE=default"
+            )),
+            Some("default".to_string())
+        );
+        // A quoted value the whitespace split tore apart reads as no
+        // profile rather than as a wrong one.
+        assert_eq!(
+            unit_reported_profile(Some("RANTAICLAW_PROFILE=\"my work\"")),
+            None,
+            "no supported profile name carries whitespace; claiming none beats claiming wrong"
+        );
+        // No property, or no assignment for the profile: no claim.
+        assert_eq!(unit_reported_profile(None), None);
+        assert_eq!(unit_reported_profile(Some("OTHER=x")), None);
+        assert_eq!(unit_reported_profile(Some("RANTAICLAW_PROFILE=")), None);
+    }
+
     /// A host with no unit of that name is not a failure, but the line still
     /// has to say which manager was asked and which units were looked for —
     /// otherwise "not registered" reads as "nothing is registered", which is
@@ -1128,6 +1453,7 @@ mod tests {
         ];
         let registration = registration_from_probes(
             "systemd (user)",
+            "default",
             &candidates,
             |_| ProbeOutcome::Absent,
             None,

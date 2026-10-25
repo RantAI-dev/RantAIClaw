@@ -125,6 +125,14 @@ pub(crate) fn build_channel_system_prompt(
 ///
 /// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
 /// on-demand via `memory_recall` / `memory_search` tools.
+///
+/// Test convenience only: it cannot name the level the caller's gate
+/// enforces, so it assumes the shipped default (`Supervised`). A prompt
+/// built through it names the marker's preset only when that preset implies
+/// the default level, and names no preset otherwise — never a preset the
+/// gate does not run. Production surfaces must call
+/// [`build_system_prompt_with_mode`] with their own gate's level.
+#[cfg(test)]
 pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -154,6 +162,7 @@ pub fn build_system_prompt(
         } else {
             OwnerFiles::Omit
         },
+        crate::config::Config::default().autonomy.level,
     )
 }
 
@@ -163,6 +172,14 @@ pub fn build_system_prompt(
 /// whether `USER.md`, `MEMORY.md`, `BOOTSTRAP.md` and `TOOLS.md` go in: the
 /// caller sets it from the memory view of the turn the prompt is for
 /// ([`OwnerFiles::for_view`]). A guest prompt carries none of them.
+///
+/// `enforced_autonomy` is the level the caller's own gate enforces — the same
+/// `config.autonomy.level` snapshot the runtime was seeded from. The approval
+/// preset enters the prompt only through
+/// [`preset_for_prompt`](crate::approval::policy_writer::preset_for_prompt),
+/// so a marker that drifted from the enforced level names no preset instead
+/// of describing a policy the gate is not running.
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -174,6 +191,7 @@ pub fn build_system_prompt_with_mode(
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     audience: PromptAudience,
     owner_files: OwnerFiles,
+    enforced_autonomy: crate::security::AutonomyLevel,
 ) -> String {
     // Unified prompt builder: the SAME `SystemPromptBuilder` the TUI/`Agent`
     // path uses, with `surface = Channel` so the surface-specific hint sections
@@ -188,16 +206,23 @@ pub fn build_system_prompt_with_mode(
     // Resolve the active approval preset so SafetySection renders the
     // channel-accurate guidance (Strict really drops `shell` here after
     // PR3b-strict; Smart/Manual describe owner-approval, not the TUI's inline
-    // Y/N/A). Failure to read the policy is non-fatal — `None` falls back to the
-    // generic safety floor. The shell allowlist is intentionally NOT surfaced on
-    // channels: the Layer-A approval manager gates non-read-only tools before
-    // the Layer-B shell allowlist applies, so listing globs here would mislead.
+    // Y/N/A). The preset reaches the prompt only when it implies exactly
+    // `enforced_autonomy` — a drifted marker names no preset, and the safety
+    // section keeps its generic floor. Failure to read the policy is
+    // non-fatal — `None` falls back to the generic safety floor. The shell
+    // allowlist is intentionally NOT surfaced on channels: the Layer-A
+    // approval manager gates non-read-only tools before the Layer-B shell
+    // allowlist applies, so listing globs here would mislead.
     use crate::agent::prompt::{DescriptorTool, PromptContext, PromptSurface, SystemPromptBuilder};
 
     let autonomy_preset = crate::profile::ProfileManager::active()
         .ok()
-        .map(|profile| crate::approval::policy_writer::read_active_preset(&profile.policy_dir()))
-        .unwrap_or(None);
+        .and_then(|profile| {
+            crate::approval::policy_writer::preset_for_prompt(
+                &profile.policy_dir(),
+                enforced_autonomy,
+            )
+        });
 
     let stub_tools: Vec<Box<dyn Tool>> = tools
         .iter()

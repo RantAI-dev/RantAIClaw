@@ -61,6 +61,7 @@ impl OwnerDm {
                 false,
                 crate::config::SkillsPromptInjectionMode::Full,
                 Arc::new(Vec::new()),
+                crate::security::AutonomyLevel::Supervised,
             );
         }
         Self {

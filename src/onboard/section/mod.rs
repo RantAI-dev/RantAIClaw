@@ -44,6 +44,11 @@ pub struct BlockedSection {
     /// The command that does the work instead — the section's
     /// `headless_hint()`.
     pub hint: String,
+    /// Whether the agent cannot run without this section. Stamped by the
+    /// orchestrator from `SetupSection::required()` — the exit code is the
+    /// orchestrator's decision, so the flag is decided there, not by
+    /// whichever section recorded itself.
+    pub required: bool,
 }
 
 /// Per-run context handed to every `SetupSection::run` call.
@@ -76,9 +81,13 @@ impl SetupContext<'_> {
     /// The hint is what the operator runs instead. It is printed once, by
     /// the run's reporting path — not by the section as it gives up.
     pub fn record_blocked(&mut self, name: &str, hint: &str) {
+        // `required` starts `false` as a placeholder; `run_one` stamps the
+        // section's real `SetupSection::required()` on every entry it
+        // appends to the report.
         self.blocked.push(BlockedSection {
             name: name.to_string(),
             hint: hint.to_string(),
+            required: false,
         });
     }
 }
@@ -104,4 +113,13 @@ pub trait SetupSection {
 
     /// One-line CLI hint shown when the section bails in headless mode.
     fn headless_hint(&self) -> &'static str;
+
+    /// Whether the agent cannot run without this section configured. The
+    /// headless exit code follows this flag: a blocked required section
+    /// fails the run, a blocked optional one is only reported in the
+    /// summary. Default `false` — a section is optional until it is
+    /// proven to gate the agent's first message.
+    fn required(&self) -> bool {
+        false
+    }
 }

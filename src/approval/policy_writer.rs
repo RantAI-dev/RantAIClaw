@@ -339,6 +339,31 @@ pub fn read_active_preset(policy_dir: &Path) -> Option<PolicyPreset> {
     PolicyPreset::from_str_ci(preset_str).ok()
 }
 
+/// The preset a model-facing surface may name, given the level the gate
+/// enforces.
+///
+/// The marker and `config.autonomy.level` are written together by every
+/// sanctioned path ([`write_active_preset`] + `apply_preset_to_config`), but
+/// they can still drift: a hand edit of `config.toml`, or a preset chosen by
+/// a provisioning path that deliberately keeps the disagreement. A prompt
+/// that names a preset the gate does not enforce lies to the model in the
+/// dangerous direction — "commands run without prompts" while the gate
+/// refuses everything, or the reverse. So a model-facing surface gets the
+/// marker only when [`PolicyPreset::autonomy_level`] equals `enforced`;
+/// every other case is `None`, and the safety section renders its generic
+/// floor instead of a policy nobody is enforcing.
+///
+/// Operator-facing surfaces (`status`, `autonomy`) do NOT go through here:
+/// they report the marker as-is and print the drift note. See
+/// `cli_style::autonomy_drift_note`.
+pub fn preset_for_prompt(
+    policy_dir: &Path,
+    enforced: crate::security::AutonomyLevel,
+) -> Option<PolicyPreset> {
+    let preset = read_active_preset(policy_dir)?;
+    (preset.autonomy_level() == enforced).then_some(preset)
+}
+
 /// Classify a live autonomy config back into the `PolicyPreset` it represents —
 /// the inverse of [`apply_preset_to_config`]. The gateway UI edits autonomy via
 /// granular `level`/`always_ask` fields rather than by preset name, so this lets
@@ -1086,6 +1111,53 @@ mod tests {
     fn read_active_preset_returns_none_when_file_missing() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(read_active_preset(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn preset_for_prompt_passes_the_marker_through_when_levels_match() {
+        for preset in PolicyPreset::ALL {
+            let tmp = tempfile::tempdir().unwrap();
+            write_active_preset(tmp.path(), preset).unwrap();
+            assert_eq!(
+                preset_for_prompt(tmp.path(), preset.autonomy_level()),
+                Some(preset),
+                "preset {} implies its own level, so the prompt may name it",
+                preset.id()
+            );
+        }
+    }
+
+    #[test]
+    fn preset_for_prompt_returns_none_on_every_level_mismatch() {
+        use crate::security::AutonomyLevel;
+        for preset in PolicyPreset::ALL {
+            let tmp = tempfile::tempdir().unwrap();
+            write_active_preset(tmp.path(), preset).unwrap();
+            for enforced in [
+                AutonomyLevel::ReadOnly,
+                AutonomyLevel::Supervised,
+                AutonomyLevel::Full,
+            ] {
+                if enforced == preset.autonomy_level() {
+                    continue;
+                }
+                assert_eq!(
+                    preset_for_prompt(tmp.path(), enforced),
+                    None,
+                    "marker {} (implies {:?}) must not reach the prompt while the gate enforces {:?}",
+                    preset.id(),
+                    preset.autonomy_level(),
+                    enforced
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preset_for_prompt_returns_none_when_the_marker_is_missing() {
+        use crate::security::AutonomyLevel;
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(preset_for_prompt(tmp.path(), AutonomyLevel::Supervised).is_none());
     }
 
     #[test]

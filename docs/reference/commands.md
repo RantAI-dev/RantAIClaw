@@ -28,7 +28,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `gateway` | Start webhook and WhatsApp HTTP gateway |
 | `daemon` | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
 | `service` | Manage user-level OS service lifecycle |
-| `doctor` | Run diagnostics for configuration, daemon, scheduler and channel freshness |
+| `doctor` | Run diagnostics for configuration, channels, daemon and scheduler state |
 | `status` | Print current configuration and system summary |
 | `usage` | Print today's token usage against the daily ceiling |
 | `cron` | Manage scheduled tasks |
@@ -82,7 +82,7 @@ Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker ·
 
 The `Autonomy` row names the approval preset the active profile has, read from the profile's marker (`<profile>/policy/autonomy.toml`) — the same source `rantaiclaw autonomy` reads, so the two cannot disagree. A profile with no marker has no preset, and the row reads `not provisioned — run \`rantaiclaw setup approvals\`` rather than a preset name derived from `config.toml`.
 
-The `Enforced` row right after it names the autonomy level the runtime gate actually enforces, read from `config.toml`. A profile whose marker has drifted from its config therefore shows both: the preset the profile chose and the level in force.
+The `Enforced` row right after it names the autonomy level the runtime gate actually enforces, read from `config.toml`. A profile whose marker has drifted from its config therefore shows both: the preset the profile chose and the level in force — plus a warning naming both levels and the `rantaiclaw autonomy <preset>` command that resyncs them, the same warning `rantaiclaw autonomy` prints. The model is never told a preset the gate does not enforce: a drifted preset is dropped from the system prompt, which falls back to its generic safety floor.
 
 ### `setup`
 
@@ -99,8 +99,8 @@ Approval presets are kept rather than re-offered: `rantaiclaw setup approvals` o
 
 `--non-interactive` (or a non-TTY context) behaves differently depending on whether a topic is given:
 
-- **`rantaiclaw setup --non-interactive`** — walks the sections and emits each one's headless hint instead of prompting. A section that needs a prompt (`provider`, `channels`, `mcp`, `login`, `knowledge`) cannot run, so it is named in a closing summary as **not configured**, together with the command that configures it instead, and the command exits **non-zero**. The sections that work without a prompt (`approvals`, `persona`, `skills`) are still configured. A profile where every section is already configured exits **0**. Scripts should check the exit code.
-- **`rantaiclaw setup <topic> --non-interactive`** — runs that topic's provisioner unattended. Text prompts take the default the provisioner declared, secret prompts get an empty value, a single-choice question takes its first option, and a multi-select selects **nothing**. The config is saved only when the provisioner reports that it configured something; a provisioner that aborted, errored or timed out exits **non-zero** and writes nothing. A topic with no provisioner (`channels`) runs its section instead and behaves like the sweep above: it exits **non-zero** when that section could not run. Scripts should check the exit code.
+- **`rantaiclaw setup --non-interactive`** — walks the sections and emits each one's headless hint instead of prompting. A section that needs a prompt cannot run, so it is named in a closing summary as **not configured**, together with the command that configures it instead. The exit code follows the **provider** — the one required section: a sweep that could not configure the provider exits **non-zero**, because the agent cannot run without a provider credential. The other prompt-needing sections (`channels`, `mcp`, `login`, `knowledge`) are optional: they do not fail the run, and the summary names them as optional. A profile where the provider is configured — whatever the optional sections did — exits **0**. A section that errored aborts the run with a non-zero exit as before. Scripts should check the exit code.
+- **`rantaiclaw setup <topic> --non-interactive`** — runs that topic's provisioner unattended. Text prompts take the default the provisioner declared, secret prompts get an empty value, a single-choice question takes its first option, and a multi-select selects **nothing**. The config is saved only when the provisioner reports that it configured something; a provisioner that aborted, errored or timed out exits **non-zero** and writes nothing. A topic with no provisioner (`channels`) runs its section instead: because the caller asked for that one section by name, a run in which it could not run exits **non-zero** — even though the same section is optional in a full sweep. Scripts should check the exit code.
 
 Single-topic examples:
 - `rantaiclaw setup provider` — re-run provider section only
@@ -564,8 +564,8 @@ that did not run is not a pass.
 | `provider.ping` | `live` | Does the provider actually accept the credential? |
 | `channels.auth` | `live` | Do the configured channels authenticate? |
 | `mcp.startup` | `live` | Do the configured MCP servers start? |
-| `daemon.registration` | `system` | Is **this** installation's daemon registered with the host service manager, and does the unit run this binary? |
-| `daemon.scheduler` | `system` | Is the running daemon's scheduler component healthy? |
+| `daemon.registration` | `system` | Is **this** installation's daemon registered with the host service manager — does the unit run this binary and this profile? |
+| `daemon.scheduler` | `system` | Is the running daemon's scheduler component healthy — or disabled by config? |
 | `system.deps` | `system` | Are the required system dependencies present on the host? |
 
 `--brief` skips the three `live` checks (`provider.ping`, `channels.auth`,
@@ -576,9 +576,12 @@ so the console's brief mode still reports on the daemon and its scheduler.
 #### The daemon checks
 
 `daemon.registration` names what it looked at: the service manager it asked, the unit
-it asked for, and the binary that unit runs. A unit that runs a different binary than
-the `rantaiclaw` you just invoked belongs to another installation, and the check says so
-instead of reporting it as this one's service.
+it asked for, the binary that unit runs, and — from the unit's `Environment=` — the
+profile that unit serves. A unit that runs a different binary than the `rantaiclaw` you
+just invoked belongs to another installation, and a unit stamped with another profile
+belongs to that profile; the check says so instead of reporting either as this one's
+service. On macOS the registration cannot be verified the same way: `launchctl list`
+names no executable, so the verdict there is always the warn "could not be verified".
 
 `daemon.registration` reports one of these registration verdicts:
 
@@ -586,6 +589,7 @@ instead of reporting it as this one's service.
 |---|---|---|
 | `daemon registered via <manager> as unit <unit> (runs <path>)` | This installation's unit is installed and runs this binary | ok |
 | `daemon registered with <manager> as unit <unit> but not running` | The unit is installed but stopped | info |
+| `unit <unit> is registered with <manager> but runs profile <p>, not <this profile> — this profile's daemon is not registered` | A unit for another profile answered (the installer stamps each unit with its profile); this profile has no unit | info |
 | `… but runs <path> — not this binary (<path>)` | The unit that answered belongs to a different installation | warn |
 | `unit <unit> is registered with <manager> … could not be verified — not confirmed as this installation` | The unit is installed, but the manager named no executable the check could compare — the unit may belong to another installation | warn |
 | `could not query <manager> for unit <unit> — the user service manager did not answer; registration status unknown` | The service manager could not be reached, so the unit's presence is unknown — neither registered nor absent | warn |
@@ -602,6 +606,7 @@ from the operator's service manager. Both are `info`.
 | Verdict | Meaning | Severity |
 |---|---|---|
 | `healthy` | The daemon is running and its scheduler component reports `ok` | ok |
+| `disabled by config — scheduled jobs do not run` | The daemon is running with the scheduler turned off (`[cron].enabled` and `[scheduler].enabled` gate it together); the component records `disabled`, not `ok` | info |
 | `unhealthy — see daemon logs` | The daemon is running and its scheduler component reports `error` | fail |
 | `daemon not running` | No state file, or one the daemon has stopped refreshing — start `rantaiclaw daemon` for scheduled jobs | warn |
 | `not tracked yet` | The daemon is running but does not publish a scheduler component | warn |

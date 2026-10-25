@@ -137,7 +137,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profile and that the config has not disabled contribute a directory; a skill whose manifest name is not a single
   path component contributes none. The process-wide `PATH` is never changed, and the child that runs a skill's own
   tool still gets that skill's directory prepended, so its own binary keeps winning over a same-named system binary.
-- `rantaiclaw setup --non-interactive` now exits **non-zero** when it could not configure a section, instead of exiting 0 after printing hints. A section that needs a prompt it cannot have (`provider`, `channels`, `mcp`, `login`, `knowledge`) is now named in a closing summary as **not configured**, together with the command that configures it instead. The sections that work without a prompt (`approvals`, `persona`, `skills`) are still configured, and a run that had nothing left to do still exits 0. This is a behaviour change a script may rely on: check the exit code of a headless setup.
+- `rantaiclaw setup --non-interactive` now exits **non-zero** only when the agent cannot run: the provider — the one required section — could not be configured, or a section the caller asked for by name (`setup <topic>`) was blocked. The other sections that need a prompt (`channels`, `mcp`, `login`, `knowledge`) are still named in a closing summary as **not configured**, together with the command that configures them instead, but they no longer fail the run: a sweep that left the provider configured exits 0, and the summary marks those sections as optional. A section that errors, aborts or times out still exits non-zero, and a run with nothing left to do still exits 0. This is a behaviour change a script may rely on: check the exit code of a headless setup.
 - When a fallback provider answers, the CLI agent (`agent -m` and the REPL) prints one line on stdout
   before the reply, naming the provider asked for and the fallback that answered. A reply from the primary
   prints nothing new. Channels and the gateway do not print it.
@@ -161,15 +161,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `[channels_config] cli`, which nothing read, is dropped by a migration to
   config schema 40. Every other channel setting is preserved. A config written
-  by this version is refused by a binary that knows only schema 39; restore the
-  previous config from `config.toml.bak`, which the migrator leaves next to
-  `config.toml`, to go back.
+  by this version is refused by a binary that knows only schema 39. The
+  dependable rollback is to revert the binary and set `schema_version = 39` in
+  `config.toml` by hand — v40 only removed a key that v39 fills from its
+  default, so nothing else is lost. `config.toml.bak`, which the migrator
+  leaves next to `config.toml`, helps only if nothing has saved the config
+  since the upgrade: the first later save (pairing, `permissions add`, the
+  TUI, the console) deletes it.
 
 ### Fixed
 
 - The id `cron list` printed could not be used. An operator copied the 8-character id out of the list and every command that takes a job id refused it, because the id was matched whole. The id every surface prints is now accepted everywhere — `cron run`, `cron pause`, `cron resume`, `cron update`, `cron remove`, `cron runs`, the `/cron` TUI commands, the `/api/v1/cron/{id}` HTTP endpoints and the `cron_*` agent tools — as the full id or as a prefix of one. A full id always wins, even when it is also the prefix of another job's id; a prefix must be at least 8 characters, and a shorter one is refused, because a mistyped delete is worse than a refusal; a prefix that names exactly one job resolves to it, and a prefix that names several is refused with the candidates named so one can be picked. An id that names no job is still `not found`. The prefix is compared literally, so `%` and `_` in a typed id match nothing rather than everything. The TUI now shows the id in its listings, so a named job is no longer listed without one.
 - The TUI's `/cron` commands and the cron detail panel ignored `cron.enabled`: with the switch off, a job could still be created, edited, removed, paused, resumed and run from the TUI while every other surface refused. Every door that writes a cron job now refuses with the same message — `cron is disabled by config (cron.enabled=false)` — the CLI, the HTTP API, the agent tools, the TUI commands and the TUI detail panel alike, and the store refuses a write that reaches it without the check. Reads stay open: `cron list`, `cron runs`, `GET /api/v1/cron` and `GET /api/v1/cron/{id}/runs` still work while the switch is off, so an operator can inspect dormant jobs (the `cron_list` and `cron_runs` agent tools refuse reads while disabled, as they always did). The scheduler's own bookkeeping is exempt, so a runtime flip of the switch cannot make a one-shot that already fired fire again.
 - Every surface that names the approval preset now reads the same source: the profile's marker, `<profile>/policy/autonomy.toml`. `rantaiclaw status` and `rantaiclaw autonomy` agree by construction, the channel prompt names the preset the profile has, and `GET /api/v1/status` reports the marker's preset id — or `null` when the profile has no preset, where it used to report one derived from `config.toml`. A profile that never chose a preset read as "Manual" (the shipped `always_ask` is non-empty) and the TUI's shell-block hint said "Smart"; both now read as unset. The enforced autonomy level still comes from `config.toml` and is unchanged: `status` shows it in its own `Enforced` row, right after the preset.
+- A prompt no longer names an approval preset the gate does not enforce. The preset reaches the
+  model only when it implies exactly the autonomy level the runtime enforces (`config.autonomy.level`);
+  when the marker and the config disagree — a hand edit of `config.toml`, or a failed best-effort marker
+  write — the prompt falls back to the generic safety floor instead of describing a policy the runtime is
+  not running (it used to read "shell commands execute without prompts" while the gate refused every
+  acting tool, or the reverse). This covers the channel prompt, the per-message safety splice, the
+  console turn prompt and the TUI/CLI/cron agent prompt. `rantaiclaw status` joins `rantaiclaw autonomy`
+  in warning when the marker and the config disagree, in the same words, and `GET /api/v1/status` still
+  reports the marker's preset unchanged.
 - A binary a skill's `download` install recipe placed is now found by `skills install-deps`, by `skills list` and by the skill's own tools. The recipe installs into the skill's own tools directory, which was never on the `PATH` the checks looked at, so a recipe could succeed and the skill stay gated with "recipe ran but `<bin>` still missing", and the skill's own tool could not run the binary it had just installed. The skill's tools directory is now searched first, and the child that runs that skill's tool gets it on its `PATH`; it stays invisible to every other skill and to the operator's own `PATH`. A skill whose manifest name is not a single path component has no tools directory of its own, and its `download` recipe is refused rather than writing outside `<data>/tools/`; a Windows drive prefix in that name is structure rather than a name, and is refused on every platform so the rule is the same everywhere. On the library target, `SkillRequires::unmet` now takes the owning skill, and `SkillToolAdapter::new` now takes an `Arc<Skill>` instead of a skill name.
 - A fresh install never reached the first-run wizard. The TUI boot opened the provider setup surface instead, because the wizard's condition required `default_provider` to be unset and a fresh config names one. A profile that stores no provider credential now opens the first-run wizard; a profile that stores a credential whose provider no longer builds still opens provider setup, the surface that repairs it.
 - `setup approvals` offered a preset picker it could not honour. The write is idempotent, so an existing preset stayed on disk while the overlay reported the preset that was picked. A profile that already has a preset now keeps it: the command names the preset that is active and points at `rantaiclaw setup approvals --force`, which is what offers the picker and writes the preset you pick.
@@ -399,6 +412,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved — is reported as unverified instead of as this installation's unit, and a service manager that did
   not answer (`systemctl --user status` exiting 1 or 2, as on a host without a reachable user manager) is
   reported as an unknown registration status instead of as a registered unit that is not running.
+- `doctor` no longer says what it did not check, and its verdicts describe the install
+  they looked at. The help and the command table promised "channel freshness" — no check
+  reads channel freshness, so the promise is gone (the checks themselves are unchanged).
+  `daemon.registration` reads the profile a unit serves from the unit's `Environment=`
+  (the same `systemctl show` probe it already made): a unit stamped with another profile
+  no longer counts as this profile's registration — doctor in profile `work` used to
+  report "registered" while the unit ran `default` — and the verdict names the unit and
+  the profile it found. The template unit `rantaiclaw@<profile>.service` is asked for
+  whenever the plain unit does not match. On macOS the registration verdict stays a warn
+  ("could not be verified"): `launchctl list` names no executable; the docs now say so.
+  `daemon.scheduler` reports a config-disabled scheduler as info "disabled by config —
+  scheduled jobs do not run" instead of "healthy": the daemon records the component as
+  `disabled` (not `ok`), and the TUI row follows the same verdict.
 
 ## [0.33.0-alpha] — 2026-10-08
 

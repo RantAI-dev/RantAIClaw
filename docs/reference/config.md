@@ -619,6 +619,7 @@ Web console (`rantaiclaw ui start`) settings.
 Notes:
 
 - `always_ask` is not a preset. The preset is named by the profile's marker, `<profile>/policy/autonomy.toml` — the one source of truth every surface reads (`rantaiclaw status`, `rantaiclaw autonomy`, the channel prompt, `GET /api/v1/status`). `config.toml` carries the `level` + `always_ask` a preset switched on the CLI writes, and on its own cannot say whether a preset was ever chosen: a profile with no marker reads as *no preset*, not as the default.
+- The marker and the `[autonomy]` section are written together by every sanctioned path, so a disagreement means a hand edit or a failed write. When they disagree, the model is told no preset — a prompt never describes a preset whose level differs from the `level` in force — and `rantaiclaw status` / `rantaiclaw autonomy` warn with the resync command.
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
 - `auto_approve` takes exact tool names, not patterns. An MCP tool is listed by its full name, `mcp__<server>__<tool>`, so `auto_approve = ["mcp__audit__echo"]` lets that one tool run without a prompt under `supervised`. On a surface with no approver (a terminal run whose stdin is not a terminal, a scheduled job, or a chat with no owner), a tool that needs approval is refused, the model is told no approver was available, and the operator log names the tool and how to allow it.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
@@ -1105,8 +1106,12 @@ production code read it. Existing configs drop the key on load (config schema
 **39 → 40**) while every other channel setting is preserved.
 
 A config written by this schema is refused by a binary that knows only schema
-39. Keep `config.toml.bak`, which the migrator leaves next to `config.toml`, to
-go back.
+39. The dependable rollback is to revert the binary and set `schema_version =
+39` in `config.toml` by hand — v40 only removed a key that v39 fills from its
+default, so nothing else is lost. `config.toml.bak`, which the migrator leaves
+next to `config.toml`, helps only if nothing has saved the config since the
+upgrade: the first later save (pairing, `permissions add`, the TUI, the
+console) deletes it.
 
 ### v38: the `[memory].auto_save` key retired
 
