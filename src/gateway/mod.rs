@@ -2032,7 +2032,7 @@ async fn run_gateway_chat_with_multimodal(
     // `BOOTSTRAP.md`, `TOOLS.md`).
     let mut system_prompt = {
         let config_guard = state.config.lock();
-        crate::channels::build_system_prompt(
+        crate::channels::build_system_prompt_with_mode(
             &config_guard.workspace_dir,
             &state.model,
             &tool_descs,
@@ -2040,6 +2040,14 @@ async fn run_gateway_chat_with_multimodal(
             Some(&config_guard.identity),
             None, // bootstrap_max_chars - use default
             false,
+            crate::config::SkillsPromptInjectionMode::Full,
+            crate::channels::PromptAudience::Owner,
+            // This turn runs with no memory view, so it reads nothing from
+            // memory: the prompt carries none of the owner's files.
+            crate::channels::OwnerFiles::Omit,
+            // The level this console's gate enforces, from the same config
+            // snapshot: a drifted preset marker must not name a preset here.
+            config_guard.autonomy.level,
         )
     };
 

@@ -612,5 +612,6 @@ pub(super) fn startup_guest_prompt(workspace: &std::path::Path, tools: &[(&str, 
         crate::config::SkillsPromptInjectionMode::Full,
         PromptAudience::Guest,
         OwnerFiles::Load,
+        crate::security::AutonomyLevel::Supervised,
     )
 }

@@ -82,7 +82,7 @@ Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker ·
 
 The `Autonomy` row names the approval preset the active profile has, read from the profile's marker (`<profile>/policy/autonomy.toml`) — the same source `rantaiclaw autonomy` reads, so the two cannot disagree. A profile with no marker has no preset, and the row reads `not provisioned — run \`rantaiclaw setup approvals\`` rather than a preset name derived from `config.toml`.
 
-The `Enforced` row right after it names the autonomy level the runtime gate actually enforces, read from `config.toml`. A profile whose marker has drifted from its config therefore shows both: the preset the profile chose and the level in force.
+The `Enforced` row right after it names the autonomy level the runtime gate actually enforces, read from `config.toml`. A profile whose marker has drifted from its config therefore shows both: the preset the profile chose and the level in force — plus a warning naming both levels and the `rantaiclaw autonomy <preset>` command that resyncs them, the same warning `rantaiclaw autonomy` prints. The model is never told a preset the gate does not enforce: a drifted preset is dropped from the system prompt, which falls back to its generic safety floor.
 
 ### `setup`
 

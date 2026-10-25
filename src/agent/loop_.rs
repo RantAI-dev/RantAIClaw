@@ -2712,6 +2712,9 @@ pub async fn run_with_scope(
         // The owner files are memory read into the prompt: only a run that sees
         // all of memory carries them.
         crate::channels::OwnerFiles::for_view(memory_view.as_ref()),
+        // The level this run's gate enforces, from the same config the run's
+        // SecurityPolicy was built from.
+        config.autonomy.level,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -6900,6 +6903,7 @@ Let me check the result."#;
             crate::config::SkillsPromptInjectionMode::Full,
             crate::channels::PromptAudience::Owner,
             crate::channels::OwnerFiles::Load,
+            crate::security::AutonomyLevel::Supervised,
         );
 
         // Must contain zero XML protocol artifacts

@@ -72,6 +72,28 @@ pub(crate) fn autonomy_preset_text(policy_dir: &std::path::Path) -> String {
     }
 }
 
+/// The drift note an operator surface prints when the preset marker implies a
+/// different autonomy level than the one the runtime enforces, `None` when
+/// they agree (or no marker was provisioned).
+///
+/// One helper for `status` and `autonomy`, so the two surfaces print the same
+/// words for the same state. The model never sees this text — model-facing
+/// code goes through `preset_for_prompt`, which resolves the same drift by
+/// naming no preset at all.
+pub(crate) fn autonomy_drift_note(
+    policy_dir: &std::path::Path,
+    enforced: crate::security::AutonomyLevel,
+) -> Option<String> {
+    let preset = crate::approval::policy_writer::read_active_preset(policy_dir)?;
+    let implied = preset.autonomy_level();
+    (implied != enforced).then(|| {
+        format!(
+            "⚠ preset marker implies {implied:?} but the runtime enforces {enforced:?}; run `rantaiclaw autonomy {}` to resync.",
+            preset.id()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +167,78 @@ mod tests {
             call_sites >= 2,
             "src/main.rs must print the preset through the shared helper on both \
              `status` and `autonomy` (found {call_sites} call sites)"
+        );
+    }
+
+    /// The drift note fires exactly when the marker implies another level
+    /// than the one enforced — the state an operator must be told about — and
+    /// is silent when they agree or nothing was provisioned.
+    #[test]
+    fn the_drift_note_fires_only_on_a_marker_gate_disagreement() {
+        use crate::approval::policy_writer::{write_active_preset, PolicyPreset};
+        use crate::security::AutonomyLevel;
+
+        let dir = tempfile::tempdir().expect("temp policy dir");
+        // Nothing provisioned: no marker, no note.
+        assert_eq!(
+            autonomy_drift_note(dir.path(), AutonomyLevel::Supervised),
+            None
+        );
+
+        // Marker and gate agree (Manual implies Supervised): no note.
+        write_active_preset(dir.path(), PolicyPreset::Manual).expect("write marker");
+        assert_eq!(
+            autonomy_drift_note(dir.path(), AutonomyLevel::Supervised),
+            None
+        );
+
+        // Marker implies another level than the gate runs: the note names
+        // both levels and the resync command.
+        for (marker, enforced) in [
+            (PolicyPreset::Off, AutonomyLevel::ReadOnly),
+            (PolicyPreset::Strict, AutonomyLevel::Supervised),
+            (PolicyPreset::Manual, AutonomyLevel::Full),
+        ] {
+            write_active_preset(dir.path(), marker).expect("rewrite marker");
+            let note = autonomy_drift_note(dir.path(), enforced)
+                .unwrap_or_else(|| panic!("marker {} vs {enforced:?} must drift", marker.id()));
+            assert!(
+                note.contains(&format!("{:?}", marker.autonomy_level())),
+                "the note names the level the marker implies: {note}"
+            );
+            assert!(
+                note.contains(&format!("{enforced:?}")),
+                "the note names the level the runtime enforces: {note}"
+            );
+            assert!(
+                note.contains("rantaiclaw autonomy"),
+                "the note says how to resync: {note}"
+            );
+        }
+    }
+
+    /// `status` must print the same drift note `autonomy` prints: one helper
+    /// produces the words, and the source scan here pins that the `Status`
+    /// command arm consults it (the note's own unit test above is the
+    /// behaviour half).
+    #[test]
+    fn status_prints_the_drift_note_through_the_shared_helper() {
+        let src = include_str!("main.rs");
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod tests";
+        let cut = src
+            .match_indices(TEST_MODULE_MARKER)
+            .map(|(at, _)| at)
+            .min()
+            .unwrap_or(src.len());
+        let production = &src[..cut];
+        let status_arm = production
+            .split("Some(Commands::Status)")
+            .nth(1)
+            .expect("the Status command arm");
+        assert!(
+            status_arm.contains("cli_style::autonomy_drift_note"),
+            "the `status` command must consult the shared drift-note helper, \
+             so it warns in the same words `autonomy` does"
         );
     }
 }

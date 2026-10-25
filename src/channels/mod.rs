@@ -65,9 +65,12 @@ pub mod supervisor;
 
 // The prompt builders are part of this module's external surface (`src/agent`
 // and `src/cron` call them), so they keep their `crate::channels::` path.
+// `build_system_prompt` is test-only from now on: it cannot know the level a
+// production gate enforces, so it is not part of the non-test surface.
+#[cfg(test)]
+pub use prompt::build_system_prompt;
 pub use prompt::{
-    build_system_prompt, build_system_prompt_with_mode, channel_supports_announce_delivery,
-    OwnerFiles, PromptAudience,
+    build_system_prompt_with_mode, channel_supports_announce_delivery, OwnerFiles, PromptAudience,
 };
 pub mod qq;
 pub mod qr_terminal;
@@ -344,14 +347,17 @@ pub(crate) struct ChannelRuntimeDefaults {
     /// Active approval preset, refreshed on reload. The guest prompt is built
     /// once at startup, and the owner prompt carries the tool list and skills
     /// from startup, so without carrying this the prompt kept describing
-    /// whatever preset was active when the daemon started — the gate moved, the
-    /// briefing did not.
+    /// whatever preset was active when the daemon started — the gate and the
+    /// briefing have to move together, and this field is how the briefing
+    /// follows the gate on a reload.
     ///
-    /// `None` means the profile has no preset: the on-disk marker
-    /// (`<profile>/policy/autonomy.toml`) is absent, so nothing was chosen.
-    /// The config cannot stand in for it — it cannot tell "no preset chosen"
-    /// from "the default" — so the prompt names no preset rather than a
-    /// guessed one.
+    /// `None` means the prompt names no preset, for either of two reasons:
+    /// the on-disk marker (`<profile>/policy/autonomy.toml`) is absent, so
+    /// nothing was chosen (the config cannot stand in for it — it cannot
+    /// tell "no preset chosen" from "the default"); or the marker's preset
+    /// implies a different level than the runtime enforces
+    /// (`autonomy_level` below), so naming it would describe a gate that is
+    /// not running. See `preset_for_prompt`.
     pub(crate) autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
     /// Per-channel sender allowlists, keyed by the same lowercase channel name
     /// used by `channels_by_name`. Reloaded from disk so a console or CLI
@@ -1394,6 +1400,7 @@ fn owner_prompt_builder(
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    enforced_autonomy: crate::security::AutonomyLevel,
 ) -> OwnerPromptBuilder {
     Arc::new(move |owner_files| {
         // The list is the registry's own, read on every build, so it names the
@@ -1410,6 +1417,11 @@ fn owner_prompt_builder(
             skills_prompt_mode,
             PromptAudience::Owner,
             owner_files,
+            // The level this runtime was seeded with — the same snapshot the
+            // gate's `autonomy_level` comes from. A per-message reload
+            // re-renders the safety section from the live defaults, so a
+            // drifted boot-time level cannot outlive the first splice.
+            enforced_autonomy,
         );
         append_tool_instructions_when_not_native(
             &mut prompt,
@@ -1635,6 +1647,10 @@ pub(crate) async fn build_channel_runtime(
         native_tools,
         config.skills.prompt_injection_mode,
         Arc::clone(&tools_registry),
+        // The same snapshot `runtime_defaults_from_config` reads: prompt and
+        // gate take the level from one config, so a marker that drifted from
+        // it cannot name a preset in the prompt.
+        config.autonomy.level,
     );
     // The guest audience of the same builder, for the guest prompt. It takes no
     // tools: a guest's list follows the reloaded gate, per turn. It carries no
@@ -1651,6 +1667,8 @@ pub(crate) async fn build_channel_runtime(
         config.skills.prompt_injection_mode,
         PromptAudience::Guest,
         OwnerFiles::Omit,
+        // Same snapshot as the owner prompt above: one config, one gate.
+        config.autonomy.level,
     );
 
     if !skills.is_empty() {

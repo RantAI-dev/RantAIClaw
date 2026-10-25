@@ -3808,15 +3808,24 @@ async fn snapshot_fallback_warns_once() {
     );
 }
 
-/// The runtime defaults name the preset the profile's marker names. The
-/// config cannot stand in for the marker: the shipped `always_ask` is
-/// non-empty, so a config-derived preset called a profile that chose nothing
-/// "Manual".
+/// The runtime defaults name the marker's preset only when it implies the
+/// level the gate enforces. The config cannot stand in for the marker: the
+/// shipped `always_ask` is non-empty, so a config-derived preset called a
+/// profile that chose nothing "Manual". And a marker that drifted from the
+/// gate's level names no preset at all — a prompt that described "read-only"
+/// while the gate runs Supervised (or the reverse) would describe a policy
+/// the runtime is not running.
 #[test]
-fn the_runtime_defaults_name_the_preset_the_marker_names() {
+fn the_runtime_defaults_name_no_preset_the_gate_does_not_enforce() {
     use crate::approval::policy_writer::PolicyPreset;
+    use crate::security::AutonomyLevel;
 
     let config = crate::config::Config::default();
+    assert_eq!(
+        config.autonomy.level,
+        AutonomyLevel::Supervised,
+        "the shipped default level the marker has to match"
+    );
     assert!(
         !config.autonomy.always_ask.is_empty(),
         "the shipped default `always_ask` is what made a fresh profile look Manual"
@@ -3833,13 +3842,23 @@ fn the_runtime_defaults_name_the_preset_the_marker_names() {
     // byte-for-byte what production writes and reads: `<policy_dir>/autonomy.toml`
     // with `[autonomy].preset`. A hand-written TOML string would let the test
     // pass against a format production never reads.
-    crate::approval::policy_writer::write_active_preset(policy_dir.path(), PolicyPreset::Strict)
+    crate::approval::policy_writer::write_active_preset(policy_dir.path(), PolicyPreset::Manual)
         .expect("write marker");
     let defaults = routing::runtime_defaults_from_config(&config, Some(policy_dir.path()));
     assert_eq!(
         defaults.autonomy_preset,
-        Some(PolicyPreset::Strict),
-        "the marker decides — the config still reads Manual"
+        Some(PolicyPreset::Manual),
+        "Manual implies Supervised, the level the gate enforces — the marker decides"
+    );
+
+    // The drift case: Strict implies ReadOnly, the gate enforces Supervised.
+    // The default carries no preset instead of naming one the gate not run.
+    crate::approval::policy_writer::write_active_preset(policy_dir.path(), PolicyPreset::Strict)
+        .expect("rewrite marker");
+    let defaults = routing::runtime_defaults_from_config(&config, Some(policy_dir.path()));
+    assert_eq!(
+        defaults.autonomy_preset, None,
+        "a marker whose preset implies another level than the gate enforces names no preset"
     );
 }
 
@@ -3937,6 +3956,68 @@ async fn the_channel_prompt_names_no_preset_without_one() {
     );
 }
 
+/// The start-up prompt builder names the marker's preset only when it implies
+/// the level the caller's gate enforces. Both channel audiences (owner and
+/// guest) are rendered through this one builder, so a marker that drifted
+/// from the seeded config — a hand edit of `config.toml`, or a failed
+/// best-effort marker write — must leave the prompt on the generic safety
+/// floor instead of describing a gate the runtime is not running.
+#[tokio::test]
+async fn the_startup_channel_prompt_names_no_preset_the_gate_does_not_enforce() {
+    use crate::approval::policy_writer::{write_active_preset, PolicyPreset};
+    use crate::channels::{build_system_prompt_with_mode, OwnerFiles, PromptAudience};
+    use crate::security::AutonomyLevel;
+
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let _profile_env =
+        crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-preset-drift-startup");
+    let profile = crate::profile::ProfileManager::active().expect("profile tree");
+
+    // The shipped default level: the gate every production caller seeds this
+    // builder with when the operator changed nothing.
+    let build = || {
+        build_system_prompt_with_mode(
+            std::path::Path::new("/"),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            crate::config::SkillsPromptInjectionMode::Full,
+            PromptAudience::Owner,
+            OwnerFiles::Omit,
+            AutonomyLevel::Supervised,
+        )
+    };
+
+    // Drift: the marker says Off (implies Full) while the gate enforces
+    // Supervised. The prompt describes neither — no "Active approval policy"
+    // section at all, and the generic floor intact.
+    write_active_preset(&profile.policy_dir(), PolicyPreset::Off).expect("write marker");
+    let drifted = build();
+    assert!(
+        !drifted.contains("Active approval policy:"),
+        "a marker whose preset implies another level than the gate enforces \
+         must name no preset:\n{drifted}"
+    );
+    assert!(
+        drifted.contains("Do not bypass oversight or approval mechanisms."),
+        "the safety floor must survive the drift:\n{drifted}"
+    );
+
+    // The positive control: Manual implies Supervised, so the marker's preset
+    // reaches the prompt.
+    write_active_preset(&profile.policy_dir(), PolicyPreset::Manual).expect("rewrite marker");
+    let matched = build();
+    assert!(
+        matched.contains("Active approval policy: Manual"),
+        "a marker whose preset implies the enforced level reaches the prompt:\n{matched}"
+    );
+}
+
 /// Two runtimes in one process used to share a global map keyed by config
 /// path, so they clobbered each other's applied state. Each context now owns
 /// its own.
@@ -3994,12 +4075,19 @@ async fn maybe_apply_runtime_config_update_rereads_the_preset_marker_when_provid
             std::fs::write(&config_path, toml).expect("write config");
         };
 
-    // Initial: a buildable provider at Full autonomy.
-    write_config("openrouter", crate::security::AutonomyLevel::Full, vec![]);
+    // Initial: a buildable provider at Supervised autonomy — the level the
+    // Manual marker implies, so the marker's preset may reach the prompt.
+    write_config(
+        "openrouter",
+        crate::security::AutonomyLevel::Supervised,
+        vec![],
+    );
 
     // The profile's policy dir, with a marker that names Manual. The reload
     // reads the preset from here, so the marker — not the autonomy level — is
-    // what the briefing is rendered from.
+    // what the briefing is rendered from. It reaches the prompt only because
+    // its level matches the gate's: a preset the gate does not enforce must
+    // never be named to the model.
     //
     // The marker is written with the production writer, so the file on disk is
     // byte-for-byte what production writes and reads: `<policy_dir>/autonomy.toml`
@@ -4077,22 +4165,26 @@ async fn maybe_apply_runtime_config_update_rereads_the_preset_marker_when_provid
         .expect("initial apply");
     assert_eq!(
         ctx.security.effective_autonomy(),
-        crate::security::AutonomyLevel::Full
+        crate::security::AutonomyLevel::Supervised
     );
     assert_eq!(
         routing::runtime_defaults_snapshot(&ctx).autonomy_preset,
         Some(PolicyPreset::Manual),
-        "the first apply takes the preset from the marker"
+        "the first apply takes the preset from the marker: Manual implies \
+         Supervised, the level the gate enforces"
     );
 
-    // The marker changes on disk between the two applies. A reload has to
-    // re-read it — the preset the prompt is rendered from follows the marker
-    // without a restart.
+    // The marker changes on disk between the two applies, and the config
+    // downgrades the gate to ReadOnly in the same reload. Off implies Full,
+    // so the new marker and the new gate disagree — the reload has to re-read
+    // the marker AND refuse to name it: a preset the gate does not enforce
+    // must not reach the prompt.
     //
-    // The new value is Off on purpose: it differs from the preset the first
-    // apply stored (Manual), and from the one the reloaded config would
-    // derive on its own (a ReadOnly level derives Strict). A marker of Strict
-    // would therefore pass on a reload that never looked at the marker.
+    // Off is also the value that keeps every wrong answer distinguishable. A
+    // reload that kept the first apply's preset answers Some(Manual); a
+    // reload that derived the preset from the config level answers
+    // Some(Strict) (ReadOnly derives Strict). Only a reload that re-read the
+    // marker and enforced the invariant answers None.
     crate::approval::policy_writer::write_active_preset(&policy_dir, PolicyPreset::Off)
         .expect("rewrite marker");
 
@@ -4119,22 +4211,45 @@ async fn maybe_apply_runtime_config_update_rereads_the_preset_marker_when_provid
         crate::security::AutonomyLevel::ReadOnly,
         "autonomy downgrade must apply even when the new provider can't be built"
     );
-    // ...and so did the preset the system prompt is rendered from. The gate
-    // and the briefing have to move together: `or_insert_with` on this path
-    // leaves an existing store entry untouched, so without carrying the
-    // reloaded defaults forward the prompt would keep describing the
-    // pre-reload preset while the gate enforced ReadOnly.
+    // ...and the briefing followed — by naming NO preset. The gate and the
+    // briefing have to move together: `or_insert_with` on this path leaves an
+    // existing store entry untouched, so without carrying the reloaded
+    // defaults forward the prompt would keep describing the pre-reload
+    // preset while the gate enforced ReadOnly.
     //
-    // The preset comes from the profile's marker, not from the autonomy level:
-    // the marker said Manual at the first apply and says Off now, and neither
-    // the level (ReadOnly) nor the preset the first apply stored (Manual) may
-    // stand in for it. The marker moved between the two applies, so this fails
-    // unless the reload re-read it — the previous assertion (the marker
-    // unchanged) passed on a reload that never looked at the marker.
+    // The briefing's answer to a drifted marker is `None`, not the marker's
+    // preset: Off implies Full, the gate enforces ReadOnly, and a prompt that
+    // said "shell commands execute without prompts" here would describe a
+    // gate the runtime is not running — every acting tool is refused. Neither
+    // the marker's preset (Off) nor the one the config level would derive
+    // (Strict) nor the first apply's (Manual) may stand in for it; the
+    // prompt falls back to the generic safety floor.
     assert_eq!(
         routing::runtime_defaults_snapshot(&ctx).autonomy_preset,
-        Some(PolicyPreset::Off),
-        "the reload must re-read the preset marker, not keep the preset it already had"
+        None,
+        "a marker whose preset implies another level than the gate enforces \
+         must name no preset: gate ReadOnly with marker Off gives None"
+    );
+
+    // The reload really re-reads the marker, though: with the gate still
+    // ReadOnly, a marker whose level MATCHES the gate reaches the prompt
+    // again. Strict implies ReadOnly, so the next apply carries it — a
+    // reload that never looked at the marker would keep None and fail here.
+    crate::approval::policy_writer::write_active_preset(&policy_dir, PolicyPreset::Strict)
+        .expect("rewrite marker to a level that matches the gate");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write_config(
+        "totally-unknown-provider-xyz",
+        crate::security::AutonomyLevel::ReadOnly,
+        vec![],
+    );
+    routing::maybe_apply_runtime_config_update(&ctx)
+        .await
+        .expect("reload with a matching marker");
+    assert_eq!(
+        routing::runtime_defaults_snapshot(&ctx).autonomy_preset,
+        Some(PolicyPreset::Strict),
+        "a marker whose preset implies the enforced level reaches the prompt"
     );
 
     // A reload must refresh the WHOLE `[autonomy]` section, not just the two
@@ -4158,6 +4273,15 @@ async fn maybe_apply_runtime_config_update_rereads_the_preset_marker_when_provid
     assert!(
         !ctx.security.is_path_allowed("/newly-forbidden/secret.txt"),
         "a forbidden path added by a reload must be enforced without a restart"
+    );
+    // The gate moved to Full; the marker still says Strict (ReadOnly). The
+    // briefing follows without a restart — and names no preset, because the
+    // marker implies a level the gate no longer runs.
+    assert_eq!(
+        routing::runtime_defaults_snapshot(&ctx).autonomy_preset,
+        None,
+        "the briefing tracks the gate on every reload, and a marker that no \
+         longer matches it names no preset"
     );
 }
 
@@ -9812,6 +9936,7 @@ fn prompt_skills_compact_mode_omits_instructions_and_tools() {
         crate::config::SkillsPromptInjectionMode::Compact,
         PromptAudience::Owner,
         OwnerFiles::Load,
+        crate::security::AutonomyLevel::Supervised,
     );
 
     assert!(prompt.contains("<available_skills>"), "missing skills XML");
@@ -9957,6 +10082,7 @@ fn channel_prompt_for(ws: &TempDir, guest: bool) -> String {
             PromptAudience::Owner
         },
         OwnerFiles::Load,
+        crate::security::AutonomyLevel::Supervised,
     )
 }
 
@@ -12426,8 +12552,12 @@ fn count_unquoted(line: &str, needle: char) -> usize {
 #[test]
 fn channels_module_public_surface_is_the_documented_ten() {
     let src = include_str!("mod.rs");
+    // The test-module boundary is the marker to split on: a `#[cfg(test)]`
+    // item earlier in the file (the test-only `build_system_prompt`
+    // re-export since the preset-drift fix) must not truncate the
+    // production half the scanner looks at.
     let production = src
-        .split("\n#[cfg(test)]")
+        .split("\n#[cfg(test)]\n#[path = \"mod_tests.rs\"]")
         .next()
         .expect("source has a production half");
 
@@ -12441,9 +12571,11 @@ fn channels_module_public_surface_is_the_documented_ten() {
         }
     }
     // Re-exports of functions from the extracted modules.
+    // `build_system_prompt` left the production surface deliberately: it
+    // cannot know the level a gate enforces, so it is `#[cfg(test)]` now and
+    // only `_with_mode` is production-reachable.
     for reexport in [
         "doctor_channels",
-        "build_system_prompt",
         "build_system_prompt_with_mode",
         "channel_supports_announce_delivery",
     ] {
@@ -12455,7 +12587,6 @@ fn channels_module_public_surface_is_the_documented_ten() {
     public.dedup();
 
     let expected = vec![
-        "build_system_prompt".to_string(),
         "build_system_prompt_with_mode".to_string(),
         "channel_supports_announce_delivery".to_string(),
         "doctor_channels".to_string(),
@@ -14678,6 +14809,7 @@ async fn owner_turn_prompt(mode: crate::config::SkillsPromptInjectionMode) -> St
         false,
         mode,
         Arc::clone(&registry),
+        crate::security::AutonomyLevel::Supervised,
     );
 
     let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
@@ -14790,6 +14922,7 @@ fn guest_prompt_lists_skills_without_locations_in_both_modes() {
                     PromptAudience::Owner
                 },
                 OwnerFiles::Load,
+                crate::security::AutonomyLevel::Supervised,
             )
         };
         let guest = slashes(&build(true));

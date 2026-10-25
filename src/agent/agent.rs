@@ -961,13 +961,22 @@ impl Agent {
         // Resolve the active preset + its on-disk command_allowlist so
         // the SafetySection can render preset-specific guidance + the
         // exact pre-approved patterns. Both come from the active
-        // profile's policy dir. Failure to read either is non-fatal —
+        // profile's policy dir. The preset reaches the prompt only when it
+        // implies exactly the level this agent's own gate enforces
+        // (`effective_autonomy` reads the live config half) — a marker that
+        // drifted from the config names no preset, and the safety section
+        // keeps its generic floor. Failure to read either is non-fatal —
         // we fall back to None / empty and the safety section renders
         // its generic floor.
+        let enforced = self
+            .security
+            .as_ref()
+            .map(|policy| policy.effective_autonomy())
+            .unwrap_or_default();
         let (autonomy_preset, allowed_commands) = match crate::profile::ProfileManager::active() {
             Ok(profile) => {
                 let dir = profile.policy_dir();
-                let preset = crate::approval::policy_writer::read_active_preset(&dir);
+                let preset = crate::approval::policy_writer::preset_for_prompt(&dir, enforced);
                 let allowlist = read_command_allowlist(&dir).unwrap_or_default();
                 (preset, allowlist)
             }
@@ -1395,6 +1404,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The TUI, CLI, console and cron prompts are all built through
+    /// `build_system_prompt`, so the preset it names must be one the agent's
+    /// own gate enforces. A marker that drifted from `config.autonomy.level`
+    /// (a hand edit, or a provisioning path that keeps the disagreement)
+    /// leaves the prompt on the generic safety floor instead of describing a
+    /// gate the runtime is not running.
+    #[tokio::test]
+    async fn the_agent_prompt_names_no_preset_the_gate_does_not_enforce() {
+        use crate::approval::policy_writer::{write_active_preset, PolicyPreset};
+        use crate::security::AutonomyLevel;
+
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _profile_env =
+            crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-preset-drift-agent");
+
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.memory.backend = "none".into();
+        config.default_model = Some("anthropic/claude-sonnet-4.6".into());
+        config.autonomy.level = AutonomyLevel::ReadOnly;
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        // Drift: the marker says Off (implies Full) while the gate enforces
+        // ReadOnly. A prompt that said "shell commands execute without
+        // prompts" here would describe a gate that refuses every acting
+        // tool — so the prompt names no preset at all.
+        write_active_preset(&profile.policy_dir(), PolicyPreset::Off).expect("write marker");
+        let agent = Agent::from_config_with_observer(&config, observer.clone())
+            .await
+            .expect("a modelled config builds an agent");
+        let drifted = agent.build_system_prompt().unwrap();
+        assert!(
+            !drifted.contains("Active approval policy:"),
+            "a marker whose preset implies another level than the gate enforces \
+             must name no preset:\n{drifted}"
+        );
+        assert!(
+            !drifted.contains("Shell commands execute without prompts"),
+            "the drifted marker's promise must not reach the prompt:\n{drifted}"
+        );
+        assert!(
+            drifted.contains("Do not bypass oversight or approval mechanisms."),
+            "the safety floor must survive the drift:\n{drifted}"
+        );
+
+        // The positive control: Strict implies ReadOnly, the level the gate
+        // enforces, so the marker's preset reaches the prompt.
+        write_active_preset(&profile.policy_dir(), PolicyPreset::Strict).expect("rewrite marker");
+        let agent = Agent::from_config_with_observer(&config, observer)
+            .await
+            .expect("a modelled config builds an agent");
+        let matched = agent.build_system_prompt().unwrap();
+        assert!(
+            matched.contains("Active approval policy: Strict"),
+            "a marker whose preset implies the enforced level reaches the prompt:\n{matched}"
+        );
     }
 
     /// The TUI and the console chat build their prompt from the agent's own

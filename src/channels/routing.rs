@@ -202,10 +202,17 @@ pub(crate) fn runtime_defaults_from_config(
         guest_gate: Arc::new(guest_gate_from_config(config)),
         allowed_commands: Arc::new(config.autonomy.allowed_commands.clone()),
         autonomy_level: config.autonomy.level,
-        // The preset is whatever the marker says. The config cannot tell "no
-        // preset was chosen" from "the default", so deriving it from the
-        // config named a preset for a profile that never chose one.
-        autonomy_preset: policy_dir.and_then(crate::approval::policy_writer::read_active_preset),
+        // The preset is whatever the marker says — but only when it implies
+        // exactly the level this same config snapshot enforces (the
+        // `autonomy_level` above). The config cannot tell "no preset was
+        // chosen" from "the default", so deriving it from the config named a
+        // preset for a profile that never chose one; and a marker that
+        // drifted from the config (a hand edit, a failed best-effort marker
+        // write) would have the prompt describe a gate the runtime is not
+        // running. A mismatch names no preset: the generic safety floor.
+        autonomy_preset: policy_dir.and_then(|dir| {
+            crate::approval::policy_writer::preset_for_prompt(dir, config.autonomy.level)
+        }),
         allowlists: Arc::new(channel_allowlists(&config.channels_config)),
         message_timeout_secs: effective_channel_message_timeout_secs(
             config.channels_config.message_timeout_secs,
