@@ -232,7 +232,8 @@ pub async fn exec(id: &str, command: &str, timeout_secs: u64) -> Result<ExecOut>
     }
 }
 
-/// Upload a local file to the remote host over SFTP.
+/// Upload a local file to the remote host over SFTP, creating or truncating
+/// the remote file.
 ///
 /// # Errors
 /// Returns an error if the session is unknown, the local file cannot be read,
@@ -244,8 +245,16 @@ pub async fn push(id: &str, local: &str, remote: &str) -> Result<()> {
     let data = tokio::fs::read(local)
         .await
         .map_err(|e| anyhow!("cannot read local file {local}: {e}"))?;
+    use tokio::io::AsyncWriteExt;
     let sftp = open_sftp(&conn).await?;
-    sftp.write(remote, &data)
+    // `SftpSession::write` opens with WRITE only, so it cannot create a missing
+    // remote file; `create` opens with CREATE|TRUNCATE|WRITE, which is what an
+    // upload needs.
+    let mut file = sftp
+        .create(remote)
+        .await
+        .map_err(|e| anyhow!("sftp open {remote} failed: {e}"))?;
+    file.write_all(&data)
         .await
         .map_err(|e| anyhow!("sftp upload to {remote} failed: {e}"))?;
     Ok(())

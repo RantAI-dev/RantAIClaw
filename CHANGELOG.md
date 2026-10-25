@@ -426,6 +426,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `daemon.scheduler` reports a config-disabled scheduler as info "disabled by config —
   scheduled jobs do not run" instead of "healthy": the daemon records the component as
   `disabled` (not `ok`), and the TUI row follows the same verdict.
+- `ssh push` could not upload to a remote path that did not exist yet. The SFTP write opened
+  the remote file with write permission only — no create flag — so the transfer failed with
+  `No such file` unless the file was already on the server, and the `ssh` tool's `push` action
+  could never seed a new file. The upload now opens the remote file with create-and-truncate
+  semantics, so a push creates a missing file and overwrites an existing one in full; a
+  missing remote directory or a server-denied write still fails with the server's reason.
 
 ## [0.33.0-alpha] — 2026-10-08
 
