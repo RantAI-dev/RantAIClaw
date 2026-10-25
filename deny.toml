@@ -26,12 +26,12 @@ ignore = [
     # chacha20 0.10.0 was YANKED upstream (RustCrypto), flagged by cargo-deny's
     # yanked check — NOT a RUSTSEC vulnerability. Two pull paths in the current
     # lockfile: rand 0.10.3 (its default ChaCha RNG), which rantaiclaw depends on
-    # directly and which lopdf 0.42 (via pdf-extract) and russh 0.63 (via
-    # num-bigint) also pull, and ssh-cipher 0.3 (via ssh-key), which russh 0.63
-    # pulls separately. crates.io bytes are immutable, so the yanked version is
-    # byte-identical to when it was published. A non-yanked 0.10.2 is in range,
-    # but moving the lockfile to it is deliberately deferred as a separate
-    # concern; REMOVE this entry when that bump lands.
+    # directly and which lopdf 0.42 (via pdf-extract) and russh 0.63 (directly,
+    # and via num-bigint) also pull, and ssh-cipher 0.3 (via ssh-key), which
+    # russh 0.63 pulls separately. crates.io bytes are immutable, so the yanked
+    # version is byte-identical to when it was published. A non-yanked 0.10.2 is
+    # in range, but moving the lockfile to it is deliberately deferred as a
+    # separate concern; REMOVE this entry when that bump lands.
     "chacha20@0.10.0",
     # zip 8.6.0 was YANKED upstream together with EVERY 7.x/8.x release
     # (checked 2026-10-16; only 9.0.3 remains, and that is a major bump).
