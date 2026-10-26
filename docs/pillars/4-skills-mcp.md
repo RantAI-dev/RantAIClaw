@@ -188,6 +188,14 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 env = { GITHUB_PERSONAL_ACCESS_TOKEN = "..." }
 ```
 
+## MCP authentication
+
+Authed curated servers get their credential through `rantaiclaw setup mcp` (or the onboard wizard's MCP section): a token is pasted into a masked prompt, and an OAuth server — Google Drive today — runs a real OAuth flow in the operator's local browser. The flow binds its redirect to the login that started it: the authorization URL carries a one-time `state` and an S256 PKCE code challenge, only a callback whose `state` matches is accepted, and the token exchange sends the verifier that challenge was derived from. The listener binds `127.0.0.1:11500` on loopback only, and a request that does not match the active login — a different redirect slug, a missing or wrong `state` — is answered with a plain error page and ignored rather than treated as the callback.
+
+A server is registered, and reported as authed, only after its credential was actually obtained. A session that cannot show a URL and wait for the browser (a headless run, or the OAuth client id and secret missing from the environment) leaves the server unregistered, and the setup summary names `rantaiclaw setup mcp` as the step that finishes the login.
+
+There is no refresh flow yet: the stored access token is used until it expires — roughly an hour for Google — after which re-running `rantaiclaw setup mcp` logs in again.
+
 ## Roadmap
 
 - [v0.6.0 — Product Completeness Beta](https://app.clickup.com/t/86exgu406) — Setup: Skills + Setup: MCP validate install/uninstall idempotence and the 9-server curated picker. Resilience: Skills + Resilience: MCP confirm state survives a server restart.

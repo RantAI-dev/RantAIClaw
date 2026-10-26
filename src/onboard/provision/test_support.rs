@@ -67,6 +67,22 @@ pub async fn drive(
     profile: &Profile,
     answers: Vec<Answer>,
 ) -> Transcript {
+    drive_entrypoint(config, answers, async |io, config| {
+        prov.run(config, profile, io).await
+    })
+    .await
+}
+
+/// [`drive`] for a provisioner entry point that is not the trait's `run` —
+/// for when a test must pin a seam that `run` computes itself, such as the
+/// MCP provisioner's OAuth endpoints and its can-wait-for-browser gate.
+/// Same scripted-answer mechanics: `answers` are consumed in order, and the
+/// event side is drained concurrently so the channel cannot fill.
+pub async fn drive_entrypoint(
+    config: &mut Config,
+    answers: Vec<Answer>,
+    run: impl AsyncFnOnce(ProvisionIo, &mut Config) -> Result<ProvisionOutcome>,
+) -> Transcript {
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
     let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(64);
 
@@ -88,16 +104,14 @@ pub async fn drive(
         seen
     });
 
-    let outcome = prov
-        .run(
-            config,
-            profile,
-            ProvisionIo {
-                events: events_tx,
-                responses: resp_rx,
-            },
-        )
-        .await;
+    let outcome = run(
+        ProvisionIo {
+            events: events_tx,
+            responses: resp_rx,
+        },
+        config,
+    )
+    .await;
 
     let events = collector.await.expect("event collector");
     Transcript { outcome, events }

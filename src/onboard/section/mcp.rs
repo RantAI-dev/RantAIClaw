@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use super::{SetupContext, SetupSection};
 use crate::config::Config;
-use crate::mcp::curated::{curated_count, AUTHED, NO_AUTH};
+use crate::mcp::curated::{curated_count, find_by_slug, AUTHED, NO_AUTH};
 use crate::mcp::setup;
 use crate::profile::Profile;
 
@@ -28,20 +28,27 @@ impl SetupSection for McpSection {
         "Add curated MCP servers (zero-auth + token + OAuth)."
     }
 
-    /// We treat the section as "configured" only if at least one of
-    /// the curated servers has already been registered. Custom user-
-    /// added MCP entries don't count — re-running the wizard should
-    /// still offer the curated picker even when they exist.
+    /// We treat the section as "configured" only if at least one curated
+    /// server is registered **with its credential**. An authed server whose
+    /// env is empty is the artifact of a setup that claimed auth without a
+    /// finished flow; it must not silence the picker, or the login can
+    /// never actually happen. Custom user-added MCP entries never count —
+    /// re-running the wizard should still offer the curated picker.
     fn is_already_configured(&self, _profile: &Profile, config: &Config) -> bool {
-        let curated_slugs: Vec<&str> = NO_AUTH
-            .iter()
-            .chain(AUTHED.iter())
-            .map(|s| s.slug)
-            .collect();
         config
             .mcp_servers
-            .keys()
-            .any(|k| curated_slugs.iter().any(|s| s == k))
+            .iter()
+            .any(|(slug, entry)| match find_by_slug(slug) {
+                // A zero-auth server needs nothing beyond being registered.
+                Some(server) if server.env_vars.is_empty() => true,
+                Some(server) => server.env_vars.iter().any(|key| {
+                    entry
+                        .env
+                        .get(*key)
+                        .is_some_and(|value| !value.trim().is_empty())
+                }),
+                None => false,
+            })
     }
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
@@ -76,9 +83,11 @@ impl SetupSection for McpSection {
 /// The hint the MCP section records when it could not prompt.
 ///
 /// `SetupSection::headless_hint()` is a `&'static str` and cannot carry the
-/// per-server commands, so the section builds the full hint here: the trait's
-/// base text, then one `rantaiclaw mcp add <slug>` line per curated server.
-/// The orchestrator prints the result once, with the other blocked sections.
+/// server list, so the section builds the full hint here: the trait's base
+/// text — which names the one command that finishes this setup — followed by
+/// the curated servers the picker would offer. There is deliberately no
+/// per-server command: the picker is the only surface that collects
+/// credentials, so the hint may only name `rantaiclaw setup mcp`.
 fn blocked_hint(base: &str) -> String {
     let mut hint = String::new();
     hint.push_str(base);
@@ -91,7 +100,7 @@ fn blocked_hint(base: &str) -> String {
         AUTHED.len(),
     );
     for server in NO_AUTH.iter().chain(AUTHED.iter()) {
-        let _ = write!(hint, "\nrantaiclaw mcp add {}", server.slug);
+        let _ = write!(hint, "\n  {} — {}", server.slug, server.display_name);
     }
     hint
 }
@@ -110,11 +119,10 @@ mod tests {
     }
 
     /// A headless MCP section records itself as blocked, and the hint it
-    /// records must still name the commands that would set the section up.
-    /// The trait's `headless_hint()` is a `&'static str` and cannot carry
-    /// them, so the section builds the full hint itself.
+    /// records must name a command that exists and finishes the setup — the
+    /// picker, not a per-server command that was never wired up.
     #[test]
-    fn a_blocked_mcp_section_records_the_commands_that_would_set_it_up() {
+    fn a_blocked_mcp_section_names_the_command_that_finishes_the_setup() {
         let section = McpSection;
         let mut config = Config::default();
         let profile = Profile {
@@ -144,23 +152,26 @@ mod tests {
             blocked.hint
         );
         assert!(
-            blocked.hint.contains("rantaiclaw mcp add"),
-            "the recorded hint must name the command that adds a server: {}",
+            blocked.hint.contains("rantaiclaw setup mcp"),
+            "the recorded hint must name the command that finishes the setup: {}",
+            blocked.hint
+        );
+        assert!(
+            !blocked.hint.contains("mcp add"),
+            "no hint may name a command that does not exist: {}",
             blocked.hint
         );
         for server in NO_AUTH.iter().chain(AUTHED.iter()) {
             assert!(
-                blocked
-                    .hint
-                    .contains(&format!("rantaiclaw mcp add {}", server.slug)),
-                "the recorded hint must name every curated server: {}",
+                blocked.hint.contains(server.slug),
+                "the recorded hint still lists every curated server: {}",
                 blocked.hint
             );
         }
     }
 
     #[test]
-    fn is_already_configured_only_for_curated_slugs() {
+    fn custom_servers_do_not_count_as_configured() {
         let section = McpSection;
         let mut config = Config::default();
 
@@ -177,15 +188,85 @@ mod tests {
             root: std::path::PathBuf::from("/tmp"),
         };
         assert!(!section.is_already_configured(&dummy_profile, &config));
+    }
 
+    /// An authed server counts as configured only once its credential was
+    /// actually obtained: the tokenless entries a claiming setup used to
+    /// write must not silence the picker.
+    #[test]
+    fn an_authed_server_without_its_credential_does_not_count_as_configured() {
+        let section = McpSection;
+        let mut config = Config::default();
+        let dummy_profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp"),
+        };
+
+        let tokenless = |slug: &str| {
+            (
+                slug.to_string(),
+                McpServerConfig {
+                    command: "npx".into(),
+                    args: vec![],
+                    env: std::collections::HashMap::default(),
+                },
+            )
+        };
+        let (notion_key, notion_entry) = tokenless("notion");
+        config.mcp_servers.insert(notion_key, notion_entry);
+        let (drive_key, drive_entry) = tokenless("google-drive");
+        config.mcp_servers.insert(drive_key, drive_entry);
+        assert!(
+            !section.is_already_configured(&dummy_profile, &config),
+            "tokenless authed entries are not a finished setup"
+        );
+
+        // A zero-auth server still counts by being present — it needs no
+        // credential.
         config.mcp_servers.insert(
-            "notion".into(),
+            "web-fetch".into(),
             McpServerConfig {
-                command: "npx".into(),
+                command: "uvx".into(),
                 args: vec![],
                 env: std::collections::HashMap::default(),
             },
         );
         assert!(section.is_already_configured(&dummy_profile, &config));
+    }
+
+    #[test]
+    fn an_authed_server_with_its_credential_counts_as_configured() {
+        let section = McpSection;
+        let mut config = Config::default();
+        let dummy_profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp"),
+        };
+
+        let mut env = std::collections::HashMap::default();
+        env.insert("NOTION_API_KEY".to_string(), "secret".to_string());
+        config.mcp_servers.insert(
+            "notion".into(),
+            McpServerConfig {
+                command: "npx".into(),
+                args: vec![],
+                env,
+            },
+        );
+        assert!(section.is_already_configured(&dummy_profile, &config));
+
+        // The credential key must hold a value — a present-but-empty key is
+        // the same unfinished state as no key at all.
+        let mut empty_value = std::collections::HashMap::default();
+        empty_value.insert("NOTION_API_KEY".to_string(), String::new());
+        config.mcp_servers.insert(
+            "notion".into(),
+            McpServerConfig {
+                command: "npx".into(),
+                args: vec![],
+                env: empty_value,
+            },
+        );
+        assert!(!section.is_already_configured(&dummy_profile, &config));
     }
 }
