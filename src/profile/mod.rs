@@ -217,11 +217,27 @@ impl ProfileManager {
     /// Set the active profile. Refuses unknown profile names so users get a
     /// clear error instead of a silent typo.
     pub fn use_profile(name: &str) -> Result<()> {
+        let control = crate::daemon::handoff::detect_init_system();
+        Self::use_profile_with(name, control.as_ref())
+    }
+
+    /// Test seam — same as [`ProfileManager::use_profile`] with a
+    /// caller-chosen `DaemonControl`, so a test can prove which unit a
+    /// profile switch restarts without an init system on the host.
+    pub fn use_profile_with(
+        name: &str,
+        control: &dyn crate::daemon::handoff::DaemonControl,
+    ) -> Result<()> {
         validate_profile_name(name)?;
         let dir = paths::profile_dir(name);
         if !dir.exists() {
             bail!("profile {name:?} does not exist at {}", dir.display());
         }
+        // The profile the marker names BEFORE this switch — not
+        // `resolve_active_name`, which prefers the env var. A daemon that
+        // follows the marker is registered under the profile the marker
+        // named, so that sentinel is the one a switch has to look at.
+        let previous = Self::marker_profile();
         let path = paths::active_profile_file();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -231,15 +247,26 @@ impl ProfileManager {
         fs::write(&tmp, format!("{name}\n"))?;
         fs::rename(&tmp, &path)?;
 
-        // If a daemon is registered for this profile, ask the init system to
-        // restart it so it picks up the new active config. Errors here are
-        // downgraded to warnings — a stale daemon must never block the
-        // profile switch itself.
-        if let Err(e) = crate::daemon::handoff::restart_daemon_for_profile(name) {
-            eprintln!("Warning: daemon handoff for profile {name:?} failed: {e}");
+        // Hand the daemon that was serving the OLD profile over to the new
+        // one. Errors here are downgraded to warnings — a stale daemon must
+        // never block the profile switch itself.
+        match crate::daemon::handoff::restart_daemon_for_profile_with(&previous, control) {
+            Ok(outcome) => report_handoff_outcome(name, &outcome),
+            Err(e) => eprintln!("Warning: daemon handoff for profile {name:?} failed: {e}"),
         }
 
         Ok(())
+    }
+
+    /// The profile the active-profile marker names, ignoring the env var.
+    /// `"default"` when no marker is written yet — the resolution a daemon
+    /// started before any switch used.
+    fn marker_profile() -> String {
+        fs::read_to_string(paths::active_profile_file())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".to_string())
     }
 
     /// Delete a profile. Refuses to delete the active profile unless
@@ -265,6 +292,39 @@ impl ProfileManager {
             let _ = fs::remove_file(&marker);
         }
         Ok(())
+    }
+}
+
+/// Tell the operator what the switch did with the daemon that was serving
+/// the previous profile. One line per outcome; a restart line names the
+/// unit, a pinned/hand-started line says what will NOT move and why.
+fn report_handoff_outcome(active: &str, outcome: &crate::daemon::handoff::HandoffOutcome) {
+    use crate::daemon::handoff::HandoffOutcome as H;
+    match outcome {
+        H::Restarted { unit } => {
+            println!("Restarted {unit} — the daemon now follows profile {active:?}");
+        }
+        H::Pinned { profile, unit } => {
+            println!(
+                "The daemon for profile {profile:?} stays on {profile:?}: its service pins \
+                 that profile ({unit}). Run `rantaiclaw service install` from the new profile \
+                 to change that."
+            );
+        }
+        H::HandStarted { profile } => {
+            println!(
+                "The daemon for profile {profile:?} was started by hand; restart it yourself \
+                 to pick up profile {active:?}."
+            );
+        }
+        H::NotRunning => {}
+        H::NoInit { profile, pid } => {
+            println!(
+                "The daemon for profile {profile:?} (pid {pid}) is running, but no supported \
+                 init system was detected (systemd / launchd); restart it yourself to pick up \
+                 profile {active:?}."
+            );
+        }
     }
 }
 
@@ -353,6 +413,161 @@ mod profile_root_tests {
         match prev {
             Some(p) => std::env::set_var("HOME", p),
             None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// The reproduction: the daemon was serving the profile the MARKER named
+    /// (`default`), and `profile use work` must restart THAT daemon's unit —
+    /// the unit comes back and follows the marker onto `work`. The handoff
+    /// used to read the NEW profile's sentinel, found nothing, and never
+    /// restarted anything.
+    #[test]
+    fn profile_use_restarts_the_unit_of_the_daemon_following_the_marker() {
+        use crate::daemon::handoff::{DaemonControl, HandoffOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Stub {
+            restarts: AtomicUsize,
+            units: std::sync::Mutex<Vec<String>>,
+        }
+        impl DaemonControl for Stub {
+            fn name(&self) -> &str {
+                "stub"
+            }
+            fn restart(&self, unit: &str) -> Result<()> {
+                self.restarts.fetch_add(1, Ordering::SeqCst);
+                self.units.lock().unwrap().push(unit.to_string());
+                Ok(())
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool> {
+                Ok(true)
+            }
+        }
+
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
+        std::env::remove_var("RANTAICLAW_PROFILE");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProfileManager::ensure("default").unwrap();
+            ProfileManager::ensure("work").unwrap();
+            // The marker names `default`; the live daemon serving it is unit-
+            // managed and follows the marker.
+            std::fs::write(paths::active_profile_file(), "default\n").unwrap();
+            crate::profile::sentinel::write_sentinel(
+                "default",
+                &crate::profile::sentinel::DaemonSentinel {
+                    pid: std::process::id(),
+                    unit: Some("rantaiclaw.service".to_string()),
+                    started_at: None,
+                    profile_pinned: false,
+                },
+            )
+            .unwrap();
+
+            let stub = std::sync::Arc::new(Stub {
+                restarts: AtomicUsize::new(0),
+                units: std::sync::Mutex::new(vec![]),
+            });
+            ProfileManager::use_profile_with("work", stub.as_ref()).unwrap();
+
+            assert_eq!(
+                stub.restarts.load(Ordering::SeqCst),
+                1,
+                "the daemon following the old marker must be restarted exactly once"
+            );
+            assert_eq!(
+                stub.units.lock().unwrap().clone(),
+                vec!["rantaiclaw.service".to_string()]
+            );
+            assert_eq!(
+                ProfileManager::marker_profile(),
+                "work",
+                "the marker must name the new profile after the switch"
+            );
+            let _ = HandoffOutcome::NotRunning; // variant exhaustiveness guard
+        }));
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_profile {
+            Some(p) => std::env::set_var("RANTAICLAW_PROFILE", p),
+            None => std::env::remove_var("RANTAICLAW_PROFILE"),
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// The pinned twin: a daemon whose launcher pinned its profile must NOT
+    /// be restarted by a `profile use` — a restart cannot move it.
+    #[test]
+    fn profile_use_leaves_a_pinned_daemon_unrestarted() {
+        use crate::daemon::handoff::{DaemonControl, HandoffOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Stub {
+            restarts: AtomicUsize,
+        }
+        impl DaemonControl for Stub {
+            fn name(&self) -> &str {
+                "stub"
+            }
+            fn restart(&self, _unit: &str) -> Result<()> {
+                self.restarts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool> {
+                Ok(true)
+            }
+        }
+
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
+        std::env::remove_var("RANTAICLAW_PROFILE");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProfileManager::ensure("default").unwrap();
+            ProfileManager::ensure("work").unwrap();
+            std::fs::write(paths::active_profile_file(), "default\n").unwrap();
+            crate::profile::sentinel::write_sentinel(
+                "default",
+                &crate::profile::sentinel::DaemonSentinel {
+                    pid: std::process::id(),
+                    unit: Some("rantaiclaw.service".to_string()),
+                    started_at: None,
+                    profile_pinned: true,
+                },
+            )
+            .unwrap();
+
+            let stub = std::sync::Arc::new(Stub {
+                restarts: AtomicUsize::new(0),
+            });
+            ProfileManager::use_profile_with("work", stub.as_ref()).unwrap();
+
+            assert_eq!(
+                stub.restarts.load(Ordering::SeqCst),
+                0,
+                "a pinned daemon must not be restarted"
+            );
+            let _ = HandoffOutcome::NotRunning; // variant exhaustiveness guard
+        }));
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_profile {
+            Some(p) => std::env::set_var("RANTAICLAW_PROFILE", p),
+            None => std::env::remove_var("RANTAICLAW_PROFILE"),
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
         }
     }
 

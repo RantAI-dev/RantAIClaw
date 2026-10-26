@@ -777,6 +777,7 @@ mod tests {
                     pid: std::process::id(),
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();
@@ -785,8 +786,9 @@ mod tests {
                 "stale",
                 &sentinel::DaemonSentinel {
                     pid: 0x7fff_fffe,
-                    unit: Some("rantaiclaw@stale.service".into()),
+                    unit: Some("rantaiclaw.service".into()),
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();

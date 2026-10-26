@@ -150,6 +150,13 @@ Single-topic examples:
 - `rantaiclaw service status`
 - `rantaiclaw service uninstall`
 
+`service install` records the profile in the unit: when the installer ran with a
+profile chosen explicitly (the global `-p <name>` flag or `RANTAICLAW_PROFILE`), the
+unit is pinned to that profile via `RANTAICLAW_PROFILE` and `profile use` will not move
+it — reinstall from the other profile to move the service. Without an explicit profile
+the unit carries no `RANTAICLAW_PROFILE`, so the daemon follows the active-profile
+marker and `profile use` restarts it onto the profile it switches to.
+
 ### `ui`
 
 - `rantaiclaw ui install [--dir <path>] [--ref <tag>] [--force] [--allow-unverified]`
@@ -773,7 +780,7 @@ config, persona, workspace, memory, skills, sessions, policy, secrets and runtim
 |---|---|
 | `list` | All profiles |
 | `create <name> [--clone <src>]` | Create, optionally cloning an existing profile |
-| `use <name>` | Switch the active profile |
+| `use <name>` | Switch the active profile; restarts a background daemon that followed the previous profile (a daemon pinned to its profile by a service install stays put and the switch says so) |
 | `clone <src> <dst>` | Clone under a new name |
 | `delete <name>` | Delete; refuses the active profile unless `--force` |
 | `current` | Print the active profile name |

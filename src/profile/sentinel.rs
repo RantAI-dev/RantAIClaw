@@ -37,6 +37,22 @@ pub struct DaemonSentinel {
     /// ISO-8601 timestamp the daemon bound. Free-form for humans.
     #[serde(default)]
     pub started_at: Option<String>,
+    /// Whether the daemon's profile was pinned by its launcher — the
+    /// `RANTAICLAW_PROFILE` the unit (or the shell) named — instead of
+    /// following the active-profile marker.
+    ///
+    /// A `profile use` restarts only a daemon that follows the marker, so
+    /// this field is what tells the two apart. A sentinel written before the
+    /// field existed reads as `true`: an old file cannot prove the daemon
+    /// follows the marker, and the safe answer for "cannot prove" is
+    /// "pinned" — never restart a daemon that might not follow.
+    #[serde(default = "pinned_by_default")]
+    pub profile_pinned: bool,
+}
+
+/// The value a sentinel without a `profile_pinned` field reads as.
+fn pinned_by_default() -> bool {
+    true
 }
 
 /// `<profile>/.daemon_active` path.
@@ -178,14 +194,39 @@ mod tests {
             super::super::ProfileManager::ensure("alpha").unwrap();
             let s = DaemonSentinel {
                 pid: 4242,
-                unit: Some("rantaiclaw@alpha.service".into()),
+                unit: Some("rantaiclaw.service".into()),
                 started_at: Some("2026-04-28T00:00:00Z".into()),
+                profile_pinned: false,
             };
             write_sentinel("alpha", &s).unwrap();
             assert!(is_daemon_active("alpha"));
             let got = read_sentinel("alpha").unwrap().unwrap();
             assert_eq!(got.pid, 4242);
-            assert_eq!(got.unit.as_deref(), Some("rantaiclaw@alpha.service"));
+            assert_eq!(got.unit.as_deref(), Some("rantaiclaw.service"));
+            assert!(!got.profile_pinned);
+        });
+    }
+
+    /// A sentinel written by a daemon that predates the `profile_pinned`
+    /// field reads as PINNED: an old file cannot prove its daemon follows
+    /// the active-profile marker, and `profile use` must not restart a
+    /// daemon it cannot prove follows.
+    #[test]
+    fn a_sentinel_without_the_pinned_field_reads_as_pinned() {
+        with_home(|| {
+            super::super::ProfileManager::ensure("alpha").unwrap();
+            let path = sentinel_path("alpha");
+            std::fs::write(
+                &path,
+                "pid = 4242\nunit = \"rantaiclaw.service\"\n\
+                 started_at = \"2026-04-28T00:00:00Z\"\n",
+            )
+            .unwrap();
+            let got = read_sentinel("alpha").unwrap().unwrap();
+            assert!(
+                got.profile_pinned,
+                "a pre-field sentinel must read as pinned"
+            );
         });
     }
 
@@ -202,6 +243,7 @@ mod tests {
                     pid: 1,
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();
@@ -233,6 +275,7 @@ mod tests {
                     pid: 2_147_483_646,
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();
@@ -251,6 +294,7 @@ mod tests {
                     pid: me,
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();
@@ -286,6 +330,7 @@ mod tests {
                     pid,
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();

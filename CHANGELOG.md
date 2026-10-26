@@ -157,6 +157,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers that the model is changed with `/model`, and the debug toggle is removed with the `/config debug`
   key, the `/debug` command and the `/status` Debug row. `/model <provider:model>` changes the model.
 - `[browser] allowed_domains` now defaults to `["*"]` (config schema 38 → 39), so `browser` and `browser_open` take a public host on a fresh install. An existing config is left as written.
+- `rantaiclaw service install` pins a profile only when one was chosen
+  explicitly. A unit installed with `-p <name>` or `RANTAICLAW_PROFILE` set
+  carries `RANTAICLAW_PROFILE` as before; a unit installed without either now
+  carries no profile and the daemon follows the active-profile marker, so
+  `rantaiclaw profile use <name>` restarts it onto the profile it switches
+  to. The install output names the binding either way. An already installed
+  unit keeps its current binding until the next `service install`.
 
 ### Removed
 
@@ -432,6 +439,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could never seed a new file. The upload now opens the remote file with create-and-truncate
   semantics, so a push creates a missing file and overwrites an existing one in full; a
   missing remote directory or a server-denied write still fails with the server's reason.
+- A daemon that followed an active-profile marker wrote its `.daemon_active`
+  sentinel under `default`: the sentinel was keyed on `RANTAICLAW_PROFILE`
+  alone, so the record of which process owns the channels landed next to a
+  config the daemon was not running. The daemon now resolves its profile the
+  same way the config loader does (env var, then the active-profile marker,
+  then `default`), once per process, and every sentinel write and the
+  shutdown clear land under the profile whose config the daemon actually
+  loaded — a marker that changes while the daemon runs can no longer make
+  the shutdown clear a sentinel the daemon did not write.
+- `profile use` restarted the wrong daemon, when it restarted one at all. It
+  read the sentinel of the profile being switched to and restarted
+  `rantaiclaw@<new>.service`, falling back to that template name when the
+  sentinel named no unit — so the daemon actually serving the previous
+  profile kept its stale config, a template unit the installer never created
+  was a restart target, and a daemon pinned to its profile would have been
+  cycled to no effect. The handoff now runs against the previous profile:
+  the unit named by that profile's live sentinel is restarted only when the
+  init system reports it active; a daemon whose launcher pinned its profile
+  is left alone and the switch says how to move it; a daemon started by hand
+  is left to the operator; a stale sentinel is cleared instead of
+  resurrecting a daemon the operator is not running; and the
+  `rantaiclaw@<profile>.service` fallback is gone.
 
 ## [0.33.0-alpha] — 2026-10-08
 
