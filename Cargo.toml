@@ -189,7 +189,7 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 
 # Serial port for peripheral communication (STM32, etc.)
-russh = { version = "0.60", optional = true }
+russh = { version = "0.63", optional = true }
 russh-sftp = { version = "2.0", optional = true }
 
 # PDF extraction for the pdf_read tool and KB ingestion (optional, enable with --features rag-pdf)

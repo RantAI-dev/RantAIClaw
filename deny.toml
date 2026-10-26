@@ -24,13 +24,14 @@ ignore = [
     # verified-clean release. Reached transitively via blake3 + wa-rs-libsignal.
     "arrayref@0.3.9",
     # chacha20 0.10.0 was YANKED upstream (RustCrypto), flagged by cargo-deny's
-    # yanked check — NOT a RUSTSEC vulnerability. It comes from rand 0.10.3 (its
-    # default ChaCha RNG), which rantaiclaw depends on directly and which russh
-    # 0.60 (also via internal-russh-num-bigint) and lopdf 0.42 (via pdf-extract)
-    # pull in. crates.io bytes are immutable, so the yanked version is
-    # byte-identical to when it was published, and there is no in-range non-yanked
-    # replacement. REMOVE once a rand 0.10.x release depends on a non-yanked
-    # chacha20 and the lockfile picks it up (or 0.10.0 is un-yanked).
+    # yanked check — NOT a RUSTSEC vulnerability. Two pull paths in the current
+    # lockfile: rand 0.10.3 (its default ChaCha RNG), which rantaiclaw depends on
+    # directly and which lopdf 0.42 (via pdf-extract) and russh 0.63 (directly,
+    # and via num-bigint) also pull, and ssh-cipher 0.3 (via ssh-key), which
+    # russh 0.63 pulls separately. crates.io bytes are immutable, so the yanked
+    # version is byte-identical to when it was published. A non-yanked 0.10.2 is
+    # in range, but moving the lockfile to it is deliberately deferred as a
+    # separate concern; REMOVE this entry when that bump lands.
     "chacha20@0.10.0",
     # zip 8.6.0 was YANKED upstream together with EVERY 7.x/8.x release
     # (checked 2026-10-16; only 9.0.3 remains, and that is a major bump).
@@ -188,25 +189,6 @@ ignore = [
     # webpki-roots 1.x (checked 2026-10-20: tokio-tungstenite 0.30.0 still
     # requests ^0.26), and remove the 0.26.11 entry from Cargo.lock with it.
     "RUSTSEC-2026-0381",
-    # crypto-bigint 0.7.0-rc.28 — RUSTSEC-2026-0387, several operations intended
-    # to be constant-time (subtraction, zero counting, division, Montgomery
-    # multiplication, `UintRef` equality, `BoxedMontyForm::invert`) can execute
-    # secret-dependent branches. Patched only in >= 0.7.6, and no build of this
-    # tree can select it: russh 0.60.3 pins `crypto-bigint = "=0.7.0-rc.28"`
-    # exactly (checked 2026-10-24: `cargo update -p crypto-bigint --precise
-    # 0.7.6` errors on that pin), so the rc stack (rsa 0.10.0-rc.16,
-    # elliptic-curve 0.14.0-rc.28, primefield 0.14.0-rc.7, crypto-primes
-    # 0.7.0-pre.9) moves together or not at all. Same client-side surface as
-    # the RUSTSEC-2023-0071 (rsa Marvin) entry above: the keys in play are the
-    # operator's own SSH identities used against hosts the operator explicitly
-    # targets, not a multi-tenant key-extraction surface. Upstream russh 0.63+
-    # already requires crypto-bigint ^0.7.3, which resolves to the patched
-    # 0.7.6, so the real fix is a russh port, not a lockfile bump.
-    #
-    # REVIEW BY 2026-11-15 with the other russh-family entries: drop this id
-    # when russh moves past 0.60.3 and the lockfile resolves crypto-bigint
-    # >= 0.7.6.
-    "RUSTSEC-2026-0387",
 ]
 
 [licenses]
