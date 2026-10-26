@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crypto-bigint` >= 0.7.6, which `russh` 0.60.3 could never select: it pins
   `crypto-bigint = "=0.7.0-rc.28"` exactly, so `cargo update` refuses the bump. The transport
   now uses `russh` 0.63.3, whose `crypto-bigint ^0.7.3` requirement resolves to the patched
-  0.7.8, and the advisory is no longer waived in `deny.toml` or the Security Audit job's ignore
+  0.7.10, and the advisory is no longer waived in `deny.toml` or the Security Audit job's ignore
   list. Host keys already pinned in `ssh_known_hosts.json` keep the same fingerprints and the
   same accept-or-refuse outcomes, and the offered key-exchange and host-key algorithm lists are
   unchanged. One refusal is explicit now: a server that presents an OpenSSH certificate host
