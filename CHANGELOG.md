@@ -461,6 +461,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is left to the operator; a stale sentinel is cleared instead of
   resurrecting a daemon the operator is not running; and the
   `rantaiclaw@<profile>.service` fallback is gone.
+- A profile switch while a config-directory override was in effect moved the
+  per-profile stores (sessions, knowledge base, policy, persona, skills,
+  secrets) but not the config, the workspace, the memory database or the cron
+  store, leaving one install pointing at two profiles: `RANTAICLAW_CONFIG_DIR`
+  and `RANTAICLAW_WORKSPACE` and the `active_workspace.toml` marker pin the
+  config directory, and `profile use` moved everything else anyway. A switch
+  that names a profile other than the one the override keeps in effect is now
+  refused with a one-line message naming the override and how to clear it, and
+  the same refusal covers `--profile` and `RANTAICLAW_PROFILE` at every command
+  that resolves a profile. A marker that names a profile directory of this
+  root (`~/.rantaiclaw/profiles/<name>`) is a profile pointer, not an
+  override: the onboarding wizard writes that shape, and it yields to the
+  active profile, so `profile use` moves the whole install as before. Two
+  name-handling holes closed on the way: `profile create` and `profile clone`
+  now hold a NEW profile name to the unit-safe rules (letters, digits, `-`,
+  `_`, at most 64 characters), while profiles that already exist under older
+  naming keep loading; and a clone source that does not exist is an error
+  that creates nothing, where `clone nosuch copy` used to build `nosuch` as
+  an empty profile and copy that. A name read from the marker or the
+  environment that could escape the profiles directory falls back to
+  `default` with a warning instead of becoming a path.
 
 ## [0.33.0-alpha] — 2026-10-08
 

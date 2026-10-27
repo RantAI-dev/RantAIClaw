@@ -28,6 +28,8 @@ fn with_home<F: FnOnce(&Path)>(f: F) {
     let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
         "HOME",
         "RANTAICLAW_PROFILE",
+        "RANTAICLAW_CONFIG_DIR",
+        "RANTAICLAW_WORKSPACE",
         "XDG_DATA_HOME",
         "XDG_CONFIG_HOME",
     ]
@@ -37,6 +39,10 @@ fn with_home<F: FnOnce(&Path)>(f: F) {
 
     std::env::set_var("HOME", tmp.path());
     std::env::remove_var("RANTAICLAW_PROFILE");
+    // No config-dir override: one in effect refuses a profile it does not
+    // pin, and these tests switch profiles on purpose.
+    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    std::env::remove_var("RANTAICLAW_WORKSPACE");
     // Force the `directories` global data dir back onto HOME so the legacy
     // global sessions.db lands inside the tempdir, not the developer's ~.
     std::env::remove_var("XDG_DATA_HOME");

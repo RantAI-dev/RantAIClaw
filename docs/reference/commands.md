@@ -780,7 +780,7 @@ config, persona, workspace, memory, skills, sessions, policy, secrets and runtim
 |---|---|
 | `list` | All profiles |
 | `create <name> [--clone <src>]` | Create, optionally cloning an existing profile |
-| `use <name>` | Switch the active profile; restarts a background daemon that followed the previous profile (a daemon pinned to its profile by a service install stays put and the switch says so) |
+| `use <name>` | Switch the active profile; restarts a background daemon that followed the previous profile (a daemon pinned to its profile by a service install stays put and the switch says so). Refused while a config-directory override keeps another profile in effect (see the config reference, "Overrides pin the profile") |
 | `clone <src> <dst>` | Clone under a new name |
 | `delete <name>` | Delete; refuses the active profile unless `--force` |
 | `current` | Print the active profile name |
@@ -788,6 +788,13 @@ config, persona, workspace, memory, skills, sessions, policy, secrets and runtim
 To switch for a single invocation without moving the active marker, use the global
 `-p <name>` flag or the `RANTAICLAW_PROFILE` environment variable. Precedence is
 **CLI flag > env var > active-profile file > `default`**.
+
+While a config-directory override is in effect, it pins the profile: `profile use`,
+`--profile` and `RANTAICLAW_PROFILE` naming a different profile are refused with a
+one-line message naming the override and how to clear it. An `active_workspace.toml`
+marker that names a profile directory of this root (`profiles/<name>`) is a pointer
+to the active profile, not an override — onboarding writes that shape, so switching
+profiles keeps working.
 
 ### `session`
 

@@ -1128,11 +1128,15 @@ mod tests {
         .await;
 
         assert!(
-            !crate::profile::sentinel::sentinel_path("work").exists(),
+            !crate::profile::sentinel::sentinel_path("work")
+                .expect("a valid profile name")
+                .exists(),
             "this daemon must clear the sentinel it wrote"
         );
         assert!(
-            crate::profile::sentinel::sentinel_path("play").exists(),
+            crate::profile::sentinel::sentinel_path("play")
+                .expect("a valid profile name")
+                .exists(),
             "the sentinel under the NEW marker's profile is not this daemon's to clear"
         );
     }

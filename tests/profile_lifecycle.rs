@@ -20,8 +20,14 @@ fn with_home<F: FnOnce()>(f: F) {
     let tmp = TempDir::new().expect("tempdir");
     let prev_home = std::env::var_os("HOME");
     let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
+    let prev_config_dir = std::env::var_os("RANTAICLAW_CONFIG_DIR");
+    let prev_workspace = std::env::var_os("RANTAICLAW_WORKSPACE");
     std::env::set_var("HOME", tmp.path());
     std::env::remove_var("RANTAICLAW_PROFILE");
+    // No config-dir override: one in effect refuses a profile switch, and
+    // these tests switch profiles on purpose.
+    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    std::env::remove_var("RANTAICLAW_WORKSPACE");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     if let Some(h) = prev_home {
         std::env::set_var("HOME", h);
@@ -32,6 +38,14 @@ fn with_home<F: FnOnce()>(f: F) {
         std::env::set_var("RANTAICLAW_PROFILE", p);
     } else {
         std::env::remove_var("RANTAICLAW_PROFILE");
+    }
+    match prev_config_dir {
+        Some(v) => std::env::set_var("RANTAICLAW_CONFIG_DIR", v),
+        None => std::env::remove_var("RANTAICLAW_CONFIG_DIR"),
+    }
+    match prev_workspace {
+        Some(v) => std::env::set_var("RANTAICLAW_WORKSPACE", v),
+        None => std::env::remove_var("RANTAICLAW_WORKSPACE"),
     }
     if let Err(e) = result {
         std::panic::resume_unwind(e);

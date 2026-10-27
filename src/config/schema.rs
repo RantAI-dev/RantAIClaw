@@ -3586,6 +3586,25 @@ async fn load_persisted_workspace_dirs(
         return Ok(None);
     }
 
+    // A marker that names a profile directory of THIS root is a profile
+    // pointer: it says "the active profile", not "this directory". The
+    // active profile wins, so `profile use` moves the config, the workspace,
+    // the memory database and the cron store with it instead of leaving
+    // them behind. The onboarding wizard writes exactly this shape, and
+    // honoring it as an override is what kept a real install from ever
+    // moving off the profile it was on.
+    if crate::profile::config_override::profile_pointer_name(&config_dir, default_config_dir)
+        .is_some()
+    {
+        tracing::info!(
+            "Active workspace marker {} names the profile directory {}; using the active \
+             profile instead.",
+            state_path.display(),
+            config_dir.display()
+        );
+        return Ok(None);
+    }
+
     Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
@@ -9335,12 +9354,14 @@ level = "full"
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
+    /// A marker that names a directory that is NOT a profile directory of
+    /// this root stays an override and is honored.
     #[test]
     async fn resolve_runtime_config_dirs_uses_active_workspace_marker() {
         let _env_guard = env_override_lock().await;
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
-        let marker_config_dir = default_config_dir.join("profiles").join("alpha");
+        let marker_config_dir = default_config_dir.join("workspaces").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
         // Pin HOME to a tempdir before opting out of the isolation guard: if
@@ -9652,11 +9673,14 @@ level = "full"
         assert_eq!(config_dir, b_root.join("profiles/default"));
     }
 
-    /// Regression: a marker that names a directory inside its own root
-    /// (case (a)) must still be honored. The local `profiles/default` is
-    /// where the marker points and where the config lives.
+    /// A marker that names a profile directory of THIS root is a profile
+    /// pointer, not an override: it says "the active profile", and the
+    /// active profile wins. With the active profile at `default` the
+    /// resolved directory is the very directory the marker names, so an
+    /// install on `default` keeps loading the same config — the rule
+    /// changes which profile is followed, never the directory.
     #[tokio::test]
-    async fn marker_pointing_inside_its_own_root_is_honored() {
+    async fn a_marker_naming_this_roots_profile_yields_to_the_active_profile() {
         let _env_guard = env_override_lock().await;
         let temp_home = tempfile::TempDir::new().unwrap();
         let default = temp_home.path().join(".rantaiclaw");
@@ -9678,13 +9702,73 @@ level = "full"
         let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
 
-        let (config_dir, _resolved_workspace_dir, source) =
+        let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default, &default.join("workspace"))
                 .await
                 .unwrap();
 
-        assert_eq!(source, ConfigResolutionSource::ActiveWorkspaceMarker);
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
         assert_eq!(config_dir, marker_dir);
+        assert_eq!(
+            resolved_workspace_dir,
+            marker_dir.join("workspace"),
+            "the workspace follows the active profile too"
+        );
+    }
+
+    /// The wizard's marker shape: `config_dir` naming `profiles/default`.
+    /// With the active profile at `work`, the resolution follows the active
+    /// profile, so config, workspace and everything keyed on them move with
+    /// `profile use` — which the marker, honored as an override, used to
+    /// pin in place.
+    #[tokio::test]
+    async fn a_profile_pointer_marker_follows_the_active_profile() {
+        let _env_guard = env_override_lock().await;
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let default = temp_home.path().join(".rantaiclaw");
+        let wizard_marker_dir = default.join("profiles/default");
+        fs::create_dir_all(&wizard_marker_dir).await.unwrap();
+        fs::write(wizard_marker_dir.join("config.toml"), "")
+            .await
+            .unwrap();
+        let marker_state = ActiveWorkspaceState {
+            config_dir: wizard_marker_dir.to_string_lossy().into_owned(),
+        };
+        fs::write(
+            default.join(ACTIVE_WORKSPACE_STATE_FILE),
+            toml::to_string(&marker_state).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let _g_home = crate::test_env::EnvGuard::set("HOME", temp_home.path());
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+
+        // The active profile is `work`; the pointer marker names `default`.
+        crate::profile::ProfileManager::ensure("work").unwrap();
+        fs::write(crate::profile::paths::active_profile_file(), "work\n")
+            .await
+            .unwrap();
+
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default, &default.join("workspace"))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            config_dir,
+            default.join("profiles/work"),
+            "the active profile wins over the pointer marker"
+        );
+        assert_eq!(
+            resolved_workspace_dir,
+            default.join("profiles/work/workspace"),
+            "the workspace follows the active profile"
+        );
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
     }
 
     /// Regression: a marker that names a custom, non-`profiles/<name>`

@@ -56,13 +56,19 @@ fn pinned_by_default() -> bool {
 }
 
 /// `<profile>/.daemon_active` path.
-pub fn sentinel_path(profile: &str) -> PathBuf {
-    paths::profile_dir(profile).join(SENTINEL_FILE)
+///
+/// The profile name is checked first: the sentinel path is built by joining
+/// the name onto the profiles directory, and the name can come from the
+/// active-profile marker or the environment. A name that could escape the
+/// profiles directory is refused rather than joined.
+pub fn sentinel_path(profile: &str) -> Result<PathBuf> {
+    crate::profile::validate_profile_name(profile)?;
+    Ok(paths::profile_dir(profile).join(SENTINEL_FILE))
 }
 
 /// Write the sentinel atomically (tempfile + rename in same dir).
 pub fn write_sentinel(profile: &str, sentinel: &DaemonSentinel) -> Result<()> {
-    let path = sentinel_path(profile);
+    let path = sentinel_path(profile)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create profile dir {}", parent.display()))?;
@@ -76,7 +82,7 @@ pub fn write_sentinel(profile: &str, sentinel: &DaemonSentinel) -> Result<()> {
 
 /// Remove the sentinel. Idempotent — missing file is not an error.
 pub fn clear_sentinel(profile: &str) -> Result<()> {
-    let path = sentinel_path(profile);
+    let path = sentinel_path(profile)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -87,7 +93,7 @@ pub fn clear_sentinel(profile: &str) -> Result<()> {
 /// Read the sentinel. Returns `Ok(None)` when the file is absent. Parse
 /// errors are surfaced so callers can log + treat as "stale".
 pub fn read_sentinel(profile: &str) -> Result<Option<DaemonSentinel>> {
-    let path = sentinel_path(profile);
+    let path = sentinel_path(profile)?;
     match fs::read_to_string(&path) {
         Ok(body) => {
             let sentinel: DaemonSentinel =
@@ -102,7 +108,7 @@ pub fn read_sentinel(profile: &str) -> Result<Option<DaemonSentinel>> {
 /// Binary "is something registered for this profile?" — parse failures
 /// still count as active (the file's presence alone is the signal).
 pub fn is_daemon_active(profile: &str) -> bool {
-    sentinel_path(profile).exists()
+    sentinel_path(profile).is_ok_and(|path| path.exists())
 }
 
 /// Whether `pid` is a live process (advisory). Unix: `kill(pid, 0)` succeeds, or
@@ -215,7 +221,7 @@ mod tests {
     fn a_sentinel_without_the_pinned_field_reads_as_pinned() {
         with_home(|| {
             super::super::ProfileManager::ensure("alpha").unwrap();
-            let path = sentinel_path("alpha");
+            let path = sentinel_path("alpha").expect("a valid profile name");
             std::fs::write(
                 &path,
                 "pid = 4242\nunit = \"rantaiclaw.service\"\n\

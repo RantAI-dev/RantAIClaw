@@ -15,6 +15,7 @@
 //!   3. The literal string `"default"`.
 
 pub mod commands;
+pub mod config_override;
 pub mod dev_guard;
 pub mod migration;
 pub mod paths;
@@ -154,12 +155,36 @@ impl ProfileManager {
     /// every config-reading entry point.
     pub fn active() -> Result<Profile> {
         let name = Self::resolve_active_name();
+        // An override that pins the config directory refuses a profile the
+        // override does not keep in effect: the run would read the config
+        // from one profile and the per-profile stores from another.
+        config_override::refuse_switch(&name)?;
         Self::ensure(&name)
     }
 
     /// Pure resolution — no filesystem mutation. See module docstring for
     /// precedence.
+    ///
+    /// A resolved name that could escape the profiles directory (a
+    /// hand-edited marker, an env var set to `../x`) is refused here: it
+    /// would be joined onto the profiles path by every caller. The name
+    /// falls back to `"default"` and the operator is told, rather than the
+    /// path being built.
     pub fn resolve_active_name() -> String {
+        let name = Self::resolve_active_name_raw();
+        if let Err(error) = validate_profile_name(&name) {
+            tracing::warn!(
+                "Ignoring unusable active profile name {name:?} ({error}); using \"default\". \
+                 The name came from RANTAICLAW_PROFILE or the active-profile marker."
+            );
+            return "default".to_string();
+        }
+        name
+    }
+
+    /// The resolution itself, without the safety net of
+    /// [`ProfileManager::resolve_active_name`].
+    fn resolve_active_name_raw() -> String {
         // 1. Env var (set by --profile flag in main.rs)
         if let Ok(name) = std::env::var("RANTAICLAW_PROFILE") {
             let trimmed = name.trim();
@@ -201,17 +226,41 @@ impl ProfileManager {
     /// Create a new profile, optionally cloning persona/skills from a source
     /// profile. See spec §"Profile clone semantics".
     pub fn create(name: &str, clone_from: Option<&str>, opts: CloneOpts) -> Result<Profile> {
-        validate_profile_name(name)?;
+        // A name that creates a profile is held to the stricter rules.
+        validate_new_profile_name(name)?;
         let dst_dir = paths::profile_dir(name);
         if dst_dir.exists() {
             bail!("profile {name:?} already exists at {}", dst_dir.display());
         }
+        // The clone source must EXIST. `ensure` would have created it, so a
+        // typo in the source name silently cloned an empty profile — and the
+        // check has to happen before anything is created, so a refused
+        // clone leaves no directory behind.
+        let src = match clone_from {
+            Some(src_name) => Some(Self::existing(src_name)?),
+            None => None,
+        };
         let dst = Self::ensure(name)?;
-        if let Some(src_name) = clone_from {
-            let src = Self::ensure(src_name)?;
+        if let Some(src) = src {
             clone_into(&src, &dst, opts)?;
         }
         Ok(dst)
+    }
+
+    /// A profile that must already exist on disk.
+    ///
+    /// Unlike [`ProfileManager::ensure`] this never creates anything: it is
+    /// the door for a name that NAMES an existing profile (a clone source).
+    fn existing(name: &str) -> Result<Profile> {
+        validate_profile_name(name)?;
+        let dir = paths::profile_dir(name);
+        if !dir.exists() {
+            bail!("profile {name:?} does not exist at {}", dir.display());
+        }
+        Ok(Profile {
+            name: name.to_string(),
+            root: dir,
+        })
     }
 
     /// Set the active profile. Refuses unknown profile names so users get a
@@ -233,6 +282,10 @@ impl ProfileManager {
         if !dir.exists() {
             bail!("profile {name:?} does not exist at {}", dir.display());
         }
+        // An override that pins the config directory refuses a switch to
+        // another profile: the switch would move the per-profile stores and
+        // leave the config behind.
+        config_override::refuse_switch(name)?;
         // The profile the marker names BEFORE this switch — not
         // `resolve_active_name`, which prefers the env var. A daemon that
         // follows the marker is registered under the profile the marker
@@ -261,7 +314,7 @@ impl ProfileManager {
     /// The profile the active-profile marker names, ignoring the env var.
     /// `"default"` when no marker is written yet — the resolution a daemon
     /// started before any switch used.
-    fn marker_profile() -> String {
+    pub fn marker_profile() -> String {
         fs::read_to_string(paths::active_profile_file())
             .ok()
             .map(|s| s.trim().to_string())
@@ -330,7 +383,15 @@ fn report_handoff_outcome(active: &str, outcome: &crate::daemon::handoff::Handof
 
 /// Reject profile names that would escape the profiles dir or land on weird
 /// filesystem entries. Restrict to a Unix-friendly subset.
-fn validate_profile_name(name: &str) -> Result<()> {
+///
+/// This is the check for a name that NAMES AN EXISTING PROFILE: the
+/// `use`, `delete`, `--profile`, env-var, marker and sentinel doors. It
+/// only refuses what could escape the profiles directory, so a profile
+/// created before [`validate_new_profile_name`] existed stays usable.
+///
+/// A name that CREATES a profile goes through [`validate_new_profile_name`],
+/// which is stricter.
+pub fn validate_profile_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("profile name cannot be empty");
     }
@@ -339,6 +400,36 @@ fn validate_profile_name(name: &str) -> Result<()> {
     }
     if name.contains('/') || name.contains('\\') || name.contains('\0') {
         bail!("profile name {name:?} contains forbidden characters");
+    }
+    Ok(())
+}
+
+/// The rules a NEW profile name must satisfy.
+///
+/// A new name becomes a directory name, a systemd instance name and part of
+/// a unit file, so it is restricted to a subset that is safe in all three:
+/// letters, digits, `-` and `_`, at most 64 characters, and not starting
+/// with `-` (a leading dash reads as a unit option).
+///
+/// An existing profile is not held to this: a profile created before the
+/// rule existed keeps working, and only its path safety is checked
+/// ([`validate_profile_name`]).
+pub fn validate_new_profile_name(name: &str) -> Result<()> {
+    validate_profile_name(name)?;
+    if name.chars().count() > 64 {
+        bail!("profile name {name:?} is longer than 64 characters");
+    }
+    if name.starts_with('-') {
+        bail!("profile name {name:?} cannot start with '-'");
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_'))
+    {
+        bail!(
+            "profile name {name:?} contains {bad:?}; a new profile name may hold only letters, \
+             digits, '-' and '_'"
+        );
     }
     Ok(())
 }
@@ -450,6 +541,11 @@ mod profile_root_tests {
         std::env::set_var("HOME", tmp.path());
         let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
         std::env::remove_var("RANTAICLAW_PROFILE");
+        // No config-dir override in this test: an override that pins the
+        // config refuses a profile switch, because the switch would move the
+        // per-profile stores and leave the config behind.
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ProfileManager::ensure("default").unwrap();
             ProfileManager::ensure("work").unwrap();
@@ -531,6 +627,11 @@ mod profile_root_tests {
         std::env::set_var("HOME", tmp.path());
         let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
         std::env::remove_var("RANTAICLAW_PROFILE");
+        // No config-dir override in this test: an override that pins the
+        // config refuses a profile switch, because the switch would move the
+        // per-profile stores and leave the config behind.
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ProfileManager::ensure("default").unwrap();
             ProfileManager::ensure("work").unwrap();
@@ -590,5 +691,224 @@ mod profile_root_tests {
                 "{path:?} escaped the scratch root"
             );
         }
+    }
+
+    /// D2: while `RANTAICLAW_CONFIG_DIR` pins the config directory, a
+    /// switch to another profile is refused — the switch would move the
+    /// per-profile stores and leave the config, memory and cron behind.
+    /// This is the split the audit saw.
+    #[test]
+    fn a_config_dir_override_refuses_a_switch_to_another_profile() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let scratch = tempfile::tempdir().expect("scratch config dir");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", scratch.path());
+
+        ProfileManager::ensure("default").unwrap();
+        ProfileManager::ensure("work").unwrap();
+        std::fs::write(paths::active_profile_file(), "default\n").unwrap();
+
+        let error = ProfileManager::use_profile("work").expect_err("the switch must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("RANTAICLAW_CONFIG_DIR"),
+            "the refusal must name the override: {message}"
+        );
+        assert!(
+            message.contains("unset RANTAICLAW_CONFIG_DIR"),
+            "the refusal must say how to clear the override: {message}"
+        );
+        assert_eq!(
+            ProfileManager::marker_profile(),
+            "default",
+            "a refused switch must not move the marker"
+        );
+    }
+
+    /// The pinned profile itself stays switchable: an override that pins a
+    /// profile directory keeps THAT profile in effect, and a switch to it
+    /// changes nothing.
+    #[test]
+    fn a_switch_to_the_profile_an_override_pins_is_allowed() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let pinned = tmp.path().join(".rantaiclaw/profiles/work");
+        let _g_config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", &pinned);
+
+        ProfileManager::ensure("default").unwrap();
+        ProfileManager::ensure("work").unwrap();
+        std::fs::write(paths::active_profile_file(), "default\n").unwrap();
+
+        ProfileManager::use_profile("work").expect("the pinned profile is the one in effect");
+        assert_eq!(ProfileManager::marker_profile(), "work");
+    }
+
+    /// Without an override, a switch works as before.
+    #[test]
+    fn a_switch_without_an_override_is_not_refused() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+
+        ProfileManager::ensure("default").unwrap();
+        ProfileManager::ensure("work").unwrap();
+
+        ProfileManager::use_profile("work").expect("no override, no refusal");
+        assert_eq!(ProfileManager::marker_profile(), "work");
+    }
+
+    /// A marker that names a directory that is not a profile directory of
+    /// this root stays an override, so it refuses a switch too.
+    #[test]
+    fn an_override_marker_refuses_a_switch_to_another_profile() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+
+        let root = tmp.path().join(".rantaiclaw");
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(
+            root.join(config_override::ACTIVE_WORKSPACE_MARKER),
+            format!(
+                "config_dir = {:?}\n",
+                root.join("elsewhere").to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        ProfileManager::ensure("default").unwrap();
+        ProfileManager::ensure("work").unwrap();
+
+        let error = ProfileManager::use_profile("work").expect_err("the switch must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(config_override::ACTIVE_WORKSPACE_MARKER),
+            "the refusal must name the marker: {message}"
+        );
+    }
+
+    /// A clone source that does not exist is an error, and nothing is
+    /// created: `ensure` used to build the missing source as an empty
+    /// profile, so a typo silently cloned nothing.
+    #[test]
+    fn cloning_a_missing_source_creates_nothing() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        let error = ProfileManager::create("copy1", Some("nosuch"), CloneOpts::default())
+            .expect_err("the source must exist");
+        assert!(
+            format!("{error:#}").contains("nosuch"),
+            "the refusal must name the missing source: {error:#}"
+        );
+        assert!(
+            !paths::profile_dir("copy1").exists(),
+            "a refused clone must not create the destination"
+        );
+        // The direct `clone` command goes through the same door.
+        let error = ProfileManager::create("copy2", Some("nosuch"), CloneOpts::default())
+            .expect_err("the source must exist");
+        assert!(format!("{error:#}").contains("nosuch"), "{error:#}");
+        assert!(!paths::profile_dir("copy2").exists());
+    }
+
+    /// A new profile name is restricted to the unit-safe subset; an
+    /// existing profile created before the rule keeps working.
+    #[test]
+    fn a_new_profile_name_is_unit_safe_but_an_old_name_still_loads() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        for bad in ["bad name!", "-lead", "../escape", &"x".repeat(65)] {
+            let error = ProfileManager::create(bad, None, CloneOpts::default())
+                .expect_err("a new name must satisfy the unit-safe rules");
+            assert!(
+                !format!("{error:#}").is_empty(),
+                "the refusal must say why: {bad:?}"
+            );
+            assert!(
+                !paths::profile_dir(bad).exists(),
+                "a refused name must not create a directory: {bad:?}"
+            );
+        }
+        ProfileManager::create("Work_2", None, CloneOpts::default())
+            .expect("letters, digits, '-' and '_' are fine");
+
+        // An existing directory with an old-style name still loads: the
+        // path-safety rules are the only ones applied to it.
+        let legacy = paths::profile_dir("old name");
+        std::fs::create_dir_all(&legacy).unwrap();
+        ProfileManager::use_profile("old name")
+            .expect("a profile created before the rule stays usable");
+        assert_eq!(ProfileManager::marker_profile(), "old name");
+    }
+
+    /// D2, env door: `RANTAICLAW_PROFILE` naming a profile other than the
+    /// one an override keeps in effect is refused where the profile is
+    /// resolved — every command that loads a profile fails with the same
+    /// one sentence.
+    #[test]
+    fn an_override_refuses_an_env_profile_it_does_not_pin() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let scratch = tempfile::tempdir().expect("scratch config dir");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", scratch.path());
+        let _g_profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "work");
+
+        ProfileManager::ensure("work").unwrap();
+
+        let error = ProfileManager::active().expect_err("the env profile must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("RANTAICLAW_CONFIG_DIR") && message.contains("work"),
+            "the refusal must name the override and the profile: {message}"
+        );
+    }
+
+    /// A name from the marker or the environment that could escape the
+    /// profiles directory is refused where paths are built from it.
+    #[test]
+    fn a_name_that_could_escape_the_profiles_dir_never_becomes_a_path() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        ProfileManager::ensure_default().unwrap();
+        std::fs::write(paths::active_profile_file(), "../escape\n").unwrap();
+        assert_eq!(
+            ProfileManager::resolve_active_name(),
+            "default",
+            "an escaping marker name falls back to default, loudly"
+        );
+        // And the sentinel path builder refuses it outright.
+        assert!(
+            crate::profile::sentinel::sentinel_path("../escape").is_err(),
+            "an escaping name must not be joined onto the profiles dir"
+        );
     }
 }

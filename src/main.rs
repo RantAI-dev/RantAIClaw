@@ -1377,9 +1377,18 @@ async fn main() -> Result<()> {
     // that ProfileManager::resolve_active_name() observes it. Resolution
     // precedence is documented on the Cli struct.
     if let Some(profile_name) = &cli.profile {
-        if profile_name.trim().is_empty() {
+        let profile_name = profile_name.trim();
+        if profile_name.is_empty() {
             bail!("--profile cannot be empty");
         }
+        // One validator at every door a profile name enters: a name that
+        // could escape the profiles directory is refused before it becomes
+        // an environment variable every path is built from.
+        rantaiclaw::profile::validate_profile_name(profile_name)?;
+        // An override that pins the config directory refuses a profile it
+        // does not keep in effect: the run would read the config from one
+        // profile and the per-profile stores from another.
+        rantaiclaw::profile::config_override::refuse_switch(profile_name)?;
         std::env::set_var("RANTAICLAW_PROFILE", profile_name);
     }
 

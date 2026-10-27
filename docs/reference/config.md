@@ -8,7 +8,7 @@ Config path resolution at startup:
 
 1. `RANTAICLAW_CONFIG_DIR` override (if set) — the whole config directory; the workspace becomes `<dir>/workspace`
 2. `RANTAICLAW_WORKSPACE` override (if set)
-3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present) — unless the marker names the `profiles/<name>` directory of a different root while the local root has its own `config.toml` for that profile (a tree that was copied, moved or restored to another path); in that case the marker is set aside and the local profile wins, and a single warning names the marker, the directory it pointed at, and the directory used instead
+3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present) — with two exceptions: a marker that names the `profiles/<name>` directory of a different root while the local root has its own `config.toml` for that profile (a tree that was copied, moved or restored to another path) is set aside and the local profile wins, with a single warning naming the marker, the directory it pointed at, and the directory used instead; and a marker that names a profile directory **of this root** (`~/.rantaiclaw/profiles/<name>`) is a *profile pointer* — it means "the active profile", so it pins nothing and resolution continues with step 4
 4. default: the **active profile's directory** — `~/.rantaiclaw/profiles/<name>/config.toml` (profile `default` unless `RANTAICLAW_PROFILE` or the `~/.rantaiclaw/active_profile` marker selects another). A flat `~/.rantaiclaw/config.toml` is used only as a fallback if profile resolution fails.
 
 `RANTAICLAW_CONFIG_DIR` moves **config and workspace only**. The profile root —
@@ -17,6 +17,18 @@ databases, the persona, and the `.daemon_active` sentinel — is keyed on `$HOME
 and is deliberately unaffected. So are the logs, at `~/.rantaiclaw/logs/`.
 Setting only `RANTAICLAW_CONFIG_DIR` therefore gives you a split state: config
 from the custom directory, approval policy and profile data from the real home.
+
+**Overrides pin the profile.** While `RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE`
+or a non-pointer marker is in effect, it keeps the current profile in effect:
+`profile use <other>`, `--profile <other>` and `RANTAICLAW_PROFILE=<other>` are
+refused with a one-line message naming the override and how to clear it. Without
+this rule a switch would move the per-profile stores (sessions, knowledge base,
+policy, persona, secrets) but not the config, the workspace, the memory database
+or the cron store — one install pointing at two profiles. A switch to the profile
+the override already keeps in effect is a no-op and is allowed; to switch for
+real, clear the override first (`unset RANTAICLAW_CONFIG_DIR`, or remove the
+marker). The onboarding wizard writes a pointer marker (one that names
+`profiles/<name>` of this root), which pins nothing.
 
 The sentinel is the one that surprises people. It records which process owns the
 channels for a profile, and it is keyed on the profile *name*, not on the config
