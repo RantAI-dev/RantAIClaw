@@ -464,6 +464,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was never wired up, and there is no per-server command to wire — the picker is the only
   surface that collects credentials. The hint now names the real command, `rantaiclaw setup
   mcp`, once, followed by the curated servers the picker would offer.
+- A headless run's MCP hint also named curated servers that no longer exist: Google Calendar
+  and Gmail were dropped from the curated list in v0.6.51, but the hint kept naming them
+  beside the servers the picker really offers. The hint now names only the command that
+  finishes the setup; the curated servers it lists come from the registry. The docs page for
+  the MCP pillar counts the curated picker as six servers again (2 zero-auth, 4 needing
+  auth) instead of eight or nine.
 
 ## [0.33.0-alpha] — 2026-10-08
 

@@ -8,7 +8,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 
 - 5-skill bundled starter pack (web-search, scheduler-reminders, summarizer, research-assistant, meeting-notes)
 - ClawHub multi-select skill picker (sorted by stars, SHA-256 verified install)
-- 8 MCP servers curated picker — 2 zero-auth + 6 authenticated, with inline auth (filesystem dropped in v0.6.51 — see below)
+- 6 MCP servers curated picker — 2 zero-auth + 4 authenticated, with inline auth (filesystem dropped in v0.6.51 — see below)
 - Spawn-and-validate at setup time (zero-auth servers)
 - `author_skill` — writes a skill bundle from chat
 - Skill `[[tools]]` adapters offered to the model at every door (see below)
@@ -19,7 +19,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 |---|---|---|---|
 | Bundled skill starter pack | ✅ 5 skills | TBD | TBD |
 | ClawHub remote install | ✅ SHA-256 verified | n/a | n/a |
-| MCP curated picker | ✅ 9 servers | TBD | TBD |
+| MCP curated picker | ✅ 6 servers | TBD | TBD |
 | Setup-time MCP validation | ✅ spawn-and-wait | TBD | TBD |
 | Skill authoring helper | ✅ `author_skill` tool | TBD | TBD |
 
@@ -170,7 +170,7 @@ rantaiclaw skills list
 rantaiclaw skills install <source>      # ClawHub slug, git remote, or local path
 rantaiclaw skills remove <name>
 rantaiclaw setup skills                # multi-select picker
-rantaiclaw setup mcp                   # 9-server curated picker
+rantaiclaw setup mcp                   # 6-server curated picker
 ```
 
 ClawHub installs require a `sha256` for every file in the version manifest. A version that lists a file without a valid 64-hex hash is refused before anything is fetched, and the refusal names the file; `skills update` keeps the installed version instead. Skills already on disk are not re-verified or changed by this check.

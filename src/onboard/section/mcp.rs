@@ -74,9 +74,13 @@ impl SetupSection for McpSection {
         result
     }
 
+    /// The base text names the one command that finishes the setup, and no
+    /// server: the curated list is built from the registry below, so a
+    /// name written here goes stale the moment a server is dropped — this
+    /// text still named Calendar and Gmail, removed from the curated list
+    /// in v0.6.51.
     fn headless_hint(&self) -> &'static str {
-        "Run `rantaiclaw setup mcp` interactively to add curated MCP servers \
-         (Notion, Google Drive, Slack, Calendar, Gmail, GitHub + zero-auth set)."
+        "Run `rantaiclaw setup mcp` interactively to add curated MCP servers."
     }
 }
 
