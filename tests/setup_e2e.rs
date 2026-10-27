@@ -134,7 +134,7 @@ fn setup_non_interactive_on_a_fresh_profile_exits_one_because_the_provider_is_mi
         // skills (starter pack auto-installs in headless)
         ("skills", "starter pack"),
         // mcp
-        ("mcp", "rantaiclaw mcp add"),
+        ("mcp", "rantaiclaw setup mcp"),
     ];
     for (label, needle) in hints {
         assert!(

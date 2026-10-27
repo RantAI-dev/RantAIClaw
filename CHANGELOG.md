@@ -101,6 +101,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unwritable is now refused where the connection previously went through, and the message names
   the file and how to repair it.
 
+- **An MCP OAuth login could be completed by the wrong callback.** The loopback listener the
+  flow binds on `127.0.0.1:11500` accepted the first request that arrived with a `code`,
+  whatever page it came from, and the authorization URL carried neither a `state` nor a PKCE
+  challenge — so any local process that hit the port first (a preconnect, a preview, a
+  malicious page) could hand the login a code of its choosing and have it exchanged. A
+  callback is now bound to its session: the authorization URL carries a one-time `state` and
+  an S256 `code_challenge`, the token exchange sends the matching `code_verifier`, and the
+  listener keeps the login alive across stray traffic — a wrong redirect slug, a missing
+  `state`, or a `state` that does not match this login is answered with a plain error page
+  and ignored, compared in constant time so a local prober cannot time its way to the
+  expected value. An `error=` parameter carrying the right `state` still ends the flow with
+  the provider's error. The bind stays `127.0.0.1:11500` and the authorization and token
+  endpoints stay constants; no environment variable or config key can redirect the exchange,
+  and the test-only seam that can is compiled out of production paths. No config key changed.
+
 ### Added
 
 - The console's `approval_request` event carries `always_available`. It is `true` when an Always answer holds for the rest of the conversation, and `false` when the modal should not offer Always (a medium-risk prompt, or a tool forced to prompt by `always_ask` or Manual).
@@ -432,6 +447,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could never seed a new file. The upload now opens the remote file with create-and-truncate
   semantics, so a push creates a missing file and overwrites an existing one in full; a
   missing remote directory or a server-denied write still fails with the server's reason.
+- The MCP provisioner claimed a server was authed without a finished login. Selecting an OAuth
+  server (Google Drive) registered it and counted it under "N authed" even when no credential
+  was ever obtained: a session that could not show a URL and wait for the browser skipped the
+  flow entirely, and a token prompt answered with an empty string still produced a registered,
+  counted server holding an empty credential. A server is now registered and counted as authed
+  only after its credential was actually obtained. The OAuth flow runs when the session can
+  show a URL and wait; when it cannot — headless, or the client id and secret missing from the
+  environment — the server is not registered and the summary names it with the exact step that
+  finishes the setup, `rantaiclaw setup mcp`. An empty token answer is refused the same way.
+  The onboard wizard's MCP section agrees: an authed server counts as already configured only
+  when its credential env key holds a non-empty value, so the tokenless entries a claiming
+  setup wrote no longer silence the picker. Both surfaces route credential collection through
+  one shared gate so they cannot drift apart again. No config key changed.
+- A headless run's MCP hint named a command that does not exist: `rantaiclaw mcp add <slug>`
+  was never wired up, and there is no per-server command to wire — the picker is the only
+  surface that collects credentials. The hint now names the real command, `rantaiclaw setup
+  mcp`, once, followed by the curated servers the picker would offer.
 
 ## [0.33.0-alpha] — 2026-10-08
 
