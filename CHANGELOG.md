@@ -497,6 +497,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   creates nothing under `profiles/`. The help no longer claims a `-p`
   short flag: no such flag exists (`agent -p` is `--provider`), and every
   help and doc mention of one is now `--profile`.
+- A migration dropped the operator's price table without a word. The v24 → v25
+  step removed the old-shape `[cost.prices]` table — a row held `input` and
+  `output`, and the schema now keys a price per model as
+  `input_per_million`/`output_per_million` — and a config that carried prices
+  for a model lost them on the next launch with no signal, no warning and no
+  pointer to the copy that still held them. The load now says what was
+  dropped: it names every model whose price was in the table, tells the
+  operator to re-add each as `[cost.prices."<model>"]` with the current field
+  names, and points at `config.toml.bak`, where the original file sits until
+  the next config save replaces it. The values are not converted: a wrong
+  price is worse than none. A config that already carries the current shape
+  keeps its table and raises no warning.
 
 ## [0.33.0-alpha] — 2026-10-08
 

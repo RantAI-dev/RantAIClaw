@@ -4528,6 +4528,11 @@ impl Config {
             // here is the only signal we have to tell the operator that their
             // notes stayed in Postgres and the local sqlite store starts empty.
             let postgres_pre_migration = raw_memory_backend_was_postgres(&raw);
+            // Same trick for the v25 cost-price drop: `migrate_v25` removes
+            // the old-shape `[cost.prices]` table, whose rows the operator
+            // entered. Reading the model names before the call is the only
+            // point at which we know which models lost their prices.
+            let cost_prices_pre_migration = raw_cost_price_models_before_migration(&raw);
             let migrated = crate::config::migrations::migrate(&mut raw)
                 .context("Failed to migrate config schema")?;
             // A credential that ended up in `api_url` sits on disk in plaintext
@@ -4723,6 +4728,29 @@ impl Config {
                     "postgres memory was retired; your notes stay in Postgres and \
                      the local sqlite store starts empty"
                 );
+            }
+            // The v24 → v25 bump dropped the old-shape `[cost.prices]` table:
+            // a row held `input`/`output`, and the schema now keys a price
+            // per model as `input_per_million`/`output_per_million`. Those
+            // rows were operator-entered, so say which models lost their
+            // prices and where the original file still is. The values are
+            // not converted — the operator re-adds them by hand. Gated on
+            // `migrated`, like the postgres warning above.
+            if migrated {
+                if let Some(models) = cost_prices_pre_migration.as_ref() {
+                    let mut backup: std::path::PathBuf = config_path.clone();
+                    backup.as_mut_os_string().push(".bak");
+                    tracing::warn!(
+                        "the pre-v25 [cost.prices] table was dropped by this migration because \
+                         its row shape changed (input/output became input_per_million and \
+                         output_per_million); it listed prices for: {}. Re-add each as \
+                         [cost.prices.\"<model>\"] with input_per_million and output_per_million \
+                         — the values are not converted. The original config is at {} until the \
+                         next config save replaces it.",
+                        models.join(", "),
+                        backup.display()
+                    );
+                }
             }
             let mut config: Config = raw.try_into().with_context(|| {
                 format!(
@@ -5601,6 +5629,27 @@ fn raw_memory_backend_was_postgres(raw: &toml::Value) -> bool {
         .and_then(|c| c.get("provider"))
         .and_then(toml::Value::as_str)
         .is_some_and(is_postgres)
+}
+
+/// The model names a pre-migration `[cost.prices]` table listed, when the
+/// v25 migration is about to drop that table.
+///
+/// `None` when the table is absent, when it is empty, or when the config
+/// is already at v25 or later — there the migration keeps the table, in
+/// its current shape. Names only: the warning says which models lost
+/// their prices, never the prices themselves.
+fn raw_cost_price_models_before_migration(raw: &toml::Value) -> Option<Vec<String>> {
+    let from = raw
+        .get(crate::config::migrations::SCHEMA_VERSION_KEY)
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(0);
+    if from >= 25 {
+        return None;
+    }
+    let prices = raw.get("cost")?.get("prices")?.as_table()?;
+    let mut names: Vec<String> = prices.keys().cloned().collect();
+    names.sort();
+    (!names.is_empty()).then_some(names)
 }
 
 /// One-time markdown → sqlite import for a config that used the retired
@@ -13249,6 +13298,92 @@ default_model = "legacy-model"
     }
 
     /// The gate skips the backup when a complete one exists, and says so when
+    /// The v25 migration drops the old-shape `[cost.prices]` table, and
+    /// those rows were operator-entered. The load says which models lost
+    /// their prices and where the original file still is.
+    #[tokio::test]
+    async fn load_or_init_warns_when_the_migration_dropped_the_cost_price_table() {
+        let _env_guard = env_override_lock().await;
+        let sandbox = load_sandbox(
+            "schema_version = 24\n\n\
+             [cost.prices.\"anthropic/claude-sonnet-4\"]\ninput = 3.0\noutput = 15.0\n\n\
+             [cost.prices.\"openai/gpt-4\"]\ninput = 30.0\noutput = 60.0\n",
+        );
+        let (logs, _guard) = capture_logs();
+        let _config = Config::load_or_init().await.unwrap();
+        let logged = logs.contents();
+        assert!(
+            logged.contains("[cost.prices]"),
+            "the warning must name the table: {logged}"
+        );
+        assert!(
+            logged.contains("anthropic/claude-sonnet-4") && logged.contains("openai/gpt-4"),
+            "the warning must name every model that lost its prices: {logged}"
+        );
+        assert!(
+            logged.contains("config.toml.bak"),
+            "the warning must name the backup: {logged}"
+        );
+        // The backup really holds the original rows, prices and all.
+        let backup = sandbox.config_dir.join("config.toml.bak");
+        assert!(
+            backup.exists(),
+            "the migration must leave the original behind"
+        );
+        let original = std::fs::read_to_string(&backup).unwrap();
+        assert!(
+            original.contains("input = 3.0"),
+            "the backup must hold the original prices: {original}"
+        );
+    }
+
+    /// A config older than v25 that never carried a price table has nothing
+    /// to lose: the warning must not fire on the version alone.
+    #[tokio::test]
+    async fn load_or_init_does_not_warn_about_a_price_table_that_never_existed() {
+        let _env_guard = env_override_lock().await;
+        let _sandbox = load_sandbox(
+            "schema_version = 24\n\n[agent]\nmax_history_messages = 20\n\n\
+             [cost]\nmax_tokens_per_day = 2000000\n",
+        );
+        let (logs, _guard) = capture_logs();
+        let _config = Config::load_or_init().await.unwrap();
+        let logged = logs.contents();
+        assert!(
+            !logged.contains("cost.prices"),
+            "a config without a price table must not warn about one: {logged}"
+        );
+    }
+
+    /// A config that already carries the current price shape keeps it, and
+    /// the load does not warn about a table it never dropped.
+    #[tokio::test]
+    async fn load_or_init_keeps_a_current_shape_price_table_without_warning() {
+        let _env_guard = env_override_lock().await;
+        let sandbox = load_sandbox(
+            "schema_version = 40\n\n\
+             [cost.prices.\"anthropic/claude-sonnet-4\"]\n\
+             input_per_million = 3.0\noutput_per_million = 15.0\n",
+        );
+        let (logs, _guard) = capture_logs();
+        let config = Config::load_or_init().await.unwrap();
+        let logged = logs.contents();
+        assert!(
+            !logged.contains("cost.prices"),
+            "a table the migration never dropped must not warn: {logged}"
+        );
+        assert_eq!(
+            config.cost.prices.len(),
+            1,
+            "the price table must survive the load"
+        );
+        let contents = std::fs::read_to_string(sandbox.config_dir.join("config.toml")).unwrap();
+        assert!(
+            contents.contains("input_per_million"),
+            "the file must still hold the price: {contents}"
+        );
+    }
+
     /// the live markdown files hold notes newer than that backup.
     #[tokio::test]
     async fn load_or_init_warns_when_it_skips_the_backup_but_markdown_notes_are_newer() {

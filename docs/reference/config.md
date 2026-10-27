@@ -1111,6 +1111,11 @@ is refused rather than half-understood.
 Migrations only move forward. There is no automatic downgrade, so reverting to a
 binary older than your config's `schema_version` needs a manual edit.
 
+A migration moves config keys, not your data: the stores that live under the
+workspace — the memory database at `workspace/memory/brain.db` among them —
+travel with the workspace directory, so no migration renames, drops or rewrites
+your notes.
+
 ### v40: the `[channels_config].cli` key retired
 
 `[channels_config].cli` is removed. It did not gate the CLI channel and no
@@ -1219,6 +1224,20 @@ Upgrading rewrites a v31 WhatsApp section:
 3. Set `schema_version = 31`.
 
 Keeping a copy of `config.toml` before a major upgrade is cheaper than step 1.
+
+### v25: the old `[cost.prices]` table retired
+
+Before v25 a price was one row of `input`/`output` fields under
+`[cost.prices."<model>"]`; the table was removed as dead, and the key came
+back later in a new shape (`input_per_million`/`output_per_million`) once
+something read it. An upgrade from a pre-v25 config therefore drops the old
+table, and the load says so: the warning names every model whose price was in
+it, tells you to re-add each as `[cost.prices."<model>"]` with
+`input_per_million` and `output_per_million`, and points at `config.toml.bak`,
+where the original file — prices and all — sits until the next config save
+replaces it. The values are not converted for you: a wrong price is worse
+than none. A config that already carries the current shape keeps its table and
+raises no warning.
 
 ## KB (Knowledge Base)
 
