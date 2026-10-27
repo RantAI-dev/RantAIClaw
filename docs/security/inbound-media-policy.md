@@ -262,24 +262,31 @@ user is policy-checked and answered, never mistaken for an intruder.
 
 ### 15. Build features — the parser ships behind the default `kb`
 
-Documents need the default `kb` feature (PDF through the existing `unpdf` path;
-TXT is its own UTF-8 check on the bytes). A build without `kb` answers a
+Documents need the default `kb` feature (PDF through the same `pdf-extract`
+reader the `unpdf` backend uses; TXT is its own UTF-8 check on the bytes). A build without `kb` answers a
 document with the note that this build cannot read documents — a visible
 refusal, not a silent drop.
 
-**Open question for the owner — DOCX.** DOCX extraction lives behind
-`kb-office`, which is **not** a default feature. The options:
+**DOCX — decided: option (a).** DOCX extraction lives behind `kb-office`, which
+is **not** a default feature. The options the owner chose between:
 
 - **(a)** DOCX is refused with a clear note in default builds, and works only in
-  `kb-office` builds.
+  `kb-office` builds. **Chosen.**
 - **(b)** `kb-office` becomes a default feature (adds `docx-rs` and `calamine`
   to every build).
 - **(c)** a new feature carries only `docx-rs` and joins the defaults.
 
-Planner's recommendation: **(c)** if the `Cargo.lock` diff stays limited to
-`docx-rs` and its own dependencies, otherwise **(a)**. The owner is asked for
-that `Cargo.lock` diff — not a release build — to measure the cost before
-deciding.
+The reason: (b) and (c) both add a parser to every build for a format most
+senders do not send, and (c) still needs a new feature in the tree for the same
+effect. (a) keeps the default build's dependency set exactly as it is — no
+`Cargo.toml` change, no `Cargo.lock` change — and answers the case honestly: a
+default build refuses a DOCX with the note that this build cannot read DOCX
+documents, which is a visible refusal, not a silent drop. An operator who wants
+DOCX builds with `--features kb-office`.
+
+The DOCX **sniff** still runs in a default build: a DOCX is recognised as a DOCX
+(and refused as unreadable) rather than falling through to the text path, which
+would treat a ZIP as UTF-8 text.
 
 ### 16. Channels — Telegram and WhatsApp Web; every other channel keeps ignoring documents
 
