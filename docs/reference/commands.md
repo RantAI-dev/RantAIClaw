@@ -45,7 +45,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `update` | Self-replace the binary against a published GitHub release |
 | `auth` | Manage provider subscription auth profiles (OAuth / setup tokens) |
 | `permissions` | Owners and the non-owner (guest) capability ceiling, shared by all multi-user channels |
-| `personality` | Show, list, or set the active persona preset |
+| `personality` | Show, list, or set the active persona preset, name and timezone |
 | `profile` | Create, clone, switch, and delete profiles |
 | `session` | Browse, search, and rename past sessions |
 | `insights` | Cumulative session/message statistics (CLI parity for the TUI `/insights`) |
@@ -769,6 +769,14 @@ Two rules govern what `add` accepts:
 | `show` | Active persona preset for the current profile |
 | `list` | Available presets |
 | `set <preset>` | Switch preset, e.g. `rantaiclaw personality set concise_pro` |
+| `set --name <name>` | Set the persona's owner name |
+| `set --timezone <tz>` | Set the persona's timezone, e.g. `Asia/Jakarta`; an empty value clears it |
+
+The preset stays the positional argument, so `personality set concise_pro
+--timezone Asia/Jakarta` sets both; `--name` and `--timezone` can also be used
+on their own. The timezone must be an IANA name this build knows (`Europe/Berlin`,
+`UTC`); any other value is refused and nothing is written. An empty value means
+"unset" and is accepted.
 
 ### `profile`
 

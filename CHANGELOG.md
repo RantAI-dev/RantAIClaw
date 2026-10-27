@@ -135,6 +135,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfaces cannot disagree. An unhealthy scheduler is a failure, and it is the only new verdict
   that makes `rantaiclaw doctor` exit non-zero.
 
+- `rantaiclaw personality set` takes `--name` and `--timezone` next to the
+  positional preset, so the persona's owner name and its timezone can be set
+  from the shell without a console. The preset stays the positional argument,
+  and the two flags can also be used on their own. The timezone must be an
+  IANA name the build knows (`Asia/Jakarta`, `UTC`); an empty value clears it.
+
 ### Changed
 
 - The config loader now warns about an unknown key at any depth, not only at
@@ -550,6 +556,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finishes the setup; the curated servers it lists come from the registry. The docs page for
   the MCP pillar counts the curated picker as six servers again (2 zero-auth, 4 needing
   auth) instead of eight or nine.
+- A persona could store a timezone no timestamp could use. Every door that
+  writes one took any string: the console's `PUT /api/v1/personality`, the
+  onboarding wizard's free-text prompt, and the `persona.toml` writer itself.
+  A typo (`Not/AZone`) was stored and read back into the prompt that renders
+  the owner's timezone, where it means nothing. Every door now refuses a
+  timezone the timezone database does not hold, and refuses it before anything
+  is written: the HTTP API answers `400` and names the bad value, the CLI exits
+  non-zero, and the wizard asks again. The empty value still means "unset" and
+  is accepted. A `persona.toml` that was hand-edited into an unusable value
+  reads as unset, with one warning, and the file is left exactly as the
+  operator wrote it — nothing rewrites it behind their back.
 
 ## [0.33.0-alpha] — 2026-10-08
 

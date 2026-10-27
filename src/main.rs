@@ -790,7 +790,9 @@ Manage the active persona preset.
 Examples:
   rantaiclaw personality show                   # current preset for active profile
   rantaiclaw personality list                   # all available presets
-  rantaiclaw personality set concise_pro        # switch")]
+  rantaiclaw personality set concise_pro        # switch
+  rantaiclaw personality set --timezone Asia/Jakarta
+  rantaiclaw personality set --name \"Ranti\"")]
     Personality {
         #[command(subcommand)]
         cmd: PersonalityCommands,
@@ -1225,8 +1227,17 @@ enum PersonalityCommands {
     List,
     /// Set the persona preset for the current profile
     Set {
+        /// The preset to switch to. Optional when only the name or the
+        /// timezone changes.
         #[arg(value_enum)]
-        preset: rantaiclaw::persona::PresetId,
+        preset: Option<rantaiclaw::persona::PresetId>,
+        /// The persona's name — the person the agent works for.
+        #[arg(long)]
+        name: Option<String>,
+        /// The persona's IANA timezone, e.g. `Asia/Jakarta`. An empty value
+        /// clears it. A name this build cannot use is refused.
+        #[arg(long)]
+        timezone: Option<String>,
     },
 }
 
@@ -2316,7 +2327,11 @@ async fn main() -> Result<()> {
         Some(Commands::Personality { cmd }) => match cmd {
             PersonalityCommands::Show => rantaiclaw::persona::cli::show(),
             PersonalityCommands::List => rantaiclaw::persona::cli::list(),
-            PersonalityCommands::Set { preset } => rantaiclaw::persona::cli::set(preset),
+            PersonalityCommands::Set {
+                preset,
+                name,
+                timezone,
+            } => rantaiclaw::persona::cli::set(preset, name, timezone),
         },
 
         Some(Commands::Chat {
