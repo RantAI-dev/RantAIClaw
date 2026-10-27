@@ -134,6 +134,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the promise used to go unkept. It shares one verdict with the TUI's panel, so the two
   surfaces cannot disagree. An unhealthy scheduler is a failure, and it is the only new verdict
   that makes `rantaiclaw doctor` exit non-zero.
+- **Telegram and WhatsApp Web accept inbound documents** (PDF, DOCX, TXT). The type is
+  sniffed from the bytes — the platform's MIME type and the file name are an early filter and a
+  veto, never the decider — and the sender's announced size is checked before anything is
+  downloaded. A document arrives at the model as a delimited block that names the file, the page
+  count and whether the text was cut, and that states outright that the text came from the
+  sender and is untrusted; square brackets in the text are defused, so a document cannot plant an
+  attachment marker of its own. Every rejection is a visible `[Attachment rejected: …]` note
+  rather than silence. The limits are constants, not config keys: 10 MiB per document, 50 PDF
+  pages, 50,000 forwarded characters, 20 seconds per extraction with one extraction at a time,
+  and a DOCX that expands to at most 50 MiB. Documents are budgeted separately from images — 5
+  documents per sender per 10 minutes, consulted **before** any download, so an exhausted sender
+  costs no bandwidth and no `getFile` call. A Telegram document with no caption from an allowed
+  user used to be routed to the unauthorized-user path, because it parsed as empty; it is now
+  policy-checked and answered like any other message. A DOCX needs the `kb-office` feature, which
+  is not a default: a default build refuses a DOCX with a note that says why. Every other channel
+  keeps ignoring documents, and no document is ever written to disk. The full rules are in
+  `docs/security/inbound-media-policy.md`.
 
 ### Changed
 
