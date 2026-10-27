@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Password};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -94,29 +94,79 @@ pub async fn run_interactive(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// A credential a surface collected for a curated server, before it is
+/// validated and mapped to the server's env pairs.
+pub(crate) enum CollectedCredential {
+    /// A token the operator typed in (terminal masked input or a TUI prompt).
+    Typed(String),
+    /// The access token a finished OAuth flow returned.
+    OAuthToken(String),
+}
+
+/// Map a collected credential to the env pairs `register_mcp` stores, or
+/// fail naming the exact step that finishes the setup when the credential
+/// is missing or empty.
+///
+/// Both credential surfaces — this module's terminal picker and the TUI
+/// [`crate::onboard::provision::mcp::McpProvisioner`] — route through here,
+/// so neither can produce env pairs for a credential that was never
+/// actually obtained. The env-key mapping lives here too, so the two
+/// surfaces cannot drift on where a credential is stored.
+pub(crate) fn credential_env_pairs(
+    server: &CuratedMcpServer,
+    credential: CollectedCredential,
+) -> Result<Vec<(String, String)>> {
+    let (token, what_next) = match credential {
+        CollectedCredential::Typed(token) => (
+            token,
+            "re-run `rantaiclaw setup mcp` and paste the token to finish the setup".to_string(),
+        ),
+        CollectedCredential::OAuthToken(token) => (
+            token,
+            "re-run `rantaiclaw setup mcp` to retry the login".to_string(),
+        ),
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("no credential obtained — {what_next}");
+    }
+    match &server.auth {
+        AuthMethod::Token { secret_key, .. } => {
+            Ok(vec![((*secret_key).to_string(), token.to_string())])
+        }
+        AuthMethod::OAuth { .. } => Ok(vec![(oauth_env_key(server.slug), token.to_string())]),
+        AuthMethod::None => Ok(Vec::new()),
+    }
+}
+
+/// The env key an OAuth credential for `slug` is stored under.
+fn oauth_env_key(slug: &str) -> String {
+    format!("{}_OAUTH_TOKEN", slug.replace('-', "_").to_uppercase())
+}
+
 /// Collect credentials, validate, register in config.
 /// Bubbling an error short-circuits *only that server*; the caller
 /// catches and warns.
 async fn collect_and_register(config: &mut Config, server: &CuratedMcpServer) -> Result<()> {
     let theme = ColorfulTheme::default();
-    let env_pairs: Vec<(String, String)> = match &server.auth {
-        AuthMethod::None => Vec::new(),
+    let credential = match &server.auth {
+        AuthMethod::None => None,
         AuthMethod::Token { secret_key, hint } => {
             let prompt = format!("{} — paste {} ({})", server.display_name, secret_key, hint);
             let token = Password::with_theme(&theme)
                 .with_prompt(prompt)
                 .interact()
                 .context("read masked token")?;
-            vec![((*secret_key).to_string(), token)]
+            Some(CollectedCredential::Typed(token))
         }
         AuthMethod::OAuth { provider, scopes } => {
             let token = oauth::run_oauth(*provider, scopes).await?;
-            let env_key = format!(
-                "{}_OAUTH_TOKEN",
-                server.slug.replace('-', "_").to_uppercase()
-            );
-            vec![(env_key, token)]
+            Some(CollectedCredential::OAuthToken(token))
         }
+    };
+    let env_pairs = match credential {
+        Some(c) => credential_env_pairs(server, c)?,
+        None => Vec::new(),
     };
 
     validate_mcp_startup(server, &env_pairs).await?;

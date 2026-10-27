@@ -5987,13 +5987,18 @@ mod tests {
         let mut config = crate::channels::tests::config_with_only_channel("telegram");
         config.default_provider = Some("openrouter".into());
         config.api_key = Some("sk-test".into());
-        // mcp: a curated server registered.
+        // mcp: a curated server registered **with its credential** — the
+        // section counts an authed server as configured only once the login
+        // actually finished, so the fixture mirrors `section::mcp`'s own
+        // tests and gives Notion its token.
+        let mut mcp_env = std::collections::HashMap::default();
+        mcp_env.insert("NOTION_API_KEY".to_string(), "secret".to_string());
         config.mcp_servers.insert(
             "notion".into(),
             crate::config::schema::McpServerConfig {
                 command: "npx".into(),
                 args: vec![],
-                env: std::collections::HashMap::default(),
+                env: mcp_env,
             },
         );
         // login: a stored password hash.
