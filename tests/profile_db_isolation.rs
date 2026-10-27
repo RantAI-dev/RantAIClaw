@@ -74,6 +74,9 @@ fn global_data_dir(home: &Path) -> std::path::PathBuf {
 #[test]
 fn sessions_are_isolated_per_profile() {
     with_home(|_home| {
+        // A profile that does not exist is refused now; create both first.
+        ProfileManager::ensure("work").unwrap();
+        ProfileManager::ensure("personal").unwrap();
         std::env::set_var("RANTAICLAW_PROFILE", "work");
         let work_store = rantaiclaw::sessions::cli::open_store().expect("open work store");
         work_store

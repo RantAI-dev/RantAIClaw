@@ -151,7 +151,7 @@ Single-topic examples:
 - `rantaiclaw service uninstall`
 
 `service install` records the profile in the unit: when the installer ran with a
-profile chosen explicitly (the global `-p <name>` flag or `RANTAICLAW_PROFILE`), the
+profile chosen explicitly (the global `--profile <name>` flag or `RANTAICLAW_PROFILE`), the
 unit is pinned to that profile via `RANTAICLAW_PROFILE` and `profile use` will not move
 it — reinstall from the other profile to move the service. Without an explicit profile
 the unit carries no `RANTAICLAW_PROFILE`, so the daemon follows the active-profile
@@ -786,8 +786,9 @@ config, persona, workspace, memory, skills, sessions, policy, secrets and runtim
 | `current` | Print the active profile name |
 
 To switch for a single invocation without moving the active marker, use the global
-`-p <name>` flag or the `RANTAICLAW_PROFILE` environment variable. Precedence is
-**CLI flag > env var > active-profile file > `default`**.
+`--profile <name>` flag or the `RANTAICLAW_PROFILE` environment variable. The named
+profile must already exist (only `default` self-bootstraps, on the first run).
+Precedence is **CLI flag > env var > active-profile file > `default`**.
 
 While a config-directory override is in effect, it pins the profile: `profile use`,
 `--profile` and `RANTAICLAW_PROFILE` naming a different profile are refused with a

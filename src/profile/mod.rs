@@ -10,7 +10,7 @@
 //! `rantaiclaw profile create <name> [--clone <src>]`.
 //!
 //! Active-profile resolution precedence (first match wins):
-//!   1. `RANTAICLAW_PROFILE` env var (set by the `-p, --profile` CLI flag).
+//!   1. `RANTAICLAW_PROFILE` env var (set by the `--profile` CLI flag).
 //!   2. `~/.rantaiclaw/active_profile` file contents.
 //!   3. The literal string `"default"`.
 
@@ -159,6 +159,10 @@ impl ProfileManager {
         // override does not keep in effect: the run would read the config
         // from one profile and the per-profile stores from another.
         config_override::refuse_switch(&name)?;
+        // A name that names nothing must not silently become a new, empty
+        // profile directory; `default` stays self-bootstrapping for the
+        // first run.
+        Self::require_existing(&name)?;
         Self::ensure(&name)
     }
 
@@ -252,15 +256,28 @@ impl ProfileManager {
     /// Unlike [`ProfileManager::ensure`] this never creates anything: it is
     /// the door for a name that NAMES an existing profile (a clone source).
     fn existing(name: &str) -> Result<Profile> {
-        validate_profile_name(name)?;
-        let dir = paths::profile_dir(name);
-        if !dir.exists() {
-            bail!("profile {name:?} does not exist at {}", dir.display());
-        }
+        Self::require_existing(name)?;
         Ok(Profile {
             name: name.to_string(),
-            root: dir,
+            root: paths::profile_dir(name),
         })
+    }
+
+    /// Refuse a profile name that does not exist on disk. `default` is
+    /// exempt so the first run can still bootstrap it. The door for the
+    /// `--profile` flag and for [`ProfileManager::active`]: a name that
+    /// names nothing must not silently become a new, empty profile
+    /// directory.
+    pub fn require_existing(name: &str) -> Result<()> {
+        validate_profile_name(name)?;
+        if name == "default" || paths::profile_dir(name).exists() {
+            return Ok(());
+        }
+        let dir = paths::profile_dir(name);
+        bail!(
+            "profile {name:?} does not exist at {}; create it with `rantaiclaw profile create {name}`",
+            dir.display()
+        )
     }
 
     /// Set the active profile. Refuses unknown profile names so users get a
@@ -885,6 +902,68 @@ mod profile_root_tests {
             message.contains("RANTAICLAW_CONFIG_DIR") && message.contains("work"),
             "the refusal must name the override and the profile: {message}"
         );
+    }
+
+    /// The existence door: `--profile` and `active()` refuse a name that
+    /// does not exist, where the name used to silently become a new, empty
+    /// profile directory. `default` stays bootstrappable for the first run.
+    #[test]
+    fn a_profile_name_that_names_nothing_is_refused_by_the_existence_door() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        let error = ProfileManager::require_existing("work").expect_err("nothing exists yet");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("work") && message.contains("profile create work"),
+            "the refusal must name the profile and the remedy: {message}"
+        );
+
+        ProfileManager::require_existing("default")
+            .expect("default is exempt: the first run bootstraps it");
+        ProfileManager::ensure_default().unwrap();
+        ProfileManager::require_existing("default").unwrap();
+
+        ProfileManager::ensure("work").unwrap();
+        ProfileManager::require_existing("work").expect("an existing profile passes the door");
+    }
+
+    /// `active()` refuses a resolved name that does not exist — from the
+    /// environment or from the marker — where it used to create the
+    /// directory. A stale marker is healed by switching back to `default`,
+    /// which does not go through `active()`.
+    #[test]
+    fn active_refuses_a_resolved_profile_that_does_not_exist() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        let g_profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "work");
+        let error = ProfileManager::active().expect_err("work does not exist");
+        assert!(
+            format!("{error:#}").contains("profile create work"),
+            "{error:#}"
+        );
+        assert!(
+            !paths::profile_dir("work").exists(),
+            "a refused name must not create the directory"
+        );
+        drop(g_profile);
+
+        ProfileManager::ensure_default().unwrap();
+        std::fs::write(paths::active_profile_file(), "ghost\n").unwrap();
+        let error = ProfileManager::active().expect_err("ghost does not exist");
+        assert!(format!("{error:#}").contains("ghost"), "{error:#}");
+        assert!(!paths::profile_dir("ghost").exists());
+
+        ProfileManager::use_profile("default").expect("the switch back heals a stale marker");
+        ProfileManager::active().expect("default exists again");
     }
 
     /// A name from the marker or the environment that could escape the

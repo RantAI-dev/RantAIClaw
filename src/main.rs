@@ -802,15 +802,16 @@ Manage profiles. Each profile is a self-contained \
 ~/.rantaiclaw/profiles/<name>/ directory with its own config, persona, \
 workspace, memory, skills, sessions, policy, secrets and runtime state.
 
-The default profile is auto-created on first run. Use `-p <name>` (or \
-the RANTAICLAW_PROFILE env var) to switch profiles for a single \
-invocation without changing the active marker.
+The default profile is auto-created on first run. Use `--profile <name>` \
+(or the RANTAICLAW_PROFILE env var) to switch profiles for a single \
+invocation without changing the active marker. The named profile must \
+already exist.
 
 Examples:
   rantaiclaw profile list
   rantaiclaw profile create work --clone default
   rantaiclaw profile use work
-  rantaiclaw -p work profile current")]
+  rantaiclaw --profile work profile current")]
     Profile {
         #[command(subcommand)]
         cmd: profile::commands::ProfileCommand,
@@ -1389,6 +1390,10 @@ async fn main() -> Result<()> {
         // does not keep in effect: the run would read the config from one
         // profile and the per-profile stores from another.
         rantaiclaw::profile::config_override::refuse_switch(profile_name)?;
+        // A flag naming a profile that does not exist is refused before it
+        // reaches any command: it used to become a new, empty profile
+        // directory. `default` stays bootstrappable for the first run.
+        rantaiclaw::profile::ProfileManager::require_existing(profile_name)?;
         std::env::set_var("RANTAICLAW_PROFILE", profile_name);
     }
 

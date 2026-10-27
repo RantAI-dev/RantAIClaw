@@ -482,6 +482,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an empty profile and copy that. A name read from the marker or the
   environment that could escape the profiles directory falls back to
   `default` with a warning instead of becoming a path.
+- `--profile <name>` and `RANTAICLAW_PROFILE=<name>` silently created a
+  profile that did not exist: any command that resolves the active profile
+  ran `ensure` on the name, so a typo built an empty `profiles/<name>/`
+  directory — no config, persona or secrets of its own — and ran against
+  it. A flag or environment variable naming a profile that does not exist
+  is now refused with the remedy (`create it with rantaiclaw profile
+  create <name>`); the same refusal covers an active-profile marker naming
+  a deleted profile, and `default` keeps self-bootstrapping on the first
+  run. The check runs when the flag is applied, before the subcommand, so
+  `--profile work profile create work` is refused — create the profile
+  first, without the flag. A command whose config resolution misses the
+  profile (the flat `~/.rantaiclaw/config.toml` fallback) is unchanged: it
+  creates nothing under `profiles/`. The help no longer claims a `-p`
+  short flag: no such flag exists (`agent -p` is `--provider`), and every
+  help and doc mention of one is now `--profile`.
 
 ## [0.33.0-alpha] — 2026-10-08
 
