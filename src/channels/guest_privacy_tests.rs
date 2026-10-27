@@ -716,6 +716,9 @@ async fn guest_channel_turn_uses_guest_persona_without_owner_name_or_timezone() 
     let _home = crate::test_env::HomeGuard::set(home.path());
     let _profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-persona-dispatch");
 
+    // The profile this test names in the environment has to exist: the
+    // existence door refuses a name that names nothing.
+    crate::profile::ProfileManager::ensure("rt-persona-dispatch").expect("the profile tree");
     let profile = crate::profile::ProfileManager::active().unwrap();
     crate::persona::write_persona_toml(
         &profile,
@@ -2675,6 +2678,10 @@ impl Deployment {
             crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
         let profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "guest-privacy");
 
+        // A profile named by the environment must exist: the existence door
+        // refuses a name that names nothing, so the deployment creates the
+        // one it names before it resolves it.
+        crate::profile::ProfileManager::ensure("guest-privacy").expect("the profile tree");
         let active = crate::profile::ProfileManager::active().expect("the profile resolves");
         crate::persona::write_persona_toml(
             &active,

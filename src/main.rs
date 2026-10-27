@@ -1348,6 +1348,15 @@ enum IntegrationCommands {
     },
 }
 
+/// Whether the command is one of the profile-management commands.
+///
+/// The profile commands are the way out of a bad profile selection (a list,
+/// a create, a delete), so the environment door that refuses a selection
+/// under an override leaves them alone.
+fn is_profile_command(command: Option<&Commands>) -> bool {
+    matches!(command, Some(Commands::Profile { .. }))
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -1382,19 +1391,29 @@ async fn main() -> Result<()> {
         if profile_name.is_empty() {
             bail!("--profile cannot be empty");
         }
-        // One validator at every door a profile name enters: a name that
-        // could escape the profiles directory is refused before it becomes
-        // an environment variable every path is built from.
-        rantaiclaw::profile::validate_profile_name(profile_name)?;
-        // An override that pins the config directory refuses a profile it
-        // does not keep in effect: the run would read the config from one
-        // profile and the per-profile stores from another.
-        rantaiclaw::profile::config_override::refuse_switch(profile_name)?;
-        // A flag naming a profile that does not exist is refused before it
-        // reaches any command: it used to become a new, empty profile
-        // directory. `default` stays bootstrappable for the first run.
-        rantaiclaw::profile::ProfileManager::require_existing(profile_name)?;
+        // The selection door: one validator at every door a profile name
+        // enters (a name that could escape the profiles directory is
+        // refused before it becomes an environment variable every path is
+        // built from), an override that pins the config directory refusing
+        // a profile it does not keep in effect, and a flag naming a profile
+        // that does not exist refused before it reaches any command (it used
+        // to become a new, empty profile directory). `default` stays
+        // bootstrappable for the first run.
+        rantaiclaw::profile::ProfileManager::require_selectable(profile_name)?;
         std::env::set_var("RANTAICLAW_PROFILE", profile_name);
+    } else if !is_profile_command(cli.command.as_ref()) {
+        // The environment door: `RANTAICLAW_PROFILE` names the profile for
+        // this invocation exactly as `--profile` does, so it passes the same
+        // door — the same one sentence, the same remedy. The profile
+        // commands are exempt: they are the way out of a bad selection (a
+        // list, a create, a delete), and they must keep working while an
+        // override is in effect.
+        if let Ok(env_profile) = std::env::var("RANTAICLAW_PROFILE") {
+            let env_profile = env_profile.trim();
+            if !env_profile.is_empty() {
+                rantaiclaw::profile::ProfileManager::require_selectable(env_profile)?;
+            }
+        }
     }
 
     // No subcommand: launch TUI (bare invocation).

@@ -469,9 +469,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config directory, and `profile use` moved everything else anyway. A switch
   that names a profile other than the one the override keeps in effect is now
   refused with a one-line message naming the override and how to clear it, and
-  the same refusal covers `--profile` and `RANTAICLAW_PROFILE` at every command
-  that resolves a profile. A marker that names a profile directory of this
-  root (`~/.rantaiclaw/profiles/<name>`) is a profile pointer, not an
+  the same refusal covers a profile selected by `--profile` or by
+  `RANTAICLAW_PROFILE`, at the door where the selection is made. The profile
+  commands (`profile list`, `profile current`, `profile create`, `profile
+  delete`) stay available under an override — they are the way out of a
+  selection that cannot be used. A marker that names a profile directory of
+  this root (`~/.rantaiclaw/profiles/<name>`) is a profile pointer, not an
   override: the onboarding wizard writes that shape, and it yields to the
   active profile, so `profile use` moves the whole install as before. Two
   name-handling holes closed on the way: `profile create` and `profile clone`

@@ -2021,6 +2021,9 @@ mod tests {
         let _profile_env =
             crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-prompt-persona-owner-only");
 
+        // The profile this test names in the environment has to exist: the
+        // existence door refuses a name that names nothing.
+        crate::profile::ProfileManager::ensure("rt-prompt-persona-owner-only").expect("profile");
         let profile = crate::profile::ProfileManager::active().unwrap();
         crate::persona::write_persona_toml(
             &profile,
@@ -2093,6 +2096,9 @@ mod tests {
         let _profile_env =
             crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-prompt-persona-guest");
 
+        // The profile this test names in the environment has to exist: the
+        // existence door refuses a name that names nothing.
+        crate::profile::ProfileManager::ensure("rt-prompt-persona-guest").expect("profile");
         let profile = crate::profile::ProfileManager::active().unwrap();
         crate::persona::write_persona_toml(
             &profile,

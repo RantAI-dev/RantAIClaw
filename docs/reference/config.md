@@ -30,6 +30,12 @@ real, clear the override first (`unset RANTAICLAW_CONFIG_DIR`, or remove the
 marker). The onboarding wizard writes a pointer marker (one that names
 `profiles/<name>` of this root), which pins nothing.
 
+The refusal sits at the three doors that switch or select a profile — `profile
+use`, the `--profile` flag and the `RANTAICLAW_PROFILE` environment variable.
+The profile commands (`profile list`, `profile current`, `profile create`,
+`profile delete`) stay available under an override: they are the way out of a
+selection that cannot be used.
+
 The sentinel is the one that surprises people. It records which process owns the
 channels for a profile, and it is keyed on the profile *name*, not on the config
 in use — so a TUI started with `RANTAICLAW_CONFIG_DIR` pointing somewhere else

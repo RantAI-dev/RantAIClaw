@@ -795,7 +795,9 @@ While a config-directory override is in effect, it pins the profile: `profile us
 one-line message naming the override and how to clear it. An `active_workspace.toml`
 marker that names a profile directory of this root (`profiles/<name>`) is a pointer
 to the active profile, not an override — onboarding writes that shape, so switching
-profiles keeps working.
+profiles keeps working. The refusal sits at those three doors, not in the profile
+resolution: `profile list`, `profile current`, `profile create` and `profile delete`
+stay available under an override, so a selection that cannot be used is still fixable.
 
 ### `session`
 

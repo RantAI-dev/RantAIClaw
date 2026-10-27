@@ -13,6 +13,11 @@
 //! command would leave one install pointing at two profiles. So a switch that
 //! names a profile other than the one the override keeps in effect is
 //! refused, and the refusal names the override and how to clear it.
+//!
+//! The refusal belongs to the doors that switch or select a profile — `profile
+//! use`, the `--profile` flag, the `RANTAICLAW_PROFILE` environment variable —
+//! not to the resolution of the active profile: a command that only reads a
+//! profile is not stopped by it.
 
 use std::path::{Path, PathBuf};
 

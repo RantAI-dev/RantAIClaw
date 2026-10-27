@@ -153,12 +153,14 @@ impl ProfileManager {
 
     /// Resolve + ensure the active profile in one call. The hot path for
     /// every config-reading entry point.
+    ///
+    /// This is the RESOLVER, not a switch: it reads the profile the
+    /// environment names and never moves one. The rule that keeps an
+    /// override from splitting an install lives at the doors that switch or
+    /// select a profile — [`ProfileManager::use_profile_with`] for the
+    /// switch, [`ProfileManager::require_selectable`] for a selection.
     pub fn active() -> Result<Profile> {
         let name = Self::resolve_active_name();
-        // An override that pins the config directory refuses a profile the
-        // override does not keep in effect: the run would read the config
-        // from one profile and the per-profile stores from another.
-        config_override::refuse_switch(&name)?;
         // A name that names nothing must not silently become a new, empty
         // profile directory; `default` stays self-bootstrapping for the
         // first run.
@@ -278,6 +280,23 @@ impl ProfileManager {
             "profile {name:?} does not exist at {}; create it with `rantaiclaw profile create {name}`",
             dir.display()
         )
+    }
+
+    /// The door a profile *selection* passes: the `--profile` flag and the
+    /// `RANTAICLAW_PROFILE` environment variable.
+    ///
+    /// Two rules, in this order:
+    ///
+    /// 1. An override that pins the config directory refuses a profile it
+    ///    does not keep in effect: the run would read the config from one
+    ///    profile and the per-profile stores from another.
+    /// 2. A name that names nothing is refused: it used to become a new,
+    ///    empty profile directory. `default` stays bootstrappable for the
+    ///    first run.
+    pub fn require_selectable(name: &str) -> Result<()> {
+        validate_profile_name(name)?;
+        config_override::refuse_switch(name)?;
+        Self::require_existing(name)
     }
 
     /// Set the active profile. Refuses unknown profile names so users get a
@@ -880,12 +899,12 @@ mod profile_root_tests {
         assert_eq!(ProfileManager::marker_profile(), "old name");
     }
 
-    /// D2, env door: `RANTAICLAW_PROFILE` naming a profile other than the
-    /// one an override keeps in effect is refused where the profile is
-    /// resolved — every command that loads a profile fails with the same
-    /// one sentence.
+    /// D2, selection door: a profile selected for this invocation — by the
+    /// `--profile` flag or by `RANTAICLAW_PROFILE` — is refused while an
+    /// override keeps another profile in effect. It is the same one
+    /// sentence the switch door gives.
     #[test]
-    fn an_override_refuses_an_env_profile_it_does_not_pin() {
+    fn an_override_refuses_a_selection_it_does_not_pin() {
         let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::tempdir().expect("temp home");
         let scratch = tempfile::tempdir().expect("scratch config dir");
@@ -896,12 +915,34 @@ mod profile_root_tests {
 
         ProfileManager::ensure("work").unwrap();
 
-        let error = ProfileManager::active().expect_err("the env profile must be refused");
+        let error =
+            ProfileManager::require_selectable("work").expect_err("the selection must be refused");
         let message = format!("{error:#}");
         assert!(
             message.contains("RANTAICLAW_CONFIG_DIR") && message.contains("work"),
             "the refusal must name the override and the profile: {message}"
         );
+    }
+
+    /// The resolver is not a switch: it reads the profile the environment
+    /// names and never refuses one because an override is in effect. The
+    /// refusal belongs to the doors that switch or select a profile, so a
+    /// run that only reads a profile is not stopped by the rule that keeps
+    /// a switch from splitting an install.
+    #[test]
+    fn the_resolver_follows_the_environment_under_an_override() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let scratch = tempfile::tempdir().expect("scratch config dir");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", scratch.path());
+        let _g_profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "work");
+
+        ProfileManager::ensure("work").unwrap();
+
+        let profile = ProfileManager::active().expect("the profile resolves");
+        assert_eq!(profile.name, "work", "the resolver follows the environment");
     }
 
     /// The existence door: `--profile` and `active()` refuse a name that

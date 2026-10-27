@@ -1423,6 +1423,9 @@ mod tests {
         let _profile_env =
             crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-preset-drift-agent");
 
+        // The profile this test names in the environment has to exist: the
+        // existence door refuses a name that names nothing.
+        crate::profile::ProfileManager::ensure("rt-preset-drift-agent").expect("profile tree");
         let profile = crate::profile::ProfileManager::active().expect("profile tree");
         let workspace = tempfile::TempDir::new().unwrap();
         let mut config = crate::config::Config::default();
