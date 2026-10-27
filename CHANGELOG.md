@@ -101,6 +101,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unwritable is now refused where the connection previously went through, and the message names
   the file and how to repair it.
 
+- **An MCP OAuth login could be completed by the wrong callback.** The loopback listener the
+  flow binds on `127.0.0.1:11500` accepted the first request that arrived with a `code`,
+  whatever page it came from, and the authorization URL carried neither a `state` nor a PKCE
+  challenge — so any local process that hit the port first (a preconnect, a preview, a
+  malicious page) could hand the login a code of its choosing and have it exchanged. A
+  callback is now bound to its session: the authorization URL carries a one-time `state` and
+  an S256 `code_challenge`, the token exchange sends the matching `code_verifier`, and the
+  listener keeps the login alive across stray traffic — a wrong redirect slug, a missing
+  `state`, or a `state` that does not match this login is answered with a plain error page
+  and ignored, compared in constant time so a local prober cannot time its way to the
+  expected value. An `error=` parameter carrying the right `state` still ends the flow with
+  the provider's error. The bind stays `127.0.0.1:11500` and the authorization and token
+  endpoints stay constants; no environment variable or config key can redirect the exchange,
+  and the test-only seam that can is compiled out of production paths. No config key changed.
+
 ### Added
 
 - The console's `approval_request` event carries `always_available`. It is `true` when an Always answer holds for the rest of the conversation, and `false` when the modal should not offer Always (a medium-risk prompt, or a tool forced to prompt by `always_ask` or Manual).
@@ -119,6 +134,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the promise used to go unkept. It shares one verdict with the TUI's panel, so the two
   surfaces cannot disagree. An unhealthy scheduler is a failure, and it is the only new verdict
   that makes `rantaiclaw doctor` exit non-zero.
+- **Telegram and WhatsApp Web accept inbound documents** (PDF, DOCX, TXT). The type is
+  sniffed from the bytes — the platform's MIME type and the file name are an early filter and a
+  veto, never the decider — and the sender's announced size is checked before anything is
+  downloaded. A document arrives at the model as a delimited block that names the file, the page
+  count and whether the text was cut, and that states outright that the text came from the
+  sender and is untrusted; square brackets in the text are defused, so a document cannot plant an
+  attachment marker of its own. Every rejection is a visible `[Attachment rejected: …]` note
+  rather than silence. The limits are constants, not config keys: 10 MiB per document, 50 PDF
+  pages, 50,000 forwarded characters, 20 seconds per extraction with one extraction at a time,
+  and a DOCX that expands to at most 50 MiB. Documents are budgeted separately from images — 5
+  documents per sender per 10 minutes, consulted **before** any download, so an exhausted sender
+  costs no bandwidth and no `getFile` call. A Telegram document with no caption from an allowed
+  user used to be routed to the unauthorized-user path, because it parsed as empty; it is now
+  policy-checked and answered like any other message. A DOCX needs the `kb-office` feature, which
+  is not a default: a default build refuses a DOCX with a note that says why. Every other channel
+  keeps ignoring documents, and no document is ever written to disk. The full rules are in
+  `docs/security/inbound-media-policy.md`.
 
 ### Changed
 
@@ -512,6 +544,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the next config save replaces it. The values are not converted: a wrong
   price is worse than none. A config that already carries the current shape
   keeps its table and raises no warning.
+- The MCP provisioner claimed a server was authed without a finished login. Selecting an OAuth
+  server (Google Drive) registered it and counted it under "N authed" even when no credential
+  was ever obtained: a session that could not show a URL and wait for the browser skipped the
+  flow entirely, and a token prompt answered with an empty string still produced a registered,
+  counted server holding an empty credential. A server is now registered and counted as authed
+  only after its credential was actually obtained. The OAuth flow runs when the session can
+  show a URL and wait; when it cannot — headless, or the client id and secret missing from the
+  environment — the server is not registered and the summary names it with the exact step that
+  finishes the setup, `rantaiclaw setup mcp`. An empty token answer is refused the same way.
+  The onboard wizard's MCP section agrees: an authed server counts as already configured only
+  when its credential env key holds a non-empty value, so the tokenless entries a claiming
+  setup wrote no longer silence the picker. Both surfaces route credential collection through
+  one shared gate so they cannot drift apart again. No config key changed.
+- A headless run's MCP hint named a command that does not exist: `rantaiclaw mcp add <slug>`
+  was never wired up, and there is no per-server command to wire — the picker is the only
+  surface that collects credentials. The hint now names the real command, `rantaiclaw setup
+  mcp`, once, followed by the curated servers the picker would offer.
+- A headless run's MCP hint also named curated servers that no longer exist: Google Calendar
+  and Gmail were dropped from the curated list in v0.6.51, but the hint kept naming them
+  beside the servers the picker really offers. The hint now names only the command that
+  finishes the setup; the curated servers it lists come from the registry. The docs page for
+  the MCP pillar counts the curated picker as six servers again (2 zero-auth, 4 needing
+  auth) instead of eight or nine.
 
 ## [0.33.0-alpha] — 2026-10-08
 

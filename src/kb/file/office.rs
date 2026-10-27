@@ -56,7 +56,7 @@ pub async fn process_office(path: &Path) -> KbResult<String> {
 /// Walk the docx document tree, concatenating paragraph text. Joins
 /// paragraphs with double-newline so the downstream chunker sees natural
 /// boundaries. Empty paragraphs are skipped to avoid burning chunk budget.
-fn process_docx(bytes: &[u8], display: &str) -> KbResult<String> {
+pub(crate) fn process_docx(bytes: &[u8], display: &str) -> KbResult<String> {
     let docx = docx_rs::read_docx(bytes).map_err(|e| KbError::Extraction {
         extractor: "docx-rs".into(),
         message: format!("read_docx failed for {display}: {e:?}"),
