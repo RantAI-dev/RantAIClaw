@@ -2180,6 +2180,7 @@ pub(crate) async fn run_structured_loop(
                     cancellation_token.as_ref(),
                     events.as_ref(),
                     on_delta.as_ref(),
+                    keep_from,
                     nudge,
                 )
                 .await?;
@@ -2221,6 +2222,7 @@ pub(crate) async fn run_structured_loop(
         cancellation_token.as_ref(),
         events.as_ref(),
         on_delta.as_ref(),
+        keep_from,
         nudge,
     )
     .await?;
@@ -2403,11 +2405,18 @@ async fn force_final_summary(
     cancellation_token: Option<&CancellationToken>,
     events: Option<&AgentEventSender>,
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    // The index the turn in flight starts at, so this call retires the
+    // document blocks of the turns that are over.
+    keep_from: usize,
     nudge: String,
 ) -> Result<(String, Option<crate::providers::ProviderUsage>)> {
     history.push(ConversationMessage::Chat(ChatMessage::user(nudge)));
 
-    let provider_msgs = dispatcher.to_provider_messages(history);
+    // The final call flattens the history like every other call, and an old
+    // document's text must not ride along in it: the turn it belonged to is
+    // over, and the text is the sender's text.
+    let redacted = crate::channels::media::redact_historic_document_blocks(history, keep_from);
+    let provider_msgs = dispatcher.to_provider_messages(&redacted);
     let prepared =
         multimodal::prepare_messages_for_provider(&provider_msgs, multimodal_config).await?;
     observer.record_event(&ObserverEvent::LlmRequest {
@@ -4113,6 +4122,82 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("the quarterly numbers are 42")),
             "the second call of the turn must still see the document's text: {second_call:?}"
+        );
+    }
+
+    /// An earlier turn's document is retired before the final summary call.
+    ///
+    /// The soft cap makes one last provider call with the tools off. That
+    /// call flattens the history like every other call, so it must not carry
+    /// an old document's text either: the turn that document belonged to is
+    /// over, and its text is the sender's text.
+    #[tokio::test]
+    async fn an_earlier_turn_document_is_retired_before_the_final_summary() {
+        let block = crate::channels::media::document_block(
+            crate::channels::media::DocumentKind::Pdf,
+            Some("report.pdf"),
+            Some(1),
+            false,
+            "the quarterly numbers are 42",
+        );
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>\n{\"name\":\"delay_a\",\"arguments\":{\"value\":\"A\"}}\n</tool_call>",
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "delay_a",
+            0,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        // The document arrived in an earlier turn; this turn is the question
+        // that follows it.
+        let mut history = vec![ChatMessage::user(block), ChatMessage::user("and now?")];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            &crate::config::MultimodalConfig::default(),
+            1,
+            None,
+            None,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            None,
+        )
+        .await
+        .expect("the turn should complete");
+
+        assert_eq!(result, "done");
+        let final_call = provider.request(1);
+        assert!(
+            !final_call
+                .iter()
+                .any(|message| message.content.contains("the quarterly numbers are 42")),
+            "the final summary must not carry an old document's text: {final_call:?}"
         );
     }
 
