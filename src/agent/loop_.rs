@@ -1905,14 +1905,6 @@ pub(crate) async fn run_structured_loop(
             multimodal::redact_historic_image_markers(provider_messages)
         };
 
-        // A document's text is the sender's text. Carrying it in every later
-        // turn keeps a stale injection surface alive and bloats the prompt
-        // with it, so an old document block becomes a one-line stub the way an
-        // old image marker does. This runs whatever the provider can see: the
-        // text is the sender's, not the model's problem to keep.
-        let provider_messages =
-            crate::channels::media::redact_historic_document_blocks(provider_messages);
-
         let image_marker_count = multimodal::count_image_markers(&provider_messages);
         if image_marker_count > 0 && !provider.supports_vision() {
             return Err(ProviderCapabilityError {
