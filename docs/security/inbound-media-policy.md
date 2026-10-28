@@ -229,8 +229,8 @@ constant limit:
   starts.
 - **Characters: at most 50,000** of extracted text are forwarded; a longer
   extraction is **cut with a visible note**, never silently clipped.
-- **Time: at most 20 seconds** per extraction, **one extraction at a time per
-  process**.
+- **Time: at most 20 seconds** for the whole extraction, the wait for the slot
+  included, with **one extraction at a time per process**.
 
 The extraction runs in a **child process**, not in a blocking task of the agent.
 The parent (`src/kb/extract/child_process.rs`) starts the same binary with a
@@ -242,10 +242,10 @@ hidden subcommand, hands it the document on stdin and reads one answer back:
 - On **unix** the child also gets a **512 MiB memory ceiling** (`RLIMIT_AS`),
   with a CPU limit five seconds past the deadline as a backstop. On every other
   target the deadline kill is the only limit.
-- The child gets **no environment**: the parent clears it and sets only the
-  request — the document kind, the page cap and the character cap. No HOME, no
-  PATH, no provider key and no configuration directory is in reach through the
-  environment.
+- The child gets **no environment of its own**: the parent clears it and sets
+  only the request — the document kind, the page cap, the character cap and the
+  marker that says "this process is the child". No HOME, no PATH, no provider
+  key and no configuration directory is in reach through the environment.
 - The boundary is a **crash boundary, not a privilege boundary**. The child runs
   with the agent's own filesystem and network reach: a parser that wanted to
   read an operator file or open a socket could. What the child cannot do is

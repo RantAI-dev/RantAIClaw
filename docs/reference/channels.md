@@ -780,17 +780,19 @@ summary.
   constraint. A claim that is right does not make the bytes safe — the sniff
   always runs.
 - **Nothing is written to disk.** The bytes are read into memory and parsed
-  somewhere else: the parsing happens in a **child process** that holds no
-  environment and no configuration, and the document travels to it over a pipe.
-  There is no temp file, not even a short-lived one. The child keeps the
-  agent's own filesystem and network reach, so the boundary contains a crash,
-  not a privilege.
+  somewhere else: the parsing happens in a **child process** whose environment
+  holds four fixed request variables and nothing else — no HOME, no PATH, no
+  provider key, no configuration directory — and the document travels to it
+  over a pipe. There is no temp file, not even a short-lived one. The child
+  keeps the agent's own filesystem and network reach, so the boundary contains
+  a crash, not a privilege.
 - **The limits are constants, not config keys.** 10 MiB per document (checked on
   the announced size before any download and again on the bounded read; over the
   cap is refused, never truncated), 50 PDF pages counted from the bytes before
   the text is extracted, 50,000 characters of extracted text (a longer extraction
-  is cut with a visible note), 20 seconds per extraction with one extraction at a
-  time per process, and a DOCX whose ZIP directory declares more than 50 MiB
+  is cut with a visible note), 20 seconds for the whole extraction — waiting for
+  the one-at-a-time slot included — and a DOCX whose ZIP directory declares more
+  than 50 MiB
   uncompressed (the zip bomb cap). The extraction runs in a **child process**
   that is killed and reaped at the deadline, so the one-at-a-time slot is
   released when the child dies and a timed-out extraction is a rejection, not a
