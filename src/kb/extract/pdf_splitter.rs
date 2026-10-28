@@ -73,23 +73,16 @@ fn split_blocking(pdf_bytes: &[u8], pages_per_segment: usize) -> KbResult<Vec<Ve
 /// `getPdfPageCount` from the TS source.
 pub async fn get_page_count(pdf_bytes: &[u8]) -> KbResult<u32> {
     let bytes = pdf_bytes.to_vec();
-    tokio::task::spawn_blocking(move || page_count(&bytes))
-        .await
-        .map_err(|e| KbError::Other(format!("pdf_splitter join error: {e}")))?
-}
-
-/// The page count, read synchronously from the bytes.
-///
-/// The async [`get_page_count`] is this inside a blocking task. The inbound
-/// extractor is already on a blocking thread and needs the count *before* it
-/// extracts, so it calls this directly.
-pub fn page_count(pdf_bytes: &[u8]) -> KbResult<u32> {
-    let doc = Document::load_mem(pdf_bytes).map_err(|e| KbError::Extraction {
-        extractor: "pdf_splitter".into(),
-        message: format!("load failed: {e}"),
-    })?;
-    u32::try_from(doc.get_pages().len()).map_err(|_| KbError::Extraction {
-        extractor: "pdf_splitter".into(),
-        message: "page count exceeds u32".into(),
+    tokio::task::spawn_blocking(move || {
+        let doc = Document::load_mem(&bytes).map_err(|e| KbError::Extraction {
+            extractor: "pdf_splitter".into(),
+            message: format!("load failed: {e}"),
+        })?;
+        u32::try_from(doc.get_pages().len()).map_err(|_| KbError::Extraction {
+            extractor: "pdf_splitter".into(),
+            message: "page count exceeds u32".into(),
+        })
     })
+    .await
+    .map_err(|e| KbError::Other(format!("pdf_splitter join error: {e}")))?
 }

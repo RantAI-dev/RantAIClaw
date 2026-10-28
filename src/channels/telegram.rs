@@ -1,4 +1,3 @@
-use super::media::{InboundAttachment, InboundDocument};
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
@@ -1165,10 +1164,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     pub(crate) fn parse_update_message(
         &self,
         update: &serde_json::Value,
-    ) -> Option<(ChannelMessage, Option<InboundAttachment>)> {
+    ) -> Option<(ChannelMessage, Option<String>)> {
         let message = update.get("message")?;
 
-        // Support text, photo and document messages (with optional caption)
+        // Support both text messages and photo messages (with optional caption)
         let text_opt = message.get("text").and_then(serde_json::Value::as_str);
         let caption_opt = message.get("caption").and_then(serde_json::Value::as_str);
 
@@ -1181,19 +1180,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string());
 
-        // A document is a message of its own: it carries no text, and the
-        // caption is optional. It used to parse as empty, which sent an
-        // allowed user's document down the unauthorized-user path.
-        let document = message.get("document").and_then(Self::parse_document);
-
-        // Require at least text, caption, photo, or document
-        let text = match (text_opt, caption_opt, &photo_file_id, &document) {
-            (Some(t), _, _, _) => t.to_string(),
-            (None, Some(c), _, _) => c.to_string(),
-            // A photo or a document carries no text of its own: the image
-            // marker or the document block is filled in later.
-            (None, None, Some(_), _) | (None, None, None, Some(_)) => String::new(),
-            (None, None, None, None) => return None,
+        // Require at least text, caption, or photo
+        let text = match (text_opt, caption_opt, &photo_file_id) {
+            (Some(t), _, _) => t.to_string(),
+            (None, Some(c), _) => c.to_string(),
+            (None, None, Some(_)) => String::new(), // will be filled with image marker later
+            (None, None, None) => return None,
         };
 
         let username = message
@@ -1276,26 +1268,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        // Telegram carries one media kind per message — a photo and a
-        // document never share one, and a media group is several messages —
-        // so the photo keeps the precedence it always had.
-        let has_document = document.is_some();
-        let attachment = match (photo_file_id, document) {
-            (Some(file_id), _) => Some(InboundAttachment::Photo { file_id }),
-            (None, Some(document)) => Some(InboundAttachment::Document(document)),
-            (None, None) => None,
-        };
-
         let content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
-            match Self::normalize_incoming_content(&text, bot_username) {
-                Some(content) => content,
-                // A document carries its own content; the caption is only the
-                // address. The photo path keeps the behaviour it always had.
-                None if has_document => String::new(),
-                None => return None,
-            }
+            Self::normalize_incoming_content(&text, bot_username)?
         } else {
             text.to_string()
         };
@@ -1327,111 +1303,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 sender_aliases,
                 is_direct,
             },
-            attachment,
+            photo_file_id,
         ))
-    }
-
-    /// The document a Telegram message carries, if it carries one.
-    ///
-    /// Telegram announces a document with its handle, its type, the name the
-    /// sender chose and its size. All four are the sender's to influence, so
-    /// none of them decides anything here: the bytes do.
-    fn parse_document(document: &serde_json::Value) -> Option<InboundDocument> {
-        let file_id = document
-            .get("file_id")
-            .and_then(serde_json::Value::as_str)?;
-        if file_id.is_empty() {
-            return None;
-        }
-        Some(InboundDocument {
-            file_id: file_id.to_string(),
-            mime_type: document
-                .get("mime_type")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            file_name: document
-                .get("file_name")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            file_size: document
-                .get("file_size")
-                .and_then(serde_json::Value::as_u64),
-        })
-    }
-
-    /// Resolve a Telegram document to the block the model reads, or to the
-    /// note the sender should see.
-    ///
-    /// The order is the policy's: what this build can read, then the budget
-    /// — peeked **before** `getFile`, an authenticated round trip an exhausted
-    /// sender must not be able to make — then the announced size, then the
-    /// bounded download, then the sniff, and only then the extraction.
-    async fn resolve_document_block(
-        &self,
-        document: &InboundDocument,
-        sender: &str,
-        message_id: &str,
-    ) -> crate::channels::media::DocumentOutcome {
-        use crate::channels::media::DocumentOutcome;
-
-        let sender_key = format!("telegram:{sender}");
-        let claim = document.claim();
-
-        // A build that cannot read documents says so before it spends a
-        // request on one.
-        if let Some(reason) = crate::channels::media::unreadable_build_reason(&claim) {
-            return DocumentOutcome::Rejected(reason.into());
-        }
-
-        // Budget first: `getFile` is an authenticated round trip, and the
-        // charge inside the download below happens a request too late to
-        // spare an exhausted sender that one.
-        if let Err(reason) = crate::channels::media::peek_document(&sender_key) {
-            return DocumentOutcome::Rejected(reason);
-        }
-
-        // The announced size is advisory, but it is free.
-        if let Some(reason) = crate::channels::media::announced_size_reason(document.file_size) {
-            return DocumentOutcome::Rejected(reason);
-        }
-
-        // `getFile` resolves the handle to a path.
-        let get_file_url = self.api_url(&format!("getFile?file_id={}", document.file_id));
-        let Ok(resp) = self.http_client().get(&get_file_url).send().await else {
-            return DocumentOutcome::Rejected("the document could not be downloaded".into());
-        };
-        let Ok(json) = resp.json::<serde_json::Value>().await else {
-            return DocumentOutcome::Rejected("the document could not be downloaded".into());
-        };
-        let Some(file_path) = json
-            .get("result")
-            .and_then(|r| r.get("file_path"))
-            .and_then(|p| p.as_str())
-        else {
-            return DocumentOutcome::Rejected("the document could not be downloaded".into());
-        };
-        // The path comes from Telegram, but a `..` in it has no business in a
-        // URL this build assembles.
-        if file_path.contains("..") {
-            return DocumentOutcome::Rejected("the document could not be downloaded".into());
-        }
-
-        // The download itself is bounded, and charged before it starts.
-        let download_url = format!("{}/file/bot{}/{}", self.api_base, self.bot_token, file_path);
-        let bytes = match crate::channels::media::fetch_document_bytes(
-            &self.http_client(),
-            &download_url,
-            None,
-            &sender_key,
-            Some(message_id),
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(reason) => return DocumentOutcome::Rejected(reason),
-        };
-
-        crate::channels::media::document_outcome(bytes, &claim, document.file_name.as_deref()).await
     }
 
     /// Download a Telegram photo by file_id, resize to fit within 1024px, and return as base64 data URI.
@@ -2568,40 +2441,23 @@ Ensure only one `rantaiclaw` process is using this bot token."
                         continue;
                     }
 
-                    let Some((mut msg, attachment)) = self.parse_update_message(update) else {
+                    let Some((mut msg, photo_file_id)) = self.parse_update_message(update) else {
                         self.handle_unauthorized_message(update).await;
                         continue;
                     };
 
-                    match attachment {
-                        // Resolve the photo to a marker — or to a note saying
-                        // why it did not resolve. A dropped image used to be
-                        // silent.
-                        Some(InboundAttachment::Photo { file_id }) => {
-                            let marker = self
-                                .resolve_photo_marker(&file_id, &msg.sender, &msg.id)
-                                .await
-                                .to_marker();
-                            if msg.content.is_empty() {
-                                msg.content = marker;
-                            } else {
-                                msg.content = format!("{}\n{}", msg.content, marker);
-                            }
+                    // Resolve the photo to a marker — or to a note saying why
+                    // it did not resolve. A dropped image used to be silent.
+                    if let Some(file_id) = photo_file_id {
+                        let marker = self
+                            .resolve_photo_marker(&file_id, &msg.sender, &msg.id)
+                            .await
+                            .to_marker();
+                        if msg.content.is_empty() {
+                            msg.content = marker;
+                        } else {
+                            msg.content = format!("{}\n{}", msg.content, marker);
                         }
-                        // A document from an allowed user is policy-checked
-                        // and answered — never mistaken for an intruder.
-                        Some(InboundAttachment::Document(document)) => {
-                            let block = self
-                                .resolve_document_block(&document, &msg.sender, &msg.id)
-                                .await
-                                .to_text();
-                            if msg.content.is_empty() {
-                                msg.content = block;
-                            } else {
-                                msg.content = format!("{}\n{}", msg.content, block);
-                            }
-                        }
-                        None => {}
                     }
 
                     // Send "typing" indicator immediately when we receive a message
@@ -2689,7 +2545,7 @@ Ensure only one `rantaiclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::media::{parse_attachment_markers, InboundAttachment, InboundDocument};
+    use crate::channels::media::parse_attachment_markers;
 
     /// The startup pairing code grants approval-owner rights through `/claim`,
     /// and a managed daemon's stdout is the journal, so only a terminal gets it.
@@ -4830,292 +4686,6 @@ mod tests {
             !parsed.is_direct,
             "missing `chat.type` is not a DM, it stays group"
         );
-    }
-
-    // ── Inbound documents ──────────────────────────────────────────────────
-
-    /// A stand-in for the Bot API that answers the **document** path.
-    ///
-    /// `spawn_bot_api` routes POST only, and the document path is GET, so
-    /// this one answers by path and records every request it saw: a refused
-    /// document must cost **no** request.
-    async fn spawn_document_bot_api(
-        file_path: &str,
-        bytes: Vec<u8>,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use axum::extract::State;
-        use axum::http::Uri;
-
-        type Captured = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
-        let captured: Captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let state = (
-            std::sync::Arc::clone(&captured),
-            file_path.to_string(),
-            bytes,
-        );
-
-        async fn handler(
-            State((captured, file_path, bytes)): State<(Captured, String, Vec<u8>)>,
-            uri: Uri,
-        ) -> axum::response::Response {
-            captured
-                .lock()
-                .expect("capture lock")
-                .push(uri.path().to_string());
-            if uri.path().ends_with("/getFile") {
-                let body = format!(r#"{{"ok":true,"result":{{"file_path":"{file_path}"}}}}"#);
-                axum::response::Response::builder()
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(body))
-                    .expect("a response")
-            } else {
-                axum::response::Response::builder()
-                    .body(axum::body::Body::from(bytes))
-                    .expect("a response")
-            }
-        }
-
-        let app = axum::Router::new()
-            .fallback(axum::routing::any(handler))
-            .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        (format!("http://{addr}"), captured)
-    }
-
-    /// A document a sender chose.
-    fn inbound_document(file_id: &str, name: &str, mime: &str, size: u64) -> InboundDocument {
-        InboundDocument {
-            file_id: file_id.to_string(),
-            mime_type: Some(mime.to_string()),
-            file_name: Some(name.to_string()),
-            file_size: Some(size),
-        }
-    }
-
-    /// A document from an allowed user is a message. It used to parse as
-    /// empty, and an empty parse **is** the unauthorized path: the user's
-    /// document was dropped and the sender was told to bind.
-    #[test]
-    fn a_document_from_an_allowed_user_is_a_message() {
-        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
-        let update = serde_json::json!({
-            "update_id": 1,
-            "message": {
-                "message_id": 42,
-                "from": { "id": 555_001 },
-                "chat": { "id": 100_200_300, "type": "private" },
-                "document": {
-                    "file_id": "FILE1",
-                    "file_name": "notes.txt",
-                    "mime_type": "text/plain",
-                    "file_size": 12
-                }
-            }
-        });
-
-        let (msg, attachment) = ch
-            .parse_update_message(&update)
-            .expect("a document from an allowed user is a message");
-        assert!(
-            matches!(attachment, Some(InboundAttachment::Document(_))),
-            "the document must be carried, not dropped: {attachment:?}"
-        );
-        assert_eq!(msg.content, "", "the document's text arrives later");
-    }
-
-    /// A document in a group is dropped unless it addresses the bot — and it
-    /// is dropped in the parser, before anything is downloaded.
-    #[test]
-    fn a_group_document_that_does_not_address_the_bot_is_dropped() {
-        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
-        {
-            let mut cache = ch.bot_username.lock();
-            *cache = Some("mybot".to_string());
-        }
-        let update = serde_json::json!({
-            "update_id": 2,
-            "message": {
-                "message_id": 43,
-                "from": { "id": 555_002 },
-                "chat": { "id": -100_200_300, "type": "group" },
-                "document": {
-                    "file_id": "FILE2",
-                    "file_name": "notes.txt",
-                    "mime_type": "text/plain",
-                    "file_size": 12
-                }
-            }
-        });
-
-        assert!(
-            ch.parse_update_message(&update).is_none(),
-            "a document that does not address the bot is not for us"
-        );
-    }
-
-    /// A document that mentions the bot is delivered. The mention rides on the
-    /// caption, which is also the sender's own words.
-    #[test]
-    fn a_group_document_that_addresses_the_bot_is_delivered() {
-        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
-        {
-            let mut cache = ch.bot_username.lock();
-            *cache = Some("mybot".to_string());
-        }
-        let update = serde_json::json!({
-            "update_id": 3,
-            "message": {
-                "message_id": 44,
-                "from": { "id": 555_003 },
-                "chat": { "id": -100_200_300, "type": "group" },
-                "caption": "@mybot please read this",
-                "document": {
-                    "file_id": "FILE3",
-                    "file_name": "notes.txt",
-                    "mime_type": "text/plain",
-                    "file_size": 12
-                }
-            }
-        });
-
-        let (msg, attachment) = ch
-            .parse_update_message(&update)
-            .expect("the document addresses the bot");
-        assert!(
-            matches!(attachment, Some(InboundAttachment::Document(_))),
-            "the document must be carried: {attachment:?}"
-        );
-        assert!(
-            msg.content.contains("please read this"),
-            "the caption is the sender's own words: {}",
-            msg.content
-        );
-    }
-
-    /// The whole document path, against a stand-in Bot API: the file is
-    /// fetched, the bytes are checked, and the model gets a delimited block.
-    #[tokio::test]
-    async fn a_downloaded_document_becomes_a_delimited_block() {
-        let (base, captured) =
-            spawn_document_bot_api("documents/notes.txt", b"hello from a document".to_vec()).await;
-        let ch =
-            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
-
-        let block = ch
-            .resolve_document_block(
-                &inbound_document("FILE4", "notes.txt", "text/plain", 20),
-                "555004",
-                "44",
-            )
-            .await
-            .to_text();
-
-        assert!(
-            block.starts_with("[inbound document: notes.txt ("),
-            "{block}"
-        );
-        assert!(block.contains("hello from a document"), "{block}");
-        assert!(block.ends_with("[end inbound document]"), "{block}");
-        // Two requests: `getFile` resolved the handle, then the file itself.
-        let requests = captured.lock().expect("capture lock");
-        assert_eq!(
-            requests.len(),
-            2,
-            "one lookup and one download: {requests:?}"
-        );
-    }
-
-    /// An exhausted document budget costs the sender no request at all. The
-    /// budget is consulted before `getFile`, which is an authenticated round
-    /// trip the sender would otherwise have made for free.
-    #[tokio::test]
-    async fn an_exhausted_document_budget_costs_no_request() {
-        let (base, captured) =
-            spawn_document_bot_api("documents/notes.txt", b"hello".to_vec()).await;
-        let ch =
-            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
-        let sender = "555005";
-        // Five documents already sent: written out rather than read from the
-        // constant, so the test still fails if the budget moves.
-        for _ in 0..5 {
-            crate::channels::media::charge_document(&format!("telegram:{sender}"))
-                .expect("the sender has budget left");
-        }
-
-        let note = ch
-            .resolve_document_block(
-                &inbound_document("FILE5", "notes.txt", "text/plain", 5),
-                sender,
-                "45",
-            )
-            .await
-            .to_text();
-
-        assert!(note.contains("[Attachment rejected:"), "{note}");
-        assert!(note.contains("budget is spent"), "{note}");
-        let requests = captured.lock().expect("capture lock");
-        assert!(
-            requests.is_empty(),
-            "an exhausted sender must cost no request: {requests:?}"
-        );
-    }
-
-    /// A document announced over the cap is refused before any request: the
-    /// announced size costs nothing to check.
-    #[tokio::test]
-    async fn a_document_announced_over_the_cap_is_refused_without_a_request() {
-        let (base, captured) = spawn_document_bot_api("documents/big.txt", b"hello".to_vec()).await;
-        let ch =
-            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
-
-        let note = ch
-            .resolve_document_block(
-                &inbound_document(
-                    "FILE6",
-                    "big.txt",
-                    "text/plain",
-                    crate::channels::media::DOC_MAX_BYTES + 1,
-                ),
-                "555006",
-                "46",
-            )
-            .await
-            .to_text();
-
-        assert!(note.contains("too large"), "{note}");
-        let requests = captured.lock().expect("capture lock");
-        assert!(
-            requests.is_empty(),
-            "an oversized document must cost no request: {requests:?}"
-        );
-    }
-
-    /// The bytes decide the type. A file named `.pdf` that holds words is
-    /// refused, whatever it was announced as.
-    #[tokio::test]
-    async fn a_file_that_is_not_what_it_was_announced_as_is_refused() {
-        let (base, _captured) =
-            spawn_document_bot_api("documents/report.pdf", b"just words".to_vec()).await;
-        let ch =
-            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
-
-        let note = ch
-            .resolve_document_block(
-                &inbound_document("FILE7", "report.pdf", "application/pdf", 10),
-                "555007",
-                "47",
-            )
-            .await
-            .to_text();
-
-        assert!(note.contains("not what it was announced as"), "{note}");
     }
 
     #[test]
