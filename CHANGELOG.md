@@ -143,14 +143,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attachment marker of its own. Every rejection is a visible `[Attachment rejected: …]` note
   rather than silence. The limits are constants, not config keys: 10 MiB per document, 50 PDF
   pages, 50,000 forwarded characters, 20 seconds per extraction with one extraction at a time,
-  and a DOCX that expands to at most 50 MiB. Documents are budgeted separately from images — 5
-  documents per sender per 10 minutes, consulted **before** any download, so an exhausted sender
-  costs no bandwidth and no `getFile` call. A Telegram document with no caption from an allowed
-  user used to be routed to the unauthorized-user path, because it parsed as empty; it is now
-  policy-checked and answered like any other message. A DOCX needs the `kb-office` feature, which
-  is not a default: a default build refuses a DOCX with a note that says why. Every other channel
-  keeps ignoring documents, and no document is ever written to disk. The full rules are in
-  `docs/security/inbound-media-policy.md`.
+  and a DOCX that expands to at most 50 MiB. The extraction runs in a child process: the same
+  binary, started with a hidden subcommand, given the document on stdin and an environment with
+  nothing in it — no HOME, no PATH, no provider key, no configuration directory, no operator
+  file. Whatever the parser does, panic, abort, loop or runaway allocation, the child dies and
+  the agent keeps running; the child is killed and reaped at the deadline, so the one-at-a-time
+  slot is released when the child dies, and on unix it also gets a 512 MiB memory ceiling. The
+  WhatsApp Web read is bounded by a writer that refuses the write past the cap, so the bytes held
+  are at most the cap whatever the sender announced, and a document that announced no size is
+  refused before the download. Documents are budgeted separately from images — 5 documents per
+  sender per 10 minutes, consulted **before** any download, so an exhausted sender costs no
+  bandwidth and no `getFile` call. The text stays readable for the whole turn it arrived in and
+  becomes a one-line stub from the next user message on. A Telegram document with no caption is
+  a document like any other: it is policy-checked and answered, not taken for an intruder. A
+  DOCX needs the `kb-office` feature, which is not a default: a default build refuses a DOCX
+  with a note that says why. Every other channel keeps ignoring documents, and no document is
+  ever written to disk. The full rules are in `docs/security/inbound-media-policy.md`.
 
 ### Changed
 

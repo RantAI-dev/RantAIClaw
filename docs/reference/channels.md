@@ -779,16 +779,25 @@ summary.
   nothing recognizable (`application/octet-stream`, no extension) imposes no
   constraint. A claim that is right does not make the bytes safe — the sniff
   always runs.
-- **Nothing is written to disk.** The bytes are read into memory and parsed from
-  there. There is no temp file, not even a short-lived one.
+- **Nothing is written to disk.** The bytes are read into memory and parsed
+  somewhere else: the parsing happens in a **child process** that holds no
+  environment, no configuration and no operator file, and the document travels
+  to it over a pipe. There is no temp file, not even a short-lived one.
 - **The limits are constants, not config keys.** 10 MiB per document (checked on
   the announced size before any download and again on the bounded read; over the
   cap is refused, never truncated), 50 PDF pages counted from the bytes before
   the text is extracted, 50,000 characters of extracted text (a longer extraction
   is cut with a visible note), 20 seconds per extraction with one extraction at a
   time per process, and a DOCX whose ZIP directory declares more than 50 MiB
-  uncompressed (the zip bomb cap). A timed-out extraction is a rejection, not a
-  hang.
+  uncompressed (the zip bomb cap). The extraction runs in a **child process**
+  that is killed and reaped at the deadline, so the one-at-a-time slot is
+  released when the child dies and a timed-out extraction is a rejection, not a
+  hang; on unix the child gets a 512 MiB memory ceiling, and on every other
+  target the deadline kill is the only limit. The read is bounded too: Telegram
+  streams the fetch and stops one byte past the cap, and WhatsApp Web streams
+  the download into a writer that refuses the write past the cap, so the bytes
+  held are at most the cap whatever the sender announced; a WhatsApp Web
+  document that announced no size is refused before the download.
 - **Documents are budgeted separately from images**: 5 documents per sender per 10
   minutes, counted per channel-qualified sender. The budget is consulted
   **before** the download, so an exhausted sender costs no bandwidth and — on
@@ -797,9 +806,11 @@ summary.
   and whether the text was cut, and that says outright that the content came from
   the sender and is untrusted data, not instructions. Square brackets in the
   extracted text are defused, so a document cannot plant an `[IMAGE:…]` marker of
-  its own and cannot forge the block's end. After its turn, an old document block
-  is replaced by a one-line stub, the way an old image marker is, so a stale
-  injection surface does not live forever in the conversation.
+  its own and cannot forge the block's end. The text stays readable for the
+  whole turn it arrived in, so every tool call of that turn still sees the
+  document; from the next user message on the block is a one-line stub, the way
+  an old image marker is, so a stale injection surface does not live forever in
+  the conversation.
 - **Every rejection is visible**: the forwarded content carries an
   `[Attachment rejected: …]` note naming the reason — wrong type, too large, too
   many pages, too slow, budget spent, or a build that cannot read documents.
