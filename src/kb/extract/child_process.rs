@@ -390,6 +390,47 @@ mod tests {
         let _ = pdf_extract::extract_text_from_mem(&hostile_fixture_pdf(1, "Hello from a PDF"));
     }
 
+    /// A refused document is refused with **our** words.
+    ///
+    /// A parser's error can quote what it read out of the document — a value,
+    /// a key, a fragment — and the reason reaches the model. The reason is
+    /// therefore a sentence of ours, never the parser's own text.
+    #[tokio::test]
+    async fn a_refused_document_carries_our_own_words() {
+        let err = extract_inbound_document(
+            InboundDocumentKind::Pdf,
+            b"%PDF-1.4\nthis is not a pdf".to_vec(),
+            limits(50, 50_000, Duration::from_secs(20)),
+        )
+        .await
+        .expect_err("a broken PDF is refused");
+        assert_clean_rejection(&err);
+        assert_eq!(
+            err.to_string(),
+            "extraction failed (extractor=inbound-pdf): the PDF could not be read",
+            "the reason must be ours, not the parser's"
+        );
+    }
+
+    /// A refused DOCX is refused with our own words too.
+    #[cfg(feature = "kb-office")]
+    #[tokio::test]
+    async fn a_refused_docx_carries_our_own_words() {
+        let err = extract_inbound_document(
+            InboundDocumentKind::Docx,
+            docx_without_its_document_rels(),
+            limits(50, 50_000, Duration::from_secs(20)),
+        )
+        .await
+        .expect_err("the DOCX is refused");
+        assert_clean_rejection(&err);
+        assert_eq!(
+            err.to_string(),
+            "extraction failed (extractor=inbound-docx): the DOCX document could not be read",
+            "the reason must be ours, not the parser's"
+        );
+    }
+
     /// A reader that never returns is killed at the deadline, and the next
     /// document is read.
     #[tokio::test]
@@ -567,6 +608,37 @@ mod tests {
         ])
     }
 
+    /// A DOCX whose package does not carry the document's own rels.
+    ///
+    /// The office processor refuses it, and its reason would carry the
+    /// reader's own words — the reason the sender sees is ours.
+    #[cfg(feature = "kb-office")]
+    fn docx_without_its_document_rels() -> Vec<u8> {
+        const CONTENT_TYPES: &str = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+            r#"<Default Extension="xml" ContentType="application/xml"/>"#,
+            r#"<Override ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml" PartName="/word/document.xml"/>"#,
+            r#"</Types>"#
+        );
+        const PACKAGE_RELS: &str = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>"#,
+            r#"</Relationships>"#
+        );
+        const DOCUMENT: &str = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body></w:document>"#
+        );
+        build_zip(&[
+            ("[Content_Types].xml", true, CONTENT_TYPES.as_bytes(), 0),
+            ("_rels/.rels", true, PACKAGE_RELS.as_bytes(), 0),
+            ("word/document.xml", true, DOCUMENT.as_bytes(), 0),
+        ])
+    }
+
     /// A ZIP archive with the given entries.
     ///
     /// `stored` says whether the entry is stored as it is; an entry that is
@@ -630,6 +702,7 @@ mod tests {
         out.extend_from_slice(&0_u16.to_le_bytes());
         out
     }
+
 
     /// The CRC-32 of a stored entry.
     #[cfg(feature = "kb-office")]

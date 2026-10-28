@@ -287,7 +287,14 @@ pub(crate) fn extract_blocking(
 /// The count comes from the bytes, so a 500-page file is refused without its
 /// text ever being parsed.
 fn extract_pdf(bytes: &[u8], limits: ChildLimits) -> KbResult<(String, Option<u32>)> {
-    let pages = crate::kb::extract::pdf_splitter::page_count(bytes)?;
+    // A parser's own error can quote the document — a dictionary key, an
+    // outline destination, a value it read — and this reason reaches the
+    // model. The reason is ours; the parser's words are not.
+    let pages =
+        crate::kb::extract::pdf_splitter::page_count(bytes).map_err(|_| KbError::Extraction {
+            extractor: "inbound-pdf".into(),
+            message: "the PDF could not be read".into(),
+        })?;
     if pages > limits.max_pages {
         return Err(KbError::Extraction {
             extractor: "inbound-pdf".into(),
@@ -297,9 +304,9 @@ fn extract_pdf(bytes: &[u8], limits: ChildLimits) -> KbResult<(String, Option<u3
             ),
         });
     }
-    let text = pdf_extract::extract_text_from_mem(bytes).map_err(|e| KbError::Extraction {
+    let text = pdf_extract::extract_text_from_mem(bytes).map_err(|_| KbError::Extraction {
         extractor: "inbound-pdf".into(),
-        message: format!("the PDF text layer could not be read: {e}"),
+        message: "the PDF text layer could not be read".into(),
     })?;
     Ok((text, Some(pages)))
 }
@@ -311,8 +318,15 @@ fn extract_pdf(bytes: &[u8], limits: ChildLimits) -> KbResult<(String, Option<u3
 #[cfg(feature = "kb-office")]
 fn extract_docx(bytes: &[u8]) -> KbResult<String> {
     // The display name is fixed: the sender chose the file name, and it does
-    // not belong in an error message.
-    crate::kb::file::office::process_docx(bytes, "inbound document")
+    // not belong in an error message. The office processor's own message is
+    // dropped for the same reason: it can quote a value it read out of the
+    // document's XML.
+    crate::kb::file::office::process_docx(bytes, "inbound document").map_err(|_| {
+        KbError::Extraction {
+            extractor: "inbound-docx".into(),
+            message: "the DOCX document could not be read".into(),
+        }
+    })
 }
 
 /// A DOCX's text, in a build without the office processor.
@@ -325,9 +339,9 @@ fn extract_docx(_bytes: &[u8]) -> KbResult<String> {
 
 /// A plain text file's text: UTF-8, and nothing that is not text.
 fn extract_text(bytes: &[u8]) -> KbResult<String> {
-    let text = std::str::from_utf8(bytes).map_err(|e| KbError::Extraction {
+    let text = std::str::from_utf8(bytes).map_err(|_| KbError::Extraction {
         extractor: "inbound-text".into(),
-        message: format!("the file is not valid UTF-8: {e}"),
+        message: "the file is not valid UTF-8".into(),
     })?;
     if text.contains('\0') {
         return Err(KbError::Extraction {
