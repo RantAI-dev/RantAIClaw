@@ -471,7 +471,34 @@ mod tests {
         if std::env::var(CHILD_VAR).ok().as_deref() != Some("1") {
             return;
         }
+        // A reader that floods stdout: the parent's answer cap has to stop
+        // it, and the parent has to notice without waiting for a reader that
+        // is still writing.
+        if std::env::var(KIND_VAR).ok().as_deref() == Some("flood") {
+            flood_stdout();
+            std::process::exit(1);
+        }
         let code = run_child_from_env();
         std::process::exit(code);
+    }
+
+    /// A reader that writes far more than the answer cap allows, and then
+    /// keeps the pipe open.
+    ///
+    /// Test-only: the point is a reader that is still running when the cap
+    /// is passed.
+    #[cfg(test)]
+    fn flood_stdout() {
+        let mut out = std::io::stdout().lock();
+        let block = vec![b'x'; 64 * 1024];
+        for _ in 0..64 {
+            if std::io::Write::write_all(&mut out, &block).is_err() {
+                return;
+            }
+        }
+        let _ = std::io::Write::flush(&mut out);
+        // The pipe is full by now, and this reader is alive until it is
+        // killed.
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
 }

@@ -113,9 +113,16 @@ pub(crate) async fn run_child(
         .saturating_mul(ESCAPED_CHAR_BYTES)
         .saturating_add(FRAME_SLACK_BYTES);
     let outcome = tokio::time::timeout_at(deadline, async {
-        let frame = read_capped(&mut stdout, cap).await;
-        let status = child.wait().await;
-        (frame, status)
+        // A reader whose answer is too large is still running and still
+        // writing: waiting for it would fill the pipe and wait for the
+        // deadline instead of refusing the answer. The read failure is the
+        // answer, and the child is killed below.
+        let frame = match read_capped(&mut stdout, cap).await {
+            Ok(frame) => frame,
+            Err(failure) => return Err(failure),
+        };
+        let status = child.wait().await.map_err(|_| ReadFailure::Io)?;
+        Ok((frame, status))
     })
     .await;
     // The child is done with the document by now; the writer has nothing
@@ -123,14 +130,14 @@ pub(crate) async fn run_child(
     feeder.abort();
 
     match outcome {
-        Ok((Ok(frame_bytes), Ok(status))) => finish(frame_bytes, status),
-        Ok((Err(ReadFailure::TooLarge), _)) => {
+        Ok(Ok((frame_bytes, status))) => finish(frame_bytes, status),
+        Ok(Err(ReadFailure::TooLarge)) => {
             kill_and_reap(&mut child).await;
             Err(rejection(
                 "the document reader sent more than the allowed size",
             ))
         }
-        Ok((Err(ReadFailure::Io), _) | (_, Err(_))) => {
+        Ok(Err(ReadFailure::Io)) => {
             kill_and_reap(&mut child).await;
             Err(rejection("the document could not be read"))
         }
@@ -306,7 +313,7 @@ fn kind_is_known(kind: &str) -> bool {
     match kind {
         "pdf" | "docx" | "text" => true,
         #[cfg(test)]
-        "sleep" | "alloc" | "env" | "pid" => true,
+        "sleep" | "alloc" | "env" | "pid" | "flood" => true,
         _ => false,
     }
 }
@@ -428,6 +435,33 @@ mod tests {
             err.to_string(),
             "extraction failed (extractor=inbound-docx): the DOCX document could not be read",
             "the reason must be ours, not the parser's"
+        );
+    }
+
+    /// A reader that sends more than the frame allows is refused at once.
+    ///
+    /// The reader is still running and still writing when the cap is passed,
+    /// so the parent must not wait for it: waiting fills the pipe and waits
+    /// for the deadline instead of refusing the answer.
+    #[tokio::test]
+    async fn a_reader_that_sends_too_much_is_refused_at_once() {
+        let started = std::time::Instant::now();
+        let err = extract_test_document(
+            "flood",
+            &[],
+            Vec::new(),
+            limits(50, 100, Duration::from_secs(3)),
+        )
+        .await
+        .expect_err("the flood is refused");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the refusal must come at once, not at the deadline: {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("more than the allowed size"),
+            "{err}"
         );
     }
 
@@ -702,7 +736,6 @@ mod tests {
         out.extend_from_slice(&0_u16.to_le_bytes());
         out
     }
-
 
     /// The CRC-32 of a stored entry.
     #[cfg(feature = "kb-office")]
