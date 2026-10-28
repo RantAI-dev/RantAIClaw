@@ -33,6 +33,13 @@ use crate::kb::{KbError, KbResult};
 /// writes one frame to stdout, and it exits.
 pub const HIDDEN_SUBCOMMAND: &str = "__extract-document";
 
+/// The reason a failure the child did not write is reported with.
+///
+/// A [`KbError`] variant this module does not name would carry a text of its
+/// own — a path, a response body, a parser's words — and the reason reaches
+/// the model. So such a failure is reported with a sentence of ours.
+const UNEXPECTED_REASON: &str = "the document could not be read";
+
 /// The sentinel that marks the child's answer on stdout.
 ///
 /// The answer is the sentinel, a newline, and one line of JSON. A JSON
@@ -153,7 +160,10 @@ impl ChildFrame {
                 (ErrorKind::Unsupported, None, message.clone())
             }
             KbError::Other(message) => (ErrorKind::Other, None, message.clone()),
-            other => (ErrorKind::Other, None, other.to_string()),
+            // Every other variant carries a text of its own — a path, a
+            // response body, a parser's words — and the reason reaches the
+            // model. So the reason is ours, whatever the variant was.
+            _ => (ErrorKind::Other, None, UNEXPECTED_REASON.to_string()),
         };
         Self {
             ok: false,
@@ -456,6 +466,24 @@ mod tests {
     fn a_file_with_a_nul_byte_is_refused() {
         let err = extract_text(b"hello\0world").expect_err("not text");
         assert!(err.to_string().contains("NUL"), "{err}");
+    }
+
+    /// A failure the child did not write is reported with our own words.
+    ///
+    /// The variants this module does not name carry a text of their own — a
+    /// path, a response body, a parser's words — and the reason reaches the
+    /// model. The reason is therefore ours, whatever the variant was.
+    #[test]
+    fn an_unexpected_reason_is_replaced_by_ours() {
+        let frame = ChildFrame::failure(&KbError::Io(std::io::Error::other(
+            "/home/operator/.rantaiclaw/secrets.env",
+        )));
+        let message = frame.message.expect("a reason");
+        assert_eq!(message, "the document could not be read");
+        assert!(
+            !message.contains("secrets.env"),
+            "the reason must not carry the variant's own text: {message}"
+        );
     }
 
     // ── The child entry point ───────────────────────────────────────────────
