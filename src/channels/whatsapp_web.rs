@@ -124,6 +124,33 @@ const DROP_NOTICE: &str =
 static GROUP_IDENTITY_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The size a document announced, if it announced one at all.
+///
+/// WhatsApp announces a length of zero for a document it has not measured,
+/// and sends no length at all for some documents. Zero is no claim, not an
+/// empty file, so it reads as no announcement: a document whose size is
+/// unknown cannot be weighed before it is fetched.
+fn announced_document_size(file_length: Option<u64>) -> Option<u64> {
+    file_length.filter(|size| *size > 0)
+}
+
+/// The reason the sender is told when a document download failed.
+///
+/// The library's own error text is logged and never shown: it can carry host
+/// names and URLs that mean nothing to a sender and tell them more about the
+/// operator's setup than they should know. `refused` says the size cap was
+/// what stopped the download, and that is the one reason worth naming.
+fn document_download_failure_reason(refused: bool) -> String {
+    if refused {
+        format!(
+            "the document is too large (limit {} MiB)",
+            crate::channels::media::DOC_MAX_BYTES / (1024 * 1024)
+        )
+    } else {
+        "the document could not be downloaded".to_string()
+    }
+}
+
 impl WhatsAppWebChannel {
     /// Whether `chat` may be told about a drop now, recording the notice if so.
     ///
@@ -441,15 +468,28 @@ impl WhatsAppWebChannel {
             .file_name
             .clone()
             .or_else(|| document.title.clone());
-        // WhatsApp announces a length of zero for a document it has not
-        // measured; zero is no claim, not an empty file.
-        let announced_size = document.file_length.filter(|size| *size > 0);
+        let announced_size = announced_document_size(document.file_length);
 
         let download = async {
-            client.download(document).await.map_err(|e| {
-                tracing::warn!("WhatsApp Web: an inbound document could not be downloaded: {e}");
-                e.to_string()
-            })
+            // The bytes are streamed into a writer that stops at the cap, so
+            // the cap applies to what is written rather than to what the
+            // sender announced: a document that lies about its length cannot
+            // fill the memory.
+            let writer = crate::channels::media::CappedDocumentWriter::new(
+                crate::channels::media::DOC_MAX_BYTES,
+            );
+            let refused = writer.refused_flag();
+            match client.download_to_writer(document, writer).await {
+                Ok(writer) => Ok(writer.into_bytes()),
+                Err(e) => {
+                    tracing::warn!(
+                        "WhatsApp Web: an inbound document could not be downloaded: {e}"
+                    );
+                    Err(document_download_failure_reason(
+                        refused.load(std::sync::atomic::Ordering::SeqCst),
+                    ))
+                }
+            }
         };
         Self::resolve_document_with(
             download,
@@ -462,8 +502,8 @@ impl WhatsAppWebChannel {
     }
 
     /// The document path, with the download behind a future so the **order**
-    /// — budget, then download, then the policy — is reachable from a test
-    /// without a linked session or a live socket.
+    /// — budget, then the announced size, then download, then the policy — is
+    /// reachable from a test without a linked session or a live socket.
     #[cfg(feature = "whatsapp-web")]
     async fn resolve_document_with(
         download: impl std::future::Future<Output = Result<Vec<u8>, String>>,
@@ -493,6 +533,15 @@ impl WhatsAppWebChannel {
             return DocumentOutcome::Rejected(reason);
         }
 
+        // A document that announced no size cannot be weighed before it is
+        // fetched, and fetching it blind is what the size cap exists to
+        // prevent. It is refused rather than fetched.
+        if announced_size.is_none() {
+            return DocumentOutcome::Rejected(
+                "the document did not announce its size, so it cannot be checked".into(),
+            );
+        }
+
         // The announced size is advisory, but it is free.
         if let Some(reason) = crate::channels::media::announced_size_reason(announced_size) {
             return DocumentOutcome::Rejected(reason);
@@ -500,9 +549,9 @@ impl WhatsAppWebChannel {
 
         let bytes = match download.await {
             Ok(bytes) => bytes,
-            Err(_) => {
-                return DocumentOutcome::Rejected("the document could not be downloaded".into());
-            }
+            // The reason is the one the download chose: a refusal that says
+            // the document was too large must reach the sender as such.
+            Err(reason) => return DocumentOutcome::Rejected(reason),
         };
 
         Self::document_outcome_from_bytes(bytes, claimed, file_name, sender).await
@@ -2540,6 +2589,61 @@ mod media_tests {
         assert!(!downloaded, "an oversized document must cost no download");
         let note = outcome.to_text();
         assert!(note.contains("too large"), "{note}");
+    }
+
+    /// A document that announced no size cannot be weighed before it is
+    /// fetched, so it is refused rather than fetched blind: the size cap
+    /// exists to bound what a sender can make the agent hold, and a document
+    /// of unknown size is the one case the cap cannot apply to.
+    #[tokio::test]
+    async fn a_document_with_no_announced_size_is_refused_without_a_download() {
+        let mut downloaded = false;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloaded = true;
+                Ok(b"hello".to_vec())
+            },
+            Some("text/plain"),
+            Some("notes.txt"),
+            None,
+            "6280000004444",
+        )
+        .await;
+
+        assert!(
+            !downloaded,
+            "a document with no announced size must cost no download"
+        );
+        let note = outcome.to_text();
+        assert!(note.contains("[Attachment rejected:"), "{note}");
+        assert!(note.contains("did not announce its size"), "{note}");
+    }
+
+    /// The reason a failed download gives is the reason the sender sees: a
+    /// refusal that says the document is too large must not be flattened into
+    /// a generic failure.
+    #[tokio::test]
+    async fn the_reason_a_failed_download_gives_is_the_reason_the_sender_sees() {
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async { Err("the document is too large (limit 10 MiB)".to_string()) },
+            Some("text/plain"),
+            Some("notes.txt"),
+            Some(4096),
+            "6280000003333",
+        )
+        .await;
+
+        let note = outcome.to_text();
+        assert!(note.contains("too large"), "{note}");
+    }
+
+    /// WhatsApp announces a length of zero for a document it has not
+    /// measured, so a zero length is no announcement at all.
+    #[test]
+    fn a_zero_or_missing_length_is_no_announcement() {
+        assert_eq!(announced_document_size(Some(0)), None);
+        assert_eq!(announced_document_size(None), None);
+        assert_eq!(announced_document_size(Some(4096)), Some(4096));
     }
 
     fn upload(len: u64) -> wa_rs::upload::UploadResponse {

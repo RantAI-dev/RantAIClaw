@@ -450,6 +450,102 @@ pub(crate) fn announced_size_reason(size: Option<u64>) -> Option<String> {
     }
 }
 
+/// A writer that holds a document only while it is within the cap.
+///
+/// The WhatsApp client streams a download and its decryption straight into a
+/// writer, so the bytes can be capped while they arrive instead of after
+/// they have been buffered. The write that would push the document past the
+/// cap fails, and the bytes that are kept are at most the cap.
+///
+/// The refusal travels back through a shared flag rather than through the
+/// writer: the writer is moved into the download call and dropped there when
+/// the download fails, so the caller keeps the flag and learns from it
+/// whether the cap was what stopped the download.
+#[cfg(feature = "whatsapp-web")]
+mod capped_document {
+    use std::io::{self, Cursor, Seek, SeekFrom, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// The error a write past the cap fails with.
+    ///
+    /// The text is ours, not the library's: it can be logged, and it is never
+    /// what a sender is told.
+    fn over_the_cap() -> io::Error {
+        io::Error::other("the document is over the size cap")
+    }
+
+    /// A writer that keeps at most `cap` bytes of a document.
+    pub(crate) struct CappedDocumentWriter {
+        /// The bytes kept so far.
+        inner: Cursor<Vec<u8>>,
+        /// The cap, in bytes.
+        cap: u64,
+        /// Whether the cap stopped a write.
+        refused: Arc<AtomicBool>,
+    }
+
+    impl CappedDocumentWriter {
+        /// A writer that refuses anything past `cap` bytes.
+        pub(crate) fn new(cap: u64) -> Self {
+            Self {
+                inner: Cursor::new(Vec::new()),
+                cap,
+                refused: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// The flag that says the cap stopped the download.
+        ///
+        /// The caller takes it before the writer is moved into the download
+        /// call, because that call drops the writer when it fails.
+        pub(crate) fn refused_flag(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.refused)
+        }
+
+        /// The bytes that were kept, at most the cap.
+        pub(crate) fn into_bytes(self) -> Vec<u8> {
+            self.inner.into_inner()
+        }
+    }
+
+    impl Write for CappedDocumentWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            // Once the cap is hit every further write fails: the client
+            // retries a failed download against the next host, and that
+            // retry must not hold more of the document.
+            if self.refused.load(Ordering::SeqCst) {
+                return Err(over_the_cap());
+            }
+            // The position is what the attempt in hand has written so far.
+            // The client seeks back to the start before each attempt, so this
+            // counts the bytes of this attempt and not those of an earlier
+            // one that failed.
+            let end = self.inner.position().saturating_add(buf.len() as u64);
+            if end > self.cap {
+                self.refused.store(true, Ordering::SeqCst);
+                return Err(over_the_cap());
+            }
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl Seek for CappedDocumentWriter {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+}
+
+/// The writer an inbound document is streamed into, so the cap applies while
+/// the bytes arrive rather than after they have been buffered.
+#[cfg(feature = "whatsapp-web")]
+pub(crate) use capped_document::CappedDocumentWriter;
+
 /// The document types the agent accepts. Sniffed from the bytes, never from
 /// the platform's claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1366,6 +1462,58 @@ mod document_tests {
     fn an_empty_download_is_refused() {
         let err = accept_document_bytes(b"", &claim(None, None)).expect_err("no data");
         assert!(err.contains("no data"), "{err}");
+    }
+
+    // ── The capped writer ─────────────────────────────────────────────────
+
+    /// The writer a download streams into keeps the cap and refuses one byte
+    /// more: what a sender sends never decides how much is held in memory.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn the_capped_writer_keeps_the_cap_and_refuses_one_byte_more() {
+        use std::io::Write;
+
+        let mut writer = CappedDocumentWriter::new(64);
+        let refused = writer.refused_flag();
+
+        writer.write_all(&[b'x'; 64]).expect("exactly the cap fits");
+        let err = writer
+            .write_all(b"y")
+            .expect_err("one byte more does not fit");
+        assert!(err.to_string().contains("size cap"), "{err}");
+        assert!(
+            refused.load(std::sync::atomic::Ordering::SeqCst),
+            "the flag says the cap stopped the write"
+        );
+        assert_eq!(
+            writer.into_bytes().len(),
+            64,
+            "the bytes that were kept are at most the cap"
+        );
+    }
+
+    /// After the cap has been hit every further write fails: the client
+    /// retries a failed download against the next host, and that retry must
+    /// cost nothing.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_write_after_the_refusal_fails_too() {
+        use std::io::Write;
+
+        let mut writer = CappedDocumentWriter::new(64);
+        let refused = writer.refused_flag();
+
+        writer
+            .write_all(&[b'x'; 65])
+            .expect_err("one byte over the cap does not fit");
+        assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
+
+        let err = writer.write(b"z").expect_err("the retry must fail too");
+        assert!(err.to_string().contains("size cap"), "{err}");
+        assert!(
+            writer.into_bytes().is_empty(),
+            "nothing was kept of the refused document"
+        );
     }
 
     // ── The zip bomb cap ───────────────────────────────────────────────────
