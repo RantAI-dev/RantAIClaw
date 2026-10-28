@@ -9,13 +9,18 @@
 //! number of extractions running at once. The limits themselves are the
 //! policy's, and the caller passes them in — the numbers live in
 //! `channels::media` so there is one set of them and not two.
+//!
+//! The bytes themselves are parsed in a **child process** (see
+//! [`crate::kb::extract::child_process`]): a parser that panics, aborts,
+//! loops or allocates takes the child down, not the agent. This module owns
+//! the slot that keeps one extraction at a time and hands the work over.
 
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
-use crate::kb::extract::pdf_splitter;
+use crate::kb::extract::child_process;
 use crate::kb::{KbError, KbResult};
 
 /// The limits one inbound extraction runs under.
@@ -41,6 +46,17 @@ pub enum InboundDocumentKind {
     Text,
 }
 
+impl InboundDocumentKind {
+    /// The name the child process knows this kind by.
+    pub(crate) fn env_value(self) -> &'static str {
+        match self {
+            Self::Pdf => "pdf",
+            Self::Docx => "docx",
+            Self::Text => "text",
+        }
+    }
+}
+
 /// What an extraction produced.
 #[derive(Debug, Clone)]
 pub struct InboundExtraction {
@@ -54,25 +70,50 @@ pub struct InboundExtraction {
 
 /// One extraction at a time per process.
 ///
-/// A hostile file can stall its parser, and a parser thread cannot be
-/// cancelled. Letting several run at once would turn one bad file into many,
-/// so the slot is held by the blocking task itself: it is released when the
-/// task ends, not when the awaiting future gives up.
+/// A hostile file can stall its parser, and a parser that cannot be
+/// cancelled would block every later document. The child process is killed
+/// at the deadline, so the slot is released when the extraction ends — not
+/// when the parser would have finished, had it ever finished.
 static EXTRACTION_SLOT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
 /// Extract the text of an inbound document.
 ///
-/// The bytes never reach the disk. The extraction runs in a blocking task
+/// The bytes never reach the disk. The extraction runs in a child process
 /// under a single deadline, and only one runs at a time.
 pub async fn extract_inbound_document(
     kind: InboundDocumentKind,
     bytes: Vec<u8>,
     limits: InboundLimits,
 ) -> KbResult<InboundExtraction> {
+    extract_with_slot(kind.env_value(), &[], bytes, limits).await
+}
+
+/// Extract a document of a test-only kind, under the same slot and the same
+/// deadline as a real one.
+///
+/// The kinds exist in a test build only; they are how the process boundary
+/// is tested without a hostile file.
+#[cfg(test)]
+pub(crate) async fn extract_test_document(
+    kind: &str,
+    extra_env: &[(&str, &str)],
+    bytes: Vec<u8>,
+    limits: InboundLimits,
+) -> KbResult<InboundExtraction> {
+    extract_with_slot(kind, extra_env, bytes, limits).await
+}
+
+/// Take the slot, then hand the document to the child process.
+async fn extract_with_slot(
+    kind: &str,
+    extra_env: &[(&str, &str)],
+    bytes: Vec<u8>,
+    limits: InboundLimits,
+) -> KbResult<InboundExtraction> {
     let deadline = tokio::time::Instant::now() + limits.timeout;
 
-    // The slot is taken before the work starts and released when the blocking
-    // task ends — including when the task is abandoned by the deadline.
+    // The slot is taken before the work starts and released when the
+    // extraction ends.
     let permit = tokio::time::timeout_at(deadline, EXTRACTION_SLOT.clone().acquire_owned())
         .await
         .map_err(|_| {
@@ -83,108 +124,11 @@ pub async fn extract_inbound_document(
         })?
         .map_err(|_| KbError::Other("the extraction slot is closed".into()))?;
 
-    let task = tokio::task::spawn_blocking(move || {
-        // The permit lives here, so a timed-out extraction keeps the slot
-        // until its parser actually returns.
-        let _permit = permit;
-        extract_blocking(kind, &bytes, limits)
-    });
-
-    match tokio::time::timeout_at(deadline, task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(join)) => Err(KbError::Other(format!("extraction task failed: {join}"))),
-        Err(_) => Err(KbError::Other(format!(
-            "extraction timed out after {} seconds",
-            limits.timeout.as_secs()
-        ))),
-    }
-}
-
-/// The extraction itself, on the blocking thread.
-fn extract_blocking(
-    kind: InboundDocumentKind,
-    bytes: &[u8],
-    limits: InboundLimits,
-) -> KbResult<InboundExtraction> {
-    let (text, pages) = match kind {
-        InboundDocumentKind::Pdf => extract_pdf(bytes, limits)?,
-        InboundDocumentKind::Docx => (extract_docx(bytes)?, None),
-        InboundDocumentKind::Text => (extract_text(bytes)?, None),
-    };
-    let (text, truncated) = cut_text(text, limits.max_chars);
-    Ok(InboundExtraction {
-        text,
-        pages,
-        truncated,
-    })
-}
-
-/// A PDF's text, with the page count checked **before** the text is read.
-///
-/// The count comes from the bytes, so a 500-page file is refused without its
-/// text ever being parsed.
-fn extract_pdf(bytes: &[u8], limits: InboundLimits) -> KbResult<(String, Option<u32>)> {
-    let pages = pdf_splitter::page_count(bytes)?;
-    if pages > limits.max_pages {
-        return Err(KbError::Extraction {
-            extractor: "inbound-pdf".into(),
-            message: format!(
-                "the document has {pages} pages, over the {}-page limit",
-                limits.max_pages
-            ),
-        });
-    }
-    let text = pdf_extract::extract_text_from_mem(bytes).map_err(|e| KbError::Extraction {
-        extractor: "inbound-pdf".into(),
-        message: format!("the PDF text layer could not be read: {e}"),
-    })?;
-    Ok((text, Some(pages)))
-}
-
-/// A DOCX's text.
-///
-/// The office processor lives behind the `kb-office` feature. A build without
-/// it says so, rather than dropping the document.
-#[cfg(feature = "kb-office")]
-fn extract_docx(bytes: &[u8]) -> KbResult<String> {
-    // The display name is fixed: the sender chose the file name, and it does
-    // not belong in an error message.
-    crate::kb::file::office::process_docx(bytes, "inbound document")
-}
-
-/// A DOCX's text, in a build without the office processor.
-#[cfg(not(feature = "kb-office"))]
-fn extract_docx(_bytes: &[u8]) -> KbResult<String> {
-    Err(KbError::UnsupportedFileType(
-        "reading DOCX documents needs the kb-office feature".into(),
-    ))
-}
-
-/// A plain text file's text: UTF-8, and nothing that is not text.
-fn extract_text(bytes: &[u8]) -> KbResult<String> {
-    let text = std::str::from_utf8(bytes).map_err(|e| KbError::Extraction {
-        extractor: "inbound-text".into(),
-        message: format!("the file is not valid UTF-8: {e}"),
-    })?;
-    if text.contains('\0') {
-        return Err(KbError::Extraction {
-            extractor: "inbound-text".into(),
-            message: "the file contains NUL bytes and is not a text document".into(),
-        });
-    }
-    Ok(text.to_string())
-}
-
-/// The text, cut at the limit, and whether it was cut.
-///
-/// A cut is never silent: the caller turns the flag into a note the sender
-/// sees, so the model is never handed a document that looks complete and is
-/// not.
-fn cut_text(text: String, max_chars: usize) -> (String, bool) {
-    if text.chars().count() <= max_chars {
-        return (text, false);
-    }
-    (text.chars().take(max_chars).collect(), true)
+    // The permit is held for the whole child run. The child is killed at the
+    // deadline, so the slot is always released: a parser that never returns
+    // cannot block the next document.
+    let _permit = permit;
+    child_process::run_child(kind, extra_env, bytes, limits, deadline).await
 }
 
 /// A PDF with `page_count` pages, each carrying `text`.
@@ -198,6 +142,21 @@ fn cut_text(text: String, max_chars: usize) -> (String, bool) {
 /// PDF that is too long.
 #[cfg(test)]
 pub(crate) fn fixture_pdf(page_count: usize, text: &str) -> Vec<u8> {
+    build_fixture_pdf(page_count, text, None)
+}
+
+/// A PDF whose font names an encoding no parser knows.
+///
+/// `pdf-extract` panics on it (`encoding_to_unicode_table`), which is the
+/// crash the child process exists to contain.
+#[cfg(test)]
+pub(crate) fn hostile_fixture_pdf(page_count: usize, text: &str) -> Vec<u8> {
+    build_fixture_pdf(page_count, text, Some("Foo"))
+}
+
+/// The fixture PDF, with an optional font encoding.
+#[cfg(test)]
+fn build_fixture_pdf(page_count: usize, text: &str, encoding: Option<&str>) -> Vec<u8> {
     let first_page = 4;
     let first_content = first_page + page_count;
     let object_count = first_content + page_count - 1;
@@ -211,7 +170,13 @@ pub(crate) fn fixture_pdf(page_count: usize, text: &str) -> Vec<u8> {
         "<< /Type /Pages /Kids [{}] /Count {page_count} >>",
         kids.join(" ")
     ));
-    bodies.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+    let font = match encoding {
+        Some(name) => {
+            format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /{name} >>")
+        }
+        None => "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    };
+    bodies.push(font);
     for index in 0..page_count {
         bodies.push(format!(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] \
@@ -252,20 +217,6 @@ pub(crate) fn fixture_pdf(page_count: usize, text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn text_over_the_limit_is_cut_and_says_so() {
-        let (text, truncated) = cut_text("abcdef".repeat(10), 25);
-        assert_eq!(text.chars().count(), 25);
-        assert!(truncated);
-    }
-
-    #[test]
-    fn text_under_the_limit_is_left_alone() {
-        let (text, truncated) = cut_text("hello".to_string(), 25);
-        assert_eq!(text, "hello");
-        assert!(!truncated);
-    }
 
     // ── The limits the tests run under ─────────────────────────────────────
 
@@ -349,17 +300,5 @@ mod tests {
         .expect("the text is read");
         assert_eq!(extraction.text.chars().count(), 25);
         assert!(extraction.truncated, "a cut must be visible");
-    }
-
-    #[test]
-    fn a_file_that_is_not_utf8_is_refused() {
-        let err = extract_text(&[0xff, 0xfe, 0x00]).expect_err("not text");
-        assert!(err.to_string().contains("UTF-8"), "{err}");
-    }
-
-    #[test]
-    fn a_file_with_a_nul_byte_is_refused() {
-        let err = extract_text(b"hello\0world").expect_err("not text");
-        assert!(err.to_string().contains("NUL"), "{err}");
     }
 }
