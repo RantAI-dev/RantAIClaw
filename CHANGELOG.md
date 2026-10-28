@@ -567,6 +567,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is accepted. A `persona.toml` that was hand-edited into an unusable value
   reads as unset, with one warning, and the file is left exactly as the
   operator wrote it — nothing rewrites it behind their back.
+- `rantaiclaw uninstall` could say it had preserved a file it had deleted,
+  and `--purge` could delete a binary this account did not own. The report
+  named `~/.rantaiclaw/.secret_key`, a path the profile layout no longer
+  uses: the key lives next to the config it protects, at
+  `<profile>/.secret_key`. So `--keep-secrets` printed "preserving" for a file
+  that was never there, the real key went with the profile, and the operator's
+  encrypted credentials could not be decrypted after a re-install. The
+  uninstall now keeps every secret key it says it keeps, names only the keys
+  that exist, and says in the default scope that the profile's key goes with
+  the profile. `--purge` removes the binary only when it can prove it owns it:
+  the cargo registry is looked up where the binary itself lives, not under
+  `$HOME`, and a binary outside this account's home directory is left alone
+  with the `rm` command printed instead. `--keep-secrets` walks the tree
+  without following symlinks: a link in the tree is removed as itself, so
+  nothing outside the tree is ever deleted.
 
 ## [0.33.0-alpha] — 2026-10-08
 

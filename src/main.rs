@@ -728,7 +728,7 @@ installer may have added to your shell rc files.
 Examples:
   rantaiclaw uninstall                  # active profile only, prompts
   rantaiclaw uninstall --all --yes      # full wipe, no prompt
-  rantaiclaw uninstall --all --keep-secrets  # wipe profiles, keep .secret_key
+  rantaiclaw uninstall --all --keep-secrets  # wipe profiles, keep every secret key
   rantaiclaw uninstall --purge          # full wipe + remove binary
   rantaiclaw uninstall --dry-run        # show plan, change nothing")]
     Uninstall {
@@ -738,7 +738,8 @@ Examples:
         /// Implies --all + self-delete the binary.
         #[arg(long)]
         purge: bool,
-        /// Preserve ~/.rantaiclaw/.secret_key for re-install.
+        /// Wipe the tree but keep every secret key for re-install. The key
+        /// lives next to the config it protects (`<profile>/.secret_key`).
         #[arg(long)]
         keep_secrets: bool,
         /// Skip the confirmation prompt.

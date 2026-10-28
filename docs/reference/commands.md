@@ -866,12 +866,22 @@ best-effort attempt to comment out `PATH` amendments the installer added to shel
 |---|---|
 | `--all` | Remove every profile and the whole `~/.rantaiclaw/` root |
 | `--purge` | Full wipe **and** self-delete the binary |
-| `--keep-secrets` | Wipe profiles but keep `.secret_key` |
+| `--keep-secrets` | Wipe the tree but keep every secret key (`<profile>/.secret_key`) |
 | `--dry-run` | Print the plan, change nothing |
 | `-y`, `--yes` | Skip the confirmation prompt |
 
 `--dry-run` first is the cheap habit here: `--all` and `--purge` are not recoverable, and
 `rollback` does not undo them.
+
+`--keep-secrets` keeps the secret key of every profile it wipes, and the report names only the
+keys that exist. The key lives next to the config it protects (`<profile>/.secret_key`), so the
+default scope — which removes the active profile — says plainly that the profile's key goes with
+it.
+
+`--purge` removes the binary only when it can prove this account installed it. A cargo install is
+deferred to `cargo uninstall`, a workspace build is left to `cargo build`, and a binary outside
+this account's home directory is left alone with the `rm` command printed instead of deleting a
+file that belongs to somebody else.
 
 ## Validation Tip
 

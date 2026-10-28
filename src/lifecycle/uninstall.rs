@@ -10,8 +10,10 @@
 //!    the user's shell rc files.
 //!
 //! Each step is logged. `--dry-run` prints what would happen and exits 0.
-//! `--keep-secrets` preserves `~/.rantaiclaw/.secret_key` so a future
-//! re-install can decrypt prior encrypted credentials.
+//! `--keep-secrets` preserves every secret key so a future re-install can
+//! decrypt prior encrypted credentials. The key lives next to the config it
+//! protects — `<profile>/.secret_key` for the profile layout — and the report
+//! names only the keys that exist and that the scope really keeps.
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -30,7 +32,7 @@ pub struct UninstallOpts {
     pub all: bool,
     /// `--all` plus self-delete the binary.
     pub purge: bool,
-    /// Preserve `~/.rantaiclaw/.secret_key` so re-install can decrypt.
+    /// Preserve every secret key so re-install can decrypt.
     pub keep_secrets: bool,
     /// Skip the y/N prompt.
     pub yes: bool,
@@ -75,35 +77,51 @@ pub fn run(opts: UninstallOpts) -> Result<()> {
         stop_ui_console();
     }
 
-    // 2. Remove profile data.
+    // 2. Remove profile data. Every path is judged by itself
+    //    (`symlink_metadata` never follows a link), so a symlink is removed
+    //    as itself and a dangling one is not skipped.
     for path in &scope.dirs_to_remove {
-        if path.exists() {
+        if fs::symlink_metadata(path).is_ok() {
             fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
             println!("  removed {}", path.display());
         }
     }
     for path in &scope.files_to_remove {
-        if path.exists() {
+        if fs::symlink_metadata(path).is_ok() {
             fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
             println!("  removed {}", path.display());
         }
     }
 
-    // 3. Self-delete the binary (purge only).
+    // 3. Self-delete the binary (purge only). A binary this account did not
+    //    install belongs to whoever put it there: it is left alone, and the
+    //    `rm` command is printed instead of deleting someone else's file.
     if opts.purge {
-        if matches!(info.kind, InstallKind::Cargo) {
-            eprintln!(
-                "⚠ skipping --purge: cargo-installed binary at {}.\n  \
-                 Run `cargo uninstall rantaiclaw` to remove.",
-                info.path.display()
-            );
-        } else if matches!(info.kind, InstallKind::Workspace) {
-            eprintln!(
-                "⚠ skipping --purge: binary is running from a cargo workspace at {}.",
-                info.path.display()
-            );
-        } else {
-            self_delete_binary(&info.path)?;
+        match info.kind {
+            InstallKind::Cargo => {
+                eprintln!(
+                    "⚠ skipping --purge: cargo-installed binary at {}.\n  \
+                     Run `cargo uninstall rantaiclaw` to remove.",
+                    info.path.display()
+                );
+            }
+            InstallKind::Workspace => {
+                eprintln!(
+                    "⚠ skipping --purge: binary is running from a cargo workspace at {}.",
+                    info.path.display()
+                );
+            }
+            InstallKind::Binary if info.owned => {
+                self_delete_binary(&info.path)?;
+            }
+            InstallKind::Binary => {
+                eprintln!(
+                    "⚠ skipping --purge: this binary at {} was not installed by this account.\n  \
+                     Remove it with `rm -f {}` if that is what you want.",
+                    info.path.display(),
+                    info.path.display()
+                );
+            }
         }
     }
 
@@ -151,56 +169,121 @@ struct Scope {
     /// Profiles whose data is being removed — used to find daemons bound to
     /// them so they can be stopped before their profile dir is deleted.
     profiles: Vec<String>,
+    /// Secret key files this scope keeps: they survive the uninstall.
+    kept_secret_keys: Vec<PathBuf>,
+    /// Secret key files this scope removes with the profile that holds them.
+    removed_secret_keys: Vec<PathBuf>,
 }
 
 impl Scope {
     fn resolve(opts: &UninstallOpts) -> Self {
         if opts.all || opts.purge {
-            // Wipe the entire ~/.rantaiclaw tree (minus .secret_key when
+            // Wipe the entire ~/.rantaiclaw tree (minus every secret key when
             // --keep-secrets is set).
             let root = paths::rantaiclaw_root();
-            let mut dirs = vec![];
-            let mut files = vec![];
-            if root.exists() {
+            let (dirs, files, kept_secret_keys) = if root.exists() {
                 if opts.keep_secrets {
-                    // Walk top-level: remove everything except .secret_key.
-                    if let Ok(entries) = fs::read_dir(&root) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            let name = entry.file_name();
-                            if name == ".secret_key" {
-                                continue;
-                            }
-                            if path.is_dir() {
-                                dirs.push(path);
-                            } else {
-                                files.push(path);
-                            }
-                        }
-                    }
+                    removal_plan_keeping_secrets(&root)
                 } else {
-                    dirs.push(root);
+                    (vec![root], vec![], vec![])
                 }
-            }
+            } else {
+                (vec![], vec![], vec![])
+            };
             Self {
                 dirs_to_remove: dirs,
                 files_to_remove: files,
                 touch_global: true,
                 profiles: ProfileManager::list().unwrap_or_default(),
+                kept_secret_keys,
+                removed_secret_keys: vec![],
             }
         } else {
             // Default: only the active profile directory.
             let active = ProfileManager::resolve_active_name();
             let dir = paths::profile_dir(&active);
+            // The profile holds its own secret key; it goes with the profile.
+            let key = dir.join(".secret_key");
+            let removed_secret_keys = if key.exists() { vec![key] } else { vec![] };
             let dirs = if dir.exists() { vec![dir] } else { vec![] };
             Self {
                 dirs_to_remove: dirs,
                 files_to_remove: vec![],
                 touch_global: false,
                 profiles: vec![active],
+                kept_secret_keys: vec![],
+                removed_secret_keys,
             }
         }
     }
+}
+
+/// The paths to remove when `--keep-secrets` is set, and the secret keys that
+/// survive.
+///
+/// The key lives next to the config it protects — `<profile>/.secret_key` for
+/// the profile layout, `<root>/.secret_key` for an install that predates it.
+/// A directory that holds a key somewhere below stays (it ends up holding
+/// only that key); every other directory is removed whole.
+fn removal_plan_keeping_secrets(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut dirs = vec![];
+    let mut files = vec![];
+    let mut kept = vec![];
+    collect_keeping_secrets(root, &mut dirs, &mut files, &mut kept);
+    (dirs, files, kept)
+}
+
+/// Remove everything under `dir` except the secret keys it holds.
+///
+/// A symlink is an entry of the tree, never a doorway into it: it is
+/// classified by its own type, so the walk can neither step out of the tree
+/// nor chase a cycle back into it.
+fn collect_keeping_secrets(
+    dir: &Path,
+    dirs: &mut Vec<PathBuf>,
+    files: &mut Vec<PathBuf>,
+    kept: &mut Vec<PathBuf>,
+) {
+    if !subtree_holds_a_secret_key(dir) {
+        dirs.push(dir.to_path_buf());
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry_is_real_dir(&entry) {
+            collect_keeping_secrets(&path, dirs, files, kept);
+        } else if path.file_name().is_some_and(|name| name == ".secret_key") {
+            kept.push(path);
+        } else {
+            files.push(path);
+        }
+    }
+}
+
+/// Whether the entry is a real directory. A symlink never is, whatever it
+/// points at: [`fs::DirEntry::file_type`] reports the entry's own type (from
+/// `d_type`, or `lstat` when the filesystem does not report it) and never
+/// follows the link.
+fn entry_is_real_dir(entry: &fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+}
+
+/// Whether a secret key is anywhere below `dir`.
+fn subtree_holds_a_secret_key(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if entry_is_real_dir(&entry) {
+            subtree_holds_a_secret_key(&path)
+        } else {
+            path.file_name().is_some_and(|name| name == ".secret_key")
+        }
+    })
 }
 
 /// A daemon found bound to a profile via its `.daemon_active` sentinel, whose
@@ -333,54 +416,85 @@ fn stop_daemon_process(pid: u32) -> bool {
 }
 
 fn print_plan(scope: &Scope, opts: &UninstallOpts, info: &BinaryInfo, daemons: &[RunningDaemon]) {
-    println!("rantaiclaw uninstall plan:");
+    for line in plan_lines(scope, opts, info, daemons) {
+        println!("{line}");
+    }
+}
+
+/// The lines of the uninstall plan.
+///
+/// A pure function, so the report can be checked: a "preserving" line names a
+/// file that exists and that this scope really keeps, and a "remove binary"
+/// line names a binary this account really installed.
+fn plan_lines(
+    scope: &Scope,
+    opts: &UninstallOpts,
+    info: &BinaryInfo,
+    daemons: &[RunningDaemon],
+) -> Vec<String> {
+    let mut lines = vec!["rantaiclaw uninstall plan:".to_string()];
     for d in daemons {
-        match &d.unit {
-            Some(unit) => println!(
+        lines.push(match &d.unit {
+            Some(unit) => format!(
                 "  - stop service unit {} (pid {}, profile {})",
                 unit, d.pid, d.profile
             ),
-            None => println!("  - stop daemon pid {} (profile {})", d.pid, d.profile),
-        }
+            None => format!("  - stop daemon pid {} (profile {})", d.pid, d.profile),
+        });
     }
     let has_data = !scope.dirs_to_remove.is_empty() || !scope.files_to_remove.is_empty();
     if has_data {
         for d in &scope.dirs_to_remove {
-            println!("  - remove dir  {}", d.display());
+            lines.push(format!("  - remove dir  {}", d.display()));
         }
         for f in &scope.files_to_remove {
-            println!("  - remove file {}", f.display());
+            lines.push(format!("  - remove file {}", f.display()));
         }
     } else if daemons.is_empty() {
-        println!("  (nothing to remove — install state is already clean)");
+        lines.push("  (nothing to remove — install state is already clean)".to_string());
     }
-    if opts.keep_secrets {
-        println!(
+    for key in &scope.kept_secret_keys {
+        lines.push(format!(
             "  (preserving {} for future re-install)",
-            paths::rantaiclaw_root().join(".secret_key").display()
-        );
+            key.display()
+        ));
+    }
+    for key in &scope.removed_secret_keys {
+        lines.push(format!(
+            "  (the profile's secret key {} is removed with it)",
+            key.display()
+        ));
     }
     if opts.purge {
-        match info.kind {
-            InstallKind::Binary => {
-                println!("  - remove binary {}", info.path.display());
-            }
-            InstallKind::Cargo => {
-                println!(
-                    "  - skip binary (cargo-installed at {}; use `cargo uninstall rantaiclaw`)",
-                    info.path.display()
-                );
-            }
-            InstallKind::Workspace => {
-                println!(
-                    "  - skip binary (workspace build at {})",
-                    info.path.display()
-                );
-            }
-        }
+        lines.push(binary_plan_line(info));
     }
     if opts.dry_run {
-        println!("  (dry run — nothing will be touched)");
+        lines.push("  (dry run — nothing will be touched)".to_string());
+    }
+    lines
+}
+
+/// The plan line for the binary under `--purge`.
+fn binary_plan_line(info: &BinaryInfo) -> String {
+    match info.kind {
+        InstallKind::Binary if info.owned => {
+            format!("  - remove binary {}", info.path.display())
+        }
+        InstallKind::Binary => format!(
+            "  - skip binary (not installed by this account at {}; remove it with `rm -f {}`)",
+            info.path.display(),
+            info.path.display()
+        ),
+        InstallKind::Cargo => format!(
+            "  - skip binary (cargo-installed at {}; use `cargo uninstall rantaiclaw`)",
+            info.path.display()
+        ),
+        InstallKind::Workspace => {
+            format!(
+                "  - skip binary (workspace build at {})",
+                info.path.display()
+            )
+        }
     }
 }
 
@@ -521,57 +635,63 @@ fn clean_shell_rc_amendments() -> Result<()> {
 }
 
 fn print_summary(scope: &Scope, opts: &UninstallOpts, info: &BinaryInfo) {
-    println!();
-    println!("✓ uninstall complete");
+    for line in summary_lines(scope, opts, info) {
+        println!("{line}");
+    }
+}
+
+/// The lines of the uninstall summary.
+///
+/// A pure function, so the report can be checked: a "preserved" line names a
+/// file that exists and that this scope really kept.
+fn summary_lines(scope: &Scope, opts: &UninstallOpts, info: &BinaryInfo) -> Vec<String> {
+    let mut lines = vec![String::new(), "✓ uninstall complete".to_string()];
     if !opts.all && !opts.purge {
         let other = list_other_profiles();
         if !other.is_empty() {
-            println!(
+            lines.push(format!(
                 "  remaining profiles ({}): {}",
                 other.len(),
                 other.join(", ")
-            );
-            println!("  use `rantaiclaw uninstall --all` to remove them too");
+            ));
+            lines.push("  use `rantaiclaw uninstall --all` to remove them too".to_string());
         }
     }
     if !scope.touch_global {
-        return;
+        return lines;
     }
-    if opts.keep_secrets {
-        println!(
+    for key in &scope.kept_secret_keys {
+        lines.push(format!(
             "  preserved {} (re-install will reuse it to decrypt prior secrets)",
-            paths::rantaiclaw_root().join(".secret_key").display()
-        );
+            key.display()
+        ));
     }
 
     // A full uninstall wipes data but the binary self-recreates a fresh
     // ~/.rantaiclaw on next launch — so without this note it looks like the
     // uninstall "did nothing". State plainly that the binary remains and how
-    // to remove it. (--purge removes a plain Binary; cargo/workspace installs
-    // are deferred, so the binary is still present in those cases.)
-    let binary_removed = opts.purge && matches!(info.kind, InstallKind::Binary);
+    // to remove it. (--purge removes a plain Binary this account installed;
+    // cargo/workspace installs are deferred, and a binary this account did
+    // not install is left to its owner, so the binary is still present in
+    // those cases.)
+    let binary_removed = opts.purge && matches!(info.kind, InstallKind::Binary) && info.owned;
     if !binary_removed {
-        println!();
-        println!(
+        lines.push(String::new());
+        lines.push(format!(
             "  note: the rantaiclaw binary is still installed at {}",
             info.path.display()
-        );
-        println!("  running `rantaiclaw` again will recreate a fresh ~/.rantaiclaw");
-        match info.kind {
-            InstallKind::Binary => {
-                println!("  to remove it:  rm -f {}", info.path.display());
-            }
-            InstallKind::Cargo => {
-                println!("  to remove it:  cargo uninstall rantaiclaw");
-            }
-            InstallKind::Workspace => {
-                println!(
-                    "  (local workspace build at {} — recreated by `cargo build`)",
-                    info.path.display()
-                );
-            }
-        }
+        ));
+        lines.push("  running `rantaiclaw` again will recreate a fresh ~/.rantaiclaw".to_string());
+        lines.push(match info.kind {
+            InstallKind::Binary => format!("  to remove it:  rm -f {}", info.path.display()),
+            InstallKind::Cargo => "  to remove it:  cargo uninstall rantaiclaw".to_string(),
+            InstallKind::Workspace => format!(
+                "  (local workspace build at {} — recreated by `cargo build`)",
+                info.path.display()
+            ),
+        });
     }
+    lines
 }
 
 fn list_other_profiles() -> Vec<String> {
@@ -706,6 +826,416 @@ mod tests {
             assert!(
                 !paths::profile_dir("default").exists(),
                 "profiles still removed"
+            );
+        });
+    }
+
+    fn binary_info(path: &str, kind: InstallKind, owned: bool) -> BinaryInfo {
+        BinaryInfo {
+            path: PathBuf::from(path),
+            kind,
+            owned,
+        }
+    }
+
+    fn empty_scope() -> Scope {
+        Scope {
+            dirs_to_remove: vec![],
+            files_to_remove: vec![],
+            touch_global: false,
+            profiles: vec![],
+            kept_secret_keys: vec![],
+            removed_secret_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn keep_secrets_with_no_secret_key_prints_no_preserved_line() {
+        with_home(|| {
+            fs::create_dir_all(paths::profile_dir("default")).unwrap();
+
+            let opts = UninstallOpts {
+                all: true,
+                keep_secrets: true,
+                dry_run: true,
+                ..make_opts()
+            };
+            let scope = Scope::resolve(&opts);
+            assert!(scope.kept_secret_keys.is_empty());
+
+            let info = binary_info("/home/u/.local/bin/rantaiclaw", InstallKind::Binary, true);
+            let lines = plan_lines(&scope, &opts, &info, &[]);
+            assert!(
+                !lines.iter().any(|line| line.contains("preserving")),
+                "{lines:?}"
+            );
+            let summary = summary_lines(&scope, &opts, &info);
+            assert!(
+                !summary.iter().any(|line| line.contains("preserved")),
+                "{summary:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn keep_secrets_keeps_the_profile_secret_key_and_names_it() {
+        with_home(|| {
+            let profile = paths::profile_dir("default");
+            fs::create_dir_all(&profile).unwrap();
+            let key = profile.join(".secret_key");
+            fs::write(&key, "secret").unwrap();
+
+            let opts = UninstallOpts {
+                all: true,
+                keep_secrets: true,
+                dry_run: true,
+                ..make_opts()
+            };
+            let scope = Scope::resolve(&opts);
+            assert_eq!(scope.kept_secret_keys, vec![key.clone()]);
+
+            let info = binary_info("/home/u/.local/bin/rantaiclaw", InstallKind::Binary, true);
+            let lines = plan_lines(&scope, &opts, &info, &[]);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("preserving")
+                        && line.contains(&key.display().to_string())),
+                "{lines:?}"
+            );
+            let summary = summary_lines(&scope, &opts, &info);
+            assert!(
+                summary
+                    .iter()
+                    .any(|line| line.contains("preserved")
+                        && line.contains(&key.display().to_string())),
+                "{summary:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_default_scope_says_the_profile_secret_key_goes_with_the_profile() {
+        with_home(|| {
+            let profile = paths::profile_dir("default");
+            fs::create_dir_all(&profile).unwrap();
+            let key = profile.join(".secret_key");
+            fs::write(&key, "secret").unwrap();
+
+            let opts = UninstallOpts {
+                dry_run: true,
+                ..make_opts()
+            };
+            let scope = Scope::resolve(&opts);
+            assert!(scope.kept_secret_keys.is_empty());
+            assert_eq!(scope.removed_secret_keys, vec![key.clone()]);
+
+            let info = binary_info("/home/u/.local/bin/rantaiclaw", InstallKind::Binary, true);
+            let lines = plan_lines(&scope, &opts, &info, &[]);
+            assert!(
+                lines.iter().any(|line| line.contains("removed with it")
+                    && line.contains(&key.display().to_string())),
+                "{lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|line| line.contains("preserving")),
+                "{lines:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_binary_this_account_did_not_install_is_not_planned_for_removal() {
+        let opts = UninstallOpts {
+            purge: true,
+            dry_run: true,
+            ..make_opts()
+        };
+        let info = binary_info("/x/.cargo/bin/rantaiclaw", InstallKind::Binary, false);
+        let lines = plan_lines(&empty_scope(), &opts, &info, &[]);
+        assert!(
+            !lines.iter().any(|line| line.contains("remove binary")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("rm -f")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_binary_this_account_installed_is_planned_for_removal() {
+        let opts = UninstallOpts {
+            purge: true,
+            dry_run: true,
+            ..make_opts()
+        };
+        let info = binary_info("/home/u/.local/bin/rantaiclaw", InstallKind::Binary, true);
+        let lines = plan_lines(&empty_scope(), &opts, &info, &[]);
+        assert!(
+            lines.iter().any(|line| line.contains("remove binary")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn keep_secrets_preserves_the_profile_secret_key() {
+        with_home(|| {
+            let profile = paths::profile_dir("default");
+            fs::create_dir_all(&profile).unwrap();
+            let key = profile.join(".secret_key");
+            fs::write(&key, "secret").unwrap();
+            fs::write(profile.join("config.toml"), "x").unwrap();
+
+            let opts = UninstallOpts {
+                all: true,
+                keep_secrets: true,
+                ..make_opts()
+            };
+            run(opts).unwrap();
+            assert!(key.exists(), "the profile's secret key is preserved");
+            assert!(
+                !profile.join("config.toml").exists(),
+                "the rest of the profile is removed"
+            );
+        });
+    }
+
+    /// A tree whose profile holds a secret key, plus a symlink inside the
+    /// tree pointing at `outside` — a directory outside the tree that holds a
+    /// file and a secret key below it.
+    ///
+    /// Returns `(root, outside, link)`.
+    #[cfg(unix)]
+    fn tree_with_symlink_to_outside() -> (PathBuf, PathBuf, PathBuf) {
+        let root = paths::rantaiclaw_root();
+        let outside = paths::home_dir().join("outside");
+        fs::create_dir_all(outside.join("keys")).unwrap();
+        fs::write(outside.join("document.txt"), "outside").unwrap();
+        fs::write(outside.join("keys").join(".secret_key"), "secret").unwrap();
+
+        let profile = paths::profile_dir("default");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join(".secret_key"), "secret").unwrap();
+        fs::write(profile.join("config.toml"), "x").unwrap();
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        (root, outside, link)
+    }
+
+    /// The plan of `--all --keep-secrets` for a tree that holds a symlink.
+    #[cfg(unix)]
+    fn keep_secrets_plan() -> Scope {
+        let opts = UninstallOpts {
+            all: true,
+            keep_secrets: true,
+            dry_run: true,
+            ..make_opts()
+        };
+        Scope::resolve(&opts)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keep_secrets_does_not_descend_into_a_symlinked_directory_outside_the_tree() {
+        with_home(|| {
+            let (_, outside, link) = tree_with_symlink_to_outside();
+            let outside_file = outside.join("document.txt");
+
+            let scope = keep_secrets_plan();
+
+            // The symlink is an entry of the tree: it is planned as a file,
+            // and nothing below it is planned at all.
+            assert!(
+                scope.files_to_remove.contains(&link),
+                "the symlink is planned as a file, got {:?}",
+                scope.files_to_remove
+            );
+            assert!(
+                !scope.dirs_to_remove.contains(&link),
+                "a symlink is never a directory, got {:?}",
+                scope.dirs_to_remove
+            );
+            for planned in scope
+                .files_to_remove
+                .iter()
+                .chain(scope.dirs_to_remove.iter())
+            {
+                assert!(
+                    !(planned.starts_with(&link) && planned != &link),
+                    "nothing below the symlink may be planned for removal: {}",
+                    planned.display()
+                );
+            }
+
+            // The file outside the tree is not part of the plan...
+            assert!(
+                !scope.files_to_remove.contains(&outside_file)
+                    && !scope.dirs_to_remove.contains(&outside_file),
+                "a file outside the tree must never be planned"
+            );
+            // ...while the tree's own files are.
+            let profile = paths::profile_dir("default");
+            assert!(
+                scope.files_to_remove.contains(&profile.join("config.toml")),
+                "the tree's own file is planned, got {:?}",
+                scope.files_to_remove
+            );
+            assert!(
+                scope
+                    .kept_secret_keys
+                    .contains(&profile.join(".secret_key")),
+                "the tree's own key is kept, got {:?}",
+                scope.kept_secret_keys
+            );
+
+            // The outside file is untouched.
+            assert!(
+                outside_file.exists(),
+                "the file outside the tree must survive the plan"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keep_secrets_removes_a_symlink_in_the_tree_as_itself() {
+        with_home(|| {
+            let (_, outside, link) = tree_with_symlink_to_outside();
+            let outside_file = outside.join("document.txt");
+
+            let opts = UninstallOpts {
+                all: true,
+                keep_secrets: true,
+                ..make_opts()
+            };
+            run(opts).unwrap();
+
+            // The link itself is gone...
+            assert!(
+                fs::symlink_metadata(&link).is_err(),
+                "the symlink must be removed as itself"
+            );
+            // ...but nothing it pointed at was.
+            assert!(
+                outside_file.exists(),
+                "the file outside the tree must survive the uninstall"
+            );
+            assert!(
+                outside.join("keys").join(".secret_key").exists(),
+                "the key outside the tree must survive the uninstall"
+            );
+
+            // The tree's own files are gone; its key is kept.
+            let profile = paths::profile_dir("default");
+            assert!(!profile.join("config.toml").exists());
+            assert!(profile.join(".secret_key").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_in_the_tree_is_removed_as_itself() {
+        with_home(|| {
+            let root = paths::rantaiclaw_root();
+            let profile = paths::profile_dir("default");
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(profile.join(".secret_key"), "secret").unwrap();
+            fs::write(profile.join("config.toml"), "x").unwrap();
+            let dangling = root.join("dangling");
+            std::os::unix::fs::symlink(root.join("gone"), &dangling).unwrap();
+
+            let scope = keep_secrets_plan();
+            assert!(
+                scope.files_to_remove.contains(&dangling),
+                "a dangling symlink is still an entry of the tree, got {:?}",
+                scope.files_to_remove
+            );
+
+            let opts = UninstallOpts {
+                all: true,
+                keep_secrets: true,
+                ..make_opts()
+            };
+            run(opts).unwrap();
+            assert!(
+                fs::symlink_metadata(&dangling).is_err(),
+                "a dangling symlink must be removed, not skipped"
+            );
+        });
+    }
+
+    /// Marks the child half of `a_symlink_cycle_does_not_hang`.
+    const CYCLE_CHILD_ENV: &str = "RANTAICLAW_UNINSTALL_CYCLE_CHILD";
+    const CYCLE_MARKER_ENV: &str = "RANTAICLAW_UNINSTALL_CYCLE_MARKER";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_does_not_hang() {
+        // Child half: HOME is the tree the parent built. Compute the plan on
+        // it and leave a marker behind, so the parent can tell that the plan
+        // was really computed (and not that the filter matched no test).
+        if std::env::var_os(CYCLE_CHILD_ENV).is_some() {
+            let scope = keep_secrets_plan();
+            let cycle = paths::rantaiclaw_root().join("self");
+            assert!(
+                scope.files_to_remove.contains(&cycle),
+                "the cycle link is planned as a file, not walked into: {:?}",
+                scope.files_to_remove
+            );
+            let marker = std::env::var_os(CYCLE_MARKER_ENV).expect("marker path");
+            fs::write(marker, "planned").unwrap();
+            return;
+        }
+
+        with_home(|| {
+            let root = paths::rantaiclaw_root();
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(".secret_key"), "secret").unwrap();
+            // A link that points back at the tree it lives in.
+            let cycle = root.join("self");
+            std::os::unix::fs::symlink(&root, &cycle).unwrap();
+
+            // The plan must be computed, not chased forever. The child does
+            // the work; a walk that follows the link never returns, so the
+            // parent gives up on it rather than hanging the suite.
+            let marker = paths::home_dir().join("cycle-plan-computed");
+            let exe = std::env::current_exe().expect("the test binary");
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args([
+                "--exact",
+                "lifecycle::uninstall::tests::a_symlink_cycle_does_not_hang",
+            ])
+            .env(CYCLE_CHILD_ENV, "1")
+            .env(CYCLE_MARKER_ENV, &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+            let mut child = cmd.spawn().expect("spawn the child");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            panic!(
+                                "the uninstall plan never finished: the walk followed the symlink cycle"
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(err) => panic!("waiting for the child failed: {err}"),
+                }
+            };
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            assert!(status.success(), "the child failed: {stderr}");
+            assert!(
+                marker.exists(),
+                "the child never computed the plan: {stderr}"
             );
         });
     }
