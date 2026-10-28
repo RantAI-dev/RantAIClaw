@@ -802,15 +802,16 @@ Manage profiles. Each profile is a self-contained \
 ~/.rantaiclaw/profiles/<name>/ directory with its own config, persona, \
 workspace, memory, skills, sessions, policy, secrets and runtime state.
 
-The default profile is auto-created on first run. Use `-p <name>` (or \
-the RANTAICLAW_PROFILE env var) to switch profiles for a single \
-invocation without changing the active marker.
+The default profile is auto-created on first run. Use `--profile <name>` \
+(or the RANTAICLAW_PROFILE env var) to switch profiles for a single \
+invocation without changing the active marker. The named profile must \
+already exist.
 
 Examples:
   rantaiclaw profile list
   rantaiclaw profile create work --clone default
   rantaiclaw profile use work
-  rantaiclaw -p work profile current")]
+  rantaiclaw --profile work profile current")]
     Profile {
         #[command(subcommand)]
         cmd: profile::commands::ProfileCommand,
@@ -1347,6 +1348,15 @@ enum IntegrationCommands {
     },
 }
 
+/// Whether the command is one of the profile-management commands.
+///
+/// The profile commands are the way out of a bad profile selection (a list,
+/// a create, a delete), so the environment door that refuses a selection
+/// under an override leaves them alone.
+fn is_profile_command(command: Option<&Commands>) -> bool {
+    matches!(command, Some(Commands::Profile { .. }))
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -1377,10 +1387,33 @@ async fn main() -> Result<()> {
     // that ProfileManager::resolve_active_name() observes it. Resolution
     // precedence is documented on the Cli struct.
     if let Some(profile_name) = &cli.profile {
-        if profile_name.trim().is_empty() {
+        let profile_name = profile_name.trim();
+        if profile_name.is_empty() {
             bail!("--profile cannot be empty");
         }
+        // The selection door: one validator at every door a profile name
+        // enters (a name that could escape the profiles directory is
+        // refused before it becomes an environment variable every path is
+        // built from), an override that pins the config directory refusing
+        // a profile it does not keep in effect, and a flag naming a profile
+        // that does not exist refused before it reaches any command (it used
+        // to become a new, empty profile directory). `default` stays
+        // bootstrappable for the first run.
+        rantaiclaw::profile::ProfileManager::require_selectable(profile_name)?;
         std::env::set_var("RANTAICLAW_PROFILE", profile_name);
+    } else if !is_profile_command(cli.command.as_ref()) {
+        // The environment door: `RANTAICLAW_PROFILE` names the profile for
+        // this invocation exactly as `--profile` does, so it passes the same
+        // door — the same one sentence, the same remedy. The profile
+        // commands are exempt: they are the way out of a bad selection (a
+        // list, a create, a delete), and they must keep working while an
+        // override is in effect.
+        if let Ok(env_profile) = std::env::var("RANTAICLAW_PROFILE") {
+            let env_profile = env_profile.trim();
+            if !env_profile.is_empty() {
+                rantaiclaw::profile::ProfileManager::require_selectable(env_profile)?;
+            }
+        }
     }
 
     // No subcommand: launch TUI (bare invocation).

@@ -616,16 +616,18 @@ fn install_macos(config: &Config) -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
+    let install_profile = explicit_install_profile();
     let plist = macos_plist(
         SERVICE_LABEL,
         &xml_escape(&exe.display().to_string()),
         &xml_escape(&stdout.display().to_string()),
         &xml_escape(&stderr.display().to_string()),
-        &xml_escape(&installed_profile()),
+        install_profile.as_deref().map(xml_escape).as_deref(),
     );
 
     fs::write(&file, plist)?;
     println!("✅ Installed launchd service: {}", file.display());
+    print_profile_binding(install_profile.as_deref());
     println!("   Start with: rantaiclaw service start");
     Ok(())
 }
@@ -658,7 +660,24 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
 /// NOT process escapes, so the backslashes landed in the file verbatim, producing
 /// invalid XML that `launchctl load` rejected (the whole macOS service path never
 /// worked). Plain quotes here fix it.
-fn macos_plist(label: &str, exe: &str, stdout: &str, stderr: &str, profile: &str) -> String {
+fn macos_plist(
+    label: &str,
+    exe: &str,
+    stdout: &str,
+    stderr: &str,
+    profile: Option<&str>,
+) -> String {
+    // The profile key is written only when the operator chose a profile at
+    // install time; a plist without it follows the active-profile marker,
+    // which is what lets `profile use` move the service.
+    let profile_entry = profile
+        .map(|profile| {
+            format!(
+                "    <key>RANTAICLAW_PROFILE</key>\n    <string>{}</string>\n",
+                xml_escape(profile)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -673,9 +692,7 @@ fn macos_plist(label: &str, exe: &str, stdout: &str, stderr: &str, profile: &str
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>RANTAICLAW_PROFILE</key>
-    <string>{profile}</string>
-    <key>RANTAICLAW_UNIT</key>
+{profile_entry}    <key>RANTAICLAW_UNIT</key>
     <string>{label}</string>
   </dict>
   <key>RunAtLoad</key>
@@ -704,19 +721,43 @@ fn systemd_escape_value(value: &str) -> String {
     }
 }
 
-/// The profile the installed service should run as — the same source the daemon
-/// uses to key its sentinel (`RANTAICLAW_PROFILE`, default `"default"`). Read at
-/// install time and stamped into the generated unit so the service reproduces
-/// the profile the operator installed it from.
-fn installed_profile() -> String {
-    std::env::var("RANTAICLAW_PROFILE").unwrap_or_else(|_| "default".to_string())
+/// The profile the installed service should run as, when the operator chose
+/// one at install time (`RANTAICLAW_PROFILE` in the installer's environment —
+/// set by `--profile`, or by hand).
+///
+/// `None` means the unit carries no `RANTAICLAW_PROFILE` at all: the daemon
+/// then follows the active-profile marker, and `profile use` can move the
+/// service to a new profile. A unit that names a profile pins it — the
+/// daemon serves that profile whatever the marker says — so the name is
+/// written into the unit only when it was chosen on purpose.
+fn explicit_install_profile() -> Option<String> {
+    std::env::var("RANTAICLAW_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// One line that says what the freshly installed service will do when the
+/// active profile changes. Every install path prints it, so the operator
+/// never has to guess which kind of unit they have.
+fn print_profile_binding(profile: Option<&str>) {
+    match profile {
+        Some(profile) => println!(
+            "   Pinned to profile {profile:?}: this service keeps serving it, whatever \
+             `rantaiclaw profile use` says."
+        ),
+        None => println!(
+            "   Follows the active profile: `rantaiclaw profile use <name>` restarts this \
+             service onto the new profile."
+        ),
+    }
 }
 
 fn systemd_user_unit(
     exe: &Path,
     working_dir: Option<&Path>,
     path_env: Option<&str>,
-    profile: &str,
+    profile: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let mut service = String::from("Type=simple\n");
@@ -732,16 +773,20 @@ fn systemd_user_unit(
         // assignment; double `%` so systemd does not read it as a specifier.
         let _ = writeln!(service, "Environment=\"PATH={}\"", path.replace('%', "%%"));
     }
-    // Stamp the profile identity into the unit so a service installed from a
-    // non-default profile actually runs THAT profile — the daemon reads
-    // `RANTAICLAW_PROFILE` to key its sentinel — and so `profile use` restarts
-    // the real installed unit (`rantaiclaw.service`) instead of the
-    // `rantaiclaw@<profile>.service` template the installer never creates.
-    let _ = writeln!(
-        service,
-        "Environment=RANTAICLAW_PROFILE={}",
-        systemd_escape_value(profile)
-    );
+    // Stamp the profile identity into the unit ONLY when the operator chose a
+    // profile at install time. A unit that names one pins it — the daemon
+    // reads `RANTAICLAW_PROFILE` and serves that profile whatever the
+    // active-profile marker says — so `profile use` reports the pinned
+    // service instead of restarting it. Without the line the daemon follows
+    // the marker, and `profile use` restarts the real installed unit
+    // (`rantaiclaw.service`) onto the new profile.
+    if let Some(profile) = profile {
+        let _ = writeln!(
+            service,
+            "Environment=RANTAICLAW_PROFILE={}",
+            systemd_escape_value(profile)
+        );
+    }
     let _ = writeln!(service, "Environment=RANTAICLAW_UNIT=rantaiclaw.service");
     // RestartPreventExitStatus=78 (EX_CONFIG): a daemon that exited because of a
     // gateway/tunnel/other configuration error must NOT be started again every
@@ -772,17 +817,19 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let working_dir = std::env::current_dir().ok();
     let path_env = std::env::var("PATH").ok();
+    let install_profile = explicit_install_profile();
     let unit = systemd_user_unit(
         exe.as_path(),
         working_dir.as_deref(),
         path_env.as_deref(),
-        &installed_profile(),
+        install_profile.as_deref(),
     );
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "rantaiclaw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
+    print_profile_binding(install_profile.as_deref());
     if let Some(dir) = &working_dir {
         println!(
             "   Captured your working directory + PATH so tools (e.g. kubectl) resolve as in your shell: {}",
@@ -1170,15 +1217,20 @@ fn warn_if_binary_in_home(exe_path: &Path) {
 }
 
 /// Generate OpenRC init script content (pure function for testability)
-fn generate_openrc_script(exe_path: &Path, config_dir: &Path, profile: &str) -> String {
+fn generate_openrc_script(exe_path: &Path, config_dir: &Path, profile: Option<&str>) -> String {
+    // The profile export is written only when the operator chose a profile at
+    // install time; without it the daemon follows the active-profile marker,
+    // which is what lets `profile use` move the service.
+    let profile_export = profile
+        .map(|profile| format!("export RANTAICLAW_PROFILE=\"{profile}\"\n"))
+        .unwrap_or_default();
     format!(
         r#"#!/sbin/openrc-run
 
 name="rantaiclaw"
 description="RantaiClaw daemon"
 
-export RANTAICLAW_PROFILE="{profile}"
-export RANTAICLAW_UNIT="rantaiclaw"
+{profile_export}export RANTAICLAW_UNIT="rantaiclaw"
 
 command="{}"
 command_args="--config-dir {} daemon"
@@ -1326,7 +1378,8 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    let init_script = generate_openrc_script(&exe, config_dir, &installed_profile());
+    let install_profile = explicit_install_profile();
+    let init_script = generate_openrc_script(&exe, config_dir, install_profile.as_deref());
     let init_path = Path::new("/etc/init.d/rantaiclaw");
     fs::write(init_path, init_script)
         .with_context(|| format!("Failed to write {}", init_path.display()))?;
@@ -1340,6 +1393,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
     run_checked(Command::new("rc-update").args(["add", "rantaiclaw", "default"]))?;
     println!("✅ Installed OpenRC service: /etc/init.d/rantaiclaw");
+    print_profile_binding(install_profile.as_deref());
     println!("   Config path: /etc/rantaiclaw/config.toml");
     println!("   Start with: sudo rantaiclaw service start");
     let _ = config;
@@ -1476,7 +1530,7 @@ mod tests {
             "/usr/bin/rc",
             "/tmp/o.log",
             "/tmp/e.log",
-            "work",
+            Some("work"),
         );
         assert!(
             p.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
@@ -1491,12 +1545,35 @@ mod tests {
 
     #[test]
     fn macos_plist_carries_profile_identity() {
-        let p = macos_plist("com.rantaiclaw.daemon", "/usr/bin/rc", "/o", "/e", "work");
+        let p = macos_plist(
+            "com.rantaiclaw.daemon",
+            "/usr/bin/rc",
+            "/o",
+            "/e",
+            Some("work"),
+        );
         assert!(p.contains("<key>EnvironmentVariables</key>"), "plist: {p}");
         assert!(p.contains("<key>RANTAICLAW_PROFILE</key>\n    <string>work</string>"));
         // The unit identity is the launchd label so handoff restarts the real job.
         assert!(
             p.contains("<key>RANTAICLAW_UNIT</key>\n    <string>com.rantaiclaw.daemon</string>")
+        );
+    }
+
+    /// No explicit profile at install time ⇒ no `RANTAICLAW_PROFILE` key at
+    /// all: the daemon follows the active-profile marker, and `profile use`
+    /// can move the service.
+    #[test]
+    fn macos_plist_without_an_explicit_profile_names_no_profile() {
+        let p = macos_plist("com.rantaiclaw.daemon", "/usr/bin/rc", "/o", "/e", None);
+        assert!(p.contains("<key>EnvironmentVariables</key>"), "plist: {p}");
+        assert!(
+            !p.contains("RANTAICLAW_PROFILE"),
+            "an unpinned plist must not name a profile: {p}"
+        );
+        assert!(
+            p.contains("<key>RANTAICLAW_UNIT</key>\n    <string>com.rantaiclaw.daemon</string>"),
+            "the unit identity is stamped either way: {p}"
         );
     }
 
@@ -1506,7 +1583,7 @@ mod tests {
             std::path::Path::new("/opt/My Apps/rantaiclaw"),
             Some(std::path::Path::new("/home/op/My Work")),
             Some("/usr/bin:/opt/100%dir"),
-            "default",
+            Some("default"),
         );
         assert!(
             unit.contains("ExecStart=\"/opt/My Apps/rantaiclaw\" daemon"),
@@ -1692,7 +1769,7 @@ mod tests {
         use std::path::PathBuf;
 
         let exe_path = PathBuf::from("/usr/local/bin/rantaiclaw");
-        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"), "work");
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"), Some("work"));
 
         assert!(script.starts_with("#!/sbin/openrc-run"));
         assert!(script.contains("name=\"rantaiclaw\""));
@@ -1712,6 +1789,25 @@ mod tests {
         assert!(script.contains("depend()"));
         assert!(script.contains("need net"));
         assert!(script.contains("after firewall"));
+    }
+
+    /// No explicit profile at install time ⇒ no `export RANTAICLAW_PROFILE`
+    /// line: the daemon follows the active-profile marker.
+    #[test]
+    fn generate_openrc_script_without_an_explicit_profile_exports_no_profile() {
+        use std::path::PathBuf;
+
+        let exe_path = PathBuf::from("/usr/local/bin/rantaiclaw");
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"), None);
+
+        assert!(
+            !script.contains("RANTAICLAW_PROFILE"),
+            "an unpinned OpenRC script must not name a profile: {script}"
+        );
+        assert!(
+            script.contains("export RANTAICLAW_UNIT=\"rantaiclaw\""),
+            "the unit identity is exported either way: {script}"
+        );
     }
 
     #[test]
@@ -1802,7 +1898,7 @@ mod tests {
             Path::new("/home/op/.cargo/bin/rantaiclaw"),
             Some(Path::new("/home/op/repo")),
             Some("/home/op/.local/bin:/usr/bin"),
-            "default",
+            Some("default"),
         );
         assert!(
             unit.contains("WorkingDirectory=/home/op/repo\n"),
@@ -1820,10 +1916,10 @@ mod tests {
 
     #[test]
     fn systemd_user_unit_stamps_profile_identity() {
-        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None, "work");
-        // The profile + real unit name are always present so a service installed
-        // from a non-default profile runs that profile and its handoff restarts
-        // the installed `rantaiclaw.service`.
+        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None, Some("work"));
+        // An explicitly chosen profile is stamped so the service runs THAT
+        // profile; its daemon is pinned and `profile use` reports that
+        // instead of restarting the unit.
         assert!(
             unit.contains("Environment=RANTAICLAW_PROFILE=work\n"),
             "unit: {unit}"
@@ -1834,9 +1930,30 @@ mod tests {
         );
     }
 
+    /// No explicit profile at install time ⇒ no `Environment=
+    /// RANTAICLAW_PROFILE` line: the daemon follows the active-profile
+    /// marker, and `profile use` restarts this unit onto the new profile.
+    #[test]
+    fn systemd_user_unit_without_an_explicit_profile_names_no_profile() {
+        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None, None);
+        assert!(
+            !unit.contains("RANTAICLAW_PROFILE"),
+            "an unpinned unit must not name a profile: {unit}"
+        );
+        assert!(
+            unit.contains("Environment=RANTAICLAW_UNIT=rantaiclaw.service\n"),
+            "the unit identity is stamped either way: {unit}"
+        );
+    }
+
     #[test]
     fn systemd_user_unit_omits_optional_lines_when_absent() {
-        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None, "default");
+        let unit = systemd_user_unit(
+            Path::new("/usr/bin/rantaiclaw"),
+            None,
+            None,
+            Some("default"),
+        );
         assert!(!unit.contains("WorkingDirectory="), "unit: {unit}");
         // No PATH capture, but the profile-identity Environment lines still stamp.
         assert!(!unit.contains("Environment=\"PATH="), "unit: {unit}");
@@ -1850,13 +1967,27 @@ mod tests {
         );
     }
 
+    /// The unpinned shape: the [Service] section starts with the unit
+    /// identity line, not a profile pin.
+    #[test]
+    fn systemd_user_unit_without_a_profile_starts_with_the_unit_identity() {
+        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None, None);
+        assert!(
+            unit.contains(
+                "[Service]\nType=simple\nEnvironment=RANTAICLAW_UNIT=rantaiclaw.service\n\
+                 ExecStart=/usr/bin/rantaiclaw daemon\n"
+            ),
+            "unit: {unit}"
+        );
+    }
+
     #[test]
     fn systemd_user_unit_omits_path_when_empty() {
         let unit = systemd_user_unit(
             Path::new("/x/rantaiclaw"),
             Some(Path::new("/w")),
             Some(""),
-            "default",
+            Some("default"),
         );
         assert!(unit.contains("WorkingDirectory=/w\n"), "unit: {unit}");
         assert!(!unit.contains("Environment=\"PATH="), "unit: {unit}");
@@ -1864,7 +1995,7 @@ mod tests {
 
     #[test]
     fn systemd_user_unit_preserves_shutdown_settings() {
-        let unit = systemd_user_unit(Path::new("/x/rantaiclaw"), None, None, "default");
+        let unit = systemd_user_unit(Path::new("/x/rantaiclaw"), None, None, Some("default"));
         for needle in [
             "Restart=always\n",
             "RestartSec=3\n",

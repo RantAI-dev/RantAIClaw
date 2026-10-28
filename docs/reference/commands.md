@@ -150,6 +150,13 @@ Single-topic examples:
 - `rantaiclaw service status`
 - `rantaiclaw service uninstall`
 
+`service install` records the profile in the unit: when the installer ran with a
+profile chosen explicitly (the global `--profile <name>` flag or `RANTAICLAW_PROFILE`), the
+unit is pinned to that profile via `RANTAICLAW_PROFILE` and `profile use` will not move
+it — reinstall from the other profile to move the service. Without an explicit profile
+the unit carries no `RANTAICLAW_PROFILE`, so the daemon follows the active-profile
+marker and `profile use` restarts it onto the profile it switches to.
+
 ### `ui`
 
 - `rantaiclaw ui install [--dir <path>] [--ref <tag>] [--force] [--allow-unverified]`
@@ -773,14 +780,24 @@ config, persona, workspace, memory, skills, sessions, policy, secrets and runtim
 |---|---|
 | `list` | All profiles |
 | `create <name> [--clone <src>]` | Create, optionally cloning an existing profile |
-| `use <name>` | Switch the active profile |
+| `use <name>` | Switch the active profile; restarts a background daemon that followed the previous profile (a daemon pinned to its profile by a service install stays put and the switch says so). Refused while a config-directory override keeps another profile in effect (see the config reference, "Overrides pin the profile") |
 | `clone <src> <dst>` | Clone under a new name |
 | `delete <name>` | Delete; refuses the active profile unless `--force` |
 | `current` | Print the active profile name |
 
 To switch for a single invocation without moving the active marker, use the global
-`-p <name>` flag or the `RANTAICLAW_PROFILE` environment variable. Precedence is
-**CLI flag > env var > active-profile file > `default`**.
+`--profile <name>` flag or the `RANTAICLAW_PROFILE` environment variable. The named
+profile must already exist (only `default` self-bootstraps, on the first run).
+Precedence is **CLI flag > env var > active-profile file > `default`**.
+
+While a config-directory override is in effect, it pins the profile: `profile use`,
+`--profile` and `RANTAICLAW_PROFILE` naming a different profile are refused with a
+one-line message naming the override and how to clear it. An `active_workspace.toml`
+marker that names a profile directory of this root (`profiles/<name>`) is a pointer
+to the active profile, not an override — onboarding writes that shape, so switching
+profiles keeps working. The refusal sits at those three doors, not in the profile
+resolution: `profile list`, `profile current`, `profile create` and `profile delete`
+stay available under an override, so a selection that cannot be used is still fixable.
 
 ### `session`
 

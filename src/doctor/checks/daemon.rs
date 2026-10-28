@@ -266,14 +266,16 @@ fn unquote(value: &str) -> &str {
 
 /// The profile a unit's `Environment=` property names, when it names one.
 ///
-/// The installer stamps every unit it writes with
-/// `Environment=RANTAICLAW_PROFILE=<profile>` (`src/service/mod.rs`), so a
-/// unit that carries the property says which profile its daemon serves —
-/// the fact a registration claim for the profile being diagnosed must
-/// agree with. `Environment` holds space-separated `KEY=VALUE` assignments;
-/// the installer quotes a value only when it contains whitespace, which no
-/// supported profile name does — a value the whitespace split tears apart
-/// reads as no profile rather than as a wrong one.
+/// The installer stamps a unit with `Environment=RANTAICLAW_PROFILE=<profile>`
+/// (`src/service/mod.rs`) only when the operator chose a profile at install
+/// time; such a unit is pinned to that profile. A unit without the property
+/// follows the active-profile marker, so it serves the profile being
+/// diagnosed — which is why a unit that names no profile falls through to
+/// [`classify_unit`] rather than counting as foreign. `Environment` holds
+/// space-separated `KEY=VALUE` assignments; the installer quotes a value
+/// only when it contains whitespace, which no supported profile name does —
+/// a value the whitespace split tears apart reads as no profile rather than
+/// as a wrong one.
 pub(crate) fn unit_reported_profile(environment: Option<&str>) -> Option<String> {
     let environment = environment?;
     for assignment in environment.split_whitespace() {

@@ -172,6 +172,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers that the model is changed with `/model`, and the debug toggle is removed with the `/config debug`
   key, the `/debug` command and the `/status` Debug row. `/model <provider:model>` changes the model.
 - `[browser] allowed_domains` now defaults to `["*"]` (config schema 38 → 39), so `browser` and `browser_open` take a public host on a fresh install. An existing config is left as written.
+- `rantaiclaw service install` pins a profile only when one was chosen
+  explicitly. A unit installed with `-p <name>` or `RANTAICLAW_PROFILE` set
+  carries `RANTAICLAW_PROFILE` as before; a unit installed without either now
+  carries no profile and the daemon follows the active-profile marker, so
+  `rantaiclaw profile use <name>` restarts it onto the profile it switches
+  to. The install output names the binding either way. An already installed
+  unit keeps its current binding until the next `service install`.
 
 ### Removed
 
@@ -447,6 +454,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could never seed a new file. The upload now opens the remote file with create-and-truncate
   semantics, so a push creates a missing file and overwrites an existing one in full; a
   missing remote directory or a server-denied write still fails with the server's reason.
+- A daemon that followed an active-profile marker wrote its `.daemon_active`
+  sentinel under `default`: the sentinel was keyed on `RANTAICLAW_PROFILE`
+  alone, so the record of which process owns the channels landed next to a
+  config the daemon was not running. The daemon now resolves its profile the
+  same way the config loader does (env var, then the active-profile marker,
+  then `default`), once per process, and every sentinel write and the
+  shutdown clear land under the profile whose config the daemon actually
+  loaded — a marker that changes while the daemon runs can no longer make
+  the shutdown clear a sentinel the daemon did not write.
+- `profile use` restarted the wrong daemon, when it restarted one at all. It
+  read the sentinel of the profile being switched to and restarted
+  `rantaiclaw@<new>.service`, falling back to that template name when the
+  sentinel named no unit — so the daemon actually serving the previous
+  profile kept its stale config, a template unit the installer never created
+  was a restart target, and a daemon pinned to its profile would have been
+  cycled to no effect. The handoff now runs against the previous profile:
+  the unit named by that profile's live sentinel is restarted only when the
+  init system reports it active; a daemon whose launcher pinned its profile
+  is left alone and the switch says how to move it; a daemon started by hand
+  is left to the operator; a stale sentinel is cleared instead of
+  resurrecting a daemon the operator is not running; and the
+  `rantaiclaw@<profile>.service` fallback is gone.
+- A profile switch while a config-directory override was in effect moved the
+  per-profile stores (sessions, knowledge base, policy, persona, skills,
+  secrets) but not the config, the workspace, the memory database or the cron
+  store, leaving one install pointing at two profiles: `RANTAICLAW_CONFIG_DIR`
+  and `RANTAICLAW_WORKSPACE` and the `active_workspace.toml` marker pin the
+  config directory, and `profile use` moved everything else anyway. A switch
+  that names a profile other than the one the override keeps in effect is now
+  refused with a one-line message naming the override and how to clear it, and
+  the same refusal covers a profile selected by `--profile` or by
+  `RANTAICLAW_PROFILE`, at the door where the selection is made. The profile
+  commands (`profile list`, `profile current`, `profile create`, `profile
+  delete`) stay available under an override — they are the way out of a
+  selection that cannot be used. A marker that names a profile directory of
+  this root (`~/.rantaiclaw/profiles/<name>`) is a profile pointer, not an
+  override: the onboarding wizard writes that shape, and it yields to the
+  active profile, so `profile use` moves the whole install as before. Two
+  name-handling holes closed on the way: `profile create` and `profile clone`
+  now hold a NEW profile name to the unit-safe rules (letters, digits, `-`,
+  `_`, at most 64 characters), while profiles that already exist under older
+  naming keep loading; and a clone source that does not exist is an error
+  that creates nothing, where `clone nosuch copy` used to build `nosuch` as
+  an empty profile and copy that. A name read from the marker or the
+  environment that could escape the profiles directory falls back to
+  `default` with a warning instead of becoming a path.
+- `--profile <name>` and `RANTAICLAW_PROFILE=<name>` silently created a
+  profile that did not exist: any command that resolves the active profile
+  ran `ensure` on the name, so a typo built an empty `profiles/<name>/`
+  directory — no config, persona or secrets of its own — and ran against
+  it. A flag or environment variable naming a profile that does not exist
+  is now refused with the remedy (`create it with rantaiclaw profile
+  create <name>`); the same refusal covers an active-profile marker naming
+  a deleted profile, and `default` keeps self-bootstrapping on the first
+  run. The check runs when the flag is applied, before the subcommand, so
+  `--profile work profile create work` is refused — create the profile
+  first, without the flag. A command whose config resolution misses the
+  profile (the flat `~/.rantaiclaw/config.toml` fallback) is unchanged: it
+  creates nothing under `profiles/`. The help no longer claims a `-p`
+  short flag: no such flag exists (`agent -p` is `--provider`), and every
+  help and doc mention of one is now `--profile`.
+- A migration dropped the operator's price table without a word. The v24 → v25
+  step removed the old-shape `[cost.prices]` table — a row held `input` and
+  `output`, and the schema now keys a price per model as
+  `input_per_million`/`output_per_million` — and a config that carried prices
+  for a model lost them on the next launch with no signal, no warning and no
+  pointer to the copy that still held them. The load now says what was
+  dropped: it names every model whose price was in the table, tells the
+  operator to re-add each as `[cost.prices."<model>"]` with the current field
+  names, and points at `config.toml.bak`, where the original file sits until
+  the next config save replaces it. The values are not converted: a wrong
+  price is worse than none. A config that already carries the current shape
+  keeps its table and raises no warning.
 - The MCP provisioner claimed a server was authed without a finished login. Selecting an OAuth
   server (Google Drive) registered it and counted it under "N authed" even when no credential
   was ever obtained: a session that could not show a URL and wait for the browser skipped the

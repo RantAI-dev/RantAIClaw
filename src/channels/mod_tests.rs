@@ -3973,6 +3973,9 @@ async fn the_startup_channel_prompt_names_no_preset_the_gate_does_not_enforce() 
     let _home = crate::test_env::HomeGuard::set(home.path());
     let _profile_env =
         crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-preset-drift-startup");
+    // The profile this test names in the environment has to exist: the
+    // existence door refuses a name that names nothing.
+    crate::profile::ProfileManager::ensure("rt-preset-drift-startup").expect("profile tree");
     let profile = crate::profile::ProfileManager::active().expect("profile tree");
 
     // The shipped default level: the gate every production caller seeds this

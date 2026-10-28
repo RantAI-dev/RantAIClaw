@@ -37,16 +37,38 @@ pub struct DaemonSentinel {
     /// ISO-8601 timestamp the daemon bound. Free-form for humans.
     #[serde(default)]
     pub started_at: Option<String>,
+    /// Whether the daemon's profile was pinned by its launcher — the
+    /// `RANTAICLAW_PROFILE` the unit (or the shell) named — instead of
+    /// following the active-profile marker.
+    ///
+    /// A `profile use` restarts only a daemon that follows the marker, so
+    /// this field is what tells the two apart. A sentinel written before the
+    /// field existed reads as `true`: an old file cannot prove the daemon
+    /// follows the marker, and the safe answer for "cannot prove" is
+    /// "pinned" — never restart a daemon that might not follow.
+    #[serde(default = "pinned_by_default")]
+    pub profile_pinned: bool,
+}
+
+/// The value a sentinel without a `profile_pinned` field reads as.
+fn pinned_by_default() -> bool {
+    true
 }
 
 /// `<profile>/.daemon_active` path.
-pub fn sentinel_path(profile: &str) -> PathBuf {
-    paths::profile_dir(profile).join(SENTINEL_FILE)
+///
+/// The profile name is checked first: the sentinel path is built by joining
+/// the name onto the profiles directory, and the name can come from the
+/// active-profile marker or the environment. A name that could escape the
+/// profiles directory is refused rather than joined.
+pub fn sentinel_path(profile: &str) -> Result<PathBuf> {
+    crate::profile::validate_profile_name(profile)?;
+    Ok(paths::profile_dir(profile).join(SENTINEL_FILE))
 }
 
 /// Write the sentinel atomically (tempfile + rename in same dir).
 pub fn write_sentinel(profile: &str, sentinel: &DaemonSentinel) -> Result<()> {
-    let path = sentinel_path(profile);
+    let path = sentinel_path(profile)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create profile dir {}", parent.display()))?;
@@ -60,7 +82,7 @@ pub fn write_sentinel(profile: &str, sentinel: &DaemonSentinel) -> Result<()> {
 
 /// Remove the sentinel. Idempotent — missing file is not an error.
 pub fn clear_sentinel(profile: &str) -> Result<()> {
-    let path = sentinel_path(profile);
+    let path = sentinel_path(profile)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -71,7 +93,7 @@ pub fn clear_sentinel(profile: &str) -> Result<()> {
 /// Read the sentinel. Returns `Ok(None)` when the file is absent. Parse
 /// errors are surfaced so callers can log + treat as "stale".
 pub fn read_sentinel(profile: &str) -> Result<Option<DaemonSentinel>> {
-    let path = sentinel_path(profile);
+    let path = sentinel_path(profile)?;
     match fs::read_to_string(&path) {
         Ok(body) => {
             let sentinel: DaemonSentinel =
@@ -86,7 +108,7 @@ pub fn read_sentinel(profile: &str) -> Result<Option<DaemonSentinel>> {
 /// Binary "is something registered for this profile?" — parse failures
 /// still count as active (the file's presence alone is the signal).
 pub fn is_daemon_active(profile: &str) -> bool {
-    sentinel_path(profile).exists()
+    sentinel_path(profile).is_ok_and(|path| path.exists())
 }
 
 /// Whether `pid` is a live process (advisory). Unix: `kill(pid, 0)` succeeds, or
@@ -178,14 +200,39 @@ mod tests {
             super::super::ProfileManager::ensure("alpha").unwrap();
             let s = DaemonSentinel {
                 pid: 4242,
-                unit: Some("rantaiclaw@alpha.service".into()),
+                unit: Some("rantaiclaw.service".into()),
                 started_at: Some("2026-04-28T00:00:00Z".into()),
+                profile_pinned: false,
             };
             write_sentinel("alpha", &s).unwrap();
             assert!(is_daemon_active("alpha"));
             let got = read_sentinel("alpha").unwrap().unwrap();
             assert_eq!(got.pid, 4242);
-            assert_eq!(got.unit.as_deref(), Some("rantaiclaw@alpha.service"));
+            assert_eq!(got.unit.as_deref(), Some("rantaiclaw.service"));
+            assert!(!got.profile_pinned);
+        });
+    }
+
+    /// A sentinel written by a daemon that predates the `profile_pinned`
+    /// field reads as PINNED: an old file cannot prove its daemon follows
+    /// the active-profile marker, and `profile use` must not restart a
+    /// daemon it cannot prove follows.
+    #[test]
+    fn a_sentinel_without_the_pinned_field_reads_as_pinned() {
+        with_home(|| {
+            super::super::ProfileManager::ensure("alpha").unwrap();
+            let path = sentinel_path("alpha").expect("a valid profile name");
+            std::fs::write(
+                &path,
+                "pid = 4242\nunit = \"rantaiclaw.service\"\n\
+                 started_at = \"2026-04-28T00:00:00Z\"\n",
+            )
+            .unwrap();
+            let got = read_sentinel("alpha").unwrap().unwrap();
+            assert!(
+                got.profile_pinned,
+                "a pre-field sentinel must read as pinned"
+            );
         });
     }
 
@@ -202,6 +249,7 @@ mod tests {
                     pid: 1,
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();
@@ -233,6 +281,7 @@ mod tests {
                     pid: 2_147_483_646,
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();
@@ -251,6 +300,7 @@ mod tests {
                     pid: me,
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();
@@ -286,6 +336,7 @@ mod tests {
                     pid,
                     unit: None,
                     started_at: None,
+                    profile_pinned: false,
                 },
             )
             .unwrap();
