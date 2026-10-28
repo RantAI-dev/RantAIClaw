@@ -793,28 +793,43 @@ fn document_stub(block: &str) -> String {
     format!("[inbound document omitted: {name}]")
 }
 
-/// Replace old document blocks with a one-line stub.
+/// Replace the document blocks of the older turns with a one-line stub.
 ///
 /// The way `redact_historic_image_markers` retires old image markers: a
 /// document's text is the sender's text, and carrying it forever would keep
 /// a stale injection surface alive in every later turn — and bloat the
 /// prompt with it. Only the turn the user just sent keeps its text.
+///
+/// `keep_from` is the index the current turn starts at. Every user message
+/// before it belongs to an earlier turn and is stubbed; the current turn's
+/// own message, and everything after it — the tool calls, the tool results —
+/// keep their text, because the model is still answering the turn the
+/// document arrived in.
+///
+/// The history is copied, not changed: the caller keeps the turn's own text.
 pub(crate) fn redact_historic_document_blocks(
-    messages: Vec<crate::providers::ChatMessage>,
-) -> Vec<crate::providers::ChatMessage> {
-    let last = messages.len().saturating_sub(1);
-    messages
-        .into_iter()
+    history: &[crate::providers::ConversationMessage],
+    keep_from: usize,
+) -> Vec<crate::providers::ConversationMessage> {
+    history
+        .iter()
         .enumerate()
-        .map(|(index, mut message)| {
-            if index == last || message.role != "user" {
-                return message;
+        .map(|(index, message)| {
+            if index >= keep_from {
+                return message.clone();
             }
-            let Some(cleaned) = redact_document_blocks(&message.content) else {
-                return message;
+            let crate::providers::ConversationMessage::Chat(chat) = message else {
+                return message.clone();
             };
-            message.content = cleaned;
-            message
+            if chat.role != "user" {
+                return message.clone();
+            }
+            let Some(cleaned) = redact_document_blocks(&chat.content) else {
+                return message.clone();
+            };
+            let mut stubbed = chat.clone();
+            stubbed.content = cleaned;
+            crate::providers::ConversationMessage::Chat(stubbed)
         })
         .collect()
 }
@@ -1127,7 +1142,7 @@ mod zip {
 #[cfg(test)]
 mod document_tests {
     use super::*;
-    use crate::providers::ChatMessage;
+    use crate::providers::{ChatMessage, ConversationMessage};
 
     /// A stored ZIP holding the given entries.
     ///
@@ -1606,59 +1621,108 @@ mod document_tests {
         }
     }
 
-    #[test]
-    fn an_old_document_block_becomes_a_one_line_stub() {
-        let block = document_block(
+    /// A history entry of the shape the agent keeps.
+    fn chat(role: &str, content: &str) -> ConversationMessage {
+        ConversationMessage::Chat(message(role, content))
+    }
+
+    /// What a history entry says.
+    fn content_of(message: &ConversationMessage) -> &str {
+        match message {
+            ConversationMessage::Chat(chat) => &chat.content,
+            _ => "",
+        }
+    }
+
+    /// The document a sender sent, with a body worth looking for.
+    fn a_document_block() -> String {
+        document_block(
             DocumentKind::Pdf,
             Some("report.pdf"),
             Some(2),
             false,
-            "text",
-        );
-        let messages = vec![
-            message("user", &block),
-            message("assistant", "answer"),
-            message("user", "next question"),
+            "the quarterly numbers are 42",
+        )
+    }
+
+    #[test]
+    fn an_old_document_block_becomes_a_one_line_stub() {
+        let block = a_document_block();
+        let history = vec![
+            chat("user", &block),
+            chat("assistant", "answer"),
+            chat("user", "next question"),
         ];
-        let redacted = redact_historic_document_blocks(messages);
+        // The current turn starts at the third message.
+        let redacted = redact_historic_document_blocks(&history, 2);
         assert!(
-            redacted[0]
-                .content
-                .contains("[inbound document omitted: report.pdf]"),
+            content_of(&redacted[0]).contains("[inbound document omitted: report.pdf]"),
             "{}",
-            redacted[0].content
+            content_of(&redacted[0])
         );
         assert!(
-            !redacted[0].content.contains("the text"),
+            !content_of(&redacted[0]).contains("the quarterly numbers are 42"),
             "the document's text must not stay in the history: {}",
-            redacted[0].content
+            content_of(&redacted[0])
         );
-        assert_eq!(redacted[0].content.lines().count(), 1, "a one-line stub");
+        assert_eq!(
+            content_of(&redacted[0]).lines().count(),
+            1,
+            "a one-line stub"
+        );
     }
 
     #[test]
     fn the_turn_the_user_just_sent_keeps_its_text() {
-        let block = document_block(
-            DocumentKind::Pdf,
-            Some("report.pdf"),
-            Some(2),
-            false,
-            "text",
-        );
-        let messages = vec![message("user", "earlier"), message("user", &block)];
-        let redacted = redact_historic_document_blocks(messages);
+        let block = a_document_block();
+        let history = vec![chat("user", "earlier"), chat("user", &block)];
+        // The current turn starts at the second message.
+        let redacted = redact_historic_document_blocks(&history, 1);
         assert_eq!(
-            redacted[1].content, block,
+            content_of(&redacted[1]),
+            block,
             "the turn just sent keeps its document text"
         );
     }
 
     #[test]
     fn a_message_without_a_document_is_left_alone() {
-        let messages = vec![message("user", "just words"), message("user", "more words")];
-        let redacted = redact_historic_document_blocks(messages);
-        assert_eq!(redacted[0].content, "just words");
-        assert_eq!(redacted[1].content, "more words");
+        let history = vec![chat("user", "just words"), chat("user", "more words")];
+        let redacted = redact_historic_document_blocks(&history, 1);
+        assert_eq!(content_of(&redacted[0]), "just words");
+        assert_eq!(content_of(&redacted[1]), "more words");
+    }
+
+    /// A document's text stays readable for the whole turn it arrived in.
+    ///
+    /// A tool result is a message of its own, and it does not end the turn:
+    /// the model is still answering the turn the document came with. The
+    /// block is retired from the next turn on.
+    #[test]
+    fn the_document_stays_readable_through_the_tool_iterations_of_its_turn() {
+        let block = a_document_block();
+        let history = vec![
+            chat("user", &block),
+            chat("assistant", "let me look"),
+            chat(
+                "user",
+                "[Tool results]\n<tool_result name=\"report\"></tool_result>",
+            ),
+        ];
+
+        let same_turn = redact_historic_document_blocks(&history, 0);
+        assert!(
+            content_of(&same_turn[0]).contains("the quarterly numbers are 42"),
+            "the document's text must survive the tool iterations of its turn: {}",
+            content_of(&same_turn[0])
+        );
+
+        let next_turn = redact_historic_document_blocks(&history, 3);
+        assert!(
+            content_of(&next_turn[0]).contains("[inbound document omitted: report.pdf]"),
+            "the document's text must be retired from the next turn on: {}",
+            content_of(&next_turn[0])
+        );
     }
 
     // ── The build ──────────────────────────────────────────────────────────

@@ -1811,6 +1811,28 @@ pub(crate) async fn chat_with_optional_streaming(
     }
 }
 
+/// The index of the message the current turn starts at.
+///
+/// Every door appends the turn the user just sent before the loop runs, so
+/// the last user message of the history IS the turn being answered. It is
+/// found once, before the loop, and not again: a tool result that follows it
+/// in the same turn is a message of its own — the XML dispatcher makes it a
+/// user message — and picking that one would retire the turn's document
+/// while the model is still answering the turn the document arrived in.
+///
+/// A history with no user message has no document to retire, because a
+/// document block only ever arrives in a user message. It starts at the
+/// beginning.
+fn current_turn_index(history: &[ConversationMessage]) -> usize {
+    history
+        .iter()
+        .rposition(|message| match message {
+            ConversationMessage::Chat(chat) => chat.role == "user",
+            _ => false,
+        })
+        .unwrap_or(0)
+}
+
 /// Single shared agentic loop (PR2): send messages, parse tool calls, execute
 /// via the shared executor, append structured history, repeat. Operates on
 /// `Vec<ConversationMessage>` + a `ToolDispatcher` so the interactive Agent and
@@ -1883,6 +1905,11 @@ pub(crate) async fn run_structured_loop(
     let mut recent_calls: std::collections::VecDeque<(String, String, u64)> =
         std::collections::VecDeque::with_capacity(5);
 
+    // The turn the user just sent, found once. Its document stays readable
+    // for the whole turn — every tool iteration of it — and is retired from
+    // the next turn on.
+    let keep_from = current_turn_index(history);
+
     for _iteration in 0..max_iterations {
         if cancellation_token
             .as_ref()
@@ -1892,7 +1919,20 @@ pub(crate) async fn run_structured_loop(
         }
 
         // Flatten the structured history to provider messages for this turn.
-        let provider_messages = dispatcher.to_provider_messages(history);
+        //
+        // A document's text is the sender's text. Carrying it in every later
+        // turn keeps a stale injection surface alive and bloats the prompt
+        // with it, so an old document block becomes a one-line stub the way an
+        // old image marker does. This runs whatever the provider can see: the
+        // text is the sender's, not the model's problem to keep.
+        //
+        // The stub is applied to the STRUCTURED history, before the
+        // flattening: a flattened tool result is a user message, so the
+        // flattened list cannot say which message belongs to the current turn.
+        // The current turn keeps its text, so the model can still read the
+        // document while it answers the turn the document arrived in.
+        let redacted = crate::channels::media::redact_historic_document_blocks(history, keep_from);
+        let provider_messages = dispatcher.to_provider_messages(&redacted);
 
         // A provider without vision must not be stuck forever on a conversation
         // that once carried an image. The gate below counts markers across the
@@ -1904,14 +1944,6 @@ pub(crate) async fn run_structured_loop(
         } else {
             multimodal::redact_historic_image_markers(provider_messages)
         };
-
-        // A document's text is the sender's text. Carrying it in every later
-        // turn keeps a stale injection surface alive and bloats the prompt
-        // with it, so an old document block becomes a one-line stub the way an
-        // old image marker does. This runs whatever the provider can see: the
-        // text is the sender's, not the model's problem to keep.
-        let provider_messages =
-            crate::channels::media::redact_historic_document_blocks(provider_messages);
 
         let image_marker_count = multimodal::count_image_markers(&provider_messages);
         if image_marker_count > 0 && !provider.supports_vision() {
@@ -3497,6 +3529,8 @@ mod tests {
 
     struct ScriptedProvider {
         responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+        /// What the provider was asked, one entry per call, in order.
+        requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
     }
 
     impl ScriptedProvider {
@@ -3513,6 +3547,7 @@ mod tests {
                 .collect();
             Self {
                 responses: Arc::new(Mutex::new(scripted)),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -3523,6 +3558,16 @@ mod tests {
                 .lock()
                 .expect("responses lock should be valid")
                 .len()
+        }
+
+        /// The messages of the `index`-th call, as the provider saw them.
+        fn request(&self, index: usize) -> Vec<ChatMessage> {
+            self.requests
+                .lock()
+                .expect("requests lock should be valid")
+                .get(index)
+                .cloned()
+                .unwrap_or_default()
         }
 
         fn from_text_responses(responses: Vec<&str>) -> Self {
@@ -3536,6 +3581,7 @@ mod tests {
                 .collect();
             Self {
                 responses: Arc::new(Mutex::new(scripted)),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -3554,10 +3600,14 @@ mod tests {
 
         async fn chat(
             &self,
-            _request: ChatRequest<'_>,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
+            self.requests
+                .lock()
+                .expect("requests lock should be valid")
+                .push(request.messages.to_vec());
             let mut responses = self
                 .responses
                 .lock()
@@ -3989,6 +4039,80 @@ mod tests {
         assert!(
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
+        );
+    }
+
+    /// A document's text stays readable for the whole turn it arrived in.
+    ///
+    /// The turn is not over when the first tool result comes back: the model
+    /// is still answering the turn the document arrived with, so the second
+    /// provider call has to see the text too. The block is retired from the
+    /// next turn on.
+    #[tokio::test]
+    async fn the_document_stays_readable_for_every_call_of_its_turn() {
+        let block = crate::channels::media::document_block(
+            crate::channels::media::DocumentKind::Pdf,
+            Some("report.pdf"),
+            Some(1),
+            false,
+            "the quarterly numbers are 42",
+        );
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>\n{\"name\":\"delay_a\",\"arguments\":{\"value\":\"A\"}}\n</tool_call>",
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "delay_a",
+            0,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        let mut history = vec![ChatMessage::user(block)];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            None,
+        )
+        .await
+        .expect("the turn should complete");
+
+        assert_eq!(result, "done");
+        let second_call = provider.request(1);
+        assert!(
+            second_call
+                .iter()
+                .any(|message| message.content.contains("the quarterly numbers are 42")),
+            "the second call of the turn must still see the document's text: {second_call:?}"
         );
     }
 
