@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use crate::kb::{KbConfig, KbError, KbResult};
 
 pub mod hybrid;
-pub mod inbound;
 pub mod mineru;
 #[cfg(feature = "kb-ocr")]
 pub mod ocr_ollama;
