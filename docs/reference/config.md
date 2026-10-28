@@ -493,6 +493,17 @@ a token to the browser.
 
 Notes:
 
+- **A curated server that needs a credential is configured by `rantaiclaw setup mcp`
+  (or the onboard wizard's MCP section), not by hand.** The token is pasted into a
+  masked prompt, and an OAuth server — Google Drive today — completes a real OAuth
+  flow in the operator's local browser. The OAuth callback is bound to the login
+  that started it (a one-time `state` and an S256 PKCE code challenge) and is
+  accepted only from the loopback listener on `127.0.0.1:11500`; a callback that
+  does not match the active login is answered and ignored. A server is registered
+  in the config only after its credential was really obtained, so a config that
+  lists a server means the server is authed. There is no refresh flow yet: the
+  stored access token is used until it expires — roughly an hour for Google —
+  after which re-running `rantaiclaw setup mcp` logs in again.
 - A tool that an MCP server provides needs approval under `supervised` like any other tool. To let one run without a prompt, list its name in `[autonomy].auto_approve` as `mcp__<server>__<tool>`; the refusal on a surface with no approver, and how to allow it, is described in the `auto_approve` note under [`[autonomy]`](#autonomy).
 - **MCP tools reach the TUI/CLI agent, the gateway's `/api/v1` chat, chat channels
   and cron.** The last two were added by closing issue #283: the channel runtime

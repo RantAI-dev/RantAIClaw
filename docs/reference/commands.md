@@ -106,8 +106,15 @@ Single-topic examples:
 - `rantaiclaw setup provider` — re-run provider section only
 - `rantaiclaw setup channels` — re-run channels section only
 - `rantaiclaw setup approvals` — pick the Manual / Smart / Strict / Off preset; a preset already on disk is kept unless `--force` is given
+- `rantaiclaw setup mcp` — pick and authenticate curated MCP servers: a token-based server takes its key in a masked prompt, and an OAuth server (Google Drive) opens the login in your browser
 - `rantaiclaw setup knowledge` — set the Knowledge Base API keys (`[knowledge].embedding_api_key` / `vision_api_key`, encrypted at rest; vision falls back to the embedding key). Env `KB_EMBEDDING_API_KEY` / `KB_EXTRACT_VISION_API_KEY` override config at load, with `OPENROUTER_API_KEY` as the final fallback. See [config-reference.md](config.md) for the gateway `GET`/`PUT /api/v1/config/knowledge` endpoints.
 - `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (a three-minute window, the same as the console's; a timeout exits non-zero)
+
+An authed curated server gets its credential through `rantaiclaw setup mcp` (or the onboard wizard's MCP section): a token is pasted into a masked prompt, and an OAuth server — Google Drive today — runs a real OAuth flow in the operator's local browser.
+
+The flow binds its redirect to the login that started it: the authorization URL carries a one-time `state` and an S256 PKCE code challenge, only a callback whose `state` matches is accepted, and the token exchange sends the verifier that challenge was derived from. The listener binds `127.0.0.1:11500` on loopback only, and a request that does not match the active login is answered and ignored rather than treated as the callback.
+
+A server is registered, and reported as authed, only after its credential was actually obtained. A session that cannot show a URL and wait for the browser — a headless run, or the OAuth client id and secret missing from the environment — leaves the server unregistered, and the setup summary names `rantaiclaw setup mcp` as the step that finishes the login. There is no refresh flow yet: the stored access token is used until it expires — roughly an hour for Google — after which re-running `rantaiclaw setup mcp` logs in again.
 
 `setup` writes the config it loaded, to the same file the agent reads: `RANTAICLAW_CONFIG_DIR` if set, otherwise the active profile's `config.toml`.
 
