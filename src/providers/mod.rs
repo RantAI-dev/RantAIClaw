@@ -1251,6 +1251,19 @@ fn create_provider_with_url_and_options(
         resolved_credential.map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
+
+    // An expired Gemini CLI login is refused here, before a provider exists and
+    // before any request is sent: the operator is told to renew the login or to
+    // set a key, instead of a dead token going to Google and coming back as a
+    // 401. A credential that is not the CLI login — an explicit key,
+    // `GEMINI_API_KEY`, `GOOGLE_API_KEY` — wins as it always did.
+    if key.is_none()
+        && matches!(name, "gemini" | "google" | "google-gemini")
+        && gemini_cli::gemini_cli_login() == gemini_cli::GeminiCliLogin::Expired
+    {
+        anyhow::bail!(gemini_cli::EXPIRED_LOGIN_REFUSAL);
+    }
+
     match name {
         #[cfg(test)]
         "test-sse" => Ok(Box::new(TestSseProvider)),
@@ -1307,7 +1320,8 @@ fn create_provider_with_url_and_options(
             // rig's gemini client only speaks the public endpoint; Gemini CLI
             // OAuth tokens are scoped for cloudcode-pa. With no API key but CLI
             // creds present, route to the legacy provider (handles cloudcode-pa);
-            // otherwise the rig path (streaming + native tools).
+            // otherwise the rig path (streaming + native tools). An expired CLI
+            // login never reaches this point: the refusal above stops it.
             if key.is_none() && gemini_cli::gemini_cli_has_credentials() {
                 Ok(Box::new(gemini::GeminiProvider::new(key)))
             } else {

@@ -567,6 +567,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is accepted. A `persona.toml` that was hand-edited into an unusable value
   reads as unset, with one warning, and the file is left exactly as the
   operator wrote it — nothing rewrites it behind their back.
+- An expired Gemini CLI login was sent to Google, which answered with a 401.
+  The token in `~/.gemini/oauth_creds.json` was read from a field Gemini CLI
+  does not write, so the expiry check never ran: Gemini CLI stores the expiry
+  as `expiry_date`, in milliseconds since the epoch, and the reader only knew
+  `expiry`. The token was valid for about an hour and then went on being sent
+  for as long as the file existed. The reader now reads the shape Gemini CLI
+  writes, treats a token that dies within 30 seconds as expired, and refuses
+  the login before any request with the fix named: run `gemini` to renew it,
+  or set `GEMINI_API_KEY`. The reader lives in one place, so the provider and
+  the factory cannot drift apart again.
 - `rantaiclaw uninstall` could say it had preserved a file it had deleted,
   and `--purge` could delete a binary this account did not own. The report
   named `~/.rantaiclaw/.secret_key`, a path the profile layout no longer

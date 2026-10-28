@@ -2,13 +2,15 @@
 //! - Direct API key (`GEMINI_API_KEY` env var or config)
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
+//!
+//! The Gemini CLI login is read by [`crate::providers::gemini_cli`] — one
+//! reader for `~/.gemini/oauth_creds.json`, so the expiry check cannot drift
+//! apart between this provider and the factory that builds it.
 
 use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
-use directories::UserDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// Gemini provider supporting multiple authentication methods.
 pub struct GeminiProvider {
@@ -150,15 +152,8 @@ impl GenerateContentResponse {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// GEMINI CLI TOKEN STRUCTURES
+// ENDPOINTS
 // ══════════════════════════════════════════════════════════════════════════════
-
-/// OAuth token stored by Gemini CLI in `~/.gemini/oauth_creds.json`
-#[derive(Debug, Deserialize)]
-struct GeminiCliOAuthCreds {
-    access_token: Option<String>,
-    expiry: Option<String>,
-}
 
 /// Internal API endpoint used by Gemini CLI for OAuth users.
 /// See: https://github.com/google-gemini/gemini-cli/issues/19200
@@ -181,7 +176,10 @@ impl GeminiProvider {
             .map(GeminiAuth::ExplicitKey)
             .or_else(|| Self::load_non_empty_env("GEMINI_API_KEY").map(GeminiAuth::EnvGeminiKey))
             .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey))
-            .or_else(|| Self::try_load_gemini_cli_token().map(GeminiAuth::OAuthToken));
+            .or_else(|| {
+                crate::providers::gemini_cli::try_load_gemini_cli_token()
+                    .map(GeminiAuth::OAuthToken)
+            });
 
         Self {
             auth: resolved_auth,
@@ -203,42 +201,9 @@ impl GeminiProvider {
             .and_then(|value| Self::normalize_non_empty(&value))
     }
 
-    /// Try to load OAuth access token from Gemini CLI's cached credentials.
-    /// Location: `~/.gemini/oauth_creds.json`
-    fn try_load_gemini_cli_token() -> Option<String> {
-        let gemini_dir = Self::gemini_cli_dir()?;
-        let creds_path = gemini_dir.join("oauth_creds.json");
-
-        if !creds_path.exists() {
-            return None;
-        }
-
-        let content = std::fs::read_to_string(&creds_path).ok()?;
-        let creds: GeminiCliOAuthCreds = serde_json::from_str(&content).ok()?;
-
-        // Check if token is expired (basic check)
-        if let Some(ref expiry) = creds.expiry {
-            if let Ok(expiry_time) = chrono::DateTime::parse_from_rfc3339(expiry) {
-                if expiry_time < chrono::Utc::now() {
-                    tracing::warn!("Gemini CLI OAuth token expired — re-run `gemini` to refresh");
-                    return None;
-                }
-            }
-        }
-
-        creds
-            .access_token
-            .and_then(|token| Self::normalize_non_empty(&token))
-    }
-
-    /// Get the Gemini CLI config directory (~/.gemini)
-    fn gemini_cli_dir() -> Option<PathBuf> {
-        UserDirs::new().map(|u| u.home_dir().join(".gemini"))
-    }
-
     /// Check if Gemini CLI is configured and has valid credentials
     pub fn has_cli_credentials() -> bool {
-        Self::try_load_gemini_cli_token().is_some()
+        crate::providers::gemini_cli::gemini_cli_has_credentials()
     }
 
     /// Check if any Gemini authentication is available
@@ -551,16 +516,6 @@ mod tests {
     fn provider_rejects_empty_key() {
         let provider = GeminiProvider::new(Some(""));
         assert!(!matches!(provider.auth, Some(GeminiAuth::ExplicitKey(_))));
-    }
-
-    #[test]
-    fn gemini_cli_dir_returns_path() {
-        let dir = GeminiProvider::gemini_cli_dir();
-        // Should return Some on systems with home dir
-        if UserDirs::new().is_some() {
-            assert!(dir.is_some());
-            assert!(dir.unwrap().ends_with(".gemini"));
-        }
     }
 
     #[test]
