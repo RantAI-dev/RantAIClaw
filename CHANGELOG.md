@@ -185,6 +185,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rantaiclaw profile use <name>` restarts it onto the profile it switches
   to. The install output names the binding either way. An already installed
   unit keeps its current binding until the next `service install`.
+- The operator's `[[model_routes]]` table now applies to every door that runs
+  an agent turn — the gateway's webhook, the chat channels and the delegate
+  tool — not only to the CLI/TUI agent and cron. A chat runtime picks the
+  table up on a config reload like any other setting, so adding a route takes
+  effect on the next message without restarting the channel runtime.
 
 ### Removed
 
@@ -592,6 +597,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the `rm` command printed instead. `--keep-secrets` walks the tree
   without following symlinks: a link in the tree is removed as itself, so
   nothing outside the tree is ever deleted.
+- A `hint:` model reached the provider as a literal model name. Only the
+  CLI/TUI agent and cron read `[[model_routes]]`; every other door that runs
+  an agent turn — the gateway's webhook, the chat channels and the delegate
+  tool — sent the string as it stood, and the provider answered with a model
+  that does not exist. Every door that builds a provider for an agent turn now
+  builds it through the routed factory with the operator's table, so a hint
+  resolves to the provider and the model the operator configured, everywhere.
+  A hint no route names is refused before any request is sent and the refusal
+  names the hint and the hints that are configured; a route whose provider
+  could not be built is refused as configured-but-unavailable, so a broken
+  provider is no longer reported as an unknown hint; and a door with no table
+  at all refuses a `hint:` model with `no [[model_routes]] configured` instead
+  of sending the literal string.
 
 ## [0.33.0-alpha] — 2026-10-08
 

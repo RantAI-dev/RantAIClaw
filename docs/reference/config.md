@@ -879,6 +879,21 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `model` | _required_ | Model to use with that provider |
 | `api_key` | unset | Optional API key override for this route's provider (stored encrypted when `secrets.encrypt = true`) |
 
+The table applies at every door that runs an agent turn: the CLI and TUI agent, a
+scheduled cron job, the daemon's heartbeat, the console chat, the gateway's webhook, a
+chat channel's turns and the delegate tool. A model string that starts with `hint:`
+resolves to the provider and the model the route names, at every one of them.
+
+A hint no route names is refused before any request is sent, and the refusal names the
+hint and the hints that are configured. A route whose provider could not be built is
+refused as configured but its provider is not available, so a broken provider is never
+reported as an unknown hint. With no `[[model_routes]]` table configured at all, a
+`hint:` model is refused with `no [[model_routes]] configured`.
+
+A route never receives the default provider's API key. It resolves its own credential —
+its own `api_key` in the route entry, or that provider's own environment variable —
+while a route that names the default provider keeps that provider's key.
+
 ### `[[embedding_routes]]`
 
 | Key | Default | Purpose |

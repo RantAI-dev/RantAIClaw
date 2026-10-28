@@ -37,6 +37,15 @@ pub struct DelegateTool {
     /// counts against the same daily ceiling and lands in the same record —
     /// otherwise a delegating heartbeat spends without the brake ever seeing it.
     ledger: Option<Arc<crate::cost::CostTracker>>,
+    /// The operator's `[[model_routes]]` table.
+    ///
+    /// `[agents.<name>].model` may be a `hint:` string, so the sub-agent's
+    /// provider is built through the routed factory with this table: a hint
+    /// resolves to the provider and model the operator configured, and a hint
+    /// no route names is refused before any request. Empty when the tool is
+    /// built without a route table — then a `hint:` model has nothing to
+    /// resolve against and is refused the same way.
+    model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
 }
 
 impl DelegateTool {
@@ -68,6 +77,7 @@ impl DelegateTool {
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
             ledger: None,
+            model_routes: Arc::new(Vec::new()),
         }
     }
 
@@ -105,6 +115,7 @@ impl DelegateTool {
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
             ledger: None,
+            model_routes: Arc::new(Vec::new()),
         }
     }
 
@@ -123,6 +134,19 @@ impl DelegateTool {
 
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// Attach the operator's `[[model_routes]]` table.
+    ///
+    /// A sub-agent's `[agents.<name>].model` may be a `hint:` string; the
+    /// table is what resolves it to a provider and a model.
+    #[must_use]
+    pub fn with_model_routes(
+        mut self,
+        model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
+    ) -> Self {
+        self.model_routes = model_routes;
         self
     }
 }
@@ -260,9 +284,29 @@ impl Tool for DelegateTool {
         #[allow(clippy::option_as_ref_deref)]
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
-        let provider: Box<dyn Provider> = match providers::create_provider_with_options(
+        // The sub-agent's model may be a `hint:` string, so the provider is
+        // built through the routed factory with the operator's
+        // `[[model_routes]]` table: a hint resolves to the provider and the
+        // model the operator configured, and a hint no route names is refused
+        // before any request instead of being sent as a model name.
+        //
+        // One attempt, as before: the delegate makes a single call, so the
+        // retry count stays at zero. The fallback-key closure answers `None`:
+        // the delegate has no stored provider-keys map, and a route must never
+        // inherit the primary's key — the routed factory keeps the primary's
+        // key on the primary and gives a route its own credential or none.
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 0,
+            ..Default::default()
+        };
+        let provider: Box<dyn Provider> = match providers::create_routed_provider_with_options(
             &agent_config.provider,
             provider_credential,
+            None,
+            &reliability,
+            &self.model_routes,
+            &agent_config.model,
+            &|_: &str| -> Option<String> { None },
             &self.provider_runtime_options,
         ) {
             Ok(p) => p,
@@ -1301,5 +1345,169 @@ mod tests {
         }
         let wrapped = ToolArcRef::new(Arc::new(ReadProbe));
         assert!(wrapped.is_read_only_call(&serde_json::json!({})));
+    }
+
+    // ── The delegate door applies the operator's `[[model_routes]]` ─────────
+
+    /// A primary provider that points at a dead local endpoint.
+    ///
+    /// The sub-agent's turn must NOT reach the primary: the route names
+    /// another provider. A primary that answered would hide a turn that went
+    /// the wrong way, and this one fails instead — without leaving the
+    /// machine.
+    const DEAD_PRIMARY: &str = "custom:http://127.0.0.1:9";
+
+    /// The route the operator wrote: `hint:fast` goes to the recording
+    /// provider, as the model `routed-model`.
+    fn fast_route() -> crate::config::ModelRouteConfig {
+        crate::config::ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: "test-recording".to_string(),
+            model: "routed-model".to_string(),
+            api_key: None,
+        }
+    }
+
+    /// A delegate agent whose model is `model`.
+    fn hint_agent(model: &str) -> DelegateAgentConfig {
+        DelegateAgentConfig {
+            provider: DEAD_PRIMARY.to_string(),
+            model: model.to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: Some(0.2),
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            max_iterations: 10,
+        }
+    }
+
+    /// A delegate tool whose only agent runs the model `model`, with the route
+    /// table that resolves `hint:fast`.
+    fn delegate_with_routes(model: &str) -> DelegateTool {
+        let mut agents = HashMap::new();
+        agents.insert("worker".to_string(), hint_agent(model));
+        DelegateTool::new(agents, None, test_security())
+            .with_model_routes(Arc::new(vec![fast_route()]))
+    }
+
+    /// The delegate builds the sub-agent's provider through the routed factory,
+    /// so the operator's `[[model_routes]]` decide which provider and which
+    /// model the sub-agent reaches. Before this the door sent the literal
+    /// string `hint:fast` to the primary as a model name.
+    #[tokio::test]
+    async fn the_delegate_door_reaches_the_provider_and_model_the_hint_names() {
+        // The recording provider counts its calls in one process-wide place,
+        // so the tests that read it run one at a time.
+        let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+        crate::providers::tests::RecordingProvider::reset();
+
+        let tool = delegate_with_routes("hint:fast");
+        let result = tool
+            .execute(json!({"agent": "worker", "prompt": "what about the lantern"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            crate::providers::tests::RecordingProvider::calls(),
+            1,
+            "the sub-agent must reach the provider the route names"
+        );
+        let call = crate::providers::tests::RecordingProvider::last_call()
+            .expect("the routed provider saw the turn");
+        assert_eq!(
+            call.model, "routed-model",
+            "the sub-agent must carry the model the route names, not the hint"
+        );
+    }
+
+    /// A hint the route table does not name is refused before any request is
+    /// sent: the refusal names the hint and the hints that are configured, and
+    /// no provider is asked.
+    #[tokio::test]
+    async fn the_delegate_door_refuses_a_hint_the_route_table_does_not_name() {
+        let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+        crate::providers::tests::RecordingProvider::reset();
+
+        let tool = delegate_with_routes("hint:nope");
+        let result = tool
+            .execute(json!({"agent": "worker", "prompt": "what about the lantern"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("unknown route hint \"nope\""),
+            "the refusal must name the hint: {error}"
+        );
+        assert!(
+            error.contains("fast"),
+            "the refusal must name the hints that are configured: {error}"
+        );
+        assert_eq!(
+            crate::providers::tests::RecordingProvider::calls(),
+            0,
+            "an unknown hint must not reach a provider"
+        );
+    }
+
+    /// Rule #191: a route that names a DIFFERENT provider, and carries no key
+    /// of its own, must never receive the primary provider's key. A key for
+    /// one endpoint sent to another is a credential leak.
+    #[tokio::test]
+    async fn a_route_without_its_own_key_never_receives_the_primary_key() {
+        let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+        // The scrub below clears process-global variables, so this test owns
+        // the environment: a key another test sets must not reach the route's
+        // provider while this one asserts that it got none.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        // No credential may reach the route's provider from the environment
+        // either, so the assertion below is about the primary's key and
+        // nothing else.
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        crate::providers::tests::RecordingProvider::reset();
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "worker".to_string(),
+            DelegateAgentConfig {
+                // A DIFFERENT provider from the route's, and one that never
+                // leaves the machine: the rule under test is about the KEY the
+                // route's provider is built with, not about a live call.
+                provider: DEAD_PRIMARY.to_string(),
+                model: "hint:fast".to_string(),
+                system_prompt: None,
+                api_key: Some("primary-delegate-key".to_string()),
+                temperature: Some(0.2),
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+        let tool = DelegateTool::new(agents, None, test_security())
+            .with_model_routes(Arc::new(vec![fast_route()]));
+
+        let result = tool
+            .execute(json!({"agent": "worker", "prompt": "what about the lantern"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let call = crate::providers::tests::RecordingProvider::last_call()
+            .expect("the routed provider saw the turn");
+        assert_eq!(call.model, "routed-model");
+        assert_ne!(
+            call.credential.as_deref(),
+            Some("primary-delegate-key"),
+            "a route without its own key must not receive the primary's key"
+        );
+        assert_eq!(
+            call.credential, None,
+            "the route's provider must be built with no credential at all"
+        );
     }
 }

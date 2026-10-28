@@ -305,6 +305,17 @@ Then call with a hint model name (for example from tool or integration paths):
 hint:reasoning
 ```
 
+The hint resolves against the table at every door that runs an agent turn: the CLI and
+TUI agent, cron, the daemon heartbeat, the console chat and the gateway webhook, the
+chat channels and the delegate tool. A hint the table does not name is refused before
+any request is sent, and the refusal names the hint and the hints that are configured —
+`unknown route hint "nope"; configured hints: fast, reasoning`. A route whose provider
+is not available is refused as configured but its provider is not available, so a
+broken provider is not reported as an unknown hint. With no `[[model_routes]]` table at
+all, a `hint:` model is refused with `no [[model_routes]] configured`. A route resolves
+its own credential — its own `api_key` in the route entry, or that provider's own
+environment variable — and never receives the default provider's key.
+
 ## Embedding Routing (`hint:<name>`)
 
 You can route embedding calls with the same hint pattern using `[[embedding_routes]]`.

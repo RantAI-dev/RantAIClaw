@@ -1267,6 +1267,11 @@ fn create_provider_with_url_and_options(
     match name {
         #[cfg(test)]
         "test-sse" => Ok(Box::new(TestSseProvider)),
+        // A provider that counts its calls and remembers what each one
+        // carried, so a test can prove that a turn never reached a provider,
+        // and which model and credential it carried when it did.
+        #[cfg(test)]
+        "test-recording" => Ok(Box::new(tests::RecordingProvider::new(key))),
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         // Anthropic / OpenAI native / Gemini route through `RigProvider`
@@ -1694,14 +1699,20 @@ pub fn create_routed_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     if model_routes.is_empty() {
-        return create_resilient_provider_with_options(
+        // No route table: a `hint:` model has nothing to resolve against. The
+        // guard refuses it before any request, instead of sending the literal
+        // string `hint:fast` to the provider as a model name. Everything the
+        // wrapped provider does for a plain model — its retry, its fallback,
+        // its capabilities — is unchanged.
+        let provider = create_resilient_provider_with_options(
             primary_name,
             api_key,
             api_url,
             reliability,
             fallback_keys,
             options,
-        );
+        )?;
+        return Ok(Box::new(router::HintGuard::new(provider)));
     }
 
     // Collect unique provider names needed
@@ -2024,9 +2035,147 @@ pub fn list_providers() -> Vec<ProviderInfo> {
     ]
 }
 
+/// `pub(crate)`: the doors' tests reach the recording provider through the
+/// factory, so the recorder has to be nameable from outside this module.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Calls seen by the test-only recording provider.
+    pub(crate) static RECORDING_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// What one recorded call saw: the model it was asked for, and the
+    /// credential the provider was built with.
+    #[derive(Clone, Debug)]
+    pub(crate) struct RecordedCall {
+        /// The model name the provider was asked for.
+        pub(crate) model: String,
+        /// The credential the provider was built with.
+        pub(crate) credential: Option<String>,
+    }
+
+    /// The calls the recording provider has seen, oldest first.
+    static RECORDED_CALLS: Mutex<Vec<RecordedCall>> = Mutex::new(Vec::new());
+
+    /// The recorder is one process-wide place, so the tests that read it run
+    /// one at a time. `ENV_LOCK` is for the environment variables the
+    /// config resolution reads; this one is for the recorder's own counters.
+    ///
+    /// Take it BEFORE `ENV_LOCK`: every test that reads the recorder takes
+    /// this one first, so the two locks are always held in that order.
+    pub(crate) static RECORDING_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A provider that counts the calls it receives and remembers what each
+    /// one carried.
+    ///
+    /// The factory builds providers by name, so this one is reachable as the
+    /// `"test-recording"` provider name. It lets a test prove that a turn
+    /// never reached a provider, which provider and model a turn did reach,
+    /// and which credential that provider was built with.
+    pub(crate) struct RecordingProvider {
+        /// The credential this provider was built with.
+        credential: Option<String>,
+    }
+
+    impl RecordingProvider {
+        /// Build a provider that was given `credential`.
+        pub(crate) fn new(credential: Option<&str>) -> Self {
+            Self {
+                credential: credential.map(ToString::to_string),
+            }
+        }
+
+        /// How many calls the provider has seen.
+        pub(crate) fn calls() -> usize {
+            RECORDING_CALLS.load(Ordering::SeqCst)
+        }
+
+        /// Forget the calls seen so far.
+        pub(crate) fn reset() {
+            RECORDING_CALLS.store(0, Ordering::SeqCst);
+            RECORDED_CALLS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clear();
+        }
+
+        /// What the last call saw.
+        pub(crate) fn last_call() -> Option<RecordedCall> {
+            RECORDED_CALLS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .last()
+                .cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            RECORDING_CALLS.fetch_add(1, Ordering::SeqCst);
+            RECORDED_CALLS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(RecordedCall {
+                    model: model.to_string(),
+                    credential: self.credential.clone(),
+                });
+            Ok("recorded".to_string())
+        }
+    }
+
+    /// A door with no `[[model_routes]]` has nothing to resolve a `hint:`
+    /// model against. The turn is refused before any request, instead of the
+    /// literal string `hint:fast` being sent to the provider as a model name.
+    #[tokio::test]
+    async fn a_routed_provider_without_routes_refuses_a_hint() {
+        // The recording provider counts its calls in one process-wide place,
+        // so the tests that read it run one at a time.
+        let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+        // The provider build reads the environment for a credential, so the
+        // test owns the environment while it does.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        RecordingProvider::reset();
+
+        let provider = create_routed_provider_with_options(
+            "test-recording",
+            None,
+            None,
+            &crate::config::ReliabilityConfig::default(),
+            &[],
+            "default-model",
+            &|_: &str| -> Option<String> { None },
+            &ProviderRuntimeOptions::default(),
+        )
+        .expect("the provider builds");
+
+        // A plain model still reaches the provider: the recorder works.
+        let answer = provider
+            .simple_chat("hello", "default-model", 0.5)
+            .await
+            .expect("a plain model is served");
+        assert_eq!(answer, "recorded");
+        assert_eq!(RecordingProvider::calls(), 1);
+
+        // A hint is refused, and no request is sent.
+        let error = provider
+            .simple_chat("hello", "hint:fast", 0.5)
+            .await
+            .expect_err("a hint must be refused without a route table");
+        assert!(
+            error.to_string().contains(router::NO_ROUTES_REFUSAL),
+            "{error}"
+        );
+        assert_eq!(RecordingProvider::calls(), 1, "no request was sent");
+    }
 
     #[test]
     fn routed_provider_does_not_inherit_the_primary_key() {
