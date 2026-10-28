@@ -244,8 +244,13 @@ hidden subcommand, hands it the document on stdin and reads one answer back:
   target the deadline kill is the only limit.
 - The child gets **no environment**: the parent clears it and sets only the
   request — the document kind, the page cap and the character cap. No HOME, no
-  PATH, no provider key, no configuration directory and no operator file is in
-  reach.
+  PATH, no provider key and no configuration directory is in reach through the
+  environment.
+- The boundary is a **crash boundary, not a privilege boundary**. The child runs
+  with the agent's own filesystem and network reach: a parser that wanted to
+  read an operator file or open a socket could. What the child cannot do is
+  take the agent down with it. A real jail — a namespace, a seccomp filter — is
+  a separate piece of work and is not claimed here.
 - The answer comes back as one JSON frame behind a sentinel, and the parent
   reads at most the frame's worth of bytes. A non-zero exit, a signal, a
   malformed frame or an oversized answer is **one rejection reason**, and the
@@ -291,6 +296,11 @@ turn in flight. It runs **before the history is flattened**
 (`src/agent/loop_.rs`), because a flattened tool result is a user message, and
 a flattened list cannot say which message started the current turn.
 
+The final call of a turn — the one the soft cap and the loop detector make with
+the tools off — flattens the history too, so it retires the old blocks as well.
+The index is the one the turn started with, found before the loop ran, so the
+document the model is still answering stays readable in that last call.
+
 ### 13. Groups and guests — the image gates, unchanged in order, before any download
 
 A document passes the same gates an image passes, in the same order, still
@@ -309,6 +319,11 @@ a guest already gets; **it never raises what a guest can reach.**
 Every rejection becomes an `[Attachment rejected: …]` note in the forwarded
 content, naming the reason: type, size, pages, time, budget, or a build that
 cannot read documents (rule 15). Rule 5's wording is the contract.
+
+The note is written in **our own words**. A parser's error, a file name and a
+claimed MIME type never ride into it: all three are the sender's to choose, and
+the note reaches the model. A rejection therefore names the family the claim
+belonged to, not what the sender typed.
 
 One failure mode is called out because it is the one this amendment has to
 forbid: a Telegram document with no caption from an **allowed** user must not be

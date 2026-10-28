@@ -2,10 +2,14 @@
 //!
 //! Bytes a sender chose are parsed **here**, in a process of its own. The
 //! parser sees a document and nothing else: no environment, no
-//! configuration, no data directory, no operator file. Whatever it does —
-//! panic, abort, loop, allocate — the agent process keeps running, answers
-//! the sender with a visible rejection, and the next document can still be
-//! read.
+//! configuration, no data directory. Whatever it does — panic, abort, loop,
+//! allocate — the agent process keeps running, answers the sender with a
+//! visible rejection, and the next document can still be read.
+//!
+//! The boundary is a **crash boundary, not a privilege boundary**: the child
+//! keeps the agent's own filesystem and network reach. Its environment holds
+//! nothing but the request, but a parser that wanted to read an operator
+//! file or open a socket could.
 //!
 //! The parent starts this code as the same binary with a hidden subcommand
 //! ([`HIDDEN_SUBCOMMAND`]). The request travels in the environment, the

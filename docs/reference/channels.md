@@ -781,8 +781,10 @@ summary.
   always runs.
 - **Nothing is written to disk.** The bytes are read into memory and parsed
   somewhere else: the parsing happens in a **child process** that holds no
-  environment, no configuration and no operator file, and the document travels
-  to it over a pipe. There is no temp file, not even a short-lived one.
+  environment and no configuration, and the document travels to it over a pipe.
+  There is no temp file, not even a short-lived one. The child keeps the
+  agent's own filesystem and network reach, so the boundary contains a crash,
+  not a privilege.
 - **The limits are constants, not config keys.** 10 MiB per document (checked on
   the announced size before any download and again on the bounded read; over the
   cap is refused, never truncated), 50 PDF pages counted from the bytes before

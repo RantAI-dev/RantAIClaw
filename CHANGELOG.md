@@ -145,9 +145,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pages, 50,000 forwarded characters, 20 seconds per extraction with one extraction at a time,
   and a DOCX that expands to at most 50 MiB. The extraction runs in a child process: the same
   binary, started with a hidden subcommand, given the document on stdin and an environment with
-  nothing in it — no HOME, no PATH, no provider key, no configuration directory, no operator
-  file. Whatever the parser does, panic, abort, loop or runaway allocation, the child dies and
-  the agent keeps running; the child is killed and reaped at the deadline, so the one-at-a-time
+  nothing in it — no HOME, no PATH, no provider key and no configuration directory. The boundary
+  is a crash boundary rather than a privilege boundary: the child keeps the agent's own
+  filesystem and network reach. Whatever the parser does, panic, abort, loop or runaway
+  allocation, the child dies and the agent keeps running; the child is killed and reaped at the deadline, so the one-at-a-time
   slot is released when the child dies, and on unix it also gets a 512 MiB memory ceiling. The
   WhatsApp Web read is bounded by a writer that refuses the write past the cap, so the bytes held
   are at most the cap whatever the sender announced, and a document that announced no size is

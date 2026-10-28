@@ -5,10 +5,15 @@
 //! and turns that frame into the answer the caller sees.
 //!
 //! What the child can never see: the environment (it is cleared before the
-//! four request variables are set), the configuration, the data directory,
-//! the operator's files. What the child can never do: outlive the deadline
-//! (it is killed and reaped), take more memory than the ceiling (unix only),
-//! or fill the pipe (the read is capped).
+//! four request variables are set), the configuration, the data directory.
+//! What the child can never do: outlive the deadline (it is killed and
+//! reaped), take more memory than the ceiling (unix only), or fill the pipe
+//! (the read is capped).
+//!
+//! The boundary is a **crash boundary, not a privilege boundary**: the child
+//! keeps the agent's own filesystem and network reach. A parser that wanted
+//! to read an operator file or open a socket could; what it cannot do is
+//! take the agent down with it.
 //!
 //! The memory ceiling is a unix-only guard. On every other target the
 //! deadline kill still applies, and nothing else bounds the child's memory.
