@@ -192,6 +192,29 @@ OPENAI_API_KEY=sk-... rantaiclaw setup provider
    `default_provider` to a provider that runs keyless (for example
    `"openrouter"` or `"ollama"`), save, and relaunch.
 
+### The Gemini CLI login has expired
+
+Cause: the only Gemini credential is the login `~/.gemini/oauth_creds.json` holds, and its access
+token has expired. The token is valid for about an hour after the last `gemini` run, and it is never
+refreshed. The turn is refused before anything is sent, with the fix in the message:
+
+```
+the Gemini CLI login has expired — run `gemini` to renew it, or set `GEMINI_API_KEY`
+```
+
+Fix it with either one:
+
+```bash
+gemini          # renew the login, then retry
+```
+
+```bash
+export GEMINI_API_KEY=...   # use a key instead
+```
+
+With Gemini CLI's encrypted credential storage the login lives in the OS keychain and the file is
+deleted after the migration, so there is nothing to reuse and a key is the only way in.
+
 ### `anthropic: ANTHROPIC_API_KEY required` or `<name>: no credential found`
 
 The Anthropic family found no credential. It checks these sources in order, and

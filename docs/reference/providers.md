@@ -114,6 +114,13 @@ a provider that does not report them adds nothing to the day's total.
 
 - Provider ID: `gemini` (aliases: `google`, `google-gemini`)
 - Auth can come from `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or Gemini CLI OAuth cache (`~/.gemini/oauth_creds.json`)
+- The Gemini CLI login is reused while its access token is valid — about an hour after the last
+  `gemini` run. It is never refreshed. When the token has expired, run `gemini` again or set
+  `GEMINI_API_KEY`: the expired token is refused locally, with that fix named, instead of being sent
+  to Google and coming back as a 401.
+- With Gemini CLI's encrypted credential storage there is no `oauth_creds.json` to reuse — the login
+  lives in the OS keychain and the file is deleted after the migration — so nothing is found and a key
+  is needed.
 - API key requests use `generativelanguage.googleapis.com/v1beta`
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
 
@@ -297,6 +304,17 @@ Then call with a hint model name (for example from tool or integration paths):
 ```text
 hint:reasoning
 ```
+
+The hint resolves against the table at every door that runs an agent turn: the CLI and
+TUI agent, cron, the daemon heartbeat, the console chat and the gateway webhook, the
+chat channels and the delegate tool. A hint the table does not name is refused before
+any request is sent, and the refusal names the hint and the hints that are configured —
+`unknown route hint "nope"; configured hints: fast, reasoning`. A route whose provider
+is not available is refused as configured but its provider is not available, so a
+broken provider is not reported as an unknown hint. With no `[[model_routes]]` table at
+all, a `hint:` model is refused with `no [[model_routes]] configured`. A route resolves
+its own credential — its own `api_key` in the route entry, or that provider's own
+environment variable — and never receives the default provider's key.
 
 ## Embedding Routing (`hint:<name>`)
 

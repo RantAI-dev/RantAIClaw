@@ -3432,6 +3432,22 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
 
 // ── Step 6: Project Context ─────────────────────────────────────
 
+/// The timezone choices the wizard offers: the label the operator picks, and
+/// the IANA name it stands for. The names are written out instead of cut out
+/// of the label, so the value that is stored is always one the timezone
+/// database holds.
+const TZ_OPTIONS: &[(&str, &str)] = &[
+    ("US/Eastern (EST/EDT)", "US/Eastern"),
+    ("US/Central (CST/CDT)", "US/Central"),
+    ("US/Mountain (MST/MDT)", "US/Mountain"),
+    ("US/Pacific (PST/PDT)", "US/Pacific"),
+    ("Europe/London (GMT/BST)", "Europe/London"),
+    ("Europe/Berlin (CET/CEST)", "Europe/Berlin"),
+    ("Asia/Tokyo (JST)", "Asia/Tokyo"),
+    ("UTC", "UTC"),
+    ("Other (type manually)", ""),
+];
+
 fn setup_project_context() -> Result<ProjectContext> {
     print_bullet("Let's personalize your agent. You can always update these later.");
     print_bullet("Press Enter to accept defaults.");
@@ -3442,37 +3458,29 @@ fn setup_project_context() -> Result<ProjectContext> {
         .default("User".into())
         .interact_text()?;
 
-    let tz_options = vec![
-        "US/Eastern (EST/EDT)",
-        "US/Central (CST/CDT)",
-        "US/Mountain (MST/MDT)",
-        "US/Pacific (PST/PDT)",
-        "Europe/London (GMT/BST)",
-        "Europe/Berlin (CET/CEST)",
-        "Asia/Tokyo (JST)",
-        "UTC",
-        "Other (type manually)",
-    ];
-
     let tz_idx = Select::new()
         .with_prompt("  Your timezone")
-        .items(&tz_options)
+        .items(TZ_OPTIONS.iter().map(|(label, _)| *label))
         .default(0)
         .interact()?;
 
-    let timezone = if tz_idx == tz_options.len() - 1 {
-        Input::new()
-            .with_prompt("  Enter timezone (e.g. America/New_York)")
-            .default("UTC".into())
-            .interact_text()?
+    let timezone = if tz_idx == TZ_OPTIONS.len() - 1 {
+        // Free text: ask again until the name is one this build can use, so
+        // no door stores a timezone that cannot be parsed later.
+        loop {
+            let typed: String = Input::new()
+                .with_prompt("  Enter timezone (e.g. America/New_York)")
+                .default("UTC".into())
+                .interact_text()?;
+            match crate::persona::validate_timezone(&typed) {
+                Ok(()) => break typed.trim().to_string(),
+                Err(unknown) => {
+                    println!("  {} {unknown}", style("❌").red().bold());
+                }
+            }
+        }
     } else {
-        // Extract the short label before the parenthetical
-        tz_options[tz_idx]
-            .split('(')
-            .next()
-            .unwrap_or("UTC")
-            .trim()
-            .to_string()
+        TZ_OPTIONS[tz_idx].1.to_string()
     };
 
     let agent_name: String = Input::new()
@@ -6396,6 +6404,22 @@ mod tests {
         assert!(ctx.timezone.is_empty());
         assert!(ctx.agent_name.is_empty());
         assert!(ctx.communication_style.is_empty());
+    }
+
+    /// Every timezone the wizard offers must be a name this build can use:
+    /// the choice is written into the persona and into the workspace files.
+    #[test]
+    fn every_timezone_the_wizard_offers_is_a_usable_name() {
+        for (label, name) in TZ_OPTIONS {
+            if name.is_empty() {
+                // The "type it yourself" entry carries no name of its own.
+                continue;
+            }
+            assert!(
+                crate::persona::validate_timezone(name).is_ok(),
+                "the wizard offers {label:?}, which is not a timezone this build knows"
+            );
+        }
     }
 
     /// Pin the process `HOME` at `tmp` and prove the pin took.

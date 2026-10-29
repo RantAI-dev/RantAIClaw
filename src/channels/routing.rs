@@ -196,6 +196,9 @@ pub(crate) fn runtime_defaults_from_config(
         temperature: config.default_temperature,
         api_key: config.api_key.clone(),
         provider_api_keys: Arc::new(config.provider_api_keys.clone()),
+        // The operator's `[[model_routes]]`, so a `hint:` model resolves to
+        // the provider and the model the operator configured.
+        model_routes: Arc::new(config.model_routes.clone()),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
         approval_owners: Arc::new(config.channels_config.approval_owners.clone()),
@@ -265,6 +268,11 @@ pub(crate) fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelR
         // No config on this path, so no stored keys to read: an empty map means
         // a fallback resolves from its env vars alone, as it did before.
         provider_api_keys: Arc::new(HashMap::new()),
+        // No config on this path, so no route table to read: an empty table
+        // means "no routes", which is what this fallback already did for
+        // every provider. It must NOT widen anything, so nothing is invented
+        // here.
+        model_routes: Arc::new(Vec::new()),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
         approval_owners: Arc::clone(&ctx.approval_owners),
@@ -459,11 +467,18 @@ pub(crate) async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContex
         }
     }
 
-    let next_default_provider = match providers::create_resilient_provider_with_options(
+    // The reloaded provider is built through the ROUTED factory, with the
+    // operator's `[[model_routes]]` table, so a `hint:` model resolves to the
+    // provider and the model the operator configured here exactly as it does
+    // at every other door — and a hint no route names is refused before any
+    // request instead of being sent as a literal model name.
+    let next_default_provider = match providers::create_routed_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
         &next_defaults.reliability,
+        &next_defaults.model_routes,
+        &next_defaults.model,
         &|name| {
             crate::config::Config::resolve_stored_key(
                 &next_defaults.provider_api_keys,
@@ -512,6 +527,12 @@ pub(crate) async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContex
             applied.api_key = entry.defaults.api_key.clone();
             applied.api_url = entry.defaults.api_url.clone();
             applied.reliability = entry.defaults.reliability.clone();
+            // The route table is frozen here on purpose: the provider we kept
+            // is the OLD router, built with the OLD table. Applying the new
+            // table without the new provider would leave the operator's route
+            // edit silently unapplied — the defaults would name routes the
+            // running router cannot resolve.
+            applied.model_routes = entry.defaults.model_routes.clone();
             entry.defaults = applied;
             entry.last_applied_stamp = Some(stamp);
             entry.last_reload_error = Some(reason);
@@ -671,7 +692,7 @@ pub(crate) async fn get_or_create_provider(
         None
     };
 
-    let provider = create_resilient_provider_nonblocking(
+    let provider = create_routed_provider_nonblocking(
         provider_name,
         ctx.api_key.clone(),
         api_url.map(ToString::to_string),
@@ -679,6 +700,11 @@ pub(crate) async fn get_or_create_provider(
         Arc::clone(&defaults.provider_api_keys),
         defaults.default_provider.clone(),
         defaults.api_key.clone(),
+        // The operator's `[[model_routes]]`, so a `hint:` model resolves to
+        // the provider and the model the operator configured here exactly as
+        // it does at every other door.
+        Arc::clone(&defaults.model_routes),
+        defaults.model.clone(),
         ctx.provider_runtime_options.clone(),
     )
     .await?;
@@ -695,7 +721,18 @@ pub(crate) async fn get_or_create_provider(
     Ok(Arc::clone(cached))
 }
 
-pub(crate) async fn create_resilient_provider_nonblocking(
+/// Build a provider for a channel turn through the ROUTED factory.
+///
+/// The operator's `[[model_routes]]` table travels with the call, so a
+/// `hint:<name>` model resolves to the provider and the model the operator
+/// configured, exactly as it does at every other door. A hint no route names
+/// is refused before any request, instead of being sent to the provider as a
+/// literal model name.
+///
+/// With an EMPTY route table the factory returns the plain resilient provider
+/// wrapped in the hint guard: the retry and fallback behaviour is unchanged,
+/// and the only difference is that a `hint:` model is refused.
+pub(crate) async fn create_routed_provider_nonblocking(
     provider_name: &str,
     api_key: Option<String>,
     api_url: Option<String>,
@@ -703,15 +740,19 @@ pub(crate) async fn create_resilient_provider_nonblocking(
     provider_api_keys: Arc<HashMap<String, String>>,
     default_provider: String,
     top_level_api_key: Option<String>,
+    model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
+    default_model: String,
     provider_runtime_options: providers::ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let provider_name = provider_name.to_string();
     tokio::task::spawn_blocking(move || {
-        providers::create_resilient_provider_with_options(
+        providers::create_routed_provider_with_options(
             &provider_name,
             api_key.as_deref(),
             api_url.as_deref(),
             &reliability,
+            &model_routes,
+            &default_model,
             &|name| {
                 crate::config::Config::resolve_stored_key(
                     &provider_api_keys,
