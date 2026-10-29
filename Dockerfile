@@ -96,7 +96,7 @@ ENTRYPOINT ["rantaiclaw"]
 CMD ["gateway"]
 
 # ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2 AS release
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf AS release
 
 COPY --from=builder /app/rantaiclaw /usr/local/bin/rantaiclaw
 COPY --from=builder /rantaiclaw-data /rantaiclaw-data
