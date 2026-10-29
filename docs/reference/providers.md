@@ -115,9 +115,10 @@ a provider that does not report them adds nothing to the day's total.
 - Provider ID: `gemini` (aliases: `google`, `google-gemini`)
 - Auth can come from `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or Gemini CLI OAuth cache (`~/.gemini/oauth_creds.json`)
 - The Gemini CLI login is reused while its access token is valid — about an hour after the last
-  `gemini` run. It is never refreshed. When the token has expired, run `gemini` again or set
-  `GEMINI_API_KEY`: the expired token is refused locally, with that fix named, instead of being sent
-  to Google and coming back as a 401.
+  `gemini` run. It is never refreshed. The login is read when a request is sent, so an expired one
+  fails that turn with the fix named: run `gemini` again or set `GEMINI_API_KEY`. Nothing is sent to
+  Google, so the expired login no longer comes back as a 401. No restart is needed after `gemini`:
+  the renewed login is used on the next request.
 - With Gemini CLI's encrypted credential storage there is no `oauth_creds.json` to reuse — the login
   lives in the OS keychain and the file is deleted after the migration — so nothing is found and a key
   is needed.

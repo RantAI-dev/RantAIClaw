@@ -4,8 +4,9 @@
 //! the only Gemini credential that is not a key the operator typed. The
 //! onboarding wizard uses it to offer "reuse your existing Gemini CLI login"
 //! during provider setup, independent of which Gemini provider path (legacy or
-//! `RigProvider`) ends up handling inference, and the provider factory uses it
-//! to refuse a login that has expired before any request is sent.
+//! `RigProvider`) ends up handling inference, and the provider reads it when a
+//! request is sent, so a login renewed by running `gemini` is used on the next
+//! request without a restart.
 
 use directories::UserDirs;
 use serde::Deserialize;
@@ -53,7 +54,7 @@ pub enum GeminiCliLogin {
 }
 
 /// What the reader found in the login file.
-enum Login {
+pub(crate) enum Login {
     /// No file, or no access token in it.
     Missing,
     /// A usable token.
@@ -77,7 +78,11 @@ fn normalize_non_empty(value: &str) -> Option<String> {
 }
 
 /// Read the login file and decide what to do with what it holds.
-fn read_login() -> Login {
+///
+/// The one reader: the provider reads the login when a request is sent, and
+/// the factory asks the same question when it builds a provider. Both go
+/// through this function, so the expiry check cannot drift apart.
+pub(crate) fn read_gemini_cli_login() -> Login {
     let Some(creds) = read_creds() else {
         return Login::Missing;
     };
@@ -104,7 +109,7 @@ fn read_creds() -> Option<GeminiCliOAuthCreds> {
 
 /// What the Gemini CLI login file says.
 pub fn gemini_cli_login() -> GeminiCliLogin {
-    match read_login() {
+    match read_gemini_cli_login() {
         Login::Missing => GeminiCliLogin::Missing,
         Login::Valid(_) => GeminiCliLogin::Valid,
         Login::Expired => GeminiCliLogin::Expired,
@@ -117,7 +122,7 @@ pub fn gemini_cli_login() -> GeminiCliLogin {
 /// An expired token yields `None`: it is not sent to Google, where it would
 /// come back as a 401.
 pub fn try_load_gemini_cli_token() -> Option<String> {
-    match read_login() {
+    match read_gemini_cli_login() {
         Login::Valid(token) => Some(token),
         Login::Missing | Login::Expired => None,
     }
@@ -125,7 +130,7 @@ pub fn try_load_gemini_cli_token() -> Option<String> {
 
 /// Check if Gemini CLI is configured and has valid (non-expired) credentials.
 pub fn gemini_cli_has_credentials() -> bool {
-    matches!(read_login(), Login::Valid(_))
+    matches!(read_gemini_cli_login(), Login::Valid(_))
 }
 
 /// Whether the token in the file has expired.
@@ -198,6 +203,48 @@ where
     })
 }
 
+/// Point `HOME` at a fresh temp directory and create `~/.gemini` in it.
+///
+/// The guard restores `HOME` when it is dropped, so a panicking test does
+/// not leak the override into the next one sharing `ENV_LOCK`.
+///
+/// Shared by the tests of every module that needs a Gemini CLI login file:
+/// there is one helper, so the tests read the same file the reader does.
+#[cfg(test)]
+pub(crate) fn gemini_home() -> (tempfile::TempDir, crate::test_env::HomeGuard) {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let guard = crate::test_env::HomeGuard::set(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".gemini")).expect("create .gemini dir");
+    (tmp, guard)
+}
+
+/// The path of the credentials file inside a temp home.
+#[cfg(test)]
+pub(crate) fn gemini_creds_path(home: &tempfile::TempDir) -> std::path::PathBuf {
+    home.path().join(".gemini").join("oauth_creds.json")
+}
+
+/// Write the credentials file inside a temp home.
+#[cfg(test)]
+pub(crate) fn write_gemini_creds(home: &tempfile::TempDir, body: &str) {
+    std::fs::write(gemini_creds_path(home), body).expect("write creds");
+}
+
+/// Write a login file whose token expires `offset_millis` from now — a
+/// negative offset is a login that is already dead.
+#[cfg(test)]
+pub(crate) fn write_gemini_creds_with_expiry(
+    home: &tempfile::TempDir,
+    token: &str,
+    offset_millis: i64,
+) {
+    let expiry = now_millis() + offset_millis;
+    write_gemini_creds(
+        home,
+        &format!(r#"{{"access_token":"{token}","expiry_date":{expiry}}}"#),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,28 +304,6 @@ mod tests {
         }
     }
 
-    /// Point `HOME` at a fresh temp directory and create `~/.gemini` in it.
-    ///
-    /// The guard restores `HOME` when it is dropped, so a panicking test does
-    /// not leak the override into the next one sharing `ENV_LOCK`.
-    fn gemini_home() -> (tempfile::TempDir, crate::test_env::HomeGuard) {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let guard = crate::test_env::HomeGuard::set(tmp.path());
-        std::fs::create_dir_all(tmp.path().join(".gemini")).expect("create .gemini dir");
-        (tmp, guard)
-    }
-
-    /// The path of the credentials file inside a temp home.
-    fn creds_path(home: &tempfile::TempDir) -> std::path::PathBuf {
-        home.path().join(".gemini").join("oauth_creds.json")
-    }
-
-    /// The shape Gemini CLI writes: `expiry_date` in milliseconds since the
-    /// epoch.
-    fn write_creds(home: &tempfile::TempDir, body: &str) {
-        std::fs::write(creds_path(home), body).expect("write creds");
-    }
-
     /// The reproduction: the token expired an hour ago, in the shape Gemini
     /// CLI writes. The reader must not hand it out.
     #[tokio::test]
@@ -287,7 +312,7 @@ mod tests {
         let (home, _home_guard) = gemini_home();
 
         let an_hour_ago = now_millis() - 3_600_000;
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(r#"{{"access_token":"t","refresh_token":"r","expiry_date":{an_hour_ago}}}"#),
         );
@@ -304,7 +329,7 @@ mod tests {
         let (home, _home_guard) = gemini_home();
 
         let an_hour_ahead = now_millis() + 3_600_000;
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(r#"{{"access_token":"t","refresh_token":"r","expiry_date":{an_hour_ahead}}}"#),
         );
@@ -322,7 +347,7 @@ mod tests {
         let (home, _home_guard) = gemini_home();
 
         let in_ten_seconds = now_millis() + 10_000;
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(r#"{{"access_token":"t","expiry_date":{in_ten_seconds}}}"#),
         );
@@ -337,14 +362,14 @@ mod tests {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let (home, _home_guard) = gemini_home();
 
-        write_creds(
+        write_gemini_creds(
             &home,
             r#"{"access_token":"expired-token","expiry":"2000-01-01T00:00:00Z"}"#,
         );
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
         assert_eq!(try_load_gemini_cli_token(), None);
 
-        write_creds(
+        write_gemini_creds(
             &home,
             r#"{"access_token":"valid-token","expiry":"2999-01-01T00:00:00Z"}"#,
         );
@@ -359,7 +384,7 @@ mod tests {
         let (home, _home_guard) = gemini_home();
 
         let an_hour_ago = now_millis() - 3_600_000;
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(
                 r#"{{"access_token":"t","expiry":"2999-01-01T00:00:00Z","expiry_date":{an_hour_ago}}}"#
@@ -368,7 +393,7 @@ mod tests {
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
 
         let an_hour_ahead = now_millis() + 3_600_000;
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(
                 r#"{{"access_token":"t","expiry":"2000-01-01T00:00:00Z","expiry_date":{an_hour_ahead}}}"#
@@ -387,7 +412,7 @@ mod tests {
 
         // `1e30` milliseconds is no deadline at all, and no number an `i64` of
         // milliseconds can hold.
-        write_creds(
+        write_gemini_creds(
             &home,
             r#"{"access_token":"t","expiry":"2000-01-01T00:00:00Z","expiry_date":1e30}"#,
         );
@@ -397,7 +422,7 @@ mod tests {
 
         // The string decides in the other direction too: a login the `expiry`
         // string says is alive is alive.
-        write_creds(
+        write_gemini_creds(
             &home,
             r#"{"access_token":"t","expiry":"2999-01-01T00:00:00Z","expiry_date":1e30}"#,
         );
@@ -412,7 +437,7 @@ mod tests {
         let (home, _home_guard) = gemini_home();
 
         let an_hour_ahead = now_millis() + 3_600_000;
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(r#"{{"access_token":"t","expiry_date":{an_hour_ahead}.5}}"#),
         );
@@ -420,7 +445,7 @@ mod tests {
         assert_eq!(try_load_gemini_cli_token(), Some("t".to_string()));
 
         let an_hour_ago = now_millis() - 3_600_000;
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(r#"{{"access_token":"t","expiry_date":{an_hour_ago}.5}}"#),
         );
@@ -437,7 +462,7 @@ mod tests {
         let (home, _home_guard) = gemini_home();
 
         let at_the_margin = now_millis() + TOKEN_MARGIN_MILLIS;
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(r#"{{"access_token":"t","expiry_date":{at_the_margin}}}"#),
         );
@@ -445,7 +470,7 @@ mod tests {
 
         // The same deadline with a fractional part truncates to the same whole
         // millisecond, and is refused the same way.
-        write_creds(
+        write_gemini_creds(
             &home,
             &format!(r#"{{"access_token":"t","expiry_date":{at_the_margin}.5}}"#),
         );
@@ -461,7 +486,7 @@ mod tests {
         let (home, _home_guard) = gemini_home();
 
         // An hour before the epoch, with a fractional part.
-        write_creds(&home, r#"{"access_token":"t","expiry_date":-3600000.5}"#);
+        write_gemini_creds(&home, r#"{"access_token":"t","expiry_date":-3600000.5}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
         assert_eq!(try_load_gemini_cli_token(), None);
     }
@@ -473,13 +498,13 @@ mod tests {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let (home, _home_guard) = gemini_home();
 
-        write_creds(&home, r#"{"access_token":"t"}"#);
+        write_gemini_creds(&home, r#"{"access_token":"t"}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Valid);
         assert_eq!(try_load_gemini_cli_token(), Some("t".to_string()));
 
         // `expiry_date: null` is the shape Gemini CLI writes when the token
         // has no known expiry.
-        write_creds(&home, r#"{"access_token":"t","expiry_date":null}"#);
+        write_gemini_creds(&home, r#"{"access_token":"t","expiry_date":null}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Valid);
         assert_eq!(try_load_gemini_cli_token(), Some("t".to_string()));
     }
@@ -491,63 +516,64 @@ mod tests {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let (home, _home_guard) = gemini_home();
 
-        write_creds(&home, "not json at all");
+        write_gemini_creds(&home, "not json at all");
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Missing);
         assert_eq!(try_load_gemini_cli_token(), None);
 
-        write_creds(&home, r#"{"refresh_token":"r"}"#);
+        write_gemini_creds(&home, r#"{"refresh_token":"r"}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Missing);
         assert_eq!(try_load_gemini_cli_token(), None);
 
         // An empty access token is no token.
-        write_creds(&home, r#"{"access_token":"   "}"#);
+        write_gemini_creds(&home, r#"{"access_token":"   "}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Missing);
         assert_eq!(try_load_gemini_cli_token(), None);
     }
 
-    /// The provider uses the shared reader: a file in the Gemini CLI shape
-    /// decides what it holds.
+    /// The provider follows the shared reader: a login file that holds a
+    /// token — valid or expired — makes the provider use the Gemini CLI
+    /// login, and no login file at all leaves it without a credential.
     #[tokio::test]
     async fn the_provider_uses_the_shared_reader() {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
         let (home, _home_guard) = gemini_home();
 
-        let an_hour_ago = now_millis() - 3_600_000;
-        write_creds(
-            &home,
-            &format!(r#"{{"access_token":"t","expiry_date":{an_hour_ago}}}"#),
-        );
-        let provider = crate::providers::gemini::GeminiProvider::new(None);
-        assert_eq!(provider.auth_source(), "none");
-
-        let an_hour_ahead = now_millis() + 3_600_000;
-        write_creds(
-            &home,
-            &format!(r#"{{"access_token":"t","expiry_date":{an_hour_ahead}}}"#),
-        );
+        // Expired: the file still holds a token, so the provider uses the
+        // login and refuses the request with the fix named.
+        write_gemini_creds_with_expiry(&home, "ya29.mock-token", -3_600_000);
         let provider = crate::providers::gemini::GeminiProvider::new(None);
         assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
+
+        // Valid: the same provider, still the CLI login.
+        write_gemini_creds_with_expiry(&home, "ya29.mock-token", 3_600_000);
+        let provider = crate::providers::gemini::GeminiProvider::new(None);
+        assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
+
+        // No login file at all: no credential.
+        std::fs::remove_file(gemini_creds_path(&home)).expect("remove creds");
+        let provider = crate::providers::gemini::GeminiProvider::new(None);
+        assert_eq!(provider.auth_source(), "none");
     }
 
-    /// The refusal names the command to run and the key to set. The provider
-    /// is only built — no request is sent.
+    /// The refusal names the command to run and the key to set. It happens
+    /// when the request is sent, not when the provider is built: the build
+    /// succeeds, so the gateway and the channels start with an expired login.
     #[tokio::test]
     async fn an_expired_login_is_refused_with_the_fix_named() {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
         let (home, _home_guard) = gemini_home();
 
-        let an_hour_ago = now_millis() - 3_600_000;
-        write_creds(
-            &home,
-            &format!(r#"{{"access_token":"t","expiry_date":{an_hour_ago}}}"#),
-        );
+        write_gemini_creds_with_expiry(&home, "ya29.mock-token", -3_600_000);
 
-        let error = match crate::providers::create_provider("gemini", None) {
-            Ok(_) => panic!("an expired Gemini CLI login must be refused"),
-            Err(error) => error,
-        };
+        let provider = crate::providers::create_provider("gemini", None)
+            .expect("an expired login must not fail the provider build");
+
+        let error = provider
+            .chat_with_system(None, "hello", "gemini-2.0-flash", 0.7)
+            .await
+            .expect_err("an expired Gemini CLI login must be refused");
         let message = error.to_string();
         assert!(message.contains("gemini"), "{message}");
         assert!(message.contains("GEMINI_API_KEY"), "{message}");
