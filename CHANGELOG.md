@@ -144,6 +144,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the promise used to go unkept. It shares one verdict with the TUI's panel, so the two
   surfaces cannot disagree. An unhealthy scheduler is a failure, and it is the only new verdict
   that makes `rantaiclaw doctor` exit non-zero.
+- **Telegram and WhatsApp Web accept inbound documents** (PDF, DOCX, TXT). The type is sniffed
+  from the bytes — the platform's MIME type and the file name are an early filter and a veto,
+  never the decider — and the sender's announced size is checked before anything is downloaded. A
+  document arrives at the model as a delimited block that names the file, the page count and
+  whether the text was cut, and that states outright that the text came from the sender and is
+  untrusted; square brackets in the text are defused, so a document cannot plant an attachment
+  marker of its own. Every rejection is a visible `[Attachment rejected: …]` note rather than
+  silence. The limits are constants, not config keys: 10 MiB per document, 50 PDF pages, 50,000
+  forwarded characters, 20 seconds per extraction with one extraction at a time, and a DOCX that
+  expands to at most 50 MiB. The extraction runs in a child process: the same binary, started
+  with a hidden subcommand, given the document on stdin and an environment with nothing in it —
+  no HOME, no PATH, no provider key and no configuration directory — plus one allocator setting,
+  `MALLOC_ARENA_MAX=1`, so the child's address-space ceiling is spent on the document rather
+  than on the allocator's per-thread arena reservations; without it the ceiling would refuse
+  documents the channel itself accepts. The boundary is a crash boundary rather than a
+  privilege boundary: the child keeps the agent's own filesystem and network reach. Whatever
+  the parser does, panic, abort, loop or runaway allocation, the child dies and the agent keeps
+  running; the child is killed and reaped at the deadline, so the one-at-a-time slot is released
+  when the child dies, and on unix it also gets a 512 MiB memory ceiling. The WhatsApp Web read is
+  bounded by a writer that refuses the write past the cap, so the bytes held are at most the cap
+  whatever the sender announced, and a document that announced no size is refused before the
+  download. Documents are budgeted separately from images — 5
+  documents per sender per 10 minutes, consulted **before** any download, so an exhausted sender
+  costs no bandwidth and no `getFile` call. The text stays readable for the whole turn it arrived
+  in and becomes a one-line stub from the next user message on. A Telegram document with no
+  caption is a document like any other: it is policy-checked and answered, not taken for an
+  intruder. A DOCX needs the `kb-office` feature, which is not a default: a default build refuses
+  a DOCX with a note that says why. Every other channel keeps ignoring documents, and no document
+  is ever written to disk. The full rules are in `docs/security/inbound-media-policy.md`. The
+  reason a document is refused is always a sentence of ours, so no part of the sender's own word
+  reaches the model through the error.
 
 - `rantaiclaw personality set` takes `--name` and `--timezone` next to the
   positional preset, so the persona's owner name and its timezone can be set
