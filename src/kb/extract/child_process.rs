@@ -5,7 +5,8 @@
 //! and turns that frame into the answer the caller sees.
 //!
 //! What the child can never see: the environment (it is cleared before the
-//! four request variables are set), the configuration, the data directory.
+//! four request variables and the one allocator setting are set), the
+//! configuration, the data directory.
 //! What the child can never do: outlive the deadline (it is killed and
 //! reaped), take more memory than the ceiling (unix only), or fill the pipe
 //! (the read is capped).
@@ -25,7 +26,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdout, Command};
 
 use crate::kb::extract::child::{
-    self, ChildFrame, ErrorKind, CHILD_VAR, KIND_VAR, MAX_CHARS_VAR, MAX_PAGES_VAR, SENTINEL,
+    self, ChildFrame, ErrorKind, ARENA_VAR, CHILD_VAR, KIND_VAR, MAX_CHARS_VAR, MAX_PAGES_VAR,
+    SENTINEL,
 };
 use crate::kb::extract::inbound::{InboundExtraction, InboundLimits};
 use crate::kb::{KbError, KbResult};
@@ -77,6 +79,12 @@ pub(crate) async fn run_child(
     command.env(MAX_PAGES_VAR, limits.max_pages.to_string());
     command.env(MAX_CHARS_VAR, limits.max_chars.to_string());
     command.env(CHILD_VAR, "1");
+    // One allocator arena, so the ceiling is spent on the document. The
+    // ceiling is on the child's *address space*, and glibc reserves 64 MiB for
+    // every thread arena it creates; the parser's own thread pool creates
+    // several of them, and the reservations would spend the ceiling on
+    // nothing that holds data — refusing a legitimate document.
+    command.env(ARENA_VAR, "1");
     for (name, value) in extra_env {
         command.env(name, value);
     }
@@ -550,6 +558,30 @@ mod tests {
         assert!(
             extraction.text.contains("home=<absent>"),
             "{}",
+            extraction.text
+        );
+    }
+
+    /// The reader gets one allocator arena, so the ceiling is spent on the
+    /// document.
+    ///
+    /// The ceiling is on the **address space**, and glibc reserves 64 MiB for
+    /// every thread arena it creates. The parser's own thread pool creates
+    /// several of them, and the reservations would spend the ceiling on
+    /// nothing that holds data — so a legitimate document would be refused.
+    #[tokio::test]
+    async fn the_reader_gets_one_allocator_arena() {
+        let extraction = extract_test_document(
+            "env",
+            &[],
+            Vec::new(),
+            limits(50, 50_000, Duration::from_secs(20)),
+        )
+        .await
+        .expect("the reader answers");
+        assert!(
+            extraction.text.contains("arena=1"),
+            "the reader must get one allocator arena: {}",
             extraction.text
         );
     }

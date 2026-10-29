@@ -64,6 +64,15 @@ pub const MAX_CHARS_VAR: &str = "RANTAICLAW_EXTRACT_MAX_CHARS";
 /// be given a subcommand of its own.
 pub const CHILD_VAR: &str = "RANTAICLAW_EXTRACT_CHILD";
 
+/// The environment variable that caps the child's allocator arenas.
+///
+/// The ceiling is on the child's **address space** (`RLIMIT_AS`), and glibc
+/// reserves 64 MiB for every thread arena it creates. The parser's own
+/// thread pool creates several of them, so the reservations would spend the
+/// ceiling on nothing that holds data, and a legitimate document would be
+/// refused. One arena spends the ceiling on the document instead.
+pub const ARENA_VAR: &str = "MALLOC_ARENA_MAX";
+
 /// The environment variable that says how long the test reader sleeps.
 #[cfg(test)]
 pub(crate) const SLEEP_SECS_VAR: &str = "RANTAICLAW_EXTRACT_SLEEP_SECS";
@@ -451,8 +460,9 @@ fn test_alloc() -> KbResult<InboundExtraction> {
 fn test_env() -> KbResult<InboundExtraction> {
     let probe = std::env::var(PROBE_VAR).unwrap_or_else(|_| ABSENT.to_string());
     let home = std::env::var("HOME").unwrap_or_else(|_| ABSENT.to_string());
+    let arena = std::env::var(ARENA_VAR).unwrap_or_else(|_| ABSENT.to_string());
     Ok(InboundExtraction {
-        text: format!("probe={probe} home={home}"),
+        text: format!("probe={probe} home={home} arena={arena}"),
         pages: None,
         truncated: false,
     })

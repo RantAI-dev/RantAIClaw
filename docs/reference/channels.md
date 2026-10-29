@@ -781,11 +781,13 @@ summary.
   always runs.
 - **Nothing is written to disk.** The bytes are read into memory and parsed
   somewhere else: the parsing happens in a **child process** whose environment
-  holds four fixed request variables and nothing else — no HOME, no PATH, no
-  provider key, no configuration directory — and the document travels to it
-  over a pipe. There is no temp file, not even a short-lived one. The child
-  keeps the agent's own filesystem and network reach, so the boundary contains
-  a crash, not a privilege.
+  holds four fixed request variables and one allocator setting
+  (`MALLOC_ARENA_MAX=1`, so the child's address-space ceiling is spent on the
+  document and not on the parser's thread-pool reservations) and nothing else —
+  no HOME, no PATH, no provider key, no configuration directory — and the
+  document travels to it over a pipe. There is no temp file, not even a
+  short-lived one. The child keeps the agent's own filesystem and network
+  reach, so the boundary contains a crash, not a privilege.
 - **The limits are constants, not config keys.** 10 MiB per document (checked on
   the announced size before any download and again on the bounded read; over the
   cap is refused, never truncated), 50 PDF pages counted from the bytes before

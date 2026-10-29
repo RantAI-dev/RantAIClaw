@@ -244,8 +244,14 @@ hidden subcommand, hands it the document on stdin and reads one answer back:
   target the deadline kill is the only limit.
 - The child gets **no environment of its own**: the parent clears it and sets
   only the request — the document kind, the page cap, the character cap and the
-  marker that says "this process is the child". No HOME, no PATH, no provider
-  key and no configuration directory is in reach through the environment.
+  marker that says "this process is the child" — plus one allocator setting,
+  `MALLOC_ARENA_MAX=1`. The ceiling is on the child's **address space**, and
+  glibc reserves 64 MiB for every thread arena it creates; the parser's own
+  thread pool creates several of them, so without the setting the ceiling
+  would be spent on reservations that hold no data and a legitimate document
+  would be refused. The setting names no path, no key and no secret. No HOME,
+  no PATH, no provider key and no configuration directory is in reach through
+  the environment.
 - The boundary is a **crash boundary, not a privilege boundary**. The child runs
   with the agent's own filesystem and network reach: a parser that wanted to
   read an operator file or open a socket could. What the child cannot do is
