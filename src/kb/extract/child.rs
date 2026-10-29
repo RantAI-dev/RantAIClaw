@@ -41,6 +41,13 @@ pub const HIDDEN_SUBCOMMAND: &str = "__extract-document";
 /// the model. So such a failure is reported with a sentence of ours.
 const UNEXPECTED_REASON: &str = "the document could not be read";
 
+/// The reason a document kind the child does not know is refused with.
+///
+/// The kind is the sender's own word, and the reason reaches the model. So
+/// the reason is ours, and it names no part of the kind. The parent refuses
+/// an unknown kind before it starts a child, and says the same words.
+pub(crate) const UNKNOWN_KIND_REASON: &str = "the document kind is not supported";
+
 /// The sentinel that marks the child's answer on stdout.
 ///
 /// The answer is the sentinel, a newline, and one line of JSON. A JSON
@@ -80,6 +87,14 @@ pub(crate) const SLEEP_SECS_VAR: &str = "RANTAICLAW_EXTRACT_SLEEP_SECS";
 /// The environment variable the test reader reports back.
 #[cfg(test)]
 pub(crate) const PROBE_VAR: &str = "RANTAICLAW_EXTRACT_PROBE";
+
+/// The environment variable that names the file the reader writes its own
+/// process id into.
+///
+/// The parent test looks the process up after the deadline, to see that the
+/// reader was killed and not merely left behind.
+#[cfg(test)]
+pub(crate) const PID_FILE_VAR: &str = "RANTAICLAW_EXTRACT_PID_FILE";
 
 /// The most bytes the child reads from stdin.
 ///
@@ -240,8 +255,24 @@ pub fn child_exit_code_if_invoked() -> Option<i32> {
 /// Read the request, read the document, parse it.
 fn child_outcome() -> KbResult<InboundExtraction> {
     let request = read_request()?;
+    // The reader says which process it is, before it does any work: the
+    // parent test looks the process up after the deadline. Test-only.
+    #[cfg(test)]
+    report_pid();
     let bytes = read_input()?;
     run_extraction(&request.kind, &bytes, request.limits)
+}
+
+/// The reader writes its own process id where the parent asked for it.
+///
+/// The parent test looks the process up afterwards, to see that the
+/// deadline killed the reader and did not merely abandon it. Test-only.
+#[cfg(test)]
+fn report_pid() {
+    let Ok(path) = std::env::var(PID_FILE_VAR) else {
+        return;
+    };
+    let _ = std::fs::write(path, std::process::id().to_string());
 }
 
 /// What the parent asked the child to read.
@@ -304,7 +335,9 @@ fn run_extraction(kind: &str, bytes: &[u8], limits: ChildLimits) -> KbResult<Inb
         "env" => test_env(),
         #[cfg(test)]
         "pid" => test_pid(),
-        other => Err(KbError::Other(format!("unknown document kind '{other}'"))),
+        // The kind is the sender's own word, and the reason reaches the
+        // model. So the reason is ours, and it carries no part of the kind.
+        _ => Err(KbError::Other(UNKNOWN_KIND_REASON.to_string())),
     }
 }
 
@@ -528,6 +561,42 @@ mod tests {
             !message.contains("secrets.env"),
             "the reason must not carry the variant's own text: {message}"
         );
+    }
+
+    /// The child's reason for a kind it does not know is ours, and fixed.
+    ///
+    /// The kind is the sender's own word and the reason reaches the model,
+    /// so the reason is a sentence of ours that carries no part of the kind.
+    /// Two different unknown kinds get the same sentence.
+    #[test]
+    fn an_unknown_kind_is_refused_with_our_own_fixed_reason() {
+        let limits = ChildLimits {
+            max_pages: 1,
+            max_chars: 1,
+        };
+        let first = reason_for_unknown_kind("application/x-evil", limits);
+        let second = reason_for_unknown_kind("image/png", limits);
+        assert!(
+            !first.contains("application/x-evil"),
+            "the reason must not carry the kind: {first}"
+        );
+        assert!(
+            !first.contains("image/png"),
+            "the reason must not carry the kind: {first}"
+        );
+        assert_eq!(
+            first, second,
+            "the reason must be one fixed sentence, whatever the kind was"
+        );
+        assert_eq!(first, UNKNOWN_KIND_REASON);
+    }
+
+    /// The reason the child gives for a kind it does not know.
+    fn reason_for_unknown_kind(kind: &str, limits: ChildLimits) -> String {
+        match run_extraction(kind, &[], limits) {
+            Err(KbError::Other(message)) => message,
+            other => panic!("an unknown kind must be refused with our own reason: {other:?}"),
+        }
     }
 
     // ── The hidden subcommand ───────────────────────────────────────────────

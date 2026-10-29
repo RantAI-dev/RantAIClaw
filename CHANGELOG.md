@@ -172,7 +172,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caption is a document like any other: it is policy-checked and answered, not taken for an
   intruder. A DOCX needs the `kb-office` feature, which is not a default: a default build refuses
   a DOCX with a note that says why. Every other channel keeps ignoring documents, and no document
-  is ever written to disk. The full rules are in `docs/security/inbound-media-policy.md`.
+  is ever written to disk. The full rules are in `docs/security/inbound-media-policy.md`. The
+  reason a document is refused is always a sentence of ours, so no part of the sender's own word
+  reaches the model through the error.
 
 - `rantaiclaw personality set` takes `--name` and `--timezone` next to the
   positional preset, so the persona's owner name and its timezone can be set

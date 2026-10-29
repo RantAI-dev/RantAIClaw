@@ -27,7 +27,7 @@ use tokio::process::{Child, ChildStdout, Command};
 
 use crate::kb::extract::child::{
     self, ChildFrame, ErrorKind, ARENA_VAR, CHILD_VAR, KIND_VAR, MAX_CHARS_VAR, MAX_PAGES_VAR,
-    SENTINEL,
+    SENTINEL, UNKNOWN_KIND_REASON,
 };
 use crate::kb::extract::inbound::{InboundExtraction, InboundLimits};
 use crate::kb::{KbError, KbResult};
@@ -68,7 +68,7 @@ pub(crate) async fn run_child(
     deadline: tokio::time::Instant,
 ) -> KbResult<InboundExtraction> {
     if !kind_is_known(kind) {
-        return Err(rejection("the document kind is not supported"));
+        return Err(rejection(UNKNOWN_KIND_REASON));
     }
 
     let mut command = child_command();
@@ -334,7 +334,7 @@ fn kind_is_known(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kb::extract::child::{PROBE_VAR, SLEEP_SECS_VAR};
+    use crate::kb::extract::child::{PID_FILE_VAR, PROBE_VAR, SLEEP_SECS_VAR};
     use crate::kb::extract::inbound::{
         extract_inbound_document, extract_test_document, fixture_pdf, hostile_fixture_pdf,
         InboundDocumentKind,
@@ -482,10 +482,15 @@ mod tests {
     /// document is read.
     #[tokio::test]
     async fn a_reader_that_sleeps_past_the_deadline_is_killed_and_the_next_document_is_read() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let pid_file = dir.path().join("reader.pid");
         let started = std::time::Instant::now();
         let err = extract_test_document(
             "sleep",
-            &[(SLEEP_SECS_VAR, "30")],
+            &[
+                (SLEEP_SECS_VAR, "30"),
+                (PID_FILE_VAR, pid_file.to_str().expect("a path")),
+            ],
             Vec::new(),
             limits(50, 50_000, Duration::from_secs(1)),
         )
@@ -498,6 +503,10 @@ mod tests {
         );
         assert!(err.to_string().contains("too long"), "{err}");
 
+        // The reader is gone: the deadline killed it, not merely let it run.
+        #[cfg(unix)]
+        assert_reader_is_gone(&pid_file);
+
         // The slot is free again: the next document is read.
         let extraction = extract_inbound_document(
             InboundDocumentKind::Text,
@@ -507,6 +516,73 @@ mod tests {
         .await
         .expect("the next document is read");
         assert_eq!(extraction.text, "after the deadline");
+    }
+
+    /// The reader that sleeps past the deadline is killed, and it is gone.
+    ///
+    /// The deadline alone proves nothing about the kill: the abandoned work
+    /// hits the deadline whether the child was killed or not. The reader
+    /// reports the process it runs in, and once the call has returned that
+    /// process must be gone — not still running, holding the machine's
+    /// memory and CPU.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reader_that_sleeps_past_the_deadline_is_killed_and_is_gone() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let pid_file = dir.path().join("reader.pid");
+        let err = extract_test_document(
+            "sleep",
+            &[
+                (SLEEP_SECS_VAR, "30"),
+                (PID_FILE_VAR, pid_file.to_str().expect("a path")),
+            ],
+            Vec::new(),
+            limits(50, 50_000, Duration::from_secs(3)),
+        )
+        .await
+        .expect_err("the sleeping reader is refused");
+        assert!(err.to_string().contains("too long"), "{err}");
+
+        // The reader is gone: the deadline killed it, not merely let it run.
+        assert_reader_is_gone(&pid_file);
+    }
+
+    /// Assert that the reader is gone.
+    ///
+    /// Unix only: the check asks the kernel about the process, and the
+    /// kernel is the only one that knows.
+    #[cfg(unix)]
+    fn assert_reader_is_gone(pid_file: &std::path::Path) {
+        let pid = reported_pid(pid_file);
+        assert!(
+            !process_is_alive(pid),
+            "the reader must be gone, not still running: {pid}"
+        );
+    }
+
+    /// The process id the reader reported.
+    #[cfg(unix)]
+    fn reported_pid(path: &std::path::Path) -> u32 {
+        let reported =
+            std::fs::read_to_string(path).expect("the reader reports the process it runs in");
+        reported.trim().parse().expect("a process id")
+    }
+
+    /// Whether a process is still there.
+    ///
+    /// A signal of zero asks about the process without touching it, and the
+    /// answer is `ESRCH` when the process is gone. A process this test may
+    /// not signal is still there.
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal zero only asks whether the process exists.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     /// An allocation past the ceiling is a rejection, not an agent that runs
