@@ -20,6 +20,7 @@
 //! directory, and nothing here opens a socket: the hidden subcommand is not
 //! an endpoint.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -192,6 +193,39 @@ pub fn run_child_from_env() -> i32 {
         return 1;
     }
     code
+}
+
+/// Whether these arguments ask for the hidden extraction subcommand.
+///
+/// The child is the same binary with a hidden subcommand. Only the first
+/// argument may ask for it; nothing else may.
+///
+/// The arguments are the ones **after** the program name, so the first
+/// argument is the first word of the command line: `rantaiclaw
+/// __extract-document` asks for the child and `rantaiclaw chat
+/// __extract-document` does not.
+pub fn is_child_invocation<I, T>(args: I) -> bool
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<OsStr>,
+{
+    args.into_iter()
+        .next()
+        .is_some_and(|arg| arg.as_ref() == OsStr::new(HIDDEN_SUBCOMMAND))
+}
+
+/// The child's exit code when this process is the child, `None` otherwise.
+///
+/// The binary calls this first, before it parses the command line and
+/// before it reads the configuration, the profile, the log or the data
+/// directory: the child must see none of them.
+pub fn child_exit_code_if_invoked() -> Option<i32> {
+    // The program name is the zeroth argument, so the first word of the
+    // command line is the first argument after it.
+    if !is_child_invocation(std::env::args_os().skip(1)) {
+        return None;
+    }
+    Some(run_child_from_env())
 }
 
 /// Read the request, read the document, parse it.
@@ -484,6 +518,50 @@ mod tests {
             !message.contains("secrets.env"),
             "the reason must not carry the variant's own text: {message}"
         );
+    }
+
+    // ── The hidden subcommand ───────────────────────────────────────────────
+
+    /// The hidden subcommand is the child.
+    #[test]
+    fn the_hidden_subcommand_is_the_child() {
+        assert!(is_child_invocation([HIDDEN_SUBCOMMAND]));
+    }
+
+    /// Another command is not the child.
+    #[test]
+    fn another_command_is_not_the_child() {
+        assert!(!is_child_invocation(["chat"]));
+    }
+
+    /// No command is not the child either.
+    #[test]
+    fn no_command_is_not_the_child() {
+        assert!(!is_child_invocation(Vec::<String>::new()));
+        assert!(!is_child_invocation([""]));
+    }
+
+    /// The hidden subcommand is only honoured as the **first** argument.
+    ///
+    /// `rantaiclaw chat __extract-document` is the chat command with a word
+    /// behind it, not a child: the hidden subcommand is never a way in.
+    #[test]
+    fn the_hidden_subcommand_is_only_honoured_as_the_first_argument() {
+        assert!(!is_child_invocation(["chat", HIDDEN_SUBCOMMAND]));
+        assert!(!is_child_invocation([
+            "--profile",
+            "default",
+            HIDDEN_SUBCOMMAND
+        ]));
+    }
+
+    /// An ordinary run is not the child.
+    ///
+    /// This is what the binary's dispatch rests on: a run that did not ask
+    /// for the hidden subcommand must go on to the CLI.
+    #[test]
+    fn an_ordinary_run_is_not_the_child() {
+        assert!(child_exit_code_if_invoked().is_none());
     }
 
     // ── The child entry point ───────────────────────────────────────────────

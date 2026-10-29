@@ -1372,6 +1372,18 @@ fn is_profile_command(command: Option<&Commands>) -> bool {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
+    // The child of an inbound document extraction is this same binary with a
+    // hidden subcommand. It is dispatched here — before the crypto provider,
+    // before the pending Windows update and before the CLI is parsed — so
+    // the child touches no configuration, no profile, no log and no data
+    // directory.
+    #[cfg(feature = "kb")]
+    {
+        if let Some(code) = crate::kb::extract::child::child_exit_code_if_invoked() {
+            std::process::exit(code);
+        }
+    }
+
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
