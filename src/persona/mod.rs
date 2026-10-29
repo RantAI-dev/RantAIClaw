@@ -190,6 +190,56 @@ impl PersonaToml {
     }
 }
 
+/// A timezone name that this build cannot use.
+///
+/// The empty value means "unset" and is never this error. The type is
+/// separate from an I/O failure so a door that knows the difference (the HTTP
+/// API answering `400`, the CLI answering "not a timezone") can tell them
+/// apart instead of reporting every write problem as a server error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownTimezone {
+    /// The rejected value, exactly as it was written.
+    pub value: String,
+}
+
+impl std::fmt::Display for UnknownTimezone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown timezone {:?}: use an IANA name such as `Asia/Jakarta`",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for UnknownTimezone {}
+
+/// Whether `tz` is a timezone this build can use.
+///
+/// The empty value means "unset" and stays allowed. Any other value must be
+/// an IANA name the timezone database holds (`Europe/Berlin`, `UTC`, …): the
+/// value is what a timestamp is rendered in, so a name that cannot be parsed
+/// is dead weight in the file. Surrounding spaces are ignored, so the value
+/// that is stored is the trimmed one.
+pub fn validate_timezone(tz: &str) -> Result<(), UnknownTimezone> {
+    let trimmed = tz.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.parse::<chrono_tz::Tz>().is_err() {
+        return Err(UnknownTimezone {
+            value: tz.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The timezone value to store: trimmed, so a stray space cannot make a name
+/// unparseable for the reader that comes later.
+fn stored_timezone(tz: &str) -> String {
+    tz.trim().to_string()
+}
+
 /// A partial persona edit. `None` leaves the current value unchanged. `avoid`
 /// uses `Some(None)` to clear the block and `Some(Some(text))` to set it, so a
 /// partial update can distinguish "leave" from "clear".
@@ -219,7 +269,11 @@ pub fn apply_update(profile: &Profile, up: PersonaUpdate) -> Result<PersonaToml>
         next.name = n;
     }
     if let Some(tz) = up.timezone {
-        next.timezone = tz;
+        // Refuse a timezone this build cannot use, before anything is
+        // written: every caller of this function shares the rule, so no door
+        // can store a name that is not in the timezone database.
+        validate_timezone(&tz)?;
+        next.timezone = stored_timezone(&tz);
     }
     if let Some(r) = up.role {
         next.role = r;
@@ -241,6 +295,11 @@ pub fn apply_update(profile: &Profile, up: PersonaUpdate) -> Result<PersonaToml>
 /// Persist `persona.toml` for the given profile. Creates the persona
 /// directory if missing.
 pub fn write_persona_toml(profile: &Profile, persona: &PersonaToml) -> Result<()> {
+    // The one door that writes `persona.toml`: a timezone the timezone
+    // database does not hold is refused here, so a caller that builds a
+    // persona itself (the onboarding section, the provisioner) cannot store
+    // one either.
+    validate_timezone(&persona.timezone)?;
     let dir = profile.persona_dir();
     fs::create_dir_all(&dir).with_context(|| format!("create persona dir {}", dir.display()))?;
     let path = dir.join("persona.toml");
@@ -259,9 +318,39 @@ pub fn read_persona_toml(profile: &Profile) -> Result<Option<PersonaToml>> {
         return Ok(None);
     }
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let persona: PersonaToml =
+    let mut persona: PersonaToml =
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    // A hand-edited file can hold a timezone this build cannot use. It reads
+    // as "unset" — the file itself is left as the operator wrote it — and the
+    // operator is told once, so neither `personality show` nor the prompt
+    // renderer ever carries a name that cannot be parsed.
+    if validate_timezone(&persona.timezone).is_err() {
+        warn_unknown_timezone_once(&persona.timezone, &path);
+        persona.timezone = String::new();
+    }
     Ok(Some(persona))
+}
+
+/// Warn about a timezone this build cannot use, once per distinct value.
+///
+/// The prompt renderer reads the persona on every turn, so an unconditional
+/// warning would repeat forever. The file is never rewritten from here.
+fn warn_unknown_timezone_once(value: &str, path: &std::path::Path) {
+    use std::sync::Mutex;
+    static WARNED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.iter().any(|seen| seen == value) {
+        return;
+    }
+    warned.push(value.to_string());
+    tracing::warn!(
+        "Persona timezone {value:?} in {} is not an IANA name this build knows; treating it \
+         as unset. The file is left unchanged — set a usable one with \
+         `rantaiclaw personality set --timezone <IANA name>`.",
+        path.display()
+    );
 }
 
 #[cfg(test)]
@@ -318,5 +407,110 @@ mod tests {
         let body = toml::to_string_pretty(&persona).unwrap();
         let back: PersonaToml = toml::from_str(&body).unwrap();
         assert_eq!(persona, back);
+    }
+
+    /// The persona's timezone is the zone a timestamp is rendered in, so only
+    /// a name the timezone database holds may be written. The empty value
+    /// means "unset" and stays allowed.
+    #[test]
+    fn validate_timezone_accepts_iana_names_and_refuses_the_rest() {
+        for good in ["", "UTC", "Asia/Jakarta", "Europe/Berlin", "US/Eastern"] {
+            assert!(
+                validate_timezone(good).is_ok(),
+                "{good:?} is a timezone this build knows"
+            );
+        }
+        for bad in ["Not/AZone", "utc", "GMT+7", "Asia/Jakarta/Extra"] {
+            let error = validate_timezone(bad).expect_err("a name that is not a timezone");
+            assert_eq!(error.value, bad, "the error must name the value");
+            assert!(
+                error.to_string().contains(bad),
+                "the message must name the value, got: {error}"
+            );
+        }
+    }
+
+    /// A timezone this build cannot use is refused before anything is
+    /// written, so the persona file keeps the value it had.
+    #[test]
+    fn apply_update_refuses_an_unknown_timezone_and_writes_nothing() {
+        let _guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+
+        let error = apply_update(
+            &profile,
+            PersonaUpdate {
+                timezone: Some("Not/AZone".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("an unknown timezone must be refused");
+        assert!(
+            error.downcast_ref::<UnknownTimezone>().is_some(),
+            "the error must be the typed one, got: {error}"
+        );
+        assert!(
+            !profile.persona_dir().join("persona.toml").exists(),
+            "the refused update must not write a persona file"
+        );
+    }
+
+    /// The one door that writes `persona.toml` refuses a timezone this build
+    /// cannot use, so a caller that builds a persona itself cannot store one
+    /// either.
+    #[test]
+    fn write_persona_toml_refuses_an_unknown_timezone() {
+        let _guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+
+        let mut persona = PersonaToml::default_for("RantaiClaw", "UTC");
+        persona.timezone = "Not/AZone".to_string();
+
+        let error = write_persona_toml(&profile, &persona)
+            .expect_err("an unknown timezone must be refused");
+        assert!(
+            error.downcast_ref::<UnknownTimezone>().is_some(),
+            "the error must be the typed one, got: {error}"
+        );
+        assert!(
+            !profile.persona_dir().join("persona.toml").exists(),
+            "the refused write must not create a persona file"
+        );
+    }
+
+    /// A hand-edited `persona.toml` can hold a timezone this build cannot
+    /// use. It reads as "unset", the operator is told once, and the file is
+    /// left exactly as they wrote it.
+    #[test]
+    fn a_hand_edited_unknown_timezone_reads_as_unset_and_leaves_the_file_alone() {
+        let _guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+
+        let dir = profile.persona_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("persona.toml");
+        let hand_edited = "preset = \"default\"\n\
+             name = \"RantaiClaw\"\n\
+             timezone = \"Not/AZone\"\n\
+             role = \"a role\"\n\
+             tone = \"neutral\"\n";
+        std::fs::write(&path, hand_edited).unwrap();
+
+        let persona = read_persona_toml(&profile)
+            .unwrap()
+            .expect("a persona file");
+        assert_eq!(persona.timezone, "", "an unusable timezone reads as unset");
+        assert_eq!(persona.name, "RantaiClaw", "the other fields are untouched");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            hand_edited,
+            "the file must not be rewritten"
+        );
     }
 }

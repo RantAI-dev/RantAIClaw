@@ -634,12 +634,23 @@ pub fn build_gateway_router(
 
     let gateway_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let gateway_provider_credential = config.resolve_key_for_provider(gateway_provider_name);
+    // Empty when unconfigured (no baked-in model): the gateway still starts and
+    // serves the console so the operator can configure a model; a chat request
+    // then fails fast in the agent loop with a clear hint.
+    //
+    // The default model is read BEFORE the provider is built, because it can
+    // be a `hint:` string: the routed factory resolves it against the
+    // operator's `[[model_routes]]` table, and a hint no route names is
+    // refused before any request instead of being sent as a model name.
+    let model = config.default_model.clone().unwrap_or_default();
     let provider: Arc<dyn Provider> = Arc::from(
-        providers::create_resilient_provider_with_options(
+        providers::create_routed_provider_with_options(
             gateway_provider_name,
             gateway_provider_credential.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
+            &config.model_routes,
+            &model,
             &|name| config.resolve_key_for_provider(name),
             &providers::ProviderRuntimeOptions {
                 auth_profile_override: None,
@@ -675,10 +686,6 @@ pub fn build_gateway_router(
             }
         })?,
     );
-    // Empty when unconfigured (no baked-in model): the gateway still starts and
-    // serves the console so the operator can configure a model; a chat request
-    // then fails fast in the agent loop with a clear hint.
-    let model = config.default_model.clone().unwrap_or_default();
     let temperature = config.default_temperature;
     // Split by error kind: an unrecognised `backend` NAME is a configuration
     // error (unknown memory backend) that would fail again on every retry —
@@ -5631,6 +5638,168 @@ mod tests {
             "no-view webhook must NOT write memory; got {keys:?}"
         );
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── The webhook door applies the operator's `[[model_routes]]` ──────────
+
+    /// A primary provider that points at a dead local endpoint.
+    ///
+    /// The turn must NOT reach the primary: the route names another provider.
+    /// A primary that answered would hide a turn that went the wrong way, so
+    /// this one fails instead — and nothing leaves the machine either way.
+    const DEAD_PRIMARY: &str = "custom:http://127.0.0.1:9";
+
+    /// The route the operator wrote: `hint:fast` goes to the recording
+    /// provider, as the model `routed-model`.
+    fn fast_route() -> crate::config::ModelRouteConfig {
+        crate::config::ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: "test-recording".to_string(),
+            model: "routed-model".to_string(),
+            api_key: None,
+        }
+    }
+
+    /// A config whose default model is `model`, with the route table that
+    /// resolves `hint:fast`.
+    fn routing_config(workspace: &std::path::Path, model: &str) -> Config {
+        let mut config = Config {
+            workspace_dir: workspace.to_path_buf(),
+            ..Config::default()
+        };
+        config.default_provider = Some(DEAD_PRIMARY.to_string());
+        config.default_model = Some(model.to_string());
+        config.model_routes = vec![fast_route()];
+        // One attempt per provider: what these tests are about is WHICH
+        // provider is asked, not how often a failure is retried.
+        config.reliability.provider_retries = 0;
+        // Pairing is a property of the EXPOSURE boundary, not of model
+        // routing: these tests are about which provider a turn reaches, and
+        // they call the handler directly, so the bearer token would only
+        // hide the routing behind a 401.
+        config.gateway.require_pairing = false;
+        config
+    }
+
+    /// An observer that keeps the messages of the errors it was told about, so
+    /// a test can read the refusal the operator would see. The webhook answer
+    /// itself is a bare `{"error": "LLM request failed"}`, so the refusal is
+    /// only visible here.
+    #[derive(Default)]
+    struct ErrorRecordingObserver {
+        errors: Mutex<Vec<String>>,
+    }
+
+    impl crate::observability::Observer for ErrorRecordingObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            if let crate::observability::ObserverEvent::Error { message, .. } = event {
+                self.errors.lock().push(message.clone());
+            }
+        }
+
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "error-recording"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The door that runs an agent turn for a webhook builds its provider
+    /// through the routed factory, so the operator's `[[model_routes]]` decide
+    /// which provider and which model the turn reaches. Before this the door
+    /// sent the literal string `hint:fast` to the primary as a model name, and
+    /// the answer named a model that does not exist.
+    #[tokio::test]
+    async fn the_webhook_door_reaches_the_provider_and_model_the_hint_names() {
+        // The recording provider counts its calls in one process-wide place,
+        // so the tests that read it run one at a time.
+        let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+        let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        crate::providers::tests::RecordingProvider::reset();
+
+        let config = routing_config(workspace.path(), "hint:fast");
+        let (state, _app) =
+            super::build_gateway_router(config, None, None).expect("the router builds");
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "what about the lantern".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            crate::providers::tests::RecordingProvider::calls(),
+            1,
+            "the turn must reach the provider the route names"
+        );
+        let call = crate::providers::tests::RecordingProvider::last_call()
+            .expect("the routed provider saw the turn");
+        assert_eq!(
+            call.model, "routed-model",
+            "the turn must carry the model the route names, not the hint"
+        );
+    }
+
+    /// A hint the table does not name is refused before any request is sent:
+    /// the refusal names the hint and the hints that are configured, and no
+    /// provider is asked.
+    #[tokio::test]
+    async fn the_webhook_door_refuses_a_hint_the_route_table_does_not_name() {
+        // The recording provider counts its calls in one process-wide place,
+        // so the tests that read it run one at a time.
+        let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+        let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        crate::providers::tests::RecordingProvider::reset();
+
+        let observer = Arc::new(ErrorRecordingObserver::default());
+        let config = routing_config(workspace.path(), "hint:nope");
+        let (state, _app) = super::build_gateway_router(config, Some(observer.clone()), None)
+            .expect("the router builds");
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "what about the lantern".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            crate::providers::tests::RecordingProvider::calls(),
+            0,
+            "an unknown hint must not reach a provider"
+        );
+        let errors = observer.errors.lock().clone().join("\n");
+        assert!(
+            errors.contains("unknown route hint \"nope\""),
+            "the refusal must name the hint: {errors}"
+        );
+        assert!(
+            errors.contains("fast"),
+            "the refusal must name the hints that are configured: {errors}"
+        );
     }
 
     #[test]

@@ -145,6 +145,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfaces cannot disagree. An unhealthy scheduler is a failure, and it is the only new verdict
   that makes `rantaiclaw doctor` exit non-zero.
 
+- `rantaiclaw personality set` takes `--name` and `--timezone` next to the
+  positional preset, so the persona's owner name and its timezone can be set
+  from the shell without a console. The preset stays the positional argument,
+  and the two flags can also be used on their own. The timezone must be an
+  IANA name the build knows (`Asia/Jakarta`, `UTC`); an empty value clears it.
+
 ### Changed
 
 - The config loader now warns about an unknown key at any depth, not only at
@@ -189,6 +195,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rantaiclaw profile use <name>` restarts it onto the profile it switches
   to. The install output names the binding either way. An already installed
   unit keeps its current binding until the next `service install`.
+- The operator's `[[model_routes]]` table now applies to every door that runs
+  an agent turn — the gateway's webhook, the chat channels and the delegate
+  tool — not only to the CLI/TUI agent and cron. A chat runtime picks the
+  table up on a config reload like any other setting, so adding a route takes
+  effect on the next message without restarting the channel runtime.
 
 ### Removed
 
@@ -560,6 +571,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finishes the setup; the curated servers it lists come from the registry. The docs page for
   the MCP pillar counts the curated picker as six servers again (2 zero-auth, 4 needing
   auth) instead of eight or nine.
+- A persona could store a timezone no timestamp could use. Every door that
+  writes one took any string: the console's `PUT /api/v1/personality`, the
+  onboarding wizard's free-text prompt, and the `persona.toml` writer itself.
+  A typo (`Not/AZone`) was stored and read back into the prompt that renders
+  the owner's timezone, where it means nothing. Every door now refuses a
+  timezone the timezone database does not hold, and refuses it before anything
+  is written: the HTTP API answers `400` and names the bad value, the CLI exits
+  non-zero, and the wizard asks again. The empty value still means "unset" and
+  is accepted. A `persona.toml` that was hand-edited into an unusable value
+  reads as unset, with one warning, and the file is left exactly as the
+  operator wrote it — nothing rewrites it behind their back.
+- An expired Gemini CLI login was sent to Google, which answered with a 401.
+  The token in `~/.gemini/oauth_creds.json` was read from a field Gemini CLI
+  does not write, so the expiry check never ran: Gemini CLI stores the expiry
+  as `expiry_date`, in milliseconds since the epoch, and the reader only knew
+  `expiry`. The token was valid for about an hour and then went on being sent
+  for as long as the file existed. The reader now reads the shape Gemini CLI
+  writes, treats a token that dies within 30 seconds as expired, and refuses
+  the login before any request with the fix named: run `gemini` to renew it,
+  or set `GEMINI_API_KEY`. The reader lives in one place, so the provider and
+  the factory cannot drift apart again.
+- `rantaiclaw uninstall` could say it had preserved a file it had deleted,
+  and `--purge` could delete a binary this account did not own. The report
+  named `~/.rantaiclaw/.secret_key`, a path the profile layout no longer
+  uses: the key lives next to the config it protects, at
+  `<profile>/.secret_key`. So `--keep-secrets` printed "preserving" for a file
+  that was never there, the real key went with the profile, and the operator's
+  encrypted credentials could not be decrypted after a re-install. The
+  uninstall now keeps every secret key it says it keeps, names only the keys
+  that exist, and says in the default scope that the profile's key goes with
+  the profile. `--purge` removes the binary only when it can prove it owns it:
+  the cargo registry is looked up where the binary itself lives, not under
+  `$HOME`, and a binary outside this account's home directory is left alone
+  with the `rm` command printed instead. `--keep-secrets` walks the tree
+  without following symlinks: a link in the tree is removed as itself, so
+  nothing outside the tree is ever deleted.
+- A `hint:` model reached the provider as a literal model name. Only the
+  CLI/TUI agent and cron read `[[model_routes]]`; every other door that runs
+  an agent turn — the gateway's webhook, the chat channels and the delegate
+  tool — sent the string as it stood, and the provider answered with a model
+  that does not exist. Every door that builds a provider for an agent turn now
+  builds it through the routed factory with the operator's table, so a hint
+  resolves to the provider and the model the operator configured, everywhere.
+  A hint no route names is refused before any request is sent and the refusal
+  names the hint and the hints that are configured; a route whose provider
+  could not be built is refused as configured-but-unavailable, so a broken
+  provider is no longer reported as an unknown hint; and a door with no table
+  at all refuses a `hint:` model with `no [[model_routes]] configured` instead
+  of sending the literal string.
 
 ## [0.33.0-alpha] — 2026-10-08
 

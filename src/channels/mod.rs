@@ -326,6 +326,10 @@ pub(crate) struct ChannelRuntimeDefaults {
     /// Channel paths hold no live `Config`, so the map travels with the
     /// defaults the same way `api_key` does.
     pub(crate) provider_api_keys: Arc<HashMap<String, String>>,
+    /// The operator's `[[model_routes]]`. Channel paths hold no live `Config`,
+    /// so the table travels with the defaults the same way `api_key` and
+    /// `provider_api_keys` do.
+    pub(crate) model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
     pub(crate) api_url: Option<String>,
     pub(crate) reliability: crate::config::ReliabilityConfig,
     /// Senders authorized to approve over a channel
@@ -1466,7 +1470,7 @@ pub(crate) async fn build_channel_runtime(
         failover_announce: providers::FailoverAnnounce::default(),
     };
     let provider: Arc<dyn Provider> = Arc::from(
-        routing::create_resilient_provider_nonblocking(
+        routing::create_routed_provider_nonblocking(
             &provider_name,
             config.api_key.clone(),
             config.api_url.clone(),
@@ -1474,6 +1478,11 @@ pub(crate) async fn build_channel_runtime(
             Arc::new(config.provider_api_keys.clone()),
             provider_name.clone(),
             config.api_key.clone(),
+            // The operator's `[[model_routes]]` table, so a `hint:` model
+            // resolves to the provider and the model the operator configured
+            // here exactly as it does at every other door.
+            Arc::new(config.model_routes.clone()),
+            routing::resolved_default_model(&config),
             provider_runtime_options.clone(),
         )
         .await?,

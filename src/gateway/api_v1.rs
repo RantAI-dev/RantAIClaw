@@ -2748,7 +2748,15 @@ async fn personality_set(
         avoid: body.avoid.map(Some),
         always_on_kbs: body.always_on_kbs,
     };
-    let next = crate::persona::apply_update(&profile, update).map_err(err_500)?;
+    let next = crate::persona::apply_update(&profile, update).map_err(|error| {
+        // A timezone this build cannot use is the caller's to fix: the
+        // request names the bad value and the persona file is left as it
+        // was. Everything else is a server-side failure.
+        match error.downcast_ref::<crate::persona::UnknownTimezone>() {
+            Some(unknown) => err_400(unknown.to_string()),
+            None => err_500(error),
+        }
+    })?;
 
     Ok(Json(serde_json::json!({
         "preset": next.preset.slug(),
@@ -4059,6 +4067,69 @@ mod tests {
         .await
         .expect_err("overlong name must 400");
         assert_eq!(long.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// A timezone this build cannot use is the caller's to fix: the request
+    /// is refused with the bad value named, and the persona file is not
+    /// written.
+    #[tokio::test]
+    async fn personality_set_rejects_unknown_timezone() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let err = personality_set(
+            State(test_state()),
+            HeaderMap::new(),
+            Json(PersonalityBody {
+                preset: None,
+                name: None,
+                role: None,
+                tone: None,
+                avoid: None,
+                timezone: Some("Not/AZone".to_string()),
+                always_on_kbs: None,
+            }),
+        )
+        .await
+        .expect_err("an unknown timezone must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let detail = err.1 .0.detail.expect("the refusal names the bad value");
+        assert!(
+            detail.contains("Not/AZone"),
+            "the detail must name the bad value, got: {detail}"
+        );
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        assert!(
+            !profile.persona_dir().join("persona.toml").exists(),
+            "the refused request must not write a persona file"
+        );
+    }
+
+    /// The empty value means "unset" and stays allowed.
+    #[tokio::test]
+    async fn personality_set_accepts_an_empty_timezone() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let resp = personality_set(
+            State(test_state()),
+            HeaderMap::new(),
+            Json(PersonalityBody {
+                preset: None,
+                name: None,
+                role: None,
+                tone: None,
+                avoid: None,
+                timezone: Some(String::new()),
+                always_on_kbs: None,
+            }),
+        )
+        .await
+        .expect("an empty timezone means unset");
+        assert_eq!(resp.0["timezone"], "");
     }
 
     #[tokio::test]

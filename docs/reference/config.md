@@ -493,6 +493,17 @@ a token to the browser.
 
 Notes:
 
+- **A curated server that needs a credential is configured by `rantaiclaw setup mcp`
+  (or the onboard wizard's MCP section), not by hand.** The token is pasted into a
+  masked prompt, and an OAuth server — Google Drive today — completes a real OAuth
+  flow in the operator's local browser. The OAuth callback is bound to the login
+  that started it (a one-time `state` and an S256 PKCE code challenge) and is
+  accepted only from the loopback listener on `127.0.0.1:11500`; a callback that
+  does not match the active login is answered and ignored. A server is registered
+  in the config only after its credential was really obtained, so a config that
+  lists a server means the server is authed. There is no refresh flow yet: the
+  stored access token is used until it expires — roughly an hour for Google —
+  after which re-running `rantaiclaw setup mcp` logs in again.
 - A tool that an MCP server provides needs approval under `supervised` like any other tool. To let one run without a prompt, list its name in `[autonomy].auto_approve` as `mcp__<server>__<tool>`; the refusal on a surface with no approver, and how to allow it, is described in the `auto_approve` note under [`[autonomy]`](#autonomy).
 - **MCP tools reach the TUI/CLI agent, the gateway's `/api/v1` chat, chat channels
   and cron.** The last two were added by closing issue #283: the channel runtime
@@ -878,6 +889,21 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
 | `api_key` | unset | Optional API key override for this route's provider (stored encrypted when `secrets.encrypt = true`) |
+
+The table applies at every door that runs an agent turn: the CLI and TUI agent, a
+scheduled cron job, the daemon's heartbeat, the console chat, the gateway's webhook, a
+chat channel's turns and the delegate tool. A model string that starts with `hint:`
+resolves to the provider and the model the route names, at every one of them.
+
+A hint no route names is refused before any request is sent, and the refusal names the
+hint and the hints that are configured. A route whose provider could not be built is
+refused as configured but its provider is not available, so a broken provider is never
+reported as an unknown hint. With no `[[model_routes]]` table configured at all, a
+`hint:` model is refused with `no [[model_routes]] configured`.
+
+A route never receives the default provider's API key. It resolves its own credential —
+its own `api_key` in the route entry, or that provider's own environment variable —
+while a route that names the default provider keeps that provider's key.
 
 ### `[[embedding_routes]]`
 
