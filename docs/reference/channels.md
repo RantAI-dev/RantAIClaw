@@ -759,6 +759,77 @@ Operational notes:
   alone rather than annotated, since an email's attachment list carries protocol
   furniture that a chat platform's does not.
 
+## Inbound Documents
+
+**Telegram and WhatsApp Web read inbound documents: PDF, DOCX and TXT.** Every other
+channel keeps ignoring documents, exactly as it ignored them before — a document
+on Discord, Slack, Lark, Matrix, IRC or email is not read, not annotated and not
+forwarded.
+
+A document is handled by the same rules an inbound image is, and by the rules
+that are specific to documents: its **parsed text enters the model's context**,
+so both the parser and the text are attack surface. The full contract is in
+[inbound media policy](../security/inbound-media-policy.md); this is the operator's
+summary.
+
+- **The type comes from the bytes.** PDF is `%PDF-`, DOCX is a ZIP whose directory
+  names `word/document.xml`, TXT is valid UTF-8 with no NUL byte. The platform's
+  MIME type and the file name are an early filter and a veto: a document whose
+  bytes disagree with what it was announced as is refused, and a claim that says
+  nothing recognizable (`application/octet-stream`, no extension) imposes no
+  constraint. A claim that is right does not make the bytes safe — the sniff
+  always runs.
+- **Nothing is written to disk.** The bytes are read into memory and parsed
+  somewhere else: the parsing happens in a **child process** whose environment
+  holds four fixed request variables and one allocator setting
+  (`MALLOC_ARENA_MAX=1`, so the child's address-space ceiling is spent on the
+  document and not on the parser's thread-pool reservations) and nothing else —
+  no HOME, no PATH, no provider key, no configuration directory — and the
+  document travels to it over a pipe. There is no temp file, not even a
+  short-lived one. The child keeps the agent's own filesystem and network
+  reach, so the boundary contains a crash, not a privilege.
+- **The limits are constants, not config keys.** 10 MiB per document (checked on
+  the announced size before any download and again on the bounded read; over the
+  cap is refused, never truncated), 50 PDF pages counted from the bytes before
+  the text is extracted, 50,000 characters of extracted text (a longer extraction
+  is cut with a visible note), 20 seconds for the whole extraction — waiting for
+  the one-at-a-time slot included — and a DOCX whose ZIP directory declares more
+  than 50 MiB
+  uncompressed (the zip bomb cap). The extraction runs in a **child process**
+  that is killed and reaped at the deadline, so the one-at-a-time slot is
+  released when the child dies and a timed-out extraction is a rejection, not a
+  hang; on unix the child gets a 512 MiB memory ceiling, and on every other
+  target the deadline kill is the only limit. The read is bounded too: Telegram
+  streams the fetch and stops one byte past the cap, and WhatsApp Web streams
+  the download into a writer that refuses the write past the cap, so the bytes
+  held are at most the cap whatever the sender announced; a WhatsApp Web
+  document that announced no size is refused before the download.
+- **Documents are budgeted separately from images**: 5 documents per sender per 10
+  minutes, counted per channel-qualified sender. The budget is consulted
+  **before** the download, so an exhausted sender costs no bandwidth and — on
+  Telegram — no `getFile` call.
+- **The text arrives as a delimited block** that names the file, the page count
+  and whether the text was cut, and that says outright that the content came from
+  the sender and is untrusted data, not instructions. Square brackets in the
+  extracted text are defused, so a document cannot plant an `[IMAGE:…]` marker of
+  its own and cannot forge the block's end. The text stays readable for the
+  whole turn it arrived in, so every tool call of that turn still sees the
+  document; from the next user message on the block is a one-line stub, the way
+  an old image marker is, so a stale injection surface does not live forever in
+  the conversation.
+- **Every rejection is visible**: the forwarded content carries an
+  `[Attachment rejected: …]` note naming the reason — wrong type, too large, too
+  many pages, too slow, budget spent, or a build that cannot read documents.
+- **DOCX needs the `kb-office` feature**, which is not a default feature. A
+  default build refuses a DOCX with the note that this build cannot read DOCX
+  documents; a `kb-office` build reads it. PDF and TXT need the default `kb`
+  feature, and a build without it refuses every document the same way.
+- **The group and guest gates are unchanged, and still come first.** On Telegram
+  the `mention_only` group gate reads the caption, so a document caption can
+  address the bot; on WhatsApp Web the gate reads the document's own
+  `ContextInfo`. A document from a guest becomes the guest's text and gets
+  exactly the treatment a guest already gets.
+
 ## Channel Matrix
 
 ### Build Feature Toggles (`channel-matrix`)

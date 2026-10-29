@@ -124,6 +124,33 @@ const DROP_NOTICE: &str =
 static GROUP_IDENTITY_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The size a document announced, if it announced one at all.
+///
+/// WhatsApp announces a length of zero for a document it has not measured,
+/// and sends no length at all for some documents. Zero is no claim, not an
+/// empty file, so it reads as no announcement: a document whose size is
+/// unknown cannot be weighed before it is fetched.
+fn announced_document_size(file_length: Option<u64>) -> Option<u64> {
+    file_length.filter(|size| *size > 0)
+}
+
+/// The reason the sender is told when a document download failed.
+///
+/// The library's own error text is logged and never shown: it can carry host
+/// names and URLs that mean nothing to a sender and tell them more about the
+/// operator's setup than they should know. `refused` says the size cap was
+/// what stopped the download, and that is the one reason worth naming.
+fn document_download_failure_reason(refused: bool) -> String {
+    if refused {
+        format!(
+            "the document is too large (limit {} MiB)",
+            crate::channels::media::DOC_MAX_BYTES / (1024 * 1024)
+        )
+    } else {
+        "the document could not be downloaded".to_string()
+    }
+}
+
 impl WhatsAppWebChannel {
     /// Whether `chat` may be told about a drop now, recording the notice if so.
     ///
@@ -379,17 +406,18 @@ impl WhatsAppWebChannel {
     /// Extracted from the `listen()` closure so a test can reach it — no test
     /// enters that closure, which is the same structural hole
     /// `every_channel_listen_path_calls_its_allowlist_gate` exists for. Keying
-    /// this on text alone dropped an image sent with no caption.
-    pub(crate) fn has_deliverable_content(text: &str, has_image: bool) -> bool {
-        !text.trim().is_empty() || has_image
+    /// this on text alone dropped an image sent with no caption, and later a
+    /// document sent with no caption.
+    pub(crate) fn has_deliverable_content(text: &str, has_image: bool, has_document: bool) -> bool {
+        !text.trim().is_empty() || has_image || has_document
     }
 
     /// Turn downloaded image bytes into the marker the agent sees.
     ///
     /// Separated from the download so the part that carries the risk — the
     /// budget, the size cap and the byte sniffing — is reachable from a test
-    /// without the `whatsapp-web` feature, a linked session or a live socket.
-    /// The library call around it is a single `client.download(..)`.
+    /// without a linked session or a live socket. The library call around it
+    /// is a single `client.download(..)`.
     ///
     /// `charge` is explicit here because the bytes arrive from a library call
     /// rather than a URL, so `fetch_image_bytes` (which charges internally) is
@@ -416,6 +444,152 @@ impl WhatsAppWebChannel {
             }
             ImageBytes::Rejected(note) => MediaOutcome::Rejected(note).to_marker(),
         }
+    }
+
+    /// Resolve an inbound WhatsApp document to the block the model reads, or
+    /// to the note the sender should see.
+    ///
+    /// WhatsApp Web's media arrives decrypted in memory rather than by an
+    /// HTTP fetch, so this takes the bytes in hand — the same rules apply to
+    /// those bytes as to a fetched document.
+    ///
+    /// The order is the policy's: what this build can read, then the announced
+    /// size, then the budget — consulted **before** the download, so an
+    /// exhausted sender costs no bandwidth — then the download, the sniff and
+    /// the extraction.
+    #[cfg(feature = "whatsapp-web")]
+    async fn resolve_document_block(
+        client: &wa_rs::Client,
+        document: &wa_rs_proto::whatsapp::message::DocumentMessage,
+        sender: &str,
+    ) -> crate::channels::media::DocumentOutcome {
+        let claimed = document.mimetype.clone();
+        let file_name = document
+            .file_name
+            .clone()
+            .or_else(|| document.title.clone());
+        let announced_size = announced_document_size(document.file_length);
+
+        let download = async {
+            // The bytes are streamed into a writer that stops at the cap, so
+            // the cap applies to what is written rather than to what the
+            // sender announced: a document that lies about its length cannot
+            // fill the memory.
+            let writer = crate::channels::media::CappedDocumentWriter::new(
+                crate::channels::media::DOC_MAX_BYTES,
+            );
+            let refused = writer.refused_flag();
+            match client.download_to_writer(document, writer).await {
+                Ok(writer) => Ok(writer.into_bytes()),
+                Err(e) => {
+                    tracing::warn!(
+                        "WhatsApp Web: an inbound document could not be downloaded: {e}"
+                    );
+                    Err(document_download_failure_reason(
+                        refused.load(std::sync::atomic::Ordering::SeqCst),
+                    ))
+                }
+            }
+        };
+        Self::resolve_document_with(
+            download,
+            claimed.as_deref(),
+            file_name.as_deref(),
+            announced_size,
+            sender,
+        )
+        .await
+    }
+
+    /// The document path, with the download behind a future so the **order**
+    /// — budget, then the announced size, then download, then the policy — is
+    /// reachable from a test without a linked session or a live socket.
+    #[cfg(feature = "whatsapp-web")]
+    async fn resolve_document_with(
+        download: impl std::future::Future<Output = Result<Vec<u8>, String>>,
+        claimed: Option<&str>,
+        file_name: Option<&str>,
+        announced_size: Option<u64>,
+        sender: &str,
+    ) -> crate::channels::media::DocumentOutcome {
+        use crate::channels::media::DocumentOutcome;
+
+        let sender_key = format!("whatsapp:{sender}");
+        let claim = crate::channels::media::DocumentClaim {
+            mime_type: claimed.map(str::to_string),
+            file_name: file_name.map(str::to_string),
+        };
+
+        // A build that cannot read documents says so **before** it spends a
+        // download on one.
+        if let Some(reason) = crate::channels::media::unreadable_build_reason(&claim) {
+            return DocumentOutcome::Rejected(reason.into());
+        }
+
+        // The budget is consulted **before** the download: an exhausted sender
+        // costs no bandwidth. The charge happens with the bytes, because the
+        // bytes arrive from a library call rather than a URL.
+        if let Err(reason) = crate::channels::media::peek_document(&sender_key) {
+            return DocumentOutcome::Rejected(reason);
+        }
+
+        // A document that announced no size cannot be weighed before it is
+        // fetched, and fetching it blind is what the size cap exists to
+        // prevent. It is refused rather than fetched.
+        if announced_size.is_none() {
+            return DocumentOutcome::Rejected(
+                "the document did not announce its size, so it cannot be checked".into(),
+            );
+        }
+
+        // The announced size is advisory, but it is free.
+        if let Some(reason) = crate::channels::media::announced_size_reason(announced_size) {
+            return DocumentOutcome::Rejected(reason);
+        }
+
+        let bytes = match download.await {
+            Ok(bytes) => bytes,
+            // The reason is the one the download chose: a refusal that says
+            // the document was too large must reach the sender as such.
+            Err(reason) => return DocumentOutcome::Rejected(reason),
+        };
+
+        Self::document_outcome_from_bytes(bytes, claimed, file_name, sender).await
+    }
+
+    /// Turn downloaded document bytes into the block the agent sees.
+    ///
+    /// Separated from the download so the part that carries the risk — the
+    /// budget, the size cap and the byte sniffing — is reachable from a test
+    /// without the `whatsapp-web` feature, a linked session or a live socket.
+    /// The library call around it is a single `client.download(..)`.
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) async fn document_outcome_from_bytes(
+        bytes: Vec<u8>,
+        claimed: Option<&str>,
+        file_name: Option<&str>,
+        sender: &str,
+    ) -> crate::channels::media::DocumentOutcome {
+        use crate::channels::media::{DocumentClaim, DocumentOutcome};
+
+        let sender_key = format!("whatsapp:{sender}");
+        let claim = DocumentClaim {
+            mime_type: claimed.map(str::to_string),
+            file_name: file_name.map(str::to_string),
+        };
+
+        // A build that cannot read documents says so.
+        if let Some(reason) = crate::channels::media::unreadable_build_reason(&claim) {
+            return DocumentOutcome::Rejected(reason.into());
+        }
+
+        // The budget is charged here, because the bytes arrive from a library
+        // call rather than a URL.
+        if let Err(reason) = crate::channels::media::charge_document(&sender_key) {
+            return DocumentOutcome::Rejected(reason);
+        }
+
+        crate::channels::media::document_outcome(bytes, &claim, file_name).await
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -825,9 +999,9 @@ impl WhatsAppWebChannel {
     /// unit-testable without a live wa-rs client.
     ///
     /// A plain `conversation` text carries no `ContextInfo` anywhere, and
-    /// WhatsApp delivers an @-mention as an extended-text (or image) message
-    /// with `ContextInfo`, so reading those two variants is complete: a group
-    /// message with neither is unaddressed.
+    /// WhatsApp delivers an @-mention as an extended-text, image or document
+    /// message with `ContextInfo`, so reading those three variants is
+    /// complete: a group message with none of them is unaddressed.
     #[cfg(feature = "whatsapp-web")]
     fn group_message_addressed(
         msg: &wa_rs_proto::whatsapp::Message,
@@ -851,6 +1025,13 @@ impl WhatsAppWebChannel {
             .and_then(|m| m.context_info.as_deref())
             .or_else(|| {
                 base.image_message
+                    .as_ref()
+                    .and_then(|m| m.context_info.as_deref())
+            })
+            .or_else(|| {
+                // A document carries its own context, so a mention or a reply
+                // to the bot rides on it.
+                base.document_message
                     .as_ref()
                     .and_then(|m| m.context_info.as_deref())
             });
@@ -1167,8 +1348,18 @@ impl Channel for WhatsAppWebChannel {
                 async move {
                     match event {
                         Event::Message(msg, info) => {
+                            // A document's caption is not text content:
+                            // WhatsApp carries it on the document itself. The
+                            // caption is the sender's own words, so it
+                            // becomes the message text.
+                            let base = msg.get_base_message();
+                            let document = base.document_message.as_deref();
                             // Extract message content
-                            let text = msg.text_content().unwrap_or("");
+                            let text = match msg.text_content() {
+                                Some(text) => text,
+                                None => document
+                                    .map_or("", |doc| doc.caption.as_deref().unwrap_or("")),
+                            };
                             let sender = info.source.sender.user().to_string();
                             let sender_jid = info.source.sender.to_string();
                             let chat_jid = info.source.chat.clone();
@@ -1304,7 +1495,11 @@ impl Channel for WhatsAppWebChannel {
                                 // and is still a message. Keying "is there
                                 // anything here" on text alone dropped it.
                                 let image = msg.image_message.as_deref();
-                                if !Self::has_deliverable_content(&trimmed, image.is_some()) {
+                                if !Self::has_deliverable_content(
+                                    &trimmed,
+                                    image.is_some(),
+                                    document.is_some(),
+                                ) {
                                     tracing::debug!(
                                         "WhatsApp Web: ignoring empty or non-text message from {}",
                                         normalized
@@ -1343,6 +1538,23 @@ impl Channel for WhatsAppWebChannel {
                                         content.push('\n');
                                     }
                                     content.push_str(&marker);
+                                }
+
+                                // A document is delivered the way an image is:
+                                // downloaded, checked against the policy, and
+                                // appended as a block the model can read.
+                                if let Some(doc) = document {
+                                    let block = Self::resolve_document_block(
+                                        &client,
+                                        doc,
+                                        &normalized,
+                                    )
+                                    .await
+                                    .to_text();
+                                    if !content.is_empty() {
+                                        content.push('\n');
+                                    }
+                                    content.push_str(&block);
                                 }
 
                                 // Reply on the chat WhatsApp actually delivers to:
@@ -2257,21 +2469,181 @@ mod media_tests {
     #[test]
     fn an_image_with_no_caption_is_still_something_to_answer() {
         assert!(
-            WhatsAppWebChannel::has_deliverable_content("", true),
+            WhatsAppWebChannel::has_deliverable_content("", true, false),
             "an image with no caption must be delivered"
         );
         assert!(WhatsAppWebChannel::has_deliverable_content(
             "look at this",
-            true
+            true,
+            false
         ));
         assert!(WhatsAppWebChannel::has_deliverable_content(
             "just words",
+            false,
             false
         ));
         assert!(
-            !WhatsAppWebChannel::has_deliverable_content("   ", false),
+            !WhatsAppWebChannel::has_deliverable_content("   ", false, false),
             "whitespace with no image is still nothing"
         );
+    }
+
+    /// A document with no caption is still a message, the way an image with
+    /// no caption is. Keying the check on text alone dropped it.
+    #[test]
+    fn a_document_with_no_caption_is_still_something_to_answer() {
+        assert!(
+            WhatsAppWebChannel::has_deliverable_content("", false, true),
+            "a document with no caption must be delivered"
+        );
+        assert!(
+            !WhatsAppWebChannel::has_deliverable_content("   ", false, false),
+            "whitespace with no attachment is still nothing"
+        );
+    }
+
+    /// An exhausted document budget costs the sender no download at all. The
+    /// budget is consulted before the download, so an exhausted sender costs
+    /// no bandwidth.
+    #[tokio::test]
+    async fn an_exhausted_document_budget_costs_no_download() {
+        let sender = "6280000009999";
+        // Five documents already sent: written out rather than read from the
+        // constant, so the test still fails if the budget moves.
+        for _ in 0..5 {
+            crate::channels::media::charge_document(&format!("whatsapp:{sender}"))
+                .expect("the sender has budget left");
+        }
+
+        let mut downloaded = false;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloaded = true;
+                Ok(b"hello".to_vec())
+            },
+            Some("text/plain"),
+            Some("notes.txt"),
+            None,
+            sender,
+        )
+        .await;
+
+        assert!(!downloaded, "an exhausted sender must cost no download");
+        let note = outcome.to_text();
+        assert!(note.contains("[Attachment rejected:"), "{note}");
+        assert!(note.contains("budget is spent"), "{note}");
+    }
+
+    /// Document bytes become the delimited block the model reads.
+    #[tokio::test]
+    async fn document_bytes_become_a_block_the_model_reads() {
+        let outcome = WhatsAppWebChannel::document_outcome_from_bytes(
+            b"hello from a document".to_vec(),
+            Some("text/plain"),
+            Some("notes.txt"),
+            "6280000008888",
+        )
+        .await;
+
+        let block = outcome.to_text();
+        assert!(
+            block.starts_with("[inbound document: notes.txt ("),
+            "{block}"
+        );
+        assert!(block.contains("hello from a document"), "{block}");
+        assert!(block.ends_with("[end inbound document]"), "{block}");
+    }
+
+    /// Bytes that are not a document are refused with a visible note.
+    #[tokio::test]
+    async fn bytes_that_are_not_a_document_are_refused() {
+        let outcome = WhatsAppWebChannel::document_outcome_from_bytes(
+            vec![0xff, 0xfe, 0xfd, 0xfc],
+            Some("text/plain"),
+            None,
+            "6280000007777",
+        )
+        .await;
+
+        let note = outcome.to_text();
+        assert!(note.contains("[Attachment rejected:"), "{note}");
+    }
+
+    /// A document announced over the cap is refused before the download: the
+    /// announced size costs nothing to check.
+    #[tokio::test]
+    async fn a_document_announced_over_the_cap_is_refused_without_a_download() {
+        let mut downloaded = false;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloaded = true;
+                Ok(b"hello".to_vec())
+            },
+            Some("application/pdf"),
+            Some("besar.pdf"),
+            Some(crate::channels::media::DOC_MAX_BYTES + 1),
+            "6280000006666",
+        )
+        .await;
+
+        assert!(!downloaded, "an oversized document must cost no download");
+        let note = outcome.to_text();
+        assert!(note.contains("too large"), "{note}");
+    }
+
+    /// A document that announced no size cannot be weighed before it is
+    /// fetched, so it is refused rather than fetched blind: the size cap
+    /// exists to bound what a sender can make the agent hold, and a document
+    /// of unknown size is the one case the cap cannot apply to.
+    #[tokio::test]
+    async fn a_document_with_no_announced_size_is_refused_without_a_download() {
+        let mut downloaded = false;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloaded = true;
+                Ok(b"hello".to_vec())
+            },
+            Some("text/plain"),
+            Some("notes.txt"),
+            None,
+            "6280000004444",
+        )
+        .await;
+
+        assert!(
+            !downloaded,
+            "a document with no announced size must cost no download"
+        );
+        let note = outcome.to_text();
+        assert!(note.contains("[Attachment rejected:"), "{note}");
+        assert!(note.contains("did not announce its size"), "{note}");
+    }
+
+    /// The reason a failed download gives is the reason the sender sees: a
+    /// refusal that says the document is too large must not be flattened into
+    /// a generic failure.
+    #[tokio::test]
+    async fn the_reason_a_failed_download_gives_is_the_reason_the_sender_sees() {
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async { Err("the document is too large (limit 10 MiB)".to_string()) },
+            Some("text/plain"),
+            Some("notes.txt"),
+            Some(4096),
+            "6280000003333",
+        )
+        .await;
+
+        let note = outcome.to_text();
+        assert!(note.contains("too large"), "{note}");
+    }
+
+    /// WhatsApp announces a length of zero for a document it has not
+    /// measured, so a zero length is no announcement at all.
+    #[test]
+    fn a_zero_or_missing_length_is_no_announcement() {
+        assert_eq!(announced_document_size(Some(0)), None);
+        assert_eq!(announced_document_size(None), None);
+        assert_eq!(announced_document_size(Some(4096)), Some(4096));
     }
 
     fn upload(len: u64) -> wa_rs::upload::UploadResponse {
@@ -3880,6 +4252,50 @@ mod tests {
             ..Default::default()
         };
         assert!(WhatsAppWebChannel::group_message_addressed(
+            &msg,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    // ── Inbound documents ──────────────────────────────────────────────────
+
+    /// A document that mentions the bot is addressed. The mention rides on the
+    /// document's own `ContextInfo`, and the group gate has to read it there:
+    /// the extended-text and image variants were all it knew.
+    #[test]
+    fn a_group_mention_on_a_document_is_addressed() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            document_message: Some(Box::new(wa_rs_proto::whatsapp::message::DocumentMessage {
+                mimetype: Some("application/pdf".into()),
+                file_name: Some("laporan.pdf".into()),
+                context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                    mentioned_jid: vec!["6280000000000@s.whatsapp.net".to_string()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(WhatsAppWebChannel::group_message_addressed(
+            &msg,
+            Some(OWN_PN),
+            Some(OWN_LID)
+        ));
+    }
+
+    /// A document that mentions nobody is not addressed.
+    #[test]
+    fn a_group_document_that_mentions_nobody_is_not_addressed() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            document_message: Some(Box::new(wa_rs_proto::whatsapp::message::DocumentMessage {
+                mimetype: Some("application/pdf".into()),
+                file_name: Some("laporan.pdf".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(!WhatsAppWebChannel::group_message_addressed(
             &msg,
             Some(OWN_PN),
             Some(OWN_LID)
