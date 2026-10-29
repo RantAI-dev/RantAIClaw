@@ -1252,17 +1252,10 @@ fn create_provider_with_url_and_options(
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
 
-    // An expired Gemini CLI login is refused here, before a provider exists and
-    // before any request is sent: the operator is told to renew the login or to
-    // set a key, instead of a dead token going to Google and coming back as a
-    // 401. A credential that is not the CLI login — an explicit key,
-    // `GEMINI_API_KEY`, `GOOGLE_API_KEY` — wins as it always did.
-    if key.is_none()
-        && matches!(name, "gemini" | "google" | "google-gemini")
-        && gemini_cli::gemini_cli_login() == gemini_cli::GeminiCliLogin::Expired
-    {
-        anyhow::bail!(gemini_cli::EXPIRED_LOGIN_REFUSAL);
-    }
+    // The Gemini CLI login's state is not checked here: the login is read
+    // when a request is sent, so an expired login fails that request with
+    // the fix named (see `gemini::GeminiProvider`) and the build never fails
+    // because of it. The gateway and the channels start with an expired login.
 
     match name {
         #[cfg(test)]
@@ -1323,11 +1316,18 @@ fn create_provider_with_url_and_options(
         #[cfg(not(feature = "legacy-providers"))]
         "gemini" | "google" | "google-gemini" => {
             // rig's gemini client only speaks the public endpoint; Gemini CLI
-            // OAuth tokens are scoped for cloudcode-pa. With no API key but CLI
-            // creds present, route to the legacy provider (handles cloudcode-pa);
-            // otherwise the rig path (streaming + native tools). An expired CLI
-            // login never reaches this point: the refusal above stops it.
-            if key.is_none() && gemini_cli::gemini_cli_has_credentials() {
+            // OAuth tokens are scoped for cloudcode-pa. With no API key but a
+            // CLI login file that holds a token — valid or expired — route to
+            // the legacy provider (handles cloudcode-pa); otherwise the rig
+            // path (streaming + native tools). An expired login still routes
+            // here: the request that uses it is refused with the fix named,
+            // which beats a key-less rig path that cannot work either.
+            if key.is_none()
+                && !matches!(
+                    gemini_cli::read_gemini_cli_login(),
+                    gemini_cli::Login::Missing
+                )
+            {
                 Ok(Box::new(gemini::GeminiProvider::new(key)))
             } else {
                 Ok(Box::new(rig_native::RigProvider::for_provider("gemini", key)?))
@@ -2586,6 +2586,72 @@ pub(crate) mod tests {
         assert!(
             with_env_ok,
             "GEMINI_API_KEY must resolve a usable gemini provider"
+        );
+    }
+
+    /// Building a Gemini provider never fails because of the login's state:
+    /// an expired login is refused when the request is sent, with the fix
+    /// named. The gateway and the channels start with an expired login.
+    #[tokio::test]
+    async fn an_expired_gemini_cli_login_does_not_fail_the_provider_build() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (home, _home_guard) = gemini_cli::gemini_home();
+
+        gemini_cli::write_gemini_creds_with_expiry(&home, "ya29.mock-token", -3_600_000);
+
+        let provider = create_provider("gemini", None)
+            .expect("an expired Gemini CLI login must not fail the provider build");
+
+        let error = provider
+            .chat_with_system(None, "hello", "gemini-2.0-flash", 0.7)
+            .await
+            .expect_err("an expired Gemini CLI login must fail the request");
+        assert!(
+            error
+                .to_string()
+                .contains(gemini_cli::EXPIRED_LOGIN_REFUSAL),
+            "{error}"
+        );
+    }
+
+    /// The same through the routed factory the gateway builds its provider
+    /// with: the door stays open, and the turn carries the refusal.
+    #[tokio::test]
+    async fn the_routed_factory_builds_a_provider_with_an_expired_gemini_cli_login() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (home, _home_guard) = gemini_cli::gemini_home();
+
+        gemini_cli::write_gemini_creds_with_expiry(&home, "ya29.mock-token", -3_600_000);
+
+        // One attempt: the refusal is not about retrying, and the gateway's
+        // own retry policy is not what this test is about.
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 0,
+            ..Default::default()
+        };
+        let provider = create_routed_provider_with_options(
+            "gemini",
+            None,
+            None,
+            &reliability,
+            &[],
+            "gemini-2.0-flash",
+            &|_: &str| -> Option<String> { None },
+            &ProviderRuntimeOptions::default(),
+        )
+        .expect("an expired Gemini CLI login must not fail the provider build");
+
+        let error = provider
+            .chat_with_system(None, "hello", "gemini-2.0-flash", 0.7)
+            .await
+            .expect_err("an expired Gemini CLI login must fail the request");
+        assert!(
+            error
+                .to_string()
+                .contains(gemini_cli::EXPIRED_LOGIN_REFUSAL),
+            "{error}"
         );
     }
 

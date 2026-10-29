@@ -196,7 +196,8 @@ OPENAI_API_KEY=sk-... rantaiclaw setup provider
 
 Cause: the only Gemini credential is the login `~/.gemini/oauth_creds.json` holds, and its access
 token has expired. The token is valid for about an hour after the last `gemini` run, and it is never
-refreshed. The turn is refused before anything is sent, with the fix in the message:
+refreshed. The login is read when a request is sent, so the turn that uses an expired login is
+refused before anything is sent, with the fix in the message:
 
 ```
 the Gemini CLI login has expired — run `gemini` to renew it, or set `GEMINI_API_KEY`
@@ -211,6 +212,8 @@ gemini          # renew the login, then retry
 ```bash
 export GEMINI_API_KEY=...   # use a key instead
 ```
+
+No restart is needed after `gemini`: the renewed login is used on the next request.
 
 With Gemini CLI's encrypted credential storage the login lives in the OS keychain and the file is
 deleted after the migration, so there is nothing to reuse and a key is the only way in.
