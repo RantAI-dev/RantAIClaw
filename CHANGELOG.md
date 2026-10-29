@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **pulldown-cmark 0.13.5, for RUSTSEC-2026-0414.** The advisory (exponential event growth
+  with `ENABLE_WIKILINKS`, CVSS 7.5 HIGH) is a denial of service: parsing untrusted Markdown with
+  that option grows the event list exponentially and exhausts memory. The lockfile takes
+  `pulldown-cmark` 0.13.4 → 0.13.5. RantaiClaw never enabled the affected option.
+  `src/channels/format/ast.rs` sets `Options::empty()` plus `ENABLE_TABLES` and
+  `ENABLE_STRIKETHROUGH`, so the vulnerable path was not reachable. A patched release exists, so
+  no advisory waiver was added to `deny.toml` or the Security Audit job's ignore list; the bump
+  clears the finding instead of waiving it. `Cargo.toml` is unchanged, because 0.13.5 stays inside
+  the existing `0.13` requirement. `Cargo.lock` only.
+
 - **RUSTSEC-2026-0387 fixed: the `ssh` transport runs on the patched crypto stack.** The advisory
   (timing variability in operations intended to be constant-time) is fixed only in
   `crypto-bigint` >= 0.7.6, which `russh` 0.60.3 could never select: it pins
